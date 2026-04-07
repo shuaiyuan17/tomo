@@ -43,7 +43,6 @@ export const initCommand = new Command("init")
     const s0 = p.spinner();
     s0.start("Checking prerequisites");
     const { execSync } = await import("node:child_process");
-    let claudeOk = false;
     try {
       const version = execSync("claude --version 2>/dev/null", { encoding: "utf-8" }).trim();
       s0.stop(`Claude Code found (${version})`);
@@ -55,7 +54,6 @@ export const initCommand = new Command("init")
           encoding: "utf-8",
           timeout: 30_000,
         });
-        claudeOk = true;
         s1.stop("Claude Code authenticated");
       } catch {
         s1.stop("Claude Code not authenticated");

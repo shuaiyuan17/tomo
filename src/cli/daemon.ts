@@ -21,7 +21,7 @@ function getRunningPid(): number | null {
   if (!existsSync(PID_FILE)) return null;
   const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
   if (isNaN(pid) || !isRunning(pid)) {
-    try { unlinkSync(PID_FILE); } catch {}
+    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
     return null;
   }
   return pid;

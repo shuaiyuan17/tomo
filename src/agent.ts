@@ -1,15 +1,9 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { createHash } from "crypto";
 import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import { log } from "./logger.js";
-
-const QUERY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-const GROUP_PARTICIPANT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-const SILENT_TOKEN = "NO_REPLY";
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);

@@ -53,7 +53,7 @@ async function startForeground(): Promise<void> {
   const shutdown = async () => {
     scheduler.stop();
     await agent.stop();
-    try { unlinkSync(PID_FILE); } catch {}
+    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

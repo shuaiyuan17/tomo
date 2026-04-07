@@ -1,6 +1,6 @@
 {
   "name": "tomo-ai",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Personal assistant powered by Claude Agent SDK",
   "type": "module",
   "main": "dist/index.js",
@@ -16,6 +16,8 @@
     "dev": "tsx watch src/cli.ts -- start",
     "start": "node dist/cli.js start",
     "tomo": "tsx src/cli.ts",
+    "test": "vitest run",
+    "lint": "eslint src/ tests/",
     "prepublishOnly": "npm run build",
     "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  Get started:\n    tomo init       Set up your assistant\n    tomo start      Run in background\n    tomo --help     See all commands\n'"
   },
@@ -50,9 +52,13 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
     "dotenv": "^16.4.7",
+    "eslint": "^10.2.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.58.0",
+    "vitest": "^4.1.2"
   }
 }

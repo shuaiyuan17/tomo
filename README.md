@@ -6,8 +6,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/tomo-ai"><img src="https://img.shields.io/npm/v/tomo-ai.svg" alt="npm version"></a>
   <a href="https://github.com/shuaiyuan17/tomo/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/tomo-ai.svg" alt="license"></a>
-  <a href="https://www.npmjs.com/package/tomo-ai"><img src="https://img.shields.io/npm/dm/tomo-ai.svg" alt="downloads"></a>
-  <a href="https://github.com/shuaiyuan17/tomo"><img src="https://img.shields.io/github/stars/shuaiyuan17/tomo.svg?style=social" alt="GitHub stars"></a>
+  <a href="https://github.com/shuaiyuan17/tomo/actions/workflows/ci.yml"><img src="https://github.com/shuaiyuan17/tomo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
 <p align="center">

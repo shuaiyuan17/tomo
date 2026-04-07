@@ -86,6 +86,7 @@ export const initCommand = new Command("init")
       TOMO_HOME,
       join(TOMO_HOME, "workspace"),
       join(TOMO_HOME, "workspace", "memory"),
+      join(TOMO_HOME, "workspace", "tmp"),
       join(TOMO_HOME, "data", "cron"),
       join(TOMO_HOME, "data", "sessions"),
       join(TOMO_HOME, "logs"),

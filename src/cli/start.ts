@@ -42,6 +42,13 @@ async function startForeground(): Promise<void> {
   const { config } = await import("../config.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
 
+  // Ensure directories exist (handles upgrades where new dirs were added)
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(TOMO_HOME, "workspace", "tmp"), { recursive: true });
+  mkdirSync(join(TOMO_HOME, "workspace", "memory"), { recursive: true });
+  mkdirSync(join(TOMO_HOME, "data", "cron"), { recursive: true });
+  mkdirSync(join(TOMO_HOME, "logs"), { recursive: true });
+
   const agent = new Agent();
   agent.addChannel(new TelegramChannel(config.telegramToken));
 

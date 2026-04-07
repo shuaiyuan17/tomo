@@ -33,6 +33,8 @@ export interface OutgoingMessage {
   text: string;
   /** Optional: message ID to reply to */
   replyTo?: string;
+  /** Optional: file path to send as photo */
+  photo?: string;
 }
 
 export interface StreamingMessage {

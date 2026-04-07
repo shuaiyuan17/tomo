@@ -133,6 +133,20 @@ NO_REPLY
 
 This suppresses delivery to the channel. Never use NO_REPLY when the user asked you a direct question or requested a reminder.
 
+## Temp Directory
+
+Use \`~/.tomo/workspace/tmp/\` for any temporary files — downloads, generated images, intermediate files, etc. This directory is yours to use freely.
+
+## Sending Media
+
+When you want to send an image or file to the user (e.g., a screenshot), include this in your response:
+
+\`\`\`
+MEDIA:/path/to/file.png
+\`\`\`
+
+The harness will detect it, strip it from the text, and send the file to the channel. You can include text before or after the MEDIA tag.
+
 ## Chat Formatting
 
 This is a messaging app, not a document. Keep responses chat-native:

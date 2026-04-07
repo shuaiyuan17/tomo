@@ -9,6 +9,17 @@ function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
 }
 
+const MEDIA_RE = /\bMEDIA:\s*"?([^\n"]+)"?/gi;
+
+function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
+  const mediaPaths: string[] = [];
+  const cleanText = text.replace(MEDIA_RE, (_match, path) => {
+    mediaPaths.push(path.trim());
+    return "";
+  }).trim();
+  return { cleanText, mediaPaths };
+}
+
 function sdkOptions(resumeSessionId?: string, model?: string) {
   return {
     model: model ?? config.model,
@@ -175,7 +186,29 @@ export class Agent {
         return;
       }
 
-      await stream.finish();
+      const { cleanText, mediaPaths } = extractMedia(response);
+
+      if (mediaPaths.length > 0) {
+        const { existsSync: fileExists } = await import("node:fs");
+        const validPaths = mediaPaths.filter((p) => fileExists(p));
+
+        if (validPaths.length > 0) {
+          // Send first media with text as caption, rest without
+          for (let i = 0; i < validPaths.length; i++) {
+            await channel.send({
+              chatId: message.chatId,
+              photo: validPaths[i],
+              text: i === 0 ? cleanText : "",
+            });
+          }
+        } else {
+          // No valid files — fall back to text
+          stream.update(cleanText);
+          await stream.finish();
+        }
+      } else {
+        await stream.finish();
+      }
     } catch (err) {
       stopTyping();
       log.error({ err }, "Error handling message");

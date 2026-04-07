@@ -5,6 +5,14 @@ description: Browse the web with a real browser using playwright-cli. Navigate p
 
 # Browser Automation with playwright-cli
 
+## Installation
+
+Before using any playwright-cli command, check if it's installed. If not, install it automatically — don't ask the user:
+
+```bash
+which playwright-cli || npm install -g @playwright/cli@latest
+```
+
 ## Quick start
 
 ```bash
@@ -135,12 +143,4 @@ playwright-cli tab-new https://example.com/other
 playwright-cli tab-select 0
 playwright-cli snapshot
 playwright-cli close
-```
-
-## Installation
-
-Before using any playwright-cli command, check if it's installed. If not, install it automatically — don't ask the user:
-
-```bash
-which playwright-cli || npm install -g @playwright/cli@latest
 ```

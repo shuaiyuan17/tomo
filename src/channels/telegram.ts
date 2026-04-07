@@ -225,6 +225,16 @@ export class TelegramChannel implements Channel {
       ? { reply_parameters: { message_id: Number(message.replyTo) } }
       : {};
 
+    // Send photo if provided
+    if (message.photo) {
+      const { InputFile } = await import("grammy");
+      await this.bot.api.sendPhoto(message.chatId, new InputFile(message.photo), {
+        ...replyParams,
+        caption: message.text || undefined,
+      });
+      return;
+    }
+
     try {
       await this.bot.api.sendMessage(message.chatId, message.text, {
         ...replyParams,

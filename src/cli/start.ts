@@ -50,16 +50,40 @@ async function startForeground(): Promise<void> {
   mkdirSync(join(TOMO_HOME, "data", "cron"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "logs"), { recursive: true });
 
-  // Copy CONTINUITY.md if missing
-  const { copyFileSync, existsSync: fileExists } = await import("node:fs");
+  // Sync defaults on startup (handles upgrades)
+  const { copyFileSync, existsSync: fileExists, readdirSync } = await import("node:fs");
   const { resolve } = await import("node:path");
   const { dirname: dirnameFn } = await import("node:path");
   const { fileURLToPath: fileUrlFn } = await import("node:url");
   const __dirname = dirnameFn(fileUrlFn(import.meta.url));
-  const continuityDest = join(TOMO_HOME, "workspace", "CONTINUITY.md");
-  const continuitySrc = resolve(__dirname, "../../defaults/CONTINUITY.md");
-  if (!fileExists(continuityDest) && fileExists(continuitySrc)) {
-    copyFileSync(continuitySrc, continuityDest);
+  const defaultsDir = resolve(__dirname, "../../defaults");
+
+  // Copy missing workspace files (CONTINUITY.md, etc.)
+  for (const file of ["CONTINUITY.md"]) {
+    const dest = join(TOMO_HOME, "workspace", file);
+    const src = join(defaultsDir, file);
+    if (!fileExists(dest) && fileExists(src)) {
+      copyFileSync(src, dest);
+    }
+  }
+
+  // Sync default skills (copy any missing ones)
+  const defaultSkillsDir = join(defaultsDir, "skills");
+  const targetSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
+  if (fileExists(defaultSkillsDir)) {
+    mkdirSync(targetSkillsDir, { recursive: true });
+    for (const skill of readdirSync(defaultSkillsDir, { withFileTypes: true })) {
+      if (!skill.isDirectory()) continue;
+      const destDir = join(targetSkillsDir, `tomo-${skill.name}`);
+      const destFile = join(destDir, "SKILL.md");
+      if (!fileExists(destFile)) {
+        mkdirSync(destDir, { recursive: true });
+        const srcFile = join(defaultSkillsDir, skill.name, "SKILL.md");
+        if (fileExists(srcFile)) {
+          copyFileSync(srcFile, destFile);
+        }
+      }
+    }
   }
 
   const agent = new Agent();

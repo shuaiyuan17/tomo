@@ -3,4 +3,5 @@ dist/
 data/
 .claude/
 .env
+.playwright-cli/
 *.tsbuildinfo

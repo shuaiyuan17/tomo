@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { existsSync, readFileSync, unlinkSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
@@ -78,6 +78,19 @@ export const statusCommand = new Command("status")
     }
 
     console.log(`Tomo is running (PID ${pid}, uptime: ${uptime})`);
+  });
+
+export const continuityCommand = new Command("continuity")
+  .description("Manually trigger a continuity heartbeat")
+  .action(() => {
+    const pid = getRunningPid();
+    if (!pid) {
+      console.log("Tomo is not running. Start it with 'tomo start'.");
+      return;
+    }
+    const triggerFile = join(TOMO_HOME, "continuity.trigger");
+    writeFileSync(triggerFile, String(Date.now()));
+    console.log("Continuity heartbeat triggered. Check logs: tomo logs -f");
   });
 
 export const logsCommand = new Command("logs")

@@ -16,12 +16,25 @@ which playwright-cli || npm install -g @playwright/cli@latest
 ## Quick start
 
 ```bash
-playwright-cli open https://example.com
+playwright-cli open -s=tomo --browser=chrome --persistent --headed
+playwright-cli goto https://example.com
 playwright-cli snapshot
 playwright-cli click e15
 playwright-cli type "search query"
 playwright-cli screenshot
-playwright-cli close
+playwright-cli -s=tomo close
+```
+
+**Always use `-s=tomo --browser=chrome --persistent --headed`** when opening a browser. This uses real Chrome with a persistent profile (cookies/logins survive), and the user can see the browser window.
+
+The agent profile is separate from the user's personal Chrome. The user can interact with the visible browser (e.g., to log in) while the agent operates it.
+
+**Important:** After opening, all subsequent commands must include `-s=tomo` to target the named session:
+```bash
+playwright-cli -s=tomo goto https://example.com
+playwright-cli -s=tomo snapshot
+playwright-cli -s=tomo click e15
+playwright-cli -s=tomo close
 ```
 
 ## Commands
@@ -29,8 +42,8 @@ playwright-cli close
 ### Core
 
 ```bash
-playwright-cli open
-playwright-cli open https://example.com/
+playwright-cli open -s=tomo --browser=chrome --persistent --headed
+playwright-cli open -s=tomo --browser=chrome --persistent --headed https://example.com/
 playwright-cli goto https://playwright.dev
 playwright-cli type "search query"
 playwright-cli click e3
@@ -46,7 +59,7 @@ playwright-cli snapshot
 playwright-cli eval "document.title"
 playwright-cli dialog-accept
 playwright-cli dialog-dismiss
-playwright-cli close
+playwright-cli -s=tomo close
 ```
 
 ### Navigation
@@ -126,21 +139,21 @@ Prefer refs from snapshots. Fall back to CSS selectors or locators when refs are
 ## Example: Form submission
 
 ```bash
-playwright-cli open https://example.com/form
+playwright-cli open -s=tomo --browser=chrome --persistent --headed https://example.com/form
 playwright-cli snapshot
 playwright-cli fill e1 "user@example.com"
 playwright-cli fill e2 "password123"
 playwright-cli click e3
 playwright-cli snapshot
-playwright-cli close
+playwright-cli -s=tomo close
 ```
 
 ## Example: Multi-tab workflow
 
 ```bash
-playwright-cli open https://example.com
+playwright-cli open -s=tomo --browser=chrome --persistent --headed https://example.com
 playwright-cli tab-new https://example.com/other
 playwright-cli tab-select 0
 playwright-cli snapshot
-playwright-cli close
+playwright-cli -s=tomo close
 ```

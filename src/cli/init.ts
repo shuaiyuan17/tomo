@@ -260,8 +260,10 @@ function applyPersonality(file: string, content: string, p: Personality): string
 }
 
 function writeMemory(memoryDir: string, personality: Personality): void {
-  // User profile memory
-  const profileContent = [
+  const date = new Date().toISOString().split("T")[0];
+
+  // User profile
+  writeFileSync(join(memoryDir, "user_profile.md"), [
     "---",
     "name: user-profile",
     `description: Key facts about ${personality.userName}`,
@@ -270,12 +272,27 @@ function writeMemory(memoryDir: string, personality: Personality): void {
     "",
     `Name: ${personality.userName}`,
     `Preferred name to use: ${personality.userName}`,
-    `Set up ${personality.agentName} on ${new Date().toISOString().split("T")[0]}.`,
+    `Set up ${personality.agentName} on ${date}.`,
     "",
-  ].join("\n");
-  writeFileSync(join(memoryDir, "user_profile.md"), profileContent);
+  ].join("\n"));
+
+  // Work context
+  writeFileSync(join(memoryDir, "work_context.md"), [
+    "---",
+    "name: work-context",
+    `description: ${personality.userName}'s current projects and work context`,
+    "type: project",
+    "---",
+    "",
+    "(Agent will fill this in as it learns)",
+    "",
+  ].join("\n"));
 
   // MEMORY.md index
-  const index = `- [User profile](user_profile.md) — ${personality.userName}'s preferences and info\n`;
+  const index = [
+    `- [User profile](user_profile.md) — ${personality.userName}'s basic info`,
+    `- [Work context](work_context.md) — Current projects and goals`,
+    "",
+  ].join("\n");
   writeFileSync(join(memoryDir, "MEMORY.md"), index);
 }

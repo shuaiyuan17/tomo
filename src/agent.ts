@@ -15,9 +15,9 @@ function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
 }
 
-function sdkOptions(resumeSessionId?: string) {
+function sdkOptions(resumeSessionId?: string, model?: string) {
   return {
-    model: config.model,
+    model: model ?? config.model,
     cwd: config.workspaceDir,
     systemPrompt: buildSystemPrompt(),
     permissionMode: "bypassPermissions" as const,
@@ -47,6 +47,8 @@ export class Agent {
   private sessions: SessionStore;
   /** Tracks known participants per group session */
   private groupParticipants = new Map<string, Set<string>>();
+  /** Per-chat model override */
+  private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
 
   constructor() {
@@ -55,16 +57,45 @@ export class Agent {
 
   addChannel(channel: Channel): void {
     channel.onMessage((msg) => this.handleMessage(channel, msg));
-    channel.onCommand((cmd, chatId, senderName) => this.handleCommand(channel, cmd, chatId, senderName));
+    channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
     this.channels.push(channel);
   }
 
-  private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string): Promise<void> {
+  private static readonly AVAILABLE_MODELS: Record<string, string> = {
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+    "haiku": "claude-haiku-4-5",
+  };
+
+  private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
+    const key = this.sessionKey(channel, chatId);
+
     if (command === "new") {
-      const key = this.sessionKey(channel, chatId);
       this.sessions.clearSdkSessionId(key);
       log.info({ channel: channel.name, chatId, sender: senderName }, "New session started via /new");
       await channel.send({ chatId, text: "New session started." });
+      return;
+    }
+
+    if (command === "model") {
+      const arg = args?.trim().toLowerCase();
+
+      if (!arg) {
+        const current = this.modelOverrides.get(key) ?? config.model;
+        const lines = [`Current: ${current}`, "", "Switch with: /model <name>", ""];
+        for (const [shortName, fullName] of Object.entries(Agent.AVAILABLE_MODELS)) {
+          const marker = fullName === current ? " (active)" : "";
+          lines.push(`  ${shortName} — ${fullName}${marker}`);
+        }
+        await channel.send({ chatId, text: lines.join("\n") });
+        return;
+      }
+
+      const resolved = Agent.AVAILABLE_MODELS[arg] ?? arg;
+      this.modelOverrides.set(key, resolved);
+      log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
+      await channel.send({ chatId, text: `Switched to ${resolved}` });
+      return;
     }
   }
 
@@ -166,7 +197,8 @@ export class Agent {
     this.checkPromptChanged();
 
     const resumeId = this.sessions.getSdkSessionId(sessionKey);
-    const opts = sdkOptions(resumeId ?? undefined);
+    const model = this.modelOverrides.get(sessionKey);
+    const opts = sdkOptions(resumeId ?? undefined, model);
     const parts: string[] = [];
 
     // For images, prepend image description request
@@ -176,7 +208,7 @@ export class Agent {
       ? `[User sent an image${userMessage !== "[Sent an image]" ? ` with caption: ${userMessage}` : ""}]`
       : userMessage;
 
-    log.debug({ sessionKey, resume: !!resumeId }, "Running query");
+    log.debug({ sessionKey, resume: !!resumeId, model: opts.model }, "Running query");
 
     try {
       for await (const event of query({ prompt, options: opts })) {

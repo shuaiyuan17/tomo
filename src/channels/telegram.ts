@@ -17,13 +17,16 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    this.bot.command("new", async (ctx) => {
-      const chatId = String(ctx.chat.id);
-      const senderName = this.getSenderName(ctx);
-      for (const handler of this.commandHandlers) {
-        await handler("new", chatId, senderName);
-      }
-    });
+    for (const cmd of ["new", "model"]) {
+      this.bot.command(cmd, async (ctx) => {
+        const chatId = String(ctx.chat.id);
+        const senderName = this.getSenderName(ctx);
+        const args = ctx.match as string;
+        for (const handler of this.commandHandlers) {
+          await handler(cmd, chatId, senderName, args);
+        }
+      });
+    }
 
     // Text messages (skip bot commands)
     this.bot.on("message:text", async (ctx) => {
@@ -197,6 +200,7 @@ export class TelegramChannel implements Channel {
     // Register commands with Telegram so they show in the menu
     await this.bot.api.setMyCommands([
       { command: "new", description: "Start a new conversation" },
+      { command: "model", description: "Switch model (sonnet/opus/haiku)" },
     ]);
 
     this.bot.start();

@@ -36,7 +36,7 @@ export interface OutgoingMessage {
 }
 
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;
-export type CommandHandler = (command: string, chatId: string, senderName: string) => Promise<void>;
+export type CommandHandler = (command: string, chatId: string, senderName: string, args?: string) => Promise<void>;
 
 export interface Channel {
   /** Channel identifier (e.g. "telegram", "imessage") */

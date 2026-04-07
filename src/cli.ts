@@ -9,7 +9,7 @@ import { sessionsCommand } from "./cli/sessions.js";
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.1.0");
+  .version("0.1.1");
 
 program.addCommand(initCommand);
 program.addCommand(startCommand);

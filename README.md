@@ -1,8 +1,24 @@
-# Tomo
+<p align="center">
+  <h1 align="center">Tomo</h1>
+  <p align="center">A personal AI assistant that lives in your messaging apps.</p>
+</p>
 
-A personal assistant that lives in your messaging apps. Powered by [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
+<p align="center">
+  <a href="https://www.npmjs.com/package/tomo-ai"><img src="https://img.shields.io/npm/v/tomo-ai.svg" alt="npm version"></a>
+  <a href="https://github.com/shuaiyuan17/tomo/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/tomo-ai.svg" alt="license"></a>
+  <a href="https://www.npmjs.com/package/tomo-ai"><img src="https://img.shields.io/npm/dm/tomo-ai.svg" alt="downloads"></a>
+  <a href="https://github.com/shuaiyuan17/tomo"><img src="https://img.shields.io/github/stars/shuaiyuan17/tomo.svg?style=social" alt="GitHub stars"></a>
+</p>
 
-Tomo has its own personality, remembers things across conversations, can use tools autonomously, and runs scheduled tasks — all through a simple CLI.
+<p align="center">
+  Powered by <a href="https://platform.claude.com/docs/en/agent-sdk/overview">Claude Agent SDK</a> &middot;
+  Personality system &middot;
+  Persistent memory &middot;
+  Scheduled tasks &middot;
+  Telegram (more channels coming)
+</p>
+
+---
 
 ## Quick Start
 
@@ -46,40 +62,46 @@ tomo cron remove <id>  # Delete a job
 
 ## Features
 
+### Personality
+
+Three markdown files define who your assistant is, all customizable:
+
+| File | Purpose |
+|------|---------|
+| `SOUL.md` | Core personality, values, communication style |
+| `AGENT.md` | Operating rules, response format, behavior |
+| `IDENTITY.md` | Name, vibe, preferences, quirks |
+
+During `tomo init`, you choose a name, your preferred name, and a tone (chill / sharp / warm). These get baked into the templates. Edit them anytime — changes take effect on the next message, no restart needed.
+
+### Memory
+
+File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` index is injected into every conversation. Tomo reads and writes memory files autonomously — it remembers who you are, your preferences, and past context across sessions.
+
 ### Channels
+
 - **Telegram** — DM and group chat support
   - Typing indicators with keepalive and error backoff
   - Image/photo support (sends to Claude as vision input)
   - Group chat: only responds when @mentioned or replied to, tracks participants
   - Markdown rendering with plain-text fallback
-
-### Personality
-Three markdown files define who your assistant is, all customizable:
-- **SOUL.md** — Core personality and values
-- **AGENT.md** — Operating rules and response style
-- **IDENTITY.md** — Name, vibe, preferences
-
-During `tomo init`, you choose a name, your preferred name, and a tone (chill/sharp/warm). These get baked into the templates. Edit them anytime — changes take effect on the next message, no restart needed.
-
-### Memory
-File-based persistent memory at `~/.tomo/workspace/memory/`:
-- **MEMORY.md** index is injected into every conversation
-- Tomo reads and writes memory files autonomously
-- Remembers who you are, your preferences, and past context across sessions
+- More channels coming (iMessage, Discord, etc.)
 
 ### Tools
-Tomo has access to Claude's built-in tools:
-- File operations (Read, Write, Edit, Glob, Grep)
-- Shell commands (Bash)
-- Web access (WebSearch, WebFetch)
-- Subagents for complex tasks (Agent)
-- Skills for specialized workflows (Skill)
 
-### Skills
-Markdown-based skills that teach Tomo specialized abilities. Ships with:
-- **tomo-cron** — Create and manage scheduled tasks and reminders
+Tomo has access to Claude's built-in tools:
+
+| Tool | Capability |
+|------|-----------|
+| Read, Write, Edit | File operations |
+| Bash | Shell commands |
+| Glob, Grep | File search |
+| WebSearch, WebFetch | Web access |
+| Agent | Subagents for complex tasks |
+| Skill | Specialized workflows |
 
 ### Scheduled Tasks
+
 ```bash
 # One-shot reminder
 tomo cron add --name "standup" --schedule "in 20m" --message "Time for standup!"
@@ -93,57 +115,27 @@ tomo cron add --name "check" --schedule "every 2h" --message "Check email inbox"
 
 Tomo can also create jobs itself — just ask "remind me in 30 minutes to stretch."
 
-Jobs that find nothing to report reply silently (`NO_REPLY`) without messaging you.
+| Format | Type | Example |
+|--------|------|---------|
+| `in Xm/h/d` | One-shot | `in 30m`, `in 2h` |
+| `every Xm/h` | Recurring interval | `every 30m` |
+| Cron expression | Recurring (5-field) | `0 9 * * *` |
 
 ### Sessions
+
 - Multi-turn conversations via Claude Agent SDK session resume
 - Persistent across restarts
-- `/new` command in Telegram to start fresh
+- `/new` in Telegram to start fresh
 - Unlinked sessions kept for 30 days before cleanup
 
 ### Logging
-Structured logs via pino with:
+
+Structured logs via [pino](https://github.com/pinojs/pino):
 - Tool call summaries
 - Token usage and cost per message
 - Context window tracking with compaction warnings
 
-## Project Structure
-
-```
-src/
-  cli.ts                  # CLI entry point
-  cli/
-    init.ts               # tomo init (onboarding)
-    start.ts              # tomo start (foreground + daemon)
-    daemon.ts             # tomo stop/restart/status/logs
-    cron.ts               # tomo cron subcommands
-    sessions.ts           # tomo sessions subcommands
-  agent.ts                # Core agent — message handling, SDK integration
-  config.ts               # Configuration (~/.tomo/config.json)
-  logger.ts               # Pino structured logging
-  channels/
-    types.ts              # Channel interface
-    telegram.ts           # Telegram implementation (grammY)
-  sessions/
-    types.ts              # Session types and registry
-    store.ts              # Session persistence and lifecycle
-  cron/
-    types.ts              # Cron job data model
-    store.ts              # Job persistence and scheduling
-    scheduler.ts          # Timer loop and execution
-  workspace/
-    SOUL.md               # Default personality (dev)
-    AGENT.md              # Default operating rules (dev)
-    IDENTITY.md           # Default identity (dev)
-    index.ts              # System prompt builder
-defaults/                 # Templates copied by tomo init
-  SOUL.md
-  AGENT.md
-  IDENTITY.md
-  skills/cron/SKILL.md
-```
-
-## File Layout (after `tomo init`)
+## Architecture
 
 ```
 ~/.tomo/
@@ -153,9 +145,8 @@ defaults/                 # Templates copied by tomo init
     SOUL.md                   # Your personality config
     AGENT.md                  # Your operating rules
     IDENTITY.md               # Your identity config
-    memory/
-      MEMORY.md               # Memory index
-    .claude/skills/           # Skills for SDK discovery
+    memory/                   # Persistent memory files
+    .claude/skills/           # Agent skills
   data/
     cron/jobs.json            # Scheduled tasks
     sessions/                 # Transcript logs and session registry
@@ -183,16 +174,20 @@ Environment variables override config file values:
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
 | `CLAUDE_MODEL` | Override model |
 | `TOMO_WORKSPACE` | Override workspace directory |
-| `LOG_LEVEL` | Log level (default: debug) |
+| `LOG_LEVEL` | Log level (default: `debug`) |
 
 ## Development
 
 ```bash
-git clone <repo> && cd tomo
+git clone https://github.com/shuaiyuan17/tomo.git && cd tomo
 npm install
 npm run dev    # Foreground with hot reload
 ```
 
+## Contributing
+
+Issues and pull requests welcome at [github.com/shuaiyuan17/tomo](https://github.com/shuaiyuan17/tomo).
+
 ## License
 
-MIT
+[MIT](LICENSE)

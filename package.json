@@ -1,0 +1,49 @@
+{
+  "name": "tomo-ai",
+  "version": "0.1.0",
+  "description": "Personal assistant powered by Claude Agent SDK",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "tomo": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "defaults"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/cli.ts -- start",
+    "start": "node dist/cli.js start",
+    "tomo": "tsx src/cli.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "assistant",
+    "claude",
+    "telegram",
+    "chatbot",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.92",
+    "@clack/prompts": "^1.2.0",
+    "commander": "^13.1.0",
+    "croner": "^9.0.0",
+    "grammy": "^1.35.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "dotenv": "^16.4.7",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

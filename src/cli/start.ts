@@ -1,0 +1,95 @@
+import { Command } from "commander";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const TOMO_HOME = join(homedir(), ".tomo");
+const PID_FILE = join(TOMO_HOME, "tomo.pid");
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getRunningPid(): number | null {
+  if (!existsSync(PID_FILE)) return null;
+  const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
+  if (isNaN(pid) || !isRunning(pid)) {
+    unlinkSync(PID_FILE);
+    return null;
+  }
+  return pid;
+}
+
+export const startCommand = new Command("start")
+  .description("Start Tomo")
+  .option("-f, --foreground", "Run in foreground (default: background)")
+  .action(async (opts) => {
+    if (opts.foreground) {
+      return startForeground();
+    }
+    return startDaemon();
+  });
+
+async function startForeground(): Promise<void> {
+  const { Agent } = await import("../agent.js");
+  const { TelegramChannel } = await import("../channels/index.js");
+  const { config } = await import("../config.js");
+  const { CronScheduler } = await import("../cron/scheduler.js");
+
+  const agent = new Agent();
+  agent.addChannel(new TelegramChannel(config.telegramToken));
+
+  const scheduler = new CronScheduler(agent);
+
+  // Write PID so `tomo stop` can find us
+  writeFileSync(PID_FILE, String(process.pid));
+
+  const shutdown = async () => {
+    scheduler.stop();
+    await agent.stop();
+    try { unlinkSync(PID_FILE); } catch {}
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  await agent.start();
+  scheduler.start();
+}
+
+async function startDaemon(): Promise<void> {
+  const existing = getRunningPid();
+  if (existing) {
+    console.log(`Tomo is already running (PID ${existing})`);
+    process.exit(1);
+  }
+
+  const logFile = join(TOMO_HOME, "logs", "tomo.log");
+  const errFile = join(TOMO_HOME, "logs", "tomo.err");
+
+  const { openSync } = await import("node:fs");
+  const { mkdirSync: mkdirSyncFs } = await import("node:fs");
+  mkdirSyncFs(join(TOMO_HOME, "logs"), { recursive: true });
+  const errFd = openSync(errFile, "a");
+
+  // Re-run ourselves in foreground mode as a detached child
+  const child = spawn(process.execPath, [process.argv[1], "start", "--foreground"], {
+    detached: true,
+    stdio: ["ignore", "ignore", errFd],
+    env: {
+      ...process.env,
+      TOMO_LOG_FILE: logFile,
+    },
+  });
+
+  child.unref();
+  console.log(`Tomo started in background (PID ${child.pid})`);
+  console.log(`Logs: ${logFile}`);
+  process.exit(0);
+}

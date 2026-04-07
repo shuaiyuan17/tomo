@@ -1,0 +1,281 @@
+import { Command } from "commander";
+import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import { join, dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+import * as p from "@clack/prompts";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TOMO_HOME = join(homedir(), ".tomo");
+const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
+
+type Personality = {
+  agentName: string;
+  userName: string;
+  tone: "chill" | "sharp" | "warm";
+};
+
+const TONE_DESCRIPTIONS: Record<string, { vibe: string; style: string }> = {
+  chill: {
+    vibe: "Relaxed, casual, low-key. Like texting a smart friend who's always chill.",
+    style: "Lowercase is fine. Short replies. Emoji when it fits. Never formal.",
+  },
+  sharp: {
+    vibe: "Sharp, witty, slightly opinionated. Like a clever friend who has a take on everything but knows when to shut up.",
+    style: "Direct and concise. Has strong opinions. Dry humor. Doesn't sugarcoat.",
+  },
+  warm: {
+    vibe: "Warm, supportive, thoughtful. Like a kind friend who genuinely cares and pays attention.",
+    style: "Encouraging but honest. Takes time to understand. Gentle humor. Never dismissive.",
+  },
+};
+
+export const initCommand = new Command("init")
+  .description("Initialize Tomo — set up config and workspace")
+  .option("--force", "Overwrite existing config", false)
+  .action(async (opts) => {
+    p.intro("Welcome to Tomo");
+
+    const configPath = join(TOMO_HOME, "config.json");
+    const isReinit = existsSync(configPath) && !opts.force;
+
+    // 1. Prerequisites check (before anything else)
+    const s0 = p.spinner();
+    s0.start("Checking prerequisites");
+    const { execSync } = await import("node:child_process");
+    let claudeOk = false;
+    try {
+      const version = execSync("claude --version 2>/dev/null", { encoding: "utf-8" }).trim();
+      s0.stop(`Claude Code found (${version})`);
+
+      const s1 = p.spinner();
+      s1.start("Verifying Claude Code authentication");
+      try {
+        execSync('claude -p "say ok" --max-turns 1 2>/dev/null', {
+          encoding: "utf-8",
+          timeout: 30_000,
+        });
+        claudeOk = true;
+        s1.stop("Claude Code authenticated");
+      } catch {
+        s1.stop("Claude Code not authenticated");
+        p.log.error("Run `claude` in your terminal to log in, then try `tomo init` again.");
+        p.outro("Setup incomplete");
+        process.exit(1);
+      }
+    } catch {
+      s0.stop("Claude Code not found");
+      p.log.error("Claude Code is required. Install it: npm install -g @anthropic-ai/claude-code");
+      p.outro("Setup incomplete");
+      process.exit(1);
+    }
+
+    if (isReinit) {
+      p.log.info("Existing config found. Use --force to overwrite.");
+    }
+
+    // 2. Personalization
+    const personality = isReinit ? null : await askPersonality();
+    if (personality === null && !isReinit) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+
+    // 2. Directories
+    const s = p.spinner();
+    s.start("Creating directory structure");
+    const dirs = [
+      TOMO_HOME,
+      join(TOMO_HOME, "workspace"),
+      join(TOMO_HOME, "workspace", "memory"),
+      join(TOMO_HOME, "data", "cron"),
+      join(TOMO_HOME, "data", "sessions"),
+      join(TOMO_HOME, "logs"),
+    ];
+    for (const dir of dirs) {
+      mkdirSync(dir, { recursive: true });
+    }
+    s.stop("Directory structure ready");
+
+    // 3. Workspace templates
+    s.start("Setting up workspace");
+    const templates = ["SOUL.md", "AGENT.md", "IDENTITY.md"];
+    const copied: string[] = [];
+    for (const file of templates) {
+      const dest = join(TOMO_HOME, "workspace", file);
+      const src = join(DEFAULTS_DIR, file);
+      if ((!existsSync(dest) || opts.force) && existsSync(src)) {
+        let content = readFileSync(src, "utf-8");
+        if (personality) {
+          content = applyPersonality(file, content, personality);
+        }
+        writeFileSync(dest, content);
+        copied.push(file);
+      }
+    }
+
+    // Skills — write directly to .claude/skills/ with tomo- prefix
+    const skillsDir = join(DEFAULTS_DIR, "skills");
+    const claudeSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
+    if (existsSync(skillsDir)) {
+      for (const skill of readdirSync(skillsDir, { withFileTypes: true })) {
+        if (!skill.isDirectory()) continue;
+        const destDir = join(claudeSkillsDir, `tomo-${skill.name}`);
+        const destFile = join(destDir, "SKILL.md");
+        const srcFile = join(skillsDir, skill.name, "SKILL.md");
+        if ((!existsSync(destFile) || opts.force) && existsSync(srcFile)) {
+          mkdirSync(destDir, { recursive: true });
+          copyFileSync(srcFile, destFile);
+          copied.push(`skill/tomo-${skill.name}`);
+        }
+      }
+    }
+
+    // MEMORY.md with initial content
+    const memoryDir = join(TOMO_HOME, "workspace", "memory");
+    const memoryFile = join(memoryDir, "MEMORY.md");
+    if (!existsSync(memoryFile) || opts.force) {
+      if (personality) {
+        writeMemory(memoryDir, personality);
+        copied.push("MEMORY.md");
+      } else if (!existsSync(memoryFile)) {
+        writeFileSync(memoryFile, "");
+        copied.push("MEMORY.md");
+      }
+    }
+
+    if (copied.length > 0) {
+      s.stop(`Workspace ready (${copied.join(", ")})`);
+    } else {
+      s.stop("Workspace unchanged (files already exist)");
+    }
+
+    // 4. Configuration
+    if (!isReinit) {
+      const token = await p.text({
+        message: "Telegram bot token",
+        placeholder: "Paste token from @BotFather",
+        validate: (val) => {
+          if (!val?.trim()) return "Token is required. Get one from @BotFather on Telegram.";
+        },
+      });
+
+      if (p.isCancel(token)) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+
+      const model = await p.select({
+        message: "Default model",
+        options: [
+          { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "fast, recommended" },
+          { value: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "most capable" },
+          { value: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "cheapest" },
+        ],
+      });
+
+      if (p.isCancel(model)) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+
+      const config = {
+        channels: {
+          telegram: { token: token as string },
+        },
+        model,
+      };
+
+      writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+      p.log.success("Config saved");
+    }
+
+    // 5. Summary
+    const agentLabel = personality ? personality.agentName : "your assistant";
+    p.note(
+      [
+        `Personality:  ~/.tomo/workspace/SOUL.md`,
+        `Agent rules:  ~/.tomo/workspace/AGENT.md`,
+        `Identity:     ~/.tomo/workspace/IDENTITY.md`,
+        `Memory:       ~/.tomo/workspace/memory/`,
+        `Config:       ~/.tomo/config.json`,
+        `Logs:         ~/.tomo/logs/`,
+      ].join("\n"),
+      "Your files",
+    );
+
+    p.outro(`Run \`tomo start\` to meet ${agentLabel}!`);
+  });
+
+async function askPersonality(): Promise<Personality | null> {
+  const agentName = await p.text({
+    message: "What do you want to name your assistant?",
+    placeholder: "Tomo",
+    defaultValue: "Tomo",
+  });
+  if (p.isCancel(agentName)) return null;
+
+  const userName = await p.text({
+    message: "What should your assistant call you?",
+    placeholder: "Your name or nickname",
+  });
+  if (p.isCancel(userName)) return null;
+
+  const tone = await p.select({
+    message: "What tone should your assistant have?",
+    options: [
+      { value: "chill" as const, label: "Chill", hint: "relaxed, casual, like texting a friend" },
+      { value: "sharp" as const, label: "Sharp", hint: "witty, opinionated, direct" },
+      { value: "warm" as const, label: "Warm", hint: "supportive, thoughtful, encouraging" },
+    ],
+  });
+  if (p.isCancel(tone)) return null;
+
+  return {
+    agentName: (agentName as string).trim() || "Tomo",
+    userName: (userName as string).trim(),
+    tone: tone as Personality["tone"],
+  };
+}
+
+function applyPersonality(file: string, content: string, p: Personality): string {
+  // Replace "Tomo" with the chosen agent name in all templates
+  if (p.agentName !== "Tomo") {
+    content = content.replace(/\bTomo\b/g, p.agentName);
+  }
+
+  if (file === "IDENTITY.md") {
+    const tone = TONE_DESCRIPTIONS[p.tone];
+    content = content.replace(
+      /\*\*Vibe:\*\*.*/,
+      `**Vibe:** ${tone.vibe}`,
+    );
+    content = content.replace(
+      /\*\*Energy:\*\*.*/,
+      `**Energy:** ${tone.style}`,
+    );
+  }
+
+  return content;
+}
+
+function writeMemory(memoryDir: string, personality: Personality): void {
+  // User profile memory
+  const profileContent = [
+    "---",
+    "name: user-profile",
+    `description: Key facts about ${personality.userName}`,
+    "type: user",
+    "---",
+    "",
+    `Name: ${personality.userName}`,
+    `Preferred name to use: ${personality.userName}`,
+    `Set up ${personality.agentName} on ${new Date().toISOString().split("T")[0]}.`,
+    "",
+  ].join("\n");
+  writeFileSync(join(memoryDir, "user_profile.md"), profileContent);
+
+  // MEMORY.md index
+  const index = `- [User profile](user_profile.md) — ${personality.userName}'s preferences and info\n`;
+  writeFileSync(join(memoryDir, "MEMORY.md"), index);
+}

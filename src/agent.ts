@@ -168,7 +168,8 @@ export class Agent {
       const stampedText = this.injectTimestamp(textForAgent);
       const stream = channel.createStreamingMessage(message.chatId, message.id);
       const response = await this.run(key, stampedText, message.images, false, (text) => {
-        stream.update(text);
+        // Strip MEDIA: tags from streaming output so they don't flash in chat
+        stream.update(text.replace(MEDIA_RE, "").trim());
       });
       stopTyping();
 

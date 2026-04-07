@@ -214,19 +214,46 @@ class LiveSession {
     );
   }
 
-  async send(text: string, onText?: (text: string) => void): Promise<string> {
+  async send(text: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
+    const TIMEOUT_MS = 5 * 60 * 1000; // 5 minute timeout
+
+    // Build content blocks
+    type ImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+    const content: Array<Record<string, unknown>> = [];
+    if (images && images.length > 0) {
+      for (const img of images) {
+        content.push({
+          type: "image",
+          source: { type: "base64", media_type: img.mediaType as ImageMediaType, data: img.data },
+        });
+      }
+    }
+    content.push({ type: "text", text });
+
     return new Promise<string>((resolve, reject) => {
-      this.currentRequest = { message: { type: "user", message: { role: "user", content: [{ type: "text", text }] }, parent_tool_use_id: null }, onText, resolve, reject };
+      const timer = setTimeout(() => {
+        this.currentRequest = null;
+        reject(new Error("Query timed out after 5 minutes"));
+      }, TIMEOUT_MS);
+
+      const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
+      const wrappedReject = (err: Error) => { clearTimeout(timer); reject(err); };
+
+      this.currentRequest = {
+        message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
+        onText,
+        resolve: wrappedResolve,
+        reject: wrappedReject,
+      };
       this.parts = [];
       this.streamingText = "";
 
-      // Feed the message to the generator
-      if (this.pendingMessage) {
+      if (this.pendingMessage && this.currentRequest) {
         this.pendingMessage(this.currentRequest.message);
       } else {
-        reject(new Error("Session not ready to receive messages"));
+        wrappedReject(new Error("Session not ready to receive messages"));
       }
     });
   }
@@ -399,14 +426,11 @@ export class Agent {
 
     try {
       const stampedText = this.injectTimestamp(textForAgent);
-      const prompt = hasImages
-        ? `[User sent an image${stampedText !== "[Sent an image]" ? ` with caption: ${stampedText}` : ""}]`
-        : stampedText;
 
       const stream = channel.createStreamingMessage(message.chatId, message.id);
-      const response = await this.runWithRetry(key, prompt, (text) => {
+      const response = await this.runWithRetry(key, stampedText, (text) => {
         stream.update(text.replace(MEDIA_RE, "").trim());
-      });
+      }, message.images);
       stopTyping();
 
       this.sessions.append(key, {
@@ -454,10 +478,10 @@ export class Agent {
     }
   }
 
-  private async runWithRetry(key: string, prompt: string, onText?: (text: string) => void): Promise<string> {
+  private async runWithRetry(key: string, prompt: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
     try {
       const session = this.getOrCreateLiveSession(key);
-      const response = await session.send(prompt, onText);
+      const response = await session.send(prompt, onText, images);
 
       // Capture session ID if new
       const sid = session.getSessionId();
@@ -487,7 +511,7 @@ export class Agent {
         this.sessions.clearSdkSessionId(key);
 
         const session = this.getOrCreateLiveSession(key);
-        return session.send(prompt, onText);
+        return session.send(prompt, onText, images);
       }
 
       throw err;

@@ -5,9 +5,7 @@ description: Create, list, and remove scheduled tasks (reminders, recurring jobs
 
 # Scheduled Tasks
 
-> **Prefer MCP tools over CLI.** Use the `cron_add`, `cron_list`, and `cron_remove` MCP tools directly — they are faster and don't require a subprocess. Only fall back to the CLI below if the MCP tools are unavailable.
-
-Manage scheduled tasks using the `tomo` CLI via Bash (fallback only).
+Manage scheduled tasks using the `tomo` CLI via Bash.
 
 ## Create a one-shot reminder
 

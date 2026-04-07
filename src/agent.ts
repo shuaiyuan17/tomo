@@ -1,10 +1,8 @@
-import { query, createSdkMcpServer, tool, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { z } from "zod";
+import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
-import { CronStore, parseScheduleString } from "./cron/store.js";
 import { log } from "./logger.js";
 
 function isSilentReply(text: string): boolean {
@@ -22,7 +20,7 @@ function extractMedia(text: string): { cleanText: string; mediaPaths: string[] }
   return { cleanText, mediaPaths };
 }
 
-function sdkOptions(harnessMcpServer: ReturnType<typeof createSdkMcpServer>, resumeSessionId?: string, model?: string) {
+function sdkOptions(resumeSessionId?: string, model?: string) {
   return {
     model: model ?? config.model,
     cwd: config.workspaceDir,
@@ -36,7 +34,6 @@ function sdkOptions(harnessMcpServer: ReturnType<typeof createSdkMcpServer>, res
     settingSources: ["project"] as ("project")[],
     includePartialMessages: true,
     maxTurns: 30,
-    mcpServers: { "tomo-harness": harnessMcpServer },
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
   };
 }
@@ -299,93 +296,9 @@ export class Agent {
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
-  private cronStore: CronStore;
-  private activeDelivery: { channel: Channel; chatId: string } | null = null;
-  private harnessMcpServer: ReturnType<typeof createSdkMcpServer>;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
-    this.cronStore = new CronStore();
-    this.harnessMcpServer = this.buildHarnessMcpServer();
-  }
-
-  private buildHarnessMcpServer(): ReturnType<typeof createSdkMcpServer> {
-    return createSdkMcpServer({
-      name: "tomo-harness",
-      tools: [
-        tool(
-          "send_message",
-          "Send a message to the user immediately, mid-task. Use this during long-running tasks to provide progress updates or ask questions without waiting for the full turn to complete. After using this tool, reply NO_REPLY at the end if you have nothing further to add.",
-          { text: z.string().describe("The message text to send to the user") },
-          async ({ text }) => {
-            const delivery = this.activeDelivery;
-            if (!delivery) {
-              return { content: [{ type: "text" as const, text: "No active session to deliver to" }] };
-            }
-            try {
-              await delivery.channel.send({ chatId: delivery.chatId, text });
-              log.info({ channel: delivery.channel.name }, "send_message tool: %s", text.slice(0, 80));
-              return { content: [{ type: "text" as const, text: "sent" }] };
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              return { content: [{ type: "text" as const, text: `Failed to send: ${msg}` }] };
-            }
-          },
-        ),
-
-        tool(
-          "cron_add",
-          "Schedule a task to run at a future time or on a recurring schedule. Returns the job ID.",
-          {
-            name: z.string().describe("Short descriptive name for the task"),
-            schedule: z.string().describe('When to run: "in 20m", "in 2h", "in 1d", "every 30m", "every 1h", ISO-8601 datetime, or a cron expression'),
-            message: z.string().describe("The message/prompt to send when the task fires"),
-          },
-          async ({ name, schedule, message }) => {
-            try {
-              const parsed = parseScheduleString(schedule);
-              const job = this.cronStore.add({ name, schedule: parsed, message });
-              log.info({ jobId: job.id, name, schedule }, "cron_add via MCP");
-              return { content: [{ type: "text" as const, text: `Scheduled "${name}" (id: ${job.id}). Next run: ${job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "unknown"}` }] };
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              return { content: [{ type: "text" as const, text: `Failed to schedule: ${msg}` }] };
-            }
-          },
-        ),
-
-        tool(
-          "cron_list",
-          "List all scheduled tasks.",
-          {},
-          async () => {
-            const jobs = this.cronStore.list();
-            if (jobs.length === 0) {
-              return { content: [{ type: "text" as const, text: "No scheduled tasks." }] };
-            }
-            const lines = jobs.map((j) => {
-              const next = j.nextRunAt ? new Date(j.nextRunAt).toLocaleString() : "disabled";
-              return `• [${j.id}] "${j.name}" — next: ${next} | message: ${j.message.slice(0, 60)}`;
-            });
-            return { content: [{ type: "text" as const, text: lines.join("\n") }] };
-          },
-        ),
-
-        tool(
-          "cron_remove",
-          "Remove a scheduled task by its ID.",
-          { id: z.string().describe("The job ID to remove (from cron_list)") },
-          async ({ id }) => {
-            const removed = this.cronStore.remove(id);
-            if (removed) {
-              log.info({ jobId: id }, "cron_remove via MCP");
-              return { content: [{ type: "text" as const, text: `Removed job ${id}` }] };
-            }
-            return { content: [{ type: "text" as const, text: `No job found with id: ${id}` }] };
-          },
-        ),
-      ],
-    });
   }
 
   addChannel(channel: Channel): void {
@@ -455,7 +368,7 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
-    const opts = sdkOptions(this.harnessMcpServer, resumeId ?? undefined, model);
+    const opts = sdkOptions(resumeId ?? undefined, model);
 
     session = new LiveSession(opts);
     this.liveSessions.set(key, session);
@@ -509,7 +422,6 @@ export class Agent {
       return;
     }
 
-    this.activeDelivery = { channel, chatId: message.chatId };
     const stopTyping = channel.startTyping(message.chatId);
 
     try {
@@ -563,8 +475,6 @@ export class Agent {
         text: "Sorry, something went wrong. Please try again.",
         replyTo: message.id,
       });
-    } finally {
-      this.activeDelivery = null;
     }
   }
 
@@ -667,7 +577,6 @@ export class Agent {
 
     log.info({ channel: channel.name, sender: "cron" }, message);
 
-    this.activeDelivery = { channel, chatId: targetChatId };
     const stopTyping = channel.startTyping(targetChatId);
 
     try {
@@ -692,8 +601,6 @@ export class Agent {
     } catch (err) {
       stopTyping();
       log.error({ err }, "Cron message handling failed");
-    } finally {
-      this.activeDelivery = null;
     }
   }
 

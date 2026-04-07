@@ -194,12 +194,25 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
-      const config = {
+      const city = await p.text({
+        message: "Your city (for weather in continuity)",
+        placeholder: "e.g., Seattle, Tokyo, Los Angeles (use full name, leave empty to skip)",
+      });
+
+      if (p.isCancel(city)) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+
+      const config: Record<string, unknown> = {
         channels: {
           telegram: { token: token as string },
         },
         model,
       };
+      if ((city as string)?.trim()) {
+        config.city = (city as string).trim();
+      }
 
       writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
       p.log.success("Config saved");

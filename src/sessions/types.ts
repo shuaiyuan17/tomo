@@ -13,6 +13,25 @@ export interface Session {
   updatedAt: number;
 }
 
+export interface SessionStats {
+  /** Total number of queries in this session */
+  totalQueries: number;
+  /** Cumulative cost in USD */
+  totalCostUsd: number;
+  /** Cumulative input tokens */
+  totalInputTokens: number;
+  /** Cumulative output tokens */
+  totalOutputTokens: number;
+  /** Cumulative cache read tokens */
+  totalCacheReadTokens: number;
+  /** Cumulative cache creation tokens */
+  totalCacheCreationTokens: number;
+  /** Current context window usage */
+  contextUsed: number;
+  /** Context window max */
+  contextMax: number;
+}
+
 export interface SessionEntry {
   /** SDK session ID (UUID) */
   sdkSessionId: string;
@@ -26,6 +45,8 @@ export interface SessionEntry {
   unlinkedAt: number | null;
   /** When this session should be deleted (unlinkedAt + TTL). Null if active. */
   expiresAt: number | null;
+  /** Cumulative session statistics */
+  stats: SessionStats;
 }
 
 export interface SessionRegistry {

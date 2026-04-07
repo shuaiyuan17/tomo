@@ -14,6 +14,8 @@ interface TomoConfig {
   historyLimit: number;
   logsDir: string;
   tomoHome: string;
+  continuity: boolean;
+  city: string | null;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -48,6 +50,8 @@ function buildConfig(): TomoConfig {
     historyLimit: Number(process.env.HISTORY_LIMIT ?? "20"),
     logsDir: join(TOMO_HOME, "logs"),
     tomoHome: TOMO_HOME,
+    continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
+    city: (process.env.TOMO_CITY ?? file.city ?? null) as string | null,
   };
 }
 

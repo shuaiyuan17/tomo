@@ -1,6 +1,6 @@
 {
   "name": "tomo-ai",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Personal assistant powered by Claude Agent SDK",
   "type": "module",
   "main": "dist/index.js",
@@ -19,7 +19,7 @@
     "test": "vitest run",
     "lint": "eslint src/ tests/",
     "prepublishOnly": "npm run build",
-    "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  Get started:\n    tomo init       Set up your assistant\n    tomo start      Run in background\n    tomo --help     See all commands\n'"
+    "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  First time?  tomo init\n  Start:       tomo start\n  Upgraded?    tomo restart\n  Help:        tomo --help\n'"
   },
   "keywords": [
     "ai",

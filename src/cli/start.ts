@@ -46,18 +46,39 @@ async function startForeground(): Promise<void> {
   const { mkdirSync } = await import("node:fs");
   mkdirSync(join(TOMO_HOME, "workspace", "tmp"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "workspace", "memory"), { recursive: true });
+  mkdirSync(join(TOMO_HOME, "workspace", "memory", "journal"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "data", "cron"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "logs"), { recursive: true });
+
+  // Copy CONTINUITY.md if missing
+  const { copyFileSync, existsSync: fileExists } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  const { dirname: dirnameFn } = await import("node:path");
+  const { fileURLToPath: fileUrlFn } = await import("node:url");
+  const __dirname = dirnameFn(fileUrlFn(import.meta.url));
+  const continuityDest = join(TOMO_HOME, "workspace", "CONTINUITY.md");
+  const continuitySrc = resolve(__dirname, "../../defaults/CONTINUITY.md");
+  if (!fileExists(continuityDest) && fileExists(continuitySrc)) {
+    copyFileSync(continuitySrc, continuityDest);
+  }
 
   const agent = new Agent();
   agent.addChannel(new TelegramChannel(config.telegramToken));
 
   const scheduler = new CronScheduler(agent);
 
+  // Start continuity runner if enabled
+  const { ContinuityRunner } = await import("../continuity.js");
+  const continuity = new ContinuityRunner(agent, config.city);
+  if (config.continuity) {
+    continuity.start();
+  }
+
   // Write PID so `tomo stop` can find us
   writeFileSync(PID_FILE, String(process.pid));
 
   const shutdown = async () => {
+    continuity.stop();
     scheduler.stop();
     await agent.stop();
     try { unlinkSync(PID_FILE); } catch { /* ignore */ }

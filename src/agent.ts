@@ -1,4 +1,4 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -28,18 +28,8 @@ function sdkOptions(resumeSessionId?: string, model?: string) {
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
     allowedTools: [
-      "Read",
-      "Write",
-      "Edit",
-      "Bash",
-      "Glob",
-      "Grep",
-      "WebSearch",
-      "WebFetch",
-      "Agent",
-      "NotebookEdit",
-      "TodoWrite",
-      "Skill",
+      "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+      "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite", "Skill",
     ],
     settingSources: ["project"] as ("project")[],
     includePartialMessages: true,
@@ -48,12 +38,235 @@ function sdkOptions(resumeSessionId?: string, model?: string) {
   };
 }
 
+// --- Live Session (streaming input mode) ---
+
+interface MessageRequest {
+  message: SDKUserMessage;
+  onText?: (text: string) => void;
+  resolve: (response: string) => void;
+  reject: (err: Error) => void;
+}
+
+interface QueryResult {
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  contextUsed: number;
+  contextMax: number;
+}
+
+class LiveSession {
+  private q: Query;
+  private pendingMessage: ((msg: SDKUserMessage) => void) | null = null;
+  private currentRequest: MessageRequest | null = null;
+  private parts: string[] = [];
+  private streamingText = "";
+  private sessionId: string | null = null;
+  private alive = true;
+  lastResult: QueryResult | null = null;
+  private eventLoopDone: Promise<void>;
+
+  constructor(options: ReturnType<typeof sdkOptions>) {
+    this.q = query({ prompt: this.messageGenerator(), options });
+    this.eventLoopDone = this.consumeEvents();
+  }
+
+  private async *messageGenerator(): AsyncGenerator<SDKUserMessage> {
+    while (this.alive) {
+      const msg = await new Promise<SDKUserMessage>((resolve) => {
+        this.pendingMessage = resolve;
+      });
+      this.pendingMessage = null;
+      yield msg;
+    }
+  }
+
+  private async consumeEvents(): Promise<void> {
+    try {
+      for await (const event of this.q) {
+        await this.handleEvent(event);
+      }
+    } catch (err) {
+      // If there's a pending request, reject it
+      if (this.currentRequest) {
+        this.currentRequest.reject(err instanceof Error ? err : new Error(String(err)));
+        this.currentRequest = null;
+      }
+    }
+    this.alive = false;
+  }
+
+  private async handleEvent(event: SDKMessage): Promise<void> {
+    const req = this.currentRequest;
+
+    if (event.type === "stream_event") {
+      const se = event as unknown as { event: { type: string; delta?: { type: string; text?: string } } };
+      if (se.event?.type === "content_block_delta" && se.event.delta?.type === "text_delta" && se.event.delta.text) {
+        this.streamingText += se.event.delta.text;
+        req?.onText?.(this.streamingText);
+      }
+    }
+
+    if (event.type === "assistant" && event.message?.content) {
+      this.streamingText = "";
+      for (const block of event.message.content) {
+        if ("text" in block) {
+          this.parts.push(block.text);
+        } else if ("type" in block && block.type === "tool_use") {
+          const tool = block as { name: string; input?: Record<string, unknown> };
+          log.info({ tool: tool.name }, summarizeToolInput(tool.name, tool.input));
+        }
+      }
+    }
+
+    if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
+      const compact = event as { compact_metadata?: { pre_tokens?: number; post_tokens?: number } };
+      log.info(
+        { pre: compact.compact_metadata?.pre_tokens, post: compact.compact_metadata?.post_tokens },
+        "Context compacted",
+      );
+    }
+
+    if (event.type === "tool_use_summary") {
+      log.debug((event as { summary: string }).summary);
+    }
+
+    if (event.type === "result") {
+      const result = event as unknown as {
+        subtype: string;
+        num_turns?: number;
+        duration_ms?: number;
+        total_cost_usd?: number;
+        usage?: Record<string, unknown>;
+        session_id?: string;
+      };
+
+      if (result.session_id) {
+        this.sessionId = result.session_id;
+      }
+
+      const u = result.usage as Record<string, number> | undefined;
+      const input = u?.input_tokens ?? 0;
+      const output = u?.output_tokens ?? 0;
+      const cacheRead = u?.cache_read_input_tokens ?? 0;
+      const cacheCreated = u?.cache_creation_input_tokens ?? 0;
+
+      // Store result stats, get context usage, then resolve
+      this.lastResult = {
+        costUsd: result.total_cost_usd ?? 0,
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: cacheRead,
+        cacheCreationTokens: cacheCreated,
+        contextUsed: 0,
+        contextMax: 0,
+      };
+
+      // Await context usage before resolving so stats are complete
+      await this.logContextUsage(result, input, output, cacheRead, cacheCreated);
+
+      const response = this.parts.join("\n").trim() || "I'm not sure how to respond to that.";
+      this.parts = [];
+      this.streamingText = "";
+      req?.resolve(response);
+      this.currentRequest = null;
+    }
+  }
+
+  private async logContextUsage(
+    result: { subtype: string; num_turns?: number; duration_ms?: number; total_cost_usd?: number },
+    input: number, output: number, cacheRead: number, cacheCreated: number,
+  ): Promise<void> {
+    const contextInfo = await (async () => {
+      try {
+        const ctx = await this.q.getContextUsage();
+        const pct = Math.round(ctx.percentage);
+        if (this.lastResult) {
+          this.lastResult.contextUsed = ctx.totalTokens;
+          this.lastResult.contextMax = ctx.maxTokens;
+        }
+        if (pct >= 80) {
+          log.warn({ used: ctx.totalTokens, max: ctx.maxTokens, pct: `${pct}%` }, "Context nearing compaction");
+        }
+        return `${ctx.totalTokens}/${ctx.maxTokens} (${pct}%)`;
+      } catch {
+        const approx = input + cacheRead + cacheCreated;
+        if (this.lastResult) {
+          this.lastResult.contextUsed = approx;
+          this.lastResult.contextMax = 200_000;
+        }
+        return `~${approx}/200000`;
+      }
+    })();
+
+    log.info(
+      {
+        turns: result.num_turns,
+        duration: `${result.duration_ms}ms`,
+        cost: `$${result.total_cost_usd?.toFixed(4)}`,
+        tokens: `in:${input} out:${output}`,
+        cache: `read:${cacheRead} created:${cacheCreated}`,
+        context: contextInfo,
+      },
+      "Run completed (%s)", result.subtype,
+    );
+  }
+
+  async send(text: string, onText?: (text: string) => void): Promise<string> {
+    if (!this.alive) throw new Error("Session is closed");
+
+    return new Promise<string>((resolve, reject) => {
+      this.currentRequest = { message: { type: "user", message: { role: "user", content: [{ type: "text", text }] }, parent_tool_use_id: null }, onText, resolve, reject };
+      this.parts = [];
+      this.streamingText = "";
+
+      // Feed the message to the generator
+      if (this.pendingMessage) {
+        this.pendingMessage(this.currentRequest.message);
+      } else {
+        reject(new Error("Session not ready to receive messages"));
+      }
+    });
+  }
+
+  getSessionId(): string | null {
+    return this.sessionId;
+  }
+
+  isAlive(): boolean {
+    return this.alive;
+  }
+
+  close(): void {
+    this.alive = false;
+    this.q.return(undefined);
+  }
+}
+
+// --- Agent ---
+
+function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
+  if (!input) return name;
+  switch (name) {
+    case "Read": return `Read ${input.file_path}`;
+    case "Write": return `Write ${input.file_path}`;
+    case "Edit": return `Edit ${input.file_path}`;
+    case "Bash": return `Bash: ${String(input.command).slice(0, 80)}`;
+    case "Glob": return `Glob ${input.pattern}`;
+    case "Grep": return `Grep "${input.pattern}"`;
+    case "WebSearch": return `WebSearch: ${input.query}`;
+    case "WebFetch": return `WebFetch: ${input.url}`;
+    default: return `${name}: ${JSON.stringify(input).slice(0, 100)}`;
+  }
+}
+
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
-  /** Tracks known participants per group session */
+  private liveSessions = new Map<string, LiveSession>();
   private groupParticipants = new Map<string, Set<string>>();
-  /** Per-chat model override */
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
 
@@ -77,6 +290,7 @@ export class Agent {
     const key = this.sessionKey(channel, chatId);
 
     if (command === "new") {
+      this.closeLiveSession(key);
       this.sessions.clearSdkSessionId(key);
       log.info({ channel: channel.name, chatId, sender: senderName }, "New session started via /new");
       await channel.send({ chatId, text: "New session started." });
@@ -85,7 +299,6 @@ export class Agent {
 
     if (command === "model") {
       const arg = args?.trim().toLowerCase();
-
       if (!arg) {
         const current = this.modelOverrides.get(key) ?? config.model;
         const lines = [`Current: ${current}`, "", "Switch with: /model <name>", ""];
@@ -99,6 +312,8 @@ export class Agent {
 
       const resolved = Agent.AVAILABLE_MODELS[arg] ?? arg;
       this.modelOverrides.set(key, resolved);
+      // Model change requires new session (process uses one model)
+      this.closeLiveSession(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `Switched to ${resolved}` });
       return;
@@ -109,15 +324,37 @@ export class Agent {
     return `${channel.name}:${chatId}`;
   }
 
-  private checkPromptChanged(): boolean {
+  private getOrCreateLiveSession(key: string): LiveSession {
+    let session = this.liveSessions.get(key);
+    if (session?.isAlive()) return session;
+
+    // Check prompt changes
     const currentHash = this.hashString(buildSystemPrompt());
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
-      log.info("System prompt changed, new sessions will use updated prompt");
-      this.lastPromptHash = currentHash;
-      return true;
+      log.info("System prompt changed, creating new sessions");
+      for (const [k, s] of this.liveSessions) {
+        s.close();
+        this.liveSessions.delete(k);
+      }
     }
     this.lastPromptHash = currentHash;
-    return false;
+
+    const resumeId = this.sessions.getSdkSessionId(key);
+    const model = this.modelOverrides.get(key);
+    const opts = sdkOptions(resumeId ?? undefined, model);
+
+    session = new LiveSession(opts);
+    this.liveSessions.set(key, session);
+    log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
+    return session;
+  }
+
+  private closeLiveSession(key: string): void {
+    const session = this.liveSessions.get(key);
+    if (session) {
+      session.close();
+      this.liveSessions.delete(key);
+    }
   }
 
   private hashString(s: string): string {
@@ -139,11 +376,8 @@ export class Agent {
     );
 
     const key = this.sessionKey(channel, message.chatId);
-
-    // In groups, prefix with sender name so the agent knows who's talking
     const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
 
-    // Track group participants and inject context when needed
     if (isGroup) {
       await this.updateGroupContext(key, message.senderName, message.chatTitle);
     }
@@ -156,7 +390,6 @@ export class Agent {
       timestamp: message.timestamp,
     });
 
-    // In groups, only respond when mentioned or replied to
     if (isGroup && !isMentioned) {
       log.debug("Group message ignored (not mentioned)");
       return;
@@ -166,9 +399,12 @@ export class Agent {
 
     try {
       const stampedText = this.injectTimestamp(textForAgent);
+      const prompt = hasImages
+        ? `[User sent an image${stampedText !== "[Sent an image]" ? ` with caption: ${stampedText}` : ""}]`
+        : stampedText;
+
       const stream = channel.createStreamingMessage(message.chatId, message.id);
-      const response = await this.run(key, stampedText, message.images, false, (text) => {
-        // Strip MEDIA: tags from streaming output so they don't flash in chat
+      const response = await this.runWithRetry(key, prompt, (text) => {
         stream.update(text.replace(MEDIA_RE, "").trim());
       });
       stopTyping();
@@ -192,9 +428,7 @@ export class Agent {
       if (mediaPaths.length > 0) {
         const { existsSync: fileExists } = await import("node:fs");
         const validPaths = mediaPaths.filter((p) => fileExists(p));
-
         if (validPaths.length > 0) {
-          // Send first media with text as caption, rest without
           for (let i = 0; i < validPaths.length; i++) {
             await channel.send({
               chatId: message.chatId,
@@ -203,7 +437,6 @@ export class Agent {
             });
           }
         } else {
-          // No valid files — fall back to text
           stream.update(cleanText);
           await stream.finish();
         }
@@ -221,128 +454,42 @@ export class Agent {
     }
   }
 
-  private async run(sessionKey: string, userMessage: string, images?: import("./channels/types.js").ImageAttachment[], isRetry = false, onText?: (fullText: string) => void): Promise<string> {
-    this.checkPromptChanged();
-
-    const resumeId = this.sessions.getSdkSessionId(sessionKey);
-    const model = this.modelOverrides.get(sessionKey);
-    const opts = sdkOptions(resumeId ?? undefined, model);
-    const parts: string[] = [];
-    let streamingText = "";
-
-    // For images, prepend image description request
-    // V1 query() only takes string prompt, not content blocks
-    // TODO: support multimodal via raw API if needed
-    const prompt = images && images.length > 0
-      ? `[User sent an image${userMessage !== "[Sent an image]" ? ` with caption: ${userMessage}` : ""}]`
-      : userMessage;
-
-    log.debug({ sessionKey, resume: !!resumeId, model: opts.model }, "Running query");
-
+  private async runWithRetry(key: string, prompt: string, onText?: (text: string) => void): Promise<string> {
     try {
-      for await (const event of query({ prompt, options: opts })) {
-        // Handle streaming text deltas
-        if (event.type === "stream_event") {
-          const streamEvent = event as unknown as { event: { type: string; delta?: { type: string; text?: string } } };
-          if (streamEvent.event?.type === "content_block_delta" && streamEvent.event.delta?.type === "text_delta" && streamEvent.event.delta.text) {
-            streamingText += streamEvent.event.delta.text;
-            onText?.(streamingText);
-          }
-        }
+      const session = this.getOrCreateLiveSession(key);
+      const response = await session.send(prompt, onText);
 
-        if (event.type === "assistant" && event.message?.content) {
-          // Reset streaming text — the full message replaces deltas
-          streamingText = "";
-          for (const block of event.message.content) {
-            if ("text" in block) {
-              parts.push(block.text);
-            } else if ("type" in block && block.type === "tool_use") {
-              const tool = block as { name: string; input?: Record<string, unknown> };
-              const summary = this.summarizeToolInput(tool.name, tool.input);
-              log.info({ tool: tool.name }, summary);
-            }
-          }
-        }
-        if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
-          const compact = event as { compact_metadata?: { pre_tokens?: number; post_tokens?: number } };
-          log.info(
-            { pre: compact.compact_metadata?.pre_tokens, post: compact.compact_metadata?.post_tokens },
-            "Context compacted",
-          );
-        }
-        if (event.type === "tool_use_summary") {
-          log.debug((event as { summary: string }).summary);
-        }
-        if (event.type === "result") {
-          const result = event as unknown as {
-            subtype: string;
-            num_turns?: number;
-            duration_ms?: number;
-            total_cost_usd?: number;
-            usage?: Record<string, unknown>;
-            session_id?: string;
-            modelUsage?: Record<string, { inputTokens: number; outputTokens: number; contextWindow: number }>;
-          };
-
-          // Capture session ID for future resume
-          if (result.session_id) {
-            if (!this.sessions.getSdkSessionId(sessionKey)) {
-              this.sessions.setSdkSessionId(sessionKey, result.session_id);
-              log.info({ sessionId: result.session_id, key: sessionKey }, "Session ID captured");
-            } else {
-              this.sessions.touchSession(sessionKey);
-            }
-          }
-
-          const u = result.usage as Record<string, number> | undefined;
-          const input = u?.input_tokens ?? 0;
-          const output = u?.output_tokens ?? 0;
-          const cacheRead = u?.cache_read_input_tokens ?? 0;
-          const cacheCreated = u?.cache_creation_input_tokens ?? 0;
-          const model = result.modelUsage ? Object.values(result.modelUsage)[0] : undefined;
-          const contextWindow = model?.contextWindow ?? 0;
-          const used = (model?.inputTokens ?? 0) + (model?.outputTokens ?? 0);
-          const remaining = contextWindow - used;
-          const usage_pct = contextWindow > 0 ? Math.round((used / contextWindow) * 100) : 0;
-
-          if (contextWindow > 0 && used >= contextWindow * 0.8) {
-            log.warn(
-              { used, contextWindow, pct: `${usage_pct}%` },
-              "Context nearing compaction threshold",
-            );
-          }
-
-          log.info(
-            {
-              turns: result.num_turns,
-              duration: `${result.duration_ms}ms`,
-              cost: `$${result.total_cost_usd?.toFixed(4)}`,
-              tokens: `in:${input} out:${output}`,
-              cache: `read:${cacheRead} created:${cacheCreated}`,
-              context: `${used}/${contextWindow} (${remaining} remaining, ${usage_pct}%)`,
-            },
-            "Run completed (%s)", result.subtype,
-          );
-        }
+      // Capture session ID if new
+      const sid = session.getSessionId();
+      if (sid && !this.sessions.getSdkSessionId(key)) {
+        this.sessions.setSdkSessionId(key, sid);
+        log.info({ sessionId: sid, key }, "Session ID captured");
       }
 
-      return parts.join("\n").trim() || "I'm not sure how to respond to that.";
+      // Save stats
+      if (session.lastResult) {
+        this.sessions.updateStats(key, session.lastResult);
+      }
+
+      return response;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "";
-      const isSessionError = errMsg.includes("No conversation found") || errMsg.includes("session");
-      const isMaxTurns = errMsg.includes("maximum number of turns");
 
-      if (isMaxTurns) {
-        // Max turns is not a session error — return whatever we have so far
+      if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
-        return parts.join("\n").trim() || "I ran out of steps trying to complete that. Can you try a simpler request?";
+        return "I ran out of steps trying to complete that. Can you try a simpler request?";
       }
 
-      if (!isRetry && resumeId && isSessionError) {
+      // Session error — reset and retry once
+      if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
         log.warn({ err }, "Session error, resetting and retrying");
-        this.sessions.clearSdkSessionId(sessionKey);
-        return this.run(sessionKey, userMessage, images, true, onText);
+        this.closeLiveSession(key);
+        this.sessions.clearSdkSessionId(key);
+
+        const session = this.getOrCreateLiveSession(key);
+        return session.send(prompt, onText);
       }
+
       throw err;
     }
   }
@@ -359,24 +506,17 @@ export class Agent {
     const wasKnown = participants.has(senderName);
     participants.add(senderName);
 
-    // Send context message on first group message or when a new participant appears
     if (isNew || !wasKnown) {
       const names = [...participants].join(", ");
       const title = chatTitle ? `"${chatTitle}"` : "a group chat";
       const contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
 
-      // Inject as a query so it becomes part of the session history
-      const resumeId = this.sessions.getSdkSessionId(key);
-      const opts = sdkOptions(resumeId ?? undefined);
-      for await (const event of query({ prompt: contextMsg, options: { ...opts, maxTurns: 3 } })) {
-        if (event.type === "result") {
-          const result = event as unknown as { session_id?: string };
-          if (result.session_id && !this.sessions.getSdkSessionId(key)) {
-            this.sessions.setSdkSessionId(key, result.session_id);
-          }
-        }
+      try {
+        await this.runWithRetry(key, contextMsg);
+        log.info({ group: chatTitle, participants: names }, "Group context updated");
+      } catch (err) {
+        log.warn({ err }, "Failed to inject group context");
       }
-      log.info({ group: chatTitle, participants: names }, "Group context updated");
     }
   }
 
@@ -389,21 +529,6 @@ export class Agent {
     const time = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
     const tz = now.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
     return `[${weekday} ${date} ${time} ${tz}] ${text}`;
-  }
-
-  private summarizeToolInput(name: string, input?: Record<string, unknown>): string {
-    if (!input) return name;
-    switch (name) {
-      case "Read": return `Read ${input.file_path}`;
-      case "Write": return `Write ${input.file_path}`;
-      case "Edit": return `Edit ${input.file_path}`;
-      case "Bash": return `Bash: ${String(input.command).slice(0, 80)}`;
-      case "Glob": return `Glob ${input.pattern}`;
-      case "Grep": return `Grep "${input.pattern}"`;
-      case "WebSearch": return `WebSearch: ${input.query}`;
-      case "WebFetch": return `WebFetch: ${input.url}`;
-      default: return `${name}: ${JSON.stringify(input).slice(0, 100)}`;
-    }
   }
 
   /** Handle a cron-triggered message */
@@ -431,7 +556,7 @@ export class Agent {
     const stopTyping = channel.startTyping(targetChatId);
 
     try {
-      const response = await this.run(key, stampedMessage);
+      const response = await this.runWithRetry(key, stampedMessage);
       stopTyping();
 
       log.info({ channel: channel.name }, "Tomo: %s", response);
@@ -455,8 +580,33 @@ export class Agent {
     }
   }
 
+  /** Handle a continuity heartbeat — runs on the first active DM session */
+  async handleContinuity(prompt: string): Promise<void> {
+    // Find the first active DM session
+    const channel = this.channels[0];
+    if (!channel) {
+      log.warn("Continuity: no channel available");
+      return;
+    }
+
+    const targetChatId = this.findLastChatId(channel.name);
+    if (!targetChatId) {
+      log.debug("Continuity: no active session, skipping");
+      return;
+    }
+
+    const key = this.sessionKey(channel, targetChatId);
+
+    try {
+      const response = await this.runWithRetry(key, prompt);
+      log.info("Continuity response: %s", response.slice(0, 100));
+      // Continuity responses are always silent — agent should reply NO_REPLY
+    } catch (err) {
+      log.error({ err }, "Continuity heartbeat failed");
+    }
+  }
+
   private findLastChatId(channelName: string): string | undefined {
-    // Check SDK session keys for any chat on this channel
     for (const [key] of this.sessions.listSdkSessionIds()) {
       if (key.startsWith(`${channelName}:`)) {
         return key.slice(channelName.length + 1);
@@ -473,6 +623,8 @@ export class Agent {
 
   async stop(): Promise<void> {
     log.info("Shutting down");
+    for (const [, s] of this.liveSessions) s.close();
+    this.liveSessions.clear();
     await Promise.all(this.channels.map((ch) => ch.stop()));
   }
 }

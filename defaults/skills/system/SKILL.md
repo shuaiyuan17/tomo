@@ -1,0 +1,103 @@
+---
+name: tomo-system
+description: Check system status, debug issues, view session stats, manage sessions and cron jobs. Use when something isn't working, when asked about system internals, or when you need to check your own state.
+---
+
+# Tomo System Reference
+
+## Status and Health
+
+```bash
+tomo status                    # Is daemon running? PID, uptime
+tomo logs -n 20                # Recent log entries
+tomo logs -n 50 | grep ERROR   # Recent errors
+```
+
+## Sessions
+
+```bash
+tomo sessions list             # All sessions with stats (queries, cost, context usage)
+tomo sessions clear            # Unlink all sessions (30-day TTL before deletion)
+tomo sessions clear <key>      # Unlink specific session (e.g. "telegram:12345")
+```
+
+Session stats show:
+- **Queries**: total API calls in this session
+- **Cost**: cumulative USD spent
+- **Tokens**: total input/output tokens
+- **Context**: current context window usage (X/200000)
+
+If context is above 80%, compaction will happen soon — the system will automatically summarize older messages to free space.
+
+## Cron Jobs
+
+```bash
+tomo cron list                 # All scheduled jobs with status
+tomo cron add --name "X" --schedule "in 20m" --message "Y"
+tomo cron remove <id>          # Delete a job
+```
+
+## File Paths
+
+| Path | Purpose |
+|------|---------|
+| `~/.tomo/config.json` | Configuration (Telegram token, model) |
+| `~/.tomo/workspace/` | Agent working directory (cwd) |
+| `~/.tomo/workspace/memory/` | Persistent memory files |
+| `~/.tomo/workspace/memory/MEMORY.md` | Memory index (loaded every conversation) |
+| `~/.tomo/workspace/tmp/` | Temp files (downloads, screenshots, etc.) |
+| `~/.tomo/workspace/SOUL.md` | Personality config |
+| `~/.tomo/workspace/AGENT.md` | Operating rules |
+| `~/.tomo/workspace/IDENTITY.md` | Identity and preferences |
+| `~/.tomo/data/sessions/` | Transcript logs and session registry |
+| `~/.tomo/data/cron/jobs.json` | Scheduled tasks |
+| `~/.tomo/logs/tomo.log` | Daemon logs |
+
+## Harness Features
+
+### Streaming
+Responses stream to Telegram in real-time — messages update every 1.5s as tokens arrive.
+
+### MEDIA: tag
+To send an image/file to the user, include `MEDIA:/path/to/file.png` in your response. The harness strips it from text and sends the file. Text before/after becomes the caption.
+
+### NO_REPLY
+Reply with exactly `NO_REPLY` to suppress delivery to the channel. Use for background tasks that found nothing to report.
+
+### Timestamps
+Every message includes a timestamp prefix like `[Mon 04/07 14:30 PDT]` so you always know the current time.
+
+### System messages
+Messages prefixed with `System:` are from the harness (cron triggers, group context), not from a human.
+
+## Troubleshooting
+
+### Agent not responding
+```bash
+tomo status          # Check if running
+tomo logs -n 20      # Check for errors
+tomo restart         # Restart
+```
+
+### Session feels stale or confused
+```bash
+tomo sessions clear  # Reset sessions
+tomo restart
+```
+Or tell the user to send `/new` in Telegram.
+
+### Cron jobs not firing
+```bash
+tomo cron list       # Check nextRunAt and lastStatus
+tomo logs | grep Cron
+```
+Jobs are checked every 30 seconds. Jobs created via CLI are picked up on the next tick.
+
+### Context window full
+Check with `tomo sessions list`. If context is near 100%, the SDK auto-compacts. If stuck, `/new` starts a fresh session.
+
+### Memory not loading
+Memory is read from `~/.tomo/workspace/memory/MEMORY.md` at the start of every query. Check the file exists and has content:
+```bash
+cat ~/.tomo/workspace/memory/MEMORY.md
+```

@@ -97,7 +97,52 @@ export class SessionStore {
       lastActiveAt: now,
       unlinkedAt: null,
       expiresAt: null,
+      stats: {
+        totalQueries: 0,
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        contextUsed: 0,
+        contextMax: 0,
+      },
     });
+    this.saveRegistry();
+  }
+
+  /** Update session stats after a query */
+  updateStats(key: string, update: {
+    costUsd: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    contextUsed: number;
+    contextMax: number;
+  }): void {
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    if (!entry) return;
+
+    // Initialize stats if missing (migration from old format)
+    if (!entry.stats) {
+      entry.stats = {
+        totalQueries: 0, totalCostUsd: 0,
+        totalInputTokens: 0, totalOutputTokens: 0,
+        totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+        contextUsed: 0, contextMax: 0,
+      };
+    }
+
+    entry.stats.totalQueries++;
+    entry.stats.totalCostUsd += update.costUsd;
+    entry.stats.totalInputTokens += update.inputTokens;
+    entry.stats.totalOutputTokens += update.outputTokens;
+    entry.stats.totalCacheReadTokens += update.cacheReadTokens;
+    entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
+    entry.stats.contextUsed = update.contextUsed;
+    entry.stats.contextMax = update.contextMax;
+    entry.lastActiveAt = Date.now();
     this.saveRegistry();
   }
 
@@ -206,6 +251,12 @@ export class SessionStore {
           lastActiveAt: now,
           unlinkedAt: null,
           expiresAt: null,
+          stats: {
+            totalQueries: 0, totalCostUsd: 0,
+            totalInputTokens: 0, totalOutputTokens: 0,
+            totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+            contextUsed: 0, contextMax: 0,
+          },
         });
       }
       this.saveRegistry();

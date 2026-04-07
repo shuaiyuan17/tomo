@@ -33,6 +33,14 @@ sessionsCommand
         console.log(`    Session:  ${e.sdkSessionId}`);
         console.log(`    Created:  ${age} ago`);
         console.log(`    Last use: ${lastActive} ago`);
+        if (e.stats) {
+          const s = e.stats;
+          const pct = s.contextMax > 0 ? Math.round((s.contextUsed / s.contextMax) * 100) : 0;
+          console.log(`    Queries:  ${s.totalQueries}`);
+          console.log(`    Cost:     $${s.totalCostUsd.toFixed(4)}`);
+          console.log(`    Tokens:   ${s.totalInputTokens} in / ${s.totalOutputTokens} out`);
+          console.log(`    Context:  ${s.contextUsed}/${s.contextMax} (${pct}%)`);
+        }
         console.log();
       }
     }

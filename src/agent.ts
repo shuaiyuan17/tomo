@@ -31,6 +31,7 @@ function sdkOptions(resumeSessionId?: string, model?: string) {
       "Skill",
     ],
     settingSources: ["project"] as ("project")[],
+    includePartialMessages: true,
     maxTurns: 30,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
   };
@@ -154,7 +155,10 @@ export class Agent {
 
     try {
       const stampedText = this.injectTimestamp(textForAgent);
-      const response = await this.run(key, stampedText, message.images);
+      const stream = channel.createStreamingMessage(message.chatId, message.id);
+      const response = await this.run(key, stampedText, message.images, false, (text) => {
+        stream.update(text);
+      });
       stopTyping();
 
       this.sessions.append(key, {
@@ -171,11 +175,7 @@ export class Agent {
         return;
       }
 
-      await channel.send({
-        chatId: message.chatId,
-        text: response,
-        replyTo: message.id,
-      });
+      await stream.finish();
     } catch (err) {
       stopTyping();
       log.error({ err }, "Error handling message");
@@ -187,13 +187,14 @@ export class Agent {
     }
   }
 
-  private async run(sessionKey: string, userMessage: string, images?: import("./channels/types.js").ImageAttachment[], isRetry = false): Promise<string> {
+  private async run(sessionKey: string, userMessage: string, images?: import("./channels/types.js").ImageAttachment[], isRetry = false, onText?: (fullText: string) => void): Promise<string> {
     this.checkPromptChanged();
 
     const resumeId = this.sessions.getSdkSessionId(sessionKey);
     const model = this.modelOverrides.get(sessionKey);
     const opts = sdkOptions(resumeId ?? undefined, model);
     const parts: string[] = [];
+    let streamingText = "";
 
     // For images, prepend image description request
     // V1 query() only takes string prompt, not content blocks
@@ -206,7 +207,18 @@ export class Agent {
 
     try {
       for await (const event of query({ prompt, options: opts })) {
+        // Handle streaming text deltas
+        if (event.type === "stream_event") {
+          const streamEvent = event as unknown as { event: { type: string; delta?: { type: string; text?: string } } };
+          if (streamEvent.event?.type === "content_block_delta" && streamEvent.event.delta?.type === "text_delta" && streamEvent.event.delta.text) {
+            streamingText += streamEvent.event.delta.text;
+            onText?.(streamingText);
+          }
+        }
+
         if (event.type === "assistant" && event.message?.content) {
+          // Reset streaming text — the full message replaces deltas
+          streamingText = "";
           for (const block of event.message.content) {
             if ("text" in block) {
               parts.push(block.text);
@@ -295,7 +307,7 @@ export class Agent {
       if (!isRetry && resumeId && isSessionError) {
         log.warn({ err }, "Session error, resetting and retrying");
         this.sessions.clearSdkSessionId(sessionKey);
-        return this.run(sessionKey, userMessage, images, true);
+        return this.run(sessionKey, userMessage, images, true, onText);
       }
       throw err;
     }

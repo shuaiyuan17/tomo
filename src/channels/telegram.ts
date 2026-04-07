@@ -1,5 +1,5 @@
 import { Bot, type Context } from "grammy";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, StreamingMessage } from "./types.js";
 import { log } from "../logger.js";
 
 export class TelegramChannel implements Channel {
@@ -173,6 +173,51 @@ export class TelegramChannel implements Channel {
     const ttlTimeout = setTimeout(cleanup, TTL_MS);
 
     return cleanup;
+  }
+
+  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
+    const EDIT_INTERVAL_MS = 1500;
+    let messageId: number | null = null;
+    let buffer = "";
+    let lastSent = "";
+    let editTimer: ReturnType<typeof setInterval> | null = null;
+    let finished = false;
+
+    const flush = async () => {
+      if (buffer === lastSent || !buffer) return;
+      const text = buffer;
+      lastSent = text;
+
+      try {
+        if (!messageId) {
+          const replyParams = replyTo
+            ? { reply_parameters: { message_id: Number(replyTo) } }
+            : {};
+          const sent = await this.bot.api.sendMessage(chatId, text, replyParams);
+          messageId = sent.message_id;
+        } else {
+          await this.bot.api.editMessageText(chatId, messageId, text);
+        }
+      } catch {
+        // Telegram may reject edits if content unchanged or too fast
+      }
+    };
+
+    return {
+      update: (text: string) => {
+        buffer = text;
+        if (!editTimer && !finished) {
+          // First chunk — send immediately
+          flush();
+          editTimer = setInterval(flush, EDIT_INTERVAL_MS);
+        }
+      },
+      finish: async () => {
+        finished = true;
+        if (editTimer) clearInterval(editTimer);
+        await flush();
+      },
+    };
   }
 
   async send(message: OutgoingMessage): Promise<void> {

@@ -150,11 +150,27 @@ export const initCommand = new Command("init")
 
     // 4. Configuration
     if (!isReinit) {
+      p.log.step("Telegram setup");
+      p.log.message([
+        "To connect Tomo to Telegram, you need a bot token:",
+        "",
+        "  1. Open Telegram and message @BotFather",
+        "  2. Send /newbot",
+        "  3. Choose a name (e.g., \"My Tomo\")",
+        "  4. Choose a username (must end in \"bot\", e.g., \"my_tomo_bot\")",
+        "  5. BotFather will reply with a token like: 123456:ABC-DEF...",
+        "  6. Also send /setprivacy → select your bot → Disable",
+        "     (so Tomo can read group messages)",
+        "",
+        "  Open BotFather: https://t.me/BotFather",
+      ].join("\n"));
+
       const token = await p.text({
-        message: "Telegram bot token",
-        placeholder: "Paste token from @BotFather",
+        message: "Paste your bot token",
+        placeholder: "123456:ABC-DEF1234ghIkl-zyx57W2v...",
         validate: (val) => {
-          if (!val?.trim()) return "Token is required. Get one from @BotFather on Telegram.";
+          if (!val?.trim()) return "Token is required.";
+          if (!/^\d+:.+$/.test(val.trim())) return "That doesn't look like a bot token. It should be like: 123456:ABC-DEF...";
         },
       });
 

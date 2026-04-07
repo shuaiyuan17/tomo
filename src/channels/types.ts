@@ -35,6 +35,13 @@ export interface OutgoingMessage {
   replyTo?: string;
 }
 
+export interface StreamingMessage {
+  /** Append text to the streaming message */
+  update(text: string): void;
+  /** Finalize the message (flush remaining content) */
+  finish(): Promise<void>;
+}
+
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;
 export type CommandHandler = (command: string, chatId: string, senderName: string, args?: string) => Promise<void>;
 
@@ -50,6 +57,9 @@ export interface Channel {
 
   /** Send a message through this channel */
   send(message: OutgoingMessage): Promise<void>;
+
+  /** Create a streaming message that can be updated incrementally */
+  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage;
 
   /** Show typing indicator. Returns a stop function. */
   startTyping(chatId: string): () => void;

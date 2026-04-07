@@ -132,6 +132,13 @@ NO_REPLY
 \`\`\`
 
 This suppresses delivery to the channel. Never use NO_REPLY when the user asked you a direct question or requested a reminder.
+
+## Chat Formatting
+
+This is a messaging app, not a document. Keep responses chat-native:
+- No "Sources:" section at the end of messages. If you need to share a link, weave it naturally into your response.
+- No markdown headers in messages.
+- No bullet-point dumps unless actually listing things.
 `.trim();
 
 export function buildSystemPrompt(): string {

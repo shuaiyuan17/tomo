@@ -84,7 +84,7 @@ export class ContinuityRunner {
 
     const prompt = `System: It is ${timestamp}.${weatherLine} Read CONTINUITY.md. This is free time — reflect, research, or prepare something useful.`;
 
-    log.info("Continuity heartbeat fired");
+    log.info({ city: this.city, weather: weatherLine || "(none)" }, "Continuity heartbeat fired");
 
     try {
       await this.agent.handleContinuity(prompt);

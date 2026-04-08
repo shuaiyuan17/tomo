@@ -40,6 +40,13 @@ sessionsCommand
           console.log(`    Cost:     $${s.totalCostUsd.toFixed(4)}`);
           console.log(`    Tokens:   ${s.totalInputTokens} in / ${s.totalOutputTokens} out`);
           console.log(`    Context:  ${s.contextUsed}/${s.contextMax} (${pct}%)`);
+          if (s.contextBreakdown?.length) {
+            console.log(`    Breakdown:`);
+            for (const c of s.contextBreakdown) {
+              const catPct = s.contextMax > 0 ? Math.round((c.tokens / s.contextMax) * 100) : 0;
+              console.log(`      ${c.name}: ${c.tokens.toLocaleString()} (${catPct}%)`);
+            }
+          }
         }
         console.log();
       }

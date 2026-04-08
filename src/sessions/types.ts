@@ -21,6 +21,11 @@ export interface Session {
   updatedAt: number;
 }
 
+export interface ContextCategory {
+  name: string;
+  tokens: number;
+}
+
 export interface SessionStats {
   /** Total number of queries in this session */
   totalQueries: number;
@@ -38,6 +43,8 @@ export interface SessionStats {
   contextUsed: number;
   /** Context window max */
   contextMax: number;
+  /** Context window breakdown by category */
+  contextBreakdown?: ContextCategory[];
 }
 
 export interface SessionEntry {

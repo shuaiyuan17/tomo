@@ -243,6 +243,7 @@ export class SessionStore {
     cacheCreationTokens: number;
     contextUsed: number;
     contextMax: number;
+    contextBreakdown?: { name: string; tokens: number }[];
   }): void {
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (!entry) return;
@@ -265,6 +266,9 @@ export class SessionStore {
     entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
     entry.stats.contextUsed = update.contextUsed;
     entry.stats.contextMax = update.contextMax;
+    if (update.contextBreakdown) {
+      entry.stats.contextBreakdown = update.contextBreakdown;
+    }
     entry.lastActiveAt = Date.now();
     this.saveRegistry();
   }

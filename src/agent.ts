@@ -70,6 +70,7 @@ interface QueryResult {
   cacheCreationTokens: number;
   contextUsed: number;
   contextMax: number;
+  contextBreakdown?: { name: string; tokens: number }[];
 }
 
 class LiveSession {
@@ -208,6 +209,9 @@ class LiveSession {
         if (this.lastResult) {
           this.lastResult.contextUsed = ctx.totalTokens;
           this.lastResult.contextMax = ctx.maxTokens;
+          this.lastResult.contextBreakdown = ctx.categories
+            .filter((c) => c.tokens > 0)
+            .map((c) => ({ name: c.name, tokens: c.tokens }));
         }
         if (pct >= 80) {
           log.warn({ used: ctx.totalTokens, max: ctx.maxTokens, pct: `${pct}%` }, "Context nearing compaction");

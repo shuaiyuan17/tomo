@@ -8,6 +8,7 @@ export class TelegramChannel implements Channel {
   private handlers: MessageHandler[] = [];
   private commandHandlers: CommandHandler[] = [];
   private botUsername: string | undefined;
+  private stopping = false;
 
   constructor(token: string) {
     this.bot = new Bot(token);
@@ -258,11 +259,27 @@ export class TelegramChannel implements Channel {
       { command: "model", description: "Switch model (sonnet/opus/haiku)" },
     ]);
 
-    this.bot.start();
+    this.startPolling();
+  }
+
+  private startPolling(): void {
+    if (this.stopping) return;
+    this.bot.start().then(() => {
+      if (!this.stopping) {
+        log.warn("Telegram polling ended unexpectedly, restarting in 3s");
+        setTimeout(() => this.startPolling(), 3000);
+      }
+    }).catch((err) => {
+      if (!this.stopping) {
+        log.error({ err }, "Telegram polling failed, restarting in 3s");
+        setTimeout(() => this.startPolling(), 3000);
+      }
+    });
   }
 
   async stop(): Promise<void> {
     log.info("Telegram bot stopping");
+    this.stopping = true;
     await this.bot.stop();
   }
 }

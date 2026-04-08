@@ -3,7 +3,6 @@ import { buildSystemPrompt } from "../src/workspace/index.js";
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { tmpdir } from "node:os";
 
 const TOMO_WORKSPACE = join(homedir(), ".tomo", "workspace");
 

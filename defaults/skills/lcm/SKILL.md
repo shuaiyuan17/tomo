@@ -66,9 +66,9 @@ When compacting a section, also write a brief note to `memory/YYYY-MM-DD.md` for
 ```markdown
 ## 2026-03-29 — from LCM compact
 
-- Published first blog post: claw.posthaven.com
-- SOUL.md rewritten — more specific, less generic
-- Backup system set up (backup.sh, daily cron, iCloud)
+- Completed auth refactor: JWT middleware extracted, 12 routes updated
+- Discussed deployment strategy with Shuai — decided on blue/green
+- Set up backup cron job
 ```
 
 Two-layer recall:

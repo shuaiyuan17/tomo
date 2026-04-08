@@ -465,6 +465,13 @@ export class Agent {
         return;
       }
 
+      // Surface API errors that the SDK returns as response text
+      if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
+        await stream.finish();
+        await channel.send({ chatId: message.chatId, text: `[error] ${response}`, replyTo: message.id });
+        return;
+      }
+
       const { cleanText, mediaPaths } = extractMedia(response);
 
       if (mediaPaths.length > 0) {
@@ -488,9 +495,10 @@ export class Agent {
     } catch (err) {
       stopTyping();
       log.error({ err }, "Error handling message");
+      const detail = err instanceof Error ? err.message : String(err);
       await channel.send({
         chatId: message.chatId,
-        text: "Sorry, something went wrong. Please try again.",
+        text: `[error] ${detail}`,
         replyTo: message.id,
       });
     }
@@ -625,6 +633,8 @@ export class Agent {
     } catch (err) {
       stopTyping();
       log.error({ err }, "Cron message handling failed");
+      const detail = err instanceof Error ? err.message : String(err);
+      await channel.send({ chatId: targetChatId, text: `[error] cron failed: ${detail}` });
     }
   }
 

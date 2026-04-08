@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { buildSystemPrompt } from "../src/workspace/index.js";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 
 const TOMO_WORKSPACE = join(homedir(), ".tomo", "workspace");
 
@@ -39,13 +40,28 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("Don't wait to be told");
   });
 
-  it("loads MEMORY.md content", () => {
+  describe("loads MEMORY.md content", () => {
     const memoryDir = join(TOMO_WORKSPACE, "memory");
-    mkdirSync(memoryDir, { recursive: true });
     const memoryFile = join(memoryDir, "MEMORY.md");
-    writeFileSync(memoryFile, "- [Test](test.md) — test memory\n");
+    let originalContent: string | null = null;
 
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain("test memory");
+    beforeEach(() => {
+      mkdirSync(memoryDir, { recursive: true });
+      originalContent = existsSync(memoryFile) ? readFileSync(memoryFile, "utf-8") : null;
+      writeFileSync(memoryFile, "- [Test](test.md) — test memory\n");
+    });
+
+    afterEach(() => {
+      if (originalContent !== null) {
+        writeFileSync(memoryFile, originalContent);
+      } else {
+        rmSync(memoryFile, { force: true });
+      }
+    });
+
+    it("includes memory entry in prompt", () => {
+      const prompt = buildSystemPrompt();
+      expect(prompt).toContain("test memory");
+    });
   });
 });

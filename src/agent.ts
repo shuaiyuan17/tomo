@@ -39,7 +39,6 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     model: model ?? config.model,
     cwd: config.workspaceDir,
     systemPrompt,
-    betas: ["context-1m-2025-08-07"] as ("context-1m-2025-08-07")[],
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
     allowedTools: [
@@ -210,9 +209,9 @@ class LiveSession {
         const approx = input + cacheRead + cacheCreated;
         if (this.lastResult) {
           this.lastResult.contextUsed = approx;
-          this.lastResult.contextMax = 200_000;
+          this.lastResult.contextMax = 1_000_000;
         }
-        return `~${approx}/200000`;
+        return `~${approx}/1000000`;
       }
     })();
 
@@ -323,8 +322,8 @@ export class Agent {
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-6[1m]",
+    "opus": "claude-opus-4-6[1m]",
     "haiku": "claude-haiku-4-5",
   };
 

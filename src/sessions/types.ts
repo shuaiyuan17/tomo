@@ -1,9 +1,17 @@
 export interface SessionMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool_summary";
   content: string;
   channel: string;
   senderName?: string;
   timestamp: number;
+  /** Monotonic sequence number within this transcript */
+  seq?: number;
+  /** UUID of the corresponding SDK session event */
+  sdkMessageUuid?: string;
+  /** For tool_summary: names of tools used in this segment */
+  toolsUsed?: string[];
+  /** For tool_summary: number of tool calls summarized */
+  toolCallCount?: number;
 }
 
 export interface Session {

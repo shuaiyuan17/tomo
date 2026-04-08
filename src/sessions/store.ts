@@ -7,11 +7,17 @@ import { log } from "../logger.js";
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /** Where the SDK stores its JSONL session files */
-function getSdkSessionDir(): string {
+export function getSdkSessionDir(): string {
   const home = homedir();
   const workspacePath = join(home, ".tomo", "workspace");
-  const encoded = workspacePath.replace(/\//g, "-");
+  // SDK encodes: replace / and . with -
+  const encoded = workspacePath.replace(/[/.]/g, "-");
   return join(home, ".claude", "projects", encoded);
+}
+
+/** Get the full path to an SDK session JSONL file */
+export function getSdkSessionPath(sessionId: string): string {
+  return join(getSdkSessionDir(), `${sessionId}.jsonl`);
 }
 
 export class SessionStore {
@@ -47,11 +53,74 @@ export class SessionStore {
   /** Append a message to the session and persist to disk */
   append(key: string, message: SessionMessage): void {
     const session = this.get(key);
+
+    // Auto-assign seq number if not present
+    if (message.seq == null) {
+      const lastSeq = this.getLastSeq(session);
+      message.seq = lastSeq + 1;
+    }
+
     session.messages.push(message);
     session.updatedAt = message.timestamp;
 
     const file = this.transcriptPath(key);
     appendFileSync(file, JSON.stringify(message) + "\n");
+  }
+
+  /** Append a tool summary entry for a completed tool chain */
+  appendToolSummary(key: string, opts: {
+    toolsUsed: string[];
+    toolCallCount: number;
+    content: string;
+    timestamp: number;
+    sdkMessageUuid?: string;
+  }): void {
+    this.append(key, {
+      role: "tool_summary",
+      content: opts.content,
+      channel: "sdk",
+      timestamp: opts.timestamp,
+      toolsUsed: opts.toolsUsed,
+      toolCallCount: opts.toolCallCount,
+      sdkMessageUuid: opts.sdkMessageUuid,
+    });
+  }
+
+  /** Search transcript by text query, optionally filtered by time range */
+  searchTranscript(key: string, opts: {
+    query?: string;
+    fromSeq?: number;
+    toSeq?: number;
+    fromTime?: number;
+    toTime?: number;
+    limit?: number;
+  }): SessionMessage[] {
+    const session = this.get(key);
+    const limit = opts.limit ?? 50;
+    const results: SessionMessage[] = [];
+
+    const queryLower = opts.query?.toLowerCase();
+
+    for (const msg of session.messages) {
+      if (opts.fromSeq != null && (msg.seq ?? 0) < opts.fromSeq) continue;
+      if (opts.toSeq != null && (msg.seq ?? 0) > opts.toSeq) continue;
+      if (opts.fromTime != null && msg.timestamp < opts.fromTime) continue;
+      if (opts.toTime != null && msg.timestamp > opts.toTime) continue;
+      if (queryLower && !msg.content.toLowerCase().includes(queryLower)) continue;
+
+      results.push(msg);
+      if (results.length >= limit) break;
+    }
+
+    return results;
+  }
+
+  /** Get the highest seq number in a session */
+  private getLastSeq(session: Session): number {
+    for (let i = session.messages.length - 1; i >= 0; i--) {
+      if (session.messages[i].seq != null) return session.messages[i].seq!;
+    }
+    return 0;
   }
 
   /** Get the last N turns of conversation for LLM context */

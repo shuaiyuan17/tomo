@@ -106,8 +106,9 @@ lcmCommand
 
 lcmCommand
   .command("search")
-  .description("Search the transcript for messages matching a query")
-  .requiredOption("--channel-key <key>", "Channel key (e.g. telegram_1360399016)")
+  .description("Search the transcript and archive for messages matching a query")
+  .option("--channel-key <key>", "Channel key (e.g. telegram_1360399016)")
+  .option("--session-id <id>", "SDK session ID (searches archive too)")
   .option("--query <text>", "Text to search for")
   .option("--from-seq <n>", "Start seq number", parseInt)
   .option("--to-seq <n>", "End seq number", parseInt)
@@ -115,12 +116,36 @@ lcmCommand
   .option("--json", "Output raw JSON")
   .action((opts) => {
     const store = new SessionStore(sessionsDir, 20);
-    const results = store.searchTranscript(opts.channelKey, {
-      query: opts.query,
-      fromSeq: opts.fromSeq,
-      toSeq: opts.toSeq,
-      limit: opts.limit,
-    });
+    const limit = opts.limit ?? 50;
+    const results: Array<{ role: string; content: string; timestamp: number; seq?: number; source?: string }> = [];
+
+    // Search transcript if channel key provided
+    if (opts.channelKey) {
+      const transcriptResults = store.searchTranscript(opts.channelKey, {
+        query: opts.query,
+        fromSeq: opts.fromSeq,
+        toSeq: opts.toSeq,
+        limit,
+      });
+      results.push(...transcriptResults.map(r => ({ ...r, source: "transcript" })));
+    }
+
+    // Search archive if session ID provided
+    if (opts.sessionId) {
+      const remaining = limit - results.length;
+      if (remaining > 0) {
+        const archiveResults = store.searchArchive(opts.sessionId, {
+          query: opts.query,
+          limit: remaining,
+        });
+        results.push(...archiveResults.map(r => ({ ...r, source: "archive" })));
+      }
+    }
+
+    if (!opts.channelKey && !opts.sessionId) {
+      console.error("Provide --channel-key and/or --session-id");
+      process.exit(1);
+    }
 
     if (opts.json) {
       console.log(JSON.stringify(results, null, 2));
@@ -135,8 +160,9 @@ lcmCommand
     for (const msg of results) {
       const time = new Date(msg.timestamp).toISOString().slice(0, 16);
       const seq = msg.seq != null ? `#${msg.seq}` : "";
+      const src = msg.source === "archive" ? "[archive]" : "";
       const preview = msg.content.slice(0, 120).replace(/\n/g, " ");
-      console.log(`  ${seq.padEnd(6)} ${time} [${msg.role}] ${preview}`);
+      console.log(`  ${seq.padEnd(6)} ${time} [${msg.role}] ${src} ${preview}`);
     }
     console.log(`\n${results.length} result(s)`);
   });

@@ -115,6 +115,60 @@ export class SessionStore {
     return results;
   }
 
+  /** Search archive files (compacted SDK events) for a given session ID */
+  searchArchive(sdkSessionId: string, opts: {
+    query?: string;
+    limit?: number;
+  }): SessionMessage[] {
+    const archivePath = join(this.dir, `_archive_${sdkSessionId}.jsonl`);
+    if (!existsSync(archivePath)) return [];
+
+    const lines = readFileSync(archivePath, "utf-8").trim().split("\n");
+    const limit = opts.limit ?? 50;
+    const results: SessionMessage[] = [];
+    const queryLower = opts.query?.toLowerCase();
+
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type !== "user" && event.type !== "assistant") continue;
+
+        // Extract text from SDK event format
+        const msg = event.message;
+        if (!msg) continue;
+
+        let text = "";
+        const content = msg.content;
+        if (typeof content === "string") {
+          text = content;
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block?.type === "text") text += (block.text ?? "") + " ";
+          }
+        }
+        text = text.trim();
+        if (!text) continue;
+
+        if (queryLower && !text.toLowerCase().includes(queryLower)) continue;
+
+        const ts = event.timestamp ? new Date(event.timestamp).getTime() : 0;
+        results.push({
+          role: msg.role === "assistant" ? "assistant" : "user",
+          content: text,
+          channel: "archive",
+          timestamp: ts,
+        });
+
+        if (results.length >= limit) break;
+      } catch {
+        // Skip malformed lines
+      }
+    }
+
+    return results;
+  }
+
   /** Get the highest seq number in a session */
   private getLastSeq(session: Session): number {
     for (let i = session.messages.length - 1; i >= 0; i--) {

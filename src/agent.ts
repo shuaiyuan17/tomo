@@ -3,6 +3,7 @@ import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
+import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { log } from "./logger.js";
 
 function isSilentReply(text: string): boolean {
@@ -510,6 +511,12 @@ export class Agent {
       // Save stats
       if (session.lastResult) {
         this.sessions.updateStats(key, session.lastResult);
+      }
+
+      // If compact happened during this turn, reload the session on next turn
+      if (sid && checkAndClearCompactTrigger(sid)) {
+        this.closeLiveSession(key);
+        log.info({ key }, "Session reloaded after compact");
       }
 
       return response;

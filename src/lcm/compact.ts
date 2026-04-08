@@ -1,8 +1,23 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { getSdkSessionPath } from "../sessions/index.js";
+import { getSdkSessionPath, getSdkSessionDir } from "../sessions/index.js";
 import { log } from "../logger.js";
+
+/** Path to the compact trigger file for a given session */
+export function getCompactTriggerPath(sdkSessionId: string): string {
+  return join(getSdkSessionDir(), `${sdkSessionId}.compact-trigger`);
+}
+
+/** Check if a compact happened and clear the trigger */
+export function checkAndClearCompactTrigger(sdkSessionId: string): boolean {
+  const triggerPath = getCompactTriggerPath(sdkSessionId);
+  if (existsSync(triggerPath)) {
+    unlinkSync(triggerPath);
+    return true;
+  }
+  return false;
+}
 
 export interface CompactRequest {
   /** SDK session ID to compact */
@@ -155,6 +170,9 @@ export function compactSession(req: CompactRequest): CompactResult {
   // Write the new session file
   const output = newEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
   writeFileSync(path, output);
+
+  // Write trigger file so the harness knows to reload the session
+  writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
 
   const eventsRemoved = removeSet.size;
   log.info({

@@ -54,6 +54,27 @@ tomo lcm compact --session-id SESSION_ID \
 
 The original messages are archived to the transcript file and can be searched later.
 
+**Daily memory notes:**
+
+When compacting a section, also write a brief note to `memory/YYYY-MM-DD.md` for each date covered. This creates a fast, human-readable index you can read directly — without needing to invoke any tools.
+
+```bash
+# Example: after compacting 2026-03-29
+# Append to memory/2026-03-29.md (create if it doesn't exist)
+```
+
+```markdown
+## 2026-03-29 — from LCM compact
+
+- Completed auth refactor: JWT middleware extracted, 12 routes updated
+- Discussed deployment strategy with team — decided on blue/green
+- Set up backup cron job
+```
+
+Two-layer recall:
+1. **`memory/YYYY-MM-DD.md`** — read directly, fast, no tools needed
+2. **`tomo lcm search`** — when you need the raw original messages
+
 **Writing good summaries:**
 - Use your own natural voice — more like a note to your future self than a changelog
 - Always include explicit dates in **YYYY-MM-DD format** for anything date-specific — e.g. "2026-03-29: published first blog post". This makes `tomo lcm search` much more useful later.

@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
@@ -96,15 +96,6 @@ export function compactSession(req: CompactRequest): CompactResult {
   // Find the parentUuid chain endpoints
   const firstRemoved = allEvents[removeStartGlobal];
   const parentBeforeRange = firstRemoved.parentUuid;
-
-  // Find the first event AFTER the range
-  let firstAfterGlobal = -1;
-  for (let i = removeEndGlobal + 1; i < allEvents.length; i++) {
-    if (allEvents[i].type === "user" || allEvents[i].type === "assistant") {
-      firstAfterGlobal = i;
-      break;
-    }
-  }
 
   // Create the summary event
   const summaryUuid = randomUUID();

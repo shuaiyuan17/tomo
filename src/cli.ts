@@ -11,7 +11,7 @@ import { lcmCommand } from "./cli/lcm.js";
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.1.4");
+  .version("0.2.0");
 
 program.addCommand(initCommand);
 program.addCommand(startCommand);

@@ -39,32 +39,46 @@ Replace a heavy section with a summary. Use timestamps to specify the range:
 tomo lcm compact --session-id SESSION_ID \
   --from-time "2026-03-28T16:29" \
   --to-time "2026-03-28T19:09" \
-  --summary "Refactored auth module: extracted middleware, added JWT validation, updated 12 routes. Tests passing."
+  --summary "2026-03-28: Refactored auth module: extracted middleware, added JWT validation, updated 12 routes. Tests passing."
 ```
 
-- `--from-time` / `--to-time`: ISO timestamps (you already know these from the conversation)
+- `--from-time` / `--to-time`: ISO timestamps — you already know these from the conversation, no need to run stats first
 - `--summary`: Write a concise summary of what happened in that range — you know best since you just did the work
 
 **Workflow:**
 1. After completing a big task, decide what can be compacted
-2. You already know the time range from the timestamps in the conversation
+2. Read the time range directly from conversation timestamps — no need to run `stats` first
 3. Write a summary capturing key decisions, outcomes, and anything worth remembering
 4. Run `tomo lcm compact` with the time range and your summary
-5. Optionally run `tomo lcm stats` first if you want to see the full breakdown
+5. Optionally run `tomo lcm stats` to verify the result
 
 The original messages are archived to the transcript file and can be searched later.
+
+**Writing good summaries:**
+- Use your own natural voice — more like a note to your future self than a changelog
+- Always include explicit dates in **YYYY-MM-DD format** for anything date-specific — e.g. "2026-03-29: published first blog post". This makes `tomo lcm search` much more useful later.
+- Record *outcomes* and *key decisions*, not every step taken
+- For tool-heavy sections (browser loops, exec retries): one sentence on what was attempted and whether it worked
+- For conversations: preserve texture — a key quote or specific detail is worth more than a paragraph of abstraction
 
 ## Search past conversations
 
 Search the transcript archive for past messages:
 
 ```bash
-tomo lcm search --channel-key CHANNEL_KEY --query "momo"
+# Search both current transcript AND archive (requires --session-id)
+tomo lcm search --channel-key CHANNEL_KEY --session-id SESSION_ID --query "momo"
+
+# Search by sequence range
 tomo lcm search --channel-key CHANNEL_KEY --from-seq 100 --to-seq 200
-tomo lcm search --channel-key CHANNEL_KEY --query "blog" --limit 10
+
+# Limit results
+tomo lcm search --channel-key CHANNEL_KEY --session-id SESSION_ID --query "blog" --limit 10
 ```
 
-Your channel key is in your system prompt under `# SESSION`.
+Your channel key and session ID are in your system prompt under `# SESSION`.
+
+**Note:** Always include `--session-id` to search the archive — without it, only the current transcript is searched.
 
 Add `--json` for machine-readable output.
 
@@ -73,4 +87,4 @@ Add `--json` for machine-readable output.
 - After completing a big task with many tool calls (file operations, debugging, etc.)
 - When you notice context is above 70% capacity
 - When the harness warns you about context usage
-- Compact `tool_ops` sections first — they're usually the largest and least important to keep verbatim
+- Prioritize sections with many tool calls (browser, exec, Read/Edit loops) — these are usually the largest and least important to keep verbatim

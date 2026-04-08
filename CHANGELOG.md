@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 (2026-04-08)
+
+### Features
+
+- Add context window breakdown by category to session metadata
+- Auto-nudge agent to compact when context hits 80%
+
+### Bug fixes
+
+- Surface API errors to Telegram instead of silently swallowing
+- Split cost log into per-turn and cumulative session total
+- Fix totalCostUsd double-counting in session stats
+
 ## 0.2.0 (2026-04-08)
 
 ### Features

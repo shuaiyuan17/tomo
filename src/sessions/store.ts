@@ -259,7 +259,7 @@ export class SessionStore {
     }
 
     entry.stats.totalQueries++;
-    entry.stats.totalCostUsd += update.costUsd;
+    entry.stats.totalCostUsd = update.costUsd;
     entry.stats.totalInputTokens += update.inputTokens;
     entry.stats.totalOutputTokens += update.outputTokens;
     entry.stats.totalCacheReadTokens += update.cacheReadTokens;

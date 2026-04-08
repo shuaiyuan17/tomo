@@ -81,6 +81,7 @@ class LiveSession {
   private sessionId: string | null = null;
   private alive = true;
   lastResult: QueryResult | null = null;
+  private prevTotalCost = 0;
   private eventLoopDone: Promise<void>;
 
   constructor(options: ReturnType<typeof sdkOptions>) {
@@ -168,9 +169,14 @@ class LiveSession {
       const cacheRead = u?.cache_read_input_tokens ?? 0;
       const cacheCreated = u?.cache_creation_input_tokens ?? 0;
 
+      // Compute per-turn cost as delta from cumulative total
+      const totalCost = result.total_cost_usd ?? 0;
+      const turnCost = totalCost - this.prevTotalCost;
+      this.prevTotalCost = totalCost;
+
       // Store result stats, get context usage, then resolve
       this.lastResult = {
-        costUsd: result.total_cost_usd ?? 0,
+        costUsd: totalCost,
         inputTokens: input,
         outputTokens: output,
         cacheReadTokens: cacheRead,
@@ -180,7 +186,7 @@ class LiveSession {
       };
 
       // Await context usage before resolving so stats are complete
-      await this.logContextUsage(result, input, output, cacheRead, cacheCreated);
+      await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
       const response = this.parts.join("\n").trim() || "I'm not sure how to respond to that.";
       this.parts = [];
@@ -191,7 +197,8 @@ class LiveSession {
   }
 
   private async logContextUsage(
-    result: { subtype: string; num_turns?: number; duration_ms?: number; total_cost_usd?: number },
+    result: { subtype: string; num_turns?: number; duration_ms?: number },
+    turnCost: number, totalCost: number,
     input: number, output: number, cacheRead: number, cacheCreated: number,
   ): Promise<void> {
     const contextInfo = await (async () => {
@@ -220,7 +227,8 @@ class LiveSession {
       {
         turns: result.num_turns,
         duration: `${result.duration_ms}ms`,
-        cost: `$${result.total_cost_usd?.toFixed(4)}`,
+        cost: `$${turnCost.toFixed(4)}`,
+        totalCost: `$${totalCost.toFixed(4)}`,
         tokens: `in:${input} out:${output}`,
         cache: `read:${cacheRead} created:${cacheCreated}`,
         context: contextInfo,

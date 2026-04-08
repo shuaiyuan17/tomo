@@ -451,6 +451,16 @@ export class Agent {
       }, message.images);
       stopTyping();
 
+      // If context is high, send a system nudge so the agent can compact
+      const liveSession = this.liveSessions.get(key);
+      const ctx = liveSession?.lastResult;
+      if (ctx && ctx.contextMax > 0) {
+        const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
+        if (pct >= 80) {
+          this.runWithRetry(key, `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.`).catch(() => {});
+        }
+      }
+
       this.sessions.append(key, {
         role: "assistant",
         content: response,

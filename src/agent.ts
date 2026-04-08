@@ -39,6 +39,7 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     model: model ?? config.model,
     cwd: config.workspaceDir,
     systemPrompt,
+    betas: ["context-1m-2025-08-07"] as ("context-1m-2025-08-07")[],
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
     allowedTools: [

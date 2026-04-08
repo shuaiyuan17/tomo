@@ -1,2 +1,2 @@
 export type { Session, SessionMessage } from "./types.js";
-export { SessionStore } from "./store.js";
+export { SessionStore, getSdkSessionDir, getSdkSessionPath } from "./store.js";

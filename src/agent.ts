@@ -20,11 +20,25 @@ function extractMedia(text: string): { cleanText: string; mediaPaths: string[] }
   return { cleanText, mediaPaths };
 }
 
-function sdkOptions(resumeSessionId?: string, model?: string) {
+function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: { channelKey: string; sdkSessionId?: string }) {
+  let systemPrompt = buildSystemPrompt();
+
+  // Inject session context so the agent can use LCM tools
+  if (sessionContext) {
+    const lines = [
+      "\n\n# SESSION — Current Session Info",
+      `- Channel key: ${sessionContext.channelKey}`,
+    ];
+    if (sessionContext.sdkSessionId) {
+      lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
+    }
+    systemPrompt += lines.join("\n");
+  }
+
   return {
     model: model ?? config.model,
     cwd: config.workspaceDir,
-    systemPrompt: buildSystemPrompt(),
+    systemPrompt,
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
     allowedTools: [
@@ -368,7 +382,10 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
-    const opts = sdkOptions(resumeId ?? undefined, model);
+    const opts = sdkOptions(resumeId ?? undefined, model, {
+      channelKey: key,
+      sdkSessionId: resumeId ?? undefined,
+    });
 
     session = new LiveSession(opts);
     this.liveSessions.set(key, session);

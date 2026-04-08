@@ -6,6 +6,7 @@ import { initCommand } from "./cli/init.js";
 import { stopCommand, restartCommand, statusCommand, logsCommand, continuityCommand } from "./cli/daemon.js";
 import { sessionsCommand } from "./cli/sessions.js";
 import { migrateCommand } from "./cli/migrate.js";
+import { lcmCommand } from "./cli/lcm.js";
 
 const program = new Command()
   .name("tomo")
@@ -22,5 +23,6 @@ program.addCommand(cronCommand);
 program.addCommand(continuityCommand);
 program.addCommand(migrateCommand);
 program.addCommand(sessionsCommand);
+program.addCommand(lcmCommand);
 
 program.parse();

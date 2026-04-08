@@ -9,7 +9,8 @@
   },
   "files": [
     "dist",
-    "defaults"
+    "defaults",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",

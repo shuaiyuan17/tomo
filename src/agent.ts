@@ -465,7 +465,9 @@ export class Agent {
       return;
     }
 
-    const stopTyping = replyChannel.startTyping(replyChatId);
+    // iMessage groups: skip typing indicator (most messages will be NO_REPLY)
+    const isImessageGroup = isGroup && channel.name === "imessage";
+    const stopTyping = isImessageGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
       const stampedText = this.injectTimestamp(textForAgent);
@@ -530,6 +532,10 @@ export class Agent {
     } catch (err) {
       stopTyping();
       log.error({ err }, "Error handling message");
+
+      // iMessage groups: suppress error messages to avoid polluting the chat
+      if (isImessageGroup) return;
+
       const detail = err instanceof Error ? err.message : String(err);
       await replyChannel.send({
         chatId: replyChatId,

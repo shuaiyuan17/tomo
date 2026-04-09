@@ -1,6 +1,6 @@
 import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
-import { config } from "./config.js";
+import { config, CONFIG_PATH } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
@@ -342,6 +342,29 @@ export class Agent {
     return this.channels.find((ch) => ch.name === name);
   }
 
+  /** Activate a group chat by adding it to the channel's allowlist */
+  private async activateGroup(channel: Channel, chatId: string): Promise<void> {
+    try {
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
+      if (!channels[channel.name]) channels[channel.name] = {};
+      const allowlist = ((channels[channel.name].allowlist ?? []) as string[]);
+      if (!allowlist.includes(chatId)) {
+        allowlist.push(chatId);
+        channels[channel.name].allowlist = allowlist;
+        cfg.channels = channels;
+        writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+        // Update the router's in-memory allowlist
+        this.router.addToAllowlist(channel.name, chatId);
+      }
+      log.info({ channel: channel.name, chatId }, "Group chat activated via secret");
+      await channel.send({ chatId, text: "Tomo activated in this group." });
+    } catch (err) {
+      log.error({ err }, "Failed to activate group");
+    }
+  }
+
   addChannel(channel: Channel): void {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
     channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
@@ -451,6 +474,12 @@ export class Agent {
       { channel: channel.name, sender: message.senderName, group: isGroup || undefined, mentioned: isMentioned || undefined, images: hasImages ? message.images!.length : undefined },
       message.text,
     );
+
+    // Group secret activation: if message matches the secret, add group to allowlist
+    if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
+      await this.activateGroup(channel, message.chatId);
+      return;
+    }
 
     // Allowlist check: reject messages from unknown senders
     if (!this.router.isAllowed(channel.name, message.chatId)) {

@@ -38,6 +38,12 @@ export class IdentityRouter {
     return allowlist.has(chatId);
   }
 
+  /** Add a chatId to a channel's in-memory allowlist (after persisting to config) */
+  addToAllowlist(channelName: string, chatId: string): void {
+    if (!this.allowlists[channelName]) this.allowlists[channelName] = new Set();
+    this.allowlists[channelName].add(chatId);
+  }
+
   /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
   resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {
     // Group chats: always separate sessions

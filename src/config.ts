@@ -29,6 +29,8 @@ interface TomoConfig {
   sessionModelOverrides: Record<string, string>;
   /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
   channelAllowlists: Record<string, string[]>;
+  /** Secret phrase to activate tomo in a group chat. Null = group chat disabled. */
+  groupSecret: string | null;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -112,6 +114,7 @@ function buildConfig(): TomoConfig {
     imessageWebhookPort,
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
     channelAllowlists: parseAllowlists(channels),
+    groupSecret: (file.groupSecret as string) ?? null,
   };
 }
 

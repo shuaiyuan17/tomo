@@ -14,7 +14,7 @@
   Personality system &middot;
   Persistent memory &middot;
   Scheduled tasks &middot;
-  Telegram (more channels coming)
+  Telegram &middot; iMessage
 </p>
 
 ---
@@ -33,12 +33,15 @@ That's it. Open Telegram and message your bot.
 
 - Node.js 22+
 - [Claude Code](https://claude.com/claude-code) installed and authenticated (subscription plan — API keys are not currently supported)
-- Telegram bot token (from [@BotFather](https://t.me/BotFather))
+- At least one channel:
+  - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)
+  - **iMessage** — [BlueBubbles](https://bluebubbles.app) server running on a Mac with iMessage signed in
 
 ## CLI
 
 ```bash
 tomo init              # First-time setup
+tomo config            # Interactive settings (model, channels, identities, groups)
 tomo start             # Start in background (daemon)
 tomo start -f          # Start in foreground (for dev)
 tomo stop              # Stop the daemon
@@ -48,16 +51,14 @@ tomo logs              # View logs (pretty-printed)
 tomo logs -f           # Follow logs live
 tomo sessions list     # Show active sessions
 tomo sessions clear    # Reset all sessions
-tomo cron add          # Create a scheduled task
-tomo cron list         # List all jobs
-tomo cron remove <id>  # Delete a job
 ```
 
-## Telegram Commands
+## Chat Commands
 
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
+| `/model` | Switch model (sonnet/opus/haiku) |
 
 ## Features
 
@@ -84,7 +85,20 @@ File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` ind
   - Image/photo support (sends to Claude as vision input)
   - Group chat: only responds when @mentioned or replied to, tracks participants
   - Markdown rendering with plain-text fallback
-- More channels coming (iMessage, Discord, etc.)
+- **iMessage** — via [BlueBubbles](https://bluebubbles.app)
+  - DM and group chat support
+  - Image attachment support
+  - Contact name resolution from Mac contacts
+  - Group chat: observes all messages, only responds when relevant (replies `NO_REPLY` to stay silent)
+
+### Multi-Channel Sessions
+
+Talk to Tomo from multiple channels using the same session. Configure identities in `tomo config` to bind your Telegram and iMessage accounts — Tomo replies on whichever channel you last used (or a fixed default).
+
+- DM sessions are unified across channels per identity
+- Group chats always get their own isolated session
+- Per-channel allowlists control who can message Tomo
+- Group chats require a secret passphrase to activate (configured in `tomo config`)
 
 ### Tools
 
@@ -101,24 +115,7 @@ Tomo has access to Claude's built-in tools:
 
 ### Scheduled Tasks
 
-```bash
-# One-shot reminder
-tomo cron add --name "standup" --schedule "in 20m" --message "Time for standup!"
-
-# Recurring task
-tomo cron add --name "morning" --schedule "0 9 * * *" --message "Check calendar and weather"
-
-# Interval
-tomo cron add --name "check" --schedule "every 2h" --message "Check email inbox"
-```
-
-Tomo can also create jobs itself — just ask "remind me in 30 minutes to stretch."
-
-| Format | Type | Example |
-|--------|------|---------|
-| `in Xm/h/d` | One-shot | `in 30m`, `in 2h` |
-| `every Xm/h` | Recurring interval | `every 30m` |
-| Cron expression | Recurring (5-field) | `0 9 * * *` |
+Tomo can create scheduled tasks on its own — just ask "remind me in 30 minutes to stretch" or "check the weather every morning at 9am." Supports one-shot reminders, recurring intervals, and cron expressions.
 
 ### Sessions
 
@@ -138,7 +135,7 @@ Structured logs via [pino](https://github.com/pinojs/pino):
 
 ```
 ~/.tomo/
-  config.json                 # Telegram token, model
+  config.json                 # Channels, identities, model, settings
   tomo.pid                    # PID file (when running)
   workspace/
     SOUL.md                   # Your personality config
@@ -155,14 +152,23 @@ Structured logs via [pino](https://github.com/pinojs/pino):
 
 ## Configuration
 
-Config lives at `~/.tomo/config.json`:
+Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
 
 ```json
 {
   "channels": {
-    "telegram": { "token": "your-bot-token" }
+    "telegram": { "token": "your-bot-token", "allowlist": ["123456789"] },
+    "imessage": { "url": "http://localhost:1234", "password": "...", "allowlist": ["+15551234567"] }
   },
-  "model": "claude-sonnet-4-6"
+  "identities": [
+    {
+      "name": "yourname",
+      "channels": { "telegram": "123456789", "imessage": "+15551234567" },
+      "replyPolicy": "last-active"
+    }
+  ],
+  "model": "claude-sonnet-4-6",
+  "groupSecret": "tomo-xxxxxxxx"
 }
 ```
 
@@ -171,6 +177,7 @@ Environment variables override config file values:
 | Variable | Description |
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
+| `IMESSAGE_URL` | Override BlueBubbles URL |
 | `CLAUDE_MODEL` | Override model |
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `LOG_LEVEL` | Log level (default: `debug`) |

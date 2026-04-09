@@ -19,9 +19,9 @@ const MODELS: Record<string, string> = {
 
 const MODEL_LABELS: Record<string, string> = {
   "claude-sonnet-4-6": "Sonnet 4.6 (fast)",
-  "claude-sonnet-4-6[1m]": "Sonnet 4.6 1M (fast, recommended)",
+  "claude-sonnet-4-6[1m]": "Sonnet 4.6 1M (fast, Max Plan only)",
   "claude-opus-4-6": "Opus 4.6 (most capable)",
-  "claude-opus-4-6[1m]": "Opus 4.6 1M (most capable, extended context)",
+  "claude-opus-4-6[1m]": "Opus 4.6 1M (most capable, Max Plan only)",
   "claude-haiku-4-5": "Haiku 4.5 (cheapest)",
 };
 

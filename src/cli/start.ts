@@ -85,7 +85,19 @@ async function startForeground(): Promise<void> {
   }
 
   const agent = new Agent();
-  agent.addChannel(new TelegramChannel(config.telegramToken));
+
+  if (config.telegramToken) {
+    agent.addChannel(new TelegramChannel(config.telegramToken));
+  }
+
+  if (config.imessageUrl) {
+    const { BlueBubblesChannel } = await import("../channels/index.js");
+    agent.addChannel(new BlueBubblesChannel({
+      url: config.imessageUrl,
+      password: config.imessagePassword,
+      webhookPort: config.imessageWebhookPort,
+    }));
+  }
 
   const scheduler = new CronScheduler(agent);
 

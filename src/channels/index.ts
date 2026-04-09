@@ -6,3 +6,4 @@ export type {
   MessageHandler,
 } from "./types.js";
 export { TelegramChannel } from "./telegram.js";
+export { BlueBubblesChannel } from "./imessage.js";

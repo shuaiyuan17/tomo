@@ -180,6 +180,29 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
+      p.log.message([
+        "Your Telegram user ID is needed so only you can message the bot.",
+        "",
+        "  To find it: message @userinfobot on Telegram — it replies with your ID.",
+        "  It looks like: 123456789",
+        "",
+        "  You can add more allowed users later with `tomo config`.",
+      ].join("\n"));
+
+      const telegramUserId = await p.text({
+        message: "Your Telegram user ID",
+        placeholder: "e.g. 123456789",
+        validate: (val) => {
+          if (!val?.trim()) return "User ID is required for security.";
+          if (!/^\d+$/.test(val.trim())) return "User ID should be a number.";
+        },
+      });
+
+      if (p.isCancel(telegramUserId)) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+
       const model = await p.select({
         message: "Default model",
         options: [
@@ -204,14 +227,44 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
+      // Group chat setup
+      const enableGroups = await p.confirm({
+        message: "Enable group chat support?",
+        initialValue: false,
+      });
+
+      if (p.isCancel(enableGroups)) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+
+      let groupSecret: string | null = null;
+      if (enableGroups) {
+        const { randomBytes } = await import("node:crypto");
+        groupSecret = `tomo-${randomBytes(4).toString("hex")}`;
+        p.log.step("Group chat activation");
+        p.log.message([
+          "To activate Tomo in a group chat, send this secret to the group:",
+          "",
+          `  ${groupSecret}`,
+          "",
+          "  Tomo will recognize it and start listening in that group.",
+          "  You can view this secret later with `tomo config`.",
+        ].join("\n"));
+      }
+
+      const userId = (telegramUserId as string).trim();
       const config: Record<string, unknown> = {
         channels: {
-          telegram: { token: token as string },
+          telegram: { token: token as string, allowlist: [userId] },
         },
         model,
       };
       if ((city as string)?.trim()) {
         config.city = (city as string).trim();
+      }
+      if (groupSecret) {
+        config.groupSecret = groupSecret;
       }
 
       writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");

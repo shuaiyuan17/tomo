@@ -1,9 +1,10 @@
 import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
-import { config } from "./config.js";
+import { config, CONFIG_PATH } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
+import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 
 function isSilentReply(text: string): boolean {
@@ -319,19 +320,65 @@ function summarizeToolInput(name: string, input?: Record<string, unknown>): stri
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
+  private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
+  private messageQueues = new Map<string, Promise<void>>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
+    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
+
+    // Load persistent per-session model overrides
+    for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
+      this.modelOverrides.set(key, model);
+    }
+  }
+
+  /** Look up a channel by name */
+  private getChannel(name: string): Channel | undefined {
+    return this.channels.find((ch) => ch.name === name);
+  }
+
+  /** Activate a group chat by adding it to the channel's allowlist */
+  private async activateGroup(channel: Channel, chatId: string): Promise<void> {
+    try {
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
+      if (!channels[channel.name]) channels[channel.name] = {};
+      const allowlist = ((channels[channel.name].allowlist ?? []) as string[]);
+      if (!allowlist.includes(chatId)) {
+        allowlist.push(chatId);
+        channels[channel.name].allowlist = allowlist;
+        cfg.channels = channels;
+        writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+        // Update the router's in-memory allowlist
+        this.router.addToAllowlist(channel.name, chatId);
+      }
+      log.info({ channel: channel.name, chatId }, "Group chat activated via secret");
+      await channel.send({ chatId, text: "Tomo activated in this group." });
+    } catch (err) {
+      log.error({ err }, "Failed to activate group");
+    }
   }
 
   addChannel(channel: Channel): void {
-    channel.onMessage((msg) => this.handleMessage(channel, msg));
+    channel.onMessage((msg) => this.enqueueMessage(channel, msg));
     channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
     this.channels.push(channel);
+  }
+
+  /** Queue messages per session key so they process sequentially */
+  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+    const isGroup = message.isGroup ?? false;
+    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
+
+    const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
+    const next = prev.then(() => this.handleMessage(channel, message)).catch(() => {});
+    this.messageQueues.set(sessionKey, next);
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
@@ -341,7 +388,7 @@ export class Agent {
   };
 
   private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
-    const key = this.sessionKey(channel, chatId);
+    const { sessionKey: key } = this.router.resolve(channel.name, chatId, false);
 
     if (command === "new") {
       this.closeLiveSession(key);
@@ -372,10 +419,6 @@ export class Agent {
       await channel.send({ chatId, text: `Switched to ${resolved}` });
       return;
     }
-  }
-
-  private sessionKey(channel: Channel, chatId: string): string {
-    return `${channel.name}:${chatId}`;
   }
 
   private getOrCreateLiveSession(key: string): LiveSession {
@@ -432,11 +475,27 @@ export class Agent {
       message.text,
     );
 
-    const key = this.sessionKey(channel, message.chatId);
+    // Group secret activation: if message matches the secret, add group to allowlist
+    if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
+      await this.activateGroup(channel, message.chatId);
+      return;
+    }
+
+    // Allowlist check: reject messages from unknown senders
+    if (!this.router.isAllowed(channel.name, message.chatId)) {
+      log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked (not in allowlist)");
+      return;
+    }
+
+    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    const key = resolution.sessionKey;
+    const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? channel;
+    const replyChatId = resolution.replyTarget.chatId;
+
     const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
 
     if (isGroup) {
-      await this.updateGroupContext(key, message.senderName, message.chatTitle);
+      await this.updateGroupContext(key, message.senderName, channel.name, message.chatTitle);
     }
 
     this.sessions.append(key, {
@@ -452,12 +511,14 @@ export class Agent {
       return;
     }
 
-    const stopTyping = channel.startTyping(message.chatId);
+    // iMessage groups: skip typing indicator (most messages will be NO_REPLY)
+    const isImessageGroup = isGroup && channel.name === "imessage";
+    const stopTyping = isImessageGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
       const stampedText = this.injectTimestamp(textForAgent);
 
-      const stream = channel.createStreamingMessage(message.chatId, message.id);
+      const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
       const response = await this.runWithRetry(key, stampedText, (text) => {
         stream.update(text.replace(MEDIA_RE, "").trim());
       }, message.images);
@@ -476,11 +537,11 @@ export class Agent {
       this.sessions.append(key, {
         role: "assistant",
         content: response,
-        channel: channel.name,
+        channel: replyChannel.name,
         timestamp: Date.now(),
       });
 
-      log.info({ channel: channel.name }, "Tomo: %s", response);
+      log.info({ channel: replyChannel.name }, "Tomo: %s", response);
 
       if (isSilentReply(response)) {
         log.info("Silent reply (no message sent)");
@@ -490,7 +551,7 @@ export class Agent {
       // Surface API errors that the SDK returns as response text
       if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
         await stream.finish();
-        await channel.send({ chatId: message.chatId, text: `[error] ${response}`, replyTo: message.id });
+        await replyChannel.send({ chatId: replyChatId, text: `[error] ${response}` });
         return;
       }
 
@@ -501,8 +562,8 @@ export class Agent {
         const validPaths = mediaPaths.filter((p) => fileExists(p));
         if (validPaths.length > 0) {
           for (let i = 0; i < validPaths.length; i++) {
-            await channel.send({
-              chatId: message.chatId,
+            await replyChannel.send({
+              chatId: replyChatId,
               photo: validPaths[i],
               text: i === 0 ? cleanText : "",
             });
@@ -517,11 +578,14 @@ export class Agent {
     } catch (err) {
       stopTyping();
       log.error({ err }, "Error handling message");
+
+      // iMessage groups: suppress error messages to avoid polluting the chat
+      if (isImessageGroup) return;
+
       const detail = err instanceof Error ? err.message : String(err);
-      await channel.send({
-        chatId: message.chatId,
+      await replyChannel.send({
+        chatId: replyChatId,
         text: `[error] ${detail}`,
-        replyTo: message.id,
       });
     }
   }
@@ -572,7 +636,7 @@ export class Agent {
     }
   }
 
-  private async updateGroupContext(key: string, senderName: string, chatTitle?: string): Promise<void> {
+  private async updateGroupContext(key: string, senderName: string, channelName: string, chatTitle?: string): Promise<void> {
     let participants = this.groupParticipants.get(key);
     const isNew = !participants;
 
@@ -587,7 +651,12 @@ export class Agent {
     if (isNew || !wasKnown) {
       const names = [...participants].join(", ");
       const title = chatTitle ? `"${chatTitle}"` : "a group chat";
-      const contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
+      let contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
+
+      // iMessage groups: inject guidance to stay silent unless needed
+      if (isNew && channelName === "imessage") {
+        contextMsg += " This is an iMessage group chat. You see every message but should only reply when you have something genuinely useful to add. Reply NO_REPLY to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.";
+      }
 
       try {
         await this.runWithRetry(key, contextMsg);
@@ -611,33 +680,52 @@ export class Agent {
 
   /** Handle a cron-triggered message */
   async handleCronMessage(message: string, channelName?: string, chatId?: string): Promise<void> {
-    const channel = channelName
-      ? this.channels.find((ch) => ch.name === channelName)
-      : this.channels[0];
+    // Resolve delivery target
+    let key: string;
+    let deliveryChannel: Channel;
+    let deliveryChatId: string;
 
-    if (!channel) {
-      log.warn({ channelName }, "Cron: no channel found for delivery");
-      return;
+    if (channelName && chatId) {
+      // Explicit channel+chatId from cron job — resolve through router for identity support
+      const resolution = this.router.resolve(channelName, chatId, false);
+      key = resolution.sessionKey;
+      deliveryChannel = this.getChannel(resolution.replyTarget.channelName) ?? this.channels[0];
+      deliveryChatId = resolution.replyTarget.chatId;
+    } else {
+      // No explicit target — try unified dm session first, then fall back to channel scan
+      const dmKey = this.router.findFirstDmSession();
+      if (dmKey) {
+        key = dmKey;
+        const target = this.router.getReplyTarget(dmKey);
+        if (target) {
+          deliveryChannel = this.getChannel(target.channelName) ?? this.channels[0];
+          deliveryChatId = target.chatId;
+        } else {
+          log.warn("Cron: dm session has no reply target");
+          return;
+        }
+      } else {
+        // Legacy fallback: find last active chatId on first channel
+        const channel = this.channels[0];
+        if (!channel) { log.warn("Cron: no channel available"); return; }
+        const fallbackChatId = this.findLastChatId(channel.name);
+        if (!fallbackChatId) { log.warn({ channel: channel.name }, "Cron: no chatId available"); return; }
+        key = `${channel.name}:${fallbackChatId}`;
+        deliveryChannel = channel;
+        deliveryChatId = fallbackChatId;
+      }
     }
 
-    const targetChatId = chatId ?? this.findLastChatId(channel.name);
-    if (!targetChatId) {
-      log.warn({ channel: channel.name }, "Cron: no chatId available for delivery");
-      return;
-    }
-
-    const key = this.sessionKey(channel, targetChatId);
     const stampedMessage = this.injectTimestamp(message);
+    log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
-    log.info({ channel: channel.name, sender: "cron" }, message);
-
-    const stopTyping = channel.startTyping(targetChatId);
+    const stopTyping = deliveryChannel.startTyping(deliveryChatId);
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);
       stopTyping();
 
-      log.info({ channel: channel.name }, "Tomo: %s", response);
+      log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
       if (isSilentReply(response)) {
         log.info("Cron completed silently (no reply sent)");
@@ -647,40 +735,38 @@ export class Agent {
       this.sessions.append(key, {
         role: "assistant",
         content: response,
-        channel: channel.name,
+        channel: deliveryChannel.name,
         timestamp: Date.now(),
       });
 
-      await channel.send({ chatId: targetChatId, text: response });
+      await deliveryChannel.send({ chatId: deliveryChatId, text: response });
     } catch (err) {
       stopTyping();
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
-      await channel.send({ chatId: targetChatId, text: `[error] cron failed: ${detail}` });
+      await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });
     }
   }
 
   /** Handle a continuity heartbeat — runs on the first active DM session */
   async handleContinuity(prompt: string): Promise<void> {
-    // Find the first active DM session
-    const channel = this.channels[0];
-    if (!channel) {
-      log.warn("Continuity: no channel available");
-      return;
-    }
+    // Prefer unified dm session, then fall back to channel-scoped session
+    const dmKey = this.router.findFirstDmSession();
+    let key: string;
 
-    const targetChatId = this.findLastChatId(channel.name);
-    if (!targetChatId) {
-      log.debug("Continuity: no active session, skipping");
-      return;
+    if (dmKey) {
+      key = dmKey;
+    } else {
+      const channel = this.channels[0];
+      if (!channel) { log.warn("Continuity: no channel available"); return; }
+      const chatId = this.findLastChatId(channel.name);
+      if (!chatId) { log.debug("Continuity: no active session, skipping"); return; }
+      key = `${channel.name}:${chatId}`;
     }
-
-    const key = this.sessionKey(channel, targetChatId);
 
     try {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
-      // Continuity responses are always silent — agent should reply NO_REPLY
     } catch (err) {
       log.error({ err }, "Continuity heartbeat failed");
     }

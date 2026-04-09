@@ -470,7 +470,7 @@ async function manageAllowlist(
 
     if (choice === "add") {
       const placeholder = channelName === "telegram"
-        ? "Telegram user ID (e.g. 1360399016)"
+        ? "Telegram user ID (e.g. 123456789)"
         : "Chat GUID (e.g. iMessage;-;+15551234567)";
       const hint = channelName === "telegram"
         ? "Find your ID: message @userinfobot on Telegram"
@@ -521,7 +521,7 @@ async function pickChatId(channelName: string, currentValue?: string): Promise<s
     // No sessions — fall back to manual input
     const chatId = await p.text({
       message: `Chat ID for ${channelName}`,
-      placeholder: channelName === "telegram" ? "e.g. 1360399016" : "e.g. iMessage;-;+15551234567",
+      placeholder: channelName === "telegram" ? "e.g. 123456789" : "e.g. iMessage;-;+15551234567",
       initialValue: currentValue ?? "",
     });
     if (p.isCancel(chatId)) return null;
@@ -558,7 +558,7 @@ async function pickChatId(channelName: string, currentValue?: string): Promise<s
   if (choice === "__manual__") {
     const chatId = await p.text({
       message: `Chat ID for ${channelName}`,
-      placeholder: channelName === "telegram" ? "e.g. 1360399016" : "e.g. iMessage;-;+15551234567",
+      placeholder: channelName === "telegram" ? "e.g. 123456789" : "e.g. iMessage;-;+15551234567",
       initialValue: currentValue ?? "",
     });
     if (p.isCancel(chatId)) return null;

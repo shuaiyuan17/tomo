@@ -184,14 +184,14 @@ export const initCommand = new Command("init")
         "Your Telegram user ID is needed so only you can message the bot.",
         "",
         "  To find it: message @userinfobot on Telegram — it replies with your ID.",
-        "  It looks like: 1360399016",
+        "  It looks like: 123456789",
         "",
         "  You can add more allowed users later with `tomo config`.",
       ].join("\n"));
 
       const telegramUserId = await p.text({
         message: "Your Telegram user ID",
-        placeholder: "e.g. 1360399016",
+        placeholder: "e.g. 123456789",
         validate: (val) => {
           if (!val?.trim()) return "User ID is required for security.";
           if (!/^\d+$/.test(val.trim())) return "User ID should be a number.";

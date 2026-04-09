@@ -14,7 +14,7 @@ export const lcmCommand = new Command("lcm")
 lcmCommand
   .command("session-id")
   .description("Get the active SDK session ID for a channel")
-  .requiredOption("--channel-key <key>", "Channel key (e.g. telegram_1360399016)")
+  .requiredOption("--channel-key <key>", "Channel key (e.g. telegram_123456789)")
   .action((opts) => {
     const store = new SessionStore(sessionsDir, 20);
     const sid = store.getSdkSessionId(opts.channelKey);
@@ -60,7 +60,7 @@ lcmCommand
   .requiredOption("--from-time <iso>", "Start timestamp (ISO 8601, e.g. 2026-03-28T16:29)")
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
-  .option("--channel-key <key>", "Channel key for transcript archive (e.g. telegram_1360399016)")
+  .option("--channel-key <key>", "Channel key for transcript archive (e.g. telegram_123456789)")
   .action((opts) => {
     // Resolve timestamps to indices using context_stats
     const stats = computeContextStats(opts.sessionId);
@@ -107,7 +107,7 @@ lcmCommand
 lcmCommand
   .command("search")
   .description("Search the transcript and archive for messages matching a query")
-  .option("--channel-key <key>", "Channel key (e.g. telegram_1360399016)")
+  .option("--channel-key <key>", "Channel key (e.g. telegram_123456789)")
   .option("--session-id <id>", "SDK session ID (searches archive too)")
   .option("--query <text>", "Text to search for")
   .option("--from-seq <n>", "Start seq number", parseInt)

@@ -322,6 +322,7 @@ export class Agent {
   private sessions: SessionStore;
   private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
+  private messageQueues = new Map<string, Promise<void>>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
@@ -342,9 +343,19 @@ export class Agent {
   }
 
   addChannel(channel: Channel): void {
-    channel.onMessage((msg) => this.handleMessage(channel, msg));
+    channel.onMessage((msg) => this.enqueueMessage(channel, msg));
     channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
     this.channels.push(channel);
+  }
+
+  /** Queue messages per session key so they process sequentially */
+  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+    const isGroup = message.isGroup ?? false;
+    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
+
+    const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
+    const next = prev.then(() => this.handleMessage(channel, message)).catch(() => {});
+    this.messageQueues.set(sessionKey, next);
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {

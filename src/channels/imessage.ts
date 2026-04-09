@@ -19,6 +19,7 @@ export class BlueBubblesChannel implements Channel {
   private apiUrl: string;
   private password: string;
   private webhookPort: number;
+  private contactCache = new Map<string, string>(); // address → display name
 
   constructor(config: BlueBubblesConfig) {
     this.apiUrl = config.url.replace(/\/+$/, "");
@@ -45,6 +46,9 @@ export class BlueBubblesChannel implements Channel {
       log.error({ err }, "Failed to connect to BlueBubbles server at %s", this.apiUrl);
       throw new Error(`BlueBubbles server unreachable at ${this.apiUrl}`, { cause: err });
     }
+
+    // Load contacts for name resolution
+    await this.loadContacts();
 
     // Start webhook HTTP server
     await this.startWebhookServer();
@@ -260,10 +264,12 @@ export class BlueBubblesChannel implements Channel {
     const attachments = data.attachments as Array<Record<string, unknown>> | undefined;
     const images = await this.downloadAttachments(attachments);
 
+    const senderName = this.resolveContactName(senderAddress);
+
     const message: IncomingMessage = {
       id: guid,
       chatId: chatGuid,
-      senderName: senderAddress,
+      senderName,
       text: text || (images.length > 0 ? "[Sent an image]" : ""),
       images: images.length > 0 ? images : undefined,
       timestamp: typeof data.dateCreated === "number" ? data.dateCreated : Date.now(),
@@ -307,6 +313,49 @@ export class BlueBubblesChannel implements Channel {
     }
 
     return images;
+  }
+
+  // --- Contact resolution ---
+
+  private async loadContacts(): Promise<void> {
+    try {
+      const result = await this.api("GET", "/contact");
+      const contacts = (result?.data ?? []) as Array<Record<string, unknown>>;
+
+      for (const contact of contacts) {
+        const firstName = (contact.firstName as string) ?? "";
+        const lastName = (contact.lastName as string) ?? "";
+        const displayName = [firstName, lastName].filter(Boolean).join(" ");
+        if (!displayName) continue;
+
+        // Map all phone numbers and emails for this contact
+        const phoneNumbers = (contact.phoneNumbers ?? []) as Array<Record<string, unknown>>;
+        const emails = (contact.emails ?? []) as Array<Record<string, unknown>>;
+
+        for (const phone of phoneNumbers) {
+          const addr = phone.address as string | undefined;
+          if (addr) this.contactCache.set(this.normalizeAddress(addr), displayName);
+        }
+        for (const email of emails) {
+          const addr = email.address as string | undefined;
+          if (addr) this.contactCache.set(addr.toLowerCase(), displayName);
+        }
+      }
+
+      log.info({ contacts: this.contactCache.size }, "Contacts loaded");
+    } catch (err) {
+      log.warn({ err }, "Failed to load contacts, will use raw addresses");
+    }
+  }
+
+  private resolveContactName(address: string): string {
+    return this.contactCache.get(this.normalizeAddress(address)) ?? address;
+  }
+
+  /** Normalize phone number: strip non-digits except leading + */
+  private normalizeAddress(addr: string): string {
+    if (addr.includes("@")) return addr.toLowerCase();
+    return addr.replace(/[^\d+]/g, "");
   }
 
   // --- BlueBubbles API ---

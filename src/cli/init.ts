@@ -180,6 +180,29 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
+      p.log.message([
+        "Your Telegram user ID is needed so only you can message the bot.",
+        "",
+        "  To find it: message @userinfobot on Telegram — it replies with your ID.",
+        "  It looks like: 1360399016",
+        "",
+        "  You can add more allowed users later with `tomo config`.",
+      ].join("\n"));
+
+      const telegramUserId = await p.text({
+        message: "Your Telegram user ID",
+        placeholder: "e.g. 1360399016",
+        validate: (val) => {
+          if (!val?.trim()) return "User ID is required for security.";
+          if (!/^\d+$/.test(val.trim())) return "User ID should be a number.";
+        },
+      });
+
+      if (p.isCancel(telegramUserId)) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+
       const model = await p.select({
         message: "Default model",
         options: [
@@ -204,9 +227,10 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
+      const userId = (telegramUserId as string).trim();
       const config: Record<string, unknown> = {
         channels: {
-          telegram: { token: token as string },
+          telegram: { token: token as string, allowlist: [userId] },
         },
         model,
       };

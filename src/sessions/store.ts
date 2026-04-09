@@ -1,7 +1,7 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { Session, SessionMessage, SessionEntry, SessionRegistry } from "./types.js";
+import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { log } from "../logger.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -334,6 +334,55 @@ export class SessionStore {
       this.saveRegistry();
       log.info({ count: expired.length }, "Cleaned up expired sessions");
     }
+  }
+
+  // --- Reply target for unified sessions ---
+
+  /** Get the persisted reply target for a session key */
+  getReplyTarget(key: string): ReplyTarget | undefined {
+    this.loadRegistry();
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    return entry?.replyTarget;
+  }
+
+  /** Set and persist the reply target for a session key */
+  setReplyTarget(key: string, target: ReplyTarget): void {
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    if (entry) {
+      entry.replyTarget = target;
+      this.saveRegistry();
+    }
+  }
+
+  /** Migrate a session from one key to another (for identity-based session unification) */
+  migrateSessionKey(oldKey: string, newKey: string): void {
+    const entry = this.registry.find((e) => e.channelKey === oldKey && e.unlinkedAt === null);
+    if (!entry) return;
+
+    // Create new entry with the new key
+    const now = Date.now();
+    this.registry.push({
+      ...entry,
+      channelKey: newKey,
+      lastActiveAt: now,
+    });
+
+    // Unlink the old entry
+    entry.unlinkedAt = now;
+    entry.expiresAt = now + 30 * 24 * 60 * 60 * 1000; // 30 days
+
+    // Rename transcript file
+    const oldPath = this.transcriptPath(oldKey);
+    const newPath = this.transcriptPath(newKey);
+    if (existsSync(oldPath) && !existsSync(newPath)) {
+      renameSync(oldPath, newPath);
+    }
+
+    // Clear in-memory session cache for old key
+    this.sessions.delete(oldKey);
+
+    this.saveRegistry();
+    log.info({ oldKey, newKey, sdkSessionId: entry.sdkSessionId }, "Session migrated to unified key");
   }
 
   // --- Registry persistence ---

@@ -4,6 +4,7 @@ import { config } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
+import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 
 function isSilentReply(text: string): boolean {
@@ -319,6 +320,7 @@ function summarizeToolInput(name: string, input?: Record<string, unknown>): stri
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
+  private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
@@ -326,6 +328,12 @@ export class Agent {
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
+    this.router = new IdentityRouter(config.identities, this.sessions);
+  }
+
+  /** Look up a channel by name */
+  private getChannel(name: string): Channel | undefined {
+    return this.channels.find((ch) => ch.name === name);
   }
 
   addChannel(channel: Channel): void {
@@ -341,7 +349,7 @@ export class Agent {
   };
 
   private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
-    const key = this.sessionKey(channel, chatId);
+    const { sessionKey: key } = this.router.resolve(channel.name, chatId, false);
 
     if (command === "new") {
       this.closeLiveSession(key);
@@ -372,10 +380,6 @@ export class Agent {
       await channel.send({ chatId, text: `Switched to ${resolved}` });
       return;
     }
-  }
-
-  private sessionKey(channel: Channel, chatId: string): string {
-    return `${channel.name}:${chatId}`;
   }
 
   private getOrCreateLiveSession(key: string): LiveSession {
@@ -432,7 +436,11 @@ export class Agent {
       message.text,
     );
 
-    const key = this.sessionKey(channel, message.chatId);
+    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    const key = resolution.sessionKey;
+    const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? channel;
+    const replyChatId = resolution.replyTarget.chatId;
+
     const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
 
     if (isGroup) {
@@ -452,12 +460,12 @@ export class Agent {
       return;
     }
 
-    const stopTyping = channel.startTyping(message.chatId);
+    const stopTyping = replyChannel.startTyping(replyChatId);
 
     try {
       const stampedText = this.injectTimestamp(textForAgent);
 
-      const stream = channel.createStreamingMessage(message.chatId, message.id);
+      const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
       const response = await this.runWithRetry(key, stampedText, (text) => {
         stream.update(text.replace(MEDIA_RE, "").trim());
       }, message.images);
@@ -476,11 +484,11 @@ export class Agent {
       this.sessions.append(key, {
         role: "assistant",
         content: response,
-        channel: channel.name,
+        channel: replyChannel.name,
         timestamp: Date.now(),
       });
 
-      log.info({ channel: channel.name }, "Tomo: %s", response);
+      log.info({ channel: replyChannel.name }, "Tomo: %s", response);
 
       if (isSilentReply(response)) {
         log.info("Silent reply (no message sent)");
@@ -490,7 +498,7 @@ export class Agent {
       // Surface API errors that the SDK returns as response text
       if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
         await stream.finish();
-        await channel.send({ chatId: message.chatId, text: `[error] ${response}`, replyTo: message.id });
+        await replyChannel.send({ chatId: replyChatId, text: `[error] ${response}` });
         return;
       }
 
@@ -501,8 +509,8 @@ export class Agent {
         const validPaths = mediaPaths.filter((p) => fileExists(p));
         if (validPaths.length > 0) {
           for (let i = 0; i < validPaths.length; i++) {
-            await channel.send({
-              chatId: message.chatId,
+            await replyChannel.send({
+              chatId: replyChatId,
               photo: validPaths[i],
               text: i === 0 ? cleanText : "",
             });
@@ -518,10 +526,9 @@ export class Agent {
       stopTyping();
       log.error({ err }, "Error handling message");
       const detail = err instanceof Error ? err.message : String(err);
-      await channel.send({
-        chatId: message.chatId,
+      await replyChannel.send({
+        chatId: replyChatId,
         text: `[error] ${detail}`,
-        replyTo: message.id,
       });
     }
   }
@@ -611,33 +618,52 @@ export class Agent {
 
   /** Handle a cron-triggered message */
   async handleCronMessage(message: string, channelName?: string, chatId?: string): Promise<void> {
-    const channel = channelName
-      ? this.channels.find((ch) => ch.name === channelName)
-      : this.channels[0];
+    // Resolve delivery target
+    let key: string;
+    let deliveryChannel: Channel;
+    let deliveryChatId: string;
 
-    if (!channel) {
-      log.warn({ channelName }, "Cron: no channel found for delivery");
-      return;
+    if (channelName && chatId) {
+      // Explicit channel+chatId from cron job — resolve through router for identity support
+      const resolution = this.router.resolve(channelName, chatId, false);
+      key = resolution.sessionKey;
+      deliveryChannel = this.getChannel(resolution.replyTarget.channelName) ?? this.channels[0];
+      deliveryChatId = resolution.replyTarget.chatId;
+    } else {
+      // No explicit target — try unified dm session first, then fall back to channel scan
+      const dmKey = this.router.findFirstDmSession();
+      if (dmKey) {
+        key = dmKey;
+        const target = this.router.getReplyTarget(dmKey);
+        if (target) {
+          deliveryChannel = this.getChannel(target.channelName) ?? this.channels[0];
+          deliveryChatId = target.chatId;
+        } else {
+          log.warn("Cron: dm session has no reply target");
+          return;
+        }
+      } else {
+        // Legacy fallback: find last active chatId on first channel
+        const channel = this.channels[0];
+        if (!channel) { log.warn("Cron: no channel available"); return; }
+        const fallbackChatId = this.findLastChatId(channel.name);
+        if (!fallbackChatId) { log.warn({ channel: channel.name }, "Cron: no chatId available"); return; }
+        key = `${channel.name}:${fallbackChatId}`;
+        deliveryChannel = channel;
+        deliveryChatId = fallbackChatId;
+      }
     }
 
-    const targetChatId = chatId ?? this.findLastChatId(channel.name);
-    if (!targetChatId) {
-      log.warn({ channel: channel.name }, "Cron: no chatId available for delivery");
-      return;
-    }
-
-    const key = this.sessionKey(channel, targetChatId);
     const stampedMessage = this.injectTimestamp(message);
+    log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
-    log.info({ channel: channel.name, sender: "cron" }, message);
-
-    const stopTyping = channel.startTyping(targetChatId);
+    const stopTyping = deliveryChannel.startTyping(deliveryChatId);
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);
       stopTyping();
 
-      log.info({ channel: channel.name }, "Tomo: %s", response);
+      log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
       if (isSilentReply(response)) {
         log.info("Cron completed silently (no reply sent)");
@@ -647,40 +673,38 @@ export class Agent {
       this.sessions.append(key, {
         role: "assistant",
         content: response,
-        channel: channel.name,
+        channel: deliveryChannel.name,
         timestamp: Date.now(),
       });
 
-      await channel.send({ chatId: targetChatId, text: response });
+      await deliveryChannel.send({ chatId: deliveryChatId, text: response });
     } catch (err) {
       stopTyping();
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
-      await channel.send({ chatId: targetChatId, text: `[error] cron failed: ${detail}` });
+      await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });
     }
   }
 
   /** Handle a continuity heartbeat — runs on the first active DM session */
   async handleContinuity(prompt: string): Promise<void> {
-    // Find the first active DM session
-    const channel = this.channels[0];
-    if (!channel) {
-      log.warn("Continuity: no channel available");
-      return;
-    }
+    // Prefer unified dm session, then fall back to channel-scoped session
+    const dmKey = this.router.findFirstDmSession();
+    let key: string;
 
-    const targetChatId = this.findLastChatId(channel.name);
-    if (!targetChatId) {
-      log.debug("Continuity: no active session, skipping");
-      return;
+    if (dmKey) {
+      key = dmKey;
+    } else {
+      const channel = this.channels[0];
+      if (!channel) { log.warn("Continuity: no channel available"); return; }
+      const chatId = this.findLastChatId(channel.name);
+      if (!chatId) { log.debug("Continuity: no active session, skipping"); return; }
+      key = `${channel.name}:${chatId}`;
     }
-
-    const key = this.sessionKey(channel, targetChatId);
 
     try {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
-      // Continuity responses are always silent — agent should reply NO_REPLY
     } catch (err) {
       log.error({ err }, "Continuity heartbeat failed");
     }

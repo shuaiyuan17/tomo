@@ -47,10 +47,15 @@ export interface SessionStats {
   contextBreakdown?: ContextCategory[];
 }
 
+export interface ReplyTarget {
+  channelName: string;
+  chatId: string;
+}
+
 export interface SessionEntry {
   /** SDK session ID (UUID) */
   sdkSessionId: string;
-  /** Channel session key (e.g. "telegram:12345") */
+  /** Channel session key (e.g. "telegram:12345" or "dm:shuai") */
   channelKey: string;
   /** When this session was created */
   createdAt: number;
@@ -62,6 +67,8 @@ export interface SessionEntry {
   expiresAt: number | null;
   /** Cumulative session statistics */
   stats: SessionStats;
+  /** Reply routing target for unified multi-channel sessions */
+  replyTarget?: ReplyTarget;
 }
 
 export interface SessionRegistry {

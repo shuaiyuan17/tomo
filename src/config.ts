@@ -6,6 +6,12 @@ const HOME = homedir();
 const TOMO_HOME = join(HOME, ".tomo");
 const CONFIG_PATH = join(TOMO_HOME, "config.json");
 
+export interface IdentityConfig {
+  name: string;
+  channels: Record<string, string>;  // channelName → chatId
+  replyPolicy: string;               // "last-active" | channelName
+}
+
 interface TomoConfig {
   telegramToken: string;
   model: string;
@@ -16,6 +22,10 @@ interface TomoConfig {
   tomoHome: string;
   continuity: boolean;
   city: string | null;
+  identities: IdentityConfig[];
+  imessageUrl: string;
+  imessagePassword: string;
+  imessageWebhookPort: number;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -36,11 +46,42 @@ function buildConfig(): TomoConfig {
     channels.telegram?.token ??
     "";
 
-  if (!telegramToken) {
+  const imessageUrl =
+    process.env.IMESSAGE_URL ??
+    channels.imessage?.url ??
+    "";
+
+  const imessagePassword =
+    process.env.IMESSAGE_PASSWORD ??
+    channels.imessage?.password ??
+    "";
+
+  const imessageWebhookPort = Number(
+    process.env.IMESSAGE_WEBHOOK_PORT ??
+    channels.imessage?.webhookPort ??
+    "3100",
+  );
+
+  // At least one channel must be configured
+  if (!telegramToken && !imessageUrl) {
     throw new Error(
-      "Telegram bot token not found. Run 'tomo init' or set TELEGRAM_BOT_TOKEN.",
+      "No channels configured. Run 'tomo init' or set TELEGRAM_BOT_TOKEN / IMESSAGE_URL.",
     );
   }
+
+  // Parse identities
+  const rawIdentities = (file.identities ?? []) as Array<{
+    name?: string;
+    channels?: Record<string, string>;
+    replyPolicy?: string;
+  }>;
+  const identities: IdentityConfig[] = rawIdentities
+    .filter((id) => id.name && id.channels)
+    .map((id) => ({
+      name: id.name!,
+      channels: id.channels!,
+      replyPolicy: id.replyPolicy ?? "last-active",
+    }));
 
   return {
     telegramToken,
@@ -52,6 +93,10 @@ function buildConfig(): TomoConfig {
     tomoHome: TOMO_HOME,
     continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
     city: (process.env.TOMO_CITY ?? file.city ?? null) as string | null,
+    identities,
+    imessageUrl,
+    imessagePassword,
+    imessageWebhookPort,
   };
 }
 

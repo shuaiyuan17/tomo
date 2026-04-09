@@ -1,0 +1,102 @@
+import type { IdentityConfig } from "./config.js";
+import type { ReplyTarget } from "./sessions/types.js";
+import type { SessionStore } from "./sessions/store.js";
+import { log } from "./logger.js";
+
+export interface SessionResolution {
+  sessionKey: string;
+  replyTarget: ReplyTarget;
+  identityName?: string;
+}
+
+export class IdentityRouter {
+  constructor(
+    private identities: IdentityConfig[],
+    private sessions: SessionStore,
+  ) {}
+
+  /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
+  resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {
+    // Group chats: always separate sessions
+    if (isGroup) {
+      return {
+        sessionKey: `${channelName}:${chatId}`,
+        replyTarget: { channelName, chatId },
+      };
+    }
+
+    // Find identity matching this channel + chatId
+    const identity = this.findIdentity(channelName, chatId);
+    if (!identity) {
+      return {
+        sessionKey: `${channelName}:${chatId}`,
+        replyTarget: { channelName, chatId },
+      };
+    }
+
+    const sessionKey = `dm:${identity.name}`;
+
+    // Migrate from old channel-scoped key if needed (one-time)
+    this.maybeMigrate(identity, sessionKey);
+
+    // Determine reply target based on policy
+    const replyTarget = this.resolveReplyTarget(identity, channelName, chatId);
+
+    // Persist updated reply target
+    this.sessions.setReplyTarget(sessionKey, replyTarget);
+
+    return { sessionKey, replyTarget, identityName: identity.name };
+  }
+
+  /** Get the current reply target for a session key (used by cron/continuity) */
+  getReplyTarget(sessionKey: string): ReplyTarget | undefined {
+    return this.sessions.getReplyTarget(sessionKey);
+  }
+
+  /** Find the first active dm: session key (for continuity) */
+  findFirstDmSession(): string | undefined {
+    for (const [key] of this.sessions.listSdkSessionIds()) {
+      if (key.startsWith("dm:")) return key;
+    }
+    return undefined;
+  }
+
+  private findIdentity(channelName: string, chatId: string): IdentityConfig | undefined {
+    return this.identities.find((id) => id.channels[channelName] === chatId);
+  }
+
+  private resolveReplyTarget(
+    identity: IdentityConfig,
+    channelName: string,
+    chatId: string,
+  ): ReplyTarget {
+    if (identity.replyPolicy === "last-active") {
+      return { channelName, chatId };
+    }
+
+    // Fixed channel policy: always reply on the configured channel
+    const fixedChannel = identity.replyPolicy;
+    const fixedChatId = identity.channels[fixedChannel];
+    if (fixedChatId) {
+      return { channelName: fixedChannel, chatId: fixedChatId };
+    }
+
+    // Fallback to current channel if configured default is invalid
+    return { channelName, chatId };
+  }
+
+  private maybeMigrate(identity: IdentityConfig, sessionKey: string): void {
+    // Already has a session under the unified key
+    if (this.sessions.getSdkSessionId(sessionKey)) return;
+
+    // Check if any old channel-specific key has an active session
+    for (const [chName, chId] of Object.entries(identity.channels)) {
+      const oldKey = `${chName}:${chId}`;
+      if (this.sessions.getSdkSessionId(oldKey)) {
+        this.sessions.migrateSessionKey(oldKey, sessionKey);
+        log.info({ identity: identity.name, from: oldKey, to: sessionKey }, "Migrated session to unified identity");
+        return;
+      }
+    }
+  }
+}

@@ -27,6 +27,8 @@ interface TomoConfig {
   imessagePassword: string;
   imessageWebhookPort: number;
   sessionModelOverrides: Record<string, string>;
+  /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
+  channelAllowlists: Record<string, string[]>;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -38,28 +40,38 @@ function loadConfigFile(): Record<string, unknown> {
   }
 }
 
+function parseAllowlists(channels: Record<string, Record<string, unknown>>): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const [name, ch] of Object.entries(channels)) {
+    if (Array.isArray(ch.allowlist)) {
+      result[name] = ch.allowlist.map(String);
+    }
+  }
+  return result;
+}
+
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
-  const channels = (file.channels ?? {}) as Record<string, Record<string, string>>;
+  const channels = (file.channels ?? {}) as Record<string, Record<string, unknown>>;
 
   const telegramToken =
     process.env.TELEGRAM_BOT_TOKEN ??
-    channels.telegram?.token ??
+    (channels.telegram?.token as string | undefined) ??
     "";
 
   const imessageUrl =
     process.env.IMESSAGE_URL ??
-    channels.imessage?.url ??
+    (channels.imessage?.url as string | undefined) ??
     "";
 
   const imessagePassword =
     process.env.IMESSAGE_PASSWORD ??
-    channels.imessage?.password ??
+    (channels.imessage?.password as string | undefined) ??
     "";
 
   const imessageWebhookPort = Number(
     process.env.IMESSAGE_WEBHOOK_PORT ??
-    channels.imessage?.webhookPort ??
+    (channels.imessage?.webhookPort as string | undefined) ??
     "3100",
   );
 
@@ -99,6 +111,7 @@ function buildConfig(): TomoConfig {
     imessagePassword,
     imessageWebhookPort,
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
+    channelAllowlists: parseAllowlists(channels),
   };
 }
 

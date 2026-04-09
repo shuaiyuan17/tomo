@@ -10,10 +10,33 @@ export interface SessionResolution {
 }
 
 export class IdentityRouter {
+  private allowlists: Record<string, Set<string>>;
+
   constructor(
     private identities: IdentityConfig[],
     private sessions: SessionStore,
-  ) {}
+    channelAllowlists: Record<string, string[]>,
+  ) {
+    // Build fast lookup sets: explicit allowlist + all identity-bound chatIds per channel
+    this.allowlists = {};
+    for (const [ch, list] of Object.entries(channelAllowlists)) {
+      this.allowlists[ch] = new Set(list);
+    }
+    // Add identity-bound chatIds to each channel's allowlist
+    for (const id of identities) {
+      for (const [ch, chatId] of Object.entries(id.channels)) {
+        if (!this.allowlists[ch]) this.allowlists[ch] = new Set();
+        this.allowlists[ch].add(chatId);
+      }
+    }
+  }
+
+  /** Check if a chatId is allowed on a channel. Returns true if no allowlist is configured (open). */
+  isAllowed(channelName: string, chatId: string): boolean {
+    const allowlist = this.allowlists[channelName];
+    if (!allowlist) return true; // No allowlist → open
+    return allowlist.has(chatId);
+  }
 
   /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
   resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {

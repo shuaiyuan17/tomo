@@ -329,7 +329,7 @@ export class Agent {
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
-    this.router = new IdentityRouter(config.identities, this.sessions);
+    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -451,6 +451,12 @@ export class Agent {
       { channel: channel.name, sender: message.senderName, group: isGroup || undefined, mentioned: isMentioned || undefined, images: hasImages ? message.images!.length : undefined },
       message.text,
     );
+
+    // Allowlist check: reject messages from unknown senders
+    if (!this.router.isAllowed(channel.name, message.chatId)) {
+      log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked (not in allowlist)");
+      return;
+    }
 
     const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
     const key = resolution.sessionKey;

@@ -35,7 +35,13 @@ export class IdentityRouter {
   isAllowed(channelName: string, chatId: string): boolean {
     const allowlist = this.allowlists[channelName];
     if (!allowlist) return true; // No allowlist → open
-    return allowlist.has(chatId);
+    if (allowlist.has(chatId)) return true;
+    // iMessage: match by identifier suffix (e.g. "+15551234567" matches "any;-;+15551234567")
+    if (channelName === "imessage") {
+      const identifier = extractImessageIdentifier(chatId);
+      if (identifier && allowlist.has(identifier)) return true;
+    }
+    return false;
   }
 
   /** Add a chatId to a channel's in-memory allowlist (after persisting to config) */
@@ -91,7 +97,17 @@ export class IdentityRouter {
   }
 
   private findIdentity(channelName: string, chatId: string): IdentityConfig | undefined {
-    return this.identities.find((id) => id.channels[channelName] === chatId);
+    return this.identities.find((id) => {
+      const configured = id.channels[channelName];
+      if (!configured) return false;
+      if (configured === chatId) return true;
+      // iMessage: match by identifier (e.g. config has "+15551234567", chatId is "any;-;+15551234567")
+      if (channelName === "imessage") {
+        const identifier = extractImessageIdentifier(chatId);
+        if (identifier && identifier === configured) return true;
+      }
+      return false;
+    });
   }
 
   private resolveReplyTarget(
@@ -128,4 +144,11 @@ export class IdentityRouter {
       }
     }
   }
+}
+
+/** Extract the identifier from an iMessage chat GUID (e.g. "any;-;+15551234567" → "+15551234567") */
+function extractImessageIdentifier(chatGuid: string): string | null {
+  const parts = chatGuid.split(";");
+  if (parts.length >= 3) return parts.slice(2).join(";");
+  return null;
 }

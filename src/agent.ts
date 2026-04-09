@@ -377,7 +377,9 @@ export class Agent {
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
 
     const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
-    const next = prev.then(() => this.handleMessage(channel, message)).catch(() => {});
+    const next = prev.then(() => this.handleMessage(channel, message)).catch((err) => {
+      log.error({ err, sessionKey }, "Unhandled error in message queue");
+    });
     this.messageQueues.set(sessionKey, next);
   }
 

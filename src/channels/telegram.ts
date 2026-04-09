@@ -183,25 +183,29 @@ export class TelegramChannel implements Channel {
     let lastSent = "";
     let editTimer: ReturnType<typeof setInterval> | null = null;
     let finished = false;
+    let flushPending: Promise<void> = Promise.resolve();
 
-    const flush = async () => {
-      if (buffer === lastSent || !buffer) return;
-      const text = buffer;
-      lastSent = text;
+    const flush = () => {
+      flushPending = flushPending.then(async () => {
+        if (buffer === lastSent || !buffer) return;
+        const text = buffer;
+        lastSent = text;
 
-      try {
-        if (!messageId) {
-          const replyParams = replyTo
-            ? { reply_parameters: { message_id: Number(replyTo) } }
-            : {};
-          const sent = await this.bot.api.sendMessage(chatId, text, replyParams);
-          messageId = sent.message_id;
-        } else {
-          await this.bot.api.editMessageText(chatId, messageId, text);
+        try {
+          if (!messageId) {
+            const replyParams = replyTo
+              ? { reply_parameters: { message_id: Number(replyTo) } }
+              : {};
+            const sent = await this.bot.api.sendMessage(chatId, text, replyParams);
+            messageId = sent.message_id;
+          } else {
+            await this.bot.api.editMessageText(chatId, messageId, text);
+          }
+        } catch {
+          // Telegram may reject edits if content unchanged or too fast
         }
-      } catch {
-        // Telegram may reject edits if content unchanged or too fast
-      }
+      });
+      return flushPending;
     };
 
     return {

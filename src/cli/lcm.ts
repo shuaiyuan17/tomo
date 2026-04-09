@@ -2,11 +2,17 @@ import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
 import { SessionStore } from "../sessions/store.js";
-import { config } from "../config.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const sessionsDir = config.sessionsDir ?? join(homedir(), ".tomo", "data", "sessions");
+async function getSessionsDir(): Promise<string> {
+  try {
+    const { config } = await import("../config.js");
+    return config.sessionsDir ?? join(homedir(), ".tomo", "data", "sessions");
+  } catch {
+    return join(homedir(), ".tomo", "data", "sessions");
+  }
+}
 
 export const lcmCommand = new Command("lcm")
   .description("Context management tools");
@@ -15,7 +21,8 @@ lcmCommand
   .command("session-id")
   .description("Get the active SDK session ID for a channel")
   .requiredOption("--channel-key <key>", "Channel key (e.g. telegram_123456789)")
-  .action((opts) => {
+  .action(async (opts) => {
+    const sessionsDir = await getSessionsDir();
     const store = new SessionStore(sessionsDir, 20);
     const sid = store.getSdkSessionId(opts.channelKey);
     if (sid) {
@@ -61,7 +68,8 @@ lcmCommand
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
   .option("--channel-key <key>", "Channel key for transcript archive (e.g. telegram_123456789)")
-  .action((opts) => {
+  .action(async (opts) => {
+    const sessionsDir = await getSessionsDir();
     // Resolve timestamps to indices using context_stats
     const stats = computeContextStats(opts.sessionId);
     if (!stats) {
@@ -114,7 +122,8 @@ lcmCommand
   .option("--to-seq <n>", "End seq number", parseInt)
   .option("--limit <n>", "Max results", parseInt)
   .option("--json", "Output raw JSON")
-  .action((opts) => {
+  .action(async (opts) => {
+    const sessionsDir = await getSessionsDir();
     const store = new SessionStore(sessionsDir, 20);
     const limit = opts.limit ?? 50;
     const results: Array<{ role: string; content: string; timestamp: number; seq?: number; source?: string }> = [];

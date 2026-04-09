@@ -27,6 +27,8 @@ Session stats show:
 - **Tokens**: total input/output tokens
 - **Context**: current context window usage (X/200000)
 
+**Note:** Context stats come from the SDK API and reflect the state at the end of the *previous* query. After compacting or other changes, you need to wait for a new query to complete before the numbers update.
+
 If context is above 80%, compaction will happen soon — the system will automatically summarize older messages to free space.
 
 ## Cron Jobs

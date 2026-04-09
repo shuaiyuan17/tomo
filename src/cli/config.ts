@@ -225,13 +225,9 @@ async function configIdentities(): Promise<void> {
       };
 
       for (const ch of configuredChannels) {
-        const chatId = await p.text({
-          message: `Chat ID for ${ch}`,
-          placeholder: ch === "telegram" ? "e.g. 1360399016" : "e.g. iMessage;-;+15551234567",
-        });
-        if (p.isCancel(chatId)) break;
-        const val = (chatId as string).trim();
-        if (val) identity.channels[ch] = val;
+        const chatId = await pickChatId(ch);
+        if (chatId === null) break;
+        if (chatId) identity.channels[ch] = chatId;
       }
 
       if (Object.keys(identity.channels).length === 0) {
@@ -272,15 +268,10 @@ async function configIdentities(): Promise<void> {
 
       if (action === "bindings") {
         for (const ch of configuredChannels) {
-          const chatId = await p.text({
-            message: `Chat ID for ${ch}`,
-            placeholder: ch === "telegram" ? "e.g. 1360399016" : "e.g. iMessage;-;+15551234567",
-            initialValue: id.channels[ch] ?? "",
-          });
-          if (p.isCancel(chatId)) break;
-          const val = (chatId as string).trim();
-          if (val) {
-            id.channels[ch] = val;
+          const chatId = await pickChatId(ch, id.channels[ch]);
+          if (chatId === null) break;
+          if (chatId) {
+            id.channels[ch] = chatId;
           } else {
             delete id.channels[ch];
           }
@@ -406,4 +397,73 @@ async function configSessions(): Promise<void> {
       p.log.success(`Session "${key}" cleared`);
     }
   }
+}
+
+// --- Chat ID picker ---
+
+/** Pick a chat ID for a channel — shows existing sessions as selectable options, with fallback to manual input. Returns null if cancelled, empty string to skip. */
+async function pickChatId(channelName: string, currentValue?: string): Promise<string | null> {
+  const store = new SessionStore(SESSIONS_DIR, 20);
+  const allSessions = store.listAllSessions().filter((e) => e.unlinkedAt === null);
+
+  // Find sessions for this channel (non-group DMs)
+  const prefix = `${channelName}:`;
+  const channelSessions = allSessions.filter((e) => {
+    if (!e.channelKey.startsWith(prefix)) return false;
+    // Skip group sessions (contain ;+; for iMessage groups, or negative IDs for Telegram groups)
+    const chatId = e.channelKey.slice(prefix.length);
+    if (chatId.includes(";+;")) return false;
+    if (chatId.startsWith("-")) return false;
+    return true;
+  });
+
+  if (channelSessions.length === 0) {
+    // No sessions — fall back to manual input
+    const chatId = await p.text({
+      message: `Chat ID for ${channelName}`,
+      placeholder: channelName === "telegram" ? "e.g. 1360399016" : "e.g. iMessage;-;+15551234567",
+      initialValue: currentValue ?? "",
+    });
+    if (p.isCancel(chatId)) return null;
+    return (chatId as string).trim();
+  }
+
+  // Build options from existing sessions with last message preview
+  const options: Array<{ value: string; label: string; hint?: string }> = [];
+
+  for (const entry of channelSessions) {
+    const chatId = entry.channelKey.slice(prefix.length);
+    const session = store.get(entry.channelKey);
+    const lastMsg = [...session.messages].reverse().find((m) => m.role === "user");
+    const preview = lastMsg
+      ? `${lastMsg.senderName ?? "user"}: ${lastMsg.content.slice(0, 50)}${lastMsg.content.length > 50 ? "..." : ""}`
+      : `${entry.stats?.totalQueries ?? 0} queries`;
+    const isCurrent = chatId === currentValue;
+
+    options.push({
+      value: chatId,
+      label: `${chatId}${isCurrent ? " (current)" : ""}`,
+      hint: preview,
+    });
+  }
+
+  options.push({ value: "__manual__", label: "Enter manually" });
+  options.push({ value: "__skip__", label: "Skip" });
+
+  const choice = await p.select({ message: `Chat ID for ${channelName}`, options });
+  if (p.isCancel(choice)) return null;
+
+  if (choice === "__skip__") return "";
+
+  if (choice === "__manual__") {
+    const chatId = await p.text({
+      message: `Chat ID for ${channelName}`,
+      placeholder: channelName === "telegram" ? "e.g. 1360399016" : "e.g. iMessage;-;+15551234567",
+      initialValue: currentValue ?? "",
+    });
+    if (p.isCancel(chatId)) return null;
+    return (chatId as string).trim();
+  }
+
+  return choice as string;
 }

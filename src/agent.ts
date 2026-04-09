@@ -329,6 +329,11 @@ export class Agent {
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions);
+
+    // Load persistent per-session model overrides
+    for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
+      this.modelOverrides.set(key, model);
+    }
   }
 
   /** Look up a channel by name */

@@ -3,8 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 const HOME = homedir();
-const TOMO_HOME = join(HOME, ".tomo");
-const CONFIG_PATH = join(TOMO_HOME, "config.json");
+export const TOMO_HOME = join(HOME, ".tomo");
+export const CONFIG_PATH = join(TOMO_HOME, "config.json");
 
 export interface IdentityConfig {
   name: string;
@@ -26,6 +26,7 @@ interface TomoConfig {
   imessageUrl: string;
   imessagePassword: string;
   imessageWebhookPort: number;
+  sessionModelOverrides: Record<string, string>;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -97,6 +98,7 @@ function buildConfig(): TomoConfig {
     imessageUrl,
     imessagePassword,
     imessageWebhookPort,
+    sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
   };
 }
 

@@ -10,16 +10,18 @@ const CONFIG_PATH = join(TOMO_HOME, "config.json");
 const SESSIONS_DIR = join(TOMO_HOME, "data", "sessions");
 
 const MODELS: Record<string, string> = {
-  "sonnet": "claude-sonnet-4-6[1m]",
-  "opus": "claude-opus-4-6[1m]",
+  "sonnet": "claude-sonnet-4-6",
+  "sonnet-1m": "claude-sonnet-4-6[1m]",
+  "opus": "claude-opus-4-6",
+  "opus-1m": "claude-opus-4-6[1m]",
   "haiku": "claude-haiku-4-5",
 };
 
 const MODEL_LABELS: Record<string, string> = {
-  "claude-sonnet-4-6[1m]": "Sonnet 4.6 (fast, recommended)",
-  "claude-sonnet-4-6": "Sonnet 4.6",
-  "claude-opus-4-6[1m]": "Opus 4.6 (most capable)",
-  "claude-opus-4-6": "Opus 4.6",
+  "claude-sonnet-4-6": "Sonnet 4.6 (fast)",
+  "claude-sonnet-4-6[1m]": "Sonnet 4.6 1M (fast, recommended)",
+  "claude-opus-4-6": "Opus 4.6 (most capable)",
+  "claude-opus-4-6[1m]": "Opus 4.6 1M (most capable, extended context)",
   "claude-haiku-4-5": "Haiku 4.5 (cheapest)",
 };
 

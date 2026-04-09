@@ -296,7 +296,7 @@ class LiveSession {
 
   close(): void {
     this.alive = false;
-    this.q.return(undefined);
+    this.q.close();
   }
 }
 

@@ -31,6 +31,8 @@ Sections:
 
 Add `--json` for machine-readable output.
 
+**Note:** Context stats come from the SDK API and reflect the state at the end of the *previous* query. After compacting, the updated context size won't show until the next query completes.
+
 ## Compact a section
 
 Replace a heavy section with a summary. Use timestamps to specify the range:

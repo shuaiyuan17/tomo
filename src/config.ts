@@ -86,7 +86,7 @@ function buildConfig(): TomoConfig {
 
   return {
     telegramToken,
-    model: (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string,
+    model: (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6") as string,
     workspaceDir: process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace"),
     sessionsDir: process.env.SESSIONS_DIR ?? join(TOMO_HOME, "data", "sessions"),
     historyLimit: Number(process.env.HISTORY_LIMIT ?? "20"),

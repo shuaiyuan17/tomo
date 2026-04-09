@@ -239,8 +239,9 @@ export class BlueBubblesChannel implements Channel {
     const handle = data.handle as Record<string, unknown> | undefined;
     const senderAddress = (handle?.address as string) ?? "Unknown";
 
-    // Check if bot was mentioned (group chats)
-    const isMentioned = false; // BlueBubbles doesn't have a built-in mention system for iMessage
+    // iMessage has no @mention system — treat all group messages as mentioned
+    // (the agent gets a one-time system prompt to stay silent unless it has something to say)
+    const isMentioned = isGroup;
 
     // Handle slash commands
     if (text.startsWith("/")) {

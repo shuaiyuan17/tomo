@@ -444,7 +444,7 @@ export class Agent {
     const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
 
     if (isGroup) {
-      await this.updateGroupContext(key, message.senderName, message.chatTitle);
+      await this.updateGroupContext(key, message.senderName, channel.name, message.chatTitle);
     }
 
     this.sessions.append(key, {
@@ -579,7 +579,7 @@ export class Agent {
     }
   }
 
-  private async updateGroupContext(key: string, senderName: string, chatTitle?: string): Promise<void> {
+  private async updateGroupContext(key: string, senderName: string, channelName: string, chatTitle?: string): Promise<void> {
     let participants = this.groupParticipants.get(key);
     const isNew = !participants;
 
@@ -594,7 +594,12 @@ export class Agent {
     if (isNew || !wasKnown) {
       const names = [...participants].join(", ");
       const title = chatTitle ? `"${chatTitle}"` : "a group chat";
-      const contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
+      let contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
+
+      // iMessage groups: inject guidance to stay silent unless needed
+      if (isNew && channelName === "imessage") {
+        contextMsg += " This is an iMessage group chat. You see every message but should only reply when you have something genuinely useful to add. Reply NO_REPLY to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.";
+      }
 
       try {
         await this.runWithRetry(key, contextMsg);

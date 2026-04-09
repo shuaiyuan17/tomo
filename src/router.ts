@@ -69,7 +69,7 @@ export class IdentityRouter {
       };
     }
 
-    const sessionKey = `dm:${identity.name}`;
+    const sessionKey = `dm:${identity.name.toLowerCase()}`;
 
     // Migrate from old channel-scoped key if needed (one-time)
     this.maybeMigrate(identity, sessionKey);

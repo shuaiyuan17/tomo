@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import * as p from "@clack/prompts";
+import { printBanner } from "./banner.js";
 import { SessionStore } from "../sessions/store.js";
 
 const TOMO_HOME = join(homedir(), ".tomo");
@@ -49,6 +50,7 @@ function modelLabel(model: string): string {
 export const configCommand = new Command("config")
   .description("Interactive configuration")
   .action(async () => {
+    printBanner();
     p.intro("Tomo Configuration");
 
     if (!existsSync(CONFIG_PATH)) {

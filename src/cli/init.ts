@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
+import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TOMO_HOME = join(homedir(), ".tomo");
@@ -308,6 +309,26 @@ export const initCommand = new Command("init")
       p.log.success("Config saved");
     }
 
+    // 4b. Autostart (first-time only, macOS only)
+    if (!isReinit && isMacOS()) {
+      const autostart = await p.confirm({
+        message: "Start Tomo automatically when you log in?",
+        initialValue: true,
+      });
+      if (!p.isCancel(autostart) && autostart) {
+        const s = p.spinner();
+        s.start("Enabling autostart");
+        try {
+          await enableAutostart();
+          s.stop("Autostart enabled");
+        } catch (err) {
+          s.stop("Could not enable autostart");
+          p.log.warn((err as Error).message);
+          p.log.info("You can enable it later with `tomo config` → Autostart.");
+        }
+      }
+    }
+
     // 5. Summary
     const agentLabel = personality ? personality.agentName : "your assistant";
     p.note(
@@ -322,7 +343,11 @@ export const initCommand = new Command("init")
       "Your files",
     );
 
-    p.outro(`Run \`tomo start\` to meet ${agentLabel}!`);
+    if (isAutostartEnabled()) {
+      p.outro(`${agentLabel} is running — say hi on Telegram!`);
+    } else {
+      p.outro(`Run \`tomo start\` to meet ${agentLabel}!`);
+    }
   });
 
 async function askPersonality(): Promise<Personality | null> {

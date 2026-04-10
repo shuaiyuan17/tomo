@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { SessionStore } from "../sessions/store.js";
+import { disableAutostart, enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 
 const TOMO_HOME = join(homedir(), ".tomo");
 const CONFIG_PATH = join(TOMO_HOME, "config.json");
@@ -60,16 +61,25 @@ export const configCommand = new Command("config")
     }
 
     for (;;) {
+      const options: Array<{ value: string; label: string; hint?: string }> = [
+        { value: "model", label: "Model", hint: "set default model" },
+        { value: "channels", label: "Channels", hint: "manage channel connections" },
+        { value: "identities", label: "Identities", hint: "bind DMs across channels" },
+        { value: "groups", label: "Group chats", hint: "activation secret" },
+        { value: "sessions", label: "Sessions", hint: "view and configure sessions" },
+      ];
+      if (isMacOS()) {
+        options.push({
+          value: "autostart",
+          label: "Autostart",
+          hint: isAutostartEnabled() ? "enabled" : "disabled",
+        });
+      }
+      options.push({ value: "exit", label: "Exit" });
+
       const choice = await p.select({
         message: "What would you like to configure?",
-        options: [
-          { value: "model", label: "Model", hint: "set default model" },
-          { value: "channels", label: "Channels", hint: "manage channel connections" },
-          { value: "identities", label: "Identities", hint: "bind DMs across channels" },
-          { value: "groups", label: "Group chats", hint: "activation secret" },
-          { value: "sessions", label: "Sessions", hint: "view and configure sessions" },
-          { value: "exit", label: "Exit" },
-        ],
+        options,
       });
 
       if (p.isCancel(choice) || choice === "exit") break;
@@ -79,6 +89,7 @@ export const configCommand = new Command("config")
       if (choice === "identities") await configIdentities();
       if (choice === "groups") await configGroups();
       if (choice === "sessions") await configSessions();
+      if (choice === "autostart") await configAutostart();
     }
 
     p.outro("Restart tomo for changes to take effect.");
@@ -105,6 +116,39 @@ async function configModel(): Promise<void> {
   cfg.model = choice;
   saveConfig(cfg);
   p.log.success(`Default model set to ${modelLabel(choice as string)}`);
+}
+
+// --- Autostart ---
+
+async function configAutostart(): Promise<void> {
+  if (!isMacOS()) {
+    p.log.info("Autostart is only supported on macOS.");
+    return;
+  }
+
+  const enabled = isAutostartEnabled();
+  p.log.info(`Currently: ${enabled ? "enabled" : "disabled"}`);
+
+  const action = await p.confirm({
+    message: enabled ? "Disable autostart?" : "Start Tomo automatically when you log in?",
+    initialValue: !enabled,
+  });
+  if (p.isCancel(action) || !action) return;
+
+  const s = p.spinner();
+  s.start(enabled ? "Disabling autostart" : "Enabling autostart");
+  try {
+    if (enabled) {
+      await disableAutostart();
+      s.stop("Autostart disabled");
+    } else {
+      await enableAutostart();
+      s.stop("Autostart enabled");
+    }
+  } catch (err) {
+    s.stop("Failed");
+    p.log.error((err as Error).message);
+  }
 }
 
 // --- Channels ---

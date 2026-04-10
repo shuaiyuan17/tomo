@@ -8,11 +8,12 @@ import { sessionsCommand } from "./cli/sessions.js";
 import { migrateCommand } from "./cli/migrate.js";
 import { lcmCommand } from "./cli/lcm.js";
 import { configCommand } from "./cli/config.js";
+import { uninstallCommand } from "./cli/uninstall.js";
 
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.3.3");
+  .version("0.3.4");
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);
@@ -26,5 +27,6 @@ program.addCommand(continuityCommand);
 program.addCommand(migrateCommand);
 program.addCommand(sessionsCommand);
 program.addCommand(lcmCommand);
+program.addCommand(uninstallCommand);
 
 program.parse();

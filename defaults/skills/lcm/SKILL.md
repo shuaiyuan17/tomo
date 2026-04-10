@@ -7,15 +7,15 @@ description: Context management — prune tool results, check context usage, com
 
 Manage your context window via `tomo lcm` CLI. Your channel key and SDK session ID are in your system prompt under `# SESSION`.
 
-## Prune tool results (fastest)
+## Prune tool results and images (fastest)
 
-Strip bulky tool output without removing events. No summary needed.
+Strip bulky tool output and base64 images without removing events. No summary needed.
 
 ```bash
 tomo lcm prune-tools --session-id SESSION_ID
 ```
 
-Options: `--dry-run` to preview, `--min-size 5000` for only large results, `--tools Read,Bash` to target specific tools.
+Options: `--dry-run` to preview, `--min-size 5000` for only large results, `--tools Read,Bash` to target specific tools, `--no-images` to skip image pruning.
 
 ## Check context
 

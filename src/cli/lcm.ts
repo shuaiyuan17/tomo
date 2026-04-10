@@ -179,10 +179,11 @@ lcmCommand
 
 lcmCommand
   .command("prune-tools")
-  .description("Prune bulky tool result content from a session")
+  .description("Prune bulky tool results and base64 images from a session")
   .requiredOption("--session-id <id>", "SDK session ID")
-  .option("--min-size <chars>", "Only prune results larger than N chars (default 500)", parseInt)
+  .option("--min-size <chars>", "Only prune entries larger than N chars (default 500)", parseInt)
   .option("--tools <names>", "Comma-separated tool names to prune (e.g. Read,Bash,WebSearch)")
+  .option("--no-images", "Skip pruning base64 images")
   .option("--dry-run", "Preview what would be pruned without modifying")
   .option("--channel-key <key>", "Channel key for archiving originals")
   .action(async (opts) => {
@@ -192,6 +193,7 @@ lcmCommand
       sdkSessionId: opts.sessionId,
       minSize: opts.minSize,
       tools: opts.tools ? opts.tools.split(",") : undefined,
+      includeImages: opts.images !== false,
       dryRun: opts.dryRun,
       archivePath: opts.channelKey
         ? join(sessionsDir, `_archive_${opts.sessionId}.jsonl`)
@@ -208,19 +210,20 @@ lcmCommand
       return;
     }
 
-    // Group by tool name
-    const byTool = new Map<string, { count: number; chars: number }>();
+    // Group by label (tool name or "images")
+    const byLabel = new Map<string, { count: number; chars: number }>();
     for (const p of result.pruned) {
-      const entry = byTool.get(p.tool) ?? { count: 0, chars: 0 };
+      const label = p.category === "image" ? "images" : (p.tool ?? "unknown");
+      const entry = byLabel.get(label) ?? { count: 0, chars: 0 };
       entry.count++;
       entry.chars += p.originalSize;
-      byTool.set(p.tool, entry);
+      byLabel.set(label, entry);
     }
 
     const label = opts.dryRun ? "Would prune" : "Pruned";
     const afterChars = result.pruned.length * 40; // rough stub size
-    console.log(`${label} ${result.pruned.length} tool results (${result.totalCharsRemoved.toLocaleString()} chars → ~${afterChars.toLocaleString()} chars)\n`);
-    for (const [tool, { count, chars }] of byTool) {
-      console.log(`  ${tool.padEnd(12)} x${count}  — ${chars.toLocaleString()} chars removed`);
+    console.log(`${label} ${result.pruned.length} entries (${result.totalCharsRemoved.toLocaleString()} chars → ~${afterChars.toLocaleString()} chars)\n`);
+    for (const [name, { count, chars }] of byLabel) {
+      console.log(`  ${name.padEnd(12)} x${count}  — ${chars.toLocaleString()} chars removed`);
     }
   });

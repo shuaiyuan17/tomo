@@ -384,8 +384,10 @@ export class Agent {
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
-    "sonnet": "claude-sonnet-4-6[1m]",
-    "opus": "claude-opus-4-6[1m]",
+    "sonnet": "claude-sonnet-4-6",
+    "sonnet-1m": "claude-sonnet-4-6[1m]",
+    "opus": "claude-opus-4-6",
+    "opus-1m": "claude-opus-4-6[1m]",
     "haiku": "claude-haiku-4-5",
   };
 
@@ -419,6 +421,44 @@ export class Agent {
       this.closeLiveSession(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `Switched to ${resolved}` });
+      return;
+    }
+
+    if (command === "status") {
+      const model = this.modelOverrides.get(key) ?? config.model;
+      const session = this.sessions.get(key);
+      const entry = this.sessions.getEntry(key);
+      const live = this.liveSessions.get(key);
+
+      const lines: string[] = [];
+      lines.push(`Session: ${key}`);
+      lines.push(`Channel: ${channel.name}`);
+      lines.push(`Model: ${model}`);
+      lines.push(`Live: ${live?.isAlive() ? "yes" : "no"}`);
+
+      const msgCount = session.messages.filter((m) => m.role === "user").length;
+      lines.push(`Messages: ${msgCount} user turns`);
+
+      if (session.createdAt) {
+        lines.push(`Created: ${new Date(session.createdAt).toLocaleString()}`);
+      }
+      if (session.updatedAt) {
+        lines.push(`Last active: ${new Date(session.updatedAt).toLocaleString()}`);
+      }
+
+      if (entry?.stats) {
+        const s = entry.stats;
+        lines.push("");
+        lines.push(`Queries: ${s.totalQueries}`);
+        lines.push(`Cost: $${s.totalCostUsd.toFixed(4)}`);
+        lines.push(`Tokens: ${s.totalInputTokens.toLocaleString()} in / ${s.totalOutputTokens.toLocaleString()} out`);
+        if (s.contextMax > 0) {
+          const pct = ((s.contextUsed / s.contextMax) * 100).toFixed(0);
+          lines.push(`Context: ${pct}% (${s.contextUsed.toLocaleString()} / ${s.contextMax.toLocaleString()})`);
+        }
+      }
+
+      await channel.send({ chatId, text: lines.join("\n") });
       return;
     }
   }
@@ -518,7 +558,7 @@ export class Agent {
     const stopTyping = isImessageGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
-      const stampedText = this.injectTimestamp(textForAgent);
+      const stampedText = this.injectTimestamp(textForAgent, channel.name);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
       const response = await this.runWithRetry(key, stampedText, (text) => {
@@ -669,7 +709,7 @@ export class Agent {
     }
   }
 
-  private injectTimestamp(text: string): string {
+  private injectTimestamp(text: string, channelName?: string): string {
     const now = new Date();
     const weekday = now.toLocaleDateString("en-US", { weekday: "short" });
     const mm = String(now.getMonth() + 1).padStart(2, "0");
@@ -677,7 +717,8 @@ export class Agent {
     const date = `${mm}/${dd}`;
     const time = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
     const tz = now.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
-    return `[${weekday} ${date} ${time} ${tz}] ${text}`;
+    const prefix = channelName ? `${channelName} · ` : "";
+    return `[${prefix}${weekday} ${date} ${time} ${tz}] ${text}`;
   }
 
   /** Handle a cron-triggered message */
@@ -718,7 +759,7 @@ export class Agent {
       }
     }
 
-    const stampedMessage = this.injectTimestamp(message);
+    const stampedMessage = this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
     const stopTyping = deliveryChannel.startTyping(deliveryChatId);

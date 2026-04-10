@@ -252,7 +252,7 @@ export class BlueBubblesChannel implements Channel {
       const parts = text.slice(1).split(/\s+/);
       const command = parts[0];
       const args = parts.slice(1).join(" ");
-      if (command === "new" || command === "model") {
+      if (command === "new" || command === "model" || command === "status") {
         for (const handler of this.commandHandlers) {
           await handler(command, chatGuid, senderAddress, args);
         }

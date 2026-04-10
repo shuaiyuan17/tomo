@@ -67,7 +67,7 @@ async function startForeground(): Promise<void> {
     }
   }
 
-  // Sync default skills (always overwrite to pick up updates)
+  // Sync tomo- skills (always overwrite to pick up updates)
   const defaultSkillsDir = join(defaultsDir, "skills");
   const targetSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
   if (fileExists(defaultSkillsDir)) {
@@ -75,11 +75,9 @@ async function startForeground(): Promise<void> {
     for (const skill of readdirSync(defaultSkillsDir, { withFileTypes: true })) {
       if (!skill.isDirectory()) continue;
       const destDir = join(targetSkillsDir, `tomo-${skill.name}`);
-      const destFile = join(destDir, "SKILL.md");
-      const srcFile = join(defaultSkillsDir, skill.name, "SKILL.md");
-      if (fileExists(srcFile)) {
-        mkdirSync(destDir, { recursive: true });
-        copyFileSync(srcFile, destFile);
+      mkdirSync(destDir, { recursive: true });
+      for (const file of readdirSync(join(defaultSkillsDir, skill.name))) {
+        copyFileSync(join(defaultSkillsDir, skill.name, file), join(destDir, file));
       }
     }
   }

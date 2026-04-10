@@ -72,6 +72,26 @@ Every message includes a timestamp prefix like `[Mon 04/07 14:30 PDT]` so you al
 ### System messages
 Messages prefixed with `System:` are from the harness (cron triggers, group context), not from a human.
 
+## Skills
+
+### Built-in skills (`tomo-*`)
+Skills prefixed with `tomo-` are bundled with Tomo and automatically updated on every `tomo start`. Do not edit these — your changes will be overwritten on next restart.
+
+Current built-in skills: `tomo-system`, `tomo-lcm`, `tomo-browse`, `tomo-cron`.
+
+### Custom / third-party skills
+Place skill directories under `~/.tomo/workspace/.claude/skills/`. Each skill needs a `SKILL.md` with YAML frontmatter (`name` and `description`). The harness picks them up automatically — restart Tomo to load new skills.
+
+```
+~/.tomo/workspace/.claude/skills/
+├── tomo-system/       # built-in (auto-updated)
+├── tomo-lcm/          # built-in (auto-updated)
+├── my-custom-skill/   # user-managed (never overwritten)
+│   └── SKILL.md
+```
+
+Avoid the `tomo-` prefix for custom skills so they won't conflict with built-in updates.
+
 ## Troubleshooting
 
 ### Agent not responding

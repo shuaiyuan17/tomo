@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { getSdkSessionPath } from "../sessions/index.js";
+import { getCompactTriggerPath } from "./compact.js";
 import { log } from "../logger.js";
 
 export interface PruneToolsRequest {
@@ -131,6 +132,24 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
         continue;
       }
     }
+
+    // Prune toolUseResult at event level (SDK visual previews)
+    if (includeImages && evt.toolUseResult && typeof evt.toolUseResult === "object") {
+      const tur = evt.toolUseResult;
+      if (tur.type === "image" && tur.file) {
+        const data = tur.file.base64 ?? tur.file.data ?? "";
+        const size = data.length;
+        if (size >= minSize) {
+          const mediaType = tur.file.type ?? tur.file.media_type ?? "image/unknown";
+          const sizeKb = Math.round(size / 1024);
+          pruned.push({ category: "image", mediaType, originalSize: size });
+
+          if (!req.dryRun) {
+            evt.toolUseResult = { type: "text", text: `[pruned — ${mediaType}, ${sizeKb}KB base64]` };
+          }
+        }
+      }
+    }
   }
 
   if (pruned.length === 0) {
@@ -148,6 +167,9 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
     // Write modified session file
     const output = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
     writeFileSync(path, output);
+
+    // Write trigger file so the harness reloads the live session on next turn
+    writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
 
     log.info({
       sessionId: req.sdkSessionId,

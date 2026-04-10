@@ -12,7 +12,7 @@ import { configCommand } from "./cli/config.js";
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.3.0");
+  .version("0.3.2");
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);

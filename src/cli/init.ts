@@ -75,7 +75,40 @@ export const initCommand = new Command("init")
       p.log.info("Existing config found. Use --force to overwrite.");
     }
 
-    // 2. Personalization
+    // 2. Safety disclaimer (first-time users only)
+    const isFirstTime = !existsSync(configPath);
+    if (isFirstTime) {
+      p.note(
+        [
+          "Tomo connects Claude to your messaging channels and gives it tools",
+          "that take real actions. Before you start, a few things to know:",
+          "",
+          "  • AI makes mistakes. It can misunderstand, hallucinate, or act on",
+          "    bad input — double-check anything consequential.",
+          "  • Prompt injection is real. Messages, emails, or web content Tomo",
+          "    reads may contain hidden instructions that try to hijack the agent.",
+          "  • Keep the allowlist tight. Only let people you trust message Tomo —",
+          "    every allowed user can steer the agent.",
+          "  • Run Tomo on a machine without sensitive data or credentials you",
+          "    can't afford to expose. Treat it like a semi-trusted process.",
+          "",
+          "We're actively strengthening the guardrails, but you are the last",
+          "line of defense.",
+        ].join("\n"),
+        "Heads up — please read",
+      );
+
+      const ack = await p.confirm({
+        message: "I understand the risks and want to continue",
+        initialValue: true,
+      });
+      if (p.isCancel(ack) || !ack) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+    }
+
+    // 3. Personalization
     const personality = isReinit ? null : await askPersonality();
     if (personality === null && !isReinit) {
       p.cancel("Setup cancelled.");

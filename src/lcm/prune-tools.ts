@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { getSdkSessionPath } from "../sessions/index.js";
+import { getCompactTriggerPath } from "./compact.js";
 import { log } from "../logger.js";
 
 export interface PruneToolsRequest {
@@ -9,20 +10,24 @@ export interface PruneToolsRequest {
   minSize?: number;
   /** Only prune these tool names (e.g. ["Read", "Bash"]). Prunes all if empty. */
   tools?: string[];
+  /** Also prune base64 image blocks (default true) */
+  includeImages?: boolean;
   /** Preview only, don't modify the file */
   dryRun?: boolean;
   /** Path to archive original content */
   archivePath?: string;
 }
 
-export interface PrunedTool {
-  tool: string;
+export interface PrunedEntry {
+  category: "tool" | "image";
+  tool?: string;
+  mediaType?: string;
   originalSize: number;
 }
 
 export interface PruneToolsResult {
   success: boolean;
-  pruned: PrunedTool[];
+  pruned: PrunedEntry[];
   totalCharsRemoved: number;
   error?: string;
 }
@@ -70,8 +75,9 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
     }
   }
 
-  const pruned: PrunedTool[] = [];
+  const pruned: PrunedEntry[] = [];
   const toolFilter = req.tools ? new Set(req.tools.map((t) => t.toLowerCase())) : null;
+  const includeImages = req.includeImages !== false; // default true
 
   for (const evt of events) {
     const content = evt.message?.content;
@@ -79,30 +85,69 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
 
     for (let i = 0; i < content.length; i++) {
       const block = content[i];
-      if (block.type !== "tool_result") continue;
 
-      const toolName = toolNameById.get(block.tool_use_id) ?? "unknown";
+      // Prune tool results
+      if (block.type === "tool_result") {
+        const toolName = toolNameById.get(block.tool_use_id) ?? "unknown";
 
-      // Filter by tool name if specified
-      if (toolFilter && !toolFilter.has(toolName.toLowerCase())) continue;
+        if (toolFilter && !toolFilter.has(toolName.toLowerCase())) continue;
 
-      // Measure content size
-      const resultContent = block.content;
-      let size: number;
-      if (typeof resultContent === "string") {
-        size = resultContent.length;
-      } else if (Array.isArray(resultContent)) {
-        size = resultContent.reduce((sum: number, c: any) => sum + JSON.stringify(c).length, 0);
-      } else {
+        const resultContent = block.content;
+        let size: number;
+        if (typeof resultContent === "string") {
+          size = resultContent.length;
+        } else if (Array.isArray(resultContent)) {
+          size = resultContent.reduce((sum: number, c: any) => sum + JSON.stringify(c).length, 0);
+        } else {
+          continue;
+        }
+
+        if (size < minSize) continue;
+
+        pruned.push({ category: "tool", tool: toolName, originalSize: size });
+
+        if (!req.dryRun) {
+          block.content = `[pruned — ${size.toLocaleString()} chars from ${toolName}]`;
+        }
         continue;
       }
 
-      if (size < minSize) continue;
+      // Prune base64 images
+      if (includeImages && block.type === "image" && block.source?.type === "base64") {
+        const data = block.source.data ?? "";
+        const size = data.length;
+        if (size < minSize) continue;
 
-      pruned.push({ tool: toolName, originalSize: size });
+        const mediaType = block.source.media_type ?? "image/unknown";
+        const sizeKb = Math.round(size / 1024);
+        pruned.push({ category: "image", mediaType, originalSize: size });
 
-      if (!req.dryRun) {
-        block.content = `[pruned — ${size.toLocaleString()} chars from ${toolName}]`;
+        if (!req.dryRun) {
+          // Replace with a tiny text block preserving the event structure
+          content[i] = {
+            type: "text",
+            text: `[pruned — ${mediaType}, ${sizeKb}KB base64]`,
+          };
+        }
+        continue;
+      }
+    }
+
+    // Prune toolUseResult at event level (SDK visual previews)
+    if (includeImages && evt.toolUseResult && typeof evt.toolUseResult === "object") {
+      const tur = evt.toolUseResult;
+      if (tur.type === "image" && tur.file) {
+        const data = tur.file.base64 ?? tur.file.data ?? "";
+        const size = data.length;
+        if (size >= minSize) {
+          const mediaType = tur.file.type ?? tur.file.media_type ?? "image/unknown";
+          const sizeKb = Math.round(size / 1024);
+          pruned.push({ category: "image", mediaType, originalSize: size });
+
+          if (!req.dryRun) {
+            evt.toolUseResult = { type: "text", text: `[pruned — ${mediaType}, ${sizeKb}KB base64]` };
+          }
+        }
       }
     }
   }
@@ -122,6 +167,9 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
     // Write modified session file
     const output = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
     writeFileSync(path, output);
+
+    // Write trigger file so the harness reloads the live session on next turn
+    writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
 
     log.info({
       sessionId: req.sdkSessionId,

@@ -264,6 +264,9 @@ export class BlueBubblesChannel implements Channel {
     const attachments = data.attachments as Array<Record<string, unknown>> | undefined;
     const images = await this.downloadAttachments(attachments);
 
+    // Mark chat as read (best-effort; requires BlueBubbles Private API helper)
+    this.api("POST", `/chat/${encodeURIComponent(chatGuid)}/read`).catch(() => {});
+
     const senderName = this.resolveContactName(senderAddress);
 
     const message: IncomingMessage = {

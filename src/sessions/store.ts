@@ -207,6 +207,12 @@ export class SessionStore {
     return entry?.sdkSessionId;
   }
 
+  /** Get the active registry entry for a channel key */
+  getEntry(key: string): SessionEntry | undefined {
+    this.loadRegistry();
+    return this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+  }
+
   /** Link a new SDK session to a channel key */
   setSdkSessionId(key: string, sessionId: string): void {
     // Unlink any existing session for this key

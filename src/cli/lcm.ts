@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
+import { pruneTools } from "../lcm/prune-tools.js";
 import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -174,4 +175,52 @@ lcmCommand
       console.log(`  ${seq.padEnd(6)} ${time} [${msg.role}] ${src} ${preview}`);
     }
     console.log(`\n${results.length} result(s)`);
+  });
+
+lcmCommand
+  .command("prune-tools")
+  .description("Prune bulky tool result content from a session")
+  .requiredOption("--session-id <id>", "SDK session ID")
+  .option("--min-size <chars>", "Only prune results larger than N chars (default 500)", parseInt)
+  .option("--tools <names>", "Comma-separated tool names to prune (e.g. Read,Bash,WebSearch)")
+  .option("--dry-run", "Preview what would be pruned without modifying")
+  .option("--channel-key <key>", "Channel key for archiving originals")
+  .action(async (opts) => {
+    const sessionsDir = await getSessionsDir();
+
+    const result = pruneTools({
+      sdkSessionId: opts.sessionId,
+      minSize: opts.minSize,
+      tools: opts.tools ? opts.tools.split(",") : undefined,
+      dryRun: opts.dryRun,
+      archivePath: opts.channelKey
+        ? join(sessionsDir, `_archive_${opts.sessionId}.jsonl`)
+        : undefined,
+    });
+
+    if (!result.success) {
+      console.error(result.error);
+      process.exit(1);
+    }
+
+    if (result.pruned.length === 0) {
+      console.log("Nothing to prune.");
+      return;
+    }
+
+    // Group by tool name
+    const byTool = new Map<string, { count: number; chars: number }>();
+    for (const p of result.pruned) {
+      const entry = byTool.get(p.tool) ?? { count: 0, chars: 0 };
+      entry.count++;
+      entry.chars += p.originalSize;
+      byTool.set(p.tool, entry);
+    }
+
+    const label = opts.dryRun ? "Would prune" : "Pruned";
+    const afterChars = result.pruned.length * 40; // rough stub size
+    console.log(`${label} ${result.pruned.length} tool results (${result.totalCharsRemoved.toLocaleString()} chars → ~${afterChars.toLocaleString()} chars)\n`);
+    for (const [tool, { count, chars }] of byTool) {
+      console.log(`  ${tool.padEnd(12)} x${count}  — ${chars.toLocaleString()} chars removed`);
+    }
   });

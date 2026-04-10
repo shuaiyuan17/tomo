@@ -58,8 +58,9 @@ export const initCommand = new Command("init")
         });
         s1.stop("Claude Code authenticated");
       } catch {
-        s1.stop("Claude Code not authenticated");
-        p.log.error("Run `claude` in your terminal to log in, then try `tomo init` again.");
+        s1.stop("Claude Code not responding");
+        p.log.error("This could mean you're not logged in, or your usage limit has been reached.");
+        p.log.error("Run `claude` in your terminal to check, then try `tomo init` again.");
         p.outro("Setup incomplete");
         process.exit(1);
       }
@@ -122,11 +123,12 @@ export const initCommand = new Command("init")
       for (const skill of readdirSync(skillsDir, { withFileTypes: true })) {
         if (!skill.isDirectory()) continue;
         const destDir = join(claudeSkillsDir, `tomo-${skill.name}`);
-        const destFile = join(destDir, "SKILL.md");
-        const srcFile = join(skillsDir, skill.name, "SKILL.md");
-        if ((!existsSync(destFile) || opts.force) && existsSync(srcFile)) {
+        const skillFile = join(destDir, "SKILL.md");
+        if (!existsSync(skillFile) || opts.force) {
           mkdirSync(destDir, { recursive: true });
-          copyFileSync(srcFile, destFile);
+          for (const file of readdirSync(join(skillsDir, skill.name))) {
+            copyFileSync(join(skillsDir, skill.name, file), join(destDir, file));
+          }
           copied.push(`skill/tomo-${skill.name}`);
         }
       }

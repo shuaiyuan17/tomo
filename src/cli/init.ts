@@ -4,6 +4,7 @@ import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
+import { printBanner } from "./banner.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TOMO_HOME = join(homedir(), ".tomo");
@@ -34,6 +35,7 @@ export const initCommand = new Command("init")
   .description("Initialize Tomo — set up config and workspace")
   .option("--force", "Overwrite existing config", false)
   .action(async (opts) => {
+    printBanner("your personal assistant, powered by Claude");
     p.intro("Welcome to Tomo");
 
     const configPath = join(TOMO_HOME, "config.json");

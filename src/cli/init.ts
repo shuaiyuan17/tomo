@@ -58,8 +58,9 @@ export const initCommand = new Command("init")
         });
         s1.stop("Claude Code authenticated");
       } catch {
-        s1.stop("Claude Code not authenticated");
-        p.log.error("Run `claude` in your terminal to log in, then try `tomo init` again.");
+        s1.stop("Claude Code not responding");
+        p.log.error("This could mean you're not logged in, or your usage limit has been reached.");
+        p.log.error("Run `claude` in your terminal to check, then try `tomo init` again.");
         p.outro("Setup incomplete");
         process.exit(1);
       }

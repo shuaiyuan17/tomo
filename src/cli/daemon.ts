@@ -1,7 +1,8 @@
 import { Command } from "commander";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { RESTART_REASON_FILE } from "../config.js";
 import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
 
@@ -56,8 +57,8 @@ export const restartCommand = new Command("restart")
   .option("--reason <reason>", "Reason for restart (sent to agent after restart)")
   .action(async (opts: { reason?: string }) => {
     if (opts.reason) {
-      const reasonFile = join(TOMO_HOME, "data", ".restart-reason");
-      writeFileSync(reasonFile, opts.reason, "utf-8");
+      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
+      writeFileSync(RESTART_REASON_FILE, opts.reason, "utf-8");
     }
     if (isAutostartEnabled()) {
       try {

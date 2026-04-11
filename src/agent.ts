@@ -1,6 +1,6 @@
 import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
-import { config, CONFIG_PATH } from "./config.js";
+import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
@@ -8,8 +8,6 @@ import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -835,8 +833,7 @@ export class Agent {
           if (channel) {
             const { cleanText, mediaPaths } = extractMedia(response);
             if (mediaPaths.length > 0) {
-              const { existsSync: fileExists } = await import("node:fs");
-              const validPaths = mediaPaths.filter((p) => fileExists(p));
+              const validPaths = mediaPaths.filter((p) => existsSync(p));
               for (let i = 0; i < validPaths.length; i++) {
                 await channel.send({
                   chatId: replyTarget.chatId,
@@ -886,19 +883,14 @@ export class Agent {
     log.info("Tomo is running");
 
     // Check for restart reason and notify via continuity-style message
-    const reasonFile = join(homedir(), ".tomo", "data", ".restart-reason");
-    if (existsSync(reasonFile)) {
-      const reason = readFileSync(reasonFile, "utf-8").trim();
-      try { unlinkSync(reasonFile); } catch { /* ignore */ }
+    if (existsSync(RESTART_REASON_FILE)) {
+      const reason = readFileSync(RESTART_REASON_FILE, "utf-8").trim();
+      try { unlinkSync(RESTART_REASON_FILE); } catch { /* ignore */ }
       if (reason) {
         log.info({ reason }, "Restart reason found, notifying agent");
-        const prompt = `System: Restarted. Reason: ${reason}`;
-        // Small delay to let channels connect
-        setTimeout(() => {
-          this.handleContinuity(prompt).catch((err) =>
-            log.error({ err }, "Failed to send restart reason")
-          );
-        }, 2000);
+        this.handleContinuity(`System: Restarted. Reason: ${reason}`).catch((err) =>
+          log.error({ err }, "Failed to send restart reason")
+        );
       }
     }
   }

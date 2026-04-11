@@ -5,6 +5,7 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -201,6 +202,21 @@ backupCommand
   .command("restore <date>")
   .description("Restore from a backup (e.g. 2026-04-10_1430)")
   .action(async (date: string) => {
+    // Refuse to restore while daemon is running
+    const pidFile = join(TOMO_HOME, "tomo.pid");
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, "utf-8").trim());
+      if (!isNaN(pid)) {
+        try {
+          process.kill(pid, 0);
+          console.error("Tomo daemon is running. Run `tomo stop` first.");
+          process.exit(1);
+        } catch {
+          // process not alive — stale PID file, continue
+        }
+      }
+    }
+
     const backupPath = join(BACKUPS_DIR, date);
     if (!existsSync(backupPath)) {
       console.error(`Backup not found: ${backupPath}`);
@@ -226,12 +242,16 @@ backupCommand
       console.log("  [ok] config.json");
     }
 
-    // 2. workspace/
+    // 2. workspace/ (preserve .claude/ which is populated by init/start)
     const workspaceSrc = join(backupPath, "workspace");
     if (existsSync(workspaceSrc)) {
       const workspaceDest = join(TOMO_HOME, "workspace");
+      const claudeDir = join(workspaceDest, ".claude");
+      const claudePreserve = join(workspaceDest, ".claude.preserve");
+      if (existsSync(claudeDir)) renameSync(claudeDir, claudePreserve);
       rmSync(workspaceDest, { recursive: true, force: true });
       cpSync(workspaceSrc, workspaceDest, { recursive: true });
+      if (existsSync(claudePreserve)) renameSync(claudePreserve, claudeDir);
       console.log("  [ok] workspace/");
     }
 

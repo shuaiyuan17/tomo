@@ -314,12 +314,12 @@ function summarizeToolInput(name: string, input?: Record<string, unknown>): stri
     case "Read": return `Read ${input.file_path}`;
     case "Write": return `Write ${input.file_path}`;
     case "Edit": return `Edit ${input.file_path}`;
-    case "Bash": return `Bash: ${String(input.command).slice(0, 80)}`;
+    case "Bash": return `Bash: ${String(input.command).slice(0, 500)}`;
     case "Glob": return `Glob ${input.pattern}`;
     case "Grep": return `Grep "${input.pattern}"`;
     case "WebSearch": return `WebSearch: ${input.query}`;
     case "WebFetch": return `WebFetch: ${input.url}`;
-    default: return `${name}: ${JSON.stringify(input).slice(0, 100)}`;
+    default: return `${name}: ${JSON.stringify(input).slice(0, 500)}`;
   }
 }
 

@@ -822,8 +822,9 @@ export class Agent {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
 
-      // Send non-silent responses to the user
-      if (!isSilentReply(response)) {
+      // Send non-silent responses to the user (check includes() for multi-turn responses
+      // where NO_REPLY may appear after earlier text output)
+      if (!isSilentReply(response) && !response.includes("NO_REPLY")) {
         const replyTarget = this.router.getReplyTarget(key)
           ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined)
           ?? this.parseChannelKey(key);

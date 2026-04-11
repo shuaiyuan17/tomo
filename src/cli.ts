@@ -13,7 +13,7 @@ import { uninstallCommand } from "./cli/uninstall.js";
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.3.4");
+  .version("0.3.5");
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);

@@ -143,6 +143,15 @@ backupCommand
       console.log("  [--] workspace/ (not found)");
     }
 
+    // 2b. .claude/skills/ (custom skills — preserve symlinks to avoid bloating backup)
+    const skillsSrc = join(workspaceSrc, ".claude", "skills");
+    const skillsDest = join(workspaceDest, ".claude", "skills");
+    if (existsSync(skillsSrc)) {
+      mkdirSync(join(workspaceDest, ".claude"), { recursive: true });
+      cpSync(skillsSrc, skillsDest, { recursive: true, dereference: false });
+      console.log("  [ok] workspace/.claude/skills/");
+    }
+
     // 3. data/
     const dataSrc = join(TOMO_HOME, "data");
     const dataDest = join(tmpDest, "data");
@@ -252,6 +261,15 @@ backupCommand
       rmSync(workspaceDest, { recursive: true, force: true });
       cpSync(workspaceSrc, workspaceDest, { recursive: true });
       if (existsSync(claudePreserve)) renameSync(claudePreserve, claudeDir);
+
+      // Merge backed-up custom skills into restored workspace
+      const skillsBackup = join(workspaceSrc, ".claude", "skills");
+      const skillsTarget = join(workspaceDest, ".claude", "skills");
+      if (existsSync(skillsBackup)) {
+        mkdirSync(skillsTarget, { recursive: true });
+        cpSync(skillsBackup, skillsTarget, { recursive: true });
+      }
+
       console.log("  [ok] workspace/");
     }
 

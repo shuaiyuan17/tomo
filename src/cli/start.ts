@@ -37,6 +37,15 @@ export const startCommand = new Command("start")
   });
 
 async function startForeground(): Promise<void> {
+  // Refuse to start if another tomo (manual daemon or launchd-managed) already
+  // owns the pidfile. Prevents two tomos fighting over Telegram polling, the
+  // BlueBubbles webhook port, and the session registry.
+  const existing = getRunningPid();
+  if (existing) {
+    console.error(`Tomo is already running (PID ${existing}). Refusing to start a second instance.`);
+    process.exit(1);
+  }
+
   const { Agent } = await import("../agent.js");
   const { TelegramChannel } = await import("../channels/index.js");
   const { config } = await import("../config.js");

@@ -1,11 +1,13 @@
 import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
-import { config, CONFIG_PATH } from "./config.js";
+import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
+import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -779,7 +781,7 @@ export class Agent {
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
-      if (isSilentReply(response)) {
+      if (isSilentReply(response) || response.includes("NO_REPLY")) {
         log.info("Cron completed silently (no reply sent)");
         return;
       }
@@ -819,9 +821,52 @@ export class Agent {
     try {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
+
+      // Send non-silent responses to the user (check includes() for multi-turn responses
+      // where NO_REPLY may appear after earlier text output)
+      if (!isSilentReply(response) && !response.includes("NO_REPLY")) {
+        const replyTarget = this.router.getReplyTarget(key)
+          ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined)
+          ?? this.parseChannelKey(key);
+
+        if (replyTarget) {
+          const channel = this.getChannel(replyTarget.channelName);
+          if (channel) {
+            const { cleanText, mediaPaths } = extractMedia(response);
+            if (mediaPaths.length > 0) {
+              const validPaths = mediaPaths.filter((p) => existsSync(p));
+              for (let i = 0; i < validPaths.length; i++) {
+                await channel.send({
+                  chatId: replyTarget.chatId,
+                  photo: validPaths[i],
+                  text: i === 0 ? cleanText : "",
+                });
+              }
+            } else {
+              await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+            }
+          }
+        }
+      }
     } catch (err) {
       log.error({ err }, "Continuity heartbeat failed");
     }
+  }
+
+  /** Parse a "channel:chatId" key into a reply target (fallback for non-identity users).
+   *  Skips group chats (Telegram negative IDs, iMessage group GUIDs). */
+  private parseChannelKey(key: string): ReplyTarget | undefined {
+    if (key.startsWith("dm:")) return undefined; // dm keys use deriveReplyTargetFromConfig
+    const colonIdx = key.indexOf(":");
+    if (colonIdx < 0) return undefined;
+    const channelName = key.slice(0, colonIdx);
+    const chatId = key.slice(colonIdx + 1);
+    if (!channelName || !chatId) return undefined;
+    // Skip Telegram group chats (negative IDs)
+    if (channelName === "telegram" && chatId.startsWith("-")) return undefined;
+    // Skip iMessage group chats (GUID contains ";+;")
+    if (channelName === "imessage" && chatId.includes(";+;")) return undefined;
+    return { channelName, chatId };
   }
 
   private findLastChatId(channelName: string): string | undefined {
@@ -837,6 +882,18 @@ export class Agent {
     log.info({ channels: this.channels.length }, "Starting Tomo");
     await Promise.all(this.channels.map((ch) => ch.start()));
     log.info("Tomo is running");
+
+    // Check for restart reason and notify via continuity-style message
+    if (existsSync(RESTART_REASON_FILE)) {
+      const reason = readFileSync(RESTART_REASON_FILE, "utf-8").trim();
+      try { unlinkSync(RESTART_REASON_FILE); } catch { /* ignore */ }
+      if (reason) {
+        log.info({ reason }, "Restart reason found, notifying agent");
+        this.handleContinuity(`System: Restarted. Reason: ${reason}`).catch((err) =>
+          log.error({ err }, "Failed to send restart reason")
+        );
+      }
+    }
   }
 
   async stop(): Promise<void> {

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
 export const CONFIG_PATH = join(TOMO_HOME, "config.json");
+export const RESTART_REASON_FILE = join(TOMO_HOME, "data", ".restart-reason");
 
 export interface IdentityConfig {
   name: string;

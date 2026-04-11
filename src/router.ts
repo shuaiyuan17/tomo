@@ -88,6 +88,34 @@ export class IdentityRouter {
     return this.sessions.getReplyTarget(sessionKey);
   }
 
+  /**
+   * Read-only derivation of a reply target from identity config + replyPolicy.
+   * Used as a fallback when a dm:<identity> session has no persisted replyTarget yet
+   * (e.g. cron fires before the identity has ever received a message). Does not
+   * touch the session registry.
+   */
+  deriveReplyTargetFromConfig(identityName: string): ReplyTarget | undefined {
+    const identity = this.identities.find(
+      (id) => id.name.toLowerCase() === identityName.toLowerCase(),
+    );
+    if (!identity) return undefined;
+
+    const channelNames = Object.keys(identity.channels);
+    if (channelNames.length === 0) return undefined;
+
+    // Fixed channel policy: use the configured channel if set
+    if (identity.replyPolicy !== "last-active") {
+      const fixedChatId = identity.channels[identity.replyPolicy];
+      if (fixedChatId) {
+        return { channelName: identity.replyPolicy, chatId: fixedChatId };
+      }
+    }
+
+    // last-active (or invalid fixed policy): fall back to the first bound channel
+    const first = channelNames[0];
+    return { channelName: first, chatId: identity.channels[first] };
+  }
+
   /** Find the first active dm: session key (for continuity) */
   findFirstDmSession(): string | undefined {
     for (const [key] of this.sessions.listSdkSessionIds()) {

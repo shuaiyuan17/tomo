@@ -55,6 +55,10 @@ tomo cron remove <id>          # Delete a job
 | `~/.tomo/data/cron/jobs.json` | Scheduled tasks |
 | `~/.tomo/logs/tomo.log` | Daemon logs |
 
+## Config file
+
+`~/.tomo/config.json` holds model, channels, identities, allowlists, and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, and env-var overrides see [CONFIG.md](CONFIG.md). Changes require `tomo restart` to take effect.
+
 ## Harness Features
 
 ### Streaming

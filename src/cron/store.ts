@@ -28,8 +28,7 @@ export class CronStore {
     name: string;
     schedule: CronSchedule;
     message: string;
-    channel?: string;
-    chatId?: string;
+    sessionKey: string;
     deleteAfterRun?: boolean;
   }): CronJob {
     const now = Date.now();
@@ -39,8 +38,7 @@ export class CronStore {
       enabled: true,
       schedule: opts.schedule,
       message: opts.message,
-      channel: opts.channel,
-      chatId: opts.chatId,
+      sessionKey: opts.sessionKey,
       deleteAfterRun: opts.deleteAfterRun ?? (opts.schedule.kind === "at"),
       createdAt: now,
       nextRunAt: computeNextRun(opts.schedule, now),
@@ -50,6 +48,20 @@ export class CronStore {
     this.jobs.push(job);
     this.save();
     return job;
+  }
+
+  /** Rewrite sessionKey on all jobs matching oldKey. Returns count changed. */
+  rewriteSessionKey(oldKey: string, newKey: string): number {
+    this.load();
+    let count = 0;
+    for (const job of this.jobs) {
+      if (job.sessionKey === oldKey) {
+        job.sessionKey = newKey;
+        count++;
+      }
+    }
+    if (count > 0) this.save();
+    return count;
   }
 
   remove(id: string): boolean {

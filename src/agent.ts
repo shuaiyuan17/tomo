@@ -22,14 +22,14 @@ function extractMedia(text: string): { cleanText: string; mediaPaths: string[] }
   return { cleanText, mediaPaths };
 }
 
-function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: { channelKey: string; sdkSessionId?: string }) {
+function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: { sessionKey: string; sdkSessionId?: string }) {
   let systemPrompt = buildSystemPrompt();
 
   // Inject session context so the agent can use LCM tools
   if (sessionContext) {
     const lines = [
       "\n\n# SESSION — Current Session Info",
-      `- Channel key: ${sessionContext.channelKey}`,
+      `- Session key: ${sessionContext.sessionKey}`,
     ];
     if (sessionContext.sdkSessionId) {
       lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
@@ -48,6 +48,12 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
       "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite", "Skill",
     ],
     settingSources: ["project"] as ("project")[],
+    settings: {
+      attribution: {
+        commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
+        pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
+      },
+    },
     includePartialMessages: true,
     maxTurns: 30,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
@@ -481,7 +487,7 @@ export class Agent {
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
     const opts = sdkOptions(resumeId ?? undefined, model, {
-      channelKey: key,
+      sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
     });
 
@@ -722,41 +728,44 @@ export class Agent {
   }
 
   /** Handle a cron-triggered message */
-  async handleCronMessage(message: string, channelName?: string, chatId?: string): Promise<void> {
-    // Resolve delivery target
-    let key: string;
+  async handleCronMessage(message: string, sessionKey: string): Promise<void> {
+    const key = sessionKey;
     let deliveryChannel: Channel;
     let deliveryChatId: string;
 
-    if (channelName && chatId) {
-      // Explicit channel+chatId from cron job — resolve through router for identity support
-      const resolution = this.router.resolve(channelName, chatId, false);
-      key = resolution.sessionKey;
-      deliveryChannel = this.getChannel(resolution.replyTarget.channelName) ?? this.channels[0];
-      deliveryChatId = resolution.replyTarget.chatId;
-    } else {
-      // No explicit target — try unified dm session first, then fall back to channel scan
-      const dmKey = this.router.findFirstDmSession();
-      if (dmKey) {
-        key = dmKey;
-        const target = this.router.getReplyTarget(dmKey);
-        if (target) {
-          deliveryChannel = this.getChannel(target.channelName) ?? this.channels[0];
-          deliveryChatId = target.chatId;
-        } else {
-          log.warn("Cron: dm session has no reply target");
-          return;
-        }
-      } else {
-        // Legacy fallback: find last active chatId on first channel
-        const channel = this.channels[0];
-        if (!channel) { log.warn("Cron: no channel available"); return; }
-        const fallbackChatId = this.findLastChatId(channel.name);
-        if (!fallbackChatId) { log.warn({ channel: channel.name }, "Cron: no chatId available"); return; }
-        key = `${channel.name}:${fallbackChatId}`;
-        deliveryChannel = channel;
-        deliveryChatId = fallbackChatId;
+    if (sessionKey.startsWith("dm:")) {
+      // Unified identity session — read persisted replyTarget, fall back to identity config
+      const identityName = sessionKey.slice(3);
+      const target =
+        this.router.getReplyTarget(sessionKey) ??
+        this.router.deriveReplyTargetFromConfig(identityName);
+      if (!target) {
+        log.warn({ sessionKey }, "Cron: no reply target for dm session");
+        return;
       }
+      const ch = this.getChannel(target.channelName);
+      if (!ch) {
+        log.warn({ sessionKey, channelName: target.channelName }, "Cron: channel not loaded");
+        return;
+      }
+      deliveryChannel = ch;
+      deliveryChatId = target.chatId;
+    } else {
+      // Raw per-channel key: <channel>:<chatId> (DM without identity, or group chat)
+      const colonIdx = sessionKey.indexOf(":");
+      if (colonIdx < 0) {
+        log.warn({ sessionKey }, "Cron: invalid session key");
+        return;
+      }
+      const channelName = sessionKey.slice(0, colonIdx);
+      const chatId = sessionKey.slice(colonIdx + 1);
+      const ch = this.getChannel(channelName);
+      if (!ch) {
+        log.warn({ sessionKey, channelName }, "Cron: channel not loaded");
+        return;
+      }
+      deliveryChannel = ch;
+      deliveryChatId = chatId;
     }
 
     const stampedMessage = this.injectTimestamp(message, deliveryChannel.name);

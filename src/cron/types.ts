@@ -9,9 +9,8 @@ export interface CronJob {
   enabled: boolean;
   schedule: CronSchedule;
   message: string;
-  /** Channel + chatId to deliver response to */
-  channel?: string;
-  chatId?: string;
+  /** Session key to deliver the triggered message to */
+  sessionKey: string;
   /** Auto-delete after successful run (for one-shots) */
   deleteAfterRun: boolean;
   createdAt: number;
@@ -21,9 +20,7 @@ export interface CronJob {
   lastStatus: "ok" | "error" | null;
 }
 
-export type CronJobCreate = Pick<CronJob, "name" | "message"> & {
+export type CronJobCreate = Pick<CronJob, "name" | "message" | "sessionKey"> & {
   schedule: string; // Parsed by the CLI: "in 20m", "every 1h", "0 9 * * *"
-  channel?: string;
-  chatId?: string;
   deleteAfterRun?: boolean;
 };

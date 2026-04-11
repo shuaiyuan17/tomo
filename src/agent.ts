@@ -855,13 +855,19 @@ export class Agent {
     }
   }
 
-  /** Parse a "channel:chatId" key into a reply target (fallback for non-identity users) */
+  /** Parse a "channel:chatId" key into a reply target (fallback for non-identity users).
+   *  Skips group chats (Telegram negative IDs, iMessage group GUIDs). */
   private parseChannelKey(key: string): ReplyTarget | undefined {
+    if (key.startsWith("dm:")) return undefined; // dm keys use deriveReplyTargetFromConfig
     const colonIdx = key.indexOf(":");
     if (colonIdx < 0) return undefined;
     const channelName = key.slice(0, colonIdx);
     const chatId = key.slice(colonIdx + 1);
     if (!channelName || !chatId) return undefined;
+    // Skip Telegram group chats (negative IDs)
+    if (channelName === "telegram" && chatId.startsWith("-")) return undefined;
+    // Skip iMessage group chats (GUID contains ";+;")
+    if (channelName === "imessage" && chatId.includes(";+;")) return undefined;
     return { channelName, chatId };
   }
 

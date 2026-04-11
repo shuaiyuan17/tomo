@@ -822,6 +822,32 @@ export class Agent {
     try {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
+
+      // Send non-silent responses to the user
+      if (!isSilentReply(response)) {
+        const replyTarget = this.router.getReplyTarget(key)
+          ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined);
+
+        if (replyTarget) {
+          const channel = this.getChannel(replyTarget.channelName);
+          if (channel) {
+            const { cleanText, mediaPaths } = extractMedia(response);
+            if (mediaPaths.length > 0) {
+              const { existsSync: fileExists } = await import("node:fs");
+              const validPaths = mediaPaths.filter((p) => fileExists(p));
+              for (let i = 0; i < validPaths.length; i++) {
+                await channel.send({
+                  chatId: replyTarget.chatId,
+                  photo: validPaths[i],
+                  text: i === 0 ? cleanText : "",
+                });
+              }
+            } else {
+              await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+            }
+          }
+        }
+      }
     } catch (err) {
       log.error({ err }, "Continuity heartbeat failed");
     }

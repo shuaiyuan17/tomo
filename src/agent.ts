@@ -9,6 +9,9 @@ import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
+// Disable SDK auto-compaction — we manage context ourselves via LCM
+process.env.DISABLE_AUTO_COMPACT = "1";
+
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
 }

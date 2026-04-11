@@ -137,7 +137,7 @@ export const logsCommand = new Command("logs")
     tailArgs.push(LOG_FILE);
 
     const tail = spawn("tail", tailArgs, { stdio: ["ignore", "pipe", "inherit"] });
-    const pretty = spawn("npx", ["pino-pretty", "--ignore", "pid,hostname", "--translateTime", "HH:MM:ss"], {
+    const pretty = spawn("npx", ["pino-pretty", "--ignore", "pid,hostname", "--translateTime", "SYS:HH:MM:ss"], {
       stdio: ["pipe", "inherit", "inherit"],
     });
     tail.stdout.pipe(pretty.stdin);

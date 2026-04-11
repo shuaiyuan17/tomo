@@ -96,6 +96,16 @@ Place skill directories under `~/.tomo/workspace/.claude/skills/`. Each skill ne
 
 Avoid the `tomo-` prefix for custom skills so they won't conflict with built-in updates.
 
+## Backup
+
+```bash
+tomo backup              # Create a backup (config, workspace, data, SDK sessions)
+tomo backup list         # List existing backups
+tomo backup restore <id> # Restore from a backup (daemon must be stopped first)
+```
+
+Backups are stored in `~/Backups/tomo/` with 14-day rolling retention.
+
 ## Troubleshooting
 
 ### Agent not responding

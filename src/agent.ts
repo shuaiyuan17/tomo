@@ -3,6 +3,7 @@ import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
+import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
@@ -826,7 +827,8 @@ export class Agent {
       // Send non-silent responses to the user
       if (!isSilentReply(response)) {
         const replyTarget = this.router.getReplyTarget(key)
-          ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined);
+          ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined)
+          ?? this.parseChannelKey(key);
 
         if (replyTarget) {
           const channel = this.getChannel(replyTarget.channelName);
@@ -851,6 +853,16 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Continuity heartbeat failed");
     }
+  }
+
+  /** Parse a "channel:chatId" key into a reply target (fallback for non-identity users) */
+  private parseChannelKey(key: string): ReplyTarget | undefined {
+    const colonIdx = key.indexOf(":");
+    if (colonIdx < 0) return undefined;
+    const channelName = key.slice(0, colonIdx);
+    const chatId = key.slice(colonIdx + 1);
+    if (!channelName || !chatId) return undefined;
+    return { channelName, chatId };
   }
 
   private findLastChatId(channelName: string): string | undefined {

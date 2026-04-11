@@ -6,6 +6,9 @@ import { SessionStore } from "./sessions/index.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -837,6 +840,23 @@ export class Agent {
     log.info({ channels: this.channels.length }, "Starting Tomo");
     await Promise.all(this.channels.map((ch) => ch.start()));
     log.info("Tomo is running");
+
+    // Check for restart reason and notify via continuity-style message
+    const reasonFile = join(homedir(), ".tomo", "data", ".restart-reason");
+    if (existsSync(reasonFile)) {
+      const reason = readFileSync(reasonFile, "utf-8").trim();
+      try { unlinkSync(reasonFile); } catch { /* ignore */ }
+      if (reason) {
+        log.info({ reason }, "Restart reason found, notifying agent");
+        const prompt = `System: Restarted. Reason: ${reason}`;
+        // Small delay to let channels connect
+        setTimeout(() => {
+          this.handleContinuity(prompt).catch((err) =>
+            log.error({ err }, "Failed to send restart reason")
+          );
+        }, 2000);
+      }
+    }
   }
 
   async stop(): Promise<void> {

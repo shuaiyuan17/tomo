@@ -53,7 +53,12 @@ export const stopCommand = new Command("stop")
 
 export const restartCommand = new Command("restart")
   .description("Restart Tomo daemon")
-  .action(async () => {
+  .option("--reason <reason>", "Reason for restart (sent to agent after restart)")
+  .action(async (opts: { reason?: string }) => {
+    if (opts.reason) {
+      const reasonFile = join(TOMO_HOME, "data", ".restart-reason");
+      writeFileSync(reasonFile, opts.reason, "utf-8");
+    }
     if (isAutostartEnabled()) {
       try {
         await restartAutostart();

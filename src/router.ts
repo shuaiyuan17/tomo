@@ -162,15 +162,27 @@ export class IdentityRouter {
     // Already has a session under the unified key
     if (this.sessions.getSdkSessionId(sessionKey)) return;
 
-    // Check if any old channel-specific key has an active session
+    // Collect all old channel-specific keys that have an active session
+    const candidates: string[] = [];
     for (const [chName, chId] of Object.entries(identity.channels)) {
       const oldKey = `${chName}:${chId}`;
-      if (this.sessions.getSdkSessionId(oldKey)) {
-        this.sessions.migrateSessionKey(oldKey, sessionKey);
-        log.info({ identity: identity.name, from: oldKey, to: sessionKey }, "Migrated session to unified identity");
-        return;
-      }
+      if (this.sessions.getSdkSessionId(oldKey)) candidates.push(oldKey);
     }
+
+    if (candidates.length === 0) return;
+
+    if (candidates.length === 1) {
+      this.sessions.migrateSessionKey(candidates[0], sessionKey);
+      log.info({ identity: identity.name, from: candidates[0], to: sessionKey }, "Migrated session to unified identity");
+      return;
+    }
+
+    // Ambiguous: multiple bound channels already have sessions. Don't silently
+    // pick one — the config TUI resolves this interactively. Start fresh here.
+    log.warn(
+      { identity: identity.name, candidates, unifiedKey: sessionKey },
+      "Multiple existing sessions found for identity; refusing to auto-migrate. Run `tomo config` → Identities to choose which session to keep.",
+    );
   }
 }
 

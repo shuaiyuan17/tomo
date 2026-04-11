@@ -321,9 +321,25 @@ export class SessionStore {
     const now = Date.now();
     const sdkDir = getSdkSessionDir();
     const expired = this.registry.filter((e) => e.expiresAt !== null && e.expiresAt <= now);
+    const deletedFiles = new Set<string>();
 
     for (const entry of expired) {
-      // Delete the SDK JSONL file
+      // Skip deletion if any surviving entry still references this sdkSessionId
+      // (e.g. shared after migrateSessionKey, or unlinked but not yet expired)
+      const stillReferenced = this.registry.some(
+        (e) => e.sdkSessionId === entry.sdkSessionId && (e.expiresAt === null || e.expiresAt > now),
+      );
+      if (stillReferenced) {
+        log.info(
+          { sessionId: entry.sdkSessionId, channelKey: entry.channelKey },
+          "Expired entry removed, SDK file preserved: sdkSessionId still referenced by another entry",
+        );
+        continue;
+      }
+
+      if (deletedFiles.has(entry.sdkSessionId)) continue;
+      deletedFiles.add(entry.sdkSessionId);
+
       const sdkFile = join(sdkDir, `${entry.sdkSessionId}.jsonl`);
       if (existsSync(sdkFile)) {
         try {
@@ -362,20 +378,19 @@ export class SessionStore {
 
   /** Migrate a session from one key to another (for identity-based session unification) */
   migrateSessionKey(oldKey: string, newKey: string): void {
-    const entry = this.registry.find((e) => e.channelKey === oldKey && e.unlinkedAt === null);
-    if (!entry) return;
+    const idx = this.registry.findIndex((e) => e.channelKey === oldKey && e.unlinkedAt === null);
+    if (idx === -1) return;
+    const entry = this.registry[idx];
 
-    // Create new entry with the new key
+    // Re-key the entry in place: the data lives on under newKey, so there's no
+    // need to keep a phantom unlinked entry that would confuse `sessions list`
+    // and (pre-fix) trick cleanupExpired into deleting the shared SDK file.
     const now = Date.now();
-    this.registry.push({
+    this.registry[idx] = {
       ...entry,
       channelKey: newKey,
       lastActiveAt: now,
-    });
-
-    // Unlink the old entry
-    entry.unlinkedAt = now;
-    entry.expiresAt = now + 30 * 24 * 60 * 60 * 1000; // 30 days
+    };
 
     // Rename transcript file
     const oldPath = this.transcriptPath(oldKey);

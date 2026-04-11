@@ -398,6 +398,8 @@ async function configIdentities(): Promise<void> {
       if (moved > 0) {
         p.log.success(`Moved ${moved} cron job(s) to dm:${identity.name.toLowerCase()}`);
       }
+
+      await resolveUnifiedSession(identity);
     }
 
     if (typeof choice === "string" && (choice as string).startsWith("edit:")) {
@@ -433,6 +435,8 @@ async function configIdentities(): Promise<void> {
         if (moved > 0) {
           p.log.success(`Moved ${moved} cron job(s) to dm:${id.name.toLowerCase()}`);
         }
+
+        await resolveUnifiedSession(id);
       }
 
       if (action === "policy") {
@@ -509,6 +513,89 @@ function restoreCronJobsFromIdentity(identity: {
     fallbackKey,
   );
   return { count, fallbackKey };
+}
+
+/**
+ * After an identity is created or its bindings change, decide what happens to
+ * any pre-existing per-channel sessions that are now bound to this identity.
+ * - 0 candidates: nothing to do.
+ * - 1 candidate: migrate silently into dm:<name>.
+ * - 2+ candidates: prompt the user to pick one (or start fresh). The non-chosen
+ *   sessions are explicitly unlinked, which puts them in the 30-day retention
+ *   window so they can be revisited via `tomo sessions list`.
+ * No-ops if dm:<name> already has an active session.
+ */
+async function resolveUnifiedSession(identity: {
+  name: string;
+  channels: Record<string, string>;
+}): Promise<void> {
+  const store = new SessionStore(SESSIONS_DIR, 0);
+  const unifiedKey = `dm:${identity.name.toLowerCase()}`;
+
+  if (store.getSdkSessionId(unifiedKey)) return; // already unified
+
+  const candidates: Array<{ oldKey: string; channel: string; queries: number; lastActiveAt: number }> = [];
+  for (const [ch, chatId] of Object.entries(identity.channels)) {
+    const oldKey = `${ch}:${chatId}`;
+    const entry = store.getEntry(oldKey);
+    if (!entry) continue;
+    candidates.push({
+      oldKey,
+      channel: ch,
+      queries: entry.stats?.totalQueries ?? 0,
+      lastActiveAt: entry.lastActiveAt,
+    });
+  }
+
+  if (candidates.length === 0) return;
+
+  if (candidates.length === 1) {
+    store.migrateSessionKey(candidates[0].oldKey, unifiedKey);
+    p.log.success(`Adopted ${candidates[0].oldKey} as ${unifiedKey}`);
+    return;
+  }
+
+  p.log.warn(`Found ${candidates.length} existing sessions bound to "${identity.name}".`);
+  p.log.info("Unlinked sessions stay recoverable for 30 days — see `tomo sessions list`.");
+
+  const choice = await p.select({
+    message: `Which session should become ${unifiedKey}?`,
+    options: [
+      ...candidates.map((c) => ({
+        value: c.oldKey,
+        label: c.oldKey,
+        hint: `${c.queries} queries, last used ${formatAge(Date.now() - c.lastActiveAt)} ago`,
+      })),
+      { value: "__fresh__", label: "Start fresh", hint: "unlink all candidates, begin a new unified session" },
+    ],
+  });
+
+  if (p.isCancel(choice)) {
+    p.log.warn(`Skipped. ${unifiedKey} will stay unresolved until you revisit this in \`tomo config\`.`);
+    return;
+  }
+
+  if (choice === "__fresh__") {
+    for (const c of candidates) store.clearSdkSessionId(c.oldKey);
+    p.log.success(`Unlinked ${candidates.length} session(s). ${unifiedKey} will start fresh on next message.`);
+    return;
+  }
+
+  store.migrateSessionKey(choice as string, unifiedKey);
+  for (const c of candidates) {
+    if (c.oldKey !== choice) store.clearSdkSessionId(c.oldKey);
+  }
+  p.log.success(`Adopted ${choice} as ${unifiedKey}. ${candidates.length - 1} other session(s) unlinked.`);
+}
+
+function formatAge(ms: number): string {
+  if (ms < 0) return "0s";
+  const days = Math.floor(ms / 86_400_000);
+  const hours = Math.floor((ms % 86_400_000) / 3_600_000);
+  const mins = Math.floor((ms % 3_600_000) / 60_000);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
 }
 
 // --- Sessions ---

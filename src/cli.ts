@@ -9,6 +9,7 @@ import { migrateCommand } from "./cli/migrate.js";
 import { lcmCommand } from "./cli/lcm.js";
 import { configCommand } from "./cli/config.js";
 import { uninstallCommand } from "./cli/uninstall.js";
+import { backupCommand } from "./cli/backup.js";
 
 const program = new Command()
   .name("tomo")
@@ -28,5 +29,6 @@ program.addCommand(migrateCommand);
 program.addCommand(sessionsCommand);
 program.addCommand(lcmCommand);
 program.addCommand(uninstallCommand);
+program.addCommand(backupCommand);
 
 program.parse();

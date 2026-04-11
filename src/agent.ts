@@ -781,7 +781,7 @@ export class Agent {
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
-      if (isSilentReply(response)) {
+      if (isSilentReply(response) || response.includes("NO_REPLY")) {
         log.info("Cron completed silently (no reply sent)");
         return;
       }

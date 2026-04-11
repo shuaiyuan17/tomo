@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.6 (2026-04-11)
+
+### Features
+
+- `tomo backup` — create, list, and restore backups of config, workspace, data, and SDK session files
+- 14-day rolling retention, atomic writes (`.tmp` + rename), and custom skills included in backups
+- Restore blocks while daemon is running and preserves `.claude/` directory
+- Backup commands documented in `tomo-system` skill
+
 ## 0.3.5 (2026-04-10)
 
 ### Features

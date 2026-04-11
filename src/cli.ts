@@ -14,7 +14,7 @@ import { backupCommand } from "./cli/backup.js";
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.3.5");
+  .version("0.3.6");
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);

@@ -10,14 +10,24 @@ Manage scheduled tasks using the `tomo` CLI via Bash.
 ## Create a one-shot reminder
 
 ```bash
-tomo cron add --name "check-email" --schedule "in 20m" --message "Check your email"
+tomo cron add --name "check-email" --schedule "in 20m" --message "Check your email" --session "$SESSION_KEY"
 ```
 
 ## Create a recurring task
 
 ```bash
-tomo cron add --name "morning-brief" --schedule "0 9 * * *" --message "Check calendar, weather, and summarize my day"
+tomo cron add --name "morning-brief" --schedule "0 9 * * *" --message "Check calendar, weather, and summarize my day" --session "$SESSION_KEY"
 ```
+
+## Where does the reminder get delivered? (--session)
+
+Every job requires a `--session <key>` flag. The session key is shown in your system prompt under **SESSION — Current Session Info → Session key**. Pass that value so the fired message is routed back to the right place.
+
+- **User says "remind me"** in a DM or group — use the current `Session key` from the system prompt. For a unified identity (`dm:<name>`), the reply follows the identity's reply policy at fire time, so it will reach them wherever they are most reachable. For a group chat (`imessage:...` / `telegram:-100...`), the reminder fires back into that same group.
+- **User says "remind us" / "ping the group"** in a group chat — same deal: pass the current group session key.
+- **User says "remind me" in a group chat but clearly means *them personally*, not the group** — prefer the user's unified DM session key if one exists (`dm:<name>`), not the group's key. Otherwise use the group key and accept that the reminder lands in the group.
+
+If in doubt, use the current session's key — that's the safest default.
 
 ## Schedule formats
 

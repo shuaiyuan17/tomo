@@ -12,8 +12,7 @@ cronCommand
   .requiredOption("--name <name>", "Job name")
   .requiredOption("--schedule <schedule>", 'Schedule: "in 20m", "every 1h", "0 9 * * *"')
   .requiredOption("--message <message>", "Message to send when triggered")
-  .option("--channel <channel>", "Channel to deliver to (e.g. telegram)")
-  .option("--chat-id <chatId>", "Chat ID to deliver to")
+  .requiredOption("--session <key>", "Session key to deliver to (see 'Session key' in the agent system prompt)")
   .option("--once", "Delete after successful run", false)
   .action((opts) => {
     const schedule = parseScheduleString(opts.schedule);
@@ -21,12 +20,12 @@ cronCommand
       name: opts.name,
       schedule,
       message: opts.message,
-      channel: opts.channel,
-      chatId: opts.chatId,
+      sessionKey: opts.session,
       deleteAfterRun: opts.once ?? (schedule.kind === "at"),
     });
     console.log(`Created job ${job.id}: "${job.name}"`);
     console.log(`  Schedule: ${formatSchedule(job.schedule)}`);
+    console.log(`  Session:  ${job.sessionKey}`);
     console.log(`  Next run: ${job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "never"}`);
   });
 
@@ -48,9 +47,9 @@ cronCommand
       console.log(`[${job.id}] ${job.name} (${status})`);
       console.log(`  Schedule: ${formatSchedule(job.schedule)}`);
       console.log(`  Message:  ${job.message}`);
+      console.log(`  Session:  ${job.sessionKey}`);
       console.log(`  Next run: ${next}`);
       console.log(`  Last run: ${last}`);
-      if (job.channel) console.log(`  Deliver:  ${job.channel}:${job.chatId ?? "?"}`);
       console.log();
     }
   });

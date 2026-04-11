@@ -66,8 +66,21 @@ export async function restartAutostart(): Promise<void> {
   if (!isMacOS()) {
     throw new Error("Autostart is only supported on macOS.");
   }
+  if (!existsSync(LAUNCH_AGENT_PLIST_PATH)) {
+    throw new Error(
+      "Autostart is not enabled. Run `tomo config` → Autostart to enable it, or `tomo start` to run manually.",
+    );
+  }
   const domain = guiDomain();
-  await runLaunchctl(["kickstart", "-k", `${domain}/${LAUNCH_AGENT_LABEL}`]);
+
+  // Happy path: service is loaded → kickstart restarts it in place.
+  // If the plist is on disk but the service isn't loaded (e.g. after `tomo stop`
+  // which calls bootout), kickstart fails — bootstrap it from the plist instead.
+  try {
+    await runLaunchctl(["kickstart", "-k", `${domain}/${LAUNCH_AGENT_LABEL}`]);
+  } catch {
+    await runLaunchctl(["bootstrap", domain, LAUNCH_AGENT_PLIST_PATH]);
+  }
 }
 
 /**

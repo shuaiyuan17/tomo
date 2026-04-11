@@ -44,7 +44,7 @@ export class CronScheduler {
 
     try {
       const cronMessage = `System: Scheduled task "${job.name}" triggered. ${job.message}`;
-      await this.agent.handleCronMessage(cronMessage, job.channel, job.chatId);
+      await this.agent.handleCronMessage(cronMessage, job.sessionKey);
       this.store.markRun(jobId, "ok");
       log.info({ jobId: job.id }, "Cron completed successfully");
     } catch (err) {

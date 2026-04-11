@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { SessionStore } from "../sessions/store.js";
+import { CronStore } from "../cron/store.js";
 import { disableAutostart, enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 
 const TOMO_HOME = join(homedir(), ".tomo");
@@ -392,6 +393,11 @@ async function configIdentities(): Promise<void> {
       cfg.identities = identities;
       saveConfig(cfg);
       p.log.success(`Identity "${identity.name}" created`);
+
+      const moved = migrateCronJobsToIdentity(identity);
+      if (moved > 0) {
+        p.log.success(`Moved ${moved} cron job(s) to dm:${identity.name.toLowerCase()}`);
+      }
     }
 
     if (typeof choice === "string" && (choice as string).startsWith("edit:")) {
@@ -422,6 +428,11 @@ async function configIdentities(): Promise<void> {
         cfg.identities = identities;
         saveConfig(cfg);
         p.log.success("Bindings updated");
+
+        const moved = migrateCronJobsToIdentity(id);
+        if (moved > 0) {
+          p.log.success(`Moved ${moved} cron job(s) to dm:${id.name.toLowerCase()}`);
+        }
       }
 
       if (action === "policy") {
@@ -446,13 +457,58 @@ async function configIdentities(): Promise<void> {
       if (action === "remove") {
         const confirm = await p.confirm({ message: `Remove identity "${id.name}"?` });
         if (p.isCancel(confirm) || !confirm) continue;
+
+        const restored = restoreCronJobsFromIdentity(id);
+
         identities.splice(idx, 1);
         cfg.identities = identities;
         saveConfig(cfg);
         p.log.success(`Identity "${id.name}" removed`);
+        if (restored.count > 0) {
+          p.log.success(`Moved ${restored.count} cron job(s) back to ${restored.fallbackKey}`);
+        }
       }
     }
   }
+}
+
+/**
+ * Rewrite cron jobs keyed on any of this identity's raw per-channel session keys
+ * to the unified dm:<name> key. Returns total jobs rewritten.
+ */
+function migrateCronJobsToIdentity(identity: {
+  name: string;
+  channels: Record<string, string>;
+}): number {
+  const cronStore = new CronStore();
+  const unified = `dm:${identity.name.toLowerCase()}`;
+  let total = 0;
+  for (const [ch, chatId] of Object.entries(identity.channels)) {
+    total += cronStore.rewriteSessionKey(`${ch}:${chatId}`, unified);
+  }
+  return total;
+}
+
+/**
+ * Reverse of migrateCronJobsToIdentity: move cron jobs from dm:<name> back to
+ * a concrete per-channel session key, picking the first bound channel as the
+ * fallback. Returns the rewrite count and the fallback key used.
+ */
+function restoreCronJobsFromIdentity(identity: {
+  name: string;
+  channels: Record<string, string>;
+}): { count: number; fallbackKey: string | null } {
+  const entries = Object.entries(identity.channels);
+  if (entries.length === 0) return { count: 0, fallbackKey: null };
+
+  const [ch, chatId] = entries[0];
+  const fallbackKey = `${ch}:${chatId}`;
+  const cronStore = new CronStore();
+  const count = cronStore.rewriteSessionKey(
+    `dm:${identity.name.toLowerCase()}`,
+    fallbackKey,
+  );
+  return { count, fallbackKey };
 }
 
 // --- Sessions ---

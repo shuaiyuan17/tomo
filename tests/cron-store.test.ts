@@ -22,6 +22,7 @@ describe("CronStore", () => {
       name: "test",
       schedule: { kind: "every", everyMs: 60_000 },
       message: "hello",
+      sessionKey: "dm:alice",
     });
 
     expect(job.id).toBeTruthy();
@@ -36,6 +37,7 @@ describe("CronStore", () => {
       name: "test",
       schedule: { kind: "every", everyMs: 60_000 },
       message: "hello",
+      sessionKey: "dm:alice",
     });
 
     expect(store.remove(job.id)).toBe(true);
@@ -49,6 +51,7 @@ describe("CronStore", () => {
       name: "persistent",
       schedule: { kind: "cron", expr: "0 9 * * *" },
       message: "morning",
+      sessionKey: "telegram:12345",
     });
 
     const store2 = new CronStore(TEST_PATH);
@@ -72,6 +75,7 @@ describe("CronStore", () => {
       name: "future",
       schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
       message: "later",
+      sessionKey: "dm:alice",
     });
 
     const due = store.getDueJobs();
@@ -85,6 +89,7 @@ describe("CronStore", () => {
       name: "recurring",
       schedule: { kind: "every", everyMs: 60_000 },
       message: "tick",
+      sessionKey: "dm:alice",
     });
 
     store.markRun(job.id, "ok");
@@ -100,11 +105,54 @@ describe("CronStore", () => {
       name: "once",
       schedule: { kind: "at", at: new Date(Date.now() - 1000).toISOString() },
       message: "fire once",
+      sessionKey: "dm:alice",
     });
 
     store.markRun(job.id, "ok");
     // deleteAfterRun defaults to true for "at" jobs
     expect(store.get(job.id)).toBeUndefined();
+  });
+
+  it("rewrites sessionKey in bulk", () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "job-a",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "a",
+      sessionKey: "telegram:12345",
+    });
+    store.add({
+      name: "job-b",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "b",
+      sessionKey: "telegram:12345",
+    });
+    store.add({
+      name: "job-c",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "c",
+      sessionKey: "imessage:+15551234567",
+    });
+
+    const count = store.rewriteSessionKey("telegram:12345", "dm:alice");
+    expect(count).toBe(2);
+
+    const reloaded = new CronStore(TEST_PATH);
+    const jobs = reloaded.list();
+    expect(jobs.find((j) => j.name === "job-a")?.sessionKey).toBe("dm:alice");
+    expect(jobs.find((j) => j.name === "job-b")?.sessionKey).toBe("dm:alice");
+    expect(jobs.find((j) => j.name === "job-c")?.sessionKey).toBe("imessage:+15551234567");
+  });
+
+  it("rewriteSessionKey returns 0 when no jobs match", () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "j",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+    expect(store.rewriteSessionKey("telegram:nothing", "dm:bob")).toBe(0);
   });
 });
 

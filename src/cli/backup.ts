@@ -6,25 +6,16 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
 } from "node:fs";
 import { createInterface } from "node:readline";
+import { getSdkSessionDir } from "../sessions/store.js";
 
 const TOMO_HOME = join(homedir(), ".tomo");
 const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
 const RETENTION_DAYS = 14;
-
-/** Encode a path the way the Claude SDK does: replace / and . with - */
-function encodeWorkspacePath(p: string): string {
-  return p.replace(/[/.]/g, "-");
-}
-
-function getSDKSessionDir(): string {
-  const workspacePath = join(TOMO_HOME, "workspace");
-  const encoded = encodeWorkspacePath(workspacePath);
-  return join(homedir(), ".claude", "projects", encoded);
-}
 
 function timestamp(): string {
   const now = new Date();
@@ -120,14 +111,21 @@ backupCommand
   .action(() => {
     const ts = timestamp();
     const dest = join(BACKUPS_DIR, ts);
-    mkdirSync(dest, { recursive: true });
+    const tmpDest = dest + ".tmp";
+
+    // Clean up any leftover partial backup
+    if (existsSync(tmpDest)) {
+      rmSync(tmpDest, { recursive: true, force: true });
+    }
+
+    mkdirSync(tmpDest, { recursive: true });
 
     console.log(`Creating backup: ${dest}\n`);
 
     // 1. config.json
     const configSrc = join(TOMO_HOME, "config.json");
     if (existsSync(configSrc)) {
-      cpSync(configSrc, join(dest, "config.json"));
+      cpSync(configSrc, join(tmpDest, "config.json"));
       console.log("  [ok] config.json");
     } else {
       console.log("  [--] config.json (not found)");
@@ -135,7 +133,7 @@ backupCommand
 
     // 2. workspace/ (excluding .claude/)
     const workspaceSrc = join(TOMO_HOME, "workspace");
-    const workspaceDest = join(dest, "workspace");
+    const workspaceDest = join(tmpDest, "workspace");
     if (copyIfExists(workspaceSrc, workspaceDest, {
       filter: (src) => !src.includes(`${sep}.claude${sep}`) && !src.endsWith(`${sep}.claude`),
     })) {
@@ -146,7 +144,7 @@ backupCommand
 
     // 3. data/
     const dataSrc = join(TOMO_HOME, "data");
-    const dataDest = join(dest, "data");
+    const dataDest = join(tmpDest, "data");
     if (copyIfExists(dataSrc, dataDest)) {
       console.log("  [ok] data/");
     } else {
@@ -154,13 +152,16 @@ backupCommand
     }
 
     // 4. SDK session files
-    const sdkDir = getSDKSessionDir();
-    const sdkDest = join(dest, "sdk-sessions");
+    const sdkDir = getSdkSessionDir();
+    const sdkDest = join(tmpDest, "sdk-sessions");
     if (copyIfExists(sdkDir, sdkDest)) {
       console.log("  [ok] sdk-sessions/");
     } else {
       console.log("  [--] sdk-sessions/ (not found)");
     }
+
+    // Atomically move tmp dir to final destination
+    renameSync(tmpDest, dest);
 
     // Prune old backups
     const pruned = pruneOldBackups();
@@ -229,6 +230,7 @@ backupCommand
     const workspaceSrc = join(backupPath, "workspace");
     if (existsSync(workspaceSrc)) {
       const workspaceDest = join(TOMO_HOME, "workspace");
+      rmSync(workspaceDest, { recursive: true, force: true });
       cpSync(workspaceSrc, workspaceDest, { recursive: true });
       console.log("  [ok] workspace/");
     }
@@ -237,6 +239,7 @@ backupCommand
     const dataSrc = join(backupPath, "data");
     if (existsSync(dataSrc)) {
       const dataDest = join(TOMO_HOME, "data");
+      rmSync(dataDest, { recursive: true, force: true });
       cpSync(dataSrc, dataDest, { recursive: true });
       console.log("  [ok] data/");
     }
@@ -244,7 +247,8 @@ backupCommand
     // 4. SDK session files
     const sdkSrc = join(backupPath, "sdk-sessions");
     if (existsSync(sdkSrc)) {
-      const sdkDest = getSDKSessionDir();
+      const sdkDest = getSdkSessionDir();
+      rmSync(sdkDest, { recursive: true, force: true });
       mkdirSync(sdkDest, { recursive: true });
       cpSync(sdkSrc, sdkDest, { recursive: true });
       console.log("  [ok] sdk-sessions/");

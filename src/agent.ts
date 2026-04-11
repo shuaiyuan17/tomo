@@ -37,6 +37,11 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     systemPrompt += lines.join("\n");
   }
 
+  // When using API key auth, pass the key to the SDK subprocess via env
+  const env = config.auth === "api-key" && config.apiKey
+    ? { ...process.env, ANTHROPIC_API_KEY: config.apiKey }
+    : undefined;
+
   return {
     model: model ?? config.model,
     cwd: config.workspaceDir,
@@ -56,6 +61,7 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     },
     includePartialMessages: true,
     maxTurns: 30,
+    ...(env ? { env } : {}),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
   };
 }

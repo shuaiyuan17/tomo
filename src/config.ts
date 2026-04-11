@@ -12,7 +12,13 @@ export interface IdentityConfig {
   replyPolicy: string;               // "last-active" | channelName
 }
 
+type AuthMode = "subscription" | "api-key";
+
 interface TomoConfig {
+  /** Authentication mode: "subscription" (default, uses Claude CLI login) or "api-key" */
+  auth: AuthMode;
+  /** Anthropic API key. Used when auth is "api-key". Sourced from config or ANTHROPIC_API_KEY env var. */
+  apiKey: string | null;
   telegramToken: string;
   model: string;
   workspaceDir: string;
@@ -98,7 +104,19 @@ function buildConfig(): TomoConfig {
       replyPolicy: id.replyPolicy ?? "last-active",
     }));
 
+  // Auth mode: env var ANTHROPIC_API_KEY implies "api-key" unless explicitly overridden
+  const apiKey = process.env.ANTHROPIC_API_KEY ?? (file.apiKey as string | undefined) ?? null;
+  const auth: AuthMode = (process.env.TOMO_AUTH ?? file.auth ?? (apiKey ? "api-key" : "subscription")) as AuthMode;
+
+  if (auth === "api-key" && !apiKey) {
+    throw new Error(
+      'Auth mode is "api-key" but no API key found. Set ANTHROPIC_API_KEY env var or "apiKey" in config.json.',
+    );
+  }
+
   return {
+    auth,
+    apiKey,
     telegramToken,
     model: (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6") as string,
     workspaceDir: process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace"),

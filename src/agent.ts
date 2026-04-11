@@ -48,6 +48,12 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
       "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite", "Skill",
     ],
     settingSources: ["project"] as ("project")[],
+    settings: {
+      attribution: {
+        commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
+        pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
+      },
+    },
     includePartialMessages: true,
     maxTurns: 30,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),

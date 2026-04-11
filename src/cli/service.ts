@@ -133,6 +133,7 @@ function buildPlist(): string {
   const home = escapeXml(homedir());
   const logDir = join(homedir(), ".tomo", "logs");
   mkdirSync(logDir, { recursive: true });
+  const tomoLogPath = escapeXml(join(logDir, "tomo.log"));
   const stdoutPath = escapeXml(join(logDir, "launchd.out.log"));
   const stderrPath = escapeXml(join(logDir, "launchd.err.log"));
 
@@ -163,6 +164,8 @@ function buildPlist(): string {
         <string>${home}</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TOMO_LOG_FILE</key>
+        <string>${tomoLogPath}</string>
     </dict>
 
     <key>StandardOutPath</key>

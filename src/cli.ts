@@ -10,11 +10,12 @@ import { lcmCommand } from "./cli/lcm.js";
 import { configCommand } from "./cli/config.js";
 import { uninstallCommand } from "./cli/uninstall.js";
 import { backupCommand } from "./cli/backup.js";
+import { updateCommand } from "./cli/update.js";
 
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.3.6");
+  .version("0.3.7");
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);
@@ -30,5 +31,6 @@ program.addCommand(sessionsCommand);
 program.addCommand(lcmCommand);
 program.addCommand(uninstallCommand);
 program.addCommand(backupCommand);
+program.addCommand(updateCommand);
 
 program.parse();

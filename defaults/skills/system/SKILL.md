@@ -96,6 +96,14 @@ Place skill directories under `~/.tomo/workspace/.claude/skills/`. Each skill ne
 
 Avoid the `tomo-` prefix for custom skills so they won't conflict with built-in updates.
 
+## Update
+
+```bash
+tomo update              # Check for new version, install it, and restart
+```
+
+Checks the npm registry, runs `npm install -g tomo-ai@latest`, and restarts the daemon automatically.
+
 ## Backup
 
 ```bash

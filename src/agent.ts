@@ -881,6 +881,33 @@ export class Agent {
     return undefined;
   }
 
+  /** Send a direct notification to the user's DM channel (no agent query) */
+  async sendNotification(text: string): Promise<void> {
+    const dmKey = this.router.findFirstDmSession();
+    let target: ReplyTarget | undefined;
+
+    if (dmKey) {
+      target = this.router.getReplyTarget(dmKey)
+        ?? (dmKey.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(dmKey.slice(3)) : undefined)
+        ?? this.parseChannelKey(dmKey);
+    }
+
+    if (!target) {
+      // No identity session — find the first DM (non-group) session across all channels
+      for (const [key] of this.sessions.listSdkSessionIds()) {
+        const parsed = this.parseChannelKey(key);
+        if (parsed) { target = parsed; break; }
+      }
+    }
+
+    if (!target) { log.debug("Notification: no active DM session"); return; }
+
+    const channel = this.getChannel(target.channelName);
+    if (!channel) return;
+
+    await channel.send({ chatId: target.chatId, text });
+  }
+
   async start(): Promise<void> {
     log.info({ channels: this.channels.length }, "Starting Tomo");
     await Promise.all(this.channels.map((ch) => ch.start()));

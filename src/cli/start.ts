@@ -115,10 +115,16 @@ async function startForeground(): Promise<void> {
     continuity.start();
   }
 
+  // Start version checker (weekly check, daytime-only notification)
+  const { VersionChecker } = await import("../version.js");
+  const versionChecker = new VersionChecker(agent);
+  versionChecker.start();
+
   // Write PID so `tomo stop` can find us
   writeFileSync(PID_FILE, String(process.pid));
 
   const shutdown = async () => {
+    versionChecker.stop();
     continuity.stop();
     scheduler.stop();
     await agent.stop();

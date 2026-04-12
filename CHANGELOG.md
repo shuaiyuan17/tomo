@@ -5,7 +5,7 @@
 ### Features
 
 - `tomo update` — check for new versions, install, and restart in one command
-- `tomo cost` — per-session spending breakdown TUI (#43)
+- `tomo config` — add cost analysis view with per-session spending breakdown (#43)
 - Version notification now tells users to run `tomo update` instead of manual npm commands
 
 ### Other

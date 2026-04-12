@@ -22,11 +22,13 @@ export class IdentityRouter {
     for (const [ch, list] of Object.entries(channelAllowlists)) {
       this.allowlists[ch] = new Set(list);
     }
-    // Add identity-bound chatIds to each channel's allowlist
+    // Add identity-bound chatIds to existing allowlists (don't create new ones —
+    // an identity alone should not enable allowlist enforcement for a channel)
     for (const id of identities) {
       for (const [ch, chatId] of Object.entries(id.channels)) {
-        if (!this.allowlists[ch]) this.allowlists[ch] = new Set();
-        this.allowlists[ch].add(chatId);
+        if (this.allowlists[ch]) {
+          this.allowlists[ch].add(chatId);
+        }
       }
     }
   }

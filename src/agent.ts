@@ -96,8 +96,10 @@ class LiveSession {
   lastResult: QueryResult | null = null;
   private prevTotalCost = 0;
   private eventLoopDone: Promise<void>;
+  private sessionKey: string | undefined;
 
-  constructor(options: ReturnType<typeof sdkOptions>) {
+  constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string) {
+    this.sessionKey = sessionKey;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -241,6 +243,7 @@ class LiveSession {
 
     log.info(
       {
+        session: this.sessionKey,
         turns: result.num_turns,
         duration: `${result.duration_ms}ms`,
         cost: `$${turnCost.toFixed(4)}`,
@@ -496,7 +499,7 @@ export class Agent {
       sdkSessionId: resumeId ?? undefined,
     });
 
-    session = new LiveSession(opts);
+    session = new LiveSession(opts, key);
     this.liveSessions.set(key, session);
     log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
     return session;

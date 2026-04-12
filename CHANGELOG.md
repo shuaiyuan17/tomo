@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.7 (2026-04-12)
+
+### Features
+
+- `tomo update` — check for new versions, install, and restart in one command
+- `tomo config` — add cost analysis view with per-session spending breakdown (#43)
+- Version notification now tells users to run `tomo update` instead of manual npm commands
+
+### Other
+
+- Add code coverage and CodeQL security scanning (#42)
+- Add `.nvmrc` for consistent Node version
+- Add Dependabot for weekly dependency updates (#36)
+- Bump commander 13.1.0 → 14.0.3, pino 9.14.0 → 10.3.1, croner 9.1.0 → 10.0.1, @anthropic-ai/claude-agent-sdk 0.2.92 → 0.2.104
+- Fix npm publish workflow for OIDC trusted publishing (#31, #32, #33, #35)
+
 ## 0.3.6 (2026-04-11)
 
 ### Features

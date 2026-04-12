@@ -58,7 +58,7 @@ function isNewer(latest: string, current: string): boolean {
   return false;
 }
 
-async function fetchLatestVersion(): Promise<string | null> {
+export async function fetchLatestVersion(): Promise<string | null> {
   try {
     const res = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return null;
@@ -132,7 +132,7 @@ export class VersionChecker {
   }
 
   private async notify(current: string, latest: string): Promise<void> {
-    const text = `Tomo v${latest} is available (current: v${current}).\nRun: npm update -g tomo-ai && tomo restart`;
+    const text = `Tomo v${latest} is available (current: v${current}).\nRun: tomo update`;
     log.info({ current, latest }, "New version available, notifying user");
     try {
       await this.agent.sendNotification(text);

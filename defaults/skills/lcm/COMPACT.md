@@ -12,6 +12,8 @@ tomo lcm compact --session-id SESSION_ID \
 ```
 
 - Use timestamps you already know from the conversation — no need to run `stats` first
+- Times are interpreted in your **local timezone** when no `Z` / offset is given (e.g. `2026-03-28T16:29` = local). Append `Z` for UTC.
+- If copying from `stats` output (`2026-03-28 16:29`), replace the space with `T` → `2026-03-28T16:29`
 - Originals are archived and searchable via `tomo lcm search`
 
 ## Writing good summaries

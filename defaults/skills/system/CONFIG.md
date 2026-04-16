@@ -33,7 +33,7 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
     }
   ],
   "sessionModelOverrides": {
-    "dm:alice": "claude-opus-4-6"
+    "dm:alice": "claude-opus-4-7"
   }
 }
 ```
@@ -42,7 +42,7 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 
 | Field | Type | Allowed values / notes |
 |---|---|---|
-| `model` | string | `claude-sonnet-4-6`, `claude-opus-4-6`, `claude-haiku-4-5`. Append `[1m]` for 1M-context variants on Sonnet/Opus (e.g. `claude-opus-4-6[1m]`). Default model for every session. |
+| `model` | string | `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`. Append `[1m]` for 1M-context variants on Sonnet/Opus (e.g. `claude-opus-4-7[1m]`). Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |

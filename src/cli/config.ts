@@ -16,16 +16,16 @@ const LOG_PATH = join(TOMO_HOME, "logs", "tomo.log");
 const MODELS: Record<string, string> = {
   "sonnet": "claude-sonnet-4-6",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
-  "opus": "claude-opus-4-6",
-  "opus-1m": "claude-opus-4-6[1m]",
+  "opus": "claude-opus-4-7",
+  "opus-1m": "claude-opus-4-7[1m]",
   "haiku": "claude-haiku-4-5",
 };
 
 const MODEL_LABELS: Record<string, string> = {
   "claude-sonnet-4-6": "Sonnet 4.6 (fast)",
   "claude-sonnet-4-6[1m]": "Sonnet 4.6 1M (fast, Max Plan only)",
-  "claude-opus-4-6": "Opus 4.6 (most capable)",
-  "claude-opus-4-6[1m]": "Opus 4.6 1M (most capable, Max Plan only)",
+  "claude-opus-4-7": "Opus 4.7 (most capable)",
+  "claude-opus-4-7[1m]": "Opus 4.7 1M (most capable, Max Plan only)",
   "claude-haiku-4-5": "Haiku 4.5 (cheapest)",
 };
 

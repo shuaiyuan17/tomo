@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.8 (2026-04-16)
+
+### Features
+
+- Default Opus model upgraded from Claude Opus 4.6 to Claude Opus 4.7 (#45).
+
+### Bug fixes
+
+- Message isolation: user messages, cron triggers, and continuity heartbeats now share a single FIFO queue per session. Previously only user messages were serialized, which let concurrent cron/heartbeat ingress stomp on an in-flight user turn's `currentRequest` slot inside `LiveSession` and cause response hijacking + 5-minute timeouts.
+- Bump per-`send()` timeout 5m → 10m to accommodate longer tool-using turns.
+
 ## 0.3.7 (2026-04-12)
 
 ### Features

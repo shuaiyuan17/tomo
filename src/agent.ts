@@ -259,7 +259,7 @@ class LiveSession {
   async send(text: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
-    const TIMEOUT_MS = 5 * 60 * 1000; // 5 minute timeout
+    const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()
 
     // Build content blocks
     type ImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
@@ -277,7 +277,7 @@ class LiveSession {
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.currentRequest = null;
-        reject(new Error("Query timed out after 5 minutes"));
+        reject(new Error("Query timed out after 10 minutes"));
       }, TIMEOUT_MS);
 
       const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
@@ -385,16 +385,31 @@ export class Agent {
     this.channels.push(channel);
   }
 
-  /** Queue messages per session key so they process sequentially */
-  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
-    const isGroup = message.isGroup ?? false;
-    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
-
+  /**
+   * Serialize work on a session key across ALL ingress paths (user, cron,
+   * continuity). Each task runs FIFO so only one send() is in flight per
+   * key at any time — prevents LiveSession's shared currentRequest slot
+   * from being stomped by overlapping callers.
+   */
+  private enqueueForSession<T>(sessionKey: string, task: () => Promise<T>): Promise<T> {
     const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
-    const next = prev.then(() => this.handleMessage(channel, message)).catch((err) => {
-      log.error({ err, sessionKey }, "Unhandled error in message queue");
+    const result = prev.then(() => task());
+    // Keep the queue alive even if this task throws
+    const next = result.then(() => {}, (err) => {
+      log.error({ err, sessionKey }, "Unhandled error in session queue");
     });
     this.messageQueues.set(sessionKey, next);
+    return result;
+  }
+
+  /** Queue messages per session key so they process sequentially */
+  private enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+    const isGroup = message.isGroup ?? false;
+    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
+    return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
+      .catch((err) => {
+        log.error({ err, sessionKey }, "Unhandled error in message queue");
+      });
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
@@ -735,8 +750,15 @@ export class Agent {
     return `[${prefix}${weekday} ${date} ${time} ${tz}] ${text}`;
   }
 
-  /** Handle a cron-triggered message */
+  /** Handle a cron-triggered message (queued per session key) */
   async handleCronMessage(message: string, sessionKey: string): Promise<void> {
+    return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey))
+      .catch((err) => {
+        log.error({ err, sessionKey }, "Cron message failed in queue");
+      });
+  }
+
+  private async processCronMessage(message: string, sessionKey: string): Promise<void> {
     const key = sessionKey;
     let deliveryChannel: Channel;
     let deliveryChatId: string;
@@ -808,9 +830,9 @@ export class Agent {
     }
   }
 
-  /** Handle a continuity heartbeat — runs on the first active DM session */
+  /** Handle a continuity heartbeat — runs on the first active DM session (queued) */
   async handleContinuity(prompt: string): Promise<void> {
-    // Prefer unified dm session, then fall back to channel-scoped session
+    // Resolve target session key first so we can enqueue against it
     const dmKey = this.router.findFirstDmSession();
     let key: string;
 
@@ -824,6 +846,13 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key))
+      .catch((err) => {
+        log.error({ err, sessionKey: key }, "Continuity failed in queue");
+      });
+  }
+
+  private async processContinuity(prompt: string, key: string): Promise<void> {
     try {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));

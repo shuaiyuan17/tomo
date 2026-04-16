@@ -13,6 +13,12 @@ export function resolveTimeRange(
   const path = getSdkSessionPath(sdkSessionId);
   if (!existsSync(path)) return null;
 
+  // Parse inputs as Date. If no timezone is specified, JS treats them as
+  // local time — which is what we want for agent-provided timestamps.
+  const fromMs = new Date(fromTime).getTime();
+  const toMs = new Date(toTime).getTime();
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) return null;
+
   const lines = readFileSync(path, "utf-8").trim().split("\n");
   let convIdx = 0;
   let firstIdx = -1;
@@ -24,8 +30,8 @@ export function resolveTimeRange(
     try { e = JSON.parse(line); } catch { continue; }
     if (e.type !== "user" && e.type !== "assistant") continue;
 
-    const ts = e.timestamp || "";
-    if (ts >= fromTime && ts <= toTime + "Z") {
+    const tsMs = e.timestamp ? new Date(e.timestamp).getTime() : NaN;
+    if (Number.isFinite(tsMs) && tsMs >= fromMs && tsMs <= toMs) {
       if (firstIdx === -1) firstIdx = convIdx;
       lastIdx = convIdx;
     }

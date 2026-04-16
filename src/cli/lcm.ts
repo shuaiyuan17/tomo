@@ -51,15 +51,33 @@ lcmCommand
       return;
     }
 
-    console.log(`Total: ${result.totalMessages} messages, ~${Math.round(result.totalTokens / 1000)}K tokens\n`);
+    console.log(`Total: ${result.totalMessages} messages, ~${Math.round(result.totalTokens / 1000)}K tokens`);
+    console.log(`Times shown in local timezone (${tzAbbrev()}).\n`);
     console.log("Sections:");
     for (const s of result.sections) {
       const tools = s.toolsUsed.length > 0 ? ` [${s.toolsUsed.join(", ")}]` : "";
       console.log(
-        `  #${s.id} | ${s.type.padEnd(12)} | msgs ${s.fromIdx}-${s.toIdx} (${s.messageCount}) | ~${Math.round(s.tokens / 1000)}K tokens | ${s.earliestAt.slice(11, 16)}-${s.latestAt.slice(11, 16)}${tools}`
+        `  #${s.id} | ${s.type.padEnd(12)} | msgs ${s.fromIdx}-${s.toIdx} (${s.messageCount}) | ~${Math.round(s.tokens / 1000)}K tokens | ${formatLocal(s.earliestAt)} → ${formatLocal(s.latestAt)}${tools}`
       );
     }
   });
+
+function formatLocal(iso: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return iso;
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+}
+
+function tzAbbrev(): string {
+  const parts = new Date().toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ");
+  return parts[parts.length - 1] || "local";
+}
 
 lcmCommand
   .command("compact")

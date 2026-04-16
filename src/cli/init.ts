@@ -245,7 +245,7 @@ export const initCommand = new Command("init")
         message: "Default model",
         options: [
           { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "fast, recommended" },
-          { value: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "most capable" },
+          { value: "claude-opus-4-7", label: "Claude Opus 4.7", hint: "most capable" },
           { value: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "cheapest" },
         ],
       });

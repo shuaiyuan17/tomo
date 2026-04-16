@@ -400,8 +400,8 @@ export class Agent {
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
     "sonnet": "claude-sonnet-4-6",
     "sonnet-1m": "claude-sonnet-4-6[1m]",
-    "opus": "claude-opus-4-6",
-    "opus-1m": "claude-opus-4-6[1m]",
+    "opus": "claude-opus-4-7",
+    "opus-1m": "claude-opus-4-7[1m]",
     "haiku": "claude-haiku-4-5",
   };
 

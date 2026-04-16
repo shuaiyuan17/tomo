@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 (2026-04-16)
+
+### Bug fixes
+
+- Message isolation: user messages, cron triggers, and continuity heartbeats now share a single FIFO queue per session. Previously only user messages were serialized, which let concurrent cron/heartbeat ingress stomp on an in-flight user turn and cause 5-minute timeouts.
+
+### Internal
+
+- `LiveSession` now spawns a fresh SDK `query()` per turn using `resume: <sessionId>` for continuity, replacing the single long-running query with a shared `AsyncGenerator`. The 5-minute timeout is now scoped to a single turn, and cross-turn state can no longer leak.
+- Bump `@anthropic-ai/claude-agent-sdk` 0.2.104 → 0.2.111 (required for Opus 4.7 support and `shouldQuery`/`startup`/`WarmQuery` APIs).
+
 ## 0.3.7 (2026-04-12)
 
 ### Features

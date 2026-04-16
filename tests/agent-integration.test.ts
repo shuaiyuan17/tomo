@@ -9,7 +9,14 @@ import type { Channel, IncomingMessage, OutgoingMessage, StreamingMessage, Messa
 // ---------------------------------------------------------------------------
 
 /** Controls what the mock SDK returns for each user message */
-let mockResponseFn: (text: string) => string = () => "mock response";
+let mockResponseFn: (text: string) => string | Promise<string> = () => "mock response";
+
+/** Track in-flight mock queries so tests can assert no concurrency */
+const queryState = {
+  inFlight: 0,
+  maxConcurrent: 0,
+  reset() { this.inFlight = 0; this.maxConcurrent = 0; },
+};
 
 function createMockQuery(prompt: AsyncGenerator) {
   // Event queue + waiter for the consumer side
@@ -18,6 +25,10 @@ function createMockQuery(prompt: AsyncGenerator) {
   let closed = false;
 
   // Background consumer: read from the prompt generator, push events to queue
+  queryState.inFlight++;
+  if (queryState.inFlight > queryState.maxConcurrent) {
+    queryState.maxConcurrent = queryState.inFlight;
+  }
   (async () => {
     try {
       for await (const userMsg of prompt) {
@@ -33,7 +44,7 @@ function createMockQuery(prompt: AsyncGenerator) {
           }
         }
 
-        const response = mockResponseFn(text);
+        const response = await mockResponseFn(text);
 
         // Emit stream event so onText callback fires → stream.update() gets called
         eventQueue.push({
@@ -66,6 +77,8 @@ function createMockQuery(prompt: AsyncGenerator) {
       }
     } catch {
       // prompt generator closed
+    } finally {
+      queryState.inFlight--;
     }
   })();
 
@@ -262,6 +275,7 @@ beforeEach(() => {
   mkdirSync(tmpDir, { recursive: true });
   resetConfig();
   mockResponseFn = () => "mock response";
+  queryState.reset();
 });
 
 afterEach(() => {
@@ -849,6 +863,208 @@ describe("message queueing", () => {
     expect(tg.delivered).toHaveLength(2);
     // Messages should process in order (queue serialization)
     expect(order).toEqual([1, 2]);
+
+    await agent.stop();
+  });
+});
+
+// ===== Message isolation across ingress paths =====
+//
+// Regression test for v0.4.0 refactor: user messages, cron triggers, and
+// continuity heartbeats must all route through the same per-session FIFO
+// queue. Previously only user messages were queued, which let concurrent
+// cron/heartbeat ingress stomp on an in-flight user turn.
+
+/** Wait until agent.messageQueues has settled (all queued work drained) */
+async function drainAllSessions(agent: InstanceType<typeof Agent>): Promise<void> {
+  const queues = (agent as unknown as { messageQueues: Map<string, Promise<void>> }).messageQueues;
+  // Drain repeatedly — tasks may enqueue more work
+  for (let i = 0; i < 5; i++) {
+    const all = Array.from(queues.values());
+    if (all.length === 0) break;
+    await Promise.all(all);
+  }
+}
+
+describe("ingress isolation", () => {
+  it("serializes a cron trigger while a user message is in flight", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const order: string[] = [];
+    let release: (() => void) | null = null;
+    const userGate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      if (text.includes("FROM_USER")) {
+        order.push("user-start");
+        await userGate; // block until we release
+        order.push("user-end");
+        return "user-reply";
+      }
+      if (text.includes("FROM_CRON")) {
+        order.push("cron-run");
+        return "cron-reply";
+      }
+      return "misc";
+    };
+
+    // Start a user message (will block until release)
+    const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "FROM_USER" }));
+
+    // Give user turn a chance to enter mock
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["user-start"]);
+
+    // Fire cron while user is in flight
+    const cronP = agent.handleCronMessage("FROM_CRON", "telegram:12345");
+
+    // Cron must NOT have started yet
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["user-start"]);
+
+    // Release user turn → cron should then run
+    release!();
+    await Promise.all([userP, cronP]);
+    await drainAllSessions(agent);
+
+    expect(order).toEqual(["user-start", "user-end", "cron-run"]);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("serializes a continuity heartbeat while a user message is in flight", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // Seed the dm:shuai session so findFirstDmSession() resolves
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "seed" }));
+    await drainAllSessions(agent);
+    tg.clearDelivered();
+
+    const order: string[] = [];
+    let release: (() => void) | null = null;
+    const userGate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      if (text.includes("FROM_USER")) {
+        order.push("user-start");
+        await userGate;
+        order.push("user-end");
+        return "user-reply";
+      }
+      if (text.includes("Free time")) {
+        order.push("continuity-run");
+        return "continuity-reply";
+      }
+      return "misc";
+    };
+
+    const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "FROM_USER" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["user-start"]);
+
+    const contP = agent.handleContinuity("System: Free time.");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["user-start"]);
+
+    release!();
+    await Promise.all([userP, contP]);
+    await drainAllSessions(agent);
+
+    // Continuity must have waited for user turn to finish
+    expect(order.slice(0, 2)).toEqual(["user-start", "user-end"]);
+    expect(order).toContain("continuity-run");
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("serializes a user message while cron is in flight", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const order: string[] = [];
+    let release: (() => void) | null = null;
+    const cronGate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      if (text.includes("SLOW_CRON")) {
+        order.push("cron-start");
+        await cronGate;
+        order.push("cron-end");
+        return "cron-reply";
+      }
+      if (text.includes("USER_AFTER")) {
+        order.push("user-run");
+        return "user-reply";
+      }
+      return "misc";
+    };
+
+    // Establish the session so cron can resolve reply target
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "seed" }));
+    await drainAllSessions(agent);
+    tg.clearDelivered();
+
+    const cronP = agent.handleCronMessage("SLOW_CRON", "telegram:12345");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual(["cron-start"]);
+
+    const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "USER_AFTER" }));
+    await new Promise((r) => setTimeout(r, 20));
+    // User must NOT have started
+    expect(order).toEqual(["cron-start"]);
+
+    release!();
+    await Promise.all([cronP, userP]);
+    await drainAllSessions(agent);
+
+    expect(order).toEqual(["cron-start", "cron-end", "user-run"]);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("does not run two queries concurrently for the same session under mixed load", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    let seq = 0;
+    mockResponseFn = async () => {
+      seq++;
+      // Short async gap to widen the concurrency window
+      await new Promise((r) => setTimeout(r, 5));
+      return `r-${seq}`;
+    };
+
+    // Seed the session so cron/continuity can resolve
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "seed" }));
+    await drainAllSessions(agent);
+
+    // Fire all three ingress paths in rapid succession
+    const a = tg.simulateMessage(makeMsg({ chatId: "12345", text: "user-a" }));
+    const b = agent.handleCronMessage("cron-b", "dm:shuai");
+    const c = agent.handleContinuity("System: Free time c.");
+    const d = tg.simulateMessage(makeMsg({ chatId: "12345", text: "user-d" }));
+
+    await Promise.all([a, b, c, d]);
+    await drainAllSessions(agent);
+
+    // Strict invariant: at most one mock query in flight at any time
+    expect(queryState.maxConcurrent).toBe(1);
 
     await agent.stop();
   });

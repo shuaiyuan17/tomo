@@ -1,4 +1,4 @@
-import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -65,14 +65,14 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
   };
 }
 
-// --- Live Session (streaming input mode) ---
-
-interface MessageRequest {
-  message: SDKUserMessage;
-  onText?: (text: string) => void;
-  resolve: (response: string) => void;
-  reject: (err: Error) => void;
-}
+// --- Live Session (per-turn isolated queries) ---
+//
+// Each send() spawns a fresh SDK query() using `resume: sessionId` for
+// continuity. This eliminates the cross-turn contamination that came from
+// funnelling multiple ingress sources (user messages, heartbeats, cron)
+// through a single long-running async generator. The Agent's per-session
+// FIFO mutex guarantees only one send() is in flight per sessionKey at a
+// time, so the resume chain stays intact.
 
 interface QueryResult {
   costUsd: number;
@@ -86,139 +86,181 @@ interface QueryResult {
 }
 
 class LiveSession {
-  private q: Query;
-  private pendingMessage: ((msg: SDKUserMessage) => void) | null = null;
-  private currentRequest: MessageRequest | null = null;
-  private parts: string[] = [];
-  private streamingText = "";
-  private sessionId: string | null = null;
+  private baseOptions: ReturnType<typeof sdkOptions>;
+  private sessionId: string | null;
   private alive = true;
   lastResult: QueryResult | null = null;
   private prevTotalCost = 0;
-  private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
 
   constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string) {
     this.sessionKey = sessionKey;
-    this.q = query({ prompt: this.messageGenerator(), options });
-    this.eventLoopDone = this.consumeEvents();
+    this.baseOptions = options;
+    // Pick up the resume id from options if provided
+    this.sessionId = (options as { resume?: string }).resume ?? null;
   }
 
-  private async *messageGenerator(): AsyncGenerator<SDKUserMessage> {
-    while (this.alive) {
-      const msg = await new Promise<SDKUserMessage>((resolve) => {
-        this.pendingMessage = resolve;
-      });
-      this.pendingMessage = null;
-      yield msg;
-    }
-  }
+  async send(text: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
+    if (!this.alive) throw new Error("Session is closed");
 
-  private async consumeEvents(): Promise<void> {
-    try {
-      for await (const event of this.q) {
-        await this.handleEvent(event);
-      }
-    } catch (err) {
-      // If there's a pending request, reject it
-      if (this.currentRequest) {
-        this.currentRequest.reject(err instanceof Error ? err : new Error(String(err)));
-        this.currentRequest = null;
+    const TIMEOUT_MS = 5 * 60 * 1000; // 5 minute timeout per query turn
+
+    // Build content blocks
+    type ImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+    const content: Array<Record<string, unknown>> = [];
+    if (images && images.length > 0) {
+      for (const img of images) {
+        content.push({
+          type: "image",
+          source: { type: "base64", media_type: img.mediaType as ImageMediaType, data: img.data },
+        });
       }
     }
-    this.alive = false;
-  }
+    content.push({ type: "text", text });
 
-  private async handleEvent(event: SDKMessage): Promise<void> {
-    const req = this.currentRequest;
+    const userMessage: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: content as never },
+      parent_tool_use_id: null,
+    };
 
-    if (event.type === "stream_event") {
-      const se = event as unknown as { event: { type: string; delta?: { type: string; text?: string } } };
-      if (se.event?.type === "content_block_delta" && se.event.delta?.type === "text_delta" && se.event.delta.text) {
-        this.streamingText += se.event.delta.text;
-        req?.onText?.(this.streamingText);
-      }
-    }
+    // Build options with the latest resume id so the turn continues the
+    // conversation rather than starting fresh.
+    const perTurnOptions = {
+      ...this.baseOptions,
+      ...(this.sessionId ? { resume: this.sessionId } : {}),
+    };
 
-    if (event.type === "assistant" && event.message?.content) {
-      this.streamingText = "";
-      for (const block of event.message.content) {
-        if ("text" in block) {
-          this.parts.push(block.text);
-        } else if ("type" in block && block.type === "tool_use") {
-          const tool = block as { name: string; input?: Record<string, unknown> };
-          log.info({ tool: tool.name }, summarizeToolInput(tool.name, tool.input));
+    const qRef: { current: Query | null } = { current: null };
+    const parts: string[] = [];
+    let streamingText = "";
+
+    // Single-message async iterable for the query prompt
+    const prompt: AsyncIterable<SDKUserMessage> = {
+      [Symbol.asyncIterator]() {
+        let delivered = false;
+        return {
+          async next(): Promise<IteratorResult<SDKUserMessage>> {
+            if (delivered) return { done: true, value: undefined as unknown as SDKUserMessage };
+            delivered = true;
+            return { done: false, value: userMessage };
+          },
+        };
+      },
+    };
+
+    const runQuery = async (): Promise<string> => {
+      const q = query({ prompt, options: perTurnOptions });
+      qRef.current = q;
+
+      let finalText: string | null = null;
+
+      for await (const event of q) {
+        if (!this.alive) break;
+
+        if (event.type === "stream_event") {
+          const se = event as unknown as { event: { type: string; delta?: { type: string; text?: string } } };
+          if (se.event?.type === "content_block_delta" && se.event.delta?.type === "text_delta" && se.event.delta.text) {
+            streamingText += se.event.delta.text;
+            onText?.(streamingText);
+          }
+        }
+
+        if (event.type === "assistant" && event.message?.content) {
+          streamingText = "";
+          for (const block of event.message.content) {
+            if ("text" in block) {
+              parts.push(block.text);
+            } else if ("type" in block && block.type === "tool_use") {
+              const tool = block as { name: string; input?: Record<string, unknown> };
+              log.info({ tool: tool.name }, summarizeToolInput(tool.name, tool.input));
+            }
+          }
+        }
+
+        if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
+          const compact = event as { compact_metadata?: { pre_tokens?: number; post_tokens?: number } };
+          log.info(
+            { pre: compact.compact_metadata?.pre_tokens, post: compact.compact_metadata?.post_tokens },
+            "Context compacted",
+          );
+        }
+
+        if (event.type === "tool_use_summary") {
+          log.debug((event as { summary: string }).summary);
+        }
+
+        if (event.type === "result") {
+          const result = event as unknown as {
+            subtype: string;
+            num_turns?: number;
+            duration_ms?: number;
+            total_cost_usd?: number;
+            usage?: Record<string, unknown>;
+            session_id?: string;
+          };
+
+          if (result.session_id) {
+            this.sessionId = result.session_id;
+          }
+
+          const u = result.usage as Record<string, number> | undefined;
+          const input = u?.input_tokens ?? 0;
+          const output = u?.output_tokens ?? 0;
+          const cacheRead = u?.cache_read_input_tokens ?? 0;
+          const cacheCreated = u?.cache_creation_input_tokens ?? 0;
+
+          const totalCost = result.total_cost_usd ?? 0;
+          const turnCost = totalCost - this.prevTotalCost;
+          this.prevTotalCost = totalCost;
+
+          this.lastResult = {
+            costUsd: totalCost,
+            inputTokens: input,
+            outputTokens: output,
+            cacheReadTokens: cacheRead,
+            cacheCreationTokens: cacheCreated,
+            contextUsed: 0,
+            contextMax: 0,
+          };
+
+          await this.logContextUsage(qRef.current, result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
+
+          finalText = parts.join("\n").trim() || "I'm not sure how to respond to that.";
+          break; // result terminates the turn
         }
       }
-    }
 
-    if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
-      const compact = event as { compact_metadata?: { pre_tokens?: number; post_tokens?: number } };
-      log.info(
-        { pre: compact.compact_metadata?.pre_tokens, post: compact.compact_metadata?.post_tokens },
-        "Context compacted",
-      );
-    }
+      return finalText ?? (parts.join("\n").trim() || "I'm not sure how to respond to that.");
+    };
 
-    if (event.type === "tool_use_summary") {
-      log.debug((event as { summary: string }).summary);
-    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try { qRef.current?.close(); } catch { /* ignore */ }
+        reject(new Error("Query timed out after 5 minutes"));
+      }, TIMEOUT_MS);
+    });
 
-    if (event.type === "result") {
-      const result = event as unknown as {
-        subtype: string;
-        num_turns?: number;
-        duration_ms?: number;
-        total_cost_usd?: number;
-        usage?: Record<string, unknown>;
-        session_id?: string;
-      };
-
-      if (result.session_id) {
-        this.sessionId = result.session_id;
-      }
-
-      const u = result.usage as Record<string, number> | undefined;
-      const input = u?.input_tokens ?? 0;
-      const output = u?.output_tokens ?? 0;
-      const cacheRead = u?.cache_read_input_tokens ?? 0;
-      const cacheCreated = u?.cache_creation_input_tokens ?? 0;
-
-      // Compute per-turn cost as delta from cumulative total
-      const totalCost = result.total_cost_usd ?? 0;
-      const turnCost = totalCost - this.prevTotalCost;
-      this.prevTotalCost = totalCost;
-
-      // Store result stats, get context usage, then resolve
-      this.lastResult = {
-        costUsd: totalCost,
-        inputTokens: input,
-        outputTokens: output,
-        cacheReadTokens: cacheRead,
-        cacheCreationTokens: cacheCreated,
-        contextUsed: 0,
-        contextMax: 0,
-      };
-
-      // Await context usage before resolving so stats are complete
-      await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
-
-      const response = this.parts.join("\n").trim() || "I'm not sure how to respond to that.";
-      this.parts = [];
-      this.streamingText = "";
-      req?.resolve(response);
-      this.currentRequest = null;
+    try {
+      return await Promise.race([runQuery(), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      // Best-effort cleanup: close the subprocess if still open
+      try { qRef.current?.close(); } catch { /* ignore */ }
     }
   }
 
   private async logContextUsage(
+    q: Query | null,
     result: { subtype: string; num_turns?: number; duration_ms?: number },
     turnCost: number, totalCost: number,
     input: number, output: number, cacheRead: number, cacheCreated: number,
   ): Promise<void> {
     const contextInfo = await (async () => {
       try {
-        const ctx = await this.q.getContextUsage();
+        if (!q || typeof q.getContextUsage !== "function") throw new Error("no query");
+        const ctx = await q.getContextUsage();
         const pct = Math.round(ctx.percentage);
         if (this.lastResult) {
           this.lastResult.contextUsed = ctx.totalTokens;
@@ -256,50 +298,6 @@ class LiveSession {
     );
   }
 
-  async send(text: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
-    if (!this.alive) throw new Error("Session is closed");
-
-    const TIMEOUT_MS = 5 * 60 * 1000; // 5 minute timeout
-
-    // Build content blocks
-    type ImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
-    const content: Array<Record<string, unknown>> = [];
-    if (images && images.length > 0) {
-      for (const img of images) {
-        content.push({
-          type: "image",
-          source: { type: "base64", media_type: img.mediaType as ImageMediaType, data: img.data },
-        });
-      }
-    }
-    content.push({ type: "text", text });
-
-    return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.currentRequest = null;
-        reject(new Error("Query timed out after 5 minutes"));
-      }, TIMEOUT_MS);
-
-      const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
-      const wrappedReject = (err: Error) => { clearTimeout(timer); reject(err); };
-
-      this.currentRequest = {
-        message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
-        onText,
-        resolve: wrappedResolve,
-        reject: wrappedReject,
-      };
-      this.parts = [];
-      this.streamingText = "";
-
-      if (this.pendingMessage && this.currentRequest) {
-        this.pendingMessage(this.currentRequest.message);
-      } else {
-        wrappedReject(new Error("Session not ready to receive messages"));
-      }
-    });
-  }
-
   getSessionId(): string | null {
     return this.sessionId;
   }
@@ -310,7 +308,6 @@ class LiveSession {
 
   close(): void {
     this.alive = false;
-    this.q.close();
   }
 }
 
@@ -385,16 +382,30 @@ export class Agent {
     this.channels.push(channel);
   }
 
-  /** Queue messages per session key so they process sequentially */
-  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
-    const isGroup = message.isGroup ?? false;
-    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
-
+  /**
+   * Serialize work on a session key across ALL ingress paths (user, cron,
+   * continuity). Each task runs FIFO so a single live query turn is in
+   * flight per key at any time.
+   */
+  private enqueueForSession<T>(sessionKey: string, task: () => Promise<T>): Promise<T> {
     const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
-    const next = prev.then(() => this.handleMessage(channel, message)).catch((err) => {
-      log.error({ err, sessionKey }, "Unhandled error in message queue");
+    const result = prev.then(() => task());
+    // Keep the queue alive for later enqueues even if this task throws
+    const next = result.then(() => {}, (err) => {
+      log.error({ err, sessionKey }, "Unhandled error in session queue");
     });
     this.messageQueues.set(sessionKey, next);
+    return result;
+  }
+
+  /** Queue messages per session key so they process sequentially */
+  private enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+    const isGroup = message.isGroup ?? false;
+    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
+    return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
+      .catch((err) => {
+        log.error({ err, sessionKey }, "Unhandled error in message queue");
+      });
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
@@ -735,8 +746,15 @@ export class Agent {
     return `[${prefix}${weekday} ${date} ${time} ${tz}] ${text}`;
   }
 
-  /** Handle a cron-triggered message */
+  /** Handle a cron-triggered message (queued per session key) */
   async handleCronMessage(message: string, sessionKey: string): Promise<void> {
+    return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey))
+      .catch((err) => {
+        log.error({ err, sessionKey }, "Cron message failed in queue");
+      });
+  }
+
+  private async processCronMessage(message: string, sessionKey: string): Promise<void> {
     const key = sessionKey;
     let deliveryChannel: Channel;
     let deliveryChatId: string;
@@ -808,9 +826,9 @@ export class Agent {
     }
   }
 
-  /** Handle a continuity heartbeat — runs on the first active DM session */
+  /** Handle a continuity heartbeat — runs on the first active DM session (queued) */
   async handleContinuity(prompt: string): Promise<void> {
-    // Prefer unified dm session, then fall back to channel-scoped session
+    // Resolve target session key first so we can enqueue against it
     const dmKey = this.router.findFirstDmSession();
     let key: string;
 
@@ -824,6 +842,13 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key))
+      .catch((err) => {
+        log.error({ err, sessionKey: key }, "Continuity failed in queue");
+      });
+  }
+
+  private async processContinuity(prompt: string, key: string): Promise<void> {
     try {
       const response = await this.runWithRetry(key, prompt);
       log.info("Continuity response: %s", response.slice(0, 100));

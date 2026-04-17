@@ -72,6 +72,7 @@ export async function restartAutostart(): Promise<void> {
     );
   }
   const domain = guiDomain();
+  const oldPid = readPidFile();
 
   // Happy path: service is loaded → kickstart restarts it in place.
   // If the plist is on disk but the service isn't loaded (e.g. after `tomo stop`
@@ -81,6 +82,43 @@ export async function restartAutostart(): Promise<void> {
   } catch {
     await runLaunchctl(["bootstrap", domain, LAUNCH_AGENT_PLIST_PATH]);
   }
+
+  // If the running tomo wasn't actually the launchd-managed instance (e.g.
+  // started via `tomo start` directly), kickstart -k won't reach it. SIGTERM
+  // the PID-file PID directly so it exits and launchd can take over.
+  if (oldPid !== null && isAlive(oldPid)) {
+    try { process.kill(oldPid, "SIGTERM"); } catch { /* already dead */ }
+  }
+
+  // kickstart returns as soon as SIGTERM is sent; wait for the old process to
+  // actually exit and a new one to come up before reporting success. Graceful
+  // shutdown can take tens of seconds if SIGTERM lands mid-turn (agent waits
+  // for the in-flight assistant response to finish before closing).
+  const timeoutSec = 60;
+  const deadline = Date.now() + timeoutSec * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 300));
+    if (oldPid !== null && isAlive(oldPid)) continue;
+    const newPid = readPidFile();
+    if (newPid !== null && newPid !== oldPid) return;
+  }
+  throw new Error(
+    `Restart didn't complete within ${timeoutSec}s (old PID ${oldPid ?? "?"} still alive or no new PID file yet). Check \`tomo status\` and logs.`,
+  );
+}
+
+function readPidFile(): number | null {
+  if (!existsSync(PID_FILE)) return null;
+  try {
+    const n = Number(readFileSync(PID_FILE, "utf-8").trim());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 /**

@@ -79,6 +79,13 @@ function localMonthTag(d: Date): string {
 }
 
 /**
+ * For daily rollups, keep the most recent N raw events outside the
+ * compacted range so mid-day compacts don't wipe warm short-term texture.
+ * Weekly+ consume block summaries (not raw events), so this doesn't apply.
+ */
+const DAILY_FRESH_TAIL = 32;
+
+/**
  * Resolve the event range for a given rollup level + optional explicit period.
  * Returns null if there's nothing to compact (no matching events / children).
  */
@@ -115,8 +122,27 @@ export function resolveBlockRange(
     return null;
   }
 
-  const firstIdx = matches[0];
-  const lastIdx = matches[matches.length - 1];
+  // Daily rollup only: preserve a fresh tail of the most recent raw events.
+  // The existing daily block (if any) and any earlier raw events still get
+  // compacted — we just stop short of the last DAILY_FRESH_TAIL matches.
+  let effectiveMatches = matches;
+  if (level === "daily") {
+    const rawOnly = matches.filter((idx) => !events[idx].isCompactSummary);
+    if (rawOnly.length <= DAILY_FRESH_TAIL) {
+      // Nothing outside the fresh tail to compact (and no existing block to rebuild).
+      if (!matches.some((idx) => events[idx].isCompactSummary)) {
+        return null;
+      }
+      // Existing block exists but all raw is within fresh tail → compact just the block.
+      effectiveMatches = matches.filter((idx) => events[idx].isCompactSummary);
+    } else {
+      const tailStart = rawOnly[rawOnly.length - DAILY_FRESH_TAIL];
+      effectiveMatches = matches.filter((idx) => idx < tailStart || events[idx].isCompactSummary);
+    }
+  }
+
+  const firstIdx = effectiveMatches[0];
+  const lastIdx = effectiveMatches[effectiveMatches.length - 1];
   const fromConv = convIdxOf(firstIdx);
   const toConv = convIdxOf(lastIdx);
   if (fromConv === null || toConv === null) return null;
@@ -125,10 +151,12 @@ export function resolveBlockRange(
   const existingBlock = events.find(
     (e) => e.isCompactSummary && e.blockTag === tag,
   );
-  const count = matches.length;
+  const count = effectiveMatches.length;
+  const kept = matches.length - effectiveMatches.length;
+  const tailSuffix = kept > 0 ? ` (${kept} most-recent events kept raw)` : "";
   const description = existingBlock
-    ? `update ${tag}: ${count} events (existing block will be replaced)`
-    : `create ${tag}: ${count} events`;
+    ? `update ${tag}: ${count} events (existing block will be replaced)${tailSuffix}`
+    : `create ${tag}: ${count} events${tailSuffix}`;
 
   void convIdx;
   return { blockTag: tag, fromIdx: fromConv, toIdx: toConv, description };

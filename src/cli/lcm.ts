@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
 import { pruneTools } from "../lcm/prune-tools.js";
+import { resolveBlockRange, type BlockLevel } from "../lcm/blocks.js";
 import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -78,6 +79,69 @@ function tzAbbrev(): string {
   const parts = new Date().toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ");
   return parts[parts.length - 1] || "local";
 }
+
+function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: string }) {
+  lcmCommand
+    .command(level)
+    .description(`Roll up into a ${level} block (auto-resolves range + tag)`)
+    .requiredOption("--session-id <id>", "SDK session ID")
+    .requiredOption("--summary <text>", "Summary text")
+    .option(periodOpt.flag, periodOpt.desc)
+    .action(async (opts) => {
+      const sessionsDir = await getSessionsDir();
+      const periodKey = periodOpt.flag.match(/<(\w+)>/)?.[1] ?? "period";
+      const period: string | undefined = opts[periodKey];
+
+      const resolved = resolveBlockRange(opts.sessionId, level, period);
+      if (!resolved) {
+        console.error(JSON.stringify({
+          status: "error",
+          error: `No events found for ${level} ${period ?? "(auto)"}`,
+        }));
+        process.exit(1);
+      }
+
+      const transcriptPath = join(sessionsDir, `_archive_${opts.sessionId}.jsonl`);
+      const result = compactSession({
+        sdkSessionId: opts.sessionId,
+        fromIdx: resolved.fromIdx,
+        toIdx: resolved.toIdx,
+        summary: opts.summary,
+        transcriptPath,
+        blockTag: resolved.blockTag,
+      });
+
+      if (result.success) {
+        console.log(JSON.stringify({
+          status: "ok",
+          blockTag: resolved.blockTag,
+          description: resolved.description,
+          eventsRemoved: result.eventsRemoved,
+          eventsAfter: result.eventsAfter,
+        }));
+      } else {
+        console.error(JSON.stringify({ status: "error", error: result.error }));
+        process.exit(1);
+      }
+    });
+}
+
+registerBlockLevel("daily", {
+  flag: "--date <YYYY-MM-DD>",
+  desc: "Date to compact (defaults to today, local tz)",
+});
+registerBlockLevel("weekly", {
+  flag: "--week <YYYY-Www>",
+  desc: "ISO week to roll up (defaults to last completed week)",
+});
+registerBlockLevel("monthly", {
+  flag: "--month <YYYY-MM>",
+  desc: "Month to roll up (defaults to last completed month)",
+});
+registerBlockLevel("yearly", {
+  flag: "--year <YYYY>",
+  desc: "Year to roll up (defaults to last completed year)",
+});
 
 lcmCommand
   .command("compact")

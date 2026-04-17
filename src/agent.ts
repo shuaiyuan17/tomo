@@ -5,6 +5,7 @@ import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
+import { countRawTailToday } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
@@ -340,6 +341,9 @@ export class Agent {
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
+  // Hot-tail hysteresis: track whether we've nudged for today's over-threshold.
+  // Reset when the raw tail drops below the low-water mark (i.e. agent ran daily).
+  private hotTailNudged = new Map<string, boolean>();
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
@@ -383,6 +387,11 @@ export class Agent {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
     channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
     this.channels.push(channel);
+  }
+
+  /** Active sessions as [sessionKey, sdkSessionId] pairs (RollupRunner etc). */
+  listActiveSessions(): [string, string][] {
+    return this.sessions.listSdkSessionIds();
   }
 
   /**
@@ -682,6 +691,29 @@ export class Agent {
       if (sid && checkAndClearCompactTrigger(sid)) {
         this.closeLiveSession(key);
         log.info({ key }, "Session reloaded after compact");
+      }
+
+      // Hot-tail cap hysteresis: nudge agent to run `tomo lcm daily` when the
+      // raw (non-summary) event count since today's daily block exceeds the
+      // high-water mark. Only fire once per over-threshold episode — reset
+      // when the count drops below the low-water mark (i.e. agent acted).
+      if (sid) {
+        const HIGH = 40;
+        const LOW = 24;
+        const tail = countRawTailToday(sid);
+        const nudged = this.hotTailNudged.get(key) === true;
+        if (tail <= LOW && nudged) {
+          this.hotTailNudged.set(key, false);
+        }
+        if (tail > HIGH && !nudged) {
+          this.hotTailNudged.set(key, true);
+          const nudge = `System: Today's raw tail is ${tail} events. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up the day's activity before the session grows further. The raw turns are already in your context — summarize in one turn.`;
+          log.info({ key, tail }, "Hot-tail nudge (agent should run lcm daily)");
+          // Fire-and-forget — don't block the current reply on the nudge
+          this.handleCronMessage(nudge, key).catch((err) => {
+            log.warn({ err, key }, "Hot-tail nudge failed");
+          });
+        }
       }
 
       return response;

@@ -11,10 +11,10 @@ import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
-// rollups via skill) well before the SDK's ~80% auto-compact threshold,
-// so auto-compact effectively only fires as a safety net if manual LCM
-// fails. Group sessions skip the custom LCM entirely and rely on SDK
-// auto-compact, so we leave it enabled here.
+// rollups via skill), so SDK auto-compact is disabled for them via the
+// DISABLE_AUTO_COMPACT env var — we don't want the SDK to collapse our
+// rollup structure behind our back. Group sessions skip the custom LCM
+// entirely and rely on SDK auto-compact, so we leave it enabled there.
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -66,6 +66,9 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     includePartialMessages: true,
     maxTurns: 30,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
+    ...(sessionContext && !isGroupSessionKey(sessionContext.sessionKey)
+      ? { env: { DISABLE_AUTO_COMPACT: "1" } }
+      : {}),
   };
 }
 
@@ -607,10 +610,11 @@ export class Agent {
       }, message.images);
       stopTyping();
 
-      // If context is high, send a system nudge so the agent can compact
+      // If context is high, send a system nudge so the agent can compact.
+      // Skip for group sessions — they use SDK auto-compact, not the lcm skill.
       const liveSession = this.liveSessions.get(key);
       const ctx = liveSession?.lastResult;
-      if (ctx && ctx.contextMax > 0) {
+      if (ctx && ctx.contextMax > 0 && !isGroupSessionKey(key)) {
         const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
         if (pct >= 80) {
           this.runWithRetry(key, `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.`).catch(() => {});

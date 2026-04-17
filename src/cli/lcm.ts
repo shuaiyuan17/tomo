@@ -89,7 +89,13 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
     .option(periodOpt.flag, periodOpt.desc)
     .action(async (opts) => {
       const sessionsDir = await getSessionsDir();
-      const periodKey = periodOpt.flag.match(/<(\w+)>/)?.[1] ?? "period";
+      // Option name is the part after `--`, converted to camelCase by commander.
+      // (The earlier version used /<(\w+)>/ on the placeholder, which failed
+      // on "YYYY-MM-DD" because \w+ doesn't cross hyphens — falling back to
+      // `opts.period`, which doesn't exist, so --date was silently ignored.)
+      const flagMatch = periodOpt.flag.match(/^--(\S+)/);
+      const rawKey = flagMatch?.[1] ?? "";
+      const periodKey = rawKey.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       const period: string | undefined = opts[periodKey];
 
       const resolved = resolveBlockRange(opts.sessionId, level, period);

@@ -1,6 +1,6 @@
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
-import { findDuePromotions, type DuePromotion } from "./blocks.js";
+import { findDuePromotions, isGroupSessionKey, type DuePromotion } from "./blocks.js";
 
 /**
  * Periodic rollup promotion checker.
@@ -82,6 +82,8 @@ export class RollupRunner {
     }
     const now = Date.now();
     for (const [sessionKey, sdkSessionId] of this.agent.listActiveSessions()) {
+      // Group sessions use SDK default compact — no custom LCM nudges.
+      if (isGroupSessionKey(sessionKey)) continue;
       try {
         const due = findDuePromotions(sdkSessionId);
         if (due.length === 0) continue;

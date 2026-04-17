@@ -5,13 +5,16 @@ import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
-import { countRawTailToday } from "./lcm/blocks.js";
+import { countRawTailToday, isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
-// Disable SDK auto-compaction — we manage context ourselves via LCM
-process.env.DISABLE_AUTO_COMPACT = "1";
+// DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
+// rollups via skill) well before the SDK's ~80% auto-compact threshold,
+// so auto-compact effectively only fires as a safety net if manual LCM
+// fails. Group sessions skip the custom LCM entirely and rely on SDK
+// auto-compact, so we leave it enabled here.
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -697,7 +700,8 @@ export class Agent {
       // raw (non-summary) event count since today's daily block exceeds the
       // high-water mark. Only fire once per over-threshold episode — reset
       // when the count drops below the low-water mark (i.e. agent acted).
-      if (sid) {
+      // Skip for group sessions — they use SDK default compact.
+      if (sid && !isGroupSessionKey(key)) {
         const HIGH = 40;
         const LOW = 24;
         const tail = countRawTailToday(sid);

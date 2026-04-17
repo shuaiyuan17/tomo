@@ -198,6 +198,22 @@ function matchesLevelPeriod(e: SdkEvent, level: BlockLevel, period: string): boo
   }
 }
 
+/**
+ * Group sessions use SDK default compact behavior — the block-rollup
+ * hierarchy is designed for a continuous personal DM stream, not for
+ * group chatter. Harness nudges (RollupRunner, hot-tail cap) skip groups.
+ */
+export function isGroupSessionKey(key: string): boolean {
+  if (key.startsWith("dm:")) return false;
+  const colonIdx = key.indexOf(":");
+  if (colonIdx < 0) return false;
+  const channel = key.slice(0, colonIdx);
+  const chatId = key.slice(colonIdx + 1);
+  if (channel === "telegram" && chatId.startsWith("-")) return true;
+  if (channel === "imessage" && chatId.includes(";+;")) return true;
+  return false;
+}
+
 /** Date of the Thursday (local) for a given ISO year + week. */
 function isoWeekThursday(isoYear: number, isoWeek: number): Date {
   const jan4 = new Date(isoYear, 0, 4);

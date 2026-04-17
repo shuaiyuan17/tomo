@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.10 (2026-04-17)
+
+### Bug fixes
+
+- `lcm compact`: archive compacted events to `_archive_<sdkSessionId>.jsonl` always, matching `store.searchArchive()` and `prune-tools`. Previously when `--channel-key` was passed the archive went to `<channelKey>.jsonl`, colliding with the live transcript namespace (e.g. `dm:shuai.jsonl` next to `dm_shuai.jsonl` — two files, different schemas, same directory).
+
 ## 0.3.9 (2026-04-17)
 
 ### Bug fixes

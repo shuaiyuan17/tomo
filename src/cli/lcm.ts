@@ -86,7 +86,6 @@ lcmCommand
   .requiredOption("--from-time <iso>", "Start timestamp (ISO 8601, e.g. 2026-03-28T16:29)")
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
-  .option("--channel-key <key>", "Channel key for transcript archive (e.g. telegram_123456789)")
   .action(async (opts) => {
     const sessionsDir = await getSessionsDir();
     // Resolve timestamps to indices using context_stats
@@ -106,9 +105,11 @@ lcmCommand
       process.exit(1);
     }
 
-    const transcriptPath = opts.channelKey
-      ? join(sessionsDir, `${opts.channelKey}.jsonl`)
-      : join(sessionsDir, `_archive_${opts.sessionId}.jsonl`);
+    // Archive file is keyed by SDK session id — matches store.searchArchive()
+    // and the pattern used by prune-tools. Previously an optional --channel-key
+    // branch wrote to `<channelKey>.jsonl`, colliding with the live transcript
+    // namespace (e.g. `dm:shuai.jsonl` next to `dm_shuai.jsonl`).
+    const transcriptPath = join(sessionsDir, `_archive_${opts.sessionId}.jsonl`);
 
     const result = compactSession({
       sdkSessionId: opts.sessionId,

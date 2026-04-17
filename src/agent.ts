@@ -696,23 +696,32 @@ export class Agent {
         log.info({ key }, "Session reloaded after compact");
       }
 
-      // Hot-tail cap hysteresis: nudge agent to run `tomo lcm daily` when the
-      // raw (non-summary) event count since today's daily block exceeds the
-      // high-water mark. Only fire once per over-threshold episode — reset
-      // when the count drops below the low-water mark (i.e. agent acted).
+      // Hot-tail cap hysteresis: nudge agent to run `tomo lcm daily` when
+      // today's raw-event count crosses the high-water mark AND we've used
+      // enough context that a rollup is actually worth it. If >70% of the
+      // window is still free, skip the nudge — plenty of room, no need to
+      // churn the cache. Only fire once per over-threshold episode; reset
+      // when the tail drops below the low-water mark (i.e. agent acted).
       // Skip for group sessions — they use SDK default compact.
       if (sid && !isGroupSessionKey(key)) {
-        const HIGH = 40;
-        const LOW = 24;
+        const HIGH = 96;
+        const LOW = 60;
+        const CONTEXT_USED_PCT_TO_NUDGE = 0.30; // 70% free = skip
         const tail = countRawTailToday(sid);
         const nudged = this.hotTailNudged.get(key) === true;
         if (tail <= LOW && nudged) {
           this.hotTailNudged.set(key, false);
         }
-        if (tail > HIGH && !nudged) {
+
+        const ctxUsed = session.lastResult?.contextUsed ?? 0;
+        const ctxMax = session.lastResult?.contextMax ?? 0;
+        const usedFrac = ctxMax > 0 ? ctxUsed / ctxMax : 1; // unknown → assume full to be safe
+        const roomy = usedFrac < CONTEXT_USED_PCT_TO_NUDGE;
+
+        if (tail > HIGH && !nudged && !roomy) {
           this.hotTailNudged.set(key, true);
           const nudge = `System: Today's raw tail is ${tail} events. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up the day's activity before the session grows further. The raw turns are already in your context — summarize in one turn.`;
-          log.info({ key, tail }, "Hot-tail nudge (agent should run lcm daily)");
+          log.info({ key, tail, usedPct: `${Math.round(usedFrac * 100)}%` }, "Hot-tail nudge (agent should run lcm daily)");
           // Fire-and-forget — don't block the current reply on the nudge
           this.handleCronMessage(nudge, key).catch((err) => {
             log.warn({ err, key }, "Hot-tail nudge failed");

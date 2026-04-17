@@ -5,7 +5,7 @@ import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
-import { countRawTailToday, isGroupSessionKey } from "./lcm/blocks.js";
+import { isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
@@ -344,9 +344,9 @@ export class Agent {
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
-  // Hot-tail hysteresis: track whether we've nudged for today's over-threshold.
-  // Reset when the raw tail drops below the low-water mark (i.e. agent ran daily).
-  private hotTailNudged = new Map<string, boolean>();
+  // Context-usage hysteresis: track whether we've nudged the agent to compact
+  // for the current over-threshold episode. Reset when usage drops below LOW.
+  private contextNudged = new Map<string, boolean>();
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
@@ -696,35 +696,30 @@ export class Agent {
         log.info({ key }, "Session reloaded after compact");
       }
 
-      // Hot-tail cap hysteresis: nudge agent to run `tomo lcm daily` when
-      // today's raw-event count crosses the high-water mark AND we've used
-      // enough context that a rollup is actually worth it. If >70% of the
-      // window is still free, skip the nudge — plenty of room, no need to
-      // churn the cache. Only fire once per over-threshold episode; reset
-      // when the tail drops below the low-water mark (i.e. agent acted).
+      // Context-usage hysteresis: nudge agent to run `tomo lcm daily` when
+      // context usage crosses the high-water mark; reset when it drops back
+      // below the low-water mark (a successful compact knocks it well under).
       // Skip for group sessions — they use SDK default compact.
       if (sid && !isGroupSessionKey(key)) {
-        const HIGH = 96;
-        const LOW = 60;
-        const CONTEXT_USED_PCT_TO_NUDGE = 0.30; // 70% free = skip
-        const tail = countRawTailToday(sid);
-        const nudged = this.hotTailNudged.get(key) === true;
-        if (tail <= LOW && nudged) {
-          this.hotTailNudged.set(key, false);
-        }
-
+        const HIGH = 0.70; // nudge at or above 70% of window
+        const LOW = 0.60;  // reset nudged flag below 60%
         const ctxUsed = session.lastResult?.contextUsed ?? 0;
         const ctxMax = session.lastResult?.contextMax ?? 0;
-        const usedFrac = ctxMax > 0 ? ctxUsed / ctxMax : 1; // unknown → assume full to be safe
-        const roomy = usedFrac < CONTEXT_USED_PCT_TO_NUDGE;
+        const usedFrac = ctxMax > 0 ? ctxUsed / ctxMax : 0;
+        const nudged = this.contextNudged.get(key) === true;
 
-        if (tail > HIGH && !nudged && !roomy) {
-          this.hotTailNudged.set(key, true);
-          const nudge = `System: Today's raw tail is ${tail} events. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up the day's activity before the session grows further. The raw turns are already in your context — summarize in one turn.`;
-          log.info({ key, tail, usedPct: `${Math.round(usedFrac * 100)}%` }, "Hot-tail nudge (agent should run lcm daily)");
+        if (usedFrac < LOW && nudged) {
+          this.contextNudged.set(key, false);
+        }
+
+        if (usedFrac >= HIGH && !nudged) {
+          this.contextNudged.set(key, true);
+          const pct = Math.round(usedFrac * 100);
+          const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last 32 raw events as fresh tail. After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+          log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
           // Fire-and-forget — don't block the current reply on the nudge
           this.handleCronMessage(nudge, key).catch((err) => {
-            log.warn({ err, key }, "Hot-tail nudge failed");
+            log.warn({ err, key }, "Context nudge failed");
           });
         }
       }

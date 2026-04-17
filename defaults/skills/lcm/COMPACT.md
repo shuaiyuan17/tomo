@@ -18,6 +18,20 @@ tomo lcm compact --session-id SESSION_ID \
 - If copying from `stats` output (`2026-03-28 16:29`), replace the space with `T` → `2026-03-28T16:29`
 - Originals are archived and searchable via `tomo lcm search`
 
+### Joining the rollup hierarchy
+
+By default the resulting summary is a "legacy" block (no `blockTag`), so it won't be picked up by `weekly`/`monthly`/`yearly` rollups. If you want the consolidated summary to live inside the hierarchy, pass `--block-tag`:
+
+```bash
+# Consolidate late-March through mid-April legacy blocks into a monthly:
+tomo lcm compact --session-id SESSION_ID \
+  --from-time 2026-03-24 --to-time 2026-04-17 \
+  --block-tag "monthly 2026-04" \
+  --summary "..."
+```
+
+Use the canonical tag formats: `daily YYYY-MM-DD`, `weekly YYYY-Www`, `monthly YYYY-MM`, `yearly YYYY`. That way `monthly` → `yearly` promotions can chain naturally.
+
 ## Writing good summaries
 
 - Write like a note to your future self, not a changelog

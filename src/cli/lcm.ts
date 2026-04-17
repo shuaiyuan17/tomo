@@ -222,6 +222,7 @@ lcmCommand
   .requiredOption("--from-time <iso>", "Start timestamp (ISO 8601, e.g. 2026-03-28T16:29)")
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
+  .option("--block-tag <tag>", 'Optional block tag (e.g. "monthly 2026-04") so the resulting summary joins the rollup hierarchy')
   .action(async (opts) => {
     const sessionsDir = await getSessionsDir();
     // Resolve timestamps to indices using context_stats
@@ -253,6 +254,7 @@ lcmCommand
       toIdx: resolved.toIdx,
       summary: opts.summary,
       transcriptPath,
+      ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
     });
 
     if (result.success) {
@@ -261,6 +263,7 @@ lcmCommand
         eventsRemoved: result.eventsRemoved,
         eventsAfter: result.eventsAfter,
         timeRange: { from: fromTime, to: toTime },
+        ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
       }));
     } else {
       console.error(JSON.stringify({ status: "error", error: result.error }));

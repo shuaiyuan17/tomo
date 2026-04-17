@@ -1,6 +1,8 @@
-# Compacting Sessions
+# Compacting Sessions (time-range, escape hatch)
 
-Replace a heavy section of conversation with a summary. Use after `prune-tools` if context is still too high.
+Replace an arbitrary time range with a summary. **Prefer `daily`/`weekly`/`monthly`/`yearly`** ([DAILY.md](DAILY.md), [WEEKLY.md](WEEKLY.md), [MONTHLY.md](MONTHLY.md), [YEARLY.md](YEARLY.md)) for routine rollups — they auto-resolve the range and tag.
+
+Use `compact` only for surgical middle-range compactions (e.g. compact a 2-hour tool-heavy debugging session that happened in the middle of an otherwise-light day, while keeping the rest of the day raw). The block rollups can't express "compact only this slice in the middle of today" — this command can.
 
 ## Usage
 

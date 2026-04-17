@@ -135,35 +135,29 @@ export function compactSession(req: CompactRequest): CompactResult {
     slug: firstRemoved.slug ?? "",
   };
 
-  // Build the new event list
+  // Collect UUIDs of every removed event so we can re-stitch any post-range event
+  // whose parent pointed into the removed range. The SDK walks parentUuid back from
+  // the leaf to build the API payload; any broken link here silently falls back to
+  // timestamp-based stitching, which skips the summary.
+  const removedUuids = new Set<string>();
+  for (const idx of removeSet) {
+    const u = allEvents[idx].uuid;
+    if (u) removedUuids.add(u);
+  }
+
   const newEvents: SdkEvent[] = [];
 
-  // Events before the range
   for (let i = 0; i < removeStartGlobal; i++) {
     newEvents.push(allEvents[i]);
   }
 
-  // The summary event
   newEvents.push(summaryEvent);
 
-  // Events after the range, with the first one re-parented to the summary
-  let reparented = false;
   for (let i = removeEndGlobal + 1; i < allEvents.length; i++) {
     const event = { ...allEvents[i] };
-
-    if (!reparented && (event.type === "user" || event.type === "assistant")) {
+    if (event.parentUuid && removedUuids.has(event.parentUuid)) {
       event.parentUuid = summaryUuid;
-      reparented = true;
-    } else if (!reparented && event.parentUuid != null) {
-      // Non-conversation event (attachment, etc.) that was parented to a removed event
-      const parentInRemoveSet = removeSet.has(
-        allEvents.findIndex(e => e.uuid === event.parentUuid)
-      );
-      if (parentInRemoveSet) {
-        event.parentUuid = summaryUuid;
-      }
     }
-
     newEvents.push(event);
   }
 

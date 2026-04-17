@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
 import { pruneTools } from "../lcm/prune-tools.js";
+import { resolveBlockRange, type BlockLevel } from "../lcm/blocks.js";
 import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -79,6 +80,141 @@ function tzAbbrev(): string {
   return parts[parts.length - 1] || "local";
 }
 
+function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: string }) {
+  lcmCommand
+    .command(level)
+    .description(`Roll up into a ${level} block (auto-resolves range + tag)`)
+    .requiredOption("--session-id <id>", "SDK session ID")
+    .requiredOption("--summary <text>", "Summary text")
+    .option(periodOpt.flag, periodOpt.desc)
+    .action(async (opts) => {
+      const sessionsDir = await getSessionsDir();
+      // Option name is the part after `--`, converted to camelCase by commander.
+      // (The earlier version used /<(\w+)>/ on the placeholder, which failed
+      // on "YYYY-MM-DD" because \w+ doesn't cross hyphens — falling back to
+      // `opts.period`, which doesn't exist, so --date was silently ignored.)
+      const flagMatch = periodOpt.flag.match(/^--(\S+)/);
+      const rawKey = flagMatch?.[1] ?? "";
+      const periodKey = rawKey.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      const period: string | undefined = opts[periodKey];
+
+      const resolved = resolveBlockRange(opts.sessionId, level, period);
+      if (!resolved) {
+        console.error(JSON.stringify({
+          status: "error",
+          error: `No events found for ${level} ${period ?? "(auto)"}`,
+        }));
+        process.exit(1);
+      }
+
+      const transcriptPath = join(sessionsDir, `_archive_${opts.sessionId}.jsonl`);
+      const result = compactSession({
+        sdkSessionId: opts.sessionId,
+        fromIdx: resolved.fromIdx,
+        toIdx: resolved.toIdx,
+        summary: opts.summary,
+        transcriptPath,
+        blockTag: resolved.blockTag,
+      });
+
+      if (result.success) {
+        console.log(JSON.stringify({
+          status: "ok",
+          blockTag: resolved.blockTag,
+          description: resolved.description,
+          eventsRemoved: result.eventsRemoved,
+          eventsAfter: result.eventsAfter,
+        }));
+      } else {
+        console.error(JSON.stringify({ status: "error", error: result.error }));
+        process.exit(1);
+      }
+    });
+}
+
+registerBlockLevel("daily", {
+  flag: "--date <YYYY-MM-DD>",
+  desc: "Date to compact (defaults to today, local tz)",
+});
+registerBlockLevel("weekly", {
+  flag: "--week <YYYY-Www>",
+  desc: "ISO week to roll up (defaults to last completed week)",
+});
+registerBlockLevel("monthly", {
+  flag: "--month <YYYY-MM>",
+  desc: "Month to roll up (defaults to last completed month)",
+});
+registerBlockLevel("yearly", {
+  flag: "--year <YYYY>",
+  desc: "Year to roll up (defaults to last completed year)",
+});
+
+lcmCommand
+  .command("blocks")
+  .description("List all summary blocks in a session (daily/weekly/monthly/yearly + legacy)")
+  .requiredOption("--session-id <id>", "SDK session ID")
+  .option("--level <level>", "Filter by level (daily|weekly|monthly|yearly|legacy)")
+  .option("--full", "Show full summary content instead of a preview")
+  .option("--preview <chars>", "Preview length in chars (default 160)", (v) => parseInt(v, 10), 160)
+  .action(async (opts) => {
+    const { readFileSync, existsSync } = await import("node:fs");
+    const { join: joinPath } = await import("node:path");
+    const { homedir: home } = await import("node:os");
+    const sessionPath = joinPath(home(), ".claude", "projects", joinPath(home(), ".tomo", "workspace").replace(/[/.]/g, "-"), `${opts.sessionId}.jsonl`);
+    if (!existsSync(sessionPath)) {
+      console.error(`Session file not found: ${sessionPath}`);
+      process.exit(1);
+    }
+    interface Block { tag: string; level: string; timestamp: string; eventsSummarized: number; content: string; }
+    const blocks: Block[] = [];
+    for (const line of readFileSync(sessionPath, "utf-8").split("\n")) {
+      if (!line) continue;
+      let e: Record<string, unknown>;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (!e.isCompactSummary) continue;
+      const msg = e.message as { content?: unknown } | undefined;
+      const content = typeof msg?.content === "string" ? msg.content : "";
+      const tag = typeof e.blockTag === "string" ? e.blockTag : "legacy";
+      const level = tag === "legacy" ? "legacy" : tag.split(" ")[0];
+      const m = content.match(/^\[(?:[^\]]+? — )?(\d+) events? summarized\]/);
+      const eventsSummarized = m ? parseInt(m[1], 10) : 0;
+      blocks.push({
+        tag,
+        level,
+        timestamp: typeof e.timestamp === "string" ? e.timestamp : "",
+        eventsSummarized,
+        content,
+      });
+    }
+    const filtered = opts.level ? blocks.filter((b) => b.level === opts.level) : blocks;
+    if (filtered.length === 0) {
+      console.log(`No summary blocks found${opts.level ? ` for level=${opts.level}` : ""}.`);
+      return;
+    }
+
+    // Sort by timestamp (oldest first) so the output reads chronologically
+    filtered.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    const totalEvents = filtered.reduce((s, b) => s + b.eventsSummarized, 0);
+    console.log(`${filtered.length} block(s), ${totalEvents.toLocaleString()} events summarized total\n`);
+
+    for (const b of filtered) {
+      const when = b.timestamp ? new Date(b.timestamp).toLocaleString("en-US", { timeZoneName: "short" }) : "?";
+      const header = `[${b.tag}] ${b.eventsSummarized} events · ${when}`;
+      console.log(header);
+      // Strip the auto-generated prefix "[daily ... — N events summarized]\n\n" from content preview
+      const body = b.content.replace(/^\[[^\]]+\]\n\n/, "");
+      if (opts.full) {
+        console.log("  " + body.replace(/\n/g, "\n  "));
+      } else {
+        const preview = body.slice(0, opts.preview).replace(/\n/g, " ");
+        const ellipsis = body.length > opts.preview ? " …" : "";
+        console.log(`  ${preview}${ellipsis}`);
+      }
+      console.log();
+    }
+  });
+
 lcmCommand
   .command("compact")
   .description("Compact a range of events by time range, replacing with a summary")
@@ -86,6 +222,7 @@ lcmCommand
   .requiredOption("--from-time <iso>", "Start timestamp (ISO 8601, e.g. 2026-03-28T16:29)")
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
+  .option("--block-tag <tag>", 'Optional block tag (e.g. "monthly 2026-04") so the resulting summary joins the rollup hierarchy')
   .action(async (opts) => {
     const sessionsDir = await getSessionsDir();
     // Resolve timestamps to indices using context_stats
@@ -117,6 +254,7 @@ lcmCommand
       toIdx: resolved.toIdx,
       summary: opts.summary,
       transcriptPath,
+      ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
     });
 
     if (result.success) {
@@ -125,6 +263,7 @@ lcmCommand
         eventsRemoved: result.eventsRemoved,
         eventsAfter: result.eventsAfter,
         timeRange: { from: fromTime, to: toTime },
+        ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
       }));
     } else {
       console.error(JSON.stringify({ status: "error", error: result.error }));

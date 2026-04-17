@@ -5,12 +5,16 @@ import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
+import { isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
-// Disable SDK auto-compaction — we manage context ourselves via LCM
-process.env.DISABLE_AUTO_COMPACT = "1";
+// DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
+// rollups via skill) well before the SDK's ~80% auto-compact threshold,
+// so auto-compact effectively only fires as a safety net if manual LCM
+// fails. Group sessions skip the custom LCM entirely and rely on SDK
+// auto-compact, so we leave it enabled here.
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -340,6 +344,9 @@ export class Agent {
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
+  // Context-usage hysteresis: track whether we've nudged the agent to compact
+  // for the current over-threshold episode. Reset when usage drops below LOW.
+  private contextNudged = new Map<string, boolean>();
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
@@ -383,6 +390,11 @@ export class Agent {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
     channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
     this.channels.push(channel);
+  }
+
+  /** Active sessions as [sessionKey, sdkSessionId] pairs (RollupRunner etc). */
+  listActiveSessions(): [string, string][] {
+    return this.sessions.listSdkSessionIds();
   }
 
   /**
@@ -682,6 +694,34 @@ export class Agent {
       if (sid && checkAndClearCompactTrigger(sid)) {
         this.closeLiveSession(key);
         log.info({ key }, "Session reloaded after compact");
+      }
+
+      // Context-usage hysteresis: nudge agent to run `tomo lcm daily` when
+      // context usage crosses the high-water mark; reset when it drops back
+      // below the low-water mark (a successful compact knocks it well under).
+      // Skip for group sessions — they use SDK default compact.
+      if (sid && !isGroupSessionKey(key)) {
+        const HIGH = 0.70; // nudge at or above 70% of window
+        const LOW = 0.60;  // reset nudged flag below 60%
+        const ctxUsed = session.lastResult?.contextUsed ?? 0;
+        const ctxMax = session.lastResult?.contextMax ?? 0;
+        const usedFrac = ctxMax > 0 ? ctxUsed / ctxMax : 0;
+        const nudged = this.contextNudged.get(key) === true;
+
+        if (usedFrac < LOW && nudged) {
+          this.contextNudged.set(key, false);
+        }
+
+        if (usedFrac >= HIGH && !nudged) {
+          this.contextNudged.set(key, true);
+          const pct = Math.round(usedFrac * 100);
+          const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last 32 raw events as fresh tail. After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+          log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
+          // Fire-and-forget — don't block the current reply on the nudge
+          this.handleCronMessage(nudge, key).catch((err) => {
+            log.warn({ err, key }, "Context nudge failed");
+          });
+        }
       }
 
       return response;

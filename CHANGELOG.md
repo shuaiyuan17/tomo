@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 (2026-04-17)
+
+### Features
+
+- **Hierarchical block rollups for LCM**. New `tomo lcm daily|weekly|monthly|yearly` subcommands auto-resolve the calendar period and event range, tagging each summary with a canonical `blockTag` (e.g. `daily 2026-04-17`, `weekly 2026-W16`, `monthly 2026-04`, `yearly 2026`). Each level consumes the one below — weekly rolls up 7 daily blocks into one, monthly consumes weeklies, yearly consumes monthlies. Steady state for a long-running session is bounded at ~30 summaries regardless of age.
+- **Rebuild semantics on daily blocks**. Running `tomo lcm daily` mid-day replaces the existing `daily YYYY-MM-DD` block with a fresh summary that absorbs any new raw events since the last write. Safe to run multiple times per day.
+- **Automatic promotion detection**. A new `RollupRunner` scans active sessions hourly (daytime only) for completed calendar units with un-promoted children. When found, it injects a `System:` nudge to the agent describing which rollup commands to run. Idempotent — catches missed Mondays on Tue/Wed.
+- **Hot-tail cap hysteresis**. After each turn, if today's raw (non-summary) event count exceeds 40, the harness nudges the agent to run `tomo lcm daily` to compress. Debounced at a low-water mark of 24 so it doesn't thrash.
+- **New skill docs** (`defaults/skills/lcm/SKILL.md`, `DAILY.md`, `WEEKLY.md`, `MONTHLY.md`, `YEARLY.md`) explaining the block-rollup mental model and style guidance per level. The time-range `compact` command is now documented as an escape hatch for surgical middle-range compactions.
+
 ## 0.3.10 (2026-04-17)
 
 ### Bug fixes

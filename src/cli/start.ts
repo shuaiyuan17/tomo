@@ -120,11 +120,17 @@ async function startForeground(): Promise<void> {
   const versionChecker = new VersionChecker(agent);
   versionChecker.start();
 
+  // Start LCM rollup runner (hourly check for due daily/weekly/monthly/yearly promotions)
+  const { RollupRunner } = await import("../lcm/runner.js");
+  const rollupRunner = new RollupRunner(agent);
+  rollupRunner.start();
+
   // Write PID so `tomo stop` can find us
   writeFileSync(PID_FILE, String(process.pid));
 
   const shutdown = async () => {
     versionChecker.stop();
+    rollupRunner.stop();
     continuity.stop();
     scheduler.stop();
     await agent.stop();

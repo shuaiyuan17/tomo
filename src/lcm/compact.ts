@@ -30,6 +30,14 @@ export interface CompactRequest {
   summary: string;
   /** Path to the transcript archive file */
   transcriptPath: string;
+  /**
+   * Optional block tag for hierarchical rollups (e.g. "daily 2026-04-17",
+   * "weekly 2026-W16"). If a summary event with the same blockTag already
+   * exists in the session, the range is expanded to include it so the new
+   * summary replaces the old one — supports in-place rebuild (mid-day daily
+   * refresh, re-running a weekly rollup, etc).
+   */
+  blockTag?: string;
 }
 
 export interface CompactResult {
@@ -89,8 +97,19 @@ export function compactSession(req: CompactRequest): CompactResult {
   }
 
   // Map fromIdx/toIdx (conversation-relative) to allEvents indices
-  const removeStartGlobal = convIndices[req.fromIdx];
-  const removeEndGlobal = convIndices[req.toIdx];
+  let removeStartGlobal = convIndices[req.fromIdx];
+  let removeEndGlobal = convIndices[req.toIdx];
+
+  // Rebuild semantics: if blockTag matches an existing summary event, expand
+  // the range to include it so the new summary replaces the old in place.
+  if (req.blockTag) {
+    for (let i = 0; i < allEvents.length; i++) {
+      if (allEvents[i].isCompactSummary && allEvents[i].blockTag === req.blockTag) {
+        if (i < removeStartGlobal) removeStartGlobal = i;
+        if (i > removeEndGlobal) removeEndGlobal = i;
+      }
+    }
+  }
 
   // Find events to remove: all events between removeStartGlobal and removeEndGlobal (inclusive),
   // including any metadata events (queue-operation, last-prompt, attachment) that sit between them
@@ -114,16 +133,20 @@ export function compactSession(req: CompactRequest): CompactResult {
 
   // Create the summary event
   const summaryUuid = randomUUID();
+  const prefix = req.blockTag
+    ? `[${req.blockTag} — ${removeSet.size} events summarized]`
+    : `[Compacted section — ${removeSet.size} events summarized]`;
   const summaryEvent: SdkEvent = {
     parentUuid: parentBeforeRange ?? null,
     type: "user",
     message: {
       role: "user",
-      content: `[Compacted section — ${removeSet.size} events summarized]\n\n${req.summary}`,
+      content: `${prefix}\n\n${req.summary}`,
     },
     uuid: summaryUuid,
     isSidechain: false,
     isCompactSummary: true,
+    ...(req.blockTag ? { blockTag: req.blockTag } : {}),
     timestamp: firstRemoved.timestamp,
     sessionId: req.sdkSessionId,
     // Copy common fields from the first removed event

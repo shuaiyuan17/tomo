@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.9 (2026-04-17)
+
+### Bug fixes
+
+- `lcm compact`: re-parent every post-range event whose `parentUuid` pointed into the removed range, not just the first one. Previously only the first post-range user/assistant event was re-linked to the summary, leaving any sibling events (tool chains, split assistant content blocks, attachments) orphaned. On SDK resume those broken links caused the chain walker to skip the compact summary entirely — summaries were written to disk but never reached the API.
+- `tomo restart`: wait for the old PID to exit and a new one to come up (up to 60s) before reporting success, and fall back to a direct SIGTERM if the running tomo wasn't actually the launchd-managed instance. Previously `launchctl kickstart -k` returned immediately; the CLI printed success while the old process was still draining, and in some cases the signal never reached it at all.
+
+### Other
+
+- `scripts/`: add one-shot session recovery utilities (`repair-session.ts`, `prune-session.ts`, `compact-session.ts`) for sessions that got damaged by the pre-fix compactor or grew too big to resume through the agent.
+
 ## 0.3.8 (2026-04-16)
 
 ### Features

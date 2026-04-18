@@ -66,8 +66,11 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     includePartialMessages: true,
     maxTurns: 30,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
+    // Note: SDK `env` fully replaces the child's env (not merged despite the
+    // d.ts claim), so we must spread process.env ourselves — otherwise the
+    // child CLI spawns with an empty env and fails to locate its runtime.
     ...(sessionContext && !isGroupSessionKey(sessionContext.sessionKey)
-      ? { env: { DISABLE_AUTO_COMPACT: "1" } }
+      ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
       : {}),
   };
 }

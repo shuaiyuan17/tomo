@@ -93,8 +93,10 @@ async function startForeground(): Promise<void> {
 
   const agent = new Agent();
 
+  const imageStoreBaseDir = config.saveInboundImages ? config.workspaceDir : undefined;
+
   if (config.telegramToken) {
-    agent.addChannel(new TelegramChannel(config.telegramToken));
+    agent.addChannel(new TelegramChannel(config.telegramToken, { imageStoreBaseDir }));
   }
 
   if (config.imessageUrl) {
@@ -103,6 +105,7 @@ async function startForeground(): Promise<void> {
       url: config.imessageUrl,
       password: config.imessagePassword,
       webhookPort: config.imessageWebhookPort,
+      imageStoreBaseDir,
     }));
   }
 

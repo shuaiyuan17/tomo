@@ -1,6 +1,12 @@
 import { Bot, type Context } from "grammy";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, StreamingMessage } from "./types.js";
+import { saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
+
+export interface TelegramChannelOptions {
+  /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
+  imageStoreBaseDir?: string;
+}
 
 export class TelegramChannel implements Channel {
   readonly name = "telegram";
@@ -9,9 +15,11 @@ export class TelegramChannel implements Channel {
   private commandHandlers: CommandHandler[] = [];
   private botUsername: string | undefined;
   private stopping = false;
+  private imageStoreBaseDir: string | undefined;
 
-  constructor(token: string) {
+  constructor(token: string, options: TelegramChannelOptions = {}) {
     this.bot = new Bot(token);
+    this.imageStoreBaseDir = options.imageStoreBaseDir;
 
     this.bot.catch((err) => {
       log.error({ err: err.error }, "Telegram bot error");
@@ -54,7 +62,7 @@ export class TelegramChannel implements Channel {
       const isMentioned = this.checkMentioned(ctx);
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
-      const image = await this.downloadPhoto(largest.file_id);
+      const image = await this.downloadPhoto(largest.file_id, String(ctx.chat.id));
 
       await this.dispatch({
         id: String(ctx.message.message_id),
@@ -104,7 +112,7 @@ export class TelegramChannel implements Channel {
     return text.replace(new RegExp(`@${this.botUsername}`, "gi"), "").trim();
   }
 
-  private async downloadPhoto(fileId: string): Promise<ImageAttachment | undefined> {
+  private async downloadPhoto(fileId: string, chatId?: string): Promise<ImageAttachment | undefined> {
     try {
       const file = await this.bot.api.getFile(fileId);
       if (!file.file_path) return undefined;
@@ -116,6 +124,14 @@ export class TelegramChannel implements Channel {
       const buffer = Buffer.from(await res.arrayBuffer());
       const ext = file.file_path.split(".").pop()?.toLowerCase();
       const mediaType = ext === "png" ? "image/png" : "image/jpeg";
+
+      // Additively persist to disk if configured. Never blocks the return.
+      if (this.imageStoreBaseDir) {
+        await saveInboundImage(buffer, mediaType, {
+          sessionKey: chatId ? `telegram_${chatId}` : "telegram",
+          guid: fileId,
+        }, this.imageStoreBaseDir);
+      }
 
       return { data: buffer.toString("base64"), mediaType };
     } catch (err) {

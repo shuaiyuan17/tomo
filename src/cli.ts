@@ -15,7 +15,7 @@ import { updateCommand } from "./cli/update.js";
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.3.7");
+  .version("0.4.1");
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);

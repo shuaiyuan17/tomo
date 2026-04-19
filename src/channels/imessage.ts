@@ -1,5 +1,6 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage } from "./types.js";
+import { saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -8,6 +9,8 @@ interface BlueBubblesConfig {
   url: string;
   password: string;
   webhookPort: number;
+  /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
+  imageStoreBaseDir?: string;
 }
 
 export class BlueBubblesChannel implements Channel {
@@ -19,12 +22,14 @@ export class BlueBubblesChannel implements Channel {
   private apiUrl: string;
   private password: string;
   private webhookPort: number;
+  private imageStoreBaseDir: string | undefined;
   private contactCache = new Map<string, string>(); // address → display name
 
   constructor(config: BlueBubblesConfig) {
     this.apiUrl = config.url.replace(/\/+$/, "");
     this.password = config.password;
     this.webhookPort = config.webhookPort;
+    this.imageStoreBaseDir = config.imageStoreBaseDir;
   }
 
   onMessage(handler: MessageHandler): void {
@@ -262,7 +267,7 @@ export class BlueBubblesChannel implements Channel {
 
     // Download image attachments
     const attachments = data.attachments as Array<Record<string, unknown>> | undefined;
-    const images = await this.downloadAttachments(attachments);
+    const images = await this.downloadAttachments(attachments, chatGuid);
 
     // Mark chat as read (best-effort; requires BlueBubbles Private API helper)
     this.api("POST", `/chat/${encodeURIComponent(chatGuid)}/read`).catch(() => {});
@@ -288,6 +293,7 @@ export class BlueBubblesChannel implements Channel {
 
   private async downloadAttachments(
     attachments: Array<Record<string, unknown>> | undefined,
+    chatGuid?: string,
   ): Promise<Array<{ data: string; mediaType: string }>> {
     if (!attachments || attachments.length === 0) return [];
 
@@ -310,6 +316,14 @@ export class BlueBubblesChannel implements Channel {
           data: buffer.toString("base64"),
           mediaType: mimeType,
         });
+
+        // Additively persist to disk if configured. Never blocks the return.
+        if (this.imageStoreBaseDir) {
+          await saveInboundImage(buffer, mimeType, {
+            sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
+            guid: attGuid,
+          }, this.imageStoreBaseDir);
+        }
       } catch (err) {
         log.error({ err, guid: attGuid }, "Failed to download attachment");
       }

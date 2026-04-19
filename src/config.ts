@@ -32,6 +32,8 @@ interface TomoConfig {
   channelAllowlists: Record<string, string[]>;
   /** Secret phrase to activate tomo in a group chat. Null = group chat disabled. */
   groupSecret: string | null;
+  /** If true, inbound image attachments are also persisted to workspace/memory/incoming-images/. Default true. */
+  saveInboundImages: boolean;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -116,6 +118,7 @@ function buildConfig(): TomoConfig {
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
     channelAllowlists: parseAllowlists(channels),
     groupSecret: (file.groupSecret as string) ?? null,
+    saveInboundImages: file.saveInboundImages !== false,
   };
 }
 

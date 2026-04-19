@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 (2026-04-19)
+
+### Features
+
+- **Persist inbound images to disk** (#57). Every image received via iMessage or Telegram is now additionally written to `<workspace>/memory/incoming-images/YYYY-MM-DD/HHMMSS_<session>_<guid8>.<ext>` at download time, in addition to the existing base64 inlining into the SDK event. Previously images lived only in the session archive and vanished from the agent's view on compaction. New `saveInboundImages` config flag (default `true`) gates the behavior; set to `false` in `~/.tomo/config.json` to disable.
+
+### Other
+
+- `cli --version` synced to `0.4.1` (was stale at `0.3.7` across 0.3.8 – 0.4.0 releases). Still hardcoded — a follow-up to read from `package.json` at runtime would prevent this drift recurring.
+
 ## 0.4.0 (2026-04-17)
 
 ### Features

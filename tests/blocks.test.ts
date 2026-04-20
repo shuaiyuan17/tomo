@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { resolveBlockRange } from "../src/lcm/blocks.js";
+import { resolveBlockRange, findDuePromotions } from "../src/lcm/blocks.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
@@ -101,5 +101,51 @@ describe("resolveBlockRange — daily fresh-tail behavior", () => {
     expect(result).not.toBeNull();
     expect(result!.description).toContain("32 events");
     expect(result!.description).not.toContain("kept raw");
+  });
+
+  it("compacts all events for a past day with more than 32 raw events", () => {
+    // Past day >32 should NOT keep a fresh tail either — past days are cold,
+    // there's no short-term context worth preserving outside the block.
+    const pastDay = "2026-04-14";
+    const events: any[] = [];
+    for (let i = 0; i < 50; i++) {
+      events.push(mkEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant"));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const result = resolveBlockRange(sessionId, "daily", pastDay);
+    expect(result).not.toBeNull();
+    expect(result!.description).toContain("50 events");
+    expect(result!.description).not.toContain("kept raw");
+  });
+});
+
+describe("findDuePromotions — past-day nudging", () => {
+  let sessionId: string;
+  let archivePath: string;
+
+  beforeEach(() => {
+    sessionId = `test-blocks-due-${randomUUID()}`;
+  });
+
+  afterEach(() => {
+    if (archivePath && existsSync(archivePath)) unlinkSync(archivePath);
+  });
+
+  it("flags past days with small raw-event counts (end-to-end nudge → compact)", () => {
+    // End-to-end: this is what the rollup runner uses to surface past-day
+    // rollups to Claw. Must be independent of DAILY_FRESH_TAIL — otherwise
+    // past days with ≤32 events would be invisible to the nudge loop.
+    const pastDay = "2026-04-15";
+    const events: any[] = [];
+    for (let i = 0; i < 10; i++) {
+      events.push(mkEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant"));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
+    expect(dailyDue).toBeDefined();
+    expect(dailyDue!.childCount).toBe(10);
   });
 });

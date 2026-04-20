@@ -125,8 +125,14 @@ export function resolveBlockRange(
   // Daily rollup only: preserve a fresh tail of the most recent raw events.
   // The existing daily block (if any) and any earlier raw events still get
   // compacted — we just stop short of the last DAILY_FRESH_TAIL matches.
+  //
+  // The fresh tail only applies to *today*'s rollup (mid-day compacts shouldn't
+  // wipe warm short-term texture). Past days are already cold — compact them
+  // in full, regardless of event count. Without this distinction, any past day
+  // with ≤ DAILY_FRESH_TAIL raw events can never be rolled up and stays
+  // forever in the hot context as un-promoted raw events.
   let effectiveMatches = matches;
-  if (level === "daily") {
+  if (level === "daily" && resolvedPeriod === localDateTag(new Date())) {
     const rawOnly = matches.filter((idx) => !events[idx].isCompactSummary);
     if (rawOnly.length <= DAILY_FRESH_TAIL) {
       // Nothing outside the fresh tail to compact (and no existing block to rebuild).

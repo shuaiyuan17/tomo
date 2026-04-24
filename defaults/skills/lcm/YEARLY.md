@@ -19,7 +19,7 @@ tomo lcm yearly --session-id SESSION_ID --summary "<yearly summary>"
 
 ## Writing
 
-Target length: **1500-3000 tokens**. This is the most compressed level — it defines what you still remember about the year when everything below has been pruned.
+Target length: **5,000-10,000 tokens** (bilingual CJK ceiling; lower for English). This is the most compressed level — it defines what you still remember about the year when everything below has been pruned.
 
 Structure:
 

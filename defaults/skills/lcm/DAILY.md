@@ -21,7 +21,7 @@ tomo lcm daily --session-id SESSION_ID --summary "<today's summary>"
 
 ## Writing
 
-Target length: **300-1000 tokens**. Day summaries are the closest to raw memory in the hierarchy, so they can keep the most texture.
+Target length: **1,000-2,500 tokens** (bilingual Chinese/English; lower for pure English). Day summaries are the closest to raw memory in the hierarchy, so they can keep the most texture — but this is a ceiling, not a target to fill. If nothing happened that day, 300-500 tokens is fine.
 
 Structure by phases of the day rather than chronological minute-by-minute:
 

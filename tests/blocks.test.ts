@@ -148,4 +148,57 @@ describe("findDuePromotions — past-day nudging", () => {
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(10);
   });
+
+  it("flags a past day with a daily block AND leftover raw events", () => {
+    // Scenario observed in the wild: a `daily <day>` block was written early
+    // in the day (e.g. by a mid-morning compact) but more raw events accumulated
+    // after and never got absorbed. findDuePromotions must flag this for the
+    // nudge loop so the agent re-runs `tomo lcm daily --date <day>` and
+    // rebuild semantics sweep up the leftovers.
+    const pastDay = "2026-04-22";
+    const events: any[] = [];
+    // Existing daily block
+    events.push({
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 22, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${pastDay}`,
+      message: { role: "user", content: "[daily 2026-04-22 — 50 events summarized]\n\nearly 4/22 rollup" },
+    });
+    // Leftover raw events for the same day
+    for (let i = 0; i < 20; i++) {
+      events.push(mkEvent(pastDay, 14, i % 2 === 0 ? "user" : "assistant"));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
+    expect(dailyDue).toBeDefined();
+    expect(dailyDue!.childCount).toBe(20);
+  });
+
+  it("does NOT flag a past day with a block and only a few (<8) leftover raw events", () => {
+    // Don't spam nudges for trivial residual events (attachments, a stray
+    // heartbeat). The floor kicks in when both a block exists AND leftover
+    // is below FLOOR_WITH_BLOCK = 8.
+    const pastDay = "2026-04-19";
+    const events: any[] = [];
+    events.push({
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 19, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${pastDay}`,
+      message: { role: "user", content: "[daily 2026-04-19 — 100 events summarized]\n\n..." },
+    });
+    for (let i = 0; i < 3; i++) {
+      events.push(mkEvent(pastDay, 23, i % 2 === 0 ? "user" : "assistant"));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
+    expect(dailyDue).toBeUndefined();
+  });
 });

@@ -338,8 +338,18 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     }
   }
 
-  // Also nudge for unconsolidated yesterday-or-earlier raw events
-  // (agent forgot to write a daily before midnight).
+  // Nudge for any past day that has raw (non-summary) user/assistant events
+  // sitting in the chain. Two scenarios to catch:
+  //   1. No `daily <day>` block exists yet — agent forgot to write one.
+  //   2. `daily <day>` block exists BUT extra raw events leaked past it, e.g.
+  //      fresh-tail leftovers from when that day was "today", or a partial
+  //      early-day compact that never got re-run. Rebuild semantics absorb
+  //      these cleanly when the agent re-runs `tomo lcm daily --date <day>`.
+  // Small raw-tail floors avoid spamming nudges for one or two orphaned
+  // metadata/attachment residuals.
+  const FLOOR_WITH_BLOCK = 8;   // block exists — only nudge if meaningful leftover
+  const FLOOR_WITHOUT_BLOCK = 1; // no block — any raw event is a reason to nudge
+
   const rawDays = new Map<string, number>();
   for (const e of events) {
     if (e.type !== "user" && e.type !== "assistant") continue;
@@ -351,7 +361,9 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     }
   }
   for (const [day, count] of rawDays) {
-    if (!haveTags.has(`daily ${day}`)) {
+    const hasBlock = haveTags.has(`daily ${day}`);
+    const floor = hasBlock ? FLOOR_WITH_BLOCK : FLOOR_WITHOUT_BLOCK;
+    if (count >= floor) {
       due.push({ level: "daily", period: day, childCount: count });
     }
   }

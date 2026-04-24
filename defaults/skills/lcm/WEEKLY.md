@@ -19,7 +19,7 @@ tomo lcm weekly --session-id SESSION_ID --summary "<weekly summary>"
 
 ## Writing
 
-Target length: **500-1500 tokens**. One level more compressed than daily.
+Target length: **2,000-4,000 tokens** (bilingual CJK ceiling; lower for English). One level more compressed than daily — should read cleanly without the 7 dailies at hand.
 
 Structure around **themes/arcs** of the week, not a day-by-day list:
 

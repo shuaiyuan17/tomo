@@ -20,7 +20,7 @@ tomo lcm monthly --session-id SESSION_ID --summary "<monthly summary>"
 
 ## Writing
 
-Target length: **1000-2000 tokens**. Another level of compression — preserve the month's shape, lose week-to-week granularity.
+Target length: **3,000-6,000 tokens** (bilingual CJK ceiling; lower for English). Another level of compression — preserve the month's shape, lose week-to-week granularity.
 
 Structure:
 

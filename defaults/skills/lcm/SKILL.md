@@ -70,7 +70,7 @@ The harness will nudge you via a `System:` message when rollups are due (idempot
 ## When to act
 
 1. **Harness nudge** — always prioritize. The system tells you exactly which rollup to run.
-2. **Hot-tail > 40 events** — run `tomo lcm daily` to compress today so far.
+2. **Context ≥ 70%** — the harness will nudge you to run `tomo lcm daily`.
 3. **Heavy tool output** — run `prune-tools` first (cheap, no summary needed).
 4. **Context > 70% or after big tool-heavy tasks** — use the above as appropriate.
 
@@ -82,11 +82,13 @@ See the per-level docs for tailored guidance. General rules:
 - Dates in **YYYY-MM-DD format** (searchable)
 - Preserve outcomes, decisions, key quotes — drop step-by-step narration
 - For conversations: one vivid detail beats a paragraph of abstraction
-- Target lengths:
-  - daily: 300-1000 tokens
-  - weekly: 500-1500 tokens
-  - monthly: 1000-2000 tokens
-  - yearly: 1500-3000 tokens
+- Target lengths (assumes bilingual Chinese/English — CJK characters tokenize ~3× denser than English, so byte-budget scales up accordingly):
+  - daily: 1,000-2,500 tokens
+  - weekly: 2,000-4,000 tokens
+  - monthly: 3,000-6,000 tokens
+  - yearly: 5,000-10,000 tokens
+
+If you're writing pure English, aim for the lower end (or below). These are ceilings for dense CJK content, not targets to fill.
 
 ## Archive & recall
 

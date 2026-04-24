@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.2 (2026-04-24)
+
+### Bug fixes
+
+- **LCM past-day rollups no longer stuck** (#58). `DAILY_FRESH_TAIL = 32` (the guard that preserves warm context when rolling up today) was being applied to past days too — any past day with ≤32 raw events returned "No events found" and never promoted, even as the `RollupRunner` kept nudging every tick. Gate the fresh-tail branch on `resolvedPeriod === today`; past days compact in full. Observed in-session: dailies 04-08 (28), 04-11 (32), 04-15 (10), 04-16 (11), 04-19 (15) all stuck.
+- **LCM nudges past days with leftover raw after a daily block** (#59). `findDuePromotions` previously skipped any past day whose `daily <day>` tag already existed, even when extra raw events sat outside that block. Observed: `daily 2026-04-22` absorbed ~408 events, then 238 more accumulated after and never got swept up. Now flags past days that have raw events regardless of existing block, with a floor of 8 events to suppress small residuals. Rebuild semantics of `tomo lcm daily --date <day>` absorb both the existing block and the leftover raw.
+
+### Documentation
+
+- **Realistic LCM summary target lengths for bilingual use** (#60). Original targets (daily 300–1000 tok, weekly 500–1500, monthly 1000–2000, yearly 1500–3000) assumed pure English; in bilingual Chinese/English practice CJK characters tokenize ~3× denser, so real summaries consistently ran 3–6× over target. New ceilings: daily 1,000–2,500, weekly 2,000–4,000, monthly 3,000–6,000, yearly 5,000–10,000 tokens. Hierarchy compression ratios still hold (~3–5× per level). Also removed a stale "hot-tail > 40 events" line in `SKILL.md` that predated the context-% nudging.
+
+### Other
+
+- Bump `actions/upload-artifact` 4 → 7 (#54).
+- Bump dev dependencies group: 4 updates (#55).
+
 ## 0.4.1 (2026-04-19)
 
 ### Features

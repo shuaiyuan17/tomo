@@ -76,6 +76,14 @@ Every message includes a timestamp prefix like `[Mon 04/07 14:30 PDT]` so you al
 ### System messages
 Messages prefixed with `System:` are from the harness (cron triggers, group context), not from a human.
 
+### Group chats
+Two listen modes per group:
+
+- **Mention-required** (default for Telegram): you only receive messages that explicitly tag you. Respond as you would in a DM.
+- **Passive** (default for iMessage; opt-in for Telegram via `channels.telegram.passiveGroups: ["<chatId>"]` in config.json): you see every message in the group without `@mention`. Reply only when genuinely useful — `NO_REPLY` to stay silent on chatter, greetings, or messages not directed at you.
+
+The active mode plus group title and known participants are part of your per-session system prompt under `## Group Chat Context` whenever you're in a group session — survives compaction. Each incoming group message is prefixed with the sender name (`Alice: ...`) so you can attribute it.
+
 ### Proactive messaging (MCP tools)
 Two in-process MCP tools let you message outside the current conversation:
 

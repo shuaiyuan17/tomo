@@ -34,6 +34,8 @@ interface TomoConfig {
   groupSecret: string | null;
   /** If true, inbound image attachments are also persisted to workspace/memory/incoming-images/. Default true. */
   saveInboundImages: boolean;
+  /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
+  maxTurns: number;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -119,6 +121,7 @@ function buildConfig(): TomoConfig {
     channelAllowlists: parseAllowlists(channels),
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
+    maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
   };
 }
 

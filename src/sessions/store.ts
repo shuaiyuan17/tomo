@@ -376,6 +376,25 @@ export class SessionStore {
     }
   }
 
+  /** Persist a friendly chat title for a session (mainly groups). No-op if unchanged. */
+  setChatTitle(key: string, title: string): void {
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    if (entry && entry.chatTitle !== title) {
+      entry.chatTitle = title;
+      this.saveRegistry();
+    }
+  }
+
+  /** Add a participant name to a session. No-op if already present. */
+  addParticipant(key: string, name: string): void {
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    if (!entry) return;
+    const list = entry.participants ?? [];
+    if (list.includes(name)) return;
+    entry.participants = [...list, name];
+    this.saveRegistry();
+  }
+
   /** Migrate a session from one key to another (for identity-based session unification) */
   migrateSessionKey(oldKey: string, newKey: string): void {
     const idx = this.registry.findIndex((e) => e.channelKey === oldKey && e.unlinkedAt === null);

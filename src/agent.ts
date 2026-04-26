@@ -1,4 +1,4 @@
-import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage, type SDKMessage, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -7,8 +7,16 @@ import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
+import { createTomoInternalMcpServer, TOMO_INTERNAL_MCP_NAME } from "./mcp/internal-server.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+
+export type SendResult = { ok: true } | { ok: false; error: string };
+
+export interface SessionCatalog {
+  identities: Array<{ name: string }>;
+  groups: Array<{ key: string; title?: string; participants?: string[] }>;
+}
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -31,7 +39,32 @@ function extractMedia(text: string): { cleanText: string; mediaPaths: string[] }
   return { cleanText, mediaPaths };
 }
 
-function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: { sessionKey: string; sdkSessionId?: string }) {
+const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;
+
+async function skillsCanUseTool(
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
+  const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
+  if (filePath && filePath.startsWith(SKILLS_DIR)) {
+    return { behavior: "allow", updatedInput: input };
+  }
+  // Bash mkdir / touch / etc. — allow if command targets the skills dir.
+  if (toolName === "Bash" && typeof input.command === "string" && input.command.includes(SKILLS_DIR)) {
+    return { behavior: "allow", updatedInput: input };
+  }
+  return {
+    behavior: "deny",
+    message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
+  };
+}
+
+function sdkOptions(
+  internalMcpServer: McpSdkServerConfigWithInstance,
+  resumeSessionId?: string,
+  model?: string,
+  sessionContext?: { sessionKey: string; sdkSessionId?: string },
+) {
   let systemPrompt = buildSystemPrompt();
 
   // Inject session context so the agent can use LCM tools
@@ -55,7 +88,10 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     allowedTools: [
       "Read", "Write", "Edit", "Bash", "Glob", "Grep",
       "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite", "Skill",
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__send_message`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__list_sessions`,
     ],
+    mcpServers: { [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: ["project"] as ("project")[],
     settings: {
       attribution: {
@@ -63,8 +99,15 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
       },
     },
+    // bypassPermissions auto-approves most tools at step 3 of the permission
+    // flow, but writes to `.claude/`, `.git/`, etc. are protected and fall
+    // through to step 5 (canUseTool). We narrowly re-allow `.claude/skills/`
+    // here so tomo can manage its own skill library, while leaving every
+    // other protected path on its default (deny). See:
+    // https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes
+    canUseTool: skillsCanUseTool,
     includePartialMessages: true,
-    maxTurns: 30,
+    maxTurns: config.maxTurns,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     // Note: SDK `env` fully replaces the child's env (not merged despite the
     // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -353,10 +396,16 @@ export class Agent {
   // Context-usage hysteresis: track whether we've nudged the agent to compact
   // for the current over-threshold episode. Reset when usage drops below LOW.
   private contextNudged = new Map<string, boolean>();
+  // Notes queued by sendToSession() — drained and prepended to the recipient's
+  // next user/cron/continuity turn so their Claude has context that a
+  // proactive message went out.
+  private pendingNotes = new Map<string, string[]>();
+  private readonly internalMcpServer: McpSdkServerConfigWithInstance;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
+    this.internalMcpServer = createTomoInternalMcpServer(this);
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -527,7 +576,7 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
-    const opts = sdkOptions(resumeId ?? undefined, model, {
+    const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
     });
@@ -605,7 +654,7 @@ export class Agent {
     const stopTyping = isImessageGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
-      const stampedText = this.injectTimestamp(textForAgent, channel.name);
+      const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
       const response = await this.runWithRetry(key, stampedText, (text) => {
@@ -765,6 +814,8 @@ export class Agent {
 
     const wasKnown = participants.has(senderName);
     participants.add(senderName);
+    this.sessions.addParticipant(key, senderName);
+    if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
 
     if (isNew || !wasKnown) {
       const names = [...participants].join(", ");
@@ -845,7 +896,7 @@ export class Agent {
       deliveryChatId = chatId;
     }
 
-    const stampedMessage = this.injectTimestamp(message, deliveryChannel.name);
+    const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
     const stopTyping = deliveryChannel.startTyping(deliveryChatId);
@@ -901,7 +952,7 @@ export class Agent {
 
   private async processContinuity(prompt: string, key: string): Promise<void> {
     try {
-      const response = await this.runWithRetry(key, prompt);
+      const response = await this.runWithRetry(key, this.drainPendingNotes(key) + prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
 
       // Send non-silent responses to the user (check includes() for multi-turn responses
@@ -958,6 +1009,121 @@ export class Agent {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Direct mode: post a verbatim message to a target session via Channel.send().
+   * No Claude query is invoked for the recipient — the message arrives as-is.
+   * A pending note is queued so the recipient's next Claude turn knows context.
+   */
+  async sendToSession(target: string, text: string): Promise<SendResult> {
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
+    }
+    const { sessionKey, replyTarget } = resolved;
+
+    const channel = this.getChannel(replyTarget.channelName);
+    if (!channel) {
+      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
+    }
+
+    await channel.send({ chatId: replyTarget.chatId, text });
+
+    this.sessions.append(sessionKey, {
+      role: "assistant",
+      content: `[proactive] ${text}`,
+      channel: replyTarget.channelName,
+      timestamp: Date.now(),
+    });
+
+    this.queuePendingNote(sessionKey, `[System: You proactively sent the following message to this conversation earlier (initiated from another session): "${text}"]`);
+
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Proactive message sent (direct)");
+    return { ok: true };
+  }
+
+  /**
+   * Delegate mode: queue a system request for the target session's Claude to
+   * compose and send a message in its own voice/context. Fire-and-forget — the
+   * caller's tool result returns as soon as the request is dispatched, not when
+   * the recipient's Claude finishes. The user observes the actual outcome in
+   * the recipient channel directly (since they're a participant).
+   *
+   * Note: delegate-to-self isn't blocked here. If it happens, the system
+   * request is just queued behind the current turn via enqueueForSession —
+   * one extra Claude turn fires, no infinite loop. For mid-loop self-progress
+   * updates, prefer direct mode (no extra turn).
+   */
+  async delegateToSession(target: string, request: string): Promise<SendResult> {
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
+    }
+    const { sessionKey, replyTarget } = resolved;
+
+    if (!this.getChannel(replyTarget.channelName)) {
+      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
+    }
+
+    const systemMsg = `[System: From your other conversation, you were asked to: ${request}. Use this conversation's context, tone, and participants to respond appropriately. Reply NO_REPLY if you judge it shouldn't be sent.]`;
+
+    // Fire-and-forget — handleCronMessage enqueues per session and runs through
+    // a normal Claude turn. The user verifies the outcome in the channel.
+    this.handleCronMessage(systemMsg, sessionKey).catch((err) => {
+      log.error({ err, sessionKey }, "Delegated send failed");
+    });
+
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: request.length }, "Proactive message dispatched (delegate)");
+    return { ok: true };
+  }
+
+  /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
+  private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
+    // Identity name (no colon) → dm:<name>
+    if (!target.includes(":")) {
+      const identity = config.identities.find((i) => i.name === target);
+      if (!identity) return undefined;
+      const sessionKey = `dm:${identity.name}`;
+      const replyTarget = this.router.getReplyTarget(sessionKey)
+        ?? this.router.deriveReplyTargetFromConfig(identity.name);
+      return replyTarget ? { sessionKey, replyTarget } : undefined;
+    }
+    // Session key form (dm:<name> or <channel>:<chatId>)
+    const replyTarget = this.router.getReplyTarget(target)
+      ?? (target.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(target.slice(3)) : undefined)
+      ?? this.parseChannelKey(target);
+    return replyTarget ? { sessionKey: target, replyTarget } : undefined;
+  }
+
+  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool. */
+  listSessionCatalog(): SessionCatalog {
+    const identities = config.identities.map((i) => ({ name: i.name }));
+    const groups: SessionCatalog["groups"] = [];
+    for (const [key] of this.sessions.listSdkSessionIds()) {
+      if (!isGroupSessionKey(key)) continue;
+      const entry = this.sessions.getEntry(key);
+      groups.push({
+        key,
+        ...(entry?.chatTitle ? { title: entry.chatTitle } : {}),
+        ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+      });
+    }
+    return { identities, groups };
+  }
+
+  private queuePendingNote(sessionKey: string, note: string): void {
+    const arr = this.pendingNotes.get(sessionKey) ?? [];
+    arr.push(note);
+    this.pendingNotes.set(sessionKey, arr);
+  }
+
+  /** Drain notes queued for this session (e.g. by sendToSession) and return them as a prefix. */
+  private drainPendingNotes(sessionKey: string): string {
+    const notes = this.pendingNotes.get(sessionKey);
+    if (!notes || notes.length === 0) return "";
+    this.pendingNotes.delete(sessionKey);
+    return notes.map((n) => `${n}\n\n`).join("");
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */

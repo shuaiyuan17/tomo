@@ -69,6 +69,10 @@ export interface SessionEntry {
   stats: SessionStats;
   /** Reply routing target for unified multi-channel sessions */
   replyTarget?: ReplyTarget;
+  /** Display title for groups (or any session that has a friendly name). */
+  chatTitle?: string;
+  /** Known participants (sender names seen) — used to disambiguate groups. */
+  participants?: string[];
 }
 
 export interface SessionRegistry {

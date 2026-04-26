@@ -11,7 +11,7 @@
 
 ### Other
 
-- `cli --version` synced to `0.5.0` (still hardcoded in `src/cli.ts:18`; the `0.4.1` CHANGELOG note about reading from `package.json` at runtime to prevent drift remains a useful follow-up).
+- **`cli --version` now reads from `package.json` at runtime** (#64). Resolves the long-standing drift risk flagged in `0.4.1`: `src/cli.ts` previously hardcoded the version string and required a parallel update on every release bump. Now derived from `import.meta.url` → `../package.json`, so the package.json bump is the single source of truth.
 
 ## 0.4.2 (2026-04-24)
 

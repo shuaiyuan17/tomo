@@ -150,6 +150,9 @@ class LiveSession {
   private prevTotalCost = 0;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
+  // Maps tool_use_id → tool name so we can label tool_result log lines
+  // (the result event only carries the use id, not the original name).
+  private pendingToolNames = new Map<string, string>();
 
   constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string) {
     this.sessionKey = sessionKey;
@@ -199,8 +202,23 @@ class LiveSession {
         if ("text" in block) {
           this.parts.push(block.text);
         } else if ("type" in block && block.type === "tool_use") {
-          const tool = block as { name: string; input?: Record<string, unknown> };
+          const tool = block as { id?: string; name: string; input?: Record<string, unknown> };
+          if (tool.id && tool.name) this.pendingToolNames.set(tool.id, tool.name);
           log.info({ tool: tool.name }, summarizeToolInput(tool.name, tool.input));
+        }
+      }
+    }
+
+    if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
+      for (const block of event.message.content) {
+        if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
+          const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
+          const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
+          if (tr.tool_use_id) this.pendingToolNames.delete(tr.tool_use_id);
+          log.info(
+            { tool: name ?? "?", is_error: tr.is_error ?? false },
+            `result: ${summarizeToolResult(tr.content)}`,
+          );
         }
       }
     }
@@ -368,6 +386,28 @@ class LiveSession {
 }
 
 // --- Agent ---
+
+function summarizeToolResult(content: unknown): string {
+  // Tool results arrive as either a string or an array of content blocks
+  // ({type:"text",text:"..."} | {type:"image",...} | etc.). We flatten to a
+  // short readable string for log lines — no need to be exhaustive.
+  if (content == null) return "(empty)";
+  if (typeof content === "string") return content.slice(0, 500);
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const b of content) {
+      if (b && typeof b === "object") {
+        if ("text" in b && typeof (b as { text: unknown }).text === "string") {
+          parts.push((b as { text: string }).text);
+        } else if ("type" in b) {
+          parts.push(`<${(b as { type: string }).type}>`);
+        }
+      }
+    }
+    return parts.join(" ").slice(0, 500);
+  }
+  return JSON.stringify(content).slice(0, 500);
+}
 
 function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
   if (!input) return name;

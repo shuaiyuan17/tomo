@@ -59,11 +59,24 @@ async function skillsCanUseTool(
   };
 }
 
+interface SessionContext {
+  sessionKey: string;
+  sdkSessionId?: string;
+  /** Group metadata snapshot — present only for group sessions. */
+  group?: {
+    chatTitle?: string;
+    participants?: string[];
+    /** True for iMessage groups (always) and Telegram groups in
+     *  config.passiveGroups. Drives the "stay silent unless useful" rule. */
+    isPassive: boolean;
+  };
+}
+
 function sdkOptions(
   internalMcpServer: McpSdkServerConfigWithInstance,
   resumeSessionId?: string,
   model?: string,
-  sessionContext?: { sessionKey: string; sdkSessionId?: string },
+  sessionContext?: SessionContext,
 ) {
   let systemPrompt = buildSystemPrompt();
 
@@ -75,6 +88,21 @@ function sdkOptions(
     ];
     if (sessionContext.sdkSessionId) {
       lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
+    }
+    if (sessionContext.group) {
+      const g = sessionContext.group;
+      lines.push("");
+      lines.push("## Group Chat Context");
+      if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
+      if (g.participants && g.participants.length > 0) {
+        lines.push(`- Known participants: ${g.participants.join(", ")} (more may join later — you'll see new senders prefixed in incoming messages)`);
+      }
+      lines.push("- Messages from each sender are prefixed with their name (e.g. `Alice: ...`).");
+      if (g.isPassive) {
+        lines.push("- **Listen mode: passive.** You see every message in this group; no @mention is required to address you. Reply only when you have something genuinely useful to add — reply `NO_REPLY` to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.");
+      } else {
+        lines.push("- **Listen mode: mention-required.** You only receive messages that explicitly tag you; respond as you would in a DM.");
+      }
     }
     systemPrompt += lines.join("\n");
   }
@@ -469,6 +497,20 @@ export class Agent {
     return (config.passiveGroups[channelName] ?? []).includes(chatId);
   }
 
+  /** Snapshot of group metadata for the system prompt — null for non-group sessions. */
+  private buildGroupContext(sessionKey: string): SessionContext["group"] {
+    if (!isGroupSessionKey(sessionKey)) return undefined;
+    const colonIdx = sessionKey.indexOf(":");
+    const channelName = colonIdx >= 0 ? sessionKey.slice(0, colonIdx) : "";
+    const chatId = colonIdx >= 0 ? sessionKey.slice(colonIdx + 1) : "";
+    const entry = this.sessions.getEntry(sessionKey);
+    return {
+      ...(entry?.chatTitle ? { chatTitle: entry.chatTitle } : {}),
+      ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+      isPassive: channelName ? this.isPassiveListenGroup(channelName, chatId) : false,
+    };
+  }
+
   /** Activate a group chat by adding it to the channel's allowlist */
   private async activateGroup(channel: Channel, chatId: string): Promise<void> {
     try {
@@ -630,6 +672,7 @@ export class Agent {
     const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
+      group: this.buildGroupContext(key),
     });
 
     session = new LiveSession(opts, key);
@@ -684,7 +727,7 @@ export class Agent {
     const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
 
     if (isGroup) {
-      await this.updateGroupContext(key, message.senderName, channel.name, message.chatTitle);
+      this.updateGroupContext(key, message.senderName, message.chatTitle);
     }
 
     this.sessions.append(key, {
@@ -855,39 +898,20 @@ export class Agent {
     }
   }
 
-  private async updateGroupContext(key: string, senderName: string, channelName: string, chatTitle?: string): Promise<void> {
+  /** Track participants and chat title for a group session. The actual rules
+   *  (passive listen, NO_REPLY guidance, participant snapshot) are now part of
+   *  the system prompt — see SessionContext.group in sdkOptions — so they
+   *  survive compaction. This stays as pure persistence + in-memory tracking;
+   *  no LLM injection. */
+  private updateGroupContext(key: string, senderName: string, chatTitle?: string): void {
     let participants = this.groupParticipants.get(key);
-    const isNew = !participants;
-
     if (!participants) {
       participants = new Set();
       this.groupParticipants.set(key, participants);
     }
-
-    const wasKnown = participants.has(senderName);
     participants.add(senderName);
     this.sessions.addParticipant(key, senderName);
     if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
-
-    if (isNew || !wasKnown) {
-      const names = [...participants].join(", ");
-      const title = chatTitle ? `"${chatTitle}"` : "a group chat";
-      let contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
-
-      // Passive-listen groups (iMessage always; Telegram via config.passiveGroups):
-      // inject guidance to stay silent unless genuinely useful.
-      const chatId = key.includes(":") ? key.slice(key.indexOf(":") + 1) : "";
-      if (isNew && this.isPassiveListenGroup(channelName, chatId)) {
-        contextMsg += ` You see every message in this ${channelName} group but should only reply when you have something genuinely useful to add. Reply NO_REPLY to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.`;
-      }
-
-      try {
-        await this.runWithRetry(key, contextMsg);
-        log.info({ group: chatTitle, participants: names }, "Group context updated");
-      } catch (err) {
-        log.warn({ err }, "Failed to inject group context");
-      }
-    }
   }
 
   private injectTimestamp(text: string, channelName?: string): string {

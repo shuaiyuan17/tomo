@@ -139,6 +139,7 @@ const { mockConfig } = vi.hoisted(() => ({
     imessageWebhookPort: 3100,
     sessionModelOverrides: {} as Record<string, string>,
     channelAllowlists: {} as Record<string, string[]>,
+    passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
   },
 }));

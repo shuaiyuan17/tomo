@@ -458,6 +458,17 @@ export class Agent {
     return this.channels.find((ch) => ch.name === name);
   }
 
+  /**
+   * Is this group a "passive listen" group? Tomo sees every message (no
+   * @mention required) and decides via NO_REPLY whether to respond.
+   * iMessage groups are always passive (the channel can't reliably detect
+   * mentions). Telegram (and others) opt in via config.passiveGroups.
+   */
+  private isPassiveListenGroup(channelName: string, chatId: string): boolean {
+    if (channelName === "imessage") return true;
+    return (config.passiveGroups[channelName] ?? []).includes(chatId);
+  }
+
   /** Activate a group chat by adding it to the channel's allowlist */
   private async activateGroup(channel: Channel, chatId: string): Promise<void> {
     try {
@@ -684,14 +695,15 @@ export class Agent {
       timestamp: message.timestamp,
     });
 
-    if (isGroup && !isMentioned) {
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
+
+    if (isGroup && !isMentioned && !isPassiveGroup) {
       log.debug("Group message ignored (not mentioned)");
       return;
     }
 
-    // iMessage groups: skip typing indicator (most messages will be NO_REPLY)
-    const isImessageGroup = isGroup && channel.name === "imessage";
-    const stopTyping = isImessageGroup ? () => {} : replyChannel.startTyping(replyChatId);
+    // Passive groups: skip typing indicator (most messages will be NO_REPLY)
+    const stopTyping = isPassiveGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
       const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
@@ -758,8 +770,8 @@ export class Agent {
       stopTyping();
       log.error({ err }, "Error handling message");
 
-      // iMessage groups: suppress error messages to avoid polluting the chat
-      if (isImessageGroup) return;
+      // Passive groups: suppress error messages to avoid polluting the chat
+      if (isPassiveGroup) return;
 
       const detail = err instanceof Error ? err.message : String(err);
       await replyChannel.send({
@@ -862,9 +874,11 @@ export class Agent {
       const title = chatTitle ? `"${chatTitle}"` : "a group chat";
       let contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
 
-      // iMessage groups: inject guidance to stay silent unless needed
-      if (isNew && channelName === "imessage") {
-        contextMsg += " This is an iMessage group chat. You see every message but should only reply when you have something genuinely useful to add. Reply NO_REPLY to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.";
+      // Passive-listen groups (iMessage always; Telegram via config.passiveGroups):
+      // inject guidance to stay silent unless genuinely useful.
+      const chatId = key.includes(":") ? key.slice(key.indexOf(":") + 1) : "";
+      if (isNew && this.isPassiveListenGroup(channelName, chatId)) {
+        contextMsg += ` You see every message in this ${channelName} group but should only reply when you have something genuinely useful to add. Reply NO_REPLY to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.`;
       }
 
       try {

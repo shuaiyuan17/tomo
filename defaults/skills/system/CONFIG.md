@@ -13,7 +13,8 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
   "channels": {
     "telegram": {
       "token": "123456:ABC-DEF1234ghIkl-zyx57W2v...",
-      "allowlist": ["123456789"]
+      "allowlist": ["123456789"],
+      "passiveGroups": ["-1001234567"]
     },
     "imessage": {
       "url": "https://your-bluebubbles.example.com",
@@ -49,6 +50,7 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
 | `channels.telegram.token` | string | BotFather token (`123456:...`). Required to enable the Telegram channel. |
 | `channels.telegram.allowlist` | string[] | Telegram user IDs (as strings) permitted to DM the bot. Identity-bound chatIds are auto-allowed even if missing here. |
+| `channels.telegram.passiveGroups` | string[] | Telegram group chatIds (negative IDs as strings) where Tomo should listen to every message — no `@mention` required. Tomo decides via `NO_REPLY` whether to respond. iMessage groups are always passive regardless of this list. |
 | `channels.imessage.url` | string | BlueBubbles server URL. Required to enable the iMessage channel. |
 | `channels.imessage.password` | string | BlueBubbles server password. |
 | `channels.imessage.webhookPort` | number | Port Tomo listens on for BlueBubbles webhooks. Default `3100`. |

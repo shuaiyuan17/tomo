@@ -139,6 +139,7 @@ const { mockConfig } = vi.hoisted(() => ({
     imessageWebhookPort: 3100,
     sessionModelOverrides: {} as Record<string, string>,
     channelAllowlists: {} as Record<string, string[]>,
+    passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
   },
 }));
@@ -159,6 +160,10 @@ vi.mock("../src/workspace/index.js", () => ({
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(({ prompt }: { prompt: AsyncGenerator }) => createMockQuery(prompt)),
+  createSdkMcpServer: vi.fn((opts: { name: string }) => ({ type: "sdk", name: opts.name, instance: {} })),
+  tool: vi.fn((name: string, description: string, inputSchema: unknown, handler: unknown) => ({
+    name, description, inputSchema, handler,
+  })),
 }));
 
 vi.mock("../src/logger.js", () => ({

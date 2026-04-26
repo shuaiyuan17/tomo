@@ -30,10 +30,16 @@ interface TomoConfig {
   sessionModelOverrides: Record<string, string>;
   /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
   channelAllowlists: Record<string, string[]>;
+  /** Per-channel "passive" group chatIds. Tomo sees every message in these
+   *  groups (no @mention required) and decides via NO_REPLY whether to respond.
+   *  iMessage groups are always passive regardless of this list. */
+  passiveGroups: Record<string, string[]>;
   /** Secret phrase to activate tomo in a group chat. Null = group chat disabled. */
   groupSecret: string | null;
   /** If true, inbound image attachments are also persisted to workspace/memory/incoming-images/. Default true. */
   saveInboundImages: boolean;
+  /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
+  maxTurns: number;
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -50,6 +56,16 @@ function parseAllowlists(channels: Record<string, Record<string, unknown>>): Rec
   for (const [name, ch] of Object.entries(channels)) {
     if (Array.isArray(ch.allowlist)) {
       result[name] = ch.allowlist.map(String);
+    }
+  }
+  return result;
+}
+
+function parsePassiveGroups(channels: Record<string, Record<string, unknown>>): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const [name, ch] of Object.entries(channels)) {
+    if (Array.isArray(ch.passiveGroups)) {
+      result[name] = ch.passiveGroups.map(String);
     }
   }
   return result;
@@ -117,8 +133,10 @@ function buildConfig(): TomoConfig {
     imessageWebhookPort,
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
     channelAllowlists: parseAllowlists(channels),
+    passiveGroups: parsePassiveGroups(channels),
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
+    maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
   };
 }
 

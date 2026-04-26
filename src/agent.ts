@@ -1,4 +1,4 @@
-import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage, type SDKMessage, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -7,8 +7,16 @@ import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
+import { createTomoInternalMcpServer, TOMO_INTERNAL_MCP_NAME } from "./mcp/internal-server.js";
 import { log } from "./logger.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+
+export type SendResult = { ok: true } | { ok: false; error: string };
+
+export interface SessionCatalog {
+  identities: Array<{ name: string }>;
+  groups: Array<{ key: string; title?: string; participants?: string[] }>;
+}
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -31,7 +39,45 @@ function extractMedia(text: string): { cleanText: string; mediaPaths: string[] }
   return { cleanText, mediaPaths };
 }
 
-function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: { sessionKey: string; sdkSessionId?: string }) {
+const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;
+
+async function skillsCanUseTool(
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
+  const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
+  if (filePath && filePath.startsWith(SKILLS_DIR)) {
+    return { behavior: "allow", updatedInput: input };
+  }
+  // Bash mkdir / touch / etc. — allow if command targets the skills dir.
+  if (toolName === "Bash" && typeof input.command === "string" && input.command.includes(SKILLS_DIR)) {
+    return { behavior: "allow", updatedInput: input };
+  }
+  return {
+    behavior: "deny",
+    message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
+  };
+}
+
+interface SessionContext {
+  sessionKey: string;
+  sdkSessionId?: string;
+  /** Group metadata snapshot — present only for group sessions. */
+  group?: {
+    chatTitle?: string;
+    participants?: string[];
+    /** True for iMessage groups (always) and Telegram groups in
+     *  config.passiveGroups. Drives the "stay silent unless useful" rule. */
+    isPassive: boolean;
+  };
+}
+
+function sdkOptions(
+  internalMcpServer: McpSdkServerConfigWithInstance,
+  resumeSessionId?: string,
+  model?: string,
+  sessionContext?: SessionContext,
+) {
   let systemPrompt = buildSystemPrompt();
 
   // Inject session context so the agent can use LCM tools
@@ -42,6 +88,21 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     ];
     if (sessionContext.sdkSessionId) {
       lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
+    }
+    if (sessionContext.group) {
+      const g = sessionContext.group;
+      lines.push("");
+      lines.push("## Group Chat Context");
+      if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
+      if (g.participants && g.participants.length > 0) {
+        lines.push(`- Known participants: ${g.participants.join(", ")} (more may join later — you'll see new senders prefixed in incoming messages)`);
+      }
+      lines.push("- Messages from each sender are prefixed with their name (e.g. `Alice: ...`).");
+      if (g.isPassive) {
+        lines.push("- **Listen mode: passive.** You see every message in this group; no @mention is required to address you. Reply only when you have something genuinely useful to add — reply `NO_REPLY` to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.");
+      } else {
+        lines.push("- **Listen mode: mention-required.** You only receive messages that explicitly tag you; respond as you would in a DM.");
+      }
     }
     systemPrompt += lines.join("\n");
   }
@@ -55,7 +116,10 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
     allowedTools: [
       "Read", "Write", "Edit", "Bash", "Glob", "Grep",
       "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite", "Skill",
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__send_message`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__list_sessions`,
     ],
+    mcpServers: { [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: ["project"] as ("project")[],
     settings: {
       attribution: {
@@ -63,8 +127,15 @@ function sdkOptions(resumeSessionId?: string, model?: string, sessionContext?: {
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
       },
     },
+    // bypassPermissions auto-approves most tools at step 3 of the permission
+    // flow, but writes to `.claude/`, `.git/`, etc. are protected and fall
+    // through to step 5 (canUseTool). We narrowly re-allow `.claude/skills/`
+    // here so tomo can manage its own skill library, while leaving every
+    // other protected path on its default (deny). See:
+    // https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes
+    canUseTool: skillsCanUseTool,
     includePartialMessages: true,
-    maxTurns: 30,
+    maxTurns: config.maxTurns,
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     // Note: SDK `env` fully replaces the child's env (not merged despite the
     // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -107,6 +178,9 @@ class LiveSession {
   private prevTotalCost = 0;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
+  // Maps tool_use_id → tool name so we can label tool_result log lines
+  // (the result event only carries the use id, not the original name).
+  private pendingToolNames = new Map<string, string>();
 
   constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string) {
     this.sessionKey = sessionKey;
@@ -156,8 +230,23 @@ class LiveSession {
         if ("text" in block) {
           this.parts.push(block.text);
         } else if ("type" in block && block.type === "tool_use") {
-          const tool = block as { name: string; input?: Record<string, unknown> };
+          const tool = block as { id?: string; name: string; input?: Record<string, unknown> };
+          if (tool.id && tool.name) this.pendingToolNames.set(tool.id, tool.name);
           log.info({ tool: tool.name }, summarizeToolInput(tool.name, tool.input));
+        }
+      }
+    }
+
+    if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
+      for (const block of event.message.content) {
+        if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
+          const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
+          const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
+          if (tr.tool_use_id) this.pendingToolNames.delete(tr.tool_use_id);
+          log.info(
+            { tool: name ?? "?", is_error: tr.is_error ?? false },
+            `result: ${summarizeToolResult(tr.content)}`,
+          );
         }
       }
     }
@@ -326,6 +415,28 @@ class LiveSession {
 
 // --- Agent ---
 
+function summarizeToolResult(content: unknown): string {
+  // Tool results arrive as either a string or an array of content blocks
+  // ({type:"text",text:"..."} | {type:"image",...} | etc.). We flatten to a
+  // short readable string for log lines — no need to be exhaustive.
+  if (content == null) return "(empty)";
+  if (typeof content === "string") return content.slice(0, 500);
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const b of content) {
+      if (b && typeof b === "object") {
+        if ("text" in b && typeof (b as { text: unknown }).text === "string") {
+          parts.push((b as { text: string }).text);
+        } else if ("type" in b) {
+          parts.push(`<${(b as { type: string }).type}>`);
+        }
+      }
+    }
+    return parts.join(" ").slice(0, 500);
+  }
+  return JSON.stringify(content).slice(0, 500);
+}
+
 function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
   if (!input) return name;
   switch (name) {
@@ -353,10 +464,16 @@ export class Agent {
   // Context-usage hysteresis: track whether we've nudged the agent to compact
   // for the current over-threshold episode. Reset when usage drops below LOW.
   private contextNudged = new Map<string, boolean>();
+  // Notes queued by sendToSession() — drained and prepended to the recipient's
+  // next user/cron/continuity turn so their Claude has context that a
+  // proactive message went out.
+  private pendingNotes = new Map<string, string[]>();
+  private readonly internalMcpServer: McpSdkServerConfigWithInstance;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
+    this.internalMcpServer = createTomoInternalMcpServer(this);
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -367,6 +484,31 @@ export class Agent {
   /** Look up a channel by name */
   private getChannel(name: string): Channel | undefined {
     return this.channels.find((ch) => ch.name === name);
+  }
+
+  /**
+   * Is this group a "passive listen" group? Tomo sees every message (no
+   * @mention required) and decides via NO_REPLY whether to respond.
+   * iMessage groups are always passive (the channel can't reliably detect
+   * mentions). Telegram (and others) opt in via config.passiveGroups.
+   */
+  private isPassiveListenGroup(channelName: string, chatId: string): boolean {
+    if (channelName === "imessage") return true;
+    return (config.passiveGroups[channelName] ?? []).includes(chatId);
+  }
+
+  /** Snapshot of group metadata for the system prompt — null for non-group sessions. */
+  private buildGroupContext(sessionKey: string): SessionContext["group"] {
+    if (!isGroupSessionKey(sessionKey)) return undefined;
+    const colonIdx = sessionKey.indexOf(":");
+    const channelName = colonIdx >= 0 ? sessionKey.slice(0, colonIdx) : "";
+    const chatId = colonIdx >= 0 ? sessionKey.slice(colonIdx + 1) : "";
+    const entry = this.sessions.getEntry(sessionKey);
+    return {
+      ...(entry?.chatTitle ? { chatTitle: entry.chatTitle } : {}),
+      ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+      isPassive: channelName ? this.isPassiveListenGroup(channelName, chatId) : false,
+    };
   }
 
   /** Activate a group chat by adding it to the channel's allowlist */
@@ -527,9 +669,10 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
-    const opts = sdkOptions(resumeId ?? undefined, model, {
+    const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
+      group: this.buildGroupContext(key),
     });
 
     session = new LiveSession(opts, key);
@@ -584,7 +727,7 @@ export class Agent {
     const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
 
     if (isGroup) {
-      await this.updateGroupContext(key, message.senderName, channel.name, message.chatTitle);
+      this.updateGroupContext(key, message.senderName, message.chatTitle);
     }
 
     this.sessions.append(key, {
@@ -595,17 +738,18 @@ export class Agent {
       timestamp: message.timestamp,
     });
 
-    if (isGroup && !isMentioned) {
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
+
+    if (isGroup && !isMentioned && !isPassiveGroup) {
       log.debug("Group message ignored (not mentioned)");
       return;
     }
 
-    // iMessage groups: skip typing indicator (most messages will be NO_REPLY)
-    const isImessageGroup = isGroup && channel.name === "imessage";
-    const stopTyping = isImessageGroup ? () => {} : replyChannel.startTyping(replyChatId);
+    // Passive groups: skip typing indicator (most messages will be NO_REPLY)
+    const stopTyping = isPassiveGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
-      const stampedText = this.injectTimestamp(textForAgent, channel.name);
+      const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
       const response = await this.runWithRetry(key, stampedText, (text) => {
@@ -669,8 +813,8 @@ export class Agent {
       stopTyping();
       log.error({ err }, "Error handling message");
 
-      // iMessage groups: suppress error messages to avoid polluting the chat
-      if (isImessageGroup) return;
+      // Passive groups: suppress error messages to avoid polluting the chat
+      if (isPassiveGroup) return;
 
       const detail = err instanceof Error ? err.message : String(err);
       await replyChannel.send({
@@ -754,35 +898,20 @@ export class Agent {
     }
   }
 
-  private async updateGroupContext(key: string, senderName: string, channelName: string, chatTitle?: string): Promise<void> {
+  /** Track participants and chat title for a group session. The actual rules
+   *  (passive listen, NO_REPLY guidance, participant snapshot) are now part of
+   *  the system prompt — see SessionContext.group in sdkOptions — so they
+   *  survive compaction. This stays as pure persistence + in-memory tracking;
+   *  no LLM injection. */
+  private updateGroupContext(key: string, senderName: string, chatTitle?: string): void {
     let participants = this.groupParticipants.get(key);
-    const isNew = !participants;
-
     if (!participants) {
       participants = new Set();
       this.groupParticipants.set(key, participants);
     }
-
-    const wasKnown = participants.has(senderName);
     participants.add(senderName);
-
-    if (isNew || !wasKnown) {
-      const names = [...participants].join(", ");
-      const title = chatTitle ? `"${chatTitle}"` : "a group chat";
-      let contextMsg = `System: You are in ${title}. Participants so far: ${names}. Messages are prefixed with sender names.`;
-
-      // iMessage groups: inject guidance to stay silent unless needed
-      if (isNew && channelName === "imessage") {
-        contextMsg += " This is an iMessage group chat. You see every message but should only reply when you have something genuinely useful to add. Reply NO_REPLY to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.";
-      }
-
-      try {
-        await this.runWithRetry(key, contextMsg);
-        log.info({ group: chatTitle, participants: names }, "Group context updated");
-      } catch (err) {
-        log.warn({ err }, "Failed to inject group context");
-      }
-    }
+    this.sessions.addParticipant(key, senderName);
+    if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
   }
 
   private injectTimestamp(text: string, channelName?: string): string {
@@ -845,7 +974,7 @@ export class Agent {
       deliveryChatId = chatId;
     }
 
-    const stampedMessage = this.injectTimestamp(message, deliveryChannel.name);
+    const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
     const stopTyping = deliveryChannel.startTyping(deliveryChatId);
@@ -901,7 +1030,7 @@ export class Agent {
 
   private async processContinuity(prompt: string, key: string): Promise<void> {
     try {
-      const response = await this.runWithRetry(key, prompt);
+      const response = await this.runWithRetry(key, this.drainPendingNotes(key) + prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
 
       // Send non-silent responses to the user (check includes() for multi-turn responses
@@ -958,6 +1087,136 @@ export class Agent {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Direct mode: post a verbatim message to a target session via Channel.send().
+   * No Claude query is invoked for the recipient — the message arrives as-is.
+   * A pending note is queued so the recipient's next Claude turn knows context.
+   */
+  async sendToSession(target: string, text: string): Promise<SendResult> {
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
+    }
+    const { sessionKey, replyTarget } = resolved;
+
+    const channel = this.getChannel(replyTarget.channelName);
+    if (!channel) {
+      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
+    }
+
+    await channel.send({ chatId: replyTarget.chatId, text });
+
+    this.sessions.append(sessionKey, {
+      role: "assistant",
+      content: `[proactive] ${text}`,
+      channel: replyTarget.channelName,
+      timestamp: Date.now(),
+    });
+
+    this.queuePendingNote(sessionKey, `[System: You proactively sent the following message to this conversation earlier (initiated from another session): "${text}"]`);
+
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Proactive message sent (direct)");
+    return { ok: true };
+  }
+
+  /**
+   * Delegate mode: queue a system request for the target session's Claude to
+   * compose and send a message in its own voice/context. Fire-and-forget — the
+   * caller's tool result returns as soon as the request is dispatched, not when
+   * the recipient's Claude finishes. The user observes the actual outcome in
+   * the recipient channel directly (since they're a participant).
+   *
+   * Note: delegate-to-self isn't blocked here. If it happens, the system
+   * request is just queued behind the current turn via enqueueForSession —
+   * one extra Claude turn fires, no infinite loop. For mid-loop self-progress
+   * updates, prefer direct mode (no extra turn).
+   */
+  async delegateToSession(target: string, request: string): Promise<SendResult> {
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
+    }
+    const { sessionKey, replyTarget } = resolved;
+
+    if (!this.getChannel(replyTarget.channelName)) {
+      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
+    }
+
+    const systemMsg = `[System: From your other conversation, you were asked to: ${request}. Use this conversation's context, tone, and participants to respond appropriately. Reply NO_REPLY if you judge it shouldn't be sent.]`;
+
+    // Fire-and-forget — handleCronMessage enqueues per session and runs through
+    // a normal Claude turn. The user verifies the outcome in the channel.
+    this.handleCronMessage(systemMsg, sessionKey).catch((err) => {
+      log.error({ err, sessionKey }, "Delegated send failed");
+    });
+
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: request.length }, "Proactive message dispatched (delegate)");
+    return { ok: true };
+  }
+
+  /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
+  private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
+    // Identity name (no colon) → dm:<name>
+    if (!target.includes(":")) {
+      const identity = config.identities.find((i) => i.name === target);
+      if (!identity) return undefined;
+      const sessionKey = `dm:${identity.name}`;
+      const replyTarget = this.router.getReplyTarget(sessionKey)
+        ?? this.router.deriveReplyTargetFromConfig(identity.name);
+      return replyTarget ? { sessionKey, replyTarget } : undefined;
+    }
+    // Session key form (dm:<name> or <channel>:<chatId>)
+    // Use parseRawChannelKey, NOT parseChannelKey — the latter rejects group
+    // chats by design (it's for sendNotification's "find any DM" fallback).
+    // Here the caller explicitly named a target; honor it even if it's a group.
+    const replyTarget = this.router.getReplyTarget(target)
+      ?? (target.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(target.slice(3)) : undefined)
+      ?? this.parseRawChannelKey(target);
+    return replyTarget ? { sessionKey: target, replyTarget } : undefined;
+  }
+
+  /** Parse a "<channel>:<chatId>" key into a ReplyTarget. Group-friendly; for
+   *  explicit-target paths only. Use parseChannelKey for notification fallbacks. */
+  private parseRawChannelKey(key: string): ReplyTarget | undefined {
+    if (key.startsWith("dm:")) return undefined;
+    const colonIdx = key.indexOf(":");
+    if (colonIdx < 0) return undefined;
+    const channelName = key.slice(0, colonIdx);
+    const chatId = key.slice(colonIdx + 1);
+    if (!channelName || !chatId) return undefined;
+    return { channelName, chatId };
+  }
+
+  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool. */
+  listSessionCatalog(): SessionCatalog {
+    const identities = config.identities.map((i) => ({ name: i.name }));
+    const groups: SessionCatalog["groups"] = [];
+    for (const [key] of this.sessions.listSdkSessionIds()) {
+      if (!isGroupSessionKey(key)) continue;
+      const entry = this.sessions.getEntry(key);
+      groups.push({
+        key,
+        ...(entry?.chatTitle ? { title: entry.chatTitle } : {}),
+        ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+      });
+    }
+    return { identities, groups };
+  }
+
+  private queuePendingNote(sessionKey: string, note: string): void {
+    const arr = this.pendingNotes.get(sessionKey) ?? [];
+    arr.push(note);
+    this.pendingNotes.set(sessionKey, arr);
+  }
+
+  /** Drain notes queued for this session (e.g. by sendToSession) and return them as a prefix. */
+  private drainPendingNotes(sessionKey: string): string {
+    const notes = this.pendingNotes.get(sessionKey);
+    if (!notes || notes.length === 0) return "";
+    this.pendingNotes.delete(sessionKey);
+    return notes.map((n) => `${n}\n\n`).join("");
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */

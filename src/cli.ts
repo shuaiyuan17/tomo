@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { cronCommand } from "./cli/cron.js";
 import { startCommand } from "./cli/start.js";
 import { initCommand } from "./cli/init.js";
@@ -12,10 +15,16 @@ import { uninstallCommand } from "./cli/uninstall.js";
 import { backupCommand } from "./cli/backup.js";
 import { updateCommand } from "./cli/update.js";
 
+// Read version at runtime from package.json (works in dev via tsx and after
+// build under dist/) so it can't drift from package.json on release bumps.
+const pkg = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
+) as { version: string };
+
 const program = new Command()
   .name("tomo")
   .description("Tomo — personal assistant powered by Claude")
-  .version("0.4.2");
+  .version(pkg.version);
 
 program.addCommand(initCommand);
 program.addCommand(configCommand);

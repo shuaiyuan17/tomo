@@ -13,7 +13,8 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
   "channels": {
     "telegram": {
       "token": "123456:ABC-DEF1234ghIkl-zyx57W2v...",
-      "allowlist": ["123456789"]
+      "allowlist": ["123456789"],
+      "passiveGroups": ["-1001234567"]
     },
     "imessage": {
       "url": "https://your-bluebubbles.example.com",
@@ -34,7 +35,8 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
   ],
   "sessionModelOverrides": {
     "dm:alice": "claude-opus-4-7"
-  }
+  },
+  "maxTurns": 50
 }
 ```
 
@@ -48,6 +50,7 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
 | `channels.telegram.token` | string | BotFather token (`123456:...`). Required to enable the Telegram channel. |
 | `channels.telegram.allowlist` | string[] | Telegram user IDs (as strings) permitted to DM the bot. Identity-bound chatIds are auto-allowed even if missing here. |
+| `channels.telegram.passiveGroups` | string[] | Telegram group chatIds (negative IDs as strings) where Tomo should listen to every message — no `@mention` required. Tomo decides via `NO_REPLY` whether to respond. iMessage groups are always passive regardless of this list. |
 | `channels.imessage.url` | string | BlueBubbles server URL. Required to enable the iMessage channel. |
 | `channels.imessage.password` | string | BlueBubbles server password. |
 | `channels.imessage.webhookPort` | number | Port Tomo listens on for BlueBubbles webhooks. Default `3100`. |
@@ -56,9 +59,10 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 | `identities[].channels` | object | `{ channelName: chatId }` — maps each channel the identity uses to its chatId. |
 | `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). |
+| `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
 
 ## Requirements and overrides
 
 - **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.url`. Startup fails otherwise.
-- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`.
+- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`.
 - `workspaceDir`, `sessionsDir`, `historyLimit` are env-only — they're not read from the JSON file.

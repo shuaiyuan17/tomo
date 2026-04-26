@@ -76,6 +76,24 @@ Every message includes a timestamp prefix like `[Mon 04/07 14:30 PDT]` so you al
 ### System messages
 Messages prefixed with `System:` are from the harness (cron triggers, group context), not from a human.
 
+### Group chats
+Two listen modes per group:
+
+- **Mention-required** (default for Telegram): you only receive messages that explicitly tag you. Respond as you would in a DM.
+- **Passive** (default for iMessage; opt-in for Telegram via `channels.telegram.passiveGroups: ["<chatId>"]` in config.json): you see every message in the group without `@mention`. Reply only when genuinely useful — `NO_REPLY` to stay silent on chatter, greetings, or messages not directed at you.
+
+The active mode plus group title and known participants are part of your per-session system prompt under `## Group Chat Context` whenever you're in a group session — survives compaction. Each incoming group message is prefixed with the sender name (`Alice: ...`) so you can attribute it.
+
+### Proactive messaging (MCP tools)
+Two in-process MCP tools let you message outside the current conversation:
+
+- `mcp__tomo-internal__list_sessions` — discover valid targets. Returns `{identities: [{name}], groups: [{key, title?, participants?}]}`. Group titles and participants populate as messages arrive in the group; an entry without them just hasn't seen activity since the schema landed.
+- `mcp__tomo-internal__send_message(target, message, mode?)` — send to a target. Two modes:
+  - `delegate` (default): describe the *intent* (e.g. "follow up with Alice about her recent trip"). The recipient session's Claude composes the actual message in its own voice/context. Best for social or contextual relays. Fire-and-forget.
+  - `direct`: send the verbatim text. Recipient is not triggered into a Claude turn. Best for factual broadcasts ("meeting moved to 3pm"), pasted content, or self-targeted mid-loop progress updates.
+
+Pass identity name (`"alice"`) or session key (`"telegram:-1001234567"`) as `target`. Call `list_sessions` first if unsure. Tool result lines (with `is_error` flag) appear in `tomo logs` immediately after the corresponding tool call.
+
 ## Skills
 
 ### Built-in skills (`tomo-*`)

@@ -1090,10 +1090,25 @@ export class Agent {
       return replyTarget ? { sessionKey, replyTarget } : undefined;
     }
     // Session key form (dm:<name> or <channel>:<chatId>)
+    // Use parseRawChannelKey, NOT parseChannelKey — the latter rejects group
+    // chats by design (it's for sendNotification's "find any DM" fallback).
+    // Here the caller explicitly named a target; honor it even if it's a group.
     const replyTarget = this.router.getReplyTarget(target)
       ?? (target.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(target.slice(3)) : undefined)
-      ?? this.parseChannelKey(target);
+      ?? this.parseRawChannelKey(target);
     return replyTarget ? { sessionKey: target, replyTarget } : undefined;
+  }
+
+  /** Parse a "<channel>:<chatId>" key into a ReplyTarget. Group-friendly; for
+   *  explicit-target paths only. Use parseChannelKey for notification fallbacks. */
+  private parseRawChannelKey(key: string): ReplyTarget | undefined {
+    if (key.startsWith("dm:")) return undefined;
+    const colonIdx = key.indexOf(":");
+    if (colonIdx < 0) return undefined;
+    const channelName = key.slice(0, colonIdx);
+    const chatId = key.slice(colonIdx + 1);
+    if (!channelName || !chatId) return undefined;
+    return { channelName, chatId };
   }
 
   /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool. */

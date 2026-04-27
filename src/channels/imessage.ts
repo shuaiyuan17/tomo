@@ -109,15 +109,22 @@ export class BlueBubblesChannel implements Channel {
   createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
     // iMessage can't edit sent messages — buffer and send on finish
     let buffer = "";
+    let canceled = false;
 
     return {
       update: (text: string) => {
+        if (canceled) return;
         buffer = text;
       },
       finish: async () => {
-        if (buffer) {
-          await this.send({ chatId, text: buffer });
-        }
+        if (canceled || !buffer) return;
+        await this.send({ chatId, text: buffer });
+      },
+      cancel: async () => {
+        // iMessage buffers until finish, so nothing has been sent yet —
+        // just mark canceled and drop the buffer.
+        canceled = true;
+        buffer = "";
       },
     };
   }

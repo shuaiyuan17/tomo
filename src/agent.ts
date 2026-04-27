@@ -579,14 +579,19 @@ export class Agent {
    * Queue messages per session key so they process sequentially. For DMs, also
    * coalesce: messages that pile up behind an in-flight turn are merged into a
    * single follow-up turn so the agent sees them together (e.g. "do X" → "wait"
-   * → "nevermind" all become one prompt). Groups bypass coalescing because
-   * mention-filtering and multi-sender semantics make merging risky.
+   * → "nevermind" all become one prompt). Passive groups (iMessage, opt-in
+   * Telegram) coalesce too — every message reaches Tomo there anyway, so
+   * batching just reduces turn count. Mention-required groups bypass
+   * coalescing because per-message mention filtering would be lost.
    */
   private enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const isGroup = message.isGroup ?? false;
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
 
-    if (isGroup) {
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
+    const canCoalesce = !isGroup || isPassiveGroup;
+
+    if (!canCoalesce) {
       return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
     }
@@ -605,7 +610,7 @@ export class Agent {
       } else {
         log.info(
           { sessionKey, count: items.length },
-          `Coalescing ${items.length} queued DM messages into one turn`,
+          `Coalescing ${items.length} queued messages into one turn`,
         );
         await this.handleBatchedMessages(items);
       }
@@ -865,8 +870,9 @@ export class Agent {
   }
 
   /**
-   * Process 2+ DM messages that piled up behind an in-flight turn as a single
-   * follow-up turn. Mirrors handleMessage but skips group-only logic.
+   * Process 2+ messages that piled up behind an in-flight turn as a single
+   * follow-up turn. Handles DMs and passive groups; mention-required groups
+   * never reach this path.
    */
   private async handleBatchedMessages(
     items: Array<{ channel: Channel; message: IncomingMessage }>,
@@ -874,9 +880,11 @@ export class Agent {
     const last = items[items.length - 1];
     const lastChannel = last.channel;
     const lastMessage = last.message;
+    const isGroup = lastMessage.isGroup ?? false;
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(lastChannel.name, lastMessage.chatId);
 
     log.info(
-      { channel: lastChannel.name, sender: lastMessage.senderName, count: items.length },
+      { channel: lastChannel.name, sender: lastMessage.senderName, count: items.length, group: isGroup || undefined },
       `batched: ${items.map((it) => JSON.stringify(it.message.text.slice(0, 40))).join(" | ")}`,
     );
 
@@ -888,30 +896,38 @@ export class Agent {
       return;
     }
 
-    const resolution = this.router.resolve(lastChannel.name, lastMessage.chatId, false);
+    const resolution = this.router.resolve(lastChannel.name, lastMessage.chatId, isGroup);
     const key = resolution.sessionKey;
     const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? lastChannel;
     const replyChatId = resolution.replyTarget.chatId;
 
     for (const { channel, message } of items) {
+      if (isGroup) this.updateGroupContext(key, message.senderName, message.chatTitle);
+      const transcriptText = isGroup ? `${message.senderName}: ${message.text}` : message.text;
       this.sessions.append(key, {
         role: "user",
-        content: message.text,
+        content: transcriptText,
         channel: channel.name,
         senderName: message.senderName,
         timestamp: message.timestamp,
       });
     }
 
-    const stopTyping = replyChannel.startTyping(replyChatId);
+    const stopTyping = isPassiveGroup ? () => {} : replyChannel.startTyping(replyChatId);
 
     try {
-      const numbered = items.map((it, i) => `${i + 1}. ${it.message.text}`).join("\n");
-      const combined = `[User sent ${items.length} messages in quick succession — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
+      const numbered = items.map((it, i) => {
+        const text = isGroup ? `${it.message.senderName}: ${it.message.text}` : it.message.text;
+        return `${i + 1}. ${text}`;
+      }).join("\n");
+      const subject = isGroup
+        ? `${items.length} messages arrived from this group in quick succession`
+        : `User sent ${items.length} messages in quick succession`;
+      const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
       const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(combined, lastChannel.name);
       const allImages = items.flatMap((it) => it.message.images ?? []);
 
-      const stream = replyChannel.createStreamingMessage(replyChatId);
+      const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? lastMessage.id : undefined);
       const response = await this.runWithRetry(
         key,
         stampedText,
@@ -975,6 +991,7 @@ export class Agent {
     } catch (err) {
       stopTyping();
       log.error({ err }, "Error handling batched messages");
+      if (isPassiveGroup) return;
       const detail = err instanceof Error ? err.message : String(err);
       await replyChannel.send({ chatId: replyChatId, text: `[error] ${detail}` });
     }

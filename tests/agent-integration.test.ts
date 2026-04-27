@@ -920,7 +920,7 @@ describe("message queueing", () => {
     await agent.stop();
   });
 
-  it("does not coalesce group messages", async () => {
+  it("does not coalesce mention-required groups", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -931,16 +931,44 @@ describe("message queueing", () => {
       return "reply";
     };
 
-    // Group chatId is negative for telegram; isMentioned=true so each one
-    // goes through (no NO_REPLY filtering needed for this test).
+    // Telegram groups are mention-required by default; coalescing would lose
+    // per-message mention filtering, so each mention runs as its own turn.
     const p1 = tg.simulateMessage(makeMsg({ chatId: "-100", text: "msg one", isGroup: true, isMentioned: true }));
     const p2 = tg.simulateMessage(makeMsg({ chatId: "-100", text: "msg two", isGroup: true, isMentioned: true }));
     await Promise.all([p1, p2]);
     await drainQueue(agent);
 
-    // Two separate turns — groups bypass the batch
     expect(turnTexts).toHaveLength(2);
     expect(turnTexts.some((t) => t.includes("quick succession"))).toBe(false);
+
+    await agent.stop();
+  });
+
+  it("coalesces passive group messages with sender prefixes", async () => {
+    const agent = new Agent();
+    // iMessage groups are always passive — every message reaches Tomo, so
+    // batching is safe and just reduces turn count.
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const turnTexts: string[] = [];
+    mockResponseFn = (text) => {
+      turnTexts.push(text);
+      return "reply";
+    };
+
+    const p1 = im.simulateMessage(makeMsg({ chatId: "g;+;abc", text: "hey tomo", senderName: "Alice", isGroup: true }));
+    const p2 = im.simulateMessage(makeMsg({ chatId: "g;+;abc", text: "what time is it", senderName: "Bob", isGroup: true }));
+    const p3 = im.simulateMessage(makeMsg({ chatId: "g;+;abc", text: "nvm google said 3pm", senderName: "Bob", isGroup: true }));
+    await Promise.all([p1, p2, p3]);
+    await drainQueue(agent);
+
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("messages arrived from this group");
+    expect(turnTexts[0]).toContain("Alice: hey tomo");
+    expect(turnTexts[0]).toContain("Bob: what time is it");
+    expect(turnTexts[0]).toContain("Bob: nvm google said 3pm");
+    expect(queryState.maxConcurrent).toBe(1);
 
     await agent.stop();
   });

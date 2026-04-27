@@ -13,6 +13,16 @@ export interface IdentityConfig {
   replyPolicy: string;               // "last-active" | channelName
 }
 
+export interface LcmConfig {
+  /** Context-usage % at which the harness nudges the agent to run `tomo lcm daily`. */
+  nudgeAtPct: number;
+  /** Context-usage % below which the "already nudged" flag resets (hysteresis). */
+  nudgeResetPct: number;
+  /** Compaction strategy for group sessions. "sdk" leaves SDK auto-compact on
+   *  (default); "lcm" disables it and runs the same hierarchical LCM nudges as DMs. */
+  groupCompactStyle: "sdk" | "lcm";
+}
+
 interface TomoConfig {
   telegramToken: string;
   model: string;
@@ -40,6 +50,23 @@ interface TomoConfig {
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
+  lcm: LcmConfig;
+}
+
+function parseLcmConfig(raw: unknown): LcmConfig {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const nudgeAt = Number(r.nudgeAtPct ?? 70);
+  const nudgeReset = Number(r.nudgeResetPct ?? 60);
+  const style = r.groupCompactStyle === "lcm" ? "lcm" : "sdk";
+
+  // Fall back to defaults on nonsense input (out of [1,100], or LOW >= HIGH).
+  const validHigh = Number.isFinite(nudgeAt) && nudgeAt > 0 && nudgeAt <= 100;
+  const validLow = Number.isFinite(nudgeReset) && nudgeReset >= 0 && nudgeReset < nudgeAt;
+  return {
+    nudgeAtPct: validHigh ? nudgeAt : 70,
+    nudgeResetPct: validHigh && validLow ? nudgeReset : (validHigh ? Math.max(0, nudgeAt - 10) : 60),
+    groupCompactStyle: style,
+  };
 }
 
 function loadConfigFile(): Record<string, unknown> {
@@ -137,6 +164,7 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
+    lcm: parseLcmConfig(file.lcm),
   };
 }
 

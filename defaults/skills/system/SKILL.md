@@ -29,7 +29,7 @@ Session stats show:
 
 **Note:** Context stats come from the SDK API and reflect the state at the end of the *previous* query. After compacting or other changes, you need to wait for a new query to complete before the numbers update.
 
-If context is above 80%, compaction will happen soon — the system will automatically summarize older messages to free space.
+When context crosses the nudge threshold (default 70%, set via `lcm.nudgeAtPct` in config.json), the harness sends a system message asking you to run `tomo lcm daily` — see the `tomo-lcm` skill. A second nudge at 80% asks you to use the `lcm compact` skill before the next user message. Group sessions default to SDK auto-compact instead (override with `lcm.groupCompactStyle: "lcm"`).
 
 ## Cron Jobs
 
@@ -156,7 +156,7 @@ tomo logs | grep Cron
 Jobs are checked every 30 seconds. Jobs created via CLI are picked up on the next tick.
 
 ### Context window full
-Check with `tomo sessions list`. If context is near 100%, the SDK auto-compacts. If stuck, `/new` starts a fresh session.
+Check with `tomo sessions list`. DM sessions and any group with `lcm.groupCompactStyle: "lcm"` rely on the harness nudging you to run `tomo lcm daily` / the `lcm compact` skill — SDK auto-compact is off for them. Other groups fall back to SDK auto-compact near 100%. If stuck, `/new` starts a fresh session.
 
 ### Memory not loading
 Memory is read from `~/.tomo/workspace/memory/MEMORY.md` at the start of every query. Check the file exists and has content:

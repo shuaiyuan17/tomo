@@ -36,7 +36,12 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
   "sessionModelOverrides": {
     "dm:alice": "claude-opus-4-7"
   },
-  "maxTurns": 50
+  "maxTurns": 50,
+  "lcm": {
+    "nudgeAtPct": 70,
+    "nudgeResetPct": 60,
+    "groupCompactStyle": "sdk"
+  }
 }
 ```
 
@@ -60,6 +65,9 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 | `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). |
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
+| `lcm.nudgeAtPct` | number | Context-usage % at which the harness nudges the agent to run `tomo lcm daily`. Default `70`. Lower = compact earlier and more often. |
+| `lcm.nudgeResetPct` | number | Hysteresis reset threshold — the "already nudged" flag clears once usage drops below this %. Default `60`. Must be less than `nudgeAtPct`; invalid values fall back to defaults. |
+| `lcm.groupCompactStyle` | string | `"sdk"` (default) or `"lcm"`. `"sdk"` lets the SDK auto-compact group sessions; `"lcm"` opts groups into the same hierarchical LCM flow as DMs (disables SDK auto-compact and fires the daily/80% nudges). DMs always use LCM regardless. |
 
 ## Requirements and overrides
 

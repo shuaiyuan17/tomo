@@ -31,28 +31,25 @@ function commandFor(p: DuePromotion): string {
   return `tomo lcm ${p.level} --session-id <SESSION_ID> ${flag} ${p.period} --summary "..."`;
 }
 
-function nudgeText(dues: DuePromotion[], sdkSessionId: string): string {
+function nudgeText(p: DuePromotion, sdkSessionId: string): string {
+  const flag = p.level === "daily" ? "--date" :
+               p.level === "weekly" ? "--week" :
+               p.level === "monthly" ? "--month" : "--year";
+  const childLabel = p.level === "daily" ? "raw events" : "child blocks";
   const lines = [
-    "System: LCM rollups are due. The following completed periods have un-promoted children — please consolidate them in order (oldest first):",
+    `System: An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
+    "The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:",
+    `  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`,
+    "",
+    "Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.",
+    "Token budget per block:",
+    "  - daily: ≤ 1500 tokens (texture-curate, not texture-collect — pick 1-2 texture pieces worth keeping; let the rest stay in raw events)",
+    "  - weekly / monthly / yearly: ~500-1000 tokens (compress harder at each level)",
+    "If a period genuinely has more irreducible texture than fits, exceed the budget and flag it in the summary.",
+    "",
+    "Note: this is the only rollup nudge for this tick. If other periods are also due, the next heartbeat (~1h) will pick up the next one. Don't chain multiple compacts in a single turn — running two `tomo lcm` calls back-to-back can race the SDK's in-memory state and orphan the chain.",
   ];
-  for (const p of dues) {
-    lines.push(`  - ${p.level} ${p.period} (${p.childCount} ${p.level === "daily" ? "raw events" : "child blocks"})`);
-  }
-  lines.push("");
-  lines.push("The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:");
-  for (const p of dues) {
-    const flag = p.level === "daily" ? "--date" :
-                 p.level === "weekly" ? "--week" :
-                 p.level === "monthly" ? "--month" : "--year";
-    lines.push(`  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`);
-  }
-  lines.push("");
-  lines.push("Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.");
-  lines.push("Token budget per block:");
-  lines.push("  - daily: ≤ 1500 tokens (texture-curate, not texture-collect — pick 1-2 texture pieces worth keeping; let the rest stay in raw events)");
-  lines.push("  - weekly / monthly / yearly: ~500-1000 tokens (compress harder at each level)");
-  lines.push("If a period genuinely has more irreducible texture than fits, exceed the budget and flag it in the summary.");
   void commandFor; // keep reference for potential future use
   return lines.join("\n");
 }
@@ -100,15 +97,34 @@ export class RollupRunner {
         });
         if (fresh.length === 0) continue;
 
-        log.info({ sessionKey, due: fresh.map((p) => `${p.level} ${p.period}`) }, "Rollup nudge");
-        await this.agent.handleCronMessage(nudgeText(fresh, sdkSessionId), sessionKey);
+        // Emit ONE nudge per tick (per session). Stuffing multiple due levels
+        // into a single system message lets the LLM run them all in one turn,
+        // and back-to-back compacts mid-turn race the SDK's in-memory state
+        // (orphaning the parent chain). Order by level (daily before weekly
+        // before monthly before yearly) and within a level oldest period
+        // first; the next heartbeat will pick up whatever's still due.
+        fresh.sort((a, b) =>
+          LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level] ||
+          a.period.localeCompare(b.period),
+        );
+        const next = fresh[0];
 
-        for (const p of fresh) {
-          this.lastNudged.set(`${sessionKey}:${p.level}:${p.period}`, now);
-        }
+        log.info(
+          { sessionKey, picking: `${next.level} ${next.period}`, deferred: fresh.length - 1 },
+          "Rollup nudge (one level/tick)",
+        );
+        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId), sessionKey);
+        this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
       } catch (err) {
         log.warn({ err, sessionKey }, "Rollup check failed");
       }
     }
   }
 }
+
+const LEVEL_ORDER: Record<DuePromotion["level"], number> = {
+  daily: 0,
+  weekly: 1,
+  monthly: 2,
+  yearly: 3,
+};

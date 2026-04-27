@@ -48,7 +48,11 @@ function nudgeText(dues: DuePromotion[], sdkSessionId: string): string {
     lines.push(`  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`);
   }
   lines.push("");
-  lines.push("Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction. ~500-1000 tokens per block.");
+  lines.push("Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.");
+  lines.push("Token budget per block:");
+  lines.push("  - daily: ≤ 1500 tokens (texture-curate, not texture-collect — pick 1-2 texture pieces worth keeping; let the rest stay in raw events)");
+  lines.push("  - weekly / monthly / yearly: ~500-1000 tokens (compress harder at each level)");
+  lines.push("If a period genuinely has more irreducible texture than fits, exceed the budget and flag it in the summary.");
   void commandFor; // keep reference for potential future use
   return lines.join("\n");
 }

@@ -141,6 +141,11 @@ const { mockConfig } = vi.hoisted(() => ({
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
+    lcm: {
+      nudgeAtPct: 70,
+      nudgeResetPct: 60,
+      groupCompactStyle: "sdk" as "sdk" | "lcm",
+    },
   },
 }));
 

@@ -21,8 +21,17 @@ export interface SessionCatalog {
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
 // DISABLE_AUTO_COMPACT env var — we don't want the SDK to collapse our
-// rollup structure behind our back. Group sessions skip the custom LCM
-// entirely and rely on SDK auto-compact, so we leave it enabled there.
+// rollup structure behind our back. Group sessions default to SDK auto-compact
+// (config.lcm.groupCompactStyle="sdk"); set it to "lcm" to opt groups into the
+// same hierarchical LCM flow as DMs.
+
+/** True when the session uses our custom LCM compaction (DMs always; groups only
+ *  if config.lcm.groupCompactStyle="lcm"). When false, SDK auto-compact is in
+ *  charge and the harness skips its compaction nudges. */
+function usesLcmCompact(sessionKey: string): boolean {
+  if (!isGroupSessionKey(sessionKey)) return true;
+  return config.lcm.groupCompactStyle === "lcm";
+}
 
 function isSilentReply(text: string): boolean {
   return /^\s*NO_REPLY\s*$/i.test(text);
@@ -140,7 +149,7 @@ function sdkOptions(
     // Note: SDK `env` fully replaces the child's env (not merged despite the
     // d.ts claim), so we must spread process.env ourselves — otherwise the
     // child CLI spawns with an empty env and fails to locate its runtime.
-    ...(sessionContext && !isGroupSessionKey(sessionContext.sessionKey)
+    ...(sessionContext && usesLcmCompact(sessionContext.sessionKey)
       ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
       : {}),
   };
@@ -758,10 +767,10 @@ export class Agent {
       stopTyping();
 
       // If context is high, send a system nudge so the agent can compact.
-      // Skip for group sessions — they use SDK auto-compact, not the lcm skill.
+      // Skip when the session uses SDK auto-compact (groups, unless opted in).
       const liveSession = this.liveSessions.get(key);
       const ctx = liveSession?.lastResult;
-      if (ctx && ctx.contextMax > 0 && !isGroupSessionKey(key)) {
+      if (ctx && ctx.contextMax > 0 && usesLcmCompact(key)) {
         const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
         if (pct >= 80) {
           this.runWithRetry(key, `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.`).catch(() => {});
@@ -850,10 +859,10 @@ export class Agent {
       // Context-usage hysteresis: nudge agent to run `tomo lcm daily` when
       // context usage crosses the high-water mark; reset when it drops back
       // below the low-water mark (a successful compact knocks it well under).
-      // Skip for group sessions — they use SDK default compact.
-      if (sid && !isGroupSessionKey(key)) {
-        const HIGH = 0.70; // nudge at or above 70% of window
-        const LOW = 0.60;  // reset nudged flag below 60%
+      // Skip when the session uses SDK auto-compact (groups, unless opted in).
+      if (sid && usesLcmCompact(key)) {
+        const HIGH = config.lcm.nudgeAtPct / 100;
+        const LOW = config.lcm.nudgeResetPct / 100;
         const ctxUsed = session.lastResult?.contextUsed ?? 0;
         const ctxMax = session.lastResult?.contextMax ?? 0;
         const usedFrac = ctxMax > 0 ? ctxUsed / ctxMax : 0;

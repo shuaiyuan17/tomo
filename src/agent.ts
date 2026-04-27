@@ -824,6 +824,7 @@ export class Agent {
 
       if (isSilentReply(response)) {
         log.info("Silent reply (no message sent)");
+        await stream.cancel();
         return;
       }
 

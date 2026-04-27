@@ -214,11 +214,14 @@ class MockChannel implements Channel {
 
   createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
     let text = "";
+    let canceled = false;
     return {
-      update: (t: string) => { text = t; },
+      update: (t: string) => { if (!canceled) text = t; },
       finish: async () => {
-        if (text) this.delivered.push({ chatId, text });
+        if (canceled || !text) return;
+        this.delivered.push({ chatId, text });
       },
+      cancel: async () => { canceled = true; text = ""; },
     };
   }
 

@@ -194,16 +194,26 @@ export class TelegramChannel implements Channel {
 
   createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
     const EDIT_INTERVAL_MS = 1500;
+    // Suppress flushing while the buffer looks like it might resolve to a
+    // bare NO_REPLY. Once content grows past this prefix or diverges, we know
+    // it's a real reply and proceed normally.
+    const NO_REPLY_PREFIX_RE = /^\s*(N(O(_(R(E(P(L(Y)?)?)?)?)?)?)?)?\s*$/i;
     let messageId: number | null = null;
     let buffer = "";
     let lastSent = "";
     let editTimer: ReturnType<typeof setInterval> | null = null;
     let finished = false;
+    let canceled = false;
     let flushPending: Promise<void> = Promise.resolve();
 
     const flush = () => {
       flushPending = flushPending.then(async () => {
+        if (canceled) return;
         if (buffer === lastSent || !buffer) return;
+        // Don't send while the buffer might still resolve to a NO_REPLY token —
+        // the agent uses NO_REPLY to suppress delivery, and Telegram's
+        // first-frame send would race ahead and surface it before suppression.
+        if (NO_REPLY_PREFIX_RE.test(buffer)) return;
         const text = buffer;
         lastSent = text;
 
@@ -226,9 +236,11 @@ export class TelegramChannel implements Channel {
 
     return {
       update: (text: string) => {
+        if (canceled) return;
         buffer = text;
         if (!editTimer && !finished) {
-          // First chunk — send immediately
+          // First chunk — try to send immediately (flush will suppress
+          // if buffer still looks like a NO_REPLY prefix).
           flush();
           editTimer = setInterval(flush, EDIT_INTERVAL_MS);
         }
@@ -237,6 +249,19 @@ export class TelegramChannel implements Channel {
         finished = true;
         if (editTimer) clearInterval(editTimer);
         await flush();
+      },
+      cancel: async () => {
+        canceled = true;
+        if (editTimer) clearInterval(editTimer);
+        // Wait for any in-flight flush so we know whether messageId got set.
+        await flushPending;
+        if (messageId !== null) {
+          try {
+            await this.bot.api.deleteMessage(chatId, messageId);
+          } catch {
+            // Best-effort — message may already be gone or too old to delete.
+          }
+        }
       },
     };
   }

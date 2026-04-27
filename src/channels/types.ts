@@ -42,6 +42,12 @@ export interface StreamingMessage {
   update(text: string): void;
   /** Finalize the message (flush remaining content) */
   finish(): Promise<void>;
+  /**
+   * Cancel the streaming message. If a message has already been sent
+   * (e.g. via Telegram's incremental edit flow), it is deleted. Implementations
+   * that buffer until finish (e.g. iMessage) can no-op.
+   */
+  cancel(): Promise<void>;
 }
 
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;

@@ -855,27 +855,171 @@ describe("chat commands", () => {
 // ===== Message queueing =====
 
 describe("message queueing", () => {
-  it("serializes concurrent messages to the same session", async () => {
+  it("coalesces concurrent DM messages into one turn", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    const order: number[] = [];
-    let seq = 0;
-    mockResponseFn = () => {
-      order.push(++seq);
-      return `reply-${seq}`;
+    const turnTexts: string[] = [];
+    mockResponseFn = (text) => {
+      turnTexts.push(text);
+      return `reply-${turnTexts.length}`;
     };
 
-    // Fire two messages concurrently to same chatId
+    // Fire two messages concurrently — both land in the batch before the
+    // first task gets to run, so they coalesce into a single SDK turn.
     const p1 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "First" }));
     const p2 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "Second" }));
     await Promise.all([p1, p2]);
     await drainQueue(agent);
 
-    expect(tg.delivered).toHaveLength(2);
-    // Messages should process in order (queue serialization)
-    expect(order).toEqual([1, 2]);
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("First");
+    expect(turnTexts[0]).toContain("Second");
+    expect(turnTexts[0]).toContain("User sent 2 messages in quick succession");
+    expect(tg.delivered).toHaveLength(1);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("coalesces DMs that arrive while a turn is in flight", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const turnTexts: string[] = [];
+    let release: (() => void) | null = null;
+    const firstTurnGate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      turnTexts.push(text);
+      if (turnTexts.length === 1) await firstTurnGate;
+      return `reply-${turnTexts.length}`;
+    };
+
+    // Turn 1 starts and blocks
+    const p1 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "help me to xyz" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("help me to xyz");
+    expect(turnTexts[0]).not.toContain("quick succession");
+
+    // Two more messages pile up behind it
+    const p2 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "wait" }));
+    const p3 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "actually nevermind" }));
+
+    // Release turn 1; turns 2+3 should fire as a single coalesced turn
+    release!();
+    await Promise.all([p1, p2, p3]);
+    await drainQueue(agent);
+
+    expect(turnTexts).toHaveLength(2);
+    expect(turnTexts[1]).toContain("User sent 2 messages in quick succession");
+    expect(turnTexts[1]).toContain("wait");
+    expect(turnTexts[1]).toContain("actually nevermind");
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("does not coalesce mention-required groups", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const turnTexts: string[] = [];
+    mockResponseFn = (text) => {
+      turnTexts.push(text);
+      return "reply";
+    };
+
+    // Telegram groups are mention-required by default; coalescing would lose
+    // per-message mention filtering, so each mention runs as its own turn.
+    const p1 = tg.simulateMessage(makeMsg({ chatId: "-100", text: "msg one", isGroup: true, isMentioned: true }));
+    const p2 = tg.simulateMessage(makeMsg({ chatId: "-100", text: "msg two", isGroup: true, isMentioned: true }));
+    await Promise.all([p1, p2]);
+    await drainQueue(agent);
+
+    expect(turnTexts).toHaveLength(2);
+    expect(turnTexts.some((t) => t.includes("quick succession"))).toBe(false);
+
+    await agent.stop();
+  });
+
+  it("regression: channel-side serialization does not block coalescing", async () => {
+    // Models the grammy / iMessage pattern where a channel processes updates
+    // sequentially, awaiting each handler before the next webhook is read.
+    // Before the fix, awaiting enqueueMessage's returned promise would block
+    // the next message until the SDK turn fully completed — defeating the
+    // queue and preventing any pile-up. enqueueMessage is now fire-and-forget,
+    // so a serial channel loop can still feed messages into the batch.
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const turnTexts: string[] = [];
+    let release: (() => void) | null = null;
+    const firstTurnGate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      turnTexts.push(text);
+      if (turnTexts.length === 1) await firstTurnGate;
+      return `reply-${turnTexts.length}`;
+    };
+
+    // Serial channel-side dispatch: await each handler before the next.
+    // With the bug, msg2/msg3 would never be queued until msg1's SDK done.
+    const channelLoop = (async () => {
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg one" }));
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg two" }));
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg three" }));
+    })();
+
+    await new Promise((r) => setTimeout(r, 30));
+    // Turn 1 in flight; msg2 + msg3 should already be queued (not blocked
+    // behind the SDK call).
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("msg one");
+
+    release!();
+    await channelLoop;
+    await drainQueue(agent);
+
+    // msg2 + msg3 coalesce into one turn
+    expect(turnTexts).toHaveLength(2);
+    expect(turnTexts[1]).toContain("quick succession");
+    expect(turnTexts[1]).toContain("msg two");
+    expect(turnTexts[1]).toContain("msg three");
+
+    await agent.stop();
+  });
+
+  it("coalesces passive group messages with sender prefixes", async () => {
+    const agent = new Agent();
+    // iMessage groups are always passive — every message reaches Tomo, so
+    // batching is safe and just reduces turn count.
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const turnTexts: string[] = [];
+    mockResponseFn = (text) => {
+      turnTexts.push(text);
+      return "reply";
+    };
+
+    const p1 = im.simulateMessage(makeMsg({ chatId: "g;+;abc", text: "hey tomo", senderName: "Alice", isGroup: true }));
+    const p2 = im.simulateMessage(makeMsg({ chatId: "g;+;abc", text: "what time is it", senderName: "Bob", isGroup: true }));
+    const p3 = im.simulateMessage(makeMsg({ chatId: "g;+;abc", text: "nvm google said 3pm", senderName: "Bob", isGroup: true }));
+    await Promise.all([p1, p2, p3]);
+    await drainQueue(agent);
+
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("messages arrived from this group");
+    expect(turnTexts[0]).toContain("Alice: hey tomo");
+    expect(turnTexts[0]).toContain("Bob: what time is it");
+    expect(turnTexts[0]).toContain("Bob: nvm google said 3pm");
+    expect(queryState.maxConcurrent).toBe(1);
 
     await agent.stop();
   });

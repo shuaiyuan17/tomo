@@ -467,6 +467,10 @@ export class Agent {
   private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
   private messageQueues = new Map<string, Promise<void>>();
+  // DM messages that arrived while a turn was in flight, waiting to be
+  // coalesced into one user turn. Keyed by sessionKey. Drained by the next
+  // queued task; later tasks find nothing and no-op.
+  private pendingBatches = new Map<string, Array<{ channel: Channel; message: IncomingMessage }>>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
@@ -571,14 +575,52 @@ export class Agent {
     return result;
   }
 
-  /** Queue messages per session key so they process sequentially */
-  private enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+  /**
+   * Queue messages per session key so they process sequentially. For DMs, also
+   * coalesce: messages that pile up behind an in-flight turn are merged into a
+   * single follow-up turn so the agent sees them together (e.g. "do X" → "wait"
+   * → "nevermind" all become one prompt). Passive groups (iMessage, opt-in
+   * Telegram) coalesce too — every message reaches Tomo there anyway, so
+   * batching just reduces turn count. Mention-required groups bypass
+   * coalescing because per-message mention filtering would be lost.
+   */
+  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const isGroup = message.isGroup ?? false;
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
-    return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
-      .catch((err) => {
-        log.error({ err, sessionKey }, "Unhandled error in message queue");
-      });
+
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
+    const canCoalesce = !isGroup || isPassiveGroup;
+
+    // Fire-and-forget: the returned promise resolves as soon as the message is
+    // queued, NOT when the SDK turn completes. If a caller (e.g. a channel
+    // adapter) awaits this, that's fine — they don't block the next ingress
+    // on an in-flight turn, which is what lets rapid messages pile up for the
+    // queue to coalesce.
+    if (!canCoalesce) {
+      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
+        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      return;
+    }
+
+    const batch = this.pendingBatches.get(sessionKey) ?? [];
+    batch.push({ channel, message });
+    this.pendingBatches.set(sessionKey, batch);
+
+    this.enqueueForSession(sessionKey, async () => {
+      const items = this.pendingBatches.get(sessionKey);
+      if (!items || items.length === 0) return;
+      this.pendingBatches.delete(sessionKey);
+
+      if (items.length === 1) {
+        await this.handleMessage(items[0].channel, items[0].message);
+      } else {
+        log.info(
+          { sessionKey, count: items.length },
+          `Coalescing ${items.length} queued messages into one turn`,
+        );
+        await this.handleBatchedMessages(items);
+      }
+    }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
@@ -831,6 +873,135 @@ export class Agent {
         chatId: replyChatId,
         text: `[error] ${detail}`,
       });
+    }
+  }
+
+  /**
+   * Process 2+ messages that piled up behind an in-flight turn as a single
+   * follow-up turn. Handles DMs and passive groups; mention-required groups
+   * never reach this path.
+   */
+  private async handleBatchedMessages(
+    items: Array<{ channel: Channel; message: IncomingMessage }>,
+  ): Promise<void> {
+    const last = items[items.length - 1];
+    const lastChannel = last.channel;
+    const lastMessage = last.message;
+    const isGroup = lastMessage.isGroup ?? false;
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(lastChannel.name, lastMessage.chatId);
+
+    log.info(
+      { channel: lastChannel.name, sender: lastMessage.senderName, count: items.length, group: isGroup || undefined },
+      `batched: ${items.map((it) => JSON.stringify(it.message.text.slice(0, 40))).join(" | ")}`,
+    );
+
+    if (!this.router.isAllowed(lastChannel.name, lastMessage.chatId)) {
+      log.debug(
+        { channel: lastChannel.name, chatId: lastMessage.chatId },
+        "Batched messages blocked (not in allowlist)",
+      );
+      return;
+    }
+
+    const resolution = this.router.resolve(lastChannel.name, lastMessage.chatId, isGroup);
+    const key = resolution.sessionKey;
+    const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? lastChannel;
+    const replyChatId = resolution.replyTarget.chatId;
+
+    for (const { channel, message } of items) {
+      if (isGroup) this.updateGroupContext(key, message.senderName, message.chatTitle);
+      const transcriptText = isGroup ? `${message.senderName}: ${message.text}` : message.text;
+      this.sessions.append(key, {
+        role: "user",
+        content: transcriptText,
+        channel: channel.name,
+        senderName: message.senderName,
+        timestamp: message.timestamp,
+      });
+    }
+
+    const stopTyping = isPassiveGroup ? () => {} : replyChannel.startTyping(replyChatId);
+
+    try {
+      const numbered = items.map((it, i) => {
+        const text = isGroup ? `${it.message.senderName}: ${it.message.text}` : it.message.text;
+        return `${i + 1}. ${text}`;
+      }).join("\n");
+      const subject = isGroup
+        ? `${items.length} messages arrived from this group in quick succession`
+        : `User sent ${items.length} messages in quick succession`;
+      const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
+      const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(combined, lastChannel.name);
+      const allImages = items.flatMap((it) => it.message.images ?? []);
+
+      const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? lastMessage.id : undefined);
+      const response = await this.runWithRetry(
+        key,
+        stampedText,
+        (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
+        allImages.length > 0 ? allImages : undefined,
+      );
+      stopTyping();
+
+      const liveSession = this.liveSessions.get(key);
+      const ctx = liveSession?.lastResult;
+      if (ctx && ctx.contextMax > 0 && usesLcmCompact(key)) {
+        const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
+        if (pct >= 80) {
+          this.runWithRetry(
+            key,
+            `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.`,
+          ).catch(() => {});
+        }
+      }
+
+      this.sessions.append(key, {
+        role: "assistant",
+        content: response,
+        channel: replyChannel.name,
+        timestamp: Date.now(),
+      });
+
+      log.info({ channel: replyChannel.name }, "Tomo: %s", response);
+
+      if (isSilentReply(response)) {
+        log.info("Silent reply (no message sent)");
+        await stream.cancel();
+        return;
+      }
+
+      if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
+        await stream.finish();
+        await replyChannel.send({ chatId: replyChatId, text: `[error] ${response}` });
+        return;
+      }
+
+      const { cleanText, mediaPaths } = extractMedia(response);
+
+      if (mediaPaths.length > 0) {
+        const { existsSync: fileExists } = await import("node:fs");
+        const validPaths = mediaPaths.filter((p) => fileExists(p));
+        if (validPaths.length > 0) {
+          for (let i = 0; i < validPaths.length; i++) {
+            await replyChannel.send({
+              chatId: replyChatId,
+              photo: validPaths[i],
+              text: i === 0 ? cleanText : "",
+            });
+          }
+        } else {
+          stream.update(cleanText);
+          await stream.finish();
+        }
+      } else {
+        await stream.finish();
+      }
+    } catch (err) {
+      stopTyping();
+      log.error({ err }, "Error handling batched messages");
+      if (isPassiveGroup) return;
+      const detail = err instanceof Error ? err.message : String(err);
+      await replyChannel.send({ chatId: replyChatId, text: `[error] ${detail}` });
     }
   }
 

@@ -584,23 +584,29 @@ export class Agent {
    * batching just reduces turn count. Mention-required groups bypass
    * coalescing because per-message mention filtering would be lost.
    */
-  private enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const isGroup = message.isGroup ?? false;
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
     const canCoalesce = !isGroup || isPassiveGroup;
 
+    // Fire-and-forget: the returned promise resolves as soon as the message is
+    // queued, NOT when the SDK turn completes. If a caller (e.g. a channel
+    // adapter) awaits this, that's fine — they don't block the next ingress
+    // on an in-flight turn, which is what lets rapid messages pile up for the
+    // queue to coalesce.
     if (!canCoalesce) {
-      return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
+      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      return;
     }
 
     const batch = this.pendingBatches.get(sessionKey) ?? [];
     batch.push({ channel, message });
     this.pendingBatches.set(sessionKey, batch);
 
-    return this.enqueueForSession(sessionKey, async () => {
+    this.enqueueForSession(sessionKey, async () => {
       const items = this.pendingBatches.get(sessionKey);
       if (!items || items.length === 0) return;
       this.pendingBatches.delete(sessionKey);

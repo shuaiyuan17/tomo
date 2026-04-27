@@ -947,6 +947,54 @@ describe("message queueing", () => {
     await agent.stop();
   });
 
+  it("regression: channel-side serialization does not block coalescing", async () => {
+    // Models the grammy / iMessage pattern where a channel processes updates
+    // sequentially, awaiting each handler before the next webhook is read.
+    // Before the fix, awaiting enqueueMessage's returned promise would block
+    // the next message until the SDK turn fully completed — defeating the
+    // queue and preventing any pile-up. enqueueMessage is now fire-and-forget,
+    // so a serial channel loop can still feed messages into the batch.
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const turnTexts: string[] = [];
+    let release: (() => void) | null = null;
+    const firstTurnGate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      turnTexts.push(text);
+      if (turnTexts.length === 1) await firstTurnGate;
+      return `reply-${turnTexts.length}`;
+    };
+
+    // Serial channel-side dispatch: await each handler before the next.
+    // With the bug, msg2/msg3 would never be queued until msg1's SDK done.
+    const channelLoop = (async () => {
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg one" }));
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg two" }));
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg three" }));
+    })();
+
+    await new Promise((r) => setTimeout(r, 30));
+    // Turn 1 in flight; msg2 + msg3 should already be queued (not blocked
+    // behind the SDK call).
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("msg one");
+
+    release!();
+    await channelLoop;
+    await drainQueue(agent);
+
+    // msg2 + msg3 coalesce into one turn
+    expect(turnTexts).toHaveLength(2);
+    expect(turnTexts[1]).toContain("quick succession");
+    expect(turnTexts[1]).toContain("msg two");
+    expect(turnTexts[1]).toContain("msg three");
+
+    await agent.stop();
+  });
+
   it("coalesces passive group messages with sender prefixes", async () => {
     const agent = new Agent();
     // iMessage groups are always passive — every message reaches Tomo, so

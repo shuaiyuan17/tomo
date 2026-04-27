@@ -44,7 +44,7 @@ export class TelegramChannel implements Channel {
       const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
       const isMentioned = this.checkMentioned(ctx);
 
-      await this.dispatch({
+      this.dispatch({
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
@@ -64,7 +64,7 @@ export class TelegramChannel implements Channel {
       const largest = photos[photos.length - 1];
       const image = await this.downloadPhoto(largest.file_id, String(ctx.chat.id));
 
-      await this.dispatch({
+      this.dispatch({
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
@@ -140,9 +140,12 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  private async dispatch(msg: IncomingMessage): Promise<void> {
+  private dispatch(msg: IncomingMessage): void {
+    // Fire-and-forget: the agent's per-session queue handles ordering.
+    // Awaiting here would let grammy serialize updates against the SDK turn,
+    // preventing rapid messages from piling up for the queue to coalesce.
     for (const handler of this.handlers) {
-      await handler(msg);
+      handler(msg).catch((err) => log.error({ err }, "Telegram message handler failed"));
     }
   }
 

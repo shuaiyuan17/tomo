@@ -293,8 +293,11 @@ export class BlueBubblesChannel implements Channel {
       chatTitle: (chat.displayName as string) ?? undefined,
     };
 
+    // Fire-and-forget: the agent's per-session queue handles ordering.
+    // Awaiting here would prevent rapid messages from piling up for
+    // coalescing.
     for (const handler of this.handlers) {
-      await handler(message);
+      handler(message).catch((err) => log.error({ err }, "iMessage handler failed"));
     }
   }
 

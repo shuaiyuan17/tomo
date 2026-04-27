@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2 (2026-04-27)
+
+### Bug fixes
+
+- **LCM rollup runner emits one nudge per tick** (#70). Previously stuffed every due promotion into a single `System:` message, which the LLM ran as back-to-back `tomo lcm` Bash calls in one turn — and back-to-back compacts mid-turn race the SDK's in-memory state, orphaning the parent chain. Now sorts due promotions by level (daily → weekly → monthly → yearly) then period (oldest first) and emits only the head; the next heartbeat picks up the next one. Trade-off: backlog drains over multiple ticks instead of all at once. `nudgeText` made singular and explicitly warns against chaining multiple compacts in a single turn.
+
 ## 0.5.1 (2026-04-26)
 
 ### Features

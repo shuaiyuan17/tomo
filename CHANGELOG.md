@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 (2026-04-26)
+
+### Features
+
+- **Coalesce queued messages into one turn** (#67). When multiple DMs (or messages in a passive group) arrive while a turn is in flight, they merge into a single follow-up SDK turn instead of firing one turn per message. Lets the agent see `"do X"` → `"wait"` → `"actually nevermind"` together and skip wasted work on retracted requests. Mention-required groups bypass coalescing because per-message mention filtering would be lost. Passive group batches use sender-prefixed lines (`Alice: ...` / `Bob: ...`) plus a header noting the messages came from a group. Each user message still appends individually to the on-disk transcript; only the SDK prompt is merged.
+
+### Bug fixes
+
+- **Telegram NO_REPLY no longer leaks via the streaming first frame** (#66). The streaming placeholder was sent before the model finished, so a NO_REPLY response left an empty/partial message in the chat. `StreamingMessage` now exposes `cancel()`, called in the NO_REPLY path (and the new batched path) after the SDK turn completes — cancels the placeholder before any visible content lands.
+- **Channel ingress was serializing against the SDK turn** (#67). grammy's `bot.on(...)` awaits its handler body before reading the next update, and the iMessage dispatch did the same — both then awaited `enqueueMessage`'s task-completion promise, so the channel layer waited a full SDK turn before delivering the next message. Result: messages never piled up in the queue, and the new coalescing was effectively dead in production. Three layers of fix (defense-in-depth): `telegram.ts` and `imessage.ts` dispatch fire handlers without awaiting; `agent.enqueueMessage` returns once queued, not when the turn completes. Regression test models the serial channel-loop pattern.
+
 ## 0.5.0 (2026-04-26)
 
 ### Features

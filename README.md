@@ -59,6 +59,7 @@ tomo sessions clear    # Reset all sessions
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
 | `/model` | Switch model (sonnet/opus/haiku) |
+| `/status` | Show session info (model, channel, message count) |
 
 ## Features
 
@@ -83,7 +84,7 @@ File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` ind
 - **Telegram** — DM and group chat support
   - Typing indicators with keepalive and error backoff
   - Image/photo support (sends to Claude as vision input)
-  - Group chat: only responds when @mentioned or replied to, tracks participants
+  - Group chat: defaults to mention-required (only responds when @mentioned or replied to); per-group passive listen mode opt-in via `channels.telegram.passiveGroups`
   - Markdown rendering with plain-text fallback
 - **iMessage** — via [BlueBubbles](https://bluebubbles.app)
   - DM and group chat support
@@ -112,6 +113,10 @@ Tomo has access to Claude's built-in tools:
 | WebSearch, WebFetch | Web access |
 | Agent | Subagents for complex tasks |
 | Skill | Specialized workflows |
+| TodoWrite | Task tracking within a turn |
+| NotebookEdit | Edit Jupyter notebooks |
+| `send_message` (MCP) | Proactively send a message to another session/identity |
+| `list_sessions` (MCP) | List active identities and group sessions |
 
 ### Scheduled Tasks
 
@@ -157,7 +162,11 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
 ```json
 {
   "channels": {
-    "telegram": { "token": "your-bot-token", "allowlist": ["123456789"] },
+    "telegram": {
+      "token": "your-bot-token",
+      "allowlist": ["123456789"],
+      "passiveGroups": ["-1001234567890"]
+    },
     "imessage": { "url": "http://localhost:1234", "password": "...", "allowlist": ["+15551234567"] }
   },
   "identities": [
@@ -168,7 +177,14 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     }
   ],
   "model": "claude-sonnet-4-6",
-  "groupSecret": "tomo-xxxxxxxx"
+  "maxTurns": 50,
+  "saveInboundImages": true,
+  "groupSecret": "tomo-xxxxxxxx",
+  "lcm": {
+    "nudgeAtPct": 70,
+    "nudgeResetPct": 60,
+    "groupCompactStyle": "sdk"
+  }
 }
 ```
 
@@ -180,6 +196,7 @@ Environment variables override config file values:
 | `IMESSAGE_URL` | Override BlueBubbles URL |
 | `CLAUDE_MODEL` | Override model |
 | `TOMO_WORKSPACE` | Override workspace directory |
+| `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
 
 ## Development

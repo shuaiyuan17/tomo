@@ -467,6 +467,10 @@ export class Agent {
   private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
   private messageQueues = new Map<string, Promise<void>>();
+  // DM messages that arrived while a turn was in flight, waiting to be
+  // coalesced into one user turn. Keyed by sessionKey. Drained by the next
+  // queued task; later tasks find nothing and no-op.
+  private pendingBatches = new Map<string, Array<{ channel: Channel; message: IncomingMessage }>>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
@@ -571,14 +575,41 @@ export class Agent {
     return result;
   }
 
-  /** Queue messages per session key so they process sequentially */
+  /**
+   * Queue messages per session key so they process sequentially. For DMs, also
+   * coalesce: messages that pile up behind an in-flight turn are merged into a
+   * single follow-up turn so the agent sees them together (e.g. "do X" → "wait"
+   * → "nevermind" all become one prompt). Groups bypass coalescing because
+   * mention-filtering and multi-sender semantics make merging risky.
+   */
   private enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const isGroup = message.isGroup ?? false;
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
-    return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
-      .catch((err) => {
-        log.error({ err, sessionKey }, "Unhandled error in message queue");
-      });
+
+    if (isGroup) {
+      return this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
+        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+    }
+
+    const batch = this.pendingBatches.get(sessionKey) ?? [];
+    batch.push({ channel, message });
+    this.pendingBatches.set(sessionKey, batch);
+
+    return this.enqueueForSession(sessionKey, async () => {
+      const items = this.pendingBatches.get(sessionKey);
+      if (!items || items.length === 0) return;
+      this.pendingBatches.delete(sessionKey);
+
+      if (items.length === 1) {
+        await this.handleMessage(items[0].channel, items[0].message);
+      } else {
+        log.info(
+          { sessionKey, count: items.length },
+          `Coalescing ${items.length} queued DM messages into one turn`,
+        );
+        await this.handleBatchedMessages(items);
+      }
+    }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
   }
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
@@ -830,6 +861,122 @@ export class Agent {
         chatId: replyChatId,
         text: `[error] ${detail}`,
       });
+    }
+  }
+
+  /**
+   * Process 2+ DM messages that piled up behind an in-flight turn as a single
+   * follow-up turn. Mirrors handleMessage but skips group-only logic.
+   */
+  private async handleBatchedMessages(
+    items: Array<{ channel: Channel; message: IncomingMessage }>,
+  ): Promise<void> {
+    const last = items[items.length - 1];
+    const lastChannel = last.channel;
+    const lastMessage = last.message;
+
+    log.info(
+      { channel: lastChannel.name, sender: lastMessage.senderName, count: items.length },
+      `batched: ${items.map((it) => JSON.stringify(it.message.text.slice(0, 40))).join(" | ")}`,
+    );
+
+    if (!this.router.isAllowed(lastChannel.name, lastMessage.chatId)) {
+      log.debug(
+        { channel: lastChannel.name, chatId: lastMessage.chatId },
+        "Batched messages blocked (not in allowlist)",
+      );
+      return;
+    }
+
+    const resolution = this.router.resolve(lastChannel.name, lastMessage.chatId, false);
+    const key = resolution.sessionKey;
+    const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? lastChannel;
+    const replyChatId = resolution.replyTarget.chatId;
+
+    for (const { channel, message } of items) {
+      this.sessions.append(key, {
+        role: "user",
+        content: message.text,
+        channel: channel.name,
+        senderName: message.senderName,
+        timestamp: message.timestamp,
+      });
+    }
+
+    const stopTyping = replyChannel.startTyping(replyChatId);
+
+    try {
+      const numbered = items.map((it, i) => `${i + 1}. ${it.message.text}`).join("\n");
+      const combined = `[User sent ${items.length} messages in quick succession — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
+      const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(combined, lastChannel.name);
+      const allImages = items.flatMap((it) => it.message.images ?? []);
+
+      const stream = replyChannel.createStreamingMessage(replyChatId);
+      const response = await this.runWithRetry(
+        key,
+        stampedText,
+        (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
+        allImages.length > 0 ? allImages : undefined,
+      );
+      stopTyping();
+
+      const liveSession = this.liveSessions.get(key);
+      const ctx = liveSession?.lastResult;
+      if (ctx && ctx.contextMax > 0 && usesLcmCompact(key)) {
+        const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
+        if (pct >= 80) {
+          this.runWithRetry(
+            key,
+            `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.`,
+          ).catch(() => {});
+        }
+      }
+
+      this.sessions.append(key, {
+        role: "assistant",
+        content: response,
+        channel: replyChannel.name,
+        timestamp: Date.now(),
+      });
+
+      log.info({ channel: replyChannel.name }, "Tomo: %s", response);
+
+      if (isSilentReply(response)) {
+        log.info("Silent reply (no message sent)");
+        return;
+      }
+
+      if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
+        await stream.finish();
+        await replyChannel.send({ chatId: replyChatId, text: `[error] ${response}` });
+        return;
+      }
+
+      const { cleanText, mediaPaths } = extractMedia(response);
+
+      if (mediaPaths.length > 0) {
+        const { existsSync: fileExists } = await import("node:fs");
+        const validPaths = mediaPaths.filter((p) => fileExists(p));
+        if (validPaths.length > 0) {
+          for (let i = 0; i < validPaths.length; i++) {
+            await replyChannel.send({
+              chatId: replyChatId,
+              photo: validPaths[i],
+              text: i === 0 ? cleanText : "",
+            });
+          }
+        } else {
+          stream.update(cleanText);
+          await stream.finish();
+        }
+      } else {
+        await stream.finish();
+      }
+    } catch (err) {
+      stopTyping();
+      log.error({ err }, "Error handling batched messages");
+      const detail = err instanceof Error ? err.message : String(err);
+      await replyChannel.send({ chatId: replyChatId, text: `[error] ${detail}` });
     }
   }
 

@@ -113,6 +113,61 @@ describe("CronStore", () => {
     expect(store.get(job.id)).toBeUndefined();
   });
 
+  it("defaults deleteAfterRun=true for 'at' schedules when not specified", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "at-default",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "tomorrow",
+      sessionKey: "dm:alice",
+      // deleteAfterRun intentionally omitted
+    });
+    expect(job.deleteAfterRun).toBe(true);
+  });
+
+  it("defaults deleteAfterRun=false for recurring schedules when not specified", () => {
+    const store = new CronStore(TEST_PATH);
+    const cronJob = store.add({
+      name: "daily",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "morning",
+      sessionKey: "dm:alice",
+    });
+    expect(cronJob.deleteAfterRun).toBe(false);
+
+    const everyJob = store.add({
+      name: "tick",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    expect(everyJob.deleteAfterRun).toBe(false);
+  });
+
+  it("respects explicit deleteAfterRun override on 'at' schedules", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "at-keep",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "keep me",
+      sessionKey: "dm:alice",
+      deleteAfterRun: false,
+    });
+    expect(job.deleteAfterRun).toBe(false);
+  });
+
+  it("respects explicit deleteAfterRun=true on recurring schedules", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "fire-once-then-die",
+      schedule: { kind: "cron", expr: "0 19 1 5 *" },
+      message: "may 1 only this year",
+      sessionKey: "dm:alice",
+      deleteAfterRun: true,
+    });
+    expect(job.deleteAfterRun).toBe(true);
+  });
+
   it("rewrites sessionKey in bulk", () => {
     const store = new CronStore(TEST_PATH);
     store.add({

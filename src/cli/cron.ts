@@ -81,7 +81,8 @@ cronCommand
       process.exit(1);
     }
     console.log(`Would trigger: [${job.id}] ${job.name}`);
-    console.log(`Message: ${job.message}`);
+    console.log(`  Type:    ${job.deleteAfterRun ? "one-shot (auto-deletes after run)" : "recurring"}`);
+    console.log(`  Message: ${job.message}`);
     console.log("(Use 'tomo start' to run jobs — this just previews)");
   });
 

@@ -68,7 +68,7 @@ tomo cron remove <id>
 
 ## Behavior
 
-- One-shot jobs (`in X`) auto-delete after running
+- One-shot jobs auto-delete after running. This covers all `at` schedules: `in X`, ISO dates (`2026-05-01T19:00`), and any cron expression created with `--once`.
 - When a job triggers, you receive `[Scheduled task "name"] message` — execute it naturally
 - Don't ask for confirmation when creating jobs unless the request is ambiguous
 - After creating, confirm what you set up with the job ID and next run time

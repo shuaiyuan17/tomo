@@ -1340,4 +1340,48 @@ describe("per-block streaming delivery", () => {
 
     await agent.stop();
   });
+
+  it("regression: a throwing commitBlock does not kill the live session", async () => {
+    // onBlockComplete fires inside the SDK event loop. If commitBlock throws
+    // (e.g. transient BlueBubbles HTTP error), the error must not propagate
+    // into LiveSession.consumeEvents — that would mark the session dead and
+    // trip runWithRetry's "session error" branch, double-firing the turn.
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+
+    // Override commitBlock to throw on the first call only. The test verifies
+    // the turn still resolves cleanly, the response is captured, and the
+    // session isn't restarted (would manifest as queryState.maxConcurrent > 1
+    // or duplicate deliveries).
+    let firstCall = true;
+    const origCreate = im.createStreamingMessage.bind(im);
+    im.createStreamingMessage = (chatId: string, replyTo?: string) => {
+      const stream = origCreate(chatId, replyTo);
+      const realCommit = stream.commitBlock.bind(stream);
+      stream.commitBlock = async () => {
+        if (firstCall) {
+          firstCall = false;
+          throw new Error("transient BlueBubbles HTTP error");
+        }
+        return realCommit();
+      };
+      return stream;
+    };
+    agent.addChannel(im);
+
+    mockResponseFn = () => ["block-a", "block-b"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    // Block A's commit threw → no delivery for A. Block B succeeds.
+    // (We don't assert on A specifically — just that the turn didn't double-fire.)
+    expect(queryState.maxConcurrent).toBe(1);
+    // Exactly one block delivered (block-b). Block-a was lost to the thrown
+    // commitBlock, but the run completed instead of restarting.
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("block-b");
+
+    await agent.stop();
+  });
 });

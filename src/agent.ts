@@ -367,6 +367,29 @@ export class Agent {
   }
 
   /**
+   * Build the per-block handler passed to the live session. The handler runs
+   * inside the SDK event loop (`live-session.handleEvent`); any error it
+   * throws would propagate up and kill the session mid-turn — which then
+   * trips `runWithRetry`'s "session error" branch and double-fires the whole
+   * turn. So channel-side delivery errors are caught + logged here and never
+   * leave this boundary.
+   */
+  private makeBlockHandler(
+    channel: Channel,
+    chatId: string,
+    stream: StreamingMessage,
+  ): (text: string) => Promise<void> {
+    return async (blockText: string) => {
+      try {
+        await stream.commitBlock();
+        await this.shipBlockMedia(channel, chatId, blockText);
+      } catch (err) {
+        log.warn({ err, channel: channel.name }, "Block delivery failed");
+      }
+    };
+  }
+
+  /**
    * If the live session's last turn pushed context past 80%, fire a one-shot
    * compact nudge (fire-and-forget). Skips when SDK auto-compact owns this
    * session. Shared by handleMessage and handleBatchedMessages.
@@ -438,16 +461,12 @@ export class Agent {
       const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
-      const onBlockComplete = async (blockText: string) => {
-        await stream.commitBlock();
-        await this.shipBlockMedia(replyChannel, replyChatId, blockText);
-      };
       const response = await this.runWithRetry(
         key,
         stampedText,
         (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
         message.images,
-        onBlockComplete,
+        this.makeBlockHandler(replyChannel, replyChatId, stream),
       );
       stopTyping();
 
@@ -535,16 +554,12 @@ export class Agent {
       const allImages = items.flatMap((it) => it.message.images ?? []);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? lastMessage.id : undefined);
-      const onBlockComplete = async (blockText: string) => {
-        await stream.commitBlock();
-        await this.shipBlockMedia(replyChannel, replyChatId, blockText);
-      };
       const response = await this.runWithRetry(
         key,
         stampedText,
         (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
         allImages.length > 0 ? allImages : undefined,
-        onBlockComplete,
+        this.makeBlockHandler(replyChannel, replyChatId, stream),
       );
       stopTyping();
 

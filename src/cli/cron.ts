@@ -13,19 +13,23 @@ cronCommand
   .requiredOption("--schedule <schedule>", 'Schedule: "in 20m", "every 1h", "0 9 * * *"')
   .requiredOption("--message <message>", "Message to send when triggered")
   .requiredOption("--session <key>", "Session key to deliver to (see 'Session key' in the agent system prompt)")
-  .option("--once", "Delete after successful run", false)
+  .option("--once", "Delete after successful run (default: true for one-time 'at' schedules, false for recurring)")
   .action((opts) => {
     const schedule = parseScheduleString(opts.schedule);
+    // Pass opts.once through as-is (undefined when not provided). The store
+    // defaults deleteAfterRun=true for "at" schedules, false otherwise — so
+    // one-time schedules ("in 20m", "2026-05-01", etc.) auto-clean after firing.
     const job = store.add({
       name: opts.name,
       schedule,
       message: opts.message,
       sessionKey: opts.session,
-      deleteAfterRun: opts.once ?? (schedule.kind === "at"),
+      deleteAfterRun: opts.once,
     });
     console.log(`Created job ${job.id}: "${job.name}"`);
     console.log(`  Schedule: ${formatSchedule(job.schedule)}`);
     console.log(`  Session:  ${job.sessionKey}`);
+    console.log(`  Type:     ${job.deleteAfterRun ? "one-shot (auto-deletes after run)" : "recurring"}`);
     console.log(`  Next run: ${job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "never"}`);
   });
 
@@ -40,11 +44,12 @@ cronCommand
     }
     for (const job of jobs) {
       const status = job.enabled ? "enabled" : "disabled";
+      const lifecycle = job.deleteAfterRun ? "once" : "recurring";
       const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—";
       const last = job.lastRunAt
         ? `${new Date(job.lastRunAt).toLocaleString()} (${job.lastStatus})`
         : "never";
-      console.log(`[${job.id}] ${job.name} (${status})`);
+      console.log(`[${job.id}] ${job.name} (${status}, ${lifecycle})`);
       console.log(`  Schedule: ${formatSchedule(job.schedule)}`);
       console.log(`  Message:  ${job.message}`);
       console.log(`  Session:  ${job.sessionKey}`);
@@ -76,7 +81,8 @@ cronCommand
       process.exit(1);
     }
     console.log(`Would trigger: [${job.id}] ${job.name}`);
-    console.log(`Message: ${job.message}`);
+    console.log(`  Type:    ${job.deleteAfterRun ? "one-shot (auto-deletes after run)" : "recurring"}`);
+    console.log(`  Message: ${job.message}`);
     console.log("(Use 'tomo start' to run jobs — this just previews)");
   });
 

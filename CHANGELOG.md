@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.3 (2026-04-28)
+
+### Bug fixes
+
+- **`tomo cron add` honours the `at`-default for `deleteAfterRun`**. The `--once` Commander option carried a `false` default, so `opts.once ?? (schedule.kind === "at")` always resolved to `false` and one-time `at` schedules were created with `deleteAfterRun=false`. The store layer's default already does the right thing for one-time schedules; the fix is to drop the CLI default so `opts.once` stays `undefined` when the flag isn't passed and the store's fallback can fire. Observed live: a one-time visa-interview reminder created via `--schedule "at 2026-04-27T09:00"` fired correctly but lingered as a `disabled` zombie in `cron list` instead of cleaning itself up.
+
+### UX
+
+- **`tomo cron list` and `cron add` surface lifecycle**. Each row now reads `(<enabled|disabled>, <once|recurring>)` and the `add` confirmation prints a `Type:` line. The previous output gave no in-CLI signal that a cron expression like `0 19 1 5 *` was about to silently re-fire every May 1 — operators had to grep `~/.tomo/data/cron/jobs.json` for `deleteAfterRun` to audit one-shot intent vs. behaviour. The `tomo-cron` skill doc gains a "one-shot trap with cron expressions" section recommending ISO-date and `in Xd` schedules over date-pinned cron expressions for single-fire reminders.
+
 ## 0.5.2 (2026-04-27)
 
 ### Bug fixes

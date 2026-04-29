@@ -34,14 +34,25 @@ If in doubt, use the current session's key — that's the safest default.
 | Format | Type | Example |
 |--------|------|---------|
 | `in Xm`, `in Xh`, `in Xd` | One-shot (auto-deletes) | `in 30m`, `in 2h` |
+| ISO date `YYYY-MM-DD[THH:MM]` | One-shot (auto-deletes) | `2026-05-01T19:00` |
 | `every Xm`, `every Xh` | Recurring interval | `every 30m`, `every 6h` |
-| Cron expression | Recurring (5-field) | `0 9 * * *` (daily 9am) |
+| 5-field cron expression | Recurring | `0 9 * * *` (daily 9am) |
 
 Common cron patterns:
 - `0 9 * * *` — daily at 9am
 - `0 9 * * 1-5` — weekdays at 9am
 - `0 */2 * * *` — every 2 hours
 - `30 8 * * 1` — Mondays at 8:30am
+
+### One-shot trap with cron expressions
+
+A cron expression like `0 19 1 5 *` reads as **every May 1 at 7pm forever** — not "this May 1 only". If you want a single fire on a specific date, use one of:
+
+- **ISO date schedule (preferred)**: `--schedule "2026-05-01T19:00"` — auto-cleans after firing
+- **`in Xd` relative**: `--schedule "in 3d"` — auto-cleans after firing
+- **Cron expression with `--once`**: `--schedule "0 19 1 5 *" --once` — fires once then deletes
+
+Without `--once`, a cron expression with a specific day-of-month + month will silently re-fire every year. The CLI surfaces the `Type` line on creation (`one-shot` vs `recurring`) — read it before moving on.
 
 ## List all jobs
 
@@ -57,7 +68,7 @@ tomo cron remove <id>
 
 ## Behavior
 
-- One-shot jobs (`in X`) auto-delete after running
+- One-shot jobs auto-delete after running. This covers all `at` schedules: `in X`, ISO dates (`2026-05-01T19:00`), and any cron expression created with `--once`.
 - When a job triggers, you receive `[Scheduled task "name"] message` — execute it naturally
 - Don't ask for confirmation when creating jobs unless the request is ambiguous
 - After creating, confirm what you set up with the job ID and next run time

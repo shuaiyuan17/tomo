@@ -155,7 +155,7 @@ export class TelegramChannel implements Channel {
       sticker.isAnimated ? "animated=true" : undefined,
       sticker.isVideo ? "video=true" : undefined,
     ].filter(Boolean);
-    return `[Sent a Telegram sticker: ${parts.join(", ")}. To send this sticker, use STICKER:${sticker.fileId}; to send any sticker, use STICKER:<file_id>.]`;
+    return `[Sent a Telegram sticker: ${parts.join(", ")}; resend=STICKER:${sticker.fileId}]`;
   }
 
   private async downloadPhoto(fileId: string, chatId?: string): Promise<ImageAttachment | undefined> {
@@ -389,7 +389,15 @@ export class TelegramChannel implements Channel {
       question: "\u{1F914}",
     } satisfies Record<MessageReaction, ReactionTypeEmoji["emoji"]>;
     const reactions = remove ? [] : [{ type: "emoji" as const, emoji: emojiByReaction[reaction] }];
-    await this.bot.api.setMessageReaction(chatId, Number(messageId), reactions satisfies ReactionType[]);
+    try {
+      await this.bot.api.setMessageReaction(chatId, Number(messageId), reactions satisfies ReactionType[]);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      if (/REACTION_INVALID/i.test(detail)) {
+        throw new Error("Telegram rejected that reaction; this chat may not allow it");
+      }
+      throw err;
+    }
   }
 
   async start(): Promise<void> {

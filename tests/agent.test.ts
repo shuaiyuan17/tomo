@@ -56,13 +56,14 @@ describe("injectTimestamp", () => {
 });
 
 // Test MEDIA extraction (extracted logic from agent.ts)
-const MEDIA_RE = /\bMEDIA:\s*"?([^\n"]+)"?/gi;
-const STICKER_RE = /\bSTICKER:\s*"?([^\s\n"]+)"?/gi;
+const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
+const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
+const ATTACHMENT_TAG_RE = /\bMEDIA:\s*(?:"[^"\n]+"|[^\s\n"]+)|\bSTICKER:\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
 
 function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
   const mediaPaths: string[] = [];
-  const cleanText = text.replace(MEDIA_RE, (_match, path) => {
-    mediaPaths.push(path.trim());
+  const cleanText = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
+    mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
     return "";
   }).trim();
   return { cleanText, mediaPaths };
@@ -71,12 +72,12 @@ function extractMedia(text: string): { cleanText: string; mediaPaths: string[] }
 function extractAttachments(text: string): { cleanText: string; mediaPaths: string[]; stickerIds: string[] } {
   const mediaPaths: string[] = [];
   const stickerIds: string[] = [];
-  const withoutMedia = text.replace(MEDIA_RE, (_match, path) => {
-    mediaPaths.push(path.trim());
+  const withoutMedia = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
+    mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
     return "";
   });
-  const cleanText = withoutMedia.replace(STICKER_RE, (_match, stickerId) => {
-    stickerIds.push(stickerId.trim());
+  const cleanText = withoutMedia.replace(STICKER_RE, (_match, quotedId, unquotedId) => {
+    stickerIds.push(String(quotedId ?? unquotedId).trim());
     return "";
   }).trim();
   return { cleanText, mediaPaths, stickerIds };
@@ -133,6 +134,11 @@ describe("extractAttachments", () => {
     expect(cleanText).toBe("Look");
     expect(mediaPaths).toEqual(["/tmp/a.png"]);
     expect(stickerIds).toEqual(["CAAC-123"]);
+  });
+
+  it("strips only the sticker tag from streamed text", () => {
+    const streamed = "here is STICKER:CAAC123 and more text".replace(ATTACHMENT_TAG_RE, "").trim();
+    expect(streamed).toBe("here is  and more text");
   });
 });
 

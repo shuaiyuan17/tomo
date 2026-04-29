@@ -1056,6 +1056,8 @@ export class Agent {
   }
 
   private recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {
+    // Incoming channels are expected to provide provider message ids; keep the
+    // guard defensive so synthetic/test messages cannot poison reaction state.
     if (!message.id) return;
     this.latestInboundMessages.set(sessionKey, {
       channelName: channel.name,

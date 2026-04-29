@@ -153,7 +153,7 @@ To send a Telegram sticker by file_id, include:
 STICKER:<telegram_file_id>
 \`\`\`
 
-The harness strips the STICKER tag from visible text and sends the sticker to Telegram. Only use sticker file_ids you have seen or been given.
+The harness strips the STICKER tag from visible text and sends the sticker on Telegram. Other channels ignore sticker sends. Only use sticker file_ids you have seen or been given.
 
 ## Chat Formatting
 

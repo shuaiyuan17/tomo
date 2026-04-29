@@ -90,13 +90,13 @@ function describeSticker(sticker: {
     sticker.isAnimated ? "animated=true" : undefined,
     sticker.isVideo ? "video=true" : undefined,
   ].filter(Boolean);
-  return `[Sent a Telegram sticker: ${parts.join(", ")}. To send this sticker, use STICKER:${sticker.fileId}; to send any sticker, use STICKER:<file_id>.]`;
+  return `[Sent a Telegram sticker: ${parts.join(", ")}; resend=STICKER:${sticker.fileId}]`;
 }
 
 describe("describeSticker", () => {
   it("includes file_id and resend instruction", () => {
     expect(describeSticker({ fileId: "CAAC123" })).toBe(
-      "[Sent a Telegram sticker: file_id=CAAC123. To send this sticker, use STICKER:CAAC123; to send any sticker, use STICKER:<file_id>.]",
+      "[Sent a Telegram sticker: file_id=CAAC123; resend=STICKER:CAAC123]",
     );
   });
 
@@ -109,7 +109,7 @@ describe("describeSticker", () => {
       isAnimated: true,
       isVideo: false,
     })).toBe(
-      "[Sent a Telegram sticker: file_id=CAAC456, emoji=😂, set=funny_pack, type=regular, animated=true. To send this sticker, use STICKER:CAAC456; to send any sticker, use STICKER:<file_id>.]",
+      "[Sent a Telegram sticker: file_id=CAAC456, emoji=😂, set=funny_pack, type=regular, animated=true; resend=STICKER:CAAC456]",
     );
   });
 });

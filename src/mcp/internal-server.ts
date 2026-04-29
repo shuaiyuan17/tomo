@@ -94,6 +94,81 @@ export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWit
           searchHint: "send proactive message delegate direct identity group session",
         },
       ),
+      tool(
+        "rename_group_chat",
+        [
+          "Rename a real group chat in Telegram or iMessage/BlueBubbles.",
+          "",
+          "Use only when the user explicitly asks to change the group chat title. This mutates the actual chat title visible to participants.",
+          "",
+          "Target must be a group session key from `list_sessions` (for example `telegram:-1001234567` or `imessage:iMessage;+;chat...`). Do not pass identity names or DM sessions.",
+          "",
+          "Telegram requires the bot to be an admin with permission to change chat info. BlueBubbles requires the Private API/helper to be enabled.",
+        ].join("\n"),
+        {
+          target: z.string().describe(
+            "Group session key from list_sessions, e.g. `telegram:-1001234567` or `imessage:iMessage;+;chat...`.",
+          ),
+          title: z.string().min(1).max(128).describe(
+            "New group chat title. Telegram accepts 1-128 characters; iMessage/BlueBubbles also requires a non-empty displayName.",
+          ),
+        },
+        async ({ target, title }) => {
+          const result = await agent.renameGroupChat(target, title);
+
+          if (result.ok) {
+            return {
+              content: [{ type: "text" as const, text: "OK. Group chat title renamed." }],
+            };
+          }
+          return {
+            content: [{ type: "text" as const, text: `rename_group_chat failed: ${result.error}` }],
+            isError: true,
+          };
+        },
+        {
+          searchHint: "rename group chat title telegram imessage bluebubbles setChatTitle displayName",
+        },
+      ),
+      tool(
+        "react_to_latest_message",
+        [
+          "React/tapback to the latest inbound message Tomo has seen in a session.",
+          "",
+          "Use when the user explicitly asks for a lightweight reaction like liking, loving, laughing at, emphasizing, questioning, or removing a reaction from the latest message.",
+          "",
+          "The target is normally the current Session key from the system prompt. For another conversation, pass an identity name or session key. The tool reacts to the latest inbound provider message recorded for that session since Tomo started.",
+          "",
+          "Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`. Telegram maps these to close emoji reactions; iMessage/BlueBubbles sends native tapbacks and requires the Private API/helper.",
+        ].join("\n"),
+        {
+          target: z.string().describe(
+            "Current session key, identity name, or session key to react in. Usually use the current Session key.",
+          ),
+          reaction: z.enum(["love", "like", "dislike", "laugh", "emphasize", "question"]).describe(
+            "Cross-channel reaction/tapback to apply to the latest inbound message.",
+          ),
+          remove: z.boolean().default(false).describe(
+            "Set true to remove Tomo's existing reaction/tapback of this type from the latest message.",
+          ),
+        },
+        async ({ target, reaction, remove }) => {
+          const result = await agent.reactToLatestMessage(target, reaction, remove);
+
+          if (result.ok) {
+            return {
+              content: [{ type: "text" as const, text: remove ? "OK. Reaction removed." : "OK. Reaction sent." }],
+            };
+          }
+          return {
+            content: [{ type: "text" as const, text: `react_to_latest_message failed: ${result.error}` }],
+            isError: true,
+          };
+        },
+        {
+          searchHint: "react reaction tapback latest message telegram imessage bluebubbles like love laugh",
+        },
+      ),
       ...buildCronTools(),
     ],
   });

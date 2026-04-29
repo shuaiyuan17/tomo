@@ -147,6 +147,14 @@ MEDIA:/path/to/file.png
 
 The harness will detect it, strip it from the text, and send the file to the channel. You can include text before or after the MEDIA tag.
 
+To send a Telegram sticker by file_id, include:
+
+\`\`\`
+STICKER:<telegram_file_id>
+\`\`\`
+
+The harness strips the STICKER tag from visible text and sends the sticker to Telegram. Only use sticker file_ids you have seen or been given.
+
 ## Chat Formatting
 
 This is a messaging app, not a document. Keep responses chat-native:

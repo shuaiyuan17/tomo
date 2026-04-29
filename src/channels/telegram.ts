@@ -1,5 +1,6 @@
 import { Bot, type Context } from "grammy";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, StreamingMessage } from "./types.js";
+import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, StreamingMessage, MessageReaction } from "./types.js";
 import { saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
 
@@ -76,6 +77,32 @@ export class TelegramChannel implements Channel {
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
     });
+
+    // Sticker messages. We do not download sticker artwork here; the file_id
+    // is enough for Tomo to understand and resend it later via STICKER:<id>.
+    this.bot.on("message:sticker", async (ctx) => {
+      const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+      const isMentioned = this.checkMentioned(ctx);
+      const sticker = ctx.message.sticker;
+
+      this.dispatch({
+        id: String(ctx.message.message_id),
+        chatId: String(ctx.chat.id),
+        senderName: this.getSenderName(ctx),
+        text: this.describeSticker({
+          fileId: sticker.file_id,
+          emoji: sticker.emoji,
+          setName: sticker.set_name,
+          type: sticker.type,
+          isAnimated: sticker.is_animated,
+          isVideo: sticker.is_video,
+        }),
+        timestamp: ctx.message.date * 1000,
+        isGroup,
+        isMentioned,
+        chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+      });
+    });
   }
 
   private getSenderName(ctx: Context): string {
@@ -110,6 +137,25 @@ export class TelegramChannel implements Channel {
   private cleanMention(text: string): string {
     if (!this.botUsername) return text;
     return text.replace(new RegExp(`@${this.botUsername}`, "gi"), "").trim();
+  }
+
+  private describeSticker(sticker: {
+    fileId: string;
+    emoji?: string;
+    setName?: string;
+    type?: string;
+    isAnimated?: boolean;
+    isVideo?: boolean;
+  }): string {
+    const parts = [
+      `file_id=${sticker.fileId}`,
+      sticker.emoji ? `emoji=${sticker.emoji}` : undefined,
+      sticker.setName ? `set=${sticker.setName}` : undefined,
+      sticker.type ? `type=${sticker.type}` : undefined,
+      sticker.isAnimated ? "animated=true" : undefined,
+      sticker.isVideo ? "video=true" : undefined,
+    ].filter(Boolean);
+    return `[Sent a Telegram sticker: ${parts.join(", ")}. To send this sticker, use STICKER:${sticker.fileId}; to send any sticker, use STICKER:<file_id>.]`;
   }
 
   private async downloadPhoto(fileId: string, chatId?: string): Promise<ImageAttachment | undefined> {
@@ -313,6 +359,11 @@ export class TelegramChannel implements Channel {
       return;
     }
 
+    if (message.sticker) {
+      await this.bot.api.sendSticker(message.chatId, message.sticker, replyParams);
+      return;
+    }
+
     try {
       await this.bot.api.sendMessage(message.chatId, message.text, {
         ...replyParams,
@@ -322,6 +373,23 @@ export class TelegramChannel implements Channel {
       // Fallback to plain text if Markdown parsing fails
       await this.bot.api.sendMessage(message.chatId, message.text, replyParams);
     }
+  }
+
+  async setChatTitle(chatId: string, title: string): Promise<void> {
+    await this.bot.api.setChatTitle(chatId, title);
+  }
+
+  async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove = false): Promise<void> {
+    const emojiByReaction = {
+      love: "\u2764",
+      like: "\u{1F44D}",
+      dislike: "\u{1F44E}",
+      laugh: "\u{1F923}",
+      emphasize: "\u{1F92F}",
+      question: "\u{1F914}",
+    } satisfies Record<MessageReaction, ReactionTypeEmoji["emoji"]>;
+    const reactions = remove ? [] : [{ type: "emoji" as const, emoji: emojiByReaction[reaction] }];
+    await this.bot.api.setMessageReaction(chatId, Number(messageId), reactions satisfies ReactionType[]);
   }
 
   async start(): Promise<void> {

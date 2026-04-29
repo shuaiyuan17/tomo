@@ -1,5 +1,5 @@
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import type { Channel, IncomingMessage, StreamingMessage } from "./channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -11,7 +11,7 @@ import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
 import { sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
-import { isSilentReply, MEDIA_RE, extractMedia } from "./agent/text-utils.js";
+import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
@@ -41,6 +41,7 @@ export class Agent {
   // next user/cron/continuity turn so their Claude has context that a
   // proactive message went out.
   private pendingNotes = new Map<string, string[]>();
+  private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
 
   constructor() {
@@ -348,21 +349,23 @@ export class Agent {
   }
 
   /**
-   * Ship MEDIA: attachments referenced in a single block. The block's text is
-   * already going through the streamed message (with MEDIA tags stripped at
+   * Ship MEDIA:/STICKER: attachments referenced in a single block. The block's text is
+   * already going through the streamed message (with attachment tags stripped at
    * `update()` time), so attachments here go without a caption — the matching
    * text shows up alongside as its own streamed message.
    */
-  private async shipBlockMedia(
+  private async shipBlockAttachments(
     channel: Channel,
     chatId: string,
     blockText: string,
   ): Promise<void> {
-    const { mediaPaths } = extractMedia(blockText);
-    if (mediaPaths.length === 0) return;
+    const { mediaPaths, stickerIds } = extractAttachments(blockText);
     for (const path of mediaPaths) {
       if (!existsSync(path)) continue;
       await channel.send({ chatId, photo: path, text: "" });
+    }
+    for (const stickerId of stickerIds) {
+      await channel.send({ chatId, text: "", sticker: stickerId });
     }
   }
 
@@ -382,7 +385,7 @@ export class Agent {
     return async (blockText: string) => {
       try {
         await stream.commitBlock();
-        await this.shipBlockMedia(channel, chatId, blockText);
+        await this.shipBlockAttachments(channel, chatId, blockText);
       } catch (err) {
         log.warn({ err, channel: channel.name }, "Block delivery failed");
       }
@@ -438,6 +441,7 @@ export class Agent {
     if (isGroup) {
       this.updateGroupContext(key, message.senderName, message.chatTitle);
     }
+    this.recordLatestInboundMessage(key, channel, message);
 
     this.sessions.append(key, {
       role: "user",
@@ -464,7 +468,7 @@ export class Agent {
       const response = await this.runWithRetry(
         key,
         stampedText,
-        (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
+        (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
         message.images,
         this.makeBlockHandler(replyChannel, replyChatId, stream),
       );
@@ -529,6 +533,7 @@ export class Agent {
 
     for (const { channel, message } of items) {
       if (isGroup) this.updateGroupContext(key, message.senderName, message.chatTitle);
+      this.recordLatestInboundMessage(key, channel, message);
       const transcriptText = isGroup ? `${message.senderName}: ${message.text}` : message.text;
       this.sessions.append(key, {
         role: "user",
@@ -557,7 +562,7 @@ export class Agent {
       const response = await this.runWithRetry(
         key,
         stampedText,
-        (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
+        (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
         allImages.length > 0 ? allImages : undefined,
         this.makeBlockHandler(replyChannel, replyChatId, stream),
       );
@@ -807,15 +812,27 @@ export class Agent {
         if (replyTarget) {
           const channel = this.getChannel(replyTarget.channelName);
           if (channel) {
-            const { cleanText, mediaPaths } = extractMedia(response);
-            if (mediaPaths.length > 0) {
+            const { cleanText, mediaPaths, stickerIds } = extractAttachments(response);
+            if (mediaPaths.length > 0 || stickerIds.length > 0) {
               const validPaths = mediaPaths.filter((p) => existsSync(p));
-              for (let i = 0; i < validPaths.length; i++) {
+              let sentText = false;
+              for (const path of validPaths) {
                 await channel.send({
                   chatId: replyTarget.chatId,
-                  photo: validPaths[i],
-                  text: i === 0 ? cleanText : "",
+                  photo: path,
+                  text: !sentText ? cleanText : "",
                 });
+                sentText = true;
+              }
+              for (const stickerId of stickerIds) {
+                await channel.send({
+                  chatId: replyTarget.chatId,
+                  sticker: stickerId,
+                  text: "",
+                });
+              }
+              if (!sentText && cleanText) {
+                await channel.send({ chatId: replyTarget.chatId, text: cleanText });
               }
             } else {
               await channel.send({ chatId: replyTarget.chatId, text: cleanText });
@@ -920,6 +937,75 @@ export class Agent {
     return { ok: true };
   }
 
+  /** Rename a group chat via its channel API and persist the local title immediately. */
+  async renameGroupChat(target: string, title: string): Promise<SendResult> {
+    const trimmedTitle = title.trim();
+    if (!trimmedTitle) {
+      return { ok: false, error: "Group title cannot be empty" };
+    }
+
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid group keys.` };
+    }
+    const { sessionKey, replyTarget } = resolved;
+    const rawKey = `${replyTarget.channelName}:${replyTarget.chatId}`;
+
+    if (!isGroupSessionKey(rawKey)) {
+      return { ok: false, error: `Target "${target}" is not a group chat session` };
+    }
+
+    const channel = this.getChannel(replyTarget.channelName);
+    if (!channel) {
+      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
+    }
+    if (!channel.setChatTitle) {
+      return { ok: false, error: `Channel "${replyTarget.channelName}" does not support renaming group chats` };
+    }
+
+    try {
+      await channel.setChatTitle(replyTarget.chatId, trimmedTitle);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: detail };
+    }
+
+    this.sessions.setChatTitle(sessionKey, trimmedTitle);
+    log.info({ sessionKey, channel: replyTarget.channelName }, "Group chat title renamed");
+    return { ok: true };
+  }
+
+  /** React/tapback to the latest inbound provider message seen in a session. */
+  async reactToLatestMessage(target: string, reaction: MessageReaction, remove = false): Promise<SendResult> {
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Use the current session key or call list_sessions.` };
+    }
+
+    const latest = this.latestInboundMessages.get(resolved.sessionKey);
+    if (!latest) {
+      return { ok: false, error: `No latest inbound message is known for "${resolved.sessionKey}" since Tomo started` };
+    }
+
+    const channel = this.getChannel(latest.channelName);
+    if (!channel) {
+      return { ok: false, error: `Channel "${latest.channelName}" is not connected` };
+    }
+    if (!channel.reactToMessage) {
+      return { ok: false, error: `Channel "${latest.channelName}" does not support message reactions` };
+    }
+
+    try {
+      await channel.reactToMessage(latest.chatId, latest.messageId, reaction, remove);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: detail };
+    }
+
+    log.info({ sessionKey: resolved.sessionKey, channel: latest.channelName, reaction, remove }, "Reacted to latest message");
+    return { ok: true };
+  }
+
   /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
   private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
     // Identity name (no colon) → dm:<name>
@@ -967,6 +1053,15 @@ export class Agent {
       });
     }
     return { identities, groups };
+  }
+
+  private recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {
+    if (!message.id) return;
+    this.latestInboundMessages.set(sessionKey, {
+      channelName: channel.name,
+      chatId: message.chatId,
+      messageId: message.id,
+    });
   }
 
   private queuePendingNote(sessionKey: string, note: string): void {

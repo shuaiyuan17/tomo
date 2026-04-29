@@ -1,5 +1,5 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction } from "./types.js";
 import { saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
 
@@ -86,6 +86,11 @@ export class BlueBubblesChannel implements Channel {
   }
 
   async send(message: OutgoingMessage): Promise<void> {
+    if (message.sticker) {
+      log.warn({ chatId: message.chatId }, "Ignoring unsupported sticker send on iMessage channel");
+      return;
+    }
+
     if (message.photo) {
       await this.sendAttachment(message.chatId, message.photo, message.text);
       return;
@@ -104,6 +109,21 @@ export class BlueBubblesChannel implements Channel {
         method: "apple-script",
       });
     }
+  }
+
+  async setChatTitle(chatId: string, title: string): Promise<void> {
+    await this.api("PUT", `/chat/${encodeURIComponent(chatId)}`, {
+      displayName: title,
+    });
+  }
+
+  async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove = false): Promise<void> {
+    await this.api("POST", "/message/react", {
+      chatGuid: chatId,
+      selectedMessageGuid: messageId,
+      reaction: remove ? `-${reaction}` : reaction,
+      partIndex: 0,
+    });
   }
 
   createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {

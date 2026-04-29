@@ -74,6 +74,46 @@ describe("isGroupChat", () => {
   });
 });
 
+function describeSticker(sticker: {
+  fileId: string;
+  emoji?: string;
+  setName?: string;
+  type?: string;
+  isAnimated?: boolean;
+  isVideo?: boolean;
+}): string {
+  const parts = [
+    `file_id=${sticker.fileId}`,
+    sticker.emoji ? `emoji=${sticker.emoji}` : undefined,
+    sticker.setName ? `set=${sticker.setName}` : undefined,
+    sticker.type ? `type=${sticker.type}` : undefined,
+    sticker.isAnimated ? "animated=true" : undefined,
+    sticker.isVideo ? "video=true" : undefined,
+  ].filter(Boolean);
+  return `[Sent a Telegram sticker: ${parts.join(", ")}. To send this sticker, use STICKER:${sticker.fileId}; to send any sticker, use STICKER:<file_id>.]`;
+}
+
+describe("describeSticker", () => {
+  it("includes file_id and resend instruction", () => {
+    expect(describeSticker({ fileId: "CAAC123" })).toBe(
+      "[Sent a Telegram sticker: file_id=CAAC123. To send this sticker, use STICKER:CAAC123; to send any sticker, use STICKER:<file_id>.]",
+    );
+  });
+
+  it("includes optional sticker metadata", () => {
+    expect(describeSticker({
+      fileId: "CAAC456",
+      emoji: "😂",
+      setName: "funny_pack",
+      type: "regular",
+      isAnimated: true,
+      isVideo: false,
+    })).toBe(
+      "[Sent a Telegram sticker: file_id=CAAC456, emoji=😂, set=funny_pack, type=regular, animated=true. To send this sticker, use STICKER:CAAC456; to send any sticker, use STICKER:<file_id>.]",
+    );
+  });
+});
+
 // Test streaming message flush serialization logic
 describe("streaming message flush serialization", () => {
   it("serializes concurrent flushes to prevent duplicate sends", async () => {

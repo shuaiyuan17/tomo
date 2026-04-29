@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Channel, IncomingMessage, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler } from "../src/channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler } from "../src/channels/types.js";
 
 // ---------------------------------------------------------------------------
 // Mock SDK — queue-based approach avoids async-generator timing issues
@@ -199,6 +199,7 @@ interface Delivery {
   chatId: string;
   text: string;
   photo?: string;
+  sticker?: string;
 }
 
 class MockChannel implements Channel {
@@ -209,6 +210,8 @@ class MockChannel implements Channel {
   sent: OutgoingMessage[] = [];
   /** All delivered messages (both streamed and sent) */
   delivered: Delivery[] = [];
+  renamed: Array<{ chatId: string; title: string }> = [];
+  reacted: Array<{ chatId: string; messageId: string; reaction: MessageReaction; remove?: boolean }> = [];
 
   constructor(name: string) { this.name = name; }
 
@@ -217,7 +220,15 @@ class MockChannel implements Channel {
 
   async send(msg: OutgoingMessage) {
     this.sent.push(msg);
-    this.delivered.push({ chatId: msg.chatId, text: msg.text, photo: msg.photo });
+    this.delivered.push({ chatId: msg.chatId, text: msg.text, photo: msg.photo, sticker: msg.sticker });
+  }
+
+  async setChatTitle(chatId: string, title: string) {
+    this.renamed.push({ chatId, title });
+  }
+
+  async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove?: boolean) {
+    this.reacted.push({ chatId, messageId, reaction, remove });
   }
 
   createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
@@ -251,7 +262,7 @@ class MockChannel implements Channel {
   async simulateCommand(cmd: string, chatId: string, sender: string, args?: string) {
     await this.commandHandler?.(cmd, chatId, sender, args);
   }
-  clearDelivered() { this.sent = []; this.delivered = []; }
+  clearDelivered() { this.sent = []; this.delivered = []; this.renamed = []; this.reacted = []; }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +359,68 @@ describe("DM message routing", () => {
     expect(tg.delivered).toHaveLength(2);
     expect(tg.delivered[0].chatId).toBe("111");
     expect(tg.delivered[1].chatId).toBe("222");
+
+    await agent.stop();
+  });
+
+  it("reacts to the latest inbound message in a DM session", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "NO_REPLY";
+
+    await tg.simulateMessage(makeMsg({ id: "41", chatId: "12345", text: "First" }));
+    await drainQueue(agent);
+    await tg.simulateMessage(makeMsg({ id: "42", chatId: "12345", text: "Second" }));
+    await drainQueue(agent);
+
+    const result = await agent.reactToLatestMessage("telegram:12345", "like");
+
+    expect(result.ok).toBe(true);
+    expect(tg.reacted).toEqual([{ chatId: "12345", messageId: "42", reaction: "like", remove: false }]);
+
+    await agent.stop();
+  });
+
+  it("reacts to the last active channel for an identity session", async () => {
+    resetConfig({
+      identities: [
+        { name: "shuai", channels: { telegram: "12345", imessage: "+15551234567" }, replyPolicy: "last-active" },
+      ],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+
+    mockResponseFn = () => "NO_REPLY";
+
+    await tg.simulateMessage(makeMsg({ id: "11", chatId: "12345", text: "From Telegram" }));
+    await drainQueue(agent);
+    await im.simulateMessage(makeMsg({ id: "im-22", chatId: "+15551234567", text: "From iMessage" }));
+    await drainQueue(agent);
+
+    const result = await agent.reactToLatestMessage("shuai", "love", true);
+
+    expect(result.ok).toBe(true);
+    expect(tg.reacted).toHaveLength(0);
+    expect(im.reacted).toEqual([{ chatId: "+15551234567", messageId: "im-22", reaction: "love", remove: true }]);
+
+    await agent.stop();
+  });
+
+  it("reports an error when there is no latest message to react to", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const result = await agent.reactToLatestMessage("telegram:12345", "like");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/unknown target|no latest inbound message/i);
+    expect(tg.reacted).toHaveLength(0);
 
     await agent.stop();
   });
@@ -491,6 +564,52 @@ describe("group chat handling", () => {
     const activation = tg.sent.find(m => m.text?.includes("activated"));
     expect(activation).toBeDefined();
     expect(activation!.chatId).toBe("-100group");
+
+    await agent.stop();
+  });
+
+  it("renames a group chat and updates the session catalog title", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "Group reply!";
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100123",
+      text: "@tomo hi",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+      chatTitle: "Old Title",
+    }));
+    await drainQueue(agent);
+
+    const result = await agent.renameGroupChat("telegram:-100123", "New Title");
+
+    expect(result.ok).toBe(true);
+    expect(tg.renamed).toEqual([{ chatId: "-100123", title: "New Title" }]);
+    expect(agent.listSessionCatalog().groups).toContainEqual({
+      key: "telegram:-100123",
+      title: "New Title",
+    });
+
+    await agent.stop();
+  });
+
+  it("rejects group rename for non-group targets", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
+    await drainQueue(agent);
+
+    const result = await agent.renameGroupChat("telegram:12345", "Nope");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/not a group/i);
+    expect(tg.renamed).toHaveLength(0);
 
     await agent.stop();
   });
@@ -1381,6 +1500,24 @@ describe("per-block streaming delivery", () => {
     // commitBlock, but the run completed instead of restarting.
     expect(im.delivered).toHaveLength(1);
     expect(im.delivered[0].text).toBe("block-b");
+
+    await agent.stop();
+  });
+
+  it("ships STICKER tags as sticker sends without leaking the tag into text", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "here you go STICKER:CAACAgQAAxkBAAE123";
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "send sticker" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "here you go", photo: undefined, sticker: undefined },
+      { chatId: "12345", text: "", photo: undefined, sticker: "CAACAgQAAxkBAAE123" },
+    ]);
 
     await agent.stop();
   });

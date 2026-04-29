@@ -48,6 +48,14 @@ export interface StreamingMessage {
    * that buffer until finish (e.g. iMessage) can no-op.
    */
   cancel(): Promise<void>;
+  /**
+   * Seal the current text block and reset state for the next block in the
+   * same turn. Called between text blocks of a multi-block assistant turn
+   * (text → tool → text). Channels that ship text per block (Telegram,
+   * iMessage) finalize the in-flight message and start fresh on the next
+   * `update()`. No-op when nothing has been buffered.
+   */
+  commitBlock(): Promise<void>;
 }
 
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;

@@ -309,9 +309,19 @@ export class Agent {
   }
 
   /**
-   * Send the agent's response over the channel: handle silent NO_REPLY,
-   * surface API errors, extract MEDIA: paths, and finalize the stream.
-   * Shared by handleMessage and handleBatchedMessages.
+   * Finalize the streaming message after a turn completes. Per-block delivery
+   * happens during the run (each `assistant` event triggers `commitBlock` via
+   * the `onBlockComplete` callback below), so by the time we get here the
+   * stream's only remaining job is flushing any trailing buffer state.
+   *
+   * Handles three special cases:
+   *   - Bare NO_REPLY response: cancel the stream (drops in-flight Telegram
+   *     edits, no-op for iMessage's already-shipped buffer).
+   *   - API errors surfaced as response text: finish + send a clean `[error]`.
+   *   - Otherwise: stream.finish() flushes any final-block buffer.
+   *
+   * MEDIA tags are shipped per block via `shipBlockMedia` during the run, so
+   * we don't extract them here.
    */
   private async deliverResponse(
     replyChannel: Channel,
@@ -334,24 +344,25 @@ export class Agent {
       return;
     }
 
-    const { cleanText, mediaPaths } = extractMedia(response);
+    await stream.finish();
+  }
 
-    if (mediaPaths.length > 0) {
-      const validPaths = mediaPaths.filter((p) => existsSync(p));
-      if (validPaths.length > 0) {
-        for (let i = 0; i < validPaths.length; i++) {
-          await replyChannel.send({
-            chatId: replyChatId,
-            photo: validPaths[i],
-            text: i === 0 ? cleanText : "",
-          });
-        }
-      } else {
-        stream.update(cleanText);
-        await stream.finish();
-      }
-    } else {
-      await stream.finish();
+  /**
+   * Ship MEDIA: attachments referenced in a single block. The block's text is
+   * already going through the streamed message (with MEDIA tags stripped at
+   * `update()` time), so attachments here go without a caption — the matching
+   * text shows up alongside as its own streamed message.
+   */
+  private async shipBlockMedia(
+    channel: Channel,
+    chatId: string,
+    blockText: string,
+  ): Promise<void> {
+    const { mediaPaths } = extractMedia(blockText);
+    if (mediaPaths.length === 0) return;
+    for (const path of mediaPaths) {
+      if (!existsSync(path)) continue;
+      await channel.send({ chatId, photo: path, text: "" });
     }
   }
 
@@ -427,9 +438,17 @@ export class Agent {
       const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
-      const response = await this.runWithRetry(key, stampedText, (text) => {
-        stream.update(text.replace(MEDIA_RE, "").trim());
-      }, message.images);
+      const onBlockComplete = async (blockText: string) => {
+        await stream.commitBlock();
+        await this.shipBlockMedia(replyChannel, replyChatId, blockText);
+      };
+      const response = await this.runWithRetry(
+        key,
+        stampedText,
+        (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
+        message.images,
+        onBlockComplete,
+      );
       stopTyping();
 
       this.maybeNudgeCompact(key);
@@ -516,11 +535,16 @@ export class Agent {
       const allImages = items.flatMap((it) => it.message.images ?? []);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? lastMessage.id : undefined);
+      const onBlockComplete = async (blockText: string) => {
+        await stream.commitBlock();
+        await this.shipBlockMedia(replyChannel, replyChatId, blockText);
+      };
       const response = await this.runWithRetry(
         key,
         stampedText,
         (text) => stream.update(text.replace(MEDIA_RE, "").trim()),
         allImages.length > 0 ? allImages : undefined,
+        onBlockComplete,
       );
       stopTyping();
 
@@ -543,10 +567,16 @@ export class Agent {
     }
   }
 
-  private async runWithRetry(key: string, prompt: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
+  private async runWithRetry(
+    key: string,
+    prompt: string,
+    onText?: (text: string) => void,
+    images?: Array<{ data: string; mediaType: string }>,
+    onBlockComplete?: (text: string) => void | Promise<void>,
+  ): Promise<string> {
     try {
       const session = this.getOrCreateLiveSession(key);
-      const response = await session.send(prompt, onText, images);
+      const response = await session.send(prompt, onText, images, onBlockComplete);
 
       // Capture session ID if new
       const sid = session.getSessionId();
@@ -610,7 +640,7 @@ export class Agent {
         this.sessions.clearSdkSessionId(key);
 
         const session = this.getOrCreateLiveSession(key);
-        return session.send(prompt, onText, images);
+        return session.send(prompt, onText, images, onBlockComplete);
       }
 
       throw err;

@@ -10,7 +10,7 @@ import { stopCommand, restartCommand, statusCommand, logsCommand, continuityComm
 import { sessionsCommand } from "./cli/sessions.js";
 import { migrateCommand } from "./cli/migrate.js";
 import { lcmCommand } from "./cli/lcm.js";
-import { configCommand } from "./cli/config.js";
+import { configCommand } from "./cli/config/index.js";
 import { uninstallCommand } from "./cli/uninstall.js";
 import { backupCommand } from "./cli/backup.js";
 import { updateCommand } from "./cli/update.js";

@@ -95,7 +95,7 @@ In-process MCP tools let you message outside the current conversation:
   - `delegate` (default): describe the *intent* (e.g. "follow up with Alice about her recent trip"). The recipient session's Claude composes the actual message in its own voice/context. Best for social or contextual relays. Fire-and-forget.
   - `direct`: send the verbatim text. Recipient is not triggered into a Claude turn. Best for factual broadcasts ("meeting moved to 3pm"), pasted content, or self-targeted mid-loop progress updates.
 - `mcp__tomo-internal__rename_group_chat(target, title)` — rename the real Telegram or iMessage group title. Use only when the user explicitly asks for a rename; `target` must be a group session key from `list_sessions`.
-- `mcp__tomo-internal__react_to_latest_message(target, reaction, remove?)` — react/tapback to the latest inbound message Tomo has seen in that session since startup. Use only when explicitly asked; usually pass the current Session key. Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`.
+- `mcp__tomo-internal__react_to_latest_message(target, reaction, remove?)` — react/tapback to the latest inbound message Tomo has seen in that session since startup. Usually pass the current Session key. Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`.
 
 Pass identity name (`"alice"`) or session key (`"telegram:-1001234567"`) as `target`. Call `list_sessions` first if unsure. Tool result lines (with `is_error` flag) appear in `tomo logs` immediately after the corresponding tool call.
 

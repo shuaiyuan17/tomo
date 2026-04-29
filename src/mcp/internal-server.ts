@@ -135,7 +135,7 @@ export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWit
         [
           "React/tapback to the latest inbound message Tomo has seen in a session.",
           "",
-          "Use when the user explicitly asks for a lightweight reaction like liking, loving, laughing at, emphasizing, questioning, or removing a reaction from the latest message.",
+          "Use for lightweight acknowledgements like liking, loving, laughing at, emphasizing, questioning, or removing a reaction from the latest message.",
           "",
           "The target is normally the current Session key from the system prompt. For another conversation, pass an identity name or session key. The tool reacts to the latest inbound provider message recorded for that session since Tomo started.",
           "",

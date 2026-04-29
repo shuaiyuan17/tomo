@@ -1,0 +1,161 @@
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+import { CronStore, parseScheduleString } from "../cron/store.js";
+import type { CronJob } from "../cron/types.js";
+
+/**
+ * MCP tool factories for the cron store. Registered onto the
+ * `tomo-internal` server alongside `send_message` / `list_sessions`.
+ *
+ * These are deferred (no `alwaysLoad`) so they only consume context when
+ * the agent searches for scheduling capability — most turns don't touch
+ * the cron store, and when they do, the schemas are small.
+ *
+ * Core logic stays in `CronStore`. The CLI (`tomo cron …`) is a parallel
+ * surface against the same store, kept for human audit.
+ *
+ * Each handler instantiates a fresh `CronStore` so it picks up writes
+ * from the CLI, the scheduler, or external edits (the constructor calls
+ * `load()` from disk). The on-disk JSON is the single source of truth.
+ */
+export function buildCronTools(storePath?: string) {
+  return [
+    tool(
+      "schedule_create",
+      [
+        "Create a scheduled task that fires a message back into a session at a future time, on an interval, or on a cron pattern.",
+        "",
+        "Use when the user asks for a reminder, recurring nudge, future check-in, or any time-triggered prompt to themselves or a group.",
+        "",
+        "Schedule formats (free-form string):",
+        "- `in 20m`, `in 2h`, `in 3d` — one-shot relative; auto-deletes after firing.",
+        "- `2026-05-01T19:00` — one-shot at an ISO date/time; auto-deletes after firing.",
+        "- `every 30m`, `every 6h` — recurring interval.",
+        "- 5-field cron like `0 9 * * *` (daily 9am), `0 9 * * 1-5` (weekdays 9am) — recurring.",
+        "",
+        "One-shot trap: a cron expression with a specific day-of-month + month (e.g. `0 19 1 5 *`) re-fires every year. For a single fire on a calendar date, prefer the ISO date form, or pass `once: true` with the cron expression.",
+        "",
+        "The `session` field is the routing target (the **Session key** in the agent system prompt). Use the current session key unless the user explicitly addresses someone else.",
+        "",
+        "Returns the created job (id, schedule, lifecycle, nextRunAt).",
+      ].join("\n"),
+      {
+        name: z.string().min(1).max(80).describe(
+          "Short slug-style name for the job (e.g. `airplant-weekly-soak`). Used in logs and `cron list` output.",
+        ),
+        schedule: z.string().min(1).describe(
+          'Schedule string. Examples: "in 20m", "in 3d", "2026-05-01T19:00", "every 1h", "0 9 * * *".',
+        ),
+        message: z.string().min(1).max(4000).describe(
+          "The text the user (or scheduler) will receive when the job fires. Written as a system message into the target session.",
+        ),
+        session: z.string().min(1).describe(
+          'Session key to deliver to. Identity DM ("dm:alice"), iMessage chat key ("imessage:any;+;<guid>"), Telegram chat key ("telegram:-100…"), etc.',
+        ),
+        once: z.boolean().optional().describe(
+          "Override lifecycle. Defaults to true for one-time `at` schedules and false for recurring (`every`/cron). Pass `true` to make a cron expression fire once and auto-delete; pass `false` to keep an `at` job around as a disabled record after firing.",
+        ),
+      },
+      async ({ name, schedule, message, session, once }) => {
+        let parsed;
+        try {
+          parsed = parseScheduleString(schedule);
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            isError: true,
+          };
+        }
+
+        const store = new CronStore(storePath);
+        const job = store.add({
+          name,
+          schedule: parsed,
+          message,
+          sessionKey: session,
+          deleteAfterRun: once,
+        });
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
+        };
+      },
+      {
+        searchHint: "schedule task reminder cron recurring one-shot future fire trigger ping",
+      },
+    ),
+    tool(
+      "schedule_list",
+      [
+        "List every scheduled task in the store. Use to audit what reminders/recurring jobs exist before adding more, or to find a job's id for removal.",
+        "",
+        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
+      ].join("\n"),
+      {},
+      async () => {
+        const store = new CronStore(storePath);
+        const jobs = store.list().map(summarizeJob);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(jobs, null, 2) }],
+        };
+      },
+      {
+        searchHint: "list scheduled tasks reminders crons jobs audit",
+      },
+    ),
+    tool(
+      "schedule_remove",
+      [
+        "Remove a scheduled task by id. Use when a reminder is no longer needed, or to clean up a one-shot left disabled by an older code path.",
+        "",
+        "Returns `removed` or `not_found`.",
+      ].join("\n"),
+      {
+        id: z.string().min(1).describe("The job id from `schedule_list` (e.g. `f43d8a93`)."),
+      },
+      async ({ id }) => {
+        const store = new CronStore(storePath);
+        const removed = store.remove(id);
+        return {
+          content: [{
+            type: "text" as const,
+            text: removed ? `Removed job ${id}.` : `Job ${id} not found.`,
+          }],
+          isError: !removed,
+        };
+      },
+      {
+        searchHint: "remove delete cancel scheduled task reminder cron job",
+      },
+    ),
+  ];
+}
+
+interface JobSummary {
+  id: string;
+  name: string;
+  enabled: boolean;
+  lifecycle: "once" | "recurring";
+  schedule: { kind: string; at?: string; everyMs?: number; expr?: string; tz?: string };
+  message: string;
+  sessionKey: string;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastStatus: "ok" | "error" | null;
+}
+
+function summarizeJob(job: CronJob): JobSummary {
+  return {
+    id: job.id,
+    name: job.name,
+    enabled: job.enabled,
+    lifecycle: job.deleteAfterRun ? "once" : "recurring",
+    schedule: job.schedule,
+    message: job.message,
+    sessionKey: job.sessionKey,
+    nextRunAt: job.nextRunAt ? new Date(job.nextRunAt).toISOString() : null,
+    lastRunAt: job.lastRunAt ? new Date(job.lastRunAt).toISOString() : null,
+    lastStatus: job.lastStatus,
+  };
+}

@@ -57,9 +57,24 @@ export function buildCronTools(storePath?: string) {
         ),
       },
       async ({ name, schedule, message, session, once }) => {
-        let parsed;
+        // Wrap both the parse and the store.add: parseScheduleString accepts
+        // any unrecognized string as `kind: "cron"` (catch-all), and croner
+        // throws inside `computeNextRun` when the expression is malformed.
+        // Either path means "this isn't a usable schedule" — surface it the
+        // same way so the agent doesn't think the job was scheduled.
         try {
-          parsed = parseScheduleString(schedule);
+          const parsed = parseScheduleString(schedule);
+          const store = new CronStore(storePath);
+          const job = store.add({
+            name,
+            schedule: parsed,
+            message,
+            sessionKey: session,
+            deleteAfterRun: once,
+          });
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
+          };
         } catch (err) {
           const detail = err instanceof Error ? err.message : String(err);
           return {
@@ -67,19 +82,6 @@ export function buildCronTools(storePath?: string) {
             isError: true,
           };
         }
-
-        const store = new CronStore(storePath);
-        const job = store.add({
-          name,
-          schedule: parsed,
-          message,
-          sessionKey: session,
-          deleteAfterRun: once,
-        });
-
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
-        };
       },
       {
         searchHint: "schedule task reminder cron recurring one-shot future fire trigger ping",
@@ -117,12 +119,14 @@ export function buildCronTools(storePath?: string) {
       async ({ id }) => {
         const store = new CronStore(storePath);
         const removed = store.remove(id);
+        // Not-found is an expected outcome of a list → pick → remove flow,
+        // not an error worth flagging. The text conveys the result; isError
+        // would push the agent toward retry/escalate semantics.
         return {
           content: [{
             type: "text" as const,
             text: removed ? `Removed job ${id}.` : `Job ${id} not found.`,
           }],
-          isError: !removed,
         };
       },
       {

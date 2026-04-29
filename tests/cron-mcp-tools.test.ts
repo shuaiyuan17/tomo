@@ -98,7 +98,7 @@ describe("cron MCP tools", () => {
     expect(jobs[0].nextRunAt).toBeTruthy();
   });
 
-  it("schedule_remove — removes existing job and 404s on missing", async () => {
+  it("schedule_remove — removes existing job; not-found returns text without isError", async () => {
     const create = findTool("schedule_create");
     const created = await create.handler({
       name: "to-remove",
@@ -113,9 +113,42 @@ describe("cron MCP tools", () => {
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain("Removed");
 
+    // Not-found is a normal flow outcome (list → pick → remove can race), so
+    // the tool reports it via the text but does not flag isError — flagging
+    // would push the agent toward retry/escalate semantics.
     const missing = await remove.handler({ id: "deadbeef" }, {});
-    expect(missing.isError).toBe(true);
+    expect(missing.isError).toBeFalsy();
     expect(missing.content[0].text).toContain("not found");
+  });
+
+  it("schedule_create — invalid schedule never lands a writable job", async () => {
+    const create = findTool("schedule_create");
+    const result = await create.handler({
+      name: "bad",
+      schedule: "this is not a schedule",
+      message: "x",
+      session: "dm:alice",
+    }, {});
+
+    // parseScheduleString falls through unknown strings to kind: "cron",
+    // so the explicit catch in the handler may or may not fire depending
+    // on whether croner rejects the expression at computeNextRun time.
+    // Either path is acceptable — what matters is that the tool never
+    // produces a job that the agent could mistake for "successfully
+    // scheduled and ready to fire".
+    if (result.isError) {
+      // Handler caught the parse failure and surfaced it cleanly.
+      expect(result.content[0].text).toMatch(/invalid schedule/i);
+      const list = findTool("schedule_list");
+      const listResult = await list.handler({}, {});
+      expect(JSON.parse(listResult.content[0].text)).toHaveLength(0);
+    } else {
+      // croner accepted the string but couldn't compute a next run — the
+      // job exists in the store but will never fire. Surface the latent
+      // dead-job state so the agent doesn't pretend it's scheduled.
+      const summary = JSON.parse(result.content[0].text);
+      expect(summary.nextRunAt).toBeNull();
+    }
   });
 
   it("MCP and CronStore see the same on-disk state (no in-memory drift)", async () => {

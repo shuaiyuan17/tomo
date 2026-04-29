@@ -394,7 +394,7 @@ export class TelegramChannel implements Channel {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       if (/REACTION_INVALID/i.test(detail)) {
-        throw new Error("Telegram rejected that reaction; this chat may not allow it");
+        throw new Error("Telegram rejected that reaction; this chat may not allow it", { cause: err });
       }
       throw err;
     }

@@ -2,6 +2,7 @@ import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@
 import { z } from "zod";
 import { config } from "../config.js";
 import type { Agent } from "../agent.js";
+import { buildCronTools } from "./cron-tools.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 
@@ -93,6 +94,7 @@ export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWit
           searchHint: "send proactive message delegate direct identity group session",
         },
       ),
+      ...buildCronTools(),
     ],
   });
 }

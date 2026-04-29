@@ -58,7 +58,7 @@ describe("injectTimestamp", () => {
 // Test MEDIA extraction (extracted logic from agent.ts)
 const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
 const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
-const ATTACHMENT_TAG_RE = /\bMEDIA:\s*(?:"[^"\n]+"|[^\s\n"]+)|\bSTICKER:\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
+const ATTACHMENT_TAG_RE = /\b(?:MEDIA|STICKER):\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
 
 function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
   const mediaPaths: string[] = [];
@@ -101,6 +101,12 @@ describe("extractMedia", () => {
   it("handles unquoted paths", () => {
     const { mediaPaths } = extractMedia("MEDIA: /tmp/photo.png");
     expect(mediaPaths).toEqual(["/tmp/photo.png"]);
+  });
+
+  it("handles quoted paths with spaces", () => {
+    const { cleanText, mediaPaths } = extractMedia('Here is the image MEDIA:"/tmp/my photo.png"');
+    expect(mediaPaths).toEqual(["/tmp/my photo.png"]);
+    expect(cleanText).toBe("Here is the image");
   });
 
   it("returns empty array when no media", () => {

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Group chat rename MCP tool**: `tomo-internal` now exposes `rename_group_chat(target, title)` for explicit user-requested group title changes. Telegram uses Bot API `setChatTitle`; iMessage uses BlueBubbles Private API `PUT /chat/:guid` with `displayName`. Successful renames update Tomo's persisted `chatTitle` immediately so `list_sessions` reflects the new name.
+- **Latest-message reaction MCP tool**: `react_to_latest_message(target, reaction, remove?)` reacts/tapbacks to the latest inbound message Tomo has seen in a session since startup. Telegram uses `setMessageReaction`; iMessage uses BlueBubbles Private API `POST /message/react`. Supported cross-channel reactions are `love`, `like`, `dislike`, `laugh`, `emphasize`, and `question`.
+- **Telegram sticker sending**: responses can now include `STICKER:<telegram_file_id>` to send a Telegram sticker via `sendSticker`, mirroring the existing `MEDIA:` attachment tag flow.
+- **Telegram sticker ingress**: inbound Telegram stickers now arrive as text metadata including `file_id`, optional emoji/set/type flags, and a ready-to-use `STICKER:<file_id>` resend hint.
+
 ## 0.5.3 (2026-04-28)
 
 ### Features

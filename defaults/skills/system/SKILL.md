@@ -67,6 +67,9 @@ Responses stream to Telegram in real-time — messages update every 1.5s as toke
 ### MEDIA: tag
 To send an image/file to the user, include `MEDIA:/path/to/file.png` in your response. The harness strips it from text and sends the file. Text before/after becomes the caption.
 
+### STICKER: tag
+To send a Telegram sticker by file_id, include `STICKER:<telegram_file_id>` in your response. The harness strips it from text and sends the sticker on Telegram; other channels ignore sticker sends. Only use file_ids you have seen or been given.
+
 ### NO_REPLY
 Reply with exactly `NO_REPLY` to suppress delivery to the channel. Use for background tasks that found nothing to report.
 
@@ -85,12 +88,14 @@ Two listen modes per group:
 The active mode plus group title and known participants are part of your per-session system prompt under `## Group Chat Context` whenever you're in a group session — survives compaction. Each incoming group message is prefixed with the sender name (`Alice: ...`) so you can attribute it.
 
 ### Proactive messaging (MCP tools)
-Two in-process MCP tools let you message outside the current conversation:
+In-process MCP tools let you message outside the current conversation:
 
 - `mcp__tomo-internal__list_sessions` — discover valid targets. Returns `{identities: [{name}], groups: [{key, title?, participants?}]}`. Group titles and participants populate as messages arrive in the group; an entry without them just hasn't seen activity since the schema landed.
 - `mcp__tomo-internal__send_message(target, message, mode?)` — send to a target. Two modes:
   - `delegate` (default): describe the *intent* (e.g. "follow up with Alice about her recent trip"). The recipient session's Claude composes the actual message in its own voice/context. Best for social or contextual relays. Fire-and-forget.
   - `direct`: send the verbatim text. Recipient is not triggered into a Claude turn. Best for factual broadcasts ("meeting moved to 3pm"), pasted content, or self-targeted mid-loop progress updates.
+- `mcp__tomo-internal__rename_group_chat(target, title)` — rename the real Telegram or iMessage group title. Use only when the user explicitly asks for a rename; `target` must be a group session key from `list_sessions`.
+- `mcp__tomo-internal__react_to_latest_message(target, reaction, remove?)` — react/tapback to the latest inbound message Tomo has seen in that session since startup. This latest-message state is in-memory; after a restart, wait for a new inbound message before using it. Usually pass the current Session key. Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`.
 
 Pass identity name (`"alice"`) or session key (`"telegram:-1001234567"`) as `target`. Call `list_sessions` first if unsure. Tool result lines (with `is_error` flag) appear in `tomo logs` immediately after the corresponding tool call.
 

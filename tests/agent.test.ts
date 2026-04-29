@@ -56,15 +56,31 @@ describe("injectTimestamp", () => {
 });
 
 // Test MEDIA extraction (extracted logic from agent.ts)
-const MEDIA_RE = /\bMEDIA:\s*"?([^\n"]+)"?/gi;
+const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
+const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
+const ATTACHMENT_TAG_RE = /\b(?:MEDIA|STICKER):\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
 
 function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
   const mediaPaths: string[] = [];
-  const cleanText = text.replace(MEDIA_RE, (_match, path) => {
-    mediaPaths.push(path.trim());
+  const cleanText = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
+    mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
     return "";
   }).trim();
   return { cleanText, mediaPaths };
+}
+
+function extractAttachments(text: string): { cleanText: string; mediaPaths: string[]; stickerIds: string[] } {
+  const mediaPaths: string[] = [];
+  const stickerIds: string[] = [];
+  const withoutMedia = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
+    mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
+    return "";
+  });
+  const cleanText = withoutMedia.replace(STICKER_RE, (_match, quotedId, unquotedId) => {
+    stickerIds.push(String(quotedId ?? unquotedId).trim());
+    return "";
+  }).trim();
+  return { cleanText, mediaPaths, stickerIds };
 }
 
 describe("extractMedia", () => {
@@ -87,6 +103,12 @@ describe("extractMedia", () => {
     expect(mediaPaths).toEqual(["/tmp/photo.png"]);
   });
 
+  it("handles quoted paths with spaces", () => {
+    const { cleanText, mediaPaths } = extractMedia('Here is the image MEDIA:"/tmp/my photo.png"');
+    expect(mediaPaths).toEqual(["/tmp/my photo.png"]);
+    expect(cleanText).toBe("Here is the image");
+  });
+
   it("returns empty array when no media", () => {
     const { cleanText, mediaPaths } = extractMedia("Just a normal message");
     expect(mediaPaths).toEqual([]);
@@ -102,6 +124,27 @@ describe("extractMedia", () => {
   it("case insensitive matching", () => {
     const { mediaPaths } = extractMedia('media: "/tmp/test.png"');
     expect(mediaPaths).toEqual(["/tmp/test.png"]);
+  });
+});
+
+describe("extractAttachments", () => {
+  it("extracts sticker file ids and strips tags from text", () => {
+    const { cleanText, mediaPaths, stickerIds } = extractAttachments("here STICKER:CAACAgQAAxkBAAE123 ok");
+    expect(cleanText).toBe("here  ok");
+    expect(mediaPaths).toEqual([]);
+    expect(stickerIds).toEqual(["CAACAgQAAxkBAAE123"]);
+  });
+
+  it("extracts media and sticker tags together", () => {
+    const { cleanText, mediaPaths, stickerIds } = extractAttachments('Look MEDIA:"/tmp/a.png" STICKER:"CAAC-123"');
+    expect(cleanText).toBe("Look");
+    expect(mediaPaths).toEqual(["/tmp/a.png"]);
+    expect(stickerIds).toEqual(["CAAC-123"]);
+  });
+
+  it("strips only the sticker tag from streamed text", () => {
+    const streamed = "here is STICKER:CAAC123 and more text".replace(ATTACHMENT_TAG_RE, "").trim();
+    expect(streamed).toBe("here is  and more text");
   });
 });
 

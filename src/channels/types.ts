@@ -35,7 +35,11 @@ export interface OutgoingMessage {
   replyTo?: string;
   /** Optional: file path to send as photo */
   photo?: string;
+  /** Optional: Telegram sticker file_id to send */
+  sticker?: string;
 }
+
+export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
 
 export interface StreamingMessage {
   /** Append text to the streaming message */
@@ -73,6 +77,12 @@ export interface Channel {
 
   /** Send a message through this channel */
   send(message: OutgoingMessage): Promise<void>;
+
+  /** Rename a group chat/conversation, if supported by the channel. */
+  setChatTitle?(chatId: string, title: string): Promise<void>;
+
+  /** React/tapback to a specific provider message, if supported by the channel. */
+  reactToMessage?(chatId: string, messageId: string, reaction: MessageReaction, remove?: boolean): Promise<void>;
 
   /** Create a streaming message that can be updated incrementally */
   createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage;

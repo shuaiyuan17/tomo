@@ -1,16 +1,15 @@
 # Changelog
 
-## 0.5.4 (2026-04-28)
+## 0.5.3 (2026-04-28)
 
 ### Features
 
-- **Cron exposed as MCP tools** (`schedule_create`, `schedule_list`, `schedule_remove`). Three deferred tools on the existing `tomo-internal` server, alongside `send_message` / `list_sessions`. Selected over keeping cron Bash-only because (1) ~99% of cron operations originate from the agent, not from a human terminal, and (2) the structured-args path eliminates the class of CLI-flag-default bugs (cf. #71's `--once` regression). With tool search default-on in the Agent SDK, the schemas only land in context when the agent searches for scheduling capability — no per-turn cost. Names use `schedule_*` rather than `cron_*` to avoid namespace collision with Anthropic's built-in `CronCreate / CronList / CronDelete` deferred tools surfacing in the same search. Handlers instantiate a fresh `CronStore` per call so they pick up writes from the CLI, the scheduler daemon, or external edits — the on-disk JSON is the single source of truth. The `tomo cron …` CLI is preserved as a parallel surface for human audit/debug.
-
-## 0.5.3 (2026-04-28)
+- **Cron exposed as MCP tools** (#72): `schedule_create`, `schedule_list`, `schedule_remove`. Three deferred tools on the existing `tomo-internal` server, alongside `send_message` / `list_sessions`. Selected over keeping cron Bash-only because (1) ~99% of cron operations originate from the agent, not from a human terminal, and (2) the structured-args path eliminates the class of CLI-flag-default bugs (cf. the `--once` fix in this same release). With tool search default-on in the Agent SDK, the schemas only land in context when the agent searches for scheduling capability — no per-turn cost. Names use `schedule_*` rather than `cron_*` to avoid namespace collision with Anthropic's built-in `CronCreate / CronList / CronDelete` deferred tools surfacing in the same search. Handlers instantiate a fresh `CronStore` per call so they pick up writes from the CLI, the scheduler daemon, or external edits — the on-disk JSON is the single source of truth. The `tomo cron …` CLI is preserved as a parallel surface for human audit/debug.
 
 ### Bug fixes
 
 - **`tomo cron add` honours the `at`-default for `deleteAfterRun`** (#71). The `--once` Commander option carried a `false` default, so `opts.once ?? (schedule.kind === "at")` always resolved to `false` and one-time `at` schedules were created with `deleteAfterRun=false`. The store layer's default already does the right thing for one-time schedules; the fix is to drop the CLI default so `opts.once` stays `undefined` when the flag isn't passed and the store's fallback can fire. Observed live: a one-time visa-interview reminder created via `--schedule "at 2026-04-27T09:00"` fired correctly but lingered as a `disabled` zombie in `cron list` instead of cleaning itself up.
+- **`schedule_create` invalid-schedule path no longer escapes the handler** (#72). `parseScheduleString` accepts any unrecognized string as `kind: "cron"` (catch-all), and croner throws inside `computeNextRun` on a malformed expression. The original try/catch wrapped only the parse step, so a string like `"this is not a schedule"` passed through to `store.add()` and the croner throw escaped uncaught. The try now covers parse + add together.
 
 ### UX
 

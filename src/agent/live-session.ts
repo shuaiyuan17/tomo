@@ -4,7 +4,16 @@ import type { sdkOptions } from "./sdk-options.js";
 
 export interface MessageRequest {
   message: SDKUserMessage;
+  /** Called for each text-delta as it streams (cumulative running text). */
   onText?: (text: string) => void;
+  /**
+   * Called once per text block when an `assistant` event arrives, after the
+   * block's deltas have all been streamed. Receives the block's full text.
+   * Channels can use this to seal the in-flight streamed message and start
+   * fresh on the next block, so multi-block turns ship as multiple messages
+   * instead of a single edit-in-place that drops earlier blocks.
+   */
+  onBlockComplete?: (text: string) => void | Promise<void>;
   resolve: (response: string) => void;
   reject: (err: Error) => void;
 }
@@ -120,6 +129,11 @@ export class LiveSession {
       for (const block of event.message.content) {
         if ("text" in block) {
           this.parts.push(block.text);
+          // Signal block boundary so channels can seal the streamed message
+          // and start fresh on the next block (text → tool → text turns).
+          if (req?.onBlockComplete) {
+            await req.onBlockComplete(block.text);
+          }
         } else if ("type" in block && block.type === "tool_use") {
           const tool = block as { id?: string; name: string; input?: Record<string, unknown> };
           if (tool.id && tool.name) this.pendingToolNames.set(tool.id, tool.name);
@@ -193,7 +207,12 @@ export class LiveSession {
       // Await context usage before resolving so stats are complete
       await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
-      const response = this.parts.join("\n").trim() || "I'm not sure how to respond to that.";
+      // Trim each block; drop empty ones; rejoin for the response string
+      // returned to callers (used for transcript storage and logging).
+      // Per-block delivery happens during the stream via `onBlockComplete`,
+      // not from this final snapshot.
+      const trimmed = this.parts.map((p) => p.trim()).filter((p) => p.length > 0);
+      const response = trimmed.join("\n").trim() || "I'm not sure how to respond to that.";
       this.parts = [];
       this.streamingText = "";
       req?.resolve(response);
@@ -246,7 +265,12 @@ export class LiveSession {
     );
   }
 
-  async send(text: string, onText?: (text: string) => void, images?: Array<{ data: string; mediaType: string }>): Promise<string> {
+  async send(
+    text: string,
+    onText?: (text: string) => void,
+    images?: Array<{ data: string; mediaType: string }>,
+    onBlockComplete?: (text: string) => void | Promise<void>,
+  ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
     const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()
@@ -276,6 +300,7 @@ export class LiveSession {
       this.currentRequest = {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
         onText,
+        onBlockComplete,
         resolve: wrappedResolve,
         reject: wrappedReject,
       };

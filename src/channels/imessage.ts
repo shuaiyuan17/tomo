@@ -107,21 +107,37 @@ export class BlueBubblesChannel implements Channel {
   }
 
   createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
-    // iMessage can't edit sent messages — buffer and send on finish
+    // iMessage can't edit sent messages — buffer per block, ship at boundary
+    // (commitBlock between text blocks, finish at end of turn). NO_REPLY-only
+    // blocks are dropped silently to mirror Telegram's prefix-suppression.
     let buffer = "";
     let canceled = false;
+
+    const NO_REPLY_RE = /^\s*NO_REPLY\s*$/i;
+
+    const shipBuffer = async () => {
+      if (canceled || !buffer) return;
+      if (NO_REPLY_RE.test(buffer)) { buffer = ""; return; }
+      const text = buffer;
+      buffer = "";
+      await this.send({ chatId, text });
+    };
 
     return {
       update: (text: string) => {
         if (canceled) return;
         buffer = text;
       },
+      commitBlock: async () => {
+        if (canceled) return;
+        await shipBuffer();
+      },
       finish: async () => {
-        if (canceled || !buffer) return;
-        await this.send({ chatId, text: buffer });
+        if (canceled) return;
+        await shipBuffer();
       },
       cancel: async () => {
-        // iMessage buffers until finish, so nothing has been sent yet —
+        // iMessage buffers until ship, so nothing visible has been sent yet —
         // just mark canceled and drop the buffer.
         canceled = true;
         buffer = "";

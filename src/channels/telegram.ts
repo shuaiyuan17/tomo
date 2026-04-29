@@ -237,25 +237,54 @@ export class TelegramChannel implements Channel {
       return flushPending;
     };
 
+    /**
+     * Stop the edit timer and wait for any in-flight flush so the per-block
+     * state (messageId, lastSent, buffer) reflects what's actually on screen.
+     */
+    const stopAndDrain = async () => {
+      if (editTimer) {
+        clearInterval(editTimer);
+        editTimer = null;
+      }
+      await flushPending;
+    };
+
     return {
       update: (text: string) => {
-        if (canceled) return;
+        if (canceled || finished) return;
         buffer = text;
-        if (!editTimer && !finished) {
-          // First chunk — try to send immediately (flush will suppress
-          // if buffer still looks like a NO_REPLY prefix).
+        if (!editTimer) {
+          // First delta of this block — try to send immediately (flush will
+          // suppress if buffer still looks like a NO_REPLY prefix). After
+          // commitBlock the timer is cleared, so the next block re-enters
+          // here and gets its own immediate first send.
           flush();
           editTimer = setInterval(flush, EDIT_INTERVAL_MS);
         }
       },
+      commitBlock: async () => {
+        if (canceled || finished) return;
+        // Final flush for this block, then reset state so the next update()
+        // starts a fresh sendMessage instead of editing the previous block.
+        await stopAndDrain();
+        await flush();
+        await flushPending;
+        messageId = null;
+        lastSent = "";
+        buffer = "";
+      },
       finish: async () => {
+        if (finished) return;
         finished = true;
-        if (editTimer) clearInterval(editTimer);
+        await stopAndDrain();
         await flush();
       },
       cancel: async () => {
         canceled = true;
-        if (editTimer) clearInterval(editTimer);
+        if (editTimer) {
+          clearInterval(editTimer);
+          editTimer = null;
+        }
         // Wait for any in-flight flush so we know whether messageId got set.
         await flushPending;
         if (messageId !== null) {

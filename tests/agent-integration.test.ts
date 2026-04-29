@@ -8,8 +8,11 @@ import type { Channel, IncomingMessage, OutgoingMessage, StreamingMessage, Messa
 // Mock SDK — queue-based approach avoids async-generator timing issues
 // ---------------------------------------------------------------------------
 
-/** Controls what the mock SDK returns for each user message */
-let mockResponseFn: (text: string) => string | Promise<string> = () => "mock response";
+/** Controls what the mock SDK returns for each user message. Returning a
+ *  string emits a single text block; returning an array emits one assistant
+ *  event per element (each becomes its own text block, stitched into the
+ *  same turn — the SDK only fires `result` once at the end). */
+let mockResponseFn: (text: string) => string | string[] | Promise<string | string[]> = () => "mock response";
 
 /** Track in-flight mock queries so tests can assert no concurrency */
 const queryState = {
@@ -44,18 +47,23 @@ function createMockQuery(prompt: AsyncGenerator) {
           }
         }
 
-        const response = await mockResponseFn(text);
+        const responseValue = await mockResponseFn(text);
+        const blocks = Array.isArray(responseValue) ? responseValue : [responseValue];
 
-        // Emit stream event so onText callback fires → stream.update() gets called
-        eventQueue.push({
-          type: "stream_event",
-          event: { type: "content_block_delta", delta: { type: "text_delta", text: response } },
-        });
-
-        eventQueue.push({
-          type: "assistant",
-          message: { content: [{ text: response }] },
-        });
+        // For each block, emit a stream delta + an assistant event. This
+        // mirrors how the real SDK reports multi-block turns: text deltas
+        // arrive, then an `assistant` event consolidates the just-completed
+        // block(s). Only one `result` fires at the end of the whole turn.
+        for (const block of blocks) {
+          eventQueue.push({
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: block } },
+          });
+          eventQueue.push({
+            type: "assistant",
+            message: { content: [{ text: block }] },
+          });
+        }
 
         eventQueue.push({
           type: "result",
@@ -213,14 +221,23 @@ class MockChannel implements Channel {
   }
 
   createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
+    // Mock mirrors the per-block streaming contract: update() sets the
+    // current-block buffer, commitBlock() ships it as one delivery and
+    // resets, finish() ships the trailing buffer.
     let text = "";
     let canceled = false;
+    let finished = false;
+    const NO_REPLY_RE = /^\s*NO_REPLY\s*$/i;
+    const ship = () => {
+      if (canceled || !text) return;
+      if (NO_REPLY_RE.test(text)) { text = ""; return; }
+      this.delivered.push({ chatId, text });
+      text = "";
+    };
     return {
-      update: (t: string) => { if (!canceled) text = t; },
-      finish: async () => {
-        if (canceled || !text) return;
-        this.delivered.push({ chatId, text });
-      },
+      update: (t: string) => { if (!canceled && !finished) text = t; },
+      commitBlock: async () => { if (!canceled && !finished) ship(); },
+      finish: async () => { if (finished) return; finished = true; ship(); },
       cancel: async () => { canceled = true; text = ""; },
     };
   }
@@ -1210,6 +1227,160 @@ describe("ingress isolation", () => {
     await drainAllSessions(agent);
 
     expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+});
+
+// ===== Per-block streaming delivery (iMessage + Telegram) =====
+
+describe("per-block streaming delivery", () => {
+  it("iMessage ships a single-block response as one message", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "single block reply";
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "hi" }));
+    await drainQueue(agent);
+
+    // One block → one delivery, no merging or duplication
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("single block reply");
+
+    await agent.stop();
+  });
+
+  it("iMessage ships each text block separately on multi-block turns", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    // Three text blocks in a single turn (e.g. text → tool → text → tool → text).
+    // Without per-block ship, only the last block would survive the streaming
+    // buffer reset; with it, every block lands as its own message.
+    mockResponseFn = () => ["first block", "second block", "third block"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(3);
+    expect(im.delivered.map((d) => d.text)).toEqual(["first block", "second block", "third block"]);
+
+    await agent.stop();
+  });
+
+  it("Telegram ships each text block as its own streamed message", async () => {
+    // Telegram now matches iMessage in shape: each block becomes its own
+    // sendMessage. Edit-in-place still applies *within* a block as deltas
+    // arrive; commitBlock seals it before the next block starts.
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => ["alpha", "beta", "gamma"];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toHaveLength(3);
+    expect(tg.delivered.map((d) => d.text)).toEqual(["alpha", "beta", "gamma"]);
+
+    await agent.stop();
+  });
+
+  it("suppresses NO_REPLY when it is the entire response", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "NO_REPLY";
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "noise" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("drops a NO_REPLY block but ships the others around it", async () => {
+    // Mid-turn NO_REPLY (e.g. a tool-only block whose text resolved to bare
+    // NO_REPLY) is suppressed by both channels' streaming guards.
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => ["before", "NO_REPLY", "after"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(2);
+    expect(im.delivered.map((d) => d.text)).toEqual(["before", "after"]);
+
+    await agent.stop();
+  });
+
+  it("drops empty blocks but ships the non-empty ones", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    // Whitespace-only blocks (e.g. a tool-only assistant event with no text)
+    // should not surface as empty iMessages.
+    mockResponseFn = () => ["   ", "real content", ""];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("real content");
+
+    await agent.stop();
+  });
+
+  it("regression: a throwing commitBlock does not kill the live session", async () => {
+    // onBlockComplete fires inside the SDK event loop. If commitBlock throws
+    // (e.g. transient BlueBubbles HTTP error), the error must not propagate
+    // into LiveSession.consumeEvents — that would mark the session dead and
+    // trip runWithRetry's "session error" branch, double-firing the turn.
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+
+    // Override commitBlock to throw on the first call only. The test verifies
+    // the turn still resolves cleanly, the response is captured, and the
+    // session isn't restarted (would manifest as queryState.maxConcurrent > 1
+    // or duplicate deliveries).
+    let firstCall = true;
+    const origCreate = im.createStreamingMessage.bind(im);
+    im.createStreamingMessage = (chatId: string, replyTo?: string) => {
+      const stream = origCreate(chatId, replyTo);
+      const realCommit = stream.commitBlock.bind(stream);
+      stream.commitBlock = async () => {
+        if (firstCall) {
+          firstCall = false;
+          throw new Error("transient BlueBubbles HTTP error");
+        }
+        return realCommit();
+      };
+      return stream;
+    };
+    agent.addChannel(im);
+
+    mockResponseFn = () => ["block-a", "block-b"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    // Block A's commit threw → no delivery for A. Block B succeeds.
+    // (We don't assert on A specifically — just that the turn didn't double-fire.)
+    expect(queryState.maxConcurrent).toBe(1);
+    // Exactly one block delivered (block-b). Block-a was lost to the thrown
+    // commitBlock, but the run completed instead of restarting.
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("block-b");
 
     await agent.stop();
   });

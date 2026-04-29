@@ -1,8 +1,22 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildImagePath, mimeToExt, saveInboundImage } from "../src/channels/imageStore.js";
+
+// Stub the logger so the intentionally-failing "bad baseDir" test doesn't
+// flush a real ERROR line to stderr — pino is async and the line lands at
+// unpredictable times relative to vitest's summary, making test output
+// look intermittently broken.
+vi.mock("../src/logger.js", () => ({
+  log: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+const { buildImagePath, mimeToExt, saveInboundImage } = await import("../src/channels/imageStore.js");
 
 describe("mimeToExt", () => {
   it("maps common image types", () => {

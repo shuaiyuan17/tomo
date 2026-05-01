@@ -635,7 +635,7 @@ export class Agent {
         if (usedFrac >= HIGH && !nudged) {
           this.contextNudged.set(key, true);
           const pct = Math.round(usedFrac * 100);
-          const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last 32 raw events as fresh tail. After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+          const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail. After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
           log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
           // Fire-and-forget — don't block the current reply on the nudge
           this.handleCronMessage(nudge, key).catch((err) => {

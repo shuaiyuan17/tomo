@@ -62,8 +62,8 @@ describe("readWholeFile", () => {
     appendFileSync(path, JSON.stringify(e2) + "\n");
 
     const late = readSinceOffset(path, size);
-    expect(late).toHaveLength(1);
-    expect(late[0].uuid).toBe(e2.uuid);
+    expect(late.events).toHaveLength(1);
+    expect(late.events[0].uuid).toBe(e2.uuid);
   });
 });
 
@@ -78,14 +78,16 @@ describe("readSinceOffset", () => {
     if (existsSync(path)) unlinkSync(path);
   });
 
-  it("returns [] when no bytes were appended after the offset", () => {
+  it("returns no events and unchanged readUpTo when nothing was appended", () => {
     const e = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "hello");
     writeFileSync(path, JSON.stringify(e) + "\n");
     const offset = statSync(path).size;
-    expect(readSinceOffset(path, offset)).toEqual([]);
+    const r = readSinceOffset(path, offset);
+    expect(r.events).toEqual([]);
+    expect(r.readUpTo).toBe(offset);
   });
 
-  it("returns events appended after a captured byte offset", () => {
+  it("returns events and an exact read-up-to offset for complete bytes", () => {
     const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "first");
     writeFileSync(path, JSON.stringify(e1) + "\n");
     const offset = statSync(path).size;
@@ -94,25 +96,48 @@ describe("readSinceOffset", () => {
     const e3 = mkUserEvent(e2.uuid, "2026-04-30T00:02:00.000Z", "second");
     appendFileSync(path, JSON.stringify(e2) + "\n" + JSON.stringify(e3) + "\n");
 
-    const late = readSinceOffset(path, offset);
-    expect(late).toHaveLength(2);
-    expect(late[0].uuid).toBe(e2.uuid);
-    expect(late[1].uuid).toBe(e3.uuid);
+    const r = readSinceOffset(path, offset);
+    expect(r.events).toHaveLength(2);
+    expect(r.events[0].uuid).toBe(e2.uuid);
+    expect(r.events[1].uuid).toBe(e3.uuid);
+    expect(r.readUpTo).toBe(statSync(path).size);
   });
 
-  it("skips trailing partial lines (mid-append, no newline yet)", () => {
+  it("does NOT advance readUpTo past a trailing partial line", () => {
+    // Critical: if a mid-write partial sits at the tail, the cursor must
+    // stay before it so a subsequent pass can re-read once the SDK flushes
+    // the rest. Advancing to current EOF would lose the in-flight event.
     const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "first");
     writeFileSync(path, JSON.stringify(e1) + "\n");
     const offset = statSync(path).size;
 
-    // Append a complete line, then a half-written one (no closing }, no \n).
     const e2 = mkAssistantEvent(e1.uuid, "2026-04-30T00:01:00.000Z", "ok");
-    appendFileSync(path, JSON.stringify(e2) + "\n");
-    appendFileSync(path, '{"type":"user","uuid":"abc","par');  // partial
+    const completeAppend = JSON.stringify(e2) + "\n";
+    appendFileSync(path, completeAppend);
+    const offsetAfterE2 = offset + Buffer.byteLength(completeAppend, "utf-8");
+    const partial = '{"type":"user","uuid":"abc","par';
+    appendFileSync(path, partial);
 
-    const late = readSinceOffset(path, offset);
-    expect(late).toHaveLength(1);
-    expect(late[0].uuid).toBe(e2.uuid);
+    const r = readSinceOffset(path, offset);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].uuid).toBe(e2.uuid);
+    expect(r.readUpTo).toBe(offsetAfterE2);
+    // Specifically: readUpTo must NOT equal the current file size (which
+    // includes the partial bytes). Otherwise the partial gets clobbered.
+    expect(r.readUpTo).toBeLessThan(statSync(path).size);
+  });
+
+  it("returns readUpTo === offset when the entire tail is one partial line", () => {
+    // No complete line at all in the tail → caller must not advance cursor.
+    const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "first");
+    writeFileSync(path, JSON.stringify(e1) + "\n");
+    const offset = statSync(path).size;
+
+    appendFileSync(path, '{"type":"user","uuid":"abc","par');
+
+    const r = readSinceOffset(path, offset);
+    expect(r.events).toEqual([]);
+    expect(r.readUpTo).toBe(offset);
   });
 });
 

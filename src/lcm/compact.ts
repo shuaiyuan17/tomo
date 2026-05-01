@@ -1,6 +1,6 @@
 import {
   writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
-  statSync, openSync, fstatSync, readSync, closeSync, renameSync,
+  openSync, fstatSync, readSync, closeSync, renameSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -202,18 +202,23 @@ export function compactSession(req: CompactRequest): CompactResult {
   // truncate-rewrite without splicing them in, they're lost and any later
   // tool_result lands with a parentUuid pointing at a vanished tool_use.
   //
-  // We loop: re-read the tail, splice it, then re-stat. If the file grew
-  // again while we were splicing, repeat. This drives the residual race
-  // window down to "between the final tail-read and the rename" — typically
-  // microseconds. Closing it fully would require either an advisory lock
-  // honored by the SDK or daemon-side coordination that pauses appends
-  // during compact. See followup.
+  // Loop: re-read the tail and splice events one pass at a time, advancing
+  // the cursor only to the precise offset readSinceOffset reports as fully
+  // consumed (NOT a fresh statSync — that would skip bytes appended between
+  // readSinceOffset's internal fstat and the outer stat). Stop when a pass
+  // makes no progress: either the file didn't grow, or the only new bytes
+  // are a partial mid-write line.
+  //
+  // Residual race: any append that lands strictly between the final
+  // readSinceOffset and the rename below is still lost. Window is sub-
+  // millisecond; fully closing it requires advisory locks honored by the
+  // SDK or daemon-side append pausing. Tracked as a follow-up.
   let cursor = bytesAtRead;
   let lateAppended = 0;
   const seenLateUuids = new Set<string>();
   for (let pass = 0; pass < 8; pass++) {
-    const lateEvents = readSinceOffset(path, cursor);
-    if (lateEvents.length === 0) break;
+    const { events: lateEvents, readUpTo } = readSinceOffset(path, cursor);
+    if (readUpTo === cursor) break; // no complete bytes since last cursor
     for (const e of lateEvents) {
       // Defense in depth against the duplication race: skip any uuid we've
       // already spliced in. (The atomic read above should make this
@@ -227,7 +232,7 @@ export function compactSession(req: CompactRequest): CompactResult {
       lateAppended++;
       if (e.uuid) seenLateUuids.add(e.uuid);
     }
-    cursor = statSync(path).size;
+    cursor = readUpTo;
   }
 
   // Atomic write: stage the new content in a sibling temp file and rename
@@ -291,26 +296,48 @@ export function readWholeFile(path: string): { text: string; size: number } {
 /**
  * Read events appended to a JSONL file after a given byte offset.
  *
- * Used to recover events the SDK wrote between our initial read and our
- * truncate-rewrite. Skips trailing partial lines (the SDK was mid-append) —
- * those will be re-written cleanly to the new file by the SDK's next attempt.
+ * Returns:
+ *   - `events`: parsed events in the bytes read
+ *   - `readUpTo`: the byte offset of the END of the last complete line we
+ *     consumed. The caller must advance any cursor strictly to this — never
+ *     to a fresh statSync, which would skip bytes appended after our internal
+ *     fstat but before the outer stat. Partial trailing bytes (SDK mid-write)
+ *     stay below `readUpTo` so a subsequent pass can re-read them once the
+ *     write completes.
  *
  * Exported for testing only.
  */
-export function readSinceOffset(path: string, offset: number): SdkEvent[] {
-  const size = statSync(path).size;
-  if (size <= offset) return [];
+export function readSinceOffset(
+  path: string,
+  offset: number,
+): { events: SdkEvent[]; readUpTo: number } {
   const fd = openSync(path, "r");
   try {
+    const size = fstatSync(fd).size;
+    if (size <= offset) return { events: [], readUpTo: offset };
     const buf = Buffer.alloc(size - offset);
-    readSync(fd, buf, 0, buf.length, offset);
-    const out: SdkEvent[] = [];
-    for (const line of buf.toString("utf-8").split("\n")) {
+    let total = 0;
+    while (total < buf.length) {
+      const n = readSync(fd, buf, total, buf.length - total, offset + total);
+      if (n === 0) break;
+      total += n;
+    }
+    // Locate the last newline. Bytes up to and including that newline form
+    // complete lines; anything after is a partial mid-write tail we leave
+    // alone so the next pass can re-read it.
+    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
+    if (lastNl < 0) {
+      // No complete line yet — caller's cursor must NOT advance.
+      return { events: [], readUpTo: offset };
+    }
+    const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
+    const events: SdkEvent[] = [];
+    for (const line of completeBytes.split("\n")) {
       const t = line.trim();
       if (!t) continue;
-      try { out.push(JSON.parse(t)); } catch { /* partial / malformed — skip */ }
+      try { events.push(JSON.parse(t)); } catch { /* malformed but complete — skip */ }
     }
-    return out;
+    return { events, readUpTo: offset + lastNl + 1 };
   } finally {
     closeSync(fd);
   }

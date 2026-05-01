@@ -40,7 +40,8 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,
-    "groupCompactStyle": "sdk"
+    "groupCompactStyle": "sdk",
+    "dailyFreshTail": 32
   }
 }
 ```
@@ -67,7 +68,8 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
 | `lcm.nudgeAtPct` | number | Context-usage % at which the harness nudges the agent to run `tomo lcm daily`. Default `70`. Lower = compact earlier and more often. |
 | `lcm.nudgeResetPct` | number | Hysteresis reset threshold — the "already nudged" flag clears once usage drops below this %. Default `60`. Must be less than `nudgeAtPct`; invalid values fall back to defaults. |
-| `lcm.groupCompactStyle` | string | `"sdk"` (default) or `"lcm"`. `"sdk"` lets the SDK auto-compact group sessions; `"lcm"` opts groups into the same hierarchical LCM flow as DMs (disables SDK auto-compact and fires the daily/80% nudges). DMs always use LCM regardless. |
+| `lcm.groupCompactStyle` | string | `"sdk"` (default) or `"lcm"`. `"sdk"` lets the SDK auto-compact group sessions; `"lcm"` opts groups into the same hierarchical LCM flow as DMs (disables SDK auto-compact and fires all three harness nudges: 70% daily, 80% safety net, and the periodic rollup runner). DMs always use LCM regardless. |
+| `lcm.dailyFreshTail` | number | Number of most-recent raw user/assistant events kept outside today's daily rollup so mid-day compacts don't wipe warm short-term texture. Default `32`. Counts SDK events (one tool round = multiple events), not user-typed messages. Set to `0` to compact every event into today's block. Past days are always compacted in full regardless of this value. |
 
 ## Requirements and overrides
 

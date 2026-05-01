@@ -1,5 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
+import { config } from "../config.js";
 
 /**
  * Hierarchical rollup block tags live on compact summary events. Each level
@@ -82,8 +83,11 @@ function localMonthTag(d: Date): string {
  * For daily rollups, keep the most recent N raw events outside the
  * compacted range so mid-day compacts don't wipe warm short-term texture.
  * Weekly+ consume block summaries (not raw events), so this doesn't apply.
+ * Override via config.lcm.dailyFreshTail.
  */
-const DAILY_FRESH_TAIL = 32;
+function dailyFreshTail(): number {
+  return config.lcm.dailyFreshTail;
+}
 
 /**
  * Resolve the event range for a given rollup level + optional explicit period.
@@ -124,17 +128,18 @@ export function resolveBlockRange(
 
   // Daily rollup only: preserve a fresh tail of the most recent raw events.
   // The existing daily block (if any) and any earlier raw events still get
-  // compacted — we just stop short of the last DAILY_FRESH_TAIL matches.
+  // compacted — we just stop short of the last `tail` matches.
   //
   // The fresh tail only applies to *today*'s rollup (mid-day compacts shouldn't
   // wipe warm short-term texture). Past days are already cold — compact them
   // in full, regardless of event count. Without this distinction, any past day
-  // with ≤ DAILY_FRESH_TAIL raw events can never be rolled up and stays
-  // forever in the hot context as un-promoted raw events.
+  // with ≤ tail raw events can never be rolled up and stays forever in the
+  // hot context as un-promoted raw events.
   let effectiveMatches = matches;
   if (level === "daily" && resolvedPeriod === localDateTag(new Date())) {
+    const tail = dailyFreshTail();
     const rawOnly = matches.filter((idx) => !events[idx].isCompactSummary);
-    if (rawOnly.length <= DAILY_FRESH_TAIL) {
+    if (rawOnly.length <= tail) {
       // Nothing outside the fresh tail to compact (and no existing block to rebuild).
       if (!matches.some((idx) => events[idx].isCompactSummary)) {
         return null;
@@ -142,7 +147,7 @@ export function resolveBlockRange(
       // Existing block exists but all raw is within fresh tail → compact just the block.
       effectiveMatches = matches.filter((idx) => events[idx].isCompactSummary);
     } else {
-      const tailStart = rawOnly[rawOnly.length - DAILY_FRESH_TAIL];
+      const tailStart = rawOnly[rawOnly.length - tail];
       effectiveMatches = matches.filter((idx) => idx < tailStart || events[idx].isCompactSummary);
     }
   }

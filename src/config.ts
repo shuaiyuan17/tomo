@@ -21,6 +21,10 @@ export interface LcmConfig {
   /** Compaction strategy for group sessions. "sdk" leaves SDK auto-compact on
    *  (default); "lcm" disables it and runs the same hierarchical LCM nudges as DMs. */
   groupCompactStyle: "sdk" | "lcm";
+  /** Number of most-recent raw user/assistant events kept outside today's daily
+   *  rollup so mid-day compacts don't wipe warm short-term texture. Counts SDK
+   *  events (one tool round = multiple events), not user-typed messages. */
+  dailyFreshTail: number;
 }
 
 interface TomoConfig {
@@ -58,14 +62,17 @@ function parseLcmConfig(raw: unknown): LcmConfig {
   const nudgeAt = Number(r.nudgeAtPct ?? 70);
   const nudgeReset = Number(r.nudgeResetPct ?? 60);
   const style = r.groupCompactStyle === "lcm" ? "lcm" : "sdk";
+  const tail = Number(r.dailyFreshTail ?? 32);
 
   // Fall back to defaults on nonsense input (out of [1,100], or LOW >= HIGH).
   const validHigh = Number.isFinite(nudgeAt) && nudgeAt > 0 && nudgeAt <= 100;
   const validLow = Number.isFinite(nudgeReset) && nudgeReset >= 0 && nudgeReset < nudgeAt;
+  const validTail = Number.isInteger(tail) && tail >= 0;
   return {
     nudgeAtPct: validHigh ? nudgeAt : 70,
     nudgeResetPct: validHigh && validLow ? nudgeReset : (validHigh ? Math.max(0, nudgeAt - 10) : 60),
     groupCompactStyle: style,
+    dailyFreshTail: validTail ? tail : 32,
   };
 }
 

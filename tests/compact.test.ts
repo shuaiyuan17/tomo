@@ -41,13 +41,14 @@ describe("readWholeFile", () => {
     if (existsSync(path)) unlinkSync(path);
   });
 
-  it("returns text + exact byte count of what was read", () => {
+  it("returns text + exact byte count when the file ends with a newline", () => {
     const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "hello");
     writeFileSync(path, JSON.stringify(e1) + "\n");
     const expected = statSync(path).size;
-    const { text, size } = readWholeFile(path);
+    const { text, size, hasPartialTail } = readWholeFile(path);
     expect(size).toBe(expected);
     expect(text).toContain(e1.uuid);
+    expect(hasPartialTail).toBe(false);
   });
 
   it("returns size that exactly bounds what readSinceOffset will skip", () => {
@@ -64,6 +65,23 @@ describe("readWholeFile", () => {
     const late = readSinceOffset(path, size);
     expect(late.events).toHaveLength(1);
     expect(late.events[0].uuid).toBe(e2.uuid);
+  });
+
+  it("stops at last-newline boundary and flags partial tail", () => {
+    // If the file ends with a partial in-flight write, size must point at
+    // the last-newline+1 (NOT current EOF) so the partial sits outside the
+    // snapshot and the late-splice loop can re-detect it.
+    const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "first");
+    writeFileSync(path, JSON.stringify(e1) + "\n");
+    const offsetAfterE1 = statSync(path).size;
+    appendFileSync(path, '{"type":"user","uuid":"in-flight","par');
+
+    const { text, size, hasPartialTail } = readWholeFile(path);
+    expect(size).toBe(offsetAfterE1);
+    expect(size).toBeLessThan(statSync(path).size);
+    expect(text).toContain(e1.uuid);
+    expect(text).not.toContain("in-flight");
+    expect(hasPartialTail).toBe(true);
   });
 });
 
@@ -85,6 +103,7 @@ describe("readSinceOffset", () => {
     const r = readSinceOffset(path, offset);
     expect(r.events).toEqual([]);
     expect(r.readUpTo).toBe(offset);
+    expect(r.hasPartialTail).toBe(false);
   });
 
   it("returns events and an exact read-up-to offset for complete bytes", () => {
@@ -101,6 +120,7 @@ describe("readSinceOffset", () => {
     expect(r.events[0].uuid).toBe(e2.uuid);
     expect(r.events[1].uuid).toBe(e3.uuid);
     expect(r.readUpTo).toBe(statSync(path).size);
+    expect(r.hasPartialTail).toBe(false);
   });
 
   it("does NOT advance readUpTo past a trailing partial line", () => {
@@ -125,6 +145,9 @@ describe("readSinceOffset", () => {
     // Specifically: readUpTo must NOT equal the current file size (which
     // includes the partial bytes). Otherwise the partial gets clobbered.
     expect(r.readUpTo).toBeLessThan(statSync(path).size);
+    // Caller must see the partial flag so it can wait/abort instead of
+    // proceeding to a destructive rewrite.
+    expect(r.hasPartialTail).toBe(true);
   });
 
   it("returns readUpTo === offset when the entire tail is one partial line", () => {
@@ -138,6 +161,7 @@ describe("readSinceOffset", () => {
     const r = readSinceOffset(path, offset);
     expect(r.events).toEqual([]);
     expect(r.readUpTo).toBe(offset);
+    expect(r.hasPartialTail).toBe(true);
   });
 });
 
@@ -192,6 +216,53 @@ describe("compactSession", () => {
     expect(out[1].isCompactSummary).toBe(true);
     // Chain still walks: event 4's parent should now be the summary
     expect(out[2].parentUuid).toBe(out[1].uuid);
+  });
+
+  it("aborts (does not rename) when the file ends in a partial SDK write", () => {
+    // The race we're guarding against: SDK is mid-append in a separate
+    // process when compactSession runs. If we rename the temp over the
+    // original while the file ends in partial bytes, those bytes are gone
+    // (the SDK re-opens the path on next append, finds the new inode, and
+    // never gets to flush the rest of its in-flight write to the old one).
+    //
+    // The simulation: we never complete the partial. After 8 retry passes
+    // (~35ms wall), compactSession should abort cleanly: original file
+    // intact, no .compacting.tmp leftover, success === false.
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0
+        ? mkUserEvent(parent, ts, `msg ${i}`)
+        : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    const initialContent = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, initialContent);
+    // Append a partial line that never completes — simulates SDK mid-write.
+    const partial = '{"type":"assistant","uuid":"in-flight","par';
+    appendFileSync(path, partial);
+    const sizeBefore = statSync(path).size;
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      fromIdx: 1,
+      toIdx: 3,
+      summary: "should not be applied",
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/partial/i);
+    // Original file untouched — partial bytes still there for SDK to finish.
+    expect(statSync(path).size).toBe(sizeBefore);
+    expect(readFileSync(path, "utf-8").endsWith(partial)).toBe(true);
+    // No leftover tmp file from a failed rename attempt.
+    expect(existsSync(path + ".compacting.tmp")).toBe(false);
+    // No archive side effect — caller can retry without duplicate transcript.
+    expect(existsSync(archivePath)).toBe(false);
   });
 
   it("re-stitches parentUuid on post-range events whose parent was removed", () => {

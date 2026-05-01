@@ -75,13 +75,13 @@ export function compactSession(req: CompactRequest): CompactResult {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
-  // Atomic read: open once, fstat the FD to get the byte count we're about
-  // to read, then read exactly that many bytes. This pins `bytesAtRead` to
-  // the bytes we actually loaded — anything the SDK appends after this is
-  // strictly outside `allEvents` and will be picked up by the late-splice
-  // pass at write time. Doing `statSync` then `readFileSync` separately
-  // would let an SDK append slip into both reads (counted in `allEvents`
-  // AND in the late tail), producing duplicate uuids in the output.
+  // Atomic read: open once, fstat the FD, then read exactly that many bytes.
+  // `bytesAtRead` is pinned to the last-newline boundary (NOT current EOF) so
+  // that any partial mid-write tail stays *outside* the snapshot — the
+  // late-splice loop will see it as `hasPartialTail` and either consume it
+  // on a later pass or abort the compact. Doing `statSync` then
+  // `readFileSync` separately would let an SDK append slip into both reads
+  // (counted in `allEvents` AND in the late tail), producing duplicate uuids.
   const snapshot = readWholeFile(path);
   const bytesAtRead = snapshot.size;
   const allEvents: SdkEvent[] = [];
@@ -135,9 +135,6 @@ export function compactSession(req: CompactRequest): CompactResult {
   for (let i = removeStartGlobal; i <= removeEndGlobal; i++) {
     removeSet.add(i);
   }
-
-  // Archive removed events to transcript
-  archiveEvents(req.transcriptPath, allEvents, removeSet);
 
   // Find the parentUuid chain endpoints
   const firstRemoved = allEvents[removeStartGlobal];
@@ -205,20 +202,17 @@ export function compactSession(req: CompactRequest): CompactResult {
   // Loop: re-read the tail and splice events one pass at a time, advancing
   // the cursor only to the precise offset readSinceOffset reports as fully
   // consumed (NOT a fresh statSync — that would skip bytes appended between
-  // readSinceOffset's internal fstat and the outer stat). Stop when a pass
-  // makes no progress: either the file didn't grow, or the only new bytes
-  // are a partial mid-write line.
-  //
-  // Residual race: any append that lands strictly between the final
-  // readSinceOffset and the rename below is still lost. Window is sub-
-  // millisecond; fully closing it requires advisory locks honored by the
-  // SDK or daemon-side append pausing. Tracked as a follow-up.
+  // readSinceOffset's internal fstat and the outer stat). When a pass
+  // observes a partial trailing line (SDK mid-write in another process),
+  // sleep briefly before retrying so the SDK process gets scheduled and can
+  // flush the rest. If the partial is *still* pending after all retries,
+  // abort the compact rather than rename and clobber the partial bytes.
   let cursor = bytesAtRead;
   let lateAppended = 0;
   const seenLateUuids = new Set<string>();
+  let partialStillPending = false;
   for (let pass = 0; pass < 8; pass++) {
-    const { events: lateEvents, readUpTo } = readSinceOffset(path, cursor);
-    if (readUpTo === cursor) break; // no complete bytes since last cursor
+    const { events: lateEvents, readUpTo, hasPartialTail } = readSinceOffset(path, cursor);
     for (const e of lateEvents) {
       // Defense in depth against the duplication race: skip any uuid we've
       // already spliced in. (The atomic read above should make this
@@ -233,7 +227,36 @@ export function compactSession(req: CompactRequest): CompactResult {
       if (e.uuid) seenLateUuids.add(e.uuid);
     }
     cursor = readUpTo;
+    partialStillPending = hasPartialTail;
+    if (!hasPartialTail) break; // file consumed cleanly through EOF
+    // Sub-ms partial: yield enough wall time for the SDK process to flush.
+    // 5ms × up-to-7 retries = 35ms worst case, plenty for kernel scheduling.
+    if (pass < 7) sleepMs(5);
   }
+
+  // If the SDK is mid-write through the final retry, the file still ends in
+  // a partial line. Renaming now would clobber those bytes (the rename
+  // unlinks the old inode; the SDK re-opens the path on next append, so the
+  // partial bytes are unreachable). Abort instead — the caller's retry path
+  // will pick this back up once the SDK finishes its write.
+  if (partialStillPending) {
+    log.warn({
+      sessionId: req.sdkSessionId,
+      fromIdx: req.fromIdx,
+      toIdx: req.toIdx,
+    }, "Compact aborted: SDK partial write still pending after retries");
+    return {
+      success: false,
+      eventsRemoved: 0,
+      eventsAfter: allEvents.length,
+      error: "Partial SDK write in flight; retry",
+    };
+  }
+
+  // Archive removed events to transcript. Done after the abort check so a
+  // failed compact leaves no side effects (no duplicate archive lines on
+  // retry).
+  archiveEvents(req.transcriptPath, allEvents, removeSet);
 
   // Atomic write: stage the new content in a sibling temp file and rename
   // into place. The rename is atomic at the filesystem level, so the SDK's
@@ -268,26 +291,46 @@ export function compactSession(req: CompactRequest): CompactResult {
 }
 
 /**
- * Read the entire file atomically, pinning the byte count to what was
- * actually read. Returning `{text, size}` lets the caller use `size` as a
- * lower-bound cursor for any later append-splice without risk of an
- * overlap (i.e. the same event being counted in both `allEvents` and the
- * late tail).
+ * Read the file atomically up through the last complete line.
+ *
+ * Returns `{text, size, hasPartialTail}`:
+ *   - `text`: bytes up to and including the last `\n` (no partial).
+ *   - `size`: byte offset of the last-newline+1. The caller uses this as
+ *     the cursor for any later append-splice. Pinning to the last-newline
+ *     boundary (NOT current EOF) is critical: if the file ends mid-write,
+ *     setting the cursor at EOF would cause the late-splice loop to never
+ *     re-read those partial bytes once the SDK flushes the rest.
+ *   - `hasPartialTail`: true when the file ends without a newline (an SDK
+ *     write was in flight at read time). The caller must treat this as a
+ *     pending write and refuse to rename until it resolves.
  *
  * Exported for testing only.
  */
-export function readWholeFile(path: string): { text: string; size: number } {
+export function readWholeFile(path: string): {
+  text: string;
+  size: number;
+  hasPartialTail: boolean;
+} {
   const fd = openSync(path, "r");
   try {
-    const size = fstatSync(fd).size;
-    const buf = Buffer.alloc(size);
+    const totalSize = fstatSync(fd).size;
+    const buf = Buffer.alloc(totalSize);
     let total = 0;
-    while (total < size) {
-      const n = readSync(fd, buf, total, size - total, total);
+    while (total < totalSize) {
+      const n = readSync(fd, buf, total, totalSize - total, total);
       if (n === 0) break; // EOF earlier than fstat reported (shouldn't happen)
       total += n;
     }
-    return { text: buf.subarray(0, total).toString("utf-8"), size: total };
+    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
+    if (lastNl < 0) {
+      // Empty file, or file is one in-flight partial line.
+      return { text: "", size: 0, hasPartialTail: total > 0 };
+    }
+    return {
+      text: buf.subarray(0, lastNl + 1).toString("utf-8"),
+      size: lastNl + 1,
+      hasPartialTail: total > lastNl + 1,
+    };
   } finally {
     closeSync(fd);
   }
@@ -304,17 +347,20 @@ export function readWholeFile(path: string): { text: string; size: number } {
  *     fstat but before the outer stat. Partial trailing bytes (SDK mid-write)
  *     stay below `readUpTo` so a subsequent pass can re-read them once the
  *     write completes.
+ *   - `hasPartialTail`: true when bytes exist past `readUpTo` (i.e. an SDK
+ *     write is mid-flight). The caller must NOT proceed to a destructive
+ *     rewrite while this is true — the partial bytes would be clobbered.
  *
  * Exported for testing only.
  */
 export function readSinceOffset(
   path: string,
   offset: number,
-): { events: SdkEvent[]; readUpTo: number } {
+): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
   const fd = openSync(path, "r");
   try {
     const size = fstatSync(fd).size;
-    if (size <= offset) return { events: [], readUpTo: offset };
+    if (size <= offset) return { events: [], readUpTo: offset, hasPartialTail: false };
     const buf = Buffer.alloc(size - offset);
     let total = 0;
     while (total < buf.length) {
@@ -327,8 +373,8 @@ export function readSinceOffset(
     // alone so the next pass can re-read it.
     const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
     if (lastNl < 0) {
-      // No complete line yet — caller's cursor must NOT advance.
-      return { events: [], readUpTo: offset };
+      // Entire tail is one partial line — caller's cursor must NOT advance.
+      return { events: [], readUpTo: offset, hasPartialTail: total > 0 };
     }
     const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
     const events: SdkEvent[] = [];
@@ -337,10 +383,24 @@ export function readSinceOffset(
       if (!t) continue;
       try { events.push(JSON.parse(t)); } catch { /* malformed but complete — skip */ }
     }
-    return { events, readUpTo: offset + lastNl + 1 };
+    return {
+      events,
+      readUpTo: offset + lastNl + 1,
+      hasPartialTail: total > lastNl + 1,
+    };
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * Synchronous millisecond sleep. Uses Atomics.wait on a SharedArrayBuffer
+ * because compactSession's API contract is sync — we need the loop to yield
+ * wall time so the SDK's separate-process appends get scheduled, without
+ * restructuring the caller as async.
+ */
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /** Archive removed events to a transcript JSONL file */

@@ -1,6 +1,7 @@
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
-import { findDuePromotions, isGroupSessionKey, type DuePromotion } from "./blocks.js";
+import { findDuePromotions, type DuePromotion } from "./blocks.js";
+import { usesLcmCompact } from "../agent/sdk-options.js";
 
 /**
  * Periodic rollup promotion checker.
@@ -49,6 +50,8 @@ function nudgeText(p: DuePromotion, sdkSessionId: string): string {
     "If a period genuinely has more irreducible texture than fits, exceed the budget and flag it in the summary.",
     "",
     "Note: this is the only rollup nudge for this tick. If other periods are also due, the next heartbeat (~1h) will pick up the next one. Don't chain multiple compacts in a single turn — running two `tomo lcm` calls back-to-back can race the SDK's in-memory state and orphan the chain.",
+    "",
+    "After the rollup finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.",
   ];
   void commandFor; // keep reference for potential future use
   return lines.join("\n");
@@ -83,8 +86,9 @@ export class RollupRunner {
     }
     const now = Date.now();
     for (const [sessionKey, sdkSessionId] of this.agent.listActiveSessions()) {
-      // Group sessions use SDK default compact — no custom LCM nudges.
-      if (isGroupSessionKey(sessionKey)) continue;
+      // Skip sessions on SDK auto-compact (groups by default; opt in via
+      // config.lcm.groupCompactStyle="lcm" to enroll groups in LCM nudges).
+      if (!usesLcmCompact(sessionKey)) continue;
       try {
         const due = findDuePromotions(sdkSessionId);
         if (due.length === 0) continue;

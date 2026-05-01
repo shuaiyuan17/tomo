@@ -1,6 +1,6 @@
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
-import { findDuePromotions, type DuePromotion } from "./blocks.js";
+import { findDuePromotions, isGroupSessionKey, type DuePromotion } from "./blocks.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 
 /**
@@ -32,7 +32,7 @@ function commandFor(p: DuePromotion): string {
   return `tomo lcm ${p.level} --session-id <SESSION_ID> ${flag} ${p.period} --summary "..."`;
 }
 
-function nudgeText(p: DuePromotion, sdkSessionId: string): string {
+function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
   const flag = p.level === "daily" ? "--date" :
                p.level === "weekly" ? "--week" :
                p.level === "monthly" ? "--month" : "--year";
@@ -53,6 +53,12 @@ function nudgeText(p: DuePromotion, sdkSessionId: string): string {
     "",
     "After the rollup finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.",
   ];
+  if (isGroupSessionKey(sessionKey)) {
+    lines.splice(5, 0,
+      "Group scope: this is a group session — keep the rollup focused on this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere.",
+      "",
+    );
+  }
   void commandFor; // keep reference for potential future use
   return lines.join("\n");
 }
@@ -117,7 +123,7 @@ export class RollupRunner {
           { sessionKey, picking: `${next.level} ${next.period}`, deferred: fresh.length - 1 },
           "Rollup nudge (one level/tick)",
         );
-        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId), sessionKey);
+        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey);
         this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
       } catch (err) {
         log.warn({ err, sessionKey }, "Rollup check failed");

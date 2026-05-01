@@ -1,4 +1,7 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import {
+  writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
+  openSync, fstatSync, readSync, closeSync, renameSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath, getSdkSessionDir } from "../sessions/index.js";
@@ -72,11 +75,20 @@ export function compactSession(req: CompactRequest): CompactResult {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
-  const lines = readFileSync(path, "utf-8").trim().split("\n");
+  // Atomic read: open once, fstat the FD, then read exactly that many bytes.
+  // `bytesAtRead` is pinned to the last-newline boundary (NOT current EOF) so
+  // that any partial mid-write tail stays *outside* the snapshot — the
+  // late-splice loop will see it as `hasPartialTail` and either consume it
+  // on a later pass or abort the compact. Doing `statSync` then
+  // `readFileSync` separately would let an SDK append slip into both reads
+  // (counted in `allEvents` AND in the late tail), producing duplicate uuids.
+  const snapshot = readWholeFile(path);
+  const bytesAtRead = snapshot.size;
   const allEvents: SdkEvent[] = [];
-  for (const line of lines) {
-    if (!line) continue;
-    try { allEvents.push(JSON.parse(line)); } catch { continue; }
+  for (const line of snapshot.text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try { allEvents.push(JSON.parse(t)); } catch { continue; }
   }
 
   // Separate conversation events (user/assistant) from metadata events
@@ -123,9 +135,6 @@ export function compactSession(req: CompactRequest): CompactResult {
   for (let i = removeStartGlobal; i <= removeEndGlobal; i++) {
     removeSet.add(i);
   }
-
-  // Archive removed events to transcript
-  archiveEvents(req.transcriptPath, allEvents, removeSet);
 
   // Find the parentUuid chain endpoints
   const firstRemoved = allEvents[removeStartGlobal];
@@ -184,9 +193,82 @@ export function compactSession(req: CompactRequest): CompactResult {
     newEvents.push(event);
   }
 
-  // Write the new session file
+  // Late-arrival splice: re-read any bytes the SDK appended after our initial
+  // read. These are events written while we were processing — typically the
+  // agent's own thinking/tool_use that triggered this compact via Bash. If we
+  // truncate-rewrite without splicing them in, they're lost and any later
+  // tool_result lands with a parentUuid pointing at a vanished tool_use.
+  //
+  // Loop: re-read the tail and splice events one pass at a time, advancing
+  // the cursor only to the precise offset readSinceOffset reports as fully
+  // consumed (NOT a fresh statSync — that would skip bytes appended between
+  // readSinceOffset's internal fstat and the outer stat). When a pass
+  // observes a partial trailing line (SDK mid-write in another process),
+  // sleep briefly before retrying so the SDK process gets scheduled and can
+  // flush the rest. If the partial is *still* pending after all retries,
+  // abort the compact rather than rename and clobber the partial bytes.
+  let cursor = bytesAtRead;
+  let lateAppended = 0;
+  const seenLateUuids = new Set<string>();
+  let partialStillPending = false;
+  for (let pass = 0; pass < 8; pass++) {
+    const { events: lateEvents, readUpTo, hasPartialTail } = readSinceOffset(path, cursor);
+    for (const e of lateEvents) {
+      // Defense in depth against the duplication race: skip any uuid we've
+      // already spliced in. (The atomic read above should make this
+      // impossible, but a duplicated splice would corrupt the chain.)
+      if (e.uuid && seenLateUuids.has(e.uuid)) continue;
+      const event = { ...e };
+      if (event.parentUuid && removedUuids.has(event.parentUuid)) {
+        event.parentUuid = summaryUuid;
+      }
+      newEvents.push(event);
+      lateAppended++;
+      if (e.uuid) seenLateUuids.add(e.uuid);
+    }
+    cursor = readUpTo;
+    partialStillPending = hasPartialTail;
+    if (!hasPartialTail) break; // file consumed cleanly through EOF
+    // Sub-ms partial: yield enough wall time for the SDK process to flush.
+    // 5ms × up-to-7 retries = 35ms worst case, plenty for kernel scheduling.
+    if (pass < 7) sleepMs(5);
+  }
+
+  // If the SDK is mid-write through the final retry, the file still ends in
+  // a partial line. Renaming now would clobber those bytes (the rename
+  // unlinks the old inode; the SDK re-opens the path on next append, so the
+  // partial bytes are unreachable). Abort instead — the caller's retry path
+  // will pick this back up once the SDK finishes its write.
+  if (partialStillPending) {
+    log.warn({
+      sessionId: req.sdkSessionId,
+      fromIdx: req.fromIdx,
+      toIdx: req.toIdx,
+    }, "Compact aborted: SDK partial write still pending after retries");
+    return {
+      success: false,
+      eventsRemoved: 0,
+      eventsAfter: allEvents.length,
+      error: "Partial SDK write in flight; retry",
+    };
+  }
+
+  // Archive removed events to transcript. Done after the abort check so a
+  // failed compact leaves no side effects (no duplicate archive lines on
+  // retry).
+  archiveEvents(req.transcriptPath, allEvents, removeSet);
+
+  // Atomic write: stage the new content in a sibling temp file and rename
+  // into place. The rename is atomic at the filesystem level, so the SDK's
+  // appender (which re-opens the path on each append) either sees the old
+  // file fully or the new file fully — never a half-written state. Any SDK
+  // append landing strictly between the final tail-read above and this
+  // rename is still lost; that residual window is sub-millisecond and would
+  // need lock cooperation to close fully.
   const output = newEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
-  writeFileSync(path, output);
+  const tmp = path + ".compacting.tmp";
+  writeFileSync(tmp, output);
+  renameSync(tmp, path);
 
   // Write trigger file so the harness knows to reload the session
   writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
@@ -198,6 +280,7 @@ export function compactSession(req: CompactRequest): CompactResult {
     eventsAfter: newEvents.length,
     fromIdx: req.fromIdx,
     toIdx: req.toIdx,
+    lateAppended,
   }, "Session compacted");
 
   return {
@@ -205,6 +288,119 @@ export function compactSession(req: CompactRequest): CompactResult {
     eventsRemoved,
     eventsAfter: newEvents.length,
   };
+}
+
+/**
+ * Read the file atomically up through the last complete line.
+ *
+ * Returns `{text, size, hasPartialTail}`:
+ *   - `text`: bytes up to and including the last `\n` (no partial).
+ *   - `size`: byte offset of the last-newline+1. The caller uses this as
+ *     the cursor for any later append-splice. Pinning to the last-newline
+ *     boundary (NOT current EOF) is critical: if the file ends mid-write,
+ *     setting the cursor at EOF would cause the late-splice loop to never
+ *     re-read those partial bytes once the SDK flushes the rest.
+ *   - `hasPartialTail`: true when the file ends without a newline (an SDK
+ *     write was in flight at read time). The caller must treat this as a
+ *     pending write and refuse to rename until it resolves.
+ *
+ * Exported for testing only.
+ */
+export function readWholeFile(path: string): {
+  text: string;
+  size: number;
+  hasPartialTail: boolean;
+} {
+  const fd = openSync(path, "r");
+  try {
+    const totalSize = fstatSync(fd).size;
+    const buf = Buffer.alloc(totalSize);
+    let total = 0;
+    while (total < totalSize) {
+      const n = readSync(fd, buf, total, totalSize - total, total);
+      if (n === 0) break; // EOF earlier than fstat reported (shouldn't happen)
+      total += n;
+    }
+    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
+    if (lastNl < 0) {
+      // Empty file, or file is one in-flight partial line.
+      return { text: "", size: 0, hasPartialTail: total > 0 };
+    }
+    return {
+      text: buf.subarray(0, lastNl + 1).toString("utf-8"),
+      size: lastNl + 1,
+      hasPartialTail: total > lastNl + 1,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Read events appended to a JSONL file after a given byte offset.
+ *
+ * Returns:
+ *   - `events`: parsed events in the bytes read
+ *   - `readUpTo`: the byte offset of the END of the last complete line we
+ *     consumed. The caller must advance any cursor strictly to this — never
+ *     to a fresh statSync, which would skip bytes appended after our internal
+ *     fstat but before the outer stat. Partial trailing bytes (SDK mid-write)
+ *     stay below `readUpTo` so a subsequent pass can re-read them once the
+ *     write completes.
+ *   - `hasPartialTail`: true when bytes exist past `readUpTo` (i.e. an SDK
+ *     write is mid-flight). The caller must NOT proceed to a destructive
+ *     rewrite while this is true — the partial bytes would be clobbered.
+ *
+ * Exported for testing only.
+ */
+export function readSinceOffset(
+  path: string,
+  offset: number,
+): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= offset) return { events: [], readUpTo: offset, hasPartialTail: false };
+    const buf = Buffer.alloc(size - offset);
+    let total = 0;
+    while (total < buf.length) {
+      const n = readSync(fd, buf, total, buf.length - total, offset + total);
+      if (n === 0) break;
+      total += n;
+    }
+    // Locate the last newline. Bytes up to and including that newline form
+    // complete lines; anything after is a partial mid-write tail we leave
+    // alone so the next pass can re-read it.
+    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
+    if (lastNl < 0) {
+      // Entire tail is one partial line — caller's cursor must NOT advance.
+      return { events: [], readUpTo: offset, hasPartialTail: total > 0 };
+    }
+    const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
+    const events: SdkEvent[] = [];
+    for (const line of completeBytes.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try { events.push(JSON.parse(t)); } catch { /* malformed but complete — skip */ }
+    }
+    return {
+      events,
+      readUpTo: offset + lastNl + 1,
+      hasPartialTail: total > lastNl + 1,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Synchronous millisecond sleep. Uses Atomics.wait on a SharedArrayBuffer
+ * because compactSession's API contract is sync — we need the loop to yield
+ * wall time so the SDK's separate-process appends get scheduled, without
+ * restructuring the caller as async.
+ */
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /** Archive removed events to a transcript JSONL file */

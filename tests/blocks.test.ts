@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// blocks.ts reads config.lcm.dailyFreshTail at call time. Stub the config
+// module so tests don't need a populated ~/.tomo/config.json or channel env
+// vars (CI has neither, so the real buildConfig() throws at import).
+vi.mock("../src/config.js", () => ({
+  config: { lcm: { dailyFreshTail: 32 } },
+}));
+
 import { resolveBlockRange, findDuePromotions } from "../src/lcm/blocks.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";

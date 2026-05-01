@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { compactSession, readSinceOffset } from "../src/lcm/compact.js";
+import { compactSession, readSinceOffset, readWholeFile } from "../src/lcm/compact.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import {
   writeFileSync, mkdirSync, unlinkSync, existsSync, appendFileSync, readFileSync, statSync,
@@ -29,6 +29,43 @@ function mkAssistantEvent(parentUuid: string | null, ts: string, text: string) {
     message: { role: "assistant", content: [{ type: "text", text }] },
   };
 }
+
+describe("readWholeFile", () => {
+  let path: string;
+
+  beforeEach(() => {
+    path = join(tmpdir(), `compact-whole-${randomUUID()}.jsonl`);
+  });
+
+  afterEach(() => {
+    if (existsSync(path)) unlinkSync(path);
+  });
+
+  it("returns text + exact byte count of what was read", () => {
+    const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "hello");
+    writeFileSync(path, JSON.stringify(e1) + "\n");
+    const expected = statSync(path).size;
+    const { text, size } = readWholeFile(path);
+    expect(size).toBe(expected);
+    expect(text).toContain(e1.uuid);
+  });
+
+  it("returns size that exactly bounds what readSinceOffset will skip", () => {
+    // The whole point of readWholeFile is to give a cursor that prevents
+    // duplication. Writing more bytes after, then calling readSinceOffset
+    // with the captured size, must return ONLY the new bytes.
+    const e1 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "first");
+    writeFileSync(path, JSON.stringify(e1) + "\n");
+    const { size } = readWholeFile(path);
+
+    const e2 = mkAssistantEvent(e1.uuid, "2026-04-30T00:01:00.000Z", "second");
+    appendFileSync(path, JSON.stringify(e2) + "\n");
+
+    const late = readSinceOffset(path, size);
+    expect(late).toHaveLength(1);
+    expect(late[0].uuid).toBe(e2.uuid);
+  });
+});
 
 describe("readSinceOffset", () => {
   let path: string;

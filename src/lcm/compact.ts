@@ -1,6 +1,6 @@
 import {
-  readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
-  statSync, openSync, readSync, closeSync, renameSync,
+  writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
+  statSync, openSync, fstatSync, readSync, closeSync, renameSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -75,17 +75,20 @@ export function compactSession(req: CompactRequest): CompactResult {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
-  // Capture file size at read time so we can detect (and splice) any events
-  // the SDK appends while we're processing. Without this, a long-running
-  // compact (say, an agent's `tomo lcm daily` Bash tool that takes ~minutes)
-  // can race the SDK's writes for the agent's own thinking/tool_use/tool_result
-  // events, and our truncate-rewrite at the end clobbers them.
-  const bytesAtRead = statSync(path).size;
-  const lines = readFileSync(path, "utf-8").trim().split("\n");
+  // Atomic read: open once, fstat the FD to get the byte count we're about
+  // to read, then read exactly that many bytes. This pins `bytesAtRead` to
+  // the bytes we actually loaded — anything the SDK appends after this is
+  // strictly outside `allEvents` and will be picked up by the late-splice
+  // pass at write time. Doing `statSync` then `readFileSync` separately
+  // would let an SDK append slip into both reads (counted in `allEvents`
+  // AND in the late tail), producing duplicate uuids in the output.
+  const snapshot = readWholeFile(path);
+  const bytesAtRead = snapshot.size;
   const allEvents: SdkEvent[] = [];
-  for (const line of lines) {
-    if (!line) continue;
-    try { allEvents.push(JSON.parse(line)); } catch { continue; }
+  for (const line of snapshot.text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try { allEvents.push(JSON.parse(t)); } catch { continue; }
   }
 
   // Separate conversation events (user/assistant) from metadata events
@@ -198,21 +201,42 @@ export function compactSession(req: CompactRequest): CompactResult {
   // agent's own thinking/tool_use that triggered this compact via Bash. If we
   // truncate-rewrite without splicing them in, they're lost and any later
   // tool_result lands with a parentUuid pointing at a vanished tool_use.
-  const lateEvents = readSinceOffset(path, bytesAtRead);
+  //
+  // We loop: re-read the tail, splice it, then re-stat. If the file grew
+  // again while we were splicing, repeat. This drives the residual race
+  // window down to "between the final tail-read and the rename" — typically
+  // microseconds. Closing it fully would require either an advisory lock
+  // honored by the SDK or daemon-side coordination that pauses appends
+  // during compact. See followup.
+  let cursor = bytesAtRead;
   let lateAppended = 0;
-  for (const e of lateEvents) {
-    const event = { ...e };
-    if (event.parentUuid && removedUuids.has(event.parentUuid)) {
-      event.parentUuid = summaryUuid;
+  const seenLateUuids = new Set<string>();
+  for (let pass = 0; pass < 8; pass++) {
+    const lateEvents = readSinceOffset(path, cursor);
+    if (lateEvents.length === 0) break;
+    for (const e of lateEvents) {
+      // Defense in depth against the duplication race: skip any uuid we've
+      // already spliced in. (The atomic read above should make this
+      // impossible, but a duplicated splice would corrupt the chain.)
+      if (e.uuid && seenLateUuids.has(e.uuid)) continue;
+      const event = { ...e };
+      if (event.parentUuid && removedUuids.has(event.parentUuid)) {
+        event.parentUuid = summaryUuid;
+      }
+      newEvents.push(event);
+      lateAppended++;
+      if (e.uuid) seenLateUuids.add(e.uuid);
     }
-    newEvents.push(event);
-    lateAppended++;
+    cursor = statSync(path).size;
   }
 
   // Atomic write: stage the new content in a sibling temp file and rename
   // into place. The rename is atomic at the filesystem level, so the SDK's
   // appender (which re-opens the path on each append) either sees the old
-  // file fully or the new file fully — never a half-written state.
+  // file fully or the new file fully — never a half-written state. Any SDK
+  // append landing strictly between the final tail-read above and this
+  // rename is still lost; that residual window is sub-millisecond and would
+  // need lock cooperation to close fully.
   const output = newEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
   const tmp = path + ".compacting.tmp";
   writeFileSync(tmp, output);
@@ -236,6 +260,32 @@ export function compactSession(req: CompactRequest): CompactResult {
     eventsRemoved,
     eventsAfter: newEvents.length,
   };
+}
+
+/**
+ * Read the entire file atomically, pinning the byte count to what was
+ * actually read. Returning `{text, size}` lets the caller use `size` as a
+ * lower-bound cursor for any later append-splice without risk of an
+ * overlap (i.e. the same event being counted in both `allEvents` and the
+ * late tail).
+ *
+ * Exported for testing only.
+ */
+export function readWholeFile(path: string): { text: string; size: number } {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const buf = Buffer.alloc(size);
+    let total = 0;
+    while (total < size) {
+      const n = readSync(fd, buf, total, size - total, total);
+      if (n === 0) break; // EOF earlier than fstat reported (shouldn't happen)
+      total += n;
+    }
+    return { text: buf.subarray(0, total).toString("utf-8"), size: total };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

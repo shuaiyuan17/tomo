@@ -1,4 +1,7 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
+  statSync, openSync, readSync, closeSync, renameSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath, getSdkSessionDir } from "../sessions/index.js";
@@ -72,6 +75,12 @@ export function compactSession(req: CompactRequest): CompactResult {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
+  // Capture file size at read time so we can detect (and splice) any events
+  // the SDK appends while we're processing. Without this, a long-running
+  // compact (say, an agent's `tomo lcm daily` Bash tool that takes ~minutes)
+  // can race the SDK's writes for the agent's own thinking/tool_use/tool_result
+  // events, and our truncate-rewrite at the end clobbers them.
+  const bytesAtRead = statSync(path).size;
   const lines = readFileSync(path, "utf-8").trim().split("\n");
   const allEvents: SdkEvent[] = [];
   for (const line of lines) {
@@ -184,9 +193,30 @@ export function compactSession(req: CompactRequest): CompactResult {
     newEvents.push(event);
   }
 
-  // Write the new session file
+  // Late-arrival splice: re-read any bytes the SDK appended after our initial
+  // read. These are events written while we were processing — typically the
+  // agent's own thinking/tool_use that triggered this compact via Bash. If we
+  // truncate-rewrite without splicing them in, they're lost and any later
+  // tool_result lands with a parentUuid pointing at a vanished tool_use.
+  const lateEvents = readSinceOffset(path, bytesAtRead);
+  let lateAppended = 0;
+  for (const e of lateEvents) {
+    const event = { ...e };
+    if (event.parentUuid && removedUuids.has(event.parentUuid)) {
+      event.parentUuid = summaryUuid;
+    }
+    newEvents.push(event);
+    lateAppended++;
+  }
+
+  // Atomic write: stage the new content in a sibling temp file and rename
+  // into place. The rename is atomic at the filesystem level, so the SDK's
+  // appender (which re-opens the path on each append) either sees the old
+  // file fully or the new file fully — never a half-written state.
   const output = newEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
-  writeFileSync(path, output);
+  const tmp = path + ".compacting.tmp";
+  writeFileSync(tmp, output);
+  renameSync(tmp, path);
 
   // Write trigger file so the harness knows to reload the session
   writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
@@ -198,6 +228,7 @@ export function compactSession(req: CompactRequest): CompactResult {
     eventsAfter: newEvents.length,
     fromIdx: req.fromIdx,
     toIdx: req.toIdx,
+    lateAppended,
   }, "Session compacted");
 
   return {
@@ -205,6 +236,34 @@ export function compactSession(req: CompactRequest): CompactResult {
     eventsRemoved,
     eventsAfter: newEvents.length,
   };
+}
+
+/**
+ * Read events appended to a JSONL file after a given byte offset.
+ *
+ * Used to recover events the SDK wrote between our initial read and our
+ * truncate-rewrite. Skips trailing partial lines (the SDK was mid-append) —
+ * those will be re-written cleanly to the new file by the SDK's next attempt.
+ *
+ * Exported for testing only.
+ */
+export function readSinceOffset(path: string, offset: number): SdkEvent[] {
+  const size = statSync(path).size;
+  if (size <= offset) return [];
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(size - offset);
+    readSync(fd, buf, 0, buf.length, offset);
+    const out: SdkEvent[] = [];
+    for (const line of buf.toString("utf-8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try { out.push(JSON.parse(t)); } catch { /* partial / malformed — skip */ }
+    }
+    return out;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Archive removed events to a transcript JSONL file */

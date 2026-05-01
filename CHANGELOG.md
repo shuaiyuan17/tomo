@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.5 (2026-05-01)
+
+### Bug fixes
+
+- `lcm compact`: fix write race that could clobber events the SDK appended while `compactSession` was running. Symptom: when an agent invokes a long-running `tomo lcm daily/weekly/...` via Bash tool, the SDK's `thinking` + `tool_use` events for that very turn could land on disk between compactSession's initial read and its truncate-rewrite, then get wiped by the rewrite. The subsequent `tool_result` then had a `parentUuid` pointing at a vanished tool_use, breaking the chain.
+  - Fix: capture the file size at read time, re-read the tail at write time, splice any late-arriving events into the new content, and write atomically via `<path>.compacting.tmp` + `rename`.
+
 ## 0.5.4 (2026-04-29)
 
 ### Features

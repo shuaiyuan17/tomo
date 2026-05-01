@@ -29,7 +29,7 @@ Session stats show:
 
 **Note:** Context stats come from the SDK API and reflect the state at the end of the *previous* query. After compacting or other changes, you need to wait for a new query to complete before the numbers update.
 
-When context crosses the nudge threshold (default 70%, set via `lcm.nudgeAtPct` in config.json), the harness sends a system message asking you to run `tomo lcm daily` — see the `tomo-lcm` skill. A second nudge at 80% asks you to use the `lcm compact` skill before the next user message. Group sessions default to SDK auto-compact instead (override with `lcm.groupCompactStyle: "lcm"`).
+When context crosses the nudge threshold (default 70%, set via `lcm.nudgeAtPct` in config.json), the harness sends a system message asking you to run `tomo lcm daily` — see the `tomo-lcm` skill. A second nudge at 80% asks you to use the `lcm compact` skill before the next user message. A periodic rollup runner also nudges you when daily/weekly/monthly/yearly blocks are due. Group sessions default to SDK auto-compact instead (override with `lcm.groupCompactStyle: "lcm"` to enroll groups in all three nudges).
 
 ## Cron Jobs
 

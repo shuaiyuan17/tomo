@@ -15,7 +15,7 @@ tomo lcm daily --session-id SESSION_ID --summary "<today's summary>"
 ## When to run
 
 - **End of day** (before bed or before a long idle). Cleanest shape.
-- **Mid-day** when the harness nudges you that raw tail > 40 events.
+- **Mid-day** when the harness nudges you that the raw tail has grown past the fresh-tail floor (default 32 events; tune via `lcm.dailyFreshTail` in config.json).
 - **Before a big task** when you want clean context for an involved piece of work.
 - **After long tool-heavy work** — reduce clutter before the conversation continues.
 

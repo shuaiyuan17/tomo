@@ -405,7 +405,7 @@ export class Agent {
     if (pct < 80) return;
     this.runWithRetry(
       key,
-      `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.`,
+      `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message. After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
     ).catch(() => {});
   }
 

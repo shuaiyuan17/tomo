@@ -1,6 +1,6 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction } from "./types.js";
-import { saveInboundImage } from "./imageStore.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment } from "./types.js";
+import { formatImageMarker, saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -166,29 +166,51 @@ export class BlueBubblesChannel implements Channel {
   }
 
   startTyping(chatId: string): () => void {
-    // Typing indicators require BlueBubbles Private API
-    // Best-effort: try and silently ignore failure
+    // Typing indicators require BlueBubbles Private API.
+    // BlueBubbles' typing indicator decays server-side faster than Telegram's,
+    // so we refresh at 3s (vs Telegram's 6s) to avoid visible flicker.
     let sealed = false;
-    const INTERVAL_MS = 6000;
+    let tickInFlight = false;
+    let consecutiveErrors = 0;
+    let interval: ReturnType<typeof setInterval> | null = null;
+    let ttl: ReturnType<typeof setTimeout> | null = null;
+
+    const INTERVAL_MS = 3000;
     const TTL_MS = 2 * 60 * 1000;
-
-    const sendTyping = () => {
-      if (sealed) return;
-      this.api("POST", `/chat/${encodeURIComponent(chatId)}/typing`).catch(() => {});
-    };
-
-    sendTyping();
-    const interval = setInterval(sendTyping, INTERVAL_MS);
-    const ttl = setTimeout(() => cleanup(), TTL_MS);
+    const MAX_ERRORS = 10;
 
     const cleanup = () => {
       if (sealed) return;
       sealed = true;
-      clearInterval(interval);
-      clearTimeout(ttl);
+      if (interval) clearInterval(interval);
+      if (ttl) clearTimeout(ttl);
       // Stop typing indicator
       this.api("DELETE", `/chat/${encodeURIComponent(chatId)}/typing`).catch(() => {});
     };
+
+    const sendTyping = async () => {
+      // tickInFlight guard: if a previous POST is still pending (slow
+      // BlueBubbles HTTP), drop this tick instead of piling up requests.
+      if (sealed || tickInFlight) return;
+      if (consecutiveErrors >= MAX_ERRORS) {
+        log.warn({ chatId }, "iMessage typing suspended after %d consecutive errors", MAX_ERRORS);
+        cleanup();
+        return;
+      }
+      tickInFlight = true;
+      try {
+        await this.api("POST", `/chat/${encodeURIComponent(chatId)}/typing`);
+        consecutiveErrors = 0;
+      } catch {
+        consecutiveErrors++;
+      } finally {
+        tickInFlight = false;
+      }
+    };
+
+    void sendTyping();
+    interval = setInterval(sendTyping, INTERVAL_MS);
+    ttl = setTimeout(cleanup, TTL_MS);
 
     return cleanup;
   }
@@ -310,6 +332,9 @@ export class BlueBubblesChannel implements Channel {
 
     // Download image attachments
     const attachments = data.attachments as Array<Record<string, unknown>> | undefined;
+    const intendedImageCount = (attachments ?? []).filter(
+      (a) => typeof a.mimeType === "string" && (a.mimeType as string).startsWith("image/"),
+    ).length;
     const images = await this.downloadAttachments(attachments, chatGuid);
 
     // Mark chat as read (best-effort; requires BlueBubbles Private API helper)
@@ -317,11 +342,17 @@ export class BlueBubblesChannel implements Channel {
 
     const senderName = this.resolveContactName(senderAddress);
 
+    const savedPaths = images.map((i) => i.savedPath).filter((p): p is string => Boolean(p));
+    const marker = formatImageMarker(intendedImageCount, savedPaths);
+    const composedText = text
+      ? (marker ? `${marker} ${text}` : text)
+      : marker;
+
     const message: IncomingMessage = {
       id: guid,
       chatId: chatGuid,
       senderName,
-      text: text || (images.length > 0 ? "[Sent an image]" : ""),
+      text: composedText,
       images: images.length > 0 ? images : undefined,
       timestamp: typeof data.dateCreated === "number" ? data.dateCreated : Date.now(),
       isGroup,
@@ -340,10 +371,10 @@ export class BlueBubblesChannel implements Channel {
   private async downloadAttachments(
     attachments: Array<Record<string, unknown>> | undefined,
     chatGuid?: string,
-  ): Promise<Array<{ data: string; mediaType: string }>> {
+  ): Promise<ImageAttachment[]> {
     if (!attachments || attachments.length === 0) return [];
 
-    const images: Array<{ data: string; mediaType: string }> = [];
+    const images: ImageAttachment[] = [];
 
     for (const att of attachments) {
       const mimeType = att.mimeType as string | undefined;
@@ -358,18 +389,21 @@ export class BlueBubblesChannel implements Channel {
         if (!res.ok) continue;
 
         const buffer = Buffer.from(await res.arrayBuffer());
+
+        // Additively persist to disk if configured. Never blocks the return.
+        let savedPath: string | undefined;
+        if (this.imageStoreBaseDir) {
+          savedPath = (await saveInboundImage(buffer, mimeType, {
+            sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
+            guid: attGuid,
+          }, this.imageStoreBaseDir)) ?? undefined;
+        }
+
         images.push({
           data: buffer.toString("base64"),
           mediaType: mimeType,
+          savedPath,
         });
-
-        // Additively persist to disk if configured. Never blocks the return.
-        if (this.imageStoreBaseDir) {
-          await saveInboundImage(buffer, mimeType, {
-            sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
-            guid: attGuid,
-          }, this.imageStoreBaseDir);
-        }
       } catch (err) {
         log.error({ err, guid: attGuid }, "Failed to download attachment");
       }

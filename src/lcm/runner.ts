@@ -92,8 +92,8 @@ export class RollupRunner {
     }
     const now = Date.now();
     for (const [sessionKey, sdkSessionId] of this.agent.listActiveSessions()) {
-      // Skip sessions on SDK auto-compact (groups by default; opt in via
-      // config.lcm.groupCompactStyle="lcm" to enroll groups in LCM nudges).
+      // Skip sessions on SDK auto-compact (only groups with
+      // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
       if (!usesLcmCompact(sessionKey)) continue;
       try {
         const due = findDuePromotions(sdkSessionId);

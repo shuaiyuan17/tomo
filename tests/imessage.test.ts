@@ -206,10 +206,27 @@ describe("webhook event parsing", () => {
     expect(isMentioned).toBe(true);
   });
 
-  it("provides fallback text for image-only messages", () => {
+  it("provides fallback text for image-only messages", async () => {
+    const { formatImageMarker } = await import("../src/channels/imageStore.js");
     const text = "";
-    const images = [{ data: "base64...", mediaType: "image/jpeg" }];
-    const result = text || (images.length > 0 ? "[Sent an image]" : "");
+    const marker = formatImageMarker(1, []);
+    const result = text ? (marker ? `${marker} ${text}` : text) : marker;
     expect(result).toBe("[Sent an image]");
+  });
+
+  it("includes the saved disk path in the marker when storage is on", async () => {
+    const { formatImageMarker } = await import("../src/channels/imageStore.js");
+    expect(formatImageMarker(1, ["/abs/a.jpg"])).toBe("[Sent an image, saved to: /abs/a.jpg]");
+    expect(formatImageMarker(3, ["/abs/a.jpg", "/abs/b.png"])).toBe(
+      "[Sent 3 images, saved to: /abs/a.jpg, /abs/b.png]",
+    );
+  });
+
+  it("prepends the marker even when the user wrote a caption", async () => {
+    const { formatImageMarker } = await import("../src/channels/imageStore.js");
+    const text = "look at this";
+    const marker = formatImageMarker(1, ["/abs/a.jpg"]);
+    const result = text ? (marker ? `${marker} ${text}` : text) : marker;
+    expect(result).toBe("[Sent an image, saved to: /abs/a.jpg] look at this");
   });
 });

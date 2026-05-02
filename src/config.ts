@@ -18,8 +18,8 @@ export interface LcmConfig {
   nudgeAtPct: number;
   /** Context-usage % below which the "already nudged" flag resets (hysteresis). */
   nudgeResetPct: number;
-  /** Compaction strategy for group sessions. "sdk" leaves SDK auto-compact on
-   *  (default); "lcm" disables it and runs the same hierarchical LCM nudges as DMs. */
+  /** Compaction strategy for group sessions. "lcm" runs the same hierarchical
+   *  LCM nudges as DMs (default); "sdk" leaves SDK auto-compact on instead. */
   groupCompactStyle: "sdk" | "lcm";
   /** Number of most-recent raw user/assistant events kept outside today's daily
    *  rollup so mid-day compacts don't wipe warm short-term texture. Counts SDK
@@ -61,7 +61,7 @@ function parseLcmConfig(raw: unknown): LcmConfig {
   const r = (raw ?? {}) as Record<string, unknown>;
   const nudgeAt = Number(r.nudgeAtPct ?? 70);
   const nudgeReset = Number(r.nudgeResetPct ?? 60);
-  const style = r.groupCompactStyle === "lcm" ? "lcm" : "sdk";
+  const style = r.groupCompactStyle === "sdk" ? "sdk" : "lcm";
   const tail = Number(r.dailyFreshTail ?? 32);
 
   // Fall back to defaults on nonsense input (out of [1,100], or LOW >= HIGH).

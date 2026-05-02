@@ -1,7 +1,7 @@
 import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, StreamingMessage, MessageReaction } from "./types.js";
-import { saveInboundImage } from "./imageStore.js";
+import { formatImageMarker, saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
 
 export interface TelegramChannelOptions {
@@ -65,11 +65,16 @@ export class TelegramChannel implements Channel {
       const largest = photos[photos.length - 1];
       const image = await this.downloadPhoto(largest.file_id, String(ctx.chat.id));
 
+      const caption = this.cleanMention(ctx.message.caption ?? "");
+      const savedPaths = image?.savedPath ? [image.savedPath] : [];
+      const marker = formatImageMarker(1, savedPaths);
+      const text = caption ? `${marker} ${caption}` : marker;
+
       this.dispatch({
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
-        text: this.cleanMention(ctx.message.caption ?? "[Sent an image]"),
+        text,
         images: image ? [image] : undefined,
         timestamp: ctx.message.date * 1000,
         isGroup,
@@ -172,14 +177,15 @@ export class TelegramChannel implements Channel {
       const mediaType = ext === "png" ? "image/png" : "image/jpeg";
 
       // Additively persist to disk if configured. Never blocks the return.
+      let savedPath: string | undefined;
       if (this.imageStoreBaseDir) {
-        await saveInboundImage(buffer, mediaType, {
+        savedPath = (await saveInboundImage(buffer, mediaType, {
           sessionKey: chatId ? `telegram_${chatId}` : "telegram",
           guid: fileId,
-        }, this.imageStoreBaseDir);
+        }, this.imageStoreBaseDir)) ?? undefined;
       }
 
-      return { data: buffer.toString("base64"), mediaType };
+      return { data: buffer.toString("base64"), mediaType, savedPath };
     } catch (err) {
       log.error({ err }, "Failed to download photo");
       return undefined;

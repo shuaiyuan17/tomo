@@ -7,16 +7,16 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
 // DISABLE_AUTO_COMPACT env var — we don't want the SDK to collapse our
-// rollup structure behind our back. Group sessions default to SDK auto-compact
-// (config.lcm.groupCompactStyle="sdk"); set it to "lcm" to opt groups into the
-// same hierarchical LCM flow as DMs.
+// rollup structure behind our back. Group sessions default to the same
+// hierarchical LCM flow (config.lcm.groupCompactStyle="lcm"); set it to "sdk"
+// to fall back to SDK auto-compact for groups.
 
-/** True when the session uses our custom LCM compaction (DMs always; groups only
- *  if config.lcm.groupCompactStyle="lcm"). When false, SDK auto-compact is in
- *  charge and the harness skips its compaction nudges. */
+/** True when the session uses our custom LCM compaction (DMs always; groups
+ *  unless config.lcm.groupCompactStyle="sdk"). When false, SDK auto-compact is
+ *  in charge and the harness skips its compaction nudges. */
 export function usesLcmCompact(sessionKey: string): boolean {
   if (!isGroupSessionKey(sessionKey)) return true;
-  return config.lcm.groupCompactStyle === "lcm";
+  return config.lcm.groupCompactStyle !== "sdk";
 }
 
 const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;

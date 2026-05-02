@@ -622,7 +622,8 @@ export class Agent {
       // Context-usage hysteresis: nudge agent to run `tomo lcm daily` when
       // context usage crosses the high-water mark; reset when it drops back
       // below the low-water mark (a successful compact knocks it well under).
-      // Skip when the session uses SDK auto-compact (groups, unless opted in).
+      // Skip when the session uses SDK auto-compact (only groups opted out via
+      // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
       if (sid && usesLcmCompact(key)) {
         const HIGH = config.lcm.nudgeAtPct / 100;
         const LOW = config.lcm.nudgeResetPct / 100;

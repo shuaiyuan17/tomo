@@ -3,6 +3,8 @@ export interface ImageAttachment {
   data: string;
   /** MIME type (e.g. "image/jpeg", "image/png") */
   mediaType: string;
+  /** Absolute path on disk if the channel persisted the image (saveInboundImages). */
+  savedPath?: string;
 }
 
 export interface IncomingMessage {

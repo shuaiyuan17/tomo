@@ -183,7 +183,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,
-    "groupCompactStyle": "sdk"
+    "groupCompactStyle": "lcm"
   }
 }
 ```

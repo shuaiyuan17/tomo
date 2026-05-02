@@ -42,6 +42,7 @@ export interface OutgoingMessage {
 }
 
 export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
+export type StopTyping = () => void | Promise<void>;
 
 export interface StreamingMessage {
   /** Append text to the streaming message */
@@ -90,7 +91,7 @@ export interface Channel {
   createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage;
 
   /** Show typing indicator. Returns a stop function. */
-  startTyping(chatId: string): () => void;
+  startTyping(chatId: string): StopTyping;
 
   /** Start listening for messages */
   start(): Promise<void>;

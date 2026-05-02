@@ -475,7 +475,7 @@ export class Agent {
         message.images,
         this.makeBlockHandler(replyChannel, replyChatId, stream),
       );
-      stopTyping();
+      await stopTyping();
 
       this.maybeNudgeCompact(key);
 
@@ -488,7 +488,7 @@ export class Agent {
 
       await this.deliverResponse(replyChannel, replyChatId, response, stream);
     } catch (err) {
-      stopTyping();
+      await stopTyping();
       log.error({ err }, "Error handling message");
 
       // Passive groups: suppress error messages to avoid polluting the chat
@@ -569,7 +569,7 @@ export class Agent {
         allImages.length > 0 ? allImages : undefined,
         this.makeBlockHandler(replyChannel, replyChatId, stream),
       );
-      stopTyping();
+      await stopTyping();
 
       this.maybeNudgeCompact(key);
 
@@ -582,7 +582,7 @@ export class Agent {
 
       await this.deliverResponse(replyChannel, replyChatId, response, stream);
     } catch (err) {
-      stopTyping();
+      await stopTyping();
       log.error({ err }, "Error handling batched messages");
       if (isPassiveGroup) return;
       const detail = err instanceof Error ? err.message : String(err);
@@ -757,7 +757,7 @@ export class Agent {
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);
-      stopTyping();
+      await stopTyping();
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
@@ -775,7 +775,7 @@ export class Agent {
 
       await deliveryChannel.send({ chatId: deliveryChatId, text: response });
     } catch (err) {
-      stopTyping();
+      await stopTyping();
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
       await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });

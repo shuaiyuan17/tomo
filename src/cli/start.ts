@@ -77,17 +77,29 @@ async function startForeground(): Promise<void> {
   }
 
   // Sync tomo- skills (always overwrite to pick up updates)
+  const { rmSync } = await import("node:fs");
   const defaultSkillsDir = join(defaultsDir, "skills");
   const targetSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
   if (fileExists(defaultSkillsDir)) {
     mkdirSync(targetSkillsDir, { recursive: true });
+    const expected = new Set<string>();
     for (const skill of readdirSync(defaultSkillsDir, { withFileTypes: true })) {
       if (!skill.isDirectory()) continue;
+      expected.add(`tomo-${skill.name}`);
       const destDir = join(targetSkillsDir, `tomo-${skill.name}`);
       mkdirSync(destDir, { recursive: true });
       for (const file of readdirSync(join(defaultSkillsDir, skill.name))) {
         copyFileSync(join(defaultSkillsDir, skill.name, file), join(destDir, file));
       }
+    }
+    // Prune retired tomo- skills (built-ins removed in an upgrade). Only touch
+    // `tomo-` directories — the prefix is reserved for built-ins; users are
+    // told to avoid it for custom skills, which therefore stay untouched here.
+    for (const entry of readdirSync(targetSkillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.startsWith("tomo-")) continue;
+      if (expected.has(entry.name)) continue;
+      rmSync(join(targetSkillsDir, entry.name), { recursive: true, force: true });
     }
   }
 

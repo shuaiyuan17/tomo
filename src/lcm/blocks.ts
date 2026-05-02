@@ -238,9 +238,10 @@ function matchesLevelPeriod(e: SdkEvent, level: BlockLevel, period: string): boo
 }
 
 /**
- * Group sessions use SDK default compact behavior — the block-rollup
- * hierarchy is designed for a continuous personal DM stream, not for
- * group chatter. Harness nudges (RollupRunner, hot-tail cap) skip groups.
+ * Identifies group sessions. Groups run the same hierarchical LCM flow as DMs
+ * by default (rollup nudges scope summaries to the group's own conversation);
+ * set config.lcm.groupCompactStyle="sdk" to fall back to SDK auto-compact, in
+ * which case the harness nudges (RollupRunner, hot-tail cap) skip groups.
  */
 export function isGroupSessionKey(key: string): boolean {
   if (key.startsWith("dm:")) return false;

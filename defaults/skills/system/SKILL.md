@@ -33,11 +33,15 @@ When context crosses the nudge threshold (default 70%, set via `lcm.nudgeAtPct` 
 
 ## Cron Jobs
 
-```bash
-tomo cron list                 # All scheduled jobs with status
-tomo cron add --name "X" --schedule "in 20m" --message "Y"
-tomo cron remove <id>          # Delete a job
-```
+Schedule reminders and recurring tasks via the `tomo-internal` MCP tools:
+
+- `schedule_create` — create a one-shot or recurring job (`schedule` accepts `in 20m`, `every 6h`, or a 5-field cron expression; `sessionKey` controls where the fired message lands)
+- `schedule_list` — list every job with `id`, `nextRunAt`, `lastStatus`, etc.
+- `schedule_remove` — delete by `id`
+
+These are the everyday interface — load them via tool search ("schedule reminder cron") when the user asks to schedule something.
+
+The `tomo cron list / add / remove` CLI is still here for human debugging (auditing the job store, fixing a stuck job after a restart). Prefer the MCP tools in normal conversation.
 
 ## File Paths
 
@@ -104,7 +108,7 @@ Pass identity name (`"alice"`) or session key (`"telegram:-1001234567"`) as `tar
 ### Built-in skills (`tomo-*`)
 Skills prefixed with `tomo-` are bundled with Tomo and automatically updated on every `tomo start`. Do not edit these — your changes will be overwritten on next restart.
 
-Current built-in skills: `tomo-system`, `tomo-lcm`, `tomo-browse`, `tomo-cron`.
+Current built-in skills: `tomo-system`, `tomo-lcm`, `tomo-browse`.
 
 ### Custom / third-party skills
 Place skill directories under `~/.tomo/workspace/.claude/skills/`. Each skill needs a `SKILL.md` with YAML frontmatter (`name` and `description`). The harness picks them up automatically — restart Tomo to load new skills.
@@ -148,7 +152,7 @@ tomo restart         # Restart
 
 ### Session feels stale or confused
 ```bash
-tomo sessions clear  # Reset sessions
+tomo sessions clear  # Reset sessions (Must ask user to confirm)
 tomo restart
 ```
 Or tell the user to send `/new` in Telegram.

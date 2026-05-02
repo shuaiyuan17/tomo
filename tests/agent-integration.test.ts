@@ -152,7 +152,7 @@ const { mockConfig } = vi.hoisted(() => ({
     lcm: {
       nudgeAtPct: 70,
       nudgeResetPct: 60,
-      groupCompactStyle: "sdk" as "sdk" | "lcm",
+      groupCompactStyle: "lcm" as "sdk" | "lcm",
     },
   },
 }));

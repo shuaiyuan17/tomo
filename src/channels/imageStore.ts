@@ -76,6 +76,20 @@ export function buildImagePath(
 }
 
 /**
+ * Format the inline `[Sent an image …]` marker prepended to the user-visible
+ * text of an image-bearing channel message. `intendedCount` is the number of
+ * image attachments the channel observed (regardless of download success);
+ * `savedPaths` lists absolute disk paths for images that were also persisted
+ * locally. Returns `""` when `intendedCount === 0`.
+ */
+export function formatImageMarker(intendedCount: number, savedPaths: string[]): string {
+  if (intendedCount <= 0) return "";
+  const noun = intendedCount === 1 ? "an image" : `${intendedCount} images`;
+  if (savedPaths.length === 0) return `[Sent ${noun}]`;
+  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}]`;
+}
+
+/**
  * Save an inbound image to disk. Never throws — errors are logged and the
  * function returns `null` so the message flow can continue unimpeded.
  *

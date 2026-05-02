@@ -2,10 +2,25 @@
 
 ## 0.5.5 (2026-05-01)
 
+### Features
+
+- **Inbound image marker is now always emitted, with the saved disk path when local storage is on.** Previously, a `[Sent an image]` fallback only appeared when the user sent an image with no caption — captions replaced the marker outright, and the model couldn't see the on-disk file path even when `saveInboundImages` was on. Now both Telegram and iMessage prepend `[Sent an image]` (or `[Sent N images]` for iMessage's multi-attachment messages) to the user's caption, and append `saved to: /abs/path[, /abs/path…]` when storage is enabled. The agent can now reliably know an image was attached and `Read` it from disk for tool work that goes beyond what the inline content blocks support. New `formatImageMarker(intendedCount, savedPaths)` helper in `channels/imageStore.ts`; both channels thread `savedPath` through `ImageAttachment`. Marker reflects intended-image count, so a download failure for one attachment doesn't hide the fact that an image was sent.
+
+### UX
+
+- **Group sessions default to hierarchical LCM compaction.** `config.lcm.groupCompactStyle` now defaults to `"lcm"` instead of `"sdk"`. Group sessions get the same daily/weekly/monthly/yearly rollup nudges, %-based compact prompts, and `tomo-lcm-stats` MCP tool that DMs already had. Set to `"sdk"` to opt back into SDK auto-compact for groups. Existing installs with the field unset flip on next `tomo start`. Rollup nudges for group sessions splice in a "Group scope" line so summaries stay focused on that group's conversation rather than mixing in personal/DM context.
+- **`tomo-cron` skill removed; the `schedule_*` MCP tools are now the everyday interface.** The standalone `tomo-cron` skill was redundant once `schedule_create` / `schedule_list` / `schedule_remove` landed on the `tomo-internal` MCP server in 0.5.3. The `tomo-system` skill now briefly mentions the three MCP tools and notes that the `tomo cron …` CLI remains for human debugging (auditing the job store, fixing a stuck job after a restart). Built-in skills list trimmed accordingly.
+- **`tomo-browse` skill switched from `playwright-cli` to `agent-browser`.** New skill content is a thin discovery stub pointing at `agent-browser skills get core`, so workflow guidance always tracks the installed CLI version instead of going stale in this repo. Frontmatter description broadens trigger coverage to web automation, exploratory testing, Electron app automation (VS Code, Slack, Discord, Figma), Slack workspace tasks, Vercel Sandbox, and AWS Bedrock AgentCore.
+
 ### Bug fixes
 
-- `lcm compact`: fix write race that could clobber events the SDK appended while `compactSession` was running. Symptom: when an agent invokes a long-running `tomo lcm daily/weekly/...` via Bash tool, the SDK's `thinking` + `tool_use` events for that very turn could land on disk between compactSession's initial read and its truncate-rewrite, then get wiped by the rewrite. The subsequent `tool_result` then had a `parentUuid` pointing at a vanished tool_use, breaking the chain.
+- **`lcm compact`: fix write race that could clobber events the SDK appended while `compactSession` was running.** Symptom: when an agent invokes a long-running `tomo lcm daily/weekly/...` via Bash tool, the SDK's `thinking` + `tool_use` events for that very turn could land on disk between compactSession's initial read and its truncate-rewrite, then get wiped by the rewrite. The subsequent `tool_result` then had a `parentUuid` pointing at a vanished tool_use, breaking the chain.
   - Fix: capture the file size at read time, re-read the tail at write time, splice any late-arriving events into the new content, and write atomically via `<path>.compacting.tmp` + `rename`.
+- **iMessage typing indicator: stop the flicker.** BlueBubbles' typing decays server-side faster than Telegram's, so the previous 6-second refresh cadence raced the decay and left the indicator visibly turning on/off between ticks during long SDK turns. Three changes: (1) refresh interval dropped from 6 s to **3 s**; (2) added a `tickInFlight` guard so a slow BlueBubbles HTTP server doesn't queue overlapping POSTs; (3) added Tomo-Telegram-style consecutive-error suspension — after 10 consecutive failed POSTs (e.g. Private API helper missing), typing self-suspends with a single `log.warn` and explicitly DELETEs the indicator instead of hammering the endpoint forever. Cross-checked the design against the openclaw bluebubbles extension's typing controller (`openclaw/src/channels/typing.ts`), which uses the same 3 s default and `tickInFlight` pattern.
+
+### Internal
+
+- **Built-in skill prune on startup.** `cli/start.ts` now removes `~/.tomo/workspace/.claude/skills/tomo-*` directories that no longer have a counterpart in bundled `defaults/skills/`. Custom skills (anything not prefixed `tomo-`) are never touched. Without this, retired built-ins like `tomo-cron` would persist forever on existing installs.
 
 ## 0.5.4 (2026-04-29)
 

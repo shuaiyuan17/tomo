@@ -1,5 +1,5 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, StopTyping } from "./types.js";
 import { formatImageMarker, saveInboundImage } from "./imageStore.js";
 import { log } from "../logger.js";
 
@@ -165,52 +165,67 @@ export class BlueBubblesChannel implements Channel {
     };
   }
 
-  startTyping(chatId: string): () => void {
+  startTyping(chatId: string): StopTyping {
     // Typing indicators require BlueBubbles Private API.
     // BlueBubbles' typing indicator decays server-side faster than Telegram's,
     // so we refresh at 3s (vs Telegram's 6s) to avoid visible flicker.
     let sealed = false;
-    let tickInFlight = false;
+    let tickInFlight: Promise<void> | null = null;
     let consecutiveErrors = 0;
     let interval: ReturnType<typeof setInterval> | null = null;
     let ttl: ReturnType<typeof setTimeout> | null = null;
 
     const INTERVAL_MS = 3000;
     const TTL_MS = 2 * 60 * 1000;
+    const STOP_WAIT_MS = 1000;
     const MAX_ERRORS = 10;
 
-    const cleanup = () => {
+    const cleanup = async () => {
       if (sealed) return;
       sealed = true;
       if (interval) clearInterval(interval);
       if (ttl) clearTimeout(ttl);
-      // Stop typing indicator
-      this.api("DELETE", `/chat/${encodeURIComponent(chatId)}/typing`).catch(() => {});
+      const pendingTick = tickInFlight;
+      if (pendingTick) {
+        let stopWaitTimer: ReturnType<typeof setTimeout> | null = null;
+        await Promise.race([
+          pendingTick.finally(() => {
+            if (stopWaitTimer) clearTimeout(stopWaitTimer);
+          }),
+          new Promise<void>((resolve) => {
+            stopWaitTimer = setTimeout(resolve, STOP_WAIT_MS);
+          }),
+        ]);
+      }
+      // Do not call DELETE /typing here. BlueBubbles clears typing when the
+      // message is sent or when its own timeout expires, while manual stop can
+      // race with an in-flight POST and produce a post-send typing flash.
     };
 
-    const sendTyping = async () => {
+    const sendTyping = () => {
       // tickInFlight guard: if a previous POST is still pending (slow
       // BlueBubbles HTTP), drop this tick instead of piling up requests.
       if (sealed || tickInFlight) return;
       if (consecutiveErrors >= MAX_ERRORS) {
         log.warn({ chatId }, "iMessage typing suspended after %d consecutive errors", MAX_ERRORS);
-        cleanup();
+        void cleanup();
         return;
       }
-      tickInFlight = true;
-      try {
-        await this.api("POST", `/chat/${encodeURIComponent(chatId)}/typing`);
-        consecutiveErrors = 0;
-      } catch {
-        consecutiveErrors++;
-      } finally {
-        tickInFlight = false;
-      }
+      tickInFlight = (async () => {
+        try {
+          await this.api("POST", `/chat/${encodeURIComponent(chatId)}/typing`);
+          consecutiveErrors = 0;
+        } catch {
+          consecutiveErrors++;
+        } finally {
+          tickInFlight = null;
+        }
+      })();
     };
 
-    void sendTyping();
+    sendTyping();
     interval = setInterval(sendTyping, INTERVAL_MS);
-    ttl = setTimeout(cleanup, TTL_MS);
+    ttl = setTimeout(() => void cleanup(), TTL_MS);
 
     return cleanup;
   }
@@ -472,7 +487,9 @@ export class BlueBubblesChannel implements Channel {
       throw new Error(`BlueBubbles API ${method} ${path} returned ${res.status}: ${text}`);
     }
 
-    return res.json() as Promise<Record<string, unknown>>;
+    const text = await res.text();
+    if (!text) return {};
+    return JSON.parse(text) as Record<string, unknown>;
   }
 
   private async sendAttachment(chatGuid: string, filePath: string, caption?: string): Promise<void> {

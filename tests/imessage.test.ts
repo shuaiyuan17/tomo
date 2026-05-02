@@ -1,4 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { BlueBubblesChannel } from "../src/channels/imessage.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 // Test phone/email address normalization (extracted from BlueBubblesChannel.normalizeAddress)
 function normalizeAddress(addr: string): string {
@@ -228,5 +234,42 @@ describe("webhook event parsing", () => {
     const marker = formatImageMarker(1, ["/abs/a.jpg"]);
     const result = text ? (marker ? `${marker} ${text}` : text) : marker;
     expect(result).toBe("[Sent an image, saved to: /abs/a.jpg] look at this");
+  });
+});
+
+describe("BlueBubbles typing indicator", () => {
+  it("stops the local refresh loop without sending DELETE and waits for an in-flight POST", async () => {
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const calls: Array<{ method: string; path: string }> = [];
+    const pendingFetch = new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    });
+
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      calls.push({ method: init?.method ?? "GET", path: new URL(requestUrl).pathname });
+      return pendingFetch;
+    }));
+
+    const channel = new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+
+    const stopTyping = channel.startTyping("iMessage;-;+15551234567");
+    const stopped = Promise.resolve(stopTyping());
+    let didStop = false;
+    void stopped.then(() => { didStop = true; });
+
+    await Promise.resolve();
+    expect(didStop).toBe(false);
+
+    resolveFetch!(new Response(null, { status: 204 }));
+    await stopped;
+
+    expect(calls).toEqual([
+      { method: "POST", path: "/api/v1/chat/iMessage%3B-%3B%2B15551234567/typing" },
+    ]);
   });
 });

@@ -43,6 +43,8 @@ export interface CompactRequest {
   blockTag?: string;
   /** @internal Test hook for simulating SDK appends in the final pre-rename window. */
   beforeRenameForTest?: () => void;
+  /** @internal Test hook for simulating SDK writes through a pre-rename fd. */
+  afterRenameForTest?: () => void;
 }
 
 export interface CompactResult {
@@ -81,6 +83,11 @@ export function compactSession(req: CompactRequest): CompactResult {
   try {
     return compactSessionWithFd(req, path, sourceFd);
   } finally {
+    // Holding this fd keeps the old inode readable after rename, so we can
+    // drain SDK writes that land there. Once closed, any SDK writer that had
+    // opened the old path pre-rename but delayed writing past our drain window
+    // can still write unreachable bytes. Without SDK lock cooperation, that
+    // "fd opened but idle" tail is the remaining residual boundary.
     closeSync(sourceFd);
   }
 }
@@ -280,6 +287,7 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   writeFileSync(tmp, output);
   req.beforeRenameForTest?.();
   renameSync(tmp, path);
+  req.afterRenameForTest?.();
 
   // The final pre-rename tail read still has a tiny race: the SDK can open
   // the old path just before our rename and complete an append to that old
@@ -295,6 +303,8 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   });
   lateAppended += postRenameDrain.appended;
   if (postRenameDrain.partialStillPending) {
+    // Unlike the pre-rename splice, we cannot abort after rename has committed.
+    // Keep the repaired file and warn; a future retry/repair can inspect it.
     log.warn({
       sessionId: req.sdkSessionId,
       fromIdx: req.fromIdx,
@@ -477,6 +487,8 @@ function drainOldInodeAfterRename(args: {
     cursor = readUpTo;
     partialStillPending = hasPartialTail;
     quietPasses = events.length === 0 && !hasPartialTail ? quietPasses + 1 : 0;
+    // Two empty reads give an SDK fd that survived rename a short chance to
+    // flush one final append before we release our old-inode fd.
     if (quietPasses >= 2) break;
     if (pass < 9) sleepMs(5);
   }

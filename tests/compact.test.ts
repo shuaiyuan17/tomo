@@ -335,4 +335,44 @@ describe("compactSession", () => {
     // re-parent it exactly like the pre-rename late-splice loop does.
     expect(drainedLate.parentUuid).toBe(summary.uuid);
   });
+
+  it("drains writes from an SDK fd that survives the compact rename", () => {
+    const e0 = mkUserEvent(null, "2026-04-30T00:00:00.000Z", "user 0");
+    const e1 = mkAssistantEvent(e0.uuid, "2026-04-30T00:01:00.000Z", "thinking");
+    const e2 = mkAssistantEvent(e1.uuid, "2026-04-30T00:02:00.000Z", "tool_use");
+    const e3 = mkUserEvent(e2.uuid, "2026-04-30T00:03:00.000Z", "tool_result");
+    const e4 = mkAssistantEvent(e3.uuid, "2026-04-30T00:04:00.000Z", "post-range");
+    const late = mkAssistantEvent(e2.uuid, "2026-04-30T00:05:00.000Z", "late through old fd");
+    const events = [e0, e1, e2, e3, e4];
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    let sdkFd: number | null = null;
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      fromIdx: 1,
+      toIdx: 3,
+      summary: "removed tool chain",
+      transcriptPath: archivePath,
+      beforeRenameForTest: () => {
+        sdkFd = openSync(path, "a");
+      },
+      afterRenameForTest: () => {
+        expect(sdkFd).not.toBeNull();
+        writeSync(sdkFd as number, JSON.stringify(late) + "\n");
+        closeSync(sdkFd as number);
+        sdkFd = null;
+      },
+    });
+
+    if (sdkFd !== null) closeSync(sdkFd);
+    expect(result.success).toBe(true);
+    expect(result.eventsAfter).toBe(4);
+    const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(out).toHaveLength(4);
+    const summary = out[1];
+    const drainedLate = out[3];
+    expect(drainedLate.uuid).toBe(late.uuid);
+    expect(drainedLate.parentUuid).toBe(summary.uuid);
+  });
 });

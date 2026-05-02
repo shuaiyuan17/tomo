@@ -41,6 +41,10 @@ export interface CompactRequest {
    * refresh, re-running a weekly rollup, etc).
    */
   blockTag?: string;
+  /** @internal Test hook for simulating SDK appends in the final pre-rename window. */
+  beforeRenameForTest?: () => void;
+  /** @internal Test hook for simulating SDK writes through a pre-rename fd. */
+  afterRenameForTest?: () => void;
 }
 
 export interface CompactResult {
@@ -75,6 +79,20 @@ export function compactSession(req: CompactRequest): CompactResult {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
+  const sourceFd = openSync(path, "r");
+  try {
+    return compactSessionWithFd(req, path, sourceFd);
+  } finally {
+    // Holding this fd keeps the old inode readable after rename, so we can
+    // drain SDK writes that land there. Once closed, any SDK writer that had
+    // opened the old path pre-rename but delayed writing past our drain window
+    // can still write unreachable bytes. Without SDK lock cooperation, that
+    // "fd opened but idle" tail is the remaining residual boundary.
+    closeSync(sourceFd);
+  }
+}
+
+function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: number): CompactResult {
   // Atomic read: open once, fstat the FD, then read exactly that many bytes.
   // `bytesAtRead` is pinned to the last-newline boundary (NOT current EOF) so
   // that any partial mid-write tail stays *outside* the snapshot — the
@@ -82,7 +100,7 @@ export function compactSession(req: CompactRequest): CompactResult {
   // on a later pass or abort the compact. Doing `statSync` then
   // `readFileSync` separately would let an SDK append slip into both reads
   // (counted in `allEvents` AND in the late tail), producing duplicate uuids.
-  const snapshot = readWholeFile(path);
+  const snapshot = readWholeFileFromFd(sourceFd);
   const bytesAtRead = snapshot.size;
   const allEvents: SdkEvent[] = [];
   for (const line of snapshot.text.split("\n")) {
@@ -212,7 +230,7 @@ export function compactSession(req: CompactRequest): CompactResult {
   const seenLateUuids = new Set<string>();
   let partialStillPending = false;
   for (let pass = 0; pass < 8; pass++) {
-    const { events: lateEvents, readUpTo, hasPartialTail } = readSinceOffset(path, cursor);
+    const { events: lateEvents, readUpTo, hasPartialTail } = readSinceOffsetFromFd(sourceFd, cursor);
     for (const e of lateEvents) {
       // Defense in depth against the duplication race: skip any uuid we've
       // already spliced in. (The atomic read above should make this
@@ -261,32 +279,59 @@ export function compactSession(req: CompactRequest): CompactResult {
   // Atomic write: stage the new content in a sibling temp file and rename
   // into place. The rename is atomic at the filesystem level, so the SDK's
   // appender (which re-opens the path on each append) either sees the old
-  // file fully or the new file fully — never a half-written state. Any SDK
-  // append landing strictly between the final tail-read above and this
-  // rename is still lost; that residual window is sub-millisecond and would
-  // need lock cooperation to close fully.
+  // file fully or the new file fully — never a half-written state. The
+  // post-rename drain below covers appends that land on the old inode after
+  // this final tail read.
   const output = newEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
   const tmp = path + ".compacting.tmp";
   writeFileSync(tmp, output);
+  req.beforeRenameForTest?.();
   renameSync(tmp, path);
+  req.afterRenameForTest?.();
+
+  // The final pre-rename tail read still has a tiny race: the SDK can open
+  // the old path just before our rename and complete an append to that old
+  // inode after the tail read. Keep our read fd to the old inode alive across
+  // rename and drain any complete JSONL lines from it into the new file.
+  const postRenameDrain = drainOldInodeAfterRename({
+    sourceFd,
+    startOffset: cursor,
+    path,
+    removedUuids,
+    summaryUuid,
+    seenLateUuids,
+  });
+  lateAppended += postRenameDrain.appended;
+  if (postRenameDrain.partialStillPending) {
+    // Unlike the pre-rename splice, we cannot abort after rename has committed.
+    // Keep the repaired file and warn; a future retry/repair can inspect it.
+    log.warn({
+      sessionId: req.sdkSessionId,
+      fromIdx: req.fromIdx,
+      toIdx: req.toIdx,
+    }, "Post-rename old-inode drain stopped with partial SDK write still pending");
+  }
 
   // Write trigger file so the harness knows to reload the session
   writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
 
   const eventsRemoved = removeSet.size;
+  const eventsAfter = newEvents.length + postRenameDrain.appended;
   log.info({
     sessionId: req.sdkSessionId,
     eventsRemoved,
-    eventsAfter: newEvents.length,
+    eventsAfter,
     fromIdx: req.fromIdx,
     toIdx: req.toIdx,
     lateAppended,
+    postRenameDrained: postRenameDrain.appended,
+    postRenamePartialPending: postRenameDrain.partialStillPending,
   }, "Session compacted");
 
   return {
     success: true,
     eventsRemoved,
-    eventsAfter: newEvents.length,
+    eventsAfter,
   };
 }
 
@@ -313,24 +358,7 @@ export function readWholeFile(path: string): {
 } {
   const fd = openSync(path, "r");
   try {
-    const totalSize = fstatSync(fd).size;
-    const buf = Buffer.alloc(totalSize);
-    let total = 0;
-    while (total < totalSize) {
-      const n = readSync(fd, buf, total, totalSize - total, total);
-      if (n === 0) break; // EOF earlier than fstat reported (shouldn't happen)
-      total += n;
-    }
-    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
-    if (lastNl < 0) {
-      // Empty file, or file is one in-flight partial line.
-      return { text: "", size: 0, hasPartialTail: total > 0 };
-    }
-    return {
-      text: buf.subarray(0, lastNl + 1).toString("utf-8"),
-      size: lastNl + 1,
-      hasPartialTail: total > lastNl + 1,
-    };
+    return readWholeFileFromFd(fd);
   } finally {
     closeSync(fd);
   }
@@ -359,38 +387,113 @@ export function readSinceOffset(
 ): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
   const fd = openSync(path, "r");
   try {
-    const size = fstatSync(fd).size;
-    if (size <= offset) return { events: [], readUpTo: offset, hasPartialTail: false };
-    const buf = Buffer.alloc(size - offset);
-    let total = 0;
-    while (total < buf.length) {
-      const n = readSync(fd, buf, total, buf.length - total, offset + total);
-      if (n === 0) break;
-      total += n;
-    }
-    // Locate the last newline. Bytes up to and including that newline form
-    // complete lines; anything after is a partial mid-write tail we leave
-    // alone so the next pass can re-read it.
-    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
-    if (lastNl < 0) {
-      // Entire tail is one partial line — caller's cursor must NOT advance.
-      return { events: [], readUpTo: offset, hasPartialTail: total > 0 };
-    }
-    const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
-    const events: SdkEvent[] = [];
-    for (const line of completeBytes.split("\n")) {
-      const t = line.trim();
-      if (!t) continue;
-      try { events.push(JSON.parse(t)); } catch { /* malformed but complete — skip */ }
-    }
-    return {
-      events,
-      readUpTo: offset + lastNl + 1,
-      hasPartialTail: total > lastNl + 1,
-    };
+    return readSinceOffsetFromFd(fd, offset);
   } finally {
     closeSync(fd);
   }
+}
+
+function readWholeFileFromFd(fd: number): {
+  text: string;
+  size: number;
+  hasPartialTail: boolean;
+} {
+  const totalSize = fstatSync(fd).size;
+  const buf = Buffer.alloc(totalSize);
+  let total = 0;
+  while (total < totalSize) {
+    const n = readSync(fd, buf, total, totalSize - total, total);
+    if (n === 0) break; // EOF earlier than fstat reported (shouldn't happen)
+    total += n;
+  }
+  const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
+  if (lastNl < 0) {
+    // Empty file, or file is one in-flight partial line.
+    return { text: "", size: 0, hasPartialTail: total > 0 };
+  }
+  return {
+    text: buf.subarray(0, lastNl + 1).toString("utf-8"),
+    size: lastNl + 1,
+    hasPartialTail: total > lastNl + 1,
+  };
+}
+
+function readSinceOffsetFromFd(
+  fd: number,
+  offset: number,
+): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
+  const size = fstatSync(fd).size;
+  if (size <= offset) return { events: [], readUpTo: offset, hasPartialTail: false };
+  const buf = Buffer.alloc(size - offset);
+  let total = 0;
+  while (total < buf.length) {
+    const n = readSync(fd, buf, total, buf.length - total, offset + total);
+    if (n === 0) break;
+    total += n;
+  }
+  // Locate the last newline. Bytes up to and including that newline form
+  // complete lines; anything after is a partial mid-write tail we leave
+  // alone so the next pass can re-read it.
+  const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
+  if (lastNl < 0) {
+    // Entire tail is one partial line — caller's cursor must NOT advance.
+    return { events: [], readUpTo: offset, hasPartialTail: total > 0 };
+  }
+  const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
+  const events: SdkEvent[] = [];
+  for (const line of completeBytes.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try { events.push(JSON.parse(t)); } catch { /* malformed but complete — skip */ }
+  }
+  return {
+    events,
+    readUpTo: offset + lastNl + 1,
+    hasPartialTail: total > lastNl + 1,
+  };
+}
+
+function drainOldInodeAfterRename(args: {
+  sourceFd: number;
+  startOffset: number;
+  path: string;
+  removedUuids: Set<string>;
+  summaryUuid: string;
+  seenLateUuids: Set<string>;
+}): { appended: number; partialStillPending: boolean } {
+  let cursor = args.startOffset;
+  let appended = 0;
+  let partialStillPending = false;
+  let quietPasses = 0;
+
+  for (let pass = 0; pass < 10; pass++) {
+    const { events, readUpTo, hasPartialTail } = readSinceOffsetFromFd(args.sourceFd, cursor);
+    const lines: string[] = [];
+    for (const e of events) {
+      if (e.uuid && args.seenLateUuids.has(e.uuid)) continue;
+      const event = { ...e };
+      if (event.parentUuid && args.removedUuids.has(event.parentUuid)) {
+        event.parentUuid = args.summaryUuid;
+      }
+      lines.push(JSON.stringify(event));
+      appended++;
+      if (e.uuid) args.seenLateUuids.add(e.uuid);
+    }
+
+    if (lines.length > 0) {
+      appendFileSync(args.path, lines.join("\n") + "\n");
+    }
+
+    cursor = readUpTo;
+    partialStillPending = hasPartialTail;
+    quietPasses = events.length === 0 && !hasPartialTail ? quietPasses + 1 : 0;
+    // Two empty reads give an SDK fd that survived rename a short chance to
+    // flush one final append before we release our old-inode fd.
+    if (quietPasses >= 2) break;
+    if (pass < 9) sleepMs(5);
+  }
+
+  return { appended, partialStillPending };
 }
 
 /**

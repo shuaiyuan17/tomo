@@ -1,0 +1,174 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Stub the logger so the intentionally-failing "bad baseDir" test doesn't
+// flush a real ERROR line to stderr. Same pattern as imageStore.test.ts.
+vi.mock("../src/logger.js", () => ({
+  log: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+const {
+  buildDocumentPath,
+  documentMimeToExt,
+  formatDocumentMarker,
+  isSupportedDocumentMime,
+  saveInboundDocument,
+  MAX_DOCUMENT_BYTES,
+} = await import("../src/channels/documentStore.js");
+
+describe("documentMimeToExt", () => {
+  it("maps PDF and common text formats", () => {
+    expect(documentMimeToExt("application/pdf")).toBe("pdf");
+    expect(documentMimeToExt("text/plain")).toBe("txt");
+    expect(documentMimeToExt("text/markdown")).toBe("md");
+    expect(documentMimeToExt("text/csv")).toBe("csv");
+    expect(documentMimeToExt("application/json")).toBe("json");
+  });
+
+  it("falls back to subtype for unknown application/* and text/*", () => {
+    expect(documentMimeToExt("application/xml")).toBe("xml");
+    expect(documentMimeToExt("text/yaml")).toBe("yaml");
+  });
+
+  it("returns bin for unsupported families or missing", () => {
+    expect(documentMimeToExt(undefined)).toBe("bin");
+    expect(documentMimeToExt("image/png")).toBe("bin");
+    expect(documentMimeToExt("video/mp4")).toBe("bin");
+  });
+});
+
+describe("isSupportedDocumentMime", () => {
+  it("accepts application/pdf (case-insensitive)", () => {
+    expect(isSupportedDocumentMime("application/pdf")).toBe(true);
+    expect(isSupportedDocumentMime("APPLICATION/PDF")).toBe(true);
+  });
+
+  it("rejects images and other types", () => {
+    expect(isSupportedDocumentMime("image/png")).toBe(false);
+    expect(isSupportedDocumentMime("text/plain")).toBe(false);
+    expect(isSupportedDocumentMime(undefined)).toBe(false);
+  });
+});
+
+describe("formatDocumentMarker", () => {
+  it("returns empty string for zero docs", () => {
+    expect(formatDocumentMarker(0, [])).toBe("");
+  });
+
+  it("singular vs plural", () => {
+    expect(formatDocumentMarker(1, [])).toBe("[Sent a document]");
+    expect(formatDocumentMarker(3, [])).toBe("[Sent 3 documents]");
+  });
+
+  it("appends saved paths when present", () => {
+    expect(formatDocumentMarker(1, ["/tmp/foo.pdf"])).toBe(
+      "[Sent a document, saved to: /tmp/foo.pdf]",
+    );
+    expect(formatDocumentMarker(2, ["/tmp/a.pdf", "/tmp/b.pdf"])).toBe(
+      "[Sent 2 documents, saved to: /tmp/a.pdf, /tmp/b.pdf]",
+    );
+  });
+
+  it("falls back to no-paths form when intended > saved", () => {
+    expect(formatDocumentMarker(2, [])).toBe("[Sent 2 documents]");
+  });
+});
+
+describe("buildDocumentPath", () => {
+  it("composes a date-folder path with timestamp + session + guid + ext", () => {
+    const ts = new Date(2026, 4, 5, 22, 33, 7); // local time
+    const result = buildDocumentPath("/base", "application/pdf", {
+      sessionKey: "imessage_dm",
+      guid: "abcdef1234567890",
+      timestamp: ts,
+    });
+    expect(result.dir).toBe("/base/memory/incoming-documents/2026-05-05");
+    expect(result.filename).toMatch(/^223307_imessage_dm_abcdef12\.pdf$/);
+  });
+
+  it("includes the sanitized filename stem when provided", () => {
+    const ts = new Date(2026, 4, 5, 9, 1, 2);
+    const result = buildDocumentPath("/base", "application/pdf", {
+      sessionKey: "tg",
+      guid: "g123",
+      filename: "Lab Results — May 2026.pdf",
+      timestamp: ts,
+    });
+    // Hyphen char (—) should be replaced with underscore
+    expect(result.filename).toBe("090102_tg_g123_Lab_Results___May_2026.pdf");
+  });
+
+  it("sanitizes session and guid characters", () => {
+    const ts = new Date(2026, 4, 5, 0, 0, 0);
+    const result = buildDocumentPath("/base", "application/pdf", {
+      sessionKey: "weird/session!",
+      guid: "x".repeat(40),
+      timestamp: ts,
+    });
+    expect(result.filename).toMatch(/^000000_weird_session__/);
+    // Truncated to 8 chars
+    expect(result.filename).toContain("xxxxxxxx.pdf");
+  });
+
+  it("handles missing meta fields with fallbacks", () => {
+    const ts = new Date(2026, 4, 5, 0, 0, 0);
+    const result = buildDocumentPath("/base", "application/pdf", { timestamp: ts });
+    expect(result.filename).toBe("000000_session_unknown.pdf");
+  });
+});
+
+describe("saveInboundDocument", () => {
+  let baseDir: string;
+
+  beforeEach(async () => {
+    baseDir = await mkdtemp(join(tmpdir(), "tomo-doc-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  it("writes the buffer and returns the path", async () => {
+    const ts = new Date(2026, 4, 5, 12, 34, 56);
+    const buffer = Buffer.from("%PDF-1.4 fake pdf bytes");
+    const fullPath = await saveInboundDocument(
+      buffer,
+      "application/pdf",
+      { sessionKey: "dm", guid: "g00", timestamp: ts, filename: "report.pdf" },
+      baseDir,
+    );
+    expect(fullPath).not.toBeNull();
+    expect(fullPath!.startsWith(baseDir)).toBe(true);
+    const written = await readFile(fullPath!);
+    expect(written.equals(buffer)).toBe(true);
+
+    // Verify the path layout
+    const st = await stat(fullPath!);
+    expect(st.size).toBe(buffer.length);
+  });
+
+  it("returns null and does not throw on bad baseDir (parent unwritable)", async () => {
+    // Use a path that cannot be created (a file used as a directory)
+    const bogus = "/proc/this/is/not/a/real/dir";
+    const result = await saveInboundDocument(
+      Buffer.from("x"),
+      "application/pdf",
+      { sessionKey: "dm", guid: "g" },
+      bogus,
+    );
+    expect(result).toBeNull();
+  });
+});
+
+describe("MAX_DOCUMENT_BYTES", () => {
+  it("matches Anthropic's 32 MB PDF cap", () => {
+    expect(MAX_DOCUMENT_BYTES).toBe(32 * 1024 * 1024);
+  });
+});

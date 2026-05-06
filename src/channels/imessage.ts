@@ -1,6 +1,7 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, StopTyping } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { formatImageMarker, saveInboundImage } from "./imageStore.js";
+import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { log } from "../logger.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -345,23 +346,29 @@ export class BlueBubblesChannel implements Channel {
       }
     }
 
-    // Download image attachments
+    // Download image + document attachments
     const attachments = data.attachments as Array<Record<string, unknown>> | undefined;
     const intendedImageCount = (attachments ?? []).filter(
       (a) => typeof a.mimeType === "string" && (a.mimeType as string).startsWith("image/"),
     ).length;
-    const images = await this.downloadAttachments(attachments, chatGuid);
+    const intendedDocumentCount = (attachments ?? []).filter(
+      (a) => typeof a.mimeType === "string" && isSupportedDocumentMime(a.mimeType as string),
+    ).length;
+    const { images, documents } = await this.downloadAttachments(attachments, chatGuid);
 
     // Mark chat as read (best-effort; requires BlueBubbles Private API helper)
     this.api("POST", `/chat/${encodeURIComponent(chatGuid)}/read`).catch(() => {});
 
     const senderName = this.resolveContactName(senderAddress);
 
-    const savedPaths = images.map((i) => i.savedPath).filter((p): p is string => Boolean(p));
-    const marker = formatImageMarker(intendedImageCount, savedPaths);
+    const imageSavedPaths = images.map((i) => i.savedPath).filter((p): p is string => Boolean(p));
+    const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
+    const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
+    const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
+    const markers = [imageMarker, docMarker].filter(Boolean).join(" ");
     const composedText = text
-      ? (marker ? `${marker} ${text}` : text)
-      : marker;
+      ? (markers ? `${markers} ${text}` : text)
+      : markers;
 
     const message: IncomingMessage = {
       id: guid,
@@ -369,6 +376,7 @@ export class BlueBubblesChannel implements Channel {
       senderName,
       text: composedText,
       images: images.length > 0 ? images : undefined,
+      documents: documents.length > 0 ? documents : undefined,
       timestamp: typeof data.dateCreated === "number" ? data.dateCreated : Date.now(),
       isGroup,
       isMentioned,
@@ -386,14 +394,19 @@ export class BlueBubblesChannel implements Channel {
   private async downloadAttachments(
     attachments: Array<Record<string, unknown>> | undefined,
     chatGuid?: string,
-  ): Promise<ImageAttachment[]> {
-    if (!attachments || attachments.length === 0) return [];
+  ): Promise<{ images: ImageAttachment[]; documents: DocumentAttachment[] }> {
+    if (!attachments || attachments.length === 0) return { images: [], documents: [] };
 
     const images: ImageAttachment[] = [];
+    const documents: DocumentAttachment[] = [];
 
     for (const att of attachments) {
       const mimeType = att.mimeType as string | undefined;
-      if (!mimeType?.startsWith("image/")) continue;
+      if (!mimeType) continue;
+
+      const isImage = mimeType.startsWith("image/");
+      const isDocument = isSupportedDocumentMime(mimeType);
+      if (!isImage && !isDocument) continue;
 
       const attGuid = att.guid as string;
       if (!attGuid) continue;
@@ -405,26 +418,51 @@ export class BlueBubblesChannel implements Channel {
 
         const buffer = Buffer.from(await res.arrayBuffer());
 
-        // Additively persist to disk if configured. Never blocks the return.
-        let savedPath: string | undefined;
-        if (this.imageStoreBaseDir) {
-          savedPath = (await saveInboundImage(buffer, mimeType, {
-            sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
-            guid: attGuid,
-          }, this.imageStoreBaseDir)) ?? undefined;
+        if (isImage) {
+          // Additively persist to disk if configured. Never blocks the return.
+          let savedPath: string | undefined;
+          if (this.imageStoreBaseDir) {
+            savedPath = (await saveInboundImage(buffer, mimeType, {
+              sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
+              guid: attGuid,
+            }, this.imageStoreBaseDir)) ?? undefined;
+          }
+          images.push({
+            data: buffer.toString("base64"),
+            mediaType: mimeType,
+            savedPath,
+          });
+        } else {
+          // Documents: enforce size cap (Anthropic API limit is 32 MB per PDF).
+          if (buffer.length > MAX_DOCUMENT_BYTES) {
+            log.warn(
+              { guid: attGuid, mimeType, bytes: buffer.length, max: MAX_DOCUMENT_BYTES },
+              "Skipping oversized document attachment",
+            );
+            continue;
+          }
+          const filename = (att.transferName as string | undefined) ?? undefined;
+          let savedPath: string | undefined;
+          if (this.imageStoreBaseDir) {
+            savedPath = (await saveInboundDocument(buffer, mimeType, {
+              sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
+              guid: attGuid,
+              filename,
+            }, this.imageStoreBaseDir)) ?? undefined;
+          }
+          documents.push({
+            data: buffer.toString("base64"),
+            mediaType: mimeType,
+            filename,
+            savedPath,
+          });
         }
-
-        images.push({
-          data: buffer.toString("base64"),
-          mediaType: mimeType,
-          savedPath,
-        });
       } catch (err) {
         log.error({ err, guid: attGuid }, "Failed to download attachment");
       }
     }
 
-    return images;
+    return { images, documents };
   }
 
   // --- Contact resolution ---

@@ -270,6 +270,7 @@ export class LiveSession {
     onText?: (text: string) => void,
     images?: Array<{ data: string; mediaType: string }>,
     onBlockComplete?: (text: string) => void | Promise<void>,
+    documents?: Array<{ data: string; mediaType: string; filename?: string }>,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -284,6 +285,16 @@ export class LiveSession {
           type: "image",
           source: { type: "base64", media_type: img.mediaType as ImageMediaType, data: img.data },
         });
+      }
+    }
+    if (documents && documents.length > 0) {
+      for (const doc of documents) {
+        const block: Record<string, unknown> = {
+          type: "document",
+          source: { type: "base64", media_type: doc.mediaType, data: doc.data },
+        };
+        if (doc.filename) block.title = doc.filename;
+        content.push(block);
       }
     }
     content.push({ type: "text", text });

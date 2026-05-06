@@ -2,7 +2,7 @@ import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction } from "./types.js";
 import { formatImageMarker, saveInboundImage } from "./imageStore.js";
-import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
+import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { log } from "../logger.js";
 
 export interface TelegramChannelOptions {
@@ -115,6 +115,7 @@ export class TelegramChannel implements Channel {
         doc.file_id,
         doc.mime_type as string,
         doc.file_name,
+        doc.file_size,
         String(ctx.chat.id),
       );
 
@@ -220,8 +221,20 @@ export class TelegramChannel implements Channel {
     fileId: string,
     mediaType: string,
     filename: string | undefined,
+    declaredFileSize: number | undefined,
     chatId?: string,
   ): Promise<DocumentAttachment | undefined> {
+    // Pre-check declared file_size before any HTTP work. Telegram's Document
+    // object reliably includes file_size; if it's already over the cap we
+    // skip getFile + download entirely.
+    if (typeof declaredFileSize === "number" && declaredFileSize > MAX_DOCUMENT_BYTES) {
+      log.warn(
+        { fileId, mediaType, declaredFileSize, max: MAX_DOCUMENT_BYTES },
+        "Skipping oversized document attachment (pre-download)",
+      );
+      return undefined;
+    }
+
     try {
       const file = await this.bot.api.getFile(fileId);
       if (!file.file_path) return undefined;
@@ -230,11 +243,25 @@ export class TelegramChannel implements Channel {
       const res = await fetch(url);
       if (!res.ok) return undefined;
 
-      const buffer = Buffer.from(await res.arrayBuffer());
-      if (buffer.length > MAX_DOCUMENT_BYTES) {
+      // Belt-and-suspenders: enforce the cap via Content-Length, then via a
+      // streaming reader cap, in case the Telegram CDN omits the header or
+      // declared file_size disagreed with reality.
+      const contentLengthHeader = res.headers.get("content-length");
+      const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+      if (Number.isFinite(contentLength) && contentLength > MAX_DOCUMENT_BYTES) {
         log.warn(
-          { fileId, mediaType, bytes: buffer.length, max: MAX_DOCUMENT_BYTES },
-          "Skipping oversized document attachment",
+          { fileId, mediaType, contentLength, max: MAX_DOCUMENT_BYTES },
+          "Skipping oversized document attachment (Content-Length)",
+        );
+        res.body?.cancel().catch(() => {});
+        return undefined;
+      }
+
+      const buffer = await readBodyWithCap(res, MAX_DOCUMENT_BYTES);
+      if (!buffer) {
+        log.warn(
+          { fileId, mediaType, max: MAX_DOCUMENT_BYTES },
+          "Skipping oversized document attachment (streaming cap exceeded)",
         );
         return undefined;
       }

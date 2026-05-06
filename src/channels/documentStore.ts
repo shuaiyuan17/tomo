@@ -128,6 +128,47 @@ export function formatDocumentMarker(intendedCount: number, savedPaths: string[]
 }
 
 /**
+ * Read a `fetch` response body into a Buffer with a hard size cap. Returns
+ * `null` if the body grows past `maxBytes` before completing — chunks are
+ * accumulated only up to the cap, so a malicious or mis-declared payload
+ * cannot exhaust memory before we notice. Cancels the underlying stream on
+ * cap-hit so the socket is freed promptly.
+ *
+ * Use this in addition to (not instead of) any pre-download size hint
+ * checks (e.g. Telegram's `file_size`, BlueBubbles' `totalBytes`,
+ * HTTP `Content-Length`); those hints can be missing or wrong.
+ */
+export async function readBodyWithCap(
+  res: Response,
+  maxBytes: number,
+): Promise<Buffer | null> {
+  if (!res.body) {
+    // No streaming body — fall back to arrayBuffer with a post-check.
+    const buf = Buffer.from(await res.arrayBuffer());
+    return buf.length > maxBytes ? null : buf;
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* best-effort */ }
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* best-effort */ }
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
+}
+
+/**
  * Save an inbound document to disk. Never throws — errors are logged and the
  * function returns `null` so the message flow can continue unimpeded.
  *

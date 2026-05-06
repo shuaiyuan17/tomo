@@ -19,6 +19,7 @@ const {
   documentMimeToExt,
   formatDocumentMarker,
   isSupportedDocumentMime,
+  readBodyWithCap,
   saveInboundDocument,
   MAX_DOCUMENT_BYTES,
 } = await import("../src/channels/documentStore.js");
@@ -155,8 +156,10 @@ describe("saveInboundDocument", () => {
   });
 
   it("returns null and does not throw on bad baseDir (parent unwritable)", async () => {
-    // Use a path that cannot be created (a file used as a directory)
-    const bogus = "/proc/this/is/not/a/real/dir";
+    // Use a path under /dev/null (a non-directory) so mkdir fails immediately
+    // with ENOTDIR on both macOS and Linux. This avoids slow probe paths in
+    // CI that caused the previous /proc-based path to hit the test timeout.
+    const bogus = "/dev/null/\0invalid";
     const result = await saveInboundDocument(
       Buffer.from("x"),
       "application/pdf",
@@ -170,5 +173,67 @@ describe("saveInboundDocument", () => {
 describe("MAX_DOCUMENT_BYTES", () => {
   it("matches Anthropic's 32 MB PDF cap", () => {
     expect(MAX_DOCUMENT_BYTES).toBe(32 * 1024 * 1024);
+  });
+});
+
+describe("readBodyWithCap", () => {
+  // Build a Response whose body is a ReadableStream emitting `chunks` in order.
+  function streamResponse(chunks: Uint8Array[]): Response {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    return new Response(stream);
+  }
+
+  it("returns the buffer when total size is within cap", async () => {
+    const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])];
+    const buf = await readBodyWithCap(streamResponse(chunks), 100);
+    expect(buf).not.toBeNull();
+    expect(buf!.length).toBe(5);
+    expect(Array.from(buf!)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("returns null and stops reading when cap is exceeded mid-stream", async () => {
+    let secondChunkRead = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(10));
+        // Schedule a second chunk; if cap-cancellation works, this enqueue
+        // happens but the reader is already cancelled.
+        controller.enqueue(new Uint8Array(20));
+        secondChunkRead = true;
+        controller.close();
+      },
+    });
+    const res = new Response(stream);
+    const buf = await readBodyWithCap(res, 5);
+    expect(buf).toBeNull();
+    // The second-chunk enqueue does happen at start time; what we really
+    // assert is the cap-hit returns null without throwing or buffering past
+    // the cap. The flag just confirms the start callback ran.
+    expect(secondChunkRead).toBe(true);
+  });
+
+  it("falls back to arrayBuffer + post-check when body is missing", async () => {
+    // A Response with no body (e.g. some 204-style edge cases). We construct
+    // one by passing null body, then patch arrayBuffer to return a small
+    // payload — verifying we still get a Buffer back.
+    const res = new Response(null);
+    Object.defineProperty(res, "body", { value: null });
+    res.arrayBuffer = async () => new Uint8Array([7, 8, 9]).buffer;
+    const buf = await readBodyWithCap(res, 100);
+    expect(buf).not.toBeNull();
+    expect(Array.from(buf!)).toEqual([7, 8, 9]);
+  });
+
+  it("falls back path also enforces cap via post-check", async () => {
+    const res = new Response(null);
+    Object.defineProperty(res, "body", { value: null });
+    res.arrayBuffer = async () => new Uint8Array(20).buffer;
+    const buf = await readBodyWithCap(res, 5);
+    expect(buf).toBeNull();
   });
 });

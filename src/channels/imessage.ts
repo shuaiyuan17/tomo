@@ -1,7 +1,7 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { formatImageMarker, saveInboundImage } from "./imageStore.js";
-import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
+import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { log } from "../logger.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -411,12 +411,54 @@ export class BlueBubblesChannel implements Channel {
       const attGuid = att.guid as string;
       if (!attGuid) continue;
 
+      // Pre-check declared size before any HTTP work for documents. BlueBubbles
+      // exposes `totalBytes` on the attachment payload; if it's already over
+      // the cap we skip the download entirely, so a malicious 100 GB PDF
+      // cannot make us start streaming bytes.
+      if (isDocument) {
+        const declared = att.totalBytes;
+        if (typeof declared === "number" && declared > MAX_DOCUMENT_BYTES) {
+          log.warn(
+            { guid: attGuid, mimeType, declaredBytes: declared, max: MAX_DOCUMENT_BYTES },
+            "Skipping oversized document attachment (pre-download)",
+          );
+          continue;
+        }
+      }
+
       try {
         const url = `${this.apiUrl}/api/v1/attachment/${encodeURIComponent(attGuid)}/download?password=${encodeURIComponent(this.password)}`;
         const res = await fetch(url);
         if (!res.ok) continue;
 
-        const buffer = Buffer.from(await res.arrayBuffer());
+        // For documents, also enforce the cap via Content-Length before we
+        // materialize the body, then stream with a running cap as a belt-and-
+        // suspenders guard against missing/lying Content-Length.
+        if (isDocument) {
+          const contentLengthHeader = res.headers.get("content-length");
+          const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+          if (Number.isFinite(contentLength) && contentLength > MAX_DOCUMENT_BYTES) {
+            log.warn(
+              { guid: attGuid, mimeType, contentLength, max: MAX_DOCUMENT_BYTES },
+              "Skipping oversized document attachment (Content-Length)",
+            );
+            // Drain to free the socket — best-effort, never throws.
+            res.body?.cancel().catch(() => {});
+            continue;
+          }
+        }
+
+        const buffer = isDocument
+          ? await readBodyWithCap(res, MAX_DOCUMENT_BYTES)
+          : Buffer.from(await res.arrayBuffer());
+
+        if (!buffer) {
+          log.warn(
+            { guid: attGuid, mimeType, max: MAX_DOCUMENT_BYTES },
+            "Skipping oversized document attachment (streaming cap exceeded)",
+          );
+          continue;
+        }
 
         if (isImage) {
           // Additively persist to disk if configured. Never blocks the return.
@@ -433,14 +475,6 @@ export class BlueBubblesChannel implements Channel {
             savedPath,
           });
         } else {
-          // Documents: enforce size cap (Anthropic API limit is 32 MB per PDF).
-          if (buffer.length > MAX_DOCUMENT_BYTES) {
-            log.warn(
-              { guid: attGuid, mimeType, bytes: buffer.length, max: MAX_DOCUMENT_BYTES },
-              "Skipping oversized document attachment",
-            );
-            continue;
-          }
           const filename = (att.transferName as string | undefined) ?? undefined;
           let savedPath: string | undefined;
           if (this.imageStoreBaseDir) {

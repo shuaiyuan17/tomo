@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Inbound PDF support.** Both iMessage and Telegram channels now accept PDF attachments and forward them to the agent as Anthropic `document` content blocks (alongside the existing `image` blocks). When `saveInboundImages` is on, PDFs are also persisted to `{workspaceDir}/memory/incoming-documents/YYYY-MM-DD/HHMMSS_{session}_{guid8}[_filename].pdf`, parallel to the image store. New `documentStore.ts` exposes `saveInboundDocument`, `formatDocumentMarker`, `documentMimeToExt`, and `isSupportedDocumentMime`; the supported MIME list is currently `["application/pdf"]`. Anthropic's 32 MB per-PDF cap is enforced by `MAX_DOCUMENT_BYTES`; oversized attachments are dropped with a warn log so memory and disk stay bounded. Size enforcement is layered: each channel pre-checks the declared size hint (BlueBubbles `totalBytes`, Telegram `Document.file_size`) before any HTTP work, then the HTTP `Content-Length` header at fetch time, then a streaming reader cap (`readBodyWithCap`) that hard-stops accumulation past the cap and cancels the underlying stream — so a 100 GB PDF never spikes memory regardless of which size hint is missing or wrong. iMessage downloads PDFs in the same pass as images (one BlueBubbles round-trip), Telegram adds a dedicated `message:document` handler that filters by MIME before downloading. `IncomingMessage` gains an optional `documents?: DocumentAttachment[]` field; `live-session.ts` emits `{ type: "document", source: { type: "base64", media_type, data }, title }` blocks and the agent threads documents through `runWithRetry` and `handleBatchedMessages` mirror to the existing image plumbing. Unsupported document MIMEs on Telegram still surface as a plain text marker so the agent doesn't see "user sent something" without context.
+
 ## 0.5.5 (2026-05-01)
 
 ### Features

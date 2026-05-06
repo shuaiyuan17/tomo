@@ -7,6 +7,17 @@ export interface ImageAttachment {
   savedPath?: string;
 }
 
+export interface DocumentAttachment {
+  /** Base64-encoded document data */
+  data: string;
+  /** MIME type (e.g. "application/pdf") */
+  mediaType: string;
+  /** Original filename if the channel exposed one (Telegram document, etc.). */
+  filename?: string;
+  /** Absolute path on disk if the channel persisted the document. */
+  savedPath?: string;
+}
+
 export interface IncomingMessage {
   /** Unique message ID from the source channel */
   id: string;
@@ -18,6 +29,8 @@ export interface IncomingMessage {
   text: string;
   /** Optional image attachments */
   images?: ImageAttachment[];
+  /** Optional document attachments (PDFs, etc.) */
+  documents?: DocumentAttachment[];
   /** Unix timestamp in milliseconds */
   timestamp: number;
   /** Whether this message is from a group chat */

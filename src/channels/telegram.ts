@@ -1,7 +1,8 @@
 import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, StreamingMessage, MessageReaction } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction } from "./types.js";
 import { formatImageMarker, saveInboundImage } from "./imageStore.js";
+import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { log } from "../logger.js";
 
 export interface TelegramChannelOptions {
@@ -76,6 +77,59 @@ export class TelegramChannel implements Channel {
         senderName: this.getSenderName(ctx),
         text,
         images: image ? [image] : undefined,
+        timestamp: ctx.message.date * 1000,
+        isGroup,
+        isMentioned,
+        chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+      });
+    });
+
+    // Document messages (PDFs and other supported document types). Telegram
+    // exposes generic file attachments under `message:document`; we ingest
+    // only the MIME types Anthropic accepts as document content blocks.
+    this.bot.on("message:document", async (ctx) => {
+      const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+      const isMentioned = this.checkMentioned(ctx);
+      const doc = ctx.message.document;
+
+      // Skip silently if it's not a supported document MIME — emit a plain
+      // text message so the agent can still see "user sent some unsupported
+      // file" rather than the message disappearing entirely.
+      if (!isSupportedDocumentMime(doc.mime_type)) {
+        const caption = this.cleanMention(ctx.message.caption ?? "");
+        const note = `[Sent an unsupported document: ${doc.file_name ?? "unnamed"} (${doc.mime_type ?? "no mime"})]`;
+        this.dispatch({
+          id: String(ctx.message.message_id),
+          chatId: String(ctx.chat.id),
+          senderName: this.getSenderName(ctx),
+          text: caption ? `${note} ${caption}` : note,
+          timestamp: ctx.message.date * 1000,
+          isGroup,
+          isMentioned,
+          chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+        });
+        return;
+      }
+
+      const document = await this.downloadDocument(
+        doc.file_id,
+        doc.mime_type as string,
+        doc.file_name,
+        doc.file_size,
+        String(ctx.chat.id),
+      );
+
+      const caption = this.cleanMention(ctx.message.caption ?? "");
+      const savedPaths = document?.savedPath ? [document.savedPath] : [];
+      const marker = formatDocumentMarker(1, savedPaths);
+      const text = caption ? `${marker} ${caption}` : marker;
+
+      this.dispatch({
+        id: String(ctx.message.message_id),
+        chatId: String(ctx.chat.id),
+        senderName: this.getSenderName(ctx),
+        text,
+        documents: document ? [document] : undefined,
         timestamp: ctx.message.date * 1000,
         isGroup,
         isMentioned,
@@ -161,6 +215,72 @@ export class TelegramChannel implements Channel {
       sticker.isVideo ? "video=true" : undefined,
     ].filter(Boolean);
     return `[Sent a Telegram sticker: ${parts.join(", ")}; resend=STICKER:${sticker.fileId}]`;
+  }
+
+  private async downloadDocument(
+    fileId: string,
+    mediaType: string,
+    filename: string | undefined,
+    declaredFileSize: number | undefined,
+    chatId?: string,
+  ): Promise<DocumentAttachment | undefined> {
+    // Pre-check declared file_size before any HTTP work. Telegram's Document
+    // object reliably includes file_size; if it's already over the cap we
+    // skip getFile + download entirely.
+    if (typeof declaredFileSize === "number" && declaredFileSize > MAX_DOCUMENT_BYTES) {
+      log.warn(
+        { fileId, mediaType, declaredFileSize, max: MAX_DOCUMENT_BYTES },
+        "Skipping oversized document attachment (pre-download)",
+      );
+      return undefined;
+    }
+
+    try {
+      const file = await this.bot.api.getFile(fileId);
+      if (!file.file_path) return undefined;
+
+      const url = `https://api.telegram.org/file/bot${this.bot.token}/${file.file_path}`;
+      const res = await fetch(url);
+      if (!res.ok) return undefined;
+
+      // Belt-and-suspenders: enforce the cap via Content-Length, then via a
+      // streaming reader cap, in case the Telegram CDN omits the header or
+      // declared file_size disagreed with reality.
+      const contentLengthHeader = res.headers.get("content-length");
+      const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+      if (Number.isFinite(contentLength) && contentLength > MAX_DOCUMENT_BYTES) {
+        log.warn(
+          { fileId, mediaType, contentLength, max: MAX_DOCUMENT_BYTES },
+          "Skipping oversized document attachment (Content-Length)",
+        );
+        res.body?.cancel().catch(() => {});
+        return undefined;
+      }
+
+      const buffer = await readBodyWithCap(res, MAX_DOCUMENT_BYTES);
+      if (!buffer) {
+        log.warn(
+          { fileId, mediaType, max: MAX_DOCUMENT_BYTES },
+          "Skipping oversized document attachment (streaming cap exceeded)",
+        );
+        return undefined;
+      }
+
+      // Additively persist to disk if configured. Never blocks the return.
+      let savedPath: string | undefined;
+      if (this.imageStoreBaseDir) {
+        savedPath = (await saveInboundDocument(buffer, mediaType, {
+          sessionKey: chatId ? `telegram_${chatId}` : "telegram",
+          guid: fileId,
+          filename,
+        }, this.imageStoreBaseDir)) ?? undefined;
+      }
+
+      return { data: buffer.toString("base64"), mediaType, filename, savedPath };
+    } catch (err) {
+      log.error({ err }, "Failed to download document");
+      return undefined;
+    }
   }
 
   private async downloadPhoto(fileId: string, chatId?: string): Promise<ImageAttachment | undefined> {

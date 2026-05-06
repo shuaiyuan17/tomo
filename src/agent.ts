@@ -414,11 +414,19 @@ export class Agent {
 
   private async handleMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const hasImages = message.images && message.images.length > 0;
+    const hasDocuments = message.documents && message.documents.length > 0;
     const isGroup = message.isGroup ?? false;
     const isMentioned = message.isMentioned ?? false;
 
     log.info(
-      { channel: channel.name, sender: message.senderName, group: isGroup || undefined, mentioned: isMentioned || undefined, images: hasImages ? message.images!.length : undefined },
+      {
+        channel: channel.name,
+        sender: message.senderName,
+        group: isGroup || undefined,
+        mentioned: isMentioned || undefined,
+        images: hasImages ? message.images!.length : undefined,
+        documents: hasDocuments ? message.documents!.length : undefined,
+      },
       message.text,
     );
 
@@ -474,6 +482,7 @@ export class Agent {
         (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
         message.images,
         this.makeBlockHandler(replyChannel, replyChatId, stream),
+        message.documents,
       );
       await stopTyping();
 
@@ -560,6 +569,7 @@ export class Agent {
       const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
       const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(combined, lastChannel.name);
       const allImages = items.flatMap((it) => it.message.images ?? []);
+      const allDocuments = items.flatMap((it) => it.message.documents ?? []);
 
       const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? lastMessage.id : undefined);
       const response = await this.runWithRetry(
@@ -568,6 +578,7 @@ export class Agent {
         (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
         allImages.length > 0 ? allImages : undefined,
         this.makeBlockHandler(replyChannel, replyChatId, stream),
+        allDocuments.length > 0 ? allDocuments : undefined,
       );
       await stopTyping();
 
@@ -596,10 +607,11 @@ export class Agent {
     onText?: (text: string) => void,
     images?: Array<{ data: string; mediaType: string }>,
     onBlockComplete?: (text: string) => void | Promise<void>,
+    documents?: Array<{ data: string; mediaType: string; filename?: string }>,
   ): Promise<string> {
     try {
       const session = this.getOrCreateLiveSession(key);
-      const response = await session.send(prompt, onText, images, onBlockComplete);
+      const response = await session.send(prompt, onText, images, onBlockComplete, documents);
 
       // Capture session ID if new
       const sid = session.getSessionId();
@@ -667,7 +679,7 @@ export class Agent {
         this.sessions.clearSdkSessionId(key);
 
         const session = this.getOrCreateLiveSession(key);
-        return session.send(prompt, onText, images, onBlockComplete);
+        return session.send(prompt, onText, images, onBlockComplete, documents);
       }
 
       throw err;

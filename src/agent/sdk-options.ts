@@ -95,7 +95,7 @@ export function sdkOptions(
     allowDangerouslySkipPermissions: true,
     allowedTools: [
       "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-      "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite", "Skill",
+      "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite",
       `mcp__${TOMO_INTERNAL_MCP_NAME}__send_message`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__list_sessions`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__rename_group_chat`,
@@ -104,6 +104,12 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_list`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_remove`,
     ],
+    // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path
+    // is the top-level `skills` option. The SDK appends `"Skill"` (or
+    // `"Skill(name)"` per entry) to the spawned CLI's --allowedTools only when
+    // `skills` is defined, so we set it to "all" to keep every discovered
+    // skill invocable (same surface as the old `"Skill"` allowedTools entry).
+    skills: "all" as const,
     mcpServers: { [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: ["project"] as ("project")[],
     settings: {

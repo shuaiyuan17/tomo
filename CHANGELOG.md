@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.7 (2026-05-10)
+
+### Other
+
+- **Migrate the deprecated `"Skill"` allowedTools entry to the top-level `skills: "all"` option (#94).** SDK v0.2.133 [release notes](https://github.com/anthropics/claude-agent-sdk-typescript/releases/tag/v0.2.133) deprecated passing `'Skill'` in `allowedTools`; the SDK now appends `"Skill"` (or `"Skill(name)"` per entry) to the spawned CLI's `--allowedTools` only when `skills` is defined. Setting `skills: "all"` keeps every discovered skill in `.claude/skills/` invocable with the same surface as before, while shedding the soon-to-be-removed pattern.
+- Bump `@anthropic-ai/claude-agent-sdk` 0.2.126 → 0.2.138 (#92). Tracks Claude Code through v2.1.138. Notable from the intervening releases: `resolveSettings()` alpha API to inspect merged effective settings without spawning the CLI (v0.2.136), plus deprecation notices for the `unstable_v2_*` session API → `query()` (not used here) and the `'Skill'` allowedTools pattern handled above.
+- Bump `zod` 4.4.2 → 4.4.3 (#93).
+- Bump dev dependencies group: `@types/node` 25.6.0 → 25.6.2, `typescript-eslint` 8.59.1 → 8.59.2 (#91).
+
 ## 0.5.6 (2026-05-05)
 
 ### Features

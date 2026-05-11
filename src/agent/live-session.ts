@@ -1,6 +1,6 @@
 import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
-import type { sdkOptions } from "./sdk-options.js";
+import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
 
 export interface MessageRequest {
   message: SDKUserMessage;
@@ -78,12 +78,14 @@ export class LiveSession {
   private prevTotalCost = 0;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
+  private turnBudget: TurnBudget | undefined;
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
 
-  constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string) {
+  constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string, turnBudget?: TurnBudget) {
     this.sessionKey = sessionKey;
+    this.turnBudget = turnBudget;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -273,6 +275,9 @@ export class LiveSession {
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
+
+    // Fresh maxTurns budget per user message — warnings fire once per send().
+    if (this.turnBudget) resetTurnBudget(this.turnBudget);
 
     const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()
 

@@ -10,7 +10,7 @@ import { IdentityRouter } from "./router.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
-import { sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
+import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
@@ -281,13 +281,14 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
+    const turnBudget = makeTurnBudget();
     const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.buildGroupContext(key),
-    });
+    }, turnBudget);
 
-    session = new LiveSession(opts, key);
+    session = new LiveSession(opts, key, turnBudget);
     this.liveSessions.set(key, session);
     log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
     return session;

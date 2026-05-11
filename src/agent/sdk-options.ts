@@ -1,5 +1,6 @@
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config.js";
+import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
@@ -39,6 +40,27 @@ async function skillsCanUseTool(
   };
 }
 
+/** Mutable per-send counter for the SDK's maxTurns budget. The SDK enforces
+ *  maxTurns silently and only surfaces it as an error after the fact, so we
+ *  count tool rounds via a PostToolBatch hook and inject a system reminder at
+ *  75% / 90% so the agent can wrap up before hitting the ceiling. Reset by
+ *  LiveSession.send() at the start of each user-message → response cycle. */
+export interface TurnBudget {
+  count: number;
+  fired75: boolean;
+  fired90: boolean;
+}
+
+export function makeTurnBudget(): TurnBudget {
+  return { count: 0, fired75: false, fired90: false };
+}
+
+export function resetTurnBudget(b: TurnBudget): void {
+  b.count = 0;
+  b.fired75 = false;
+  b.fired90 = false;
+}
+
 export interface SessionContext {
   sessionKey: string;
   sdkSessionId?: string;
@@ -57,6 +79,7 @@ export function sdkOptions(
   resumeSessionId?: string,
   model?: string,
   sessionContext?: SessionContext,
+  turnBudget?: TurnBudget,
 ) {
   let systemPrompt = buildSystemPrompt();
 
@@ -127,6 +150,7 @@ export function sdkOptions(
     canUseTool: skillsCanUseTool,
     includePartialMessages: true,
     maxTurns: config.maxTurns,
+    ...(turnBudget ? { hooks: turnBudgetHooks(turnBudget, config.maxTurns, sessionContext?.sessionKey) } : {}),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     // Note: SDK `env` fully replaces the child's env (not merged despite the
     // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -134,5 +158,42 @@ export function sdkOptions(
     ...(sessionContext && usesLcmCompact(sessionContext.sessionKey)
       ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
       : {}),
+  };
+}
+
+/** Build a PostToolBatch hook that increments `budget.count` once per tool
+ *  round and injects an `additionalContext` system reminder at 75% and 90% of
+ *  maxTurns. PostToolBatch is the right granularity: it fires exactly once per
+ *  model→tools→model round, which approximates a turn. */
+function turnBudgetHooks(budget: TurnBudget, max: number, sessionKey?: string) {
+  const threshold75 = Math.floor(max * 0.75);
+  const threshold90 = Math.floor(max * 0.9);
+  return {
+    PostToolBatch: [{
+      hooks: [async () => {
+        budget.count++;
+        if (budget.count >= threshold90 && !budget.fired90) {
+          budget.fired90 = true;
+          log.warn({ key: sessionKey, used: budget.count, max }, "Turn budget at 90%");
+          return {
+            hookSpecificOutput: {
+              hookEventName: "PostToolBatch" as const,
+              additionalContext: `Turn budget critical: ${budget.count}/${max} turns used (≥90%). The SDK will abort at ${max}. Stop kicking off new tool chains — finish what you have and reply now.`,
+            },
+          };
+        }
+        if (budget.count >= threshold75 && !budget.fired75) {
+          budget.fired75 = true;
+          log.info({ key: sessionKey, used: budget.count, max }, "Turn budget at 75%");
+          return {
+            hookSpecificOutput: {
+              hookEventName: "PostToolBatch" as const,
+              additionalContext: `Turn budget notice: ${budget.count}/${max} turns used (≥75%). Start wrapping up — prefer concise next steps over exploratory tool chains.`,
+            },
+          };
+        }
+        return {};
+      }],
+    }],
   };
 }

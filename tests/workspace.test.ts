@@ -63,4 +63,54 @@ describe("buildSystemPrompt", () => {
       expect(prompt).toContain("test memory");
     });
   });
+
+  describe("private memory filtering for group sessions", () => {
+    const memoryDir = join(TOMO_WORKSPACE, "memory");
+    const memoryFile = join(memoryDir, "MEMORY.md");
+    let originalContent: string | null = null;
+
+    beforeEach(() => {
+      mkdirSync(memoryDir, { recursive: true });
+      originalContent = existsSync(memoryFile) ? readFileSync(memoryFile, "utf-8") : null;
+      writeFileSync(memoryFile, [
+        "- [Public](public.md) — visible everywhere",
+        "- [Private](private/secret.md) — DM only",
+        "- [PrivateDotSlash](./private/other.md) — DM only too",
+      ].join("\n") + "\n");
+    });
+
+    afterEach(() => {
+      if (originalContent !== null) {
+        writeFileSync(memoryFile, originalContent);
+      } else {
+        rmSync(memoryFile, { force: true });
+      }
+    });
+
+    it("DM sessions see private/ entries", () => {
+      const prompt = buildSystemPrompt({ isGroup: false });
+      expect(prompt).toContain("visible everywhere");
+      expect(prompt).toContain("DM only");
+      expect(prompt).toContain("DM only too");
+    });
+
+    it("group sessions have private/ entries filtered out", () => {
+      const prompt = buildSystemPrompt({ isGroup: true });
+      expect(prompt).toContain("visible everywhere");
+      expect(prompt).not.toContain("DM only");
+      expect(prompt).not.toContain("DM only too");
+    });
+
+    it("DM prompt tells the agent to use memory/private/ for sensitive notes", () => {
+      const prompt = buildSystemPrompt({ isGroup: false });
+      expect(prompt).toContain("memory/private/");
+      expect(prompt).toMatch(/save the memory file under/i);
+    });
+
+    it("group prompt tells the agent that memory/private/ is unreachable", () => {
+      const prompt = buildSystemPrompt({ isGroup: true });
+      expect(prompt).toContain("memory/private/");
+      expect(prompt).toMatch(/restricted to DM sessions/i);
+    });
+  });
 });

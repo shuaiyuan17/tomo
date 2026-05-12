@@ -1,7 +1,7 @@
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { buildSystemPrompt } from "../workspace/index.js";
+import { buildSystemPrompt, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 
@@ -81,7 +81,8 @@ export function sdkOptions(
   sessionContext?: SessionContext,
   turnBudget?: TurnBudget,
 ) {
-  let systemPrompt = buildSystemPrompt();
+  const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
+  let systemPrompt = buildSystemPrompt({ isGroup });
 
   // Inject session context so the agent can use LCM tools
   if (sessionContext) {
@@ -150,7 +151,12 @@ export function sdkOptions(
     canUseTool: skillsCanUseTool,
     includePartialMessages: true,
     maxTurns: config.maxTurns,
-    ...(turnBudget ? { hooks: turnBudgetHooks(turnBudget, config.maxTurns, sessionContext?.sessionKey) } : {}),
+    ...buildHooksOption({
+      turnBudget,
+      maxTurns: config.maxTurns,
+      sessionKey: sessionContext?.sessionKey,
+      guardPrivateMemory: isGroup,
+    }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     // Note: SDK `env` fully replaces the child's env (not merged despite the
     // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -158,6 +164,65 @@ export function sdkOptions(
     ...(sessionContext && usesLcmCompact(sessionContext.sessionKey)
       ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
       : {}),
+  };
+}
+
+/** Combine the turn-budget PostToolBatch hook and the group-session
+ *  private-memory PreToolUse guard into a single SDK `hooks` option. Returns
+ *  an empty object when neither hook is needed so spread {} stays a no-op. */
+function buildHooksOption(args: {
+  turnBudget?: TurnBudget;
+  maxTurns: number;
+  sessionKey?: string;
+  guardPrivateMemory: boolean;
+}) {
+  const hooks: Record<string, unknown> = {};
+  if (args.turnBudget) {
+    Object.assign(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
+  }
+  if (args.guardPrivateMemory) {
+    Object.assign(hooks, privateMemoryGuardHooks(args.sessionKey));
+  }
+  return Object.keys(hooks).length > 0 ? { hooks } : {};
+}
+
+/** PreToolUse hook that denies any tool call whose input references the
+ *  private memory dir. Used only in group sessions — DMs see the full memory
+ *  tree. We match both the absolute path (e.g. ~/.tomo/workspace/memory/private/x.md)
+ *  and the relative form (memory/private/x.md, since cwd is the workspace dir).
+ *  Per SDK docs, PreToolUse denies bypass canUseTool, so this works even
+ *  though we run in bypassPermissions mode. */
+function privateMemoryGuardHooks(sessionKey?: string) {
+  const relMarker = `memory/${PRIVATE_MEMORY_SUBDIR}/`;
+  const absMarker = PRIVATE_MEMORY_DIR + "/";
+  const touchesPrivate = (s: unknown): boolean => {
+    if (typeof s !== "string") return false;
+    return s.includes(absMarker) || s.includes(relMarker);
+  };
+  return {
+    PreToolUse: [{
+      hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
+        const ti = (input.tool_input ?? {}) as Record<string, unknown>;
+        const candidates: unknown[] = [
+          ti.file_path,
+          ti.notebook_path,
+          ti.path,
+          ti.pattern,
+          ti.command,
+        ];
+        if (candidates.some(touchesPrivate)) {
+          log.warn({ key: sessionKey, tool: input.tool_name }, "Blocked group-session access to private memory");
+          return {
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse" as const,
+              permissionDecision: "deny" as const,
+              permissionDecisionReason: `\`memory/${PRIVATE_MEMORY_SUBDIR}/\` is DM-only and not accessible from group sessions.`,
+            },
+          };
+        }
+        return {};
+      }],
+    }],
   };
 }
 

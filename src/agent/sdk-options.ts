@@ -1,5 +1,6 @@
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { isAbsolute, relative, resolve as pathResolve } from "node:path";
+import { minimatch } from "minimatch";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt, MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
@@ -228,22 +229,22 @@ function isInside(child: string, parent: string): boolean {
  *  testing. The rules are intentionally conservative:
  *
  *  - File ops (Read/Edit/Write/MultiEdit/NotebookEdit): deny when the resolved
- *    path is at or inside the private dir.
- *  - Glob: deny when the search root is at-or-inside MEMORY_DIR (any glob over
- *    the memory tree is blocked — the agent has MEMORY.md in its prompt and
- *    can Read public files by name). Also deny when the root is an ancestor of
- *    PRIVATE_MEMORY_DIR and the pattern starts with an unanchored `**`, since
- *    that recursion will descend into private/.
- *  - Grep: deny when the search root is at-or-inside MEMORY_DIR. ripgrep
- *    recurses by default, so any grep rooted in memory/ surfaces private
- *    content.
- *  - Bash: deny when any whitespace-separated token resolves into the private
- *    dir, or when the command contains `private` as a path-like segment (since
- *    `cd memory && cat private/x.md` and similar can't be tracked through
- *    shell state). Group sessions don't need bash for memory ops.
+ *    file_path lands at-or-inside the private dir.
+ *  - Glob: deny when the search root is at-or-inside MEMORY_DIR, or when the
+ *    pattern joined to the root could match any path at-or-inside private/.
+ *    Wildcard segments like `pri*` are evaluated by minimatch against synthetic
+ *    probe paths under private/, so `memory/pri*\/*.md` is denied just like
+ *    `memory/private/*.md`.
+ *  - Grep: same logic against the `glob` filter when present, plus a root
+ *    check that mirrors ripgrep's default-recursive behaviour.
+ *  - Bash: deny any command that names `memory` as a path segment. The Bash
+ *    surface area is too wide to reason about — shell expansion happens after
+ *    the hook fires, `cd` rewrites the working dir, and command substitution
+ *    can hide paths. Group sessions don't need Bash for memory ops; the agent
+ *    can Read public memory files by name (MEMORY.md is in its prompt).
  *
- *  False positives in groups are tolerable — the agent can Read public memory
- *  files by name (MEMORY.md is in its prompt) instead of scanning. */
+ *  False positives in groups are tolerable for the same reason — the agent
+ *  always has an alternative path through Read on a named public file. */
 export function isPrivateMemoryAccess(
   toolName: string,
   toolInput: unknown,
@@ -290,67 +291,60 @@ export function isPrivateMemoryAccess(
     case "Bash": {
       const cmd = ti.command;
       if (typeof cmd !== "string") return false;
-      return bashTouchesPrivate(cmd, ctx);
+      return bashTouchesMemory(cmd, ctx);
     }
     default:
       return false;
   }
 }
 
-/** Decide whether a glob/grep operation rooted at `root` with file pattern
- *  `pattern` could surface anything inside the private memory dir.
+/** Decide whether a glob/grep operation rooted at `root` with pattern `pattern`
+ *  could surface anything at-or-inside the private memory dir.
  *
- *  The effective scan base is `root` joined with the pattern's literal prefix
- *  (the segments before the first wildcard). The operation can reach private/
- *  when:
- *   - the effective base sits at-or-inside private/, OR
- *   - the pattern uses `**` recursion AND the base is an ancestor of private/.
- *
- *  Anchored patterns like `skills/**` from cwd are safe because the base
- *  `cwd/skills` is neither inside nor an ancestor of `cwd/memory/private`. */
+ *  Earlier versions split the pattern at its first wildcard and compared the
+ *  literal prefix only — that missed `memory/pri*\/*.md`, which expands into
+ *  `memory/private/...` at match time. We now test the pattern against three
+ *  synthetic probe paths anchored under private/ using minimatch. If any probe
+ *  matches, the pattern can reach private/. */
 function globOrGrepReachesPrivate(
   root: string,
   pattern: string,
   ctx: { cwd: string; memoryDir: string; privateDir: string },
 ): boolean {
   if (isInside(root, ctx.memoryDir)) return true;
-  const segments = pattern.split("/");
-  const literalPrefix: string[] = [];
-  for (const seg of segments) {
-    if (seg.includes("*") || seg.includes("?") || seg.includes("[")) break;
-    literalPrefix.push(seg);
+  const relPrivate = relative(root, ctx.privateDir);
+  if (relPrivate === "" || relPrivate.startsWith("..") || isAbsolute(relPrivate)) {
+    // private/ isn't reachable by a relative path from root.
+    return false;
   }
-  const base = literalPrefix.length === 0 ? root : pathResolve(root, ...literalPrefix);
-  if (isInside(base, ctx.privateDir)) return true;
-  if (pattern.includes("**") && isInside(ctx.privateDir, base)) return true;
-  return false;
+  // Probe paths represent the dir entry itself, an immediate child file, and a
+  // nested file — covers patterns like `memory/private`, `memory/*/secret.md`,
+  // `memory/**/*.md`, etc.
+  const probes = [relPrivate, `${relPrivate}/probe.md`, `${relPrivate}/sub/probe.md`];
+  // `nocase: true` so a pattern like `Memory/PRI*\/*.md` is caught on
+  // case-insensitive filesystems (macOS default, Windows). `dot: true` so
+  // leading-dot files in private/ aren't given a free pass.
+  const opts = { dot: true, nocase: true } as const;
+  return probes.some((probe) => minimatch(probe, pattern, opts));
 }
 
-/** Heuristic check for shell commands. We resolve every whitespace-separated
- *  token as a candidate path; if any token lands inside the private dir, deny.
- *  We also flag the literal segment `private` appearing in a path-like context
- *  (preceded/followed by `/`, quotes, whitespace, or shell separators), since
- *  `cd memory && cat private/x.md` reaches the private dir without spelling
- *  the full relative path, and we can't track shell state across `cd`. */
-function bashTouchesPrivate(cmd: string, ctx: { cwd: string; privateDir: string }): boolean {
-  if (cmd.includes(ctx.privateDir)) return true;
-  // `private` as a path segment: bordered by /, quote, whitespace, shell op, or string boundary.
-  const segment = /(^|[\s'"`=()|&;></])private(\/|$|[\s'"`=()|&;><])/;
-  if (segment.test(cmd)) return true;
-  // Catch tokens that resolve inside private/ (covers absolute paths,
-  // `./memory/private`, `../workspace/memory/private`, etc.). Skip the flag
-  // strings and anything that looks like a regex/option.
-  const tokens = cmd.split(/[\s'"`|&;()<>]+/).filter((t) => t.length > 0 && !t.startsWith("-"));
-  for (const t of tokens) {
-    // Only treat as path if it has separators or looks like a relative/abs path.
-    if (!t.includes("/") && !isAbsolute(t)) continue;
-    try {
-      if (isInside(abs(t, ctx.cwd), ctx.privateDir)) return true;
-    } catch {
-      // Malformed token — ignore.
-    }
-  }
-  return false;
+/** Bash guard for group sessions. Shell expansion happens after the hook
+ *  fires, so we can't reliably predict which paths a command will actually
+ *  touch — `cat memory/pri*\/*.md`, `$(echo memory/private/x)`, and
+ *  `cd memory && cat private/x.md` all reach private/ without spelling it
+ *  literally. Rather than chase every shell construct, we deny anything that
+ *  names `memory` (or `private`) as a path segment, plus any absolute path
+ *  that lands inside the memory tree.
+ *
+ *  Group sessions don't need Bash for memory ops — Read works on named public
+ *  files, and the MEMORY.md index is already in the system prompt. */
+function bashTouchesMemory(cmd: string, ctx: { cwd: string; memoryDir: string; privateDir: string }): boolean {
+  if (cmd.includes(ctx.memoryDir) || cmd.includes(ctx.privateDir)) return true;
+  // `memory` or `private` as a path segment: bordered by /, quote, whitespace,
+  // shell operator, or string boundary. Catches `memory/x`, `./memory`,
+  // `cd memory`, `ls memory/private`, `cat private/foo`, etc.
+  const memorySegment = /(^|[\s'"`=()|&;></])(memory|private)(\/|$|[\s'"`=()|&;><])/i;
+  return memorySegment.test(cmd);
 }
 
 /** Build a PostToolBatch hook that increments `budget.count` once per tool

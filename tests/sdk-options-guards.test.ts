@@ -75,12 +75,37 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
       expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "memory/private/*" }, ctx)).toBe(true);
     });
 
+    it("denies wildcard segment that expands to private (reviewer's bypass)", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "memory/pri*/*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies pattern with intermediate wildcard reaching private", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "*/private/*" }, ctx)).toBe(true);
+    });
+
+    it("denies pattern using brace expansion containing private", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "memory/{public,private}/*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies pattern using character class matching private", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "memory/p[a-z]*/*.md" }, ctx)).toBe(true);
+    });
+
     it("allows glob anchored to a non-memory subtree", () => {
       expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "skills/**/*.md" }, ctx)).toBe(false);
     });
 
     it("allows non-recursive glob at cwd", () => {
       expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "*.json" }, ctx)).toBe(false);
+    });
+
+    it("allows glob anchored to memory siblings that don't match private", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "skills/*.json" }, ctx)).toBe(false);
+    });
+
+    it("denies case-permuted pattern (case-insensitive match)", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "Memory/PRIVATE/*.md" }, ctx)).toBe(true);
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "memory/PRI*/*.md" }, ctx)).toBe(true);
     });
   });
 
@@ -116,6 +141,10 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
     it("denies grep from cwd even with a recursive glob filter (could still reach private/)", () => {
       expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "**/*.md" }, ctx)).toBe(true);
     });
+
+    it("denies grep with wildcard glob filter that expands to private (reviewer's bypass)", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "secret", glob: "memory/pri*/*.md" }, ctx)).toBe(true);
+    });
   });
 
   describe("Bash", () => {
@@ -145,10 +174,20 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
       expect(isPrivateMemoryAccess("Bash", { command: "git status" }, ctx)).toBe(false);
     });
 
-    it("allows reads of public memory files via shell", () => {
-      // Acceptable trade-off: the agent should use Read for this anyway, but
-      // we don't block public memory access in bash.
-      expect(isPrivateMemoryAccess("Bash", { command: "cat memory/MEMORY.md" }, ctx)).toBe(false);
+    it("denies wildcard expansion targeting private (reviewer's bypass)", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cat memory/pri*/*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies any reference to the memory tree, even for public files", () => {
+      // New strict rule: groups don't get Bash access to memory/ at all.
+      // The agent should use Read on a named public file (MEMORY.md is in its
+      // prompt) instead of shelling out.
+      expect(isPrivateMemoryAccess("Bash", { command: "cat memory/MEMORY.md" }, ctx)).toBe(true);
+      expect(isPrivateMemoryAccess("Bash", { command: "ls memory" }, ctx)).toBe(true);
+    });
+
+    it("denies absolute paths into the memory tree", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cd /ws/memory" }, ctx)).toBe(true);
     });
   });
 

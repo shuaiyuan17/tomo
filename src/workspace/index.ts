@@ -8,9 +8,20 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const TOMO_HOME = join(homedir(), ".tomo");
 const WORKSPACE_DIR = process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace");
 const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
-const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
+/** Absolute path to the memory root. Exported so the group-session guard hook
+ *  can reason about scans rooted in or descending into this tree. */
+export const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
 const MEMORY_ENTRYPOINT = join(MEMORY_DIR, "MEMORY.md");
 const MAX_MEMORY_LINES = 200;
+/** Subdir for DM-only memories. Files here are filtered out of MEMORY.md for
+ *  group sessions and blocked by a PreToolUse hook (see sdk-options.ts). */
+export const PRIVATE_MEMORY_SUBDIR = "private";
+/** Absolute path to the private memory dir. Used by the group-session guard
+ *  hook to deny tool calls referencing this location. */
+export const PRIVATE_MEMORY_DIR = join(MEMORY_DIR, PRIVATE_MEMORY_SUBDIR);
+/** Matches markdown links pointing into the private subdir, with or without a
+ *  leading `./`. Used to strip private entries from MEMORY.md in groups. */
+const PRIVATE_LINK_RE = /\]\(\s*\.?\/?private\//i;
 
 /** Load a .md file from workspace, falling back to bundled defaults */
 function load(name: string): string {
@@ -25,8 +36,12 @@ function load(name: string): string {
   return "";
 }
 
-function loadMemory(): string {
+function loadMemory(isGroup: boolean): string {
   mkdirSync(MEMORY_DIR, { recursive: true });
+
+  const privacySection = isGroup
+    ? `\n## Private memories (DM-only)\n\nMemory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not listed in the index below, and you cannot read them from this group session — the harness will deny the tool call.\n`
+    : `\n## Private memories (DM-only)\n\nFor anything you wouldn't want surfaced in a group chat (sensitive personal details, private notes), save the memory file under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` instead of the top level. Index it in MEMORY.md the normal way — group sessions automatically see the index with \`${PRIVATE_MEMORY_SUBDIR}/\` lines stripped, and the harness blocks them from reading the files directly.\n`;
 
   const instructions = `
 # MEMORY — Your Persistent Memory
@@ -38,6 +53,7 @@ You have a file-based memory system at ${MEMORY_DIR}/. This directory is yours �
 - **MEMORY.md** is your index file. It's loaded into your context every conversation.
 - Each memory is a separate .md file with YAML frontmatter (name, description, type).
 - MEMORY.md contains one-line pointers: \`- [Title](file.md) — short description\`
+${privacySection}
 
 ## Memory types
 
@@ -103,11 +119,14 @@ Signals to watch for:
   let memoryContent: string;
   if (existsSync(MEMORY_ENTRYPOINT)) {
     const raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8").trim();
-    const lines = raw.split("\n");
+    let lines = raw.split("\n");
+    if (isGroup) {
+      lines = lines.filter(line => !PRIVATE_LINK_RE.test(line));
+    }
     if (lines.length > MAX_MEMORY_LINES) {
       memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;
     } else {
-      memoryContent = raw;
+      memoryContent = lines.join("\n");
     }
   } else {
     memoryContent = "(currently empty)";
@@ -163,7 +182,8 @@ This is a messaging app, not a document. Keep responses chat-native:
 - No bullet-point dumps unless actually listing things.
 `.trim();
 
-export function buildSystemPrompt(): string {
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(), HARNESS_INSTRUCTIONS].filter(Boolean);
+export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {
+  const isGroup = !!opts.isGroup;
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), HARNESS_INSTRUCTIONS].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

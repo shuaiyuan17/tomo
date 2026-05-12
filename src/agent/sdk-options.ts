@@ -4,6 +4,7 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
+import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -18,26 +19,6 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 export function usesLcmCompact(sessionKey: string): boolean {
   if (!isGroupSessionKey(sessionKey)) return true;
   return config.lcm.groupCompactStyle !== "sdk";
-}
-
-const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;
-
-async function skillsCanUseTool(
-  toolName: string,
-  input: Record<string, unknown>,
-): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
-  const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
-  if (filePath && filePath.startsWith(SKILLS_DIR)) {
-    return { behavior: "allow", updatedInput: input };
-  }
-  // Bash mkdir / touch / etc. — allow if command targets the skills dir.
-  if (toolName === "Bash" && typeof input.command === "string" && input.command.includes(SKILLS_DIR)) {
-    return { behavior: "allow", updatedInput: input };
-  }
-  return {
-    behavior: "deny",
-    message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
-  };
 }
 
 /** Mutable per-send counter for the SDK's maxTurns budget. The SDK enforces
@@ -81,7 +62,8 @@ export function sdkOptions(
   sessionContext?: SessionContext,
   turnBudget?: TurnBudget,
 ) {
-  let systemPrompt = buildSystemPrompt();
+  const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
+  let systemPrompt = buildSystemPrompt({ isGroup });
 
   // Inject session context so the agent can use LCM tools
   if (sessionContext) {
@@ -141,16 +123,17 @@ export function sdkOptions(
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
       },
     },
-    // bypassPermissions auto-approves most tools at step 3 of the permission
-    // flow, but writes to `.claude/`, `.git/`, etc. are protected and fall
-    // through to step 5 (canUseTool). We narrowly re-allow `.claude/skills/`
-    // here so tomo can manage its own skill library, while leaving every
-    // other protected path on its default (deny). See:
-    // https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes
+    // See ./permissions.ts — canUseTool re-allows `.claude/skills/` writes
+    // that bypassPermissions otherwise routes here as denials.
     canUseTool: skillsCanUseTool,
     includePartialMessages: true,
     maxTurns: config.maxTurns,
-    ...(turnBudget ? { hooks: turnBudgetHooks(turnBudget, config.maxTurns, sessionContext?.sessionKey) } : {}),
+    ...buildHooksOption({
+      turnBudget,
+      maxTurns: config.maxTurns,
+      sessionKey: sessionContext?.sessionKey,
+      guardPrivateMemory: isGroup,
+    }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     // Note: SDK `env` fully replaces the child's env (not merged despite the
     // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -159,6 +142,25 @@ export function sdkOptions(
       ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
       : {}),
   };
+}
+
+/** Combine the turn-budget PostToolBatch hook and the group-session
+ *  private-memory PreToolUse guard into a single SDK `hooks` option. Returns
+ *  an empty object when neither hook is needed so spread {} stays a no-op. */
+function buildHooksOption(args: {
+  turnBudget?: TurnBudget;
+  maxTurns: number;
+  sessionKey?: string;
+  guardPrivateMemory: boolean;
+}) {
+  const hooks: Record<string, unknown> = {};
+  if (args.turnBudget) {
+    Object.assign(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
+  }
+  if (args.guardPrivateMemory) {
+    Object.assign(hooks, privateMemoryGuardHooks(args.sessionKey));
+  }
+  return Object.keys(hooks).length > 0 ? { hooks } : {};
 }
 
 /** Build a PostToolBatch hook that increments `budget.count` once per tool

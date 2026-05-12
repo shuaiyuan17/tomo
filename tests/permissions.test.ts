@@ -1,5 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { isPrivateMemoryAccess } from "../src/agent/permissions.js";
+import { describe, it, expect, vi } from "vitest";
+
+// `permissions.ts` imports `config` at module load, which throws if no
+// channels are configured. CI has no config file and no env vars, so the real
+// module would blow up before any test runs. The isPrivateMemoryAccess
+// predicate takes its `ctx` as a parameter and never touches `config`, so a
+// minimal stub is enough.
+vi.mock("../src/config.js", () => ({
+  config: { workspaceDir: "/tmp/tomo-mock-permissions" },
+}));
+
+const { isPrivateMemoryAccess } = await import("../src/agent/permissions.js");
 
 const ctx = {
   cwd: "/ws",

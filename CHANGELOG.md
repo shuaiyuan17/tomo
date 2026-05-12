@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.8 (2026-05-12)
+
+### Features
+
+- **Private memory for DMs only** (#97). New `~/.tomo/workspace/memory/private/` subdir holds memories the agent shouldn't surface in group chats. DM sessions see the full MEMORY.md index and can Read/Write under `memory/private/` normally; group sessions get the index with `private/` links stripped *and* a `PreToolUse` hook that denies any tool call that could reach the dir. The system prompt's privacy section flips per session type so the agent knows the rule. Per Anthropic SDK docs, `PreToolUse` denials bypass `canUseTool` so the guard holds even though Tomo runs in `bypassPermissions` mode. Enforcement evolved across review rounds — final shape uses path resolution + `minimatch` reachability probes rather than substring matching:
+  - File ops (Read/Edit/Write/MultiEdit/NotebookEdit): resolved `file_path` must not land inside `memory/private/`.
+  - Glob/Grep: pattern tested against synthetic probe paths anchored under `private/` (catches `pri*`, `{public,private}`, `p[a-z]*`, case permutations); Grep also denies basename globs like `-g '*.md'` from any root that can reach private/, because ripgrep applies basename filters at every depth.
+  - Bash: denies any command that names `memory` or `private` as a path segment, or that contains the absolute private dir. Shell expansion happens after the hook fires so per-token resolution can't catch `cat memory/pri*/*.md` reliably — Bash on the memory tree is just denied wholesale. Group sessions can still Read public memory files by name (MEMORY.md is already in the prompt).
+- **Turn budget warnings at 75% and 90% of `maxTurns`** (#96). The SDK enforces `maxTurns` silently and only surfaces the limit as an error after the fact, so long agent loops would die mid-thought. A new `PostToolBatch` hook counts tool rounds per `send()` call and injects an `additionalContext` system reminder when usage crosses the thresholds — at 75% the agent is nudged to wrap up; at 90% it's told the SDK will abort imminently. Budget resets per user message → response cycle, so a single long turn doesn't poison the next one. `PostToolBatch` fires exactly once per model→tools→model round, which is the right granularity for turn counting.
+
+### Internal
+
+- **Permission logic extracted to `src/agent/permissions.ts`.** `sdk-options.ts` had grown to 405 lines with permission code (canUseTool callback + private-memory guard) accounting for ~45%. Split into a dedicated module so future guards have a clear home; `sdk-options.ts` is back to SDK option assembly and turn-budget nudges.
+
+### Other
+
+- Bump `@anthropic-ai/claude-agent-sdk` 0.2.138 → 0.2.139.
+- Bump `@clack/prompts` 1.3.0 → 1.4.0.
+- Bump dev dependencies: `@types/node` 25.6.2 → 25.7.0, `vitest` 4.1.5 → 4.1.6, `@vitest/coverage-v8` 4.1.5 → 4.1.6, `typescript-eslint` 8.59.2 → 8.59.3.
+- New direct dependency: `minimatch` ^10.2.5 (already a transitive dep) — used by the private-memory guard to evaluate Glob/Grep pattern reachability.
+
 ## 0.5.7 (2026-05-10)
 
 ### Other

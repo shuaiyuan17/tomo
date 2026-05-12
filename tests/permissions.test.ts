@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isPrivateMemoryAccess } from "../src/agent/sdk-options.js";
+import { isPrivateMemoryAccess } from "../src/agent/permissions.js";
 
 const ctx = {
   cwd: "/ws",

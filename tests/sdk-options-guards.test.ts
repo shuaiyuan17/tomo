@@ -145,6 +145,32 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
     it("denies grep with wildcard glob filter that expands to private (reviewer's bypass)", () => {
       expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "secret", glob: "memory/pri*/*.md" }, ctx)).toBe(true);
     });
+
+    it("denies grep with basename glob filter (ripgrep semantics, reviewer's bypass)", () => {
+      // `-g '*.md'` is a basename filter that matches at any depth, including
+      // `memory/private/*.md`.
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "secret", glob: "*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies grep with basename glob from memory subtree above private", () => {
+      // Root is the workspace cwd, glob has no `/` → basename filter could
+      // hit nested files in private/.
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "secret.md" }, ctx)).toBe(true);
+    });
+
+    it("denies grep with brace-only basename glob", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "{*.md,*.txt}" }, ctx)).toBe(true);
+    });
+
+    it("allows grep with basename glob when root is outside the memory tree", () => {
+      // tmp/ is a sibling of memory/, so even a basename filter can't reach
+      // private/ from there.
+      expect(isPrivateMemoryAccess("Grep", { path: "tmp", pattern: "x", glob: "*.md" }, ctx)).toBe(false);
+    });
+
+    it("allows grep with anchored path-style glob to a non-memory subtree", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "skills/**/*.md" }, ctx)).toBe(false);
+    });
   });
 
   describe("Bash", () => {

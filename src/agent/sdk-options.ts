@@ -271,22 +271,13 @@ export function isPrivateMemoryAccess(
       const rootRaw = typeof ti.path === "string" ? ti.path : ctx.cwd;
       const root = abs(rootRaw, ctx.cwd);
       const pattern = typeof ti.pattern === "string" ? ti.pattern : "";
-      return globOrGrepReachesPrivate(root, pattern, ctx);
+      return globReachesPrivate(root, pattern, ctx);
     }
     case "Grep": {
       const rootRaw = typeof ti.path === "string" ? ti.path : ctx.cwd;
       const root = abs(rootRaw, ctx.cwd);
-      // ripgrep recurses by default. The agent can narrow with `glob` (a path
-      // pattern filter); if provided, the same reachability logic applies.
-      // If absent, we treat the search as fully recursive and require the root
-      // itself to be outside the memory tree.
       const glob = typeof ti.glob === "string" ? ti.glob : "";
-      if (glob) return globOrGrepReachesPrivate(root, glob, ctx);
-      // Recursive grep with no filter — deny if root is at-or-inside memory/
-      // or if it's an ancestor of private/ (would descend into it).
-      if (isInside(root, ctx.memoryDir)) return true;
-      if (isInside(ctx.privateDir, root)) return true;
-      return false;
+      return grepReachesPrivate(root, glob, ctx);
     }
     case "Bash": {
       const cmd = ti.command;
@@ -298,34 +289,63 @@ export function isPrivateMemoryAccess(
   }
 }
 
-/** Decide whether a glob/grep operation rooted at `root` with pattern `pattern`
- *  could surface anything at-or-inside the private memory dir.
+/** Decide whether a Glob call rooted at `root` with pattern `pattern` could
+ *  surface anything at-or-inside the private memory dir.
  *
  *  Earlier versions split the pattern at its first wildcard and compared the
  *  literal prefix only — that missed `memory/pri*\/*.md`, which expands into
- *  `memory/private/...` at match time. We now test the pattern against three
- *  synthetic probe paths anchored under private/ using minimatch. If any probe
- *  matches, the pattern can reach private/. */
-function globOrGrepReachesPrivate(
+ *  `memory/private/...` at match time. We test the pattern against three
+ *  synthetic probe paths anchored under private/ using minimatch. */
+function globReachesPrivate(
   root: string,
   pattern: string,
   ctx: { cwd: string; memoryDir: string; privateDir: string },
 ): boolean {
   if (isInside(root, ctx.memoryDir)) return true;
   const relPrivate = relative(root, ctx.privateDir);
-  if (relPrivate === "" || relPrivate.startsWith("..") || isAbsolute(relPrivate)) {
-    // private/ isn't reachable by a relative path from root.
-    return false;
-  }
-  // Probe paths represent the dir entry itself, an immediate child file, and a
-  // nested file — covers patterns like `memory/private`, `memory/*/secret.md`,
-  // `memory/**/*.md`, etc.
+  if (!isRelativeDescendant(relPrivate)) return false;
   const probes = [relPrivate, `${relPrivate}/probe.md`, `${relPrivate}/sub/probe.md`];
-  // `nocase: true` so a pattern like `Memory/PRI*\/*.md` is caught on
-  // case-insensitive filesystems (macOS default, Windows). `dot: true` so
-  // leading-dot files in private/ aren't given a free pass.
+  // `nocase: true` covers case-insensitive filesystems (macOS, Windows).
+  // `dot: true` so leading-dot files inside private/ aren't given a free pass.
   const opts = { dot: true, nocase: true } as const;
   return probes.some((probe) => minimatch(probe, pattern, opts));
+}
+
+/** Decide whether a Grep call rooted at `root` with optional `glob` filter
+ *  could surface anything inside the private memory dir.
+ *
+ *  ripgrep recurses by default. The `glob` filter narrows the file set, but
+ *  its semantics differ from a typical glob library:
+ *  - If the glob has no `/`, it's a basename filter that matches files at any
+ *    depth (e.g. `-g '*.md'` matches `memory/private/x.md`). Path-style
+ *    matching would miss this — we deny outright when the root could reach
+ *    private/.
+ *  - If the glob has `/`, it's a path-style pattern; use minimatch probes.
+ *  Without a glob filter, treat the search as fully recursive. */
+function grepReachesPrivate(
+  root: string,
+  glob: string,
+  ctx: { cwd: string; memoryDir: string; privateDir: string },
+): boolean {
+  if (isInside(root, ctx.memoryDir)) return true;
+  const relPrivate = relative(root, ctx.privateDir);
+  if (!isRelativeDescendant(relPrivate)) return false;
+  // No glob filter ⇒ unrestricted recursion ⇒ reaches private/.
+  if (!glob) return true;
+  // Basename glob (no `/`) is anchored only by file basename; if private/ is
+  // reachable from root, ripgrep will scan it and apply the filter there too.
+  if (!glob.includes("/")) return true;
+  // Path-style glob: probe like Glob does.
+  const probes = [relPrivate, `${relPrivate}/probe.md`, `${relPrivate}/sub/probe.md`];
+  const opts = { dot: true, nocase: true } as const;
+  return probes.some((probe) => minimatch(probe, glob, opts));
+}
+
+/** True when `rel` represents a non-empty path that doesn't escape upward —
+ *  i.e. it points to a descendant of the reference dir. Used to short-circuit
+ *  glob/grep checks when private/ isn't reachable from the search root. */
+function isRelativeDescendant(rel: string): boolean {
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 /** Bash guard for group sessions. Shell expansion happens after the hook

@@ -171,6 +171,7 @@ vi.mock("../src/workspace/index.js", () => ({
   buildSystemPrompt: () => "Test system prompt",
   PRIVATE_MEMORY_SUBDIR: "private",
   PRIVATE_MEMORY_DIR: "/tmp/tomo-mock/workspace/memory/private",
+  MEMORY_DIR: "/tmp/tomo-mock/workspace/memory",
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({

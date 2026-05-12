@@ -8,7 +8,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const TOMO_HOME = join(homedir(), ".tomo");
 const WORKSPACE_DIR = process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace");
 const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
-const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
+/** Absolute path to the memory root. Exported so the group-session guard hook
+ *  can reason about scans rooted in or descending into this tree. */
+export const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
 const MEMORY_ENTRYPOINT = join(MEMORY_DIR, "MEMORY.md");
 const MAX_MEMORY_LINES = 200;
 /** Subdir for DM-only memories. Files here are filtered out of MEMORY.md for

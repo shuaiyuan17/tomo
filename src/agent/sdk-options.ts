@@ -1,7 +1,8 @@
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import { isAbsolute, relative, resolve as pathResolve } from "node:path";
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { buildSystemPrompt, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
+import { buildSystemPrompt, MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 
@@ -186,44 +187,170 @@ function buildHooksOption(args: {
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }
 
-/** PreToolUse hook that denies any tool call whose input references the
- *  private memory dir. Used only in group sessions — DMs see the full memory
- *  tree. We match both the absolute path (e.g. ~/.tomo/workspace/memory/private/x.md)
- *  and the relative form (memory/private/x.md, since cwd is the workspace dir).
- *  Per SDK docs, PreToolUse denies bypass canUseTool, so this works even
- *  though we run in bypassPermissions mode. */
+/** PreToolUse hook that denies tool calls that could surface DM-only memory
+ *  in a group session. Per SDK docs, PreToolUse denies bypass canUseTool, so
+ *  this enforces even in bypassPermissions mode. See {@link isPrivateMemoryAccess}
+ *  for per-tool rules — substring matching wasn't enough since parent-dir
+ *  scans, alternate relative paths, and shell `cd` tricks reach private/
+ *  without spelling the full path. */
 function privateMemoryGuardHooks(sessionKey?: string) {
-  const relMarker = `memory/${PRIVATE_MEMORY_SUBDIR}/`;
-  const absMarker = PRIVATE_MEMORY_DIR + "/";
-  const touchesPrivate = (s: unknown): boolean => {
-    if (typeof s !== "string") return false;
-    return s.includes(absMarker) || s.includes(relMarker);
-  };
+  const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   return {
     PreToolUse: [{
       hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
-        const ti = (input.tool_input ?? {}) as Record<string, unknown>;
-        const candidates: unknown[] = [
-          ti.file_path,
-          ti.notebook_path,
-          ti.path,
-          ti.pattern,
-          ti.command,
-        ];
-        if (candidates.some(touchesPrivate)) {
-          log.warn({ key: sessionKey, tool: input.tool_name }, "Blocked group-session access to private memory");
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse" as const,
-              permissionDecision: "deny" as const,
-              permissionDecisionReason: `\`memory/${PRIVATE_MEMORY_SUBDIR}/\` is DM-only and not accessible from group sessions.`,
-            },
-          };
-        }
-        return {};
+        if (!isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) return {};
+        log.warn({ key: sessionKey, tool: input.tool_name }, "Blocked group-session access to private memory");
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse" as const,
+            permissionDecision: "deny" as const,
+            permissionDecisionReason: `\`memory/${PRIVATE_MEMORY_SUBDIR}/\` is DM-only and not accessible from group sessions. Scans rooted at \`memory/\` are also blocked — use Read on a specific public memory file.`,
+          },
+        };
       }],
     }],
   };
+}
+
+/** Resolve `p` to an absolute, normalized path against `cwd` if relative. */
+function abs(p: string, cwd: string): string {
+  return isAbsolute(p) ? pathResolve(p) : pathResolve(cwd, p);
+}
+
+/** True when `child` equals `parent` or sits inside it. Both must be absolute. */
+function isInside(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  const rel = relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** Per-tool predicate for the group-session private-memory guard. Exported for
+ *  testing. The rules are intentionally conservative:
+ *
+ *  - File ops (Read/Edit/Write/MultiEdit/NotebookEdit): deny when the resolved
+ *    path is at or inside the private dir.
+ *  - Glob: deny when the search root is at-or-inside MEMORY_DIR (any glob over
+ *    the memory tree is blocked — the agent has MEMORY.md in its prompt and
+ *    can Read public files by name). Also deny when the root is an ancestor of
+ *    PRIVATE_MEMORY_DIR and the pattern starts with an unanchored `**`, since
+ *    that recursion will descend into private/.
+ *  - Grep: deny when the search root is at-or-inside MEMORY_DIR. ripgrep
+ *    recurses by default, so any grep rooted in memory/ surfaces private
+ *    content.
+ *  - Bash: deny when any whitespace-separated token resolves into the private
+ *    dir, or when the command contains `private` as a path-like segment (since
+ *    `cd memory && cat private/x.md` and similar can't be tracked through
+ *    shell state). Group sessions don't need bash for memory ops.
+ *
+ *  False positives in groups are tolerable — the agent can Read public memory
+ *  files by name (MEMORY.md is in its prompt) instead of scanning. */
+export function isPrivateMemoryAccess(
+  toolName: string,
+  toolInput: unknown,
+  ctx: { cwd: string; memoryDir: string; privateDir: string },
+): boolean {
+  if (!toolInput || typeof toolInput !== "object") return false;
+  const ti = toolInput as Record<string, unknown>;
+
+  switch (toolName) {
+    case "Read":
+    case "Edit":
+    case "Write":
+    case "MultiEdit": {
+      const p = ti.file_path;
+      if (typeof p !== "string") return false;
+      return isInside(abs(p, ctx.cwd), ctx.privateDir);
+    }
+    case "NotebookEdit": {
+      const p = ti.notebook_path;
+      if (typeof p !== "string") return false;
+      return isInside(abs(p, ctx.cwd), ctx.privateDir);
+    }
+    case "Glob": {
+      const rootRaw = typeof ti.path === "string" ? ti.path : ctx.cwd;
+      const root = abs(rootRaw, ctx.cwd);
+      const pattern = typeof ti.pattern === "string" ? ti.pattern : "";
+      return globOrGrepReachesPrivate(root, pattern, ctx);
+    }
+    case "Grep": {
+      const rootRaw = typeof ti.path === "string" ? ti.path : ctx.cwd;
+      const root = abs(rootRaw, ctx.cwd);
+      // ripgrep recurses by default. The agent can narrow with `glob` (a path
+      // pattern filter); if provided, the same reachability logic applies.
+      // If absent, we treat the search as fully recursive and require the root
+      // itself to be outside the memory tree.
+      const glob = typeof ti.glob === "string" ? ti.glob : "";
+      if (glob) return globOrGrepReachesPrivate(root, glob, ctx);
+      // Recursive grep with no filter — deny if root is at-or-inside memory/
+      // or if it's an ancestor of private/ (would descend into it).
+      if (isInside(root, ctx.memoryDir)) return true;
+      if (isInside(ctx.privateDir, root)) return true;
+      return false;
+    }
+    case "Bash": {
+      const cmd = ti.command;
+      if (typeof cmd !== "string") return false;
+      return bashTouchesPrivate(cmd, ctx);
+    }
+    default:
+      return false;
+  }
+}
+
+/** Decide whether a glob/grep operation rooted at `root` with file pattern
+ *  `pattern` could surface anything inside the private memory dir.
+ *
+ *  The effective scan base is `root` joined with the pattern's literal prefix
+ *  (the segments before the first wildcard). The operation can reach private/
+ *  when:
+ *   - the effective base sits at-or-inside private/, OR
+ *   - the pattern uses `**` recursion AND the base is an ancestor of private/.
+ *
+ *  Anchored patterns like `skills/**` from cwd are safe because the base
+ *  `cwd/skills` is neither inside nor an ancestor of `cwd/memory/private`. */
+function globOrGrepReachesPrivate(
+  root: string,
+  pattern: string,
+  ctx: { cwd: string; memoryDir: string; privateDir: string },
+): boolean {
+  if (isInside(root, ctx.memoryDir)) return true;
+  const segments = pattern.split("/");
+  const literalPrefix: string[] = [];
+  for (const seg of segments) {
+    if (seg.includes("*") || seg.includes("?") || seg.includes("[")) break;
+    literalPrefix.push(seg);
+  }
+  const base = literalPrefix.length === 0 ? root : pathResolve(root, ...literalPrefix);
+  if (isInside(base, ctx.privateDir)) return true;
+  if (pattern.includes("**") && isInside(ctx.privateDir, base)) return true;
+  return false;
+}
+
+/** Heuristic check for shell commands. We resolve every whitespace-separated
+ *  token as a candidate path; if any token lands inside the private dir, deny.
+ *  We also flag the literal segment `private` appearing in a path-like context
+ *  (preceded/followed by `/`, quotes, whitespace, or shell separators), since
+ *  `cd memory && cat private/x.md` reaches the private dir without spelling
+ *  the full relative path, and we can't track shell state across `cd`. */
+function bashTouchesPrivate(cmd: string, ctx: { cwd: string; privateDir: string }): boolean {
+  if (cmd.includes(ctx.privateDir)) return true;
+  // `private` as a path segment: bordered by /, quote, whitespace, shell op, or string boundary.
+  const segment = /(^|[\s'"`=()|&;></])private(\/|$|[\s'"`=()|&;><])/;
+  if (segment.test(cmd)) return true;
+  // Catch tokens that resolve inside private/ (covers absolute paths,
+  // `./memory/private`, `../workspace/memory/private`, etc.). Skip the flag
+  // strings and anything that looks like a regex/option.
+  const tokens = cmd.split(/[\s'"`|&;()<>]+/).filter((t) => t.length > 0 && !t.startsWith("-"));
+  for (const t of tokens) {
+    // Only treat as path if it has separators or looks like a relative/abs path.
+    if (!t.includes("/") && !isAbsolute(t)) continue;
+    try {
+      if (isInside(abs(t, ctx.cwd), ctx.privateDir)) return true;
+    } catch {
+      // Malformed token — ignore.
+    }
+  }
+  return false;
 }
 
 /** Build a PostToolBatch hook that increments `budget.count` once per tool

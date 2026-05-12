@@ -1,0 +1,161 @@
+import { describe, it, expect } from "vitest";
+import { isPrivateMemoryAccess } from "../src/agent/sdk-options.js";
+
+const ctx = {
+  cwd: "/ws",
+  memoryDir: "/ws/memory",
+  privateDir: "/ws/memory/private",
+};
+
+describe("isPrivateMemoryAccess — group-session guard", () => {
+  describe("Read / Edit / Write / NotebookEdit", () => {
+    it("denies direct read of a private file (relative)", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "memory/private/secret.md" }, ctx)).toBe(true);
+    });
+
+    it("denies direct read of a private file (absolute)", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "/ws/memory/private/secret.md" }, ctx)).toBe(true);
+    });
+
+    it("denies read through ./ prefix", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "./memory/private/secret.md" }, ctx)).toBe(true);
+    });
+
+    it("denies read through .. traversal that still lands inside private/", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "memory/../memory/private/x.md" }, ctx)).toBe(true);
+    });
+
+    it("denies write to private/", () => {
+      expect(isPrivateMemoryAccess("Write", { file_path: "memory/private/new.md", content: "x" }, ctx)).toBe(true);
+    });
+
+    it("denies edit on private/", () => {
+      expect(isPrivateMemoryAccess("Edit", { file_path: "memory/private/x.md", old_string: "a", new_string: "b" }, ctx)).toBe(true);
+    });
+
+    it("denies NotebookEdit on private/", () => {
+      expect(isPrivateMemoryAccess("NotebookEdit", { notebook_path: "memory/private/n.ipynb" }, ctx)).toBe(true);
+    });
+
+    it("allows read of a public memory file", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "memory/public.md" }, ctx)).toBe(false);
+    });
+
+    it("allows read of MEMORY.md itself", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "memory/MEMORY.md" }, ctx)).toBe(false);
+    });
+
+    it("allows read outside the memory tree", () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: "tmp/scratch.txt" }, ctx)).toBe(false);
+    });
+  });
+
+  describe("Glob", () => {
+    it("denies glob rooted at memory/ with recursive pattern (reviewer's case)", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: "memory", pattern: "**/*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies glob rooted at memory/ even with a non-recursive pattern", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: "memory", pattern: "*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies glob rooted inside private/", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: "memory/private", pattern: "*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies unanchored recursive glob from cwd (would descend into private/)", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "**/*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies unanchored recursive glob with no path arg (defaults to cwd)", () => {
+      expect(isPrivateMemoryAccess("Glob", { pattern: "**/*.md" }, ctx)).toBe(true);
+    });
+
+    it("denies glob with pattern naming the private segment", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "memory/private/*" }, ctx)).toBe(true);
+    });
+
+    it("allows glob anchored to a non-memory subtree", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "skills/**/*.md" }, ctx)).toBe(false);
+    });
+
+    it("allows non-recursive glob at cwd", () => {
+      expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "*.json" }, ctx)).toBe(false);
+    });
+  });
+
+  describe("Grep", () => {
+    it("denies grep rooted at memory/ (reviewer's case)", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: "memory", pattern: "secret" }, ctx)).toBe(true);
+    });
+
+    it("denies grep rooted inside private/", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: "memory/private", pattern: "x" }, ctx)).toBe(true);
+    });
+
+    it("denies grep at absolute memory dir", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: "/ws/memory", pattern: "x" }, ctx)).toBe(true);
+    });
+
+    it("allows grep in a non-memory subtree", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: "tmp", pattern: "x" }, ctx)).toBe(false);
+    });
+
+    it("denies recursive grep from cwd (would descend into private/)", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x" }, ctx)).toBe(true);
+    });
+
+    it("denies recursive grep with no path (defaults to cwd)", () => {
+      expect(isPrivateMemoryAccess("Grep", { pattern: "x" }, ctx)).toBe(true);
+    });
+
+    it("allows grep from cwd when glob filter anchors to a non-memory subtree", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "skills/**/*.md" }, ctx)).toBe(false);
+    });
+
+    it("denies grep from cwd even with a recursive glob filter (could still reach private/)", () => {
+      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "**/*.md" }, ctx)).toBe(true);
+    });
+  });
+
+  describe("Bash", () => {
+    it("denies cd-then-relative-cat (reviewer's case)", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cd memory && cat private/secret.md" }, ctx)).toBe(true);
+    });
+
+    it("denies ls without trailing slash (reviewer's case)", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "ls memory/private" }, ctx)).toBe(true);
+    });
+
+    it("denies cat with absolute path", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cat /ws/memory/private/x.md" }, ctx)).toBe(true);
+    });
+
+    it("denies pipe chains touching private", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "find memory/private -type f | head" }, ctx)).toBe(true);
+    });
+
+    it("denies relative paths that resolve into private/", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cat ./memory/private/x.md" }, ctx)).toBe(true);
+    });
+
+    it("allows shell ops that don't touch memory/ or 'private' as a segment", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "ls tmp" }, ctx)).toBe(false);
+      expect(isPrivateMemoryAccess("Bash", { command: "echo hello" }, ctx)).toBe(false);
+      expect(isPrivateMemoryAccess("Bash", { command: "git status" }, ctx)).toBe(false);
+    });
+
+    it("allows reads of public memory files via shell", () => {
+      // Acceptable trade-off: the agent should use Read for this anyway, but
+      // we don't block public memory access in bash.
+      expect(isPrivateMemoryAccess("Bash", { command: "cat memory/MEMORY.md" }, ctx)).toBe(false);
+    });
+  });
+
+  describe("unknown tools", () => {
+    it("allows tools that don't read filesystem inputs", () => {
+      expect(isPrivateMemoryAccess("WebSearch", { query: "private memory" }, ctx)).toBe(false);
+      expect(isPrivateMemoryAccess("TodoWrite", { todos: [] }, ctx)).toBe(false);
+    });
+  });
+});

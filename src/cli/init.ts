@@ -305,6 +305,9 @@ export const initCommand = new Command("init")
         config.groupSecret = groupSecret;
       }
 
+      if (existsSync(configPath)) {
+        copyFileSync(configPath, join(TOMO_HOME, "config.json.bak"));
+      }
       writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
       p.log.success("Config saved");
     }

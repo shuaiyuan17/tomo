@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler } from "../src/channels/types.js";
@@ -13,6 +13,7 @@ import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, Stream
  *  event per element (each becomes its own text block, stitched into the
  *  same turn — the SDK only fires `result` once at the end). */
 let mockResponseFn: (text: string) => string | string[] | Promise<string | string[]> = () => "mock response";
+let mockEmitStreamDeltas = true;
 
 /** Track in-flight mock queries so tests can assert no concurrency */
 const queryState = {
@@ -55,10 +56,12 @@ function createMockQuery(prompt: AsyncGenerator) {
         // arrive, then an `assistant` event consolidates the just-completed
         // block(s). Only one `result` fires at the end of the whole turn.
         for (const block of blocks) {
-          eventQueue.push({
-            type: "stream_event",
-            event: { type: "content_block_delta", delta: { type: "text_delta", text: block } },
-          });
+          if (mockEmitStreamDeltas) {
+            eventQueue.push({
+              type: "stream_event",
+              event: { type: "content_block_delta", delta: { type: "text_delta", text: block } },
+            });
+          }
           eventQueue.push({
             type: "assistant",
             message: { content: [{ text: block }] },
@@ -159,12 +162,15 @@ const { mockConfig } = vi.hoisted(() => ({
 
 // Store the config path so activateGroup can read/write it
 let configFilePath = "";
+let configBackupPath = "";
+let restartReasonFilePath = "";
 
 vi.mock("../src/config.js", () => ({
   config: mockConfig,
   get CONFIG_PATH() { return configFilePath; },
+  get CONFIG_BACKUP_PATH() { return configBackupPath; },
   TOMO_HOME: "/tmp/tomo-mock",
-  RESTART_REASON_FILE: "/tmp/tomo-mock/.restart-reason",
+  get RESTART_REASON_FILE() { return restartReasonFilePath; },
 }));
 
 vi.mock("../src/workspace/index.js", () => ({
@@ -289,6 +295,8 @@ function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
     ...overrides,
   });
   configFilePath = join(tmpDir, "config.json");
+  configBackupPath = join(tmpDir, "config.json.bak");
+  restartReasonFilePath = join(tmpDir, ".restart-reason");
 }
 
 function makeMsg(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
@@ -319,6 +327,7 @@ beforeEach(() => {
   mkdirSync(tmpDir, { recursive: true });
   resetConfig();
   mockResponseFn = () => "mock response";
+  mockEmitStreamDeltas = true;
   queryState.reset();
 });
 
@@ -950,6 +959,24 @@ describe("NO_REPLY suppression", () => {
 
     await agent.stop();
   });
+
+  it("delivers SDK assistant text even when no stream delta arrives", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockEmitStreamDeltas = false;
+    mockResponseFn = () => "There's an issue with the selected model (claude-sonnet-4-7). It may not exist or you may not have access to it. Run --model to pick a different model.";
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toContain("selected model");
+    expect(tg.delivered[0].text).toContain("claude-sonnet-4-7");
+
+    await agent.stop();
+  });
 });
 
 // ===== Commands =====
@@ -986,6 +1013,138 @@ describe("chat commands", () => {
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("Session:");
     expect(tg.sent[0].text).toContain("Model:");
+
+    await agent.stop();
+  });
+
+  it("/model persists a session override to config", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-4-6");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-4-6");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-4-6");
+    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-4-6");
+
+    const backup = JSON.parse(readFileSync(configBackupPath, "utf-8")) as { model?: string };
+    expect(backup.model).toBe("claude-haiku-4-5");
+
+    await agent.stop();
+  });
+
+  it("/model accepts known full model IDs", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-7");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Switched to claude-opus-4-7");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-7");
+
+    await agent.stop();
+  });
+
+  it("/model rejects unknown model names without writing config", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-4.7");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("Unknown model");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides).toBeUndefined();
+
+    await agent.stop();
+  });
+
+  it("/restore restores config.json from config.json.bak", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
+    writeFileSync(configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
+
+    await tg.simulateCommand("restore", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("Restored config.json");
+
+    const restored = JSON.parse(readFileSync(configFilePath, "utf-8")) as { model?: string };
+    expect(restored.model).toBe("claude-sonnet-4-6");
+    expect(readFileSync(restartReasonFilePath, "utf-8")).toContain("Restored");
+
+    await agent.stop();
+  });
+
+  it("/restore locks out follow-up commands during restart", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
+    writeFileSync(configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
+
+    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateCommand("new", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(3);
+    expect(tg.sent[0].text).toContain("Restored config.json");
+    expect(tg.sent[1].text).toContain("Restore is already in progress");
+    expect(tg.sent[2].text).toContain("Restore is already in progress");
+
+    await agent.stop();
+  });
+
+  it("drops normal messages during restore restart", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
+    writeFileSync(configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
+
+    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "hello?" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toContain("Restored config.json");
+
+    await agent.stop();
+  });
+
+  it("/restore reports when no config backup exists", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("restore", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("No config backup found");
 
     await agent.stop();
   });

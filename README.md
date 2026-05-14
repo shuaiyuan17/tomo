@@ -59,6 +59,7 @@ tomo sessions clear    # Reset all sessions
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
 | `/model` | Switch model (sonnet/opus/haiku) |
+| `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/status` | Show session info (model, channel, message count) |
 
 ## Features

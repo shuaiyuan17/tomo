@@ -1,6 +1,8 @@
 # Config file reference (`~/.tomo/config.json`)
 
-Prefer editing via `tomo config` (interactive TUI). This reference is for reading/verifying values or scripted edits. **Changes require `tomo restart` to take effect.**
+Prefer editing via `tomo config` (interactive TUI). This reference is for reading/verifying values or scripted edits. **Manual edits require `tomo restart` to take effect.** Chat `/model <name>` writes `sessionModelOverrides` and applies to that session without a restart.
+
+Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Chat `/restore` restores that backup over `config.json` and restarts Tomo.
 
 ## Full example (every supported field)
 
@@ -50,7 +52,7 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 
 | Field | Type | Allowed values / notes |
 |---|---|---|
-| `model` | string | `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`. Append `[1m]` for 1M-context variants on Sonnet/Opus (e.g. `claude-opus-4-7[1m]`). Default model for every session. |
+| `model` | string | `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`. Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
@@ -64,7 +66,7 @@ Prefer editing via `tomo config` (interactive TUI). This reference is for readin
 | `identities[].name` | string | Unified identity name (lowercased to form the session key `dm:<name>`). |
 | `identities[].channels` | object | `{ channelName: chatId }` — maps each channel the identity uses to its chatId. |
 | `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
-| `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). |
+| `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). Written by `/model <name>` for the current chat and by the `tomo config` Sessions menu. |
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
 | `lcm.nudgeAtPct` | number | Context-usage % at which the harness nudges the agent to run `tomo lcm daily`. Default `70`. Lower = compact earlier and more often. |
 | `lcm.nudgeResetPct` | number | Hysteresis reset threshold — the "already nudged" flag clears once usage drops below this %. Default `60`. Must be less than `nudgeAtPct`; invalid values fall back to defaults. |

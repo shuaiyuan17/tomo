@@ -127,10 +127,15 @@ export class LiveSession {
     }
 
     if (event.type === "assistant" && event.message?.content) {
+      const hadStreamDeltas = this.streamingText.length > 0;
       this.streamingText = "";
       for (const block of event.message.content) {
         if ("text" in block) {
           this.parts.push(block.text);
+          // Some SDK-originated errors arrive as an assistant text block
+          // without preceding stream deltas. Push the full block into the
+          // channel stream before sealing it so the user sees the message.
+          if (!hadStreamDeltas) req?.onText?.(block.text);
           // Signal block boundary so channels can seal the streamed message
           // and start fresh on the next block (text → tool → text turns).
           if (req?.onBlockComplete) {

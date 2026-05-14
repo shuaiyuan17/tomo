@@ -1,6 +1,6 @@
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
-import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
+import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
@@ -12,7 +12,9 @@ import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { dirname } from "node:path";
+import { spawn } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
 
@@ -42,6 +44,7 @@ export class Agent {
   // proactive message went out.
   private pendingNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
+  private restoringConfig = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
 
   constructor() {
@@ -88,7 +91,6 @@ export class Agent {
   /** Activate a group chat by adding it to the channel's allowlist */
   private async activateGroup(channel: Channel, chatId: string): Promise<void> {
     try {
-      const { readFileSync, writeFileSync } = await import("node:fs");
       const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
       const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
       if (!channels[channel.name]) channels[channel.name] = {};
@@ -97,6 +99,7 @@ export class Agent {
         allowlist.push(chatId);
         channels[channel.name].allowlist = allowlist;
         cfg.channels = channels;
+        this.backupConfig();
         writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
         // Update the router's in-memory allowlist
         this.router.addToAllowlist(channel.name, chatId);
@@ -186,14 +189,80 @@ export class Agent {
 
   private static readonly AVAILABLE_MODELS: Record<string, string> = {
     "sonnet": "claude-sonnet-4-6",
-    "sonnet-1m": "claude-sonnet-4-6[1m]",
     "opus": "claude-opus-4-7",
-    "opus-1m": "claude-opus-4-7[1m]",
     "haiku": "claude-haiku-4-5",
   };
 
+  private backupConfig(): void {
+    if (!existsSync(CONFIG_PATH)) return;
+    mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
+    copyFileSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
+  }
+
+  private resolveModelName(arg: string): string | null {
+    const resolved = Agent.AVAILABLE_MODELS[arg] ?? arg;
+    return Object.values(Agent.AVAILABLE_MODELS).includes(resolved) ? resolved : null;
+  }
+
+  private persistModelOverride(key: string, model: string): void {
+    config.sessionModelOverrides[key] = model;
+
+    const cfg = existsSync(CONFIG_PATH)
+      ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
+      : {};
+    const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
+    overrides[key] = model;
+    cfg.sessionModelOverrides = overrides;
+
+    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+    this.backupConfig();
+    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+  }
+
+  private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
+    if (!existsSync(CONFIG_BACKUP_PATH)) {
+      await channel.send({ chatId, text: "No config backup found at ~/.tomo/config.json.bak." });
+      return;
+    }
+
+    try {
+      mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+      copyFileSync(CONFIG_BACKUP_PATH, CONFIG_PATH);
+
+      const reason = "Restored ~/.tomo/config.json from ~/.tomo/config.json.bak";
+      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
+      writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
+
+      this.restoringConfig = true;
+      await channel.send({ chatId, text: "Restored config.json from config.json.bak. Restarting Tomo..." });
+
+      if (process.env.NODE_ENV === "test") return;
+
+      setTimeout(() => {
+        const cli = process.argv[1];
+        if (!cli) {
+          process.kill(process.pid, "SIGTERM");
+          return;
+        }
+        const child = spawn(process.execPath, [cli, "restart"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.unref();
+      }, 100);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await channel.send({ chatId, text: `[error] restore failed: ${detail}` });
+    }
+  }
+
   private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
     const { sessionKey: key } = this.router.resolve(channel.name, chatId, false);
+
+    if (this.restoringConfig) {
+      await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
+      return;
+    }
 
     if (command === "new") {
       this.closeLiveSession(key);
@@ -216,12 +285,23 @@ export class Agent {
         return;
       }
 
-      const resolved = Agent.AVAILABLE_MODELS[arg] ?? arg;
+      const resolved = this.resolveModelName(arg);
+      if (!resolved) {
+        const names = Object.keys(Agent.AVAILABLE_MODELS).join(", ");
+        await channel.send({ chatId, text: `Unknown model "${arg}". Use one of: ${names}` });
+        return;
+      }
       this.modelOverrides.set(key, resolved);
+      this.persistModelOverride(key, resolved);
       // Model change requires new session (process uses one model)
       this.closeLiveSession(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `Switched to ${resolved}` });
+      return;
+    }
+
+    if (command === "restore") {
+      await this.restoreConfigAndRestart(channel, chatId);
       return;
     }
 
@@ -414,6 +494,8 @@ export class Agent {
   }
 
   private async handleMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+    if (this.restoringConfig) return;
+
     const hasImages = message.images && message.images.length > 0;
     const hasDocuments = message.documents && message.documents.length > 0;
     const isGroup = message.isGroup ?? false;
@@ -470,8 +552,7 @@ export class Agent {
       return;
     }
 
-    // Passive groups: skip typing indicator (most messages will be NO_REPLY)
-    const stopTyping = isPassiveGroup ? () => {} : replyChannel.startTyping(replyChatId);
+    const stopTyping = replyChannel.startTyping(replyChatId);
 
     try {
       const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
@@ -557,7 +638,7 @@ export class Agent {
       });
     }
 
-    const stopTyping = isPassiveGroup ? () => {} : replyChannel.startTyping(replyChatId);
+    const stopTyping = replyChannel.startTyping(replyChatId);
 
     try {
       const numbered = items.map((it, i) => {

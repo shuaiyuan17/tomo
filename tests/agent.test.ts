@@ -216,14 +216,14 @@ describe("summarizeToolInput", () => {
 // Test AVAILABLE_MODELS (extracted from Agent class)
 describe("AVAILABLE_MODELS", () => {
   const AVAILABLE_MODELS: Record<string, string> = {
-    "sonnet": "claude-sonnet-4-6[1m]",
-    "opus": "claude-opus-4-7[1m]",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-7",
     "haiku": "claude-haiku-4-5",
   };
 
   it("maps short names to full model IDs", () => {
-    expect(AVAILABLE_MODELS["sonnet"]).toBe("claude-sonnet-4-6[1m]");
-    expect(AVAILABLE_MODELS["opus"]).toBe("claude-opus-4-7[1m]");
+    expect(AVAILABLE_MODELS["sonnet"]).toBe("claude-sonnet-4-6");
+    expect(AVAILABLE_MODELS["opus"]).toBe("claude-opus-4-7");
     expect(AVAILABLE_MODELS["haiku"]).toBe("claude-haiku-4-5");
   });
 

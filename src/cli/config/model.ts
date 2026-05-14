@@ -3,7 +3,7 @@ import { loadConfig, saveConfig, modelLabel, MODELS } from "./shared.js";
 
 export async function configModel(): Promise<void> {
   const cfg = loadConfig();
-  const current = (cfg.model as string) ?? "claude-sonnet-4-6[1m]";
+  const current = (cfg.model as string) ?? "claude-sonnet-4-6";
   p.log.info(`Current default: ${modelLabel(current)}`);
 
   const choice = await p.select({

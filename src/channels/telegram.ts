@@ -28,7 +28,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "model", "status"]) {
+    for (const cmd of ["new", "model", "restore", "status"]) {
       this.bot.command(cmd, async (ctx) => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
@@ -536,6 +536,7 @@ export class TelegramChannel implements Channel {
     await this.bot.api.setMyCommands([
       { command: "new", description: "Start a new conversation" },
       { command: "model", description: "Switch model (sonnet/opus/haiku)" },
+      { command: "restore", description: "Restore config from backup and restart" },
       { command: "status", description: "Show current session status" },
     ]);
 

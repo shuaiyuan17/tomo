@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.9 (2026-05-13)
+
+### Features
+
+- **Persistent per-session model switching.** `/model <name>` now writes the selected model into `sessionModelOverrides` in `~/.tomo/config.json`, so the choice survives daemon restarts. The current live SDK process is still closed immediately so the next turn uses the selected model. `/model` now accepts the short aliases (`sonnet`, `opus`, `haiku`) or their known full model IDs, and rejects unknown names instead of persisting typos. The old `sonnet-1m` / `opus-1m` aliases were removed from chat commands and the config TUI.
+- **Chat restore for bad config edits.** New `/restore` command restores `~/.tomo/config.json` from `~/.tomo/config.json.bak`, sends a confirmation, and restarts Tomo. Built-in config writers now copy the current config to `config.json.bak` before mutating it, including `/model`, group activation, `tomo config`, and re-running `tomo init` over an existing config.
+
+### Bug fixes
+
+- **Surface SDK model errors in chat.** Some SDK-originated errors, including invalid selected-model messages, arrive as assistant text blocks without stream deltas. Tomo now pushes those assistant blocks into the channel stream before sealing them, so Telegram and iMessage users see the error instead of a hanging turn.
+
+### Docs
+
+- Updated `tomo-system` docs and README with the config backup rule, `sessionModelOverrides` behavior, and `/restore` command.
+
 ## 0.5.8 (2026-05-12)
 
 ### Features

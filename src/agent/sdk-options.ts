@@ -100,7 +100,8 @@ export function sdkOptions(
     allowDangerouslySkipPermissions: true,
     allowedTools: [
       "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-      "WebSearch", "WebFetch", "Agent", "NotebookEdit", "TodoWrite",
+      "WebSearch", "WebFetch", "Agent", "NotebookEdit",
+      "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
       `mcp__${TOMO_INTERNAL_MCP_NAME}__send_message`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__list_sessions`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__rename_group_chat`,

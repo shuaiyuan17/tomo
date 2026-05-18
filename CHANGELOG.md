@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.10 (2026-05-17)
+
+### Other
+
+- Bump `@anthropic-ai/claude-agent-sdk` 0.2.139 → 0.3.143 (#102). The 0.3.142 release renamed the `TodoWrite` tool to `TaskCreate`/`TaskUpdate`/`TaskGet`/`TaskList`; the allowlist in `src/agent/sdk-options.ts` and the corresponding permissions test fixture were updated to match (#103).
+- Bump `grammy` 1.42.0 → 1.43.0 (#101).
+- Bump dev dependencies group (#100): `@types/node` 25.7.0 → 25.8.0, `eslint` 10.3.0 → 10.4.0, `tsx` 4.21.0 → 4.22.0.
+
 ## 0.5.9 (2026-05-13)
 
 ### Features

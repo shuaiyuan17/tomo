@@ -230,7 +230,7 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
   describe("unknown tools", () => {
     it("allows tools that don't read filesystem inputs", () => {
       expect(isPrivateMemoryAccess("WebSearch", { query: "private memory" }, ctx)).toBe(false);
-      expect(isPrivateMemoryAccess("TodoWrite", { todos: [] }, ctx)).toBe(false);
+      expect(isPrivateMemoryAccess("TaskCreate", { task: "test" }, ctx)).toBe(false);
     });
   });
 });

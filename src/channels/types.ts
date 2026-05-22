@@ -55,7 +55,12 @@ export interface OutgoingMessage {
 }
 
 export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
-export type StopTyping = () => void | Promise<void>;
+export interface StopTypingOptions {
+  /** Clear the remote typing indicator immediately when the channel supports it. */
+  clear?: boolean;
+}
+
+export type StopTyping = (options?: StopTypingOptions) => void | Promise<void>;
 
 export interface StreamingMessage {
   /** Append text to the streaming message */

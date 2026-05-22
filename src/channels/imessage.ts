@@ -181,7 +181,7 @@ export class BlueBubblesChannel implements Channel {
     const STOP_WAIT_MS = 1000;
     const MAX_ERRORS = 10;
 
-    const cleanup = async () => {
+    const cleanup = async (options: { clear?: boolean } = {}) => {
       if (sealed) return;
       sealed = true;
       if (interval) clearInterval(interval);
@@ -198,9 +198,17 @@ export class BlueBubblesChannel implements Channel {
           }),
         ]);
       }
-      // Do not call DELETE /typing here. BlueBubbles clears typing when the
-      // message is sent or when its own timeout expires, while manual stop can
-      // race with an in-flight POST and produce a post-send typing flash.
+      if (options.clear) {
+        try {
+          await this.api("DELETE", `/chat/${encodeURIComponent(chatId)}/typing`);
+        } catch (err) {
+          log.debug({ err, chatId }, "Failed to clear iMessage typing indicator");
+        }
+      }
+      // For normal sends, do not call DELETE /typing here. BlueBubbles clears
+      // typing when the message is sent or when its own timeout expires, while
+      // manual stop can race with an in-flight POST and produce a post-send
+      // typing flash. Silent turns pass clear=true because no message follows.
     };
 
     const sendTyping = () => {

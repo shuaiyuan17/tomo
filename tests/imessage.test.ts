@@ -272,4 +272,38 @@ describe("BlueBubbles typing indicator", () => {
       { method: "POST", path: "/api/v1/chat/iMessage%3B-%3B%2B15551234567/typing" },
     ]);
   });
+
+  it("can explicitly clear the remote typing indicator for silent turns", async () => {
+    let resolveTypingPost: ((response: Response) => void) | undefined;
+    const calls: Array<{ method: string; path: string }> = [];
+    const pendingTypingPost = new Promise<Response>((resolve) => {
+      resolveTypingPost = resolve;
+    });
+
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? "GET";
+      calls.push({ method, path: new URL(requestUrl).pathname });
+      if (method === "POST") return pendingTypingPost;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }));
+
+    const channel = new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+
+    const stopTyping = channel.startTyping("iMessage;+;group123");
+    const stopped = Promise.resolve(stopTyping({ clear: true }));
+
+    await Promise.resolve();
+    resolveTypingPost!(new Response(null, { status: 204 }));
+    await stopped;
+
+    expect(calls).toEqual([
+      { method: "POST", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+    ]);
+  });
 });

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler } from "../src/channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../src/channels/types.js";
 
 // ---------------------------------------------------------------------------
 // Mock SDK — queue-based approach avoids async-generator timing issues
@@ -219,6 +219,8 @@ class MockChannel implements Channel {
   sent: OutgoingMessage[] = [];
   /** All delivered messages (both streamed and sent) */
   delivered: Delivery[] = [];
+  typingStarts: string[] = [];
+  typingStops: Array<{ chatId: string; options?: StopTypingOptions }> = [];
   renamed: Array<{ chatId: string; title: string }> = [];
   reacted: Array<{ chatId: string; messageId: string; reaction: MessageReaction; remove?: boolean }> = [];
 
@@ -262,7 +264,12 @@ class MockChannel implements Channel {
     };
   }
 
-  startTyping(_chatId: string): () => void { return () => {}; }
+  startTyping(chatId: string) {
+    this.typingStarts.push(chatId);
+    return (options?: StopTypingOptions) => {
+      this.typingStops.push({ chatId, options });
+    };
+  }
   async start() {}
   async stop() {}
 
@@ -271,7 +278,14 @@ class MockChannel implements Channel {
   async simulateCommand(cmd: string, chatId: string, sender: string, args?: string) {
     await this.commandHandler?.(cmd, chatId, sender, args);
   }
-  clearDelivered() { this.sent = []; this.delivered = []; this.renamed = []; this.reacted = []; }
+  clearDelivered() {
+    this.sent = [];
+    this.delivered = [];
+    this.typingStarts = [];
+    this.typingStops = [];
+    this.renamed = [];
+    this.reacted = [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +954,25 @@ describe("NO_REPLY suppression", () => {
     await drainQueue(agent);
 
     expect(tg.delivered).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("clears iMessage group typing when the model returns NO_REPLY", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "NO_REPLY";
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;+;group123", text: "side chatter", isGroup: true }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(0);
+    expect(im.typingStarts).toEqual(["iMessage;+;group123"]);
+    expect(im.typingStops).toEqual([
+      { chatId: "iMessage;+;group123", options: { clear: true } },
+    ]);
 
     await agent.stop();
   });

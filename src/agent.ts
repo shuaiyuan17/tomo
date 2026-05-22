@@ -566,7 +566,7 @@ export class Agent {
         this.makeBlockHandler(replyChannel, replyChatId, stream),
         message.documents,
       );
-      await stopTyping();
+      await stopTyping({ clear: isSilentReply(response) });
 
       this.maybeNudgeCompact(key);
 
@@ -662,7 +662,7 @@ export class Agent {
         this.makeBlockHandler(replyChannel, replyChatId, stream),
         allDocuments.length > 0 ? allDocuments : undefined,
       );
-      await stopTyping();
+      await stopTyping({ clear: isSilentReply(response) });
 
       this.maybeNudgeCompact(key);
 
@@ -851,11 +851,12 @@ export class Agent {
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);
-      await stopTyping();
+      const silentCronResponse = isSilentReply(response) || response.includes("NO_REPLY");
+      await stopTyping({ clear: silentCronResponse });
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
-      if (isSilentReply(response) || response.includes("NO_REPLY")) {
+      if (silentCronResponse) {
         log.info("Cron completed silently (no reply sent)");
         return;
       }

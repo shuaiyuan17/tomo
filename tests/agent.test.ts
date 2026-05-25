@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { normalizeSendTarget } from "../src/agent/send-target.js";
 
 // Test the silent reply detection (extracted logic)
 function isSilentReply(text: string): boolean {
@@ -229,5 +230,48 @@ describe("AVAILABLE_MODELS", () => {
 
   it("does not have unknown model keys", () => {
     expect(Object.keys(AVAILABLE_MODELS)).toEqual(["sonnet", "opus", "haiku"]);
+  });
+});
+
+describe("normalizeSendTarget", () => {
+  const identities = [{ name: "Shuai" }, { name: "Alice" }];
+
+  it("returns lowercase dm: key for an identity name matching config casing", () => {
+    expect(normalizeSendTarget("Shuai", identities)).toEqual({
+      sessionKey: "dm:shuai",
+      identityName: "Shuai",
+    });
+  });
+
+  it("returns the same lowercase dm: key regardless of caller's casing", () => {
+    // Regression for the duplicate-session bug: caller using identity name
+    // verbatim from config ("Shuai") used to spawn dm:Shuai, parallel to the
+    // dm:shuai built by the inbound path (router.ts toLowerCases).
+    expect(normalizeSendTarget("Shuai", identities)?.sessionKey).toBe("dm:shuai");
+    expect(normalizeSendTarget("shuai", identities)?.sessionKey).toBe("dm:shuai");
+    expect(normalizeSendTarget("SHUAI", identities)?.sessionKey).toBe("dm:shuai");
+  });
+
+  it("returns null for an unknown identity name", () => {
+    expect(normalizeSendTarget("Eve", identities)).toBeNull();
+  });
+
+  it("lowercases the name part of a dm: session key", () => {
+    expect(normalizeSendTarget("dm:Shuai", identities)).toEqual({ sessionKey: "dm:shuai" });
+    expect(normalizeSendTarget("dm:SHUAI", identities)).toEqual({ sessionKey: "dm:shuai" });
+    expect(normalizeSendTarget("dm:shuai", identities)).toEqual({ sessionKey: "dm:shuai" });
+  });
+
+  it("does not validate dm: keys against identities (cron / fallback paths may reference removed names)", () => {
+    expect(normalizeSendTarget("dm:eve", identities)).toEqual({ sessionKey: "dm:eve" });
+  });
+
+  it("returns channel keys unchanged (case preserved for chatId hashes)", () => {
+    expect(normalizeSendTarget("imessage:any;+;ABC123DEF", identities)).toEqual({
+      sessionKey: "imessage:any;+;ABC123DEF",
+    });
+    expect(normalizeSendTarget("telegram:-1001234567", identities)).toEqual({
+      sessionKey: "telegram:-1001234567",
+    });
   });
 });

@@ -12,6 +12,7 @@ import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
+import { normalizeSendTarget } from "./agent/send-target.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -1110,23 +1111,23 @@ export class Agent {
 
   /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
   private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
-    // Identity name (no colon) → dm:<name>
-    if (!target.includes(":")) {
-      const identity = config.identities.find((i) => i.name === target);
-      if (!identity) return undefined;
-      const sessionKey = `dm:${identity.name}`;
+    const normalized = normalizeSendTarget(target, config.identities);
+    if (!normalized) return undefined;
+    const { sessionKey, identityName } = normalized;
+
+    if (sessionKey.startsWith("dm:")) {
       const replyTarget = this.router.getReplyTarget(sessionKey)
-        ?? this.router.deriveReplyTargetFromConfig(identity.name);
+        ?? this.router.deriveReplyTargetFromConfig(identityName ?? sessionKey.slice(3));
       return replyTarget ? { sessionKey, replyTarget } : undefined;
     }
-    // Session key form (dm:<name> or <channel>:<chatId>)
+
+    // Non-dm session key (channel:<chatId> form, possibly a group)
     // Use parseRawChannelKey, NOT parseChannelKey — the latter rejects group
     // chats by design (it's for sendNotification's "find any DM" fallback).
     // Here the caller explicitly named a target; honor it even if it's a group.
-    const replyTarget = this.router.getReplyTarget(target)
-      ?? (target.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(target.slice(3)) : undefined)
-      ?? this.parseRawChannelKey(target);
-    return replyTarget ? { sessionKey: target, replyTarget } : undefined;
+    const replyTarget = this.router.getReplyTarget(sessionKey)
+      ?? this.parseRawChannelKey(sessionKey);
+    return replyTarget ? { sessionKey, replyTarget } : undefined;
   }
 
   /** Parse a "<channel>:<chatId>" key into a ReplyTarget. Group-friendly; for

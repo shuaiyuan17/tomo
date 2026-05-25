@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { open, mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { log } from "../logger.js";
@@ -194,65 +196,66 @@ function orientationToSipsArgs(orientation: number): string[] | null {
 }
 
 /**
- * Normalize EXIF orientation on a saved JPEG: rotate/flip pixels to match the
- * Orientation tag, then patch the tag to 1 so EXIF-aware readers don't
- * double-rotate. macOS-only (uses `sips`). No-op for non-JPEG or missing tag.
- *
- * Never throws — errors are logged and the file is left as-is.
+ * Patch the EXIF Orientation tag in a JPEG buffer to 1 (in place).
+ * Returns true if a tag was found and patched, false otherwise.
  */
-export async function normalizeJpegOrientation(path: string): Promise<void> {
-  const lower = path.toLowerCase();
-  if (!lower.endsWith(".jpg") && !lower.endsWith(".jpeg")) return;
+function patchOrientationToOne(buffer: Buffer): boolean {
+  const found = findExifOrientation(buffer);
+  if (!found) return false;
+  if (found.endian === "BE") buffer.writeUInt16BE(1, found.valueOffset);
+  else buffer.writeUInt16LE(1, found.valueOffset);
+  return true;
+}
 
-  let fd: Awaited<ReturnType<typeof open>> | null = null;
+/**
+ * Normalize EXIF Orientation on a JPEG buffer: rotate/flip pixels to match
+ * the Orientation tag, then patch the tag to 1 so EXIF-aware readers don't
+ * double-rotate. macOS-only (uses `sips`). Returns the original buffer
+ * unchanged for non-JPEG mime types, orientation=1, or on any failure.
+ *
+ * Run before either base64-encoding the image for the model or saving it to
+ * disk — both code paths must see the same normalized bytes, otherwise the
+ * model sees a sideways image even when the saved file looks right.
+ *
+ * Never throws.
+ */
+export async function normalizeJpegBuffer(buffer: Buffer, mimeType: string): Promise<Buffer> {
+  const mt = mimeType.toLowerCase();
+  if (mt !== "image/jpeg" && mt !== "image/jpg") return buffer;
+
+  const found = findExifOrientation(buffer);
+  if (!found || found.orientation === 1) return buffer;
+
+  const sipsArgs = orientationToSipsArgs(found.orientation);
+  if (!sipsArgs) {
+    log.warn({ orientation: found.orientation, bytes: buffer.length }, "Unsupported EXIF orientation; passing buffer through");
+    return buffer;
+  }
+
+  const tmpPath = join(tmpdir(), `tomo-norm-${randomUUID()}.jpg`);
   try {
-    fd = await open(path, "r+");
-    // 64KB is enough for the EXIF header on every iPhone photo I've seen.
-    const head = Buffer.alloc(65536);
-    const { bytesRead } = await fd.read(head, 0, head.length, 0);
-    const headSlice = head.slice(0, bytesRead);
-
-    const found = findExifOrientation(headSlice);
-    if (!found || found.orientation === 1) return;
-
-    const sipsArgs = orientationToSipsArgs(found.orientation);
-    if (!sipsArgs) {
-      log.warn({ path, orientation: found.orientation }, "Unsupported EXIF orientation; leaving file as-is");
-      return;
-    }
-
-    // Close fd before sips mutates the file in place, then reopen to patch the tag.
-    await fd.close();
-    fd = null;
-    await execFileP("sips", [...sipsArgs, path]);
-
-    // Patch the orientation field to 1. The offset is stable across sips
-    // re-encode in practice (sips preserves EXIF byte layout), but we re-parse
-    // to be safe in case the segment shifted.
-    fd = await open(path, "r+");
-    const head2 = Buffer.alloc(65536);
-    const { bytesRead: br2 } = await fd.read(head2, 0, head2.length, 0);
-    const reFound = findExifOrientation(head2.slice(0, br2));
-    if (reFound) {
-      const patch = Buffer.alloc(2);
-      if (reFound.endian === "BE") patch.writeUInt16BE(1, 0);
-      else patch.writeUInt16LE(1, 0);
-      await fd.write(patch, 0, 2, reFound.valueOffset);
-    }
-    log.info({ path, fromOrientation: found.orientation }, "Normalized JPEG orientation");
+    await writeFile(tmpPath, buffer);
+    await execFileP("sips", [...sipsArgs, tmpPath]);
+    const rotated = await readFile(tmpPath);
+    patchOrientationToOne(rotated);
+    log.info({ fromOrientation: found.orientation, bytes: rotated.length }, "Normalized JPEG buffer orientation");
+    return rotated;
   } catch (err) {
-    log.error({ err, path }, "Failed to normalize JPEG orientation");
+    log.error({ err, orientation: found.orientation }, "Failed to normalize JPEG buffer; returning original");
+    return buffer;
   } finally {
-    if (fd) await fd.close().catch(() => undefined);
+    await unlink(tmpPath).catch(() => undefined);
   }
 }
 
 /**
- * Save an inbound image to disk. Never throws — errors are logged and the
- * function returns `null` so the message flow can continue unimpeded.
+ * Save an inbound image to disk. The caller should pass an already-normalized
+ * buffer (see {@link normalizeJpegBuffer}); this function does not normalize
+ * because the base64 payload sent to the model must match what's on disk, and
+ * the channel layer is the only place that sees both sides of the split.
  *
- * For JPEGs, EXIF Orientation is normalized into the pixel data so downstream
- * readers (LLMs, image viewers without EXIF support) see the right side up.
+ * Never throws — errors are logged and `null` is returned so the message flow
+ * can continue unimpeded.
  *
  * @returns the absolute path written, or `null` on failure.
  */
@@ -270,9 +273,6 @@ export async function saveInboundImage(
       { path: fullPath, bytes: buffer.length, mimeType },
       "Saved inbound image",
     );
-    // Best-effort EXIF orientation normalization (JPEG only, macOS-only).
-    // Never throws — failures leave the original file on disk.
-    await normalizeJpegOrientation(fullPath);
     return fullPath;
   } catch (err) {
     log.error({ err, mimeType, bytes: buffer.length }, "Failed to save inbound image");

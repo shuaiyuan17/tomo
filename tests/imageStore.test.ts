@@ -16,7 +16,7 @@ vi.mock("../src/logger.js", () => ({
   },
 }));
 
-const { buildImagePath, findExifOrientation, mimeToExt, normalizeJpegOrientation, saveInboundImage } = await import("../src/channels/imageStore.js");
+const { buildImagePath, findExifOrientation, mimeToExt, normalizeJpegBuffer, saveInboundImage } = await import("../src/channels/imageStore.js");
 
 /**
  * Build a minimal JPEG buffer that contains just enough structure for the EXIF
@@ -190,43 +190,33 @@ describe("findExifOrientation", () => {
   });
 });
 
-describe("normalizeJpegOrientation", () => {
-  let base: string;
-
-  beforeEach(async () => {
-    base = await mkdtemp(join(tmpdir(), "imagestore-norm-"));
+describe("normalizeJpegBuffer", () => {
+  it("returns the same buffer for non-JPEG mime types", async () => {
+    const buf = Buffer.from([0x89, 0x50, 0x4e, 0x47]); // PNG magic
+    const out = await normalizeJpegBuffer(buf, "image/png");
+    expect(out).toBe(buf);
   });
 
-  afterEach(async () => {
-    await rm(base, { recursive: true, force: true });
-  });
-
-  it("is a no-op for non-JPEG paths", async () => {
-    const path = join(base, "x.png");
-    const buf = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
-    await (await import("node:fs/promises")).writeFile(path, buf);
-    await normalizeJpegOrientation(path);
-    const after = await readFile(path);
-    expect(after.equals(buf)).toBe(true);
-  });
-
-  it("is a no-op when orientation is 1", async () => {
-    const path = join(base, "ok.jpg");
+  it("returns the same buffer when orientation is 1", async () => {
     const buf = buildJpegWithOrientation(1);
-    await (await import("node:fs/promises")).writeFile(path, buf);
-    await normalizeJpegOrientation(path);
-    const after = await readFile(path);
-    expect(after.equals(buf)).toBe(true);
+    const out = await normalizeJpegBuffer(buf, "image/jpeg");
+    expect(out).toBe(buf);
   });
 
-  it("swallows errors on a corrupt JPEG", async () => {
-    const path = join(base, "bad.jpg");
-    // Looks like a JPEG (SOI) but the APP1 length is garbage
-    await (await import("node:fs/promises")).writeFile(path, Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff, 0xff]));
-    await expect(normalizeJpegOrientation(path)).resolves.toBeUndefined();
+  it("returns the same buffer when no EXIF segment is present", async () => {
+    const buf = Buffer.from([0xff, 0xd8, 0xff, 0xd9]); // SOI + EOI only
+    const out = await normalizeJpegBuffer(buf, "image/jpeg");
+    expect(out).toBe(buf);
   });
 
-  // End-to-end behavior (sips re-encode + tag patch) is exercised manually
-  // on real iPhone photos; the parser tests above + integration tests for
-  // saveInboundImage cover the rest.
+  it("returns original buffer on corrupt JPEG without throwing", async () => {
+    // SOI + APP1 with garbage length
+    const buf = Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff, 0xff]);
+    const out = await normalizeJpegBuffer(buf, "image/jpeg");
+    expect(out).toBe(buf);
+  });
+
+  // The end-to-end "orientation 6 → rotated + patched to 1" path requires sips
+  // and a real JPEG; it's covered manually on real iPhone photos and indirectly
+  // through the saveInboundImage integration test on Mac CI.
 });

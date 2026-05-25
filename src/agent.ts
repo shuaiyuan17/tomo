@@ -23,6 +23,41 @@ export interface SessionCatalog {
   groups: Array<{ key: string; title?: string; participants?: string[] }>;
 }
 
+/**
+ * Canonicalize a `send_message` target to its session key form.
+ *
+ * - **Identity name** (no colon): case-insensitive lookup against the
+ *   identities config. Returns `dm:<lowercased name>` so the result matches
+ *   the inbound DM key built in `router.ts` (which lowercases there too).
+ *   Returns `null` if no identity matches.
+ * - **`dm:<name>` key**: lowercases the name part. Caller passing
+ *   `dm:Shuai` lands on the same `dm:shuai` session as the inbound path,
+ *   preventing a duplicate-cased shadow session from being created.
+ * - **`<channel>:<chatId>` key**: returned unchanged.
+ *
+ * Exported for unit testing; production code should call this through the
+ * `Agent` send-target path.
+ */
+export function normalizeSendTarget(
+  target: string,
+  identities: ReadonlyArray<{ name: string }>,
+): { sessionKey: string; identityName?: string } | null {
+  if (!target.includes(":")) {
+    const identity = identities.find(
+      (i) => i.name.toLowerCase() === target.toLowerCase(),
+    );
+    if (!identity) return null;
+    return {
+      sessionKey: `dm:${identity.name.toLowerCase()}`,
+      identityName: identity.name,
+    };
+  }
+  if (target.startsWith("dm:")) {
+    return { sessionKey: `dm:${target.slice(3).toLowerCase()}` };
+  }
+  return { sessionKey: target };
+}
+
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
@@ -1110,23 +1145,23 @@ export class Agent {
 
   /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
   private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
-    // Identity name (no colon) → dm:<name>
-    if (!target.includes(":")) {
-      const identity = config.identities.find((i) => i.name === target);
-      if (!identity) return undefined;
-      const sessionKey = `dm:${identity.name}`;
+    const normalized = normalizeSendTarget(target, config.identities);
+    if (!normalized) return undefined;
+    const { sessionKey, identityName } = normalized;
+
+    if (sessionKey.startsWith("dm:")) {
       const replyTarget = this.router.getReplyTarget(sessionKey)
-        ?? this.router.deriveReplyTargetFromConfig(identity.name);
+        ?? this.router.deriveReplyTargetFromConfig(identityName ?? sessionKey.slice(3));
       return replyTarget ? { sessionKey, replyTarget } : undefined;
     }
-    // Session key form (dm:<name> or <channel>:<chatId>)
+
+    // Non-dm session key (channel:<chatId> form, possibly a group)
     // Use parseRawChannelKey, NOT parseChannelKey — the latter rejects group
     // chats by design (it's for sendNotification's "find any DM" fallback).
     // Here the caller explicitly named a target; honor it even if it's a group.
-    const replyTarget = this.router.getReplyTarget(target)
-      ?? (target.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(target.slice(3)) : undefined)
-      ?? this.parseRawChannelKey(target);
-    return replyTarget ? { sessionKey: target, replyTarget } : undefined;
+    const replyTarget = this.router.getReplyTarget(sessionKey)
+      ?? this.parseRawChannelKey(sessionKey);
+    return replyTarget ? { sessionKey, replyTarget } : undefined;
   }
 
   /** Parse a "<channel>:<chatId>" key into a ReplyTarget. Group-friendly; for

@@ -1,7 +1,7 @@
 import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction } from "./types.js";
-import { formatImageMarker, saveInboundImage } from "./imageStore.js";
+import { formatImageMarker, normalizeJpegBuffer, saveInboundImage } from "./imageStore.js";
 import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { log } from "../logger.js";
 
@@ -296,16 +296,22 @@ export class TelegramChannel implements Channel {
       const ext = file.file_path.split(".").pop()?.toLowerCase();
       const mediaType = ext === "png" ? "image/png" : "image/jpeg";
 
+      // Normalize EXIF orientation BEFORE both base64 and disk save so the
+      // model and the saved file see the same pixels. Telegram's own client
+      // typically pre-rotates, but normalizing is cheap and covers edge cases
+      // (forwarded photos, file uploads that bypass the client's transcode).
+      const normalizedBuffer = await normalizeJpegBuffer(buffer, mediaType);
+
       // Additively persist to disk if configured. Never blocks the return.
       let savedPath: string | undefined;
       if (this.imageStoreBaseDir) {
-        savedPath = (await saveInboundImage(buffer, mediaType, {
+        savedPath = (await saveInboundImage(normalizedBuffer, mediaType, {
           sessionKey: chatId ? `telegram_${chatId}` : "telegram",
           guid: fileId,
         }, this.imageStoreBaseDir)) ?? undefined;
       }
 
-      return { data: buffer.toString("base64"), mediaType, savedPath };
+      return { data: normalizedBuffer.toString("base64"), mediaType, savedPath };
     } catch (err) {
       log.error({ err }, "Failed to download photo");
       return undefined;

@@ -1,6 +1,12 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { log } from "../logger.js";
+
+const execFileP = promisify(execFile);
 
 export interface ImageSaveMeta {
   /** Logical session or chat identifier (e.g. "dm_shuai", "tg_12345"). */
@@ -90,8 +96,166 @@ export function formatImageMarker(intendedCount: number, savedPaths: string[]): 
 }
 
 /**
- * Save an inbound image to disk. Never throws — errors are logged and the
- * function returns `null` so the message flow can continue unimpeded.
+ * Locate the EXIF Orientation tag (0x0112) in a JPEG buffer.
+ *
+ * iPhone photos forwarded through iMessage/BlueBubbles preserve the original
+ * orientation tag without baking the rotation into pixels. Without normalization,
+ * a portrait-shot photo (orientation=6) appears sideways to downstream readers
+ * that don't honor EXIF — including LLMs reading attached images.
+ *
+ * Returns the orientation value, the byte offset of the 16-bit value, and the
+ * byte order ("BE" for big-endian / Motorola, "LE" for little-endian / Intel),
+ * or `null` if no orientation tag is present.
+ *
+ * Exported for testing; channels should prefer {@link saveInboundImage}.
+ */
+export function findExifOrientation(
+  buffer: Buffer,
+): { orientation: number; valueOffset: number; endian: "BE" | "LE" } | null {
+  // Must be a JPEG (SOI marker FF D8)
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+
+  let i = 2;
+  while (i + 4 <= buffer.length) {
+    if (buffer[i] !== 0xff) return null;
+    const marker = buffer[i + 1];
+    // SOS (0xDA) or end — stop scanning
+    if (marker === 0xda || marker === 0xd9) return null;
+    // Standalone markers without length
+    if (marker >= 0xd0 && marker <= 0xd7) {
+      i += 2;
+      continue;
+    }
+    const segSize = buffer.readUInt16BE(i + 2);
+    if (segSize < 2 || i + 2 + segSize > buffer.length) return null;
+
+    // APP1 with EXIF identifier
+    if (marker === 0xe1 && buffer.slice(i + 4, i + 8).toString("ascii") === "Exif") {
+      const tiff = i + 10; // skip "Exif\0\0"
+      if (tiff + 8 > buffer.length) return null;
+      const byteOrder = buffer.slice(tiff, tiff + 2).toString("ascii");
+      const endian: "BE" | "LE" = byteOrder === "MM" ? "BE" : "LE";
+      const readU16 = (off: number) => endian === "BE" ? buffer.readUInt16BE(off) : buffer.readUInt16LE(off);
+      const readU32 = (off: number) => endian === "BE" ? buffer.readUInt32BE(off) : buffer.readUInt32LE(off);
+
+      // Validate magic 42
+      if (readU16(tiff + 2) !== 0x002a) return null;
+      const ifd0Offset = readU32(tiff + 4);
+      const ifd0 = tiff + ifd0Offset;
+      if (ifd0 + 2 > buffer.length) return null;
+      const nEntries = readU16(ifd0);
+      const entriesEnd = ifd0 + 2 + nEntries * 12;
+      if (entriesEnd > buffer.length) return null;
+
+      for (let j = 0; j < nEntries; j++) {
+        const entry = ifd0 + 2 + j * 12;
+        const tag = readU16(entry);
+        if (tag === 0x0112) {
+          // Orientation: SHORT (type 3), count 1; value lives in the first 2 bytes
+          // of the value/offset field (entry + 8).
+          const valueOffset = entry + 8;
+          const value = readU16(valueOffset);
+          return { orientation: value, valueOffset, endian };
+        }
+      }
+      return null;
+    }
+
+    i += 2 + segSize;
+  }
+  return null;
+}
+
+/**
+ * Map an EXIF Orientation value to the sips arguments needed to bake the
+ * rotation/flip into the pixel data. Returns `null` for value 1 (no-op) or
+ * unsupported values.
+ *
+ * EXIF orientation reference:
+ *   1: normal               (no-op)
+ *   2: flip horizontal
+ *   3: rotate 180°
+ *   4: flip vertical
+ *   5: transpose            (rotate 90° CCW + flip horizontal)
+ *   6: rotate 90° CW
+ *   7: transverse           (rotate 90° CW + flip horizontal)
+ *   8: rotate 90° CCW
+ */
+function orientationToSipsArgs(orientation: number): string[] | null {
+  switch (orientation) {
+    case 1: return null;
+    case 2: return ["-f", "horizontal"];
+    case 3: return ["-r", "180"];
+    case 4: return ["-f", "vertical"];
+    case 5: return ["-r", "90", "-f", "horizontal"];
+    case 6: return ["-r", "90"];
+    case 7: return ["-r", "90", "-f", "vertical"];
+    case 8: return ["-r", "270"];
+    default: return null;
+  }
+}
+
+/**
+ * Patch the EXIF Orientation tag in a JPEG buffer to 1 (in place).
+ * Returns true if a tag was found and patched, false otherwise.
+ */
+function patchOrientationToOne(buffer: Buffer): boolean {
+  const found = findExifOrientation(buffer);
+  if (!found) return false;
+  if (found.endian === "BE") buffer.writeUInt16BE(1, found.valueOffset);
+  else buffer.writeUInt16LE(1, found.valueOffset);
+  return true;
+}
+
+/**
+ * Normalize EXIF Orientation on a JPEG buffer: rotate/flip pixels to match
+ * the Orientation tag, then patch the tag to 1 so EXIF-aware readers don't
+ * double-rotate. macOS-only (uses `sips`). Returns the original buffer
+ * unchanged for non-JPEG mime types, orientation=1, or on any failure.
+ *
+ * Run before either base64-encoding the image for the model or saving it to
+ * disk — both code paths must see the same normalized bytes, otherwise the
+ * model sees a sideways image even when the saved file looks right.
+ *
+ * Never throws.
+ */
+export async function normalizeJpegBuffer(buffer: Buffer, mimeType: string): Promise<Buffer> {
+  const mt = mimeType.toLowerCase();
+  if (mt !== "image/jpeg" && mt !== "image/jpg") return buffer;
+
+  const found = findExifOrientation(buffer);
+  if (!found || found.orientation === 1) return buffer;
+
+  const sipsArgs = orientationToSipsArgs(found.orientation);
+  if (!sipsArgs) {
+    log.warn({ orientation: found.orientation, bytes: buffer.length }, "Unsupported EXIF orientation; passing buffer through");
+    return buffer;
+  }
+
+  const tmpPath = join(tmpdir(), `tomo-norm-${randomUUID()}.jpg`);
+  try {
+    await writeFile(tmpPath, buffer);
+    await execFileP("sips", [...sipsArgs, tmpPath]);
+    const rotated = await readFile(tmpPath);
+    patchOrientationToOne(rotated);
+    log.info({ fromOrientation: found.orientation, bytes: rotated.length }, "Normalized JPEG buffer orientation");
+    return rotated;
+  } catch (err) {
+    log.error({ err, orientation: found.orientation }, "Failed to normalize JPEG buffer; returning original");
+    return buffer;
+  } finally {
+    await unlink(tmpPath).catch(() => undefined);
+  }
+}
+
+/**
+ * Save an inbound image to disk. The caller should pass an already-normalized
+ * buffer (see {@link normalizeJpegBuffer}); this function does not normalize
+ * because the base64 payload sent to the model must match what's on disk, and
+ * the channel layer is the only place that sees both sides of the split.
+ *
+ * Never throws — errors are logged and `null` is returned so the message flow
+ * can continue unimpeded.
  *
  * @returns the absolute path written, or `null` on failure.
  */

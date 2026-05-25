@@ -1,6 +1,6 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
-import { formatImageMarker, saveInboundImage } from "./imageStore.js";
+import { formatImageMarker, normalizeJpegBuffer, saveInboundImage } from "./imageStore.js";
 import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { log } from "../logger.js";
 
@@ -469,16 +469,22 @@ export class BlueBubblesChannel implements Channel {
         }
 
         if (isImage) {
+          // Normalize EXIF orientation BEFORE both base64 encoding and disk
+          // save so the model and the saved file see the same pixels.
+          // iMessage/BlueBubbles preserves the original EXIF Orientation tag
+          // without baking rotation into pixels; without this, portrait
+          // iPhone shots reach the model sideways.
+          const normalizedBuffer = await normalizeJpegBuffer(buffer, mimeType);
           // Additively persist to disk if configured. Never blocks the return.
           let savedPath: string | undefined;
           if (this.imageStoreBaseDir) {
-            savedPath = (await saveInboundImage(buffer, mimeType, {
+            savedPath = (await saveInboundImage(normalizedBuffer, mimeType, {
               sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
               guid: attGuid,
             }, this.imageStoreBaseDir)) ?? undefined;
           }
           images.push({
-            data: buffer.toString("base64"),
+            data: normalizedBuffer.toString("base64"),
             mediaType: mimeType,
             savedPath,
           });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizeSendTarget } from "../src/agent.js";
+import { normalizeSendTarget } from "../src/agent/send-target.js";
 
 // Test the silent reply detection (extracted logic)
 function isSilentReply(text: string): boolean {

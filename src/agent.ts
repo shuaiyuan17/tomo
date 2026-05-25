@@ -12,6 +12,7 @@ import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
+import { normalizeSendTarget } from "./agent/send-target.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -21,41 +22,6 @@ export type SendResult = { ok: true } | { ok: false; error: string };
 export interface SessionCatalog {
   identities: Array<{ name: string }>;
   groups: Array<{ key: string; title?: string; participants?: string[] }>;
-}
-
-/**
- * Canonicalize a `send_message` target to its session key form.
- *
- * - **Identity name** (no colon): case-insensitive lookup against the
- *   identities config. Returns `dm:<lowercased name>` so the result matches
- *   the inbound DM key built in `router.ts` (which lowercases there too).
- *   Returns `null` if no identity matches.
- * - **`dm:<name>` key**: lowercases the name part. Caller passing
- *   `dm:Shuai` lands on the same `dm:shuai` session as the inbound path,
- *   preventing a duplicate-cased shadow session from being created.
- * - **`<channel>:<chatId>` key**: returned unchanged.
- *
- * Exported for unit testing; production code should call this through the
- * `Agent` send-target path.
- */
-export function normalizeSendTarget(
-  target: string,
-  identities: ReadonlyArray<{ name: string }>,
-): { sessionKey: string; identityName?: string } | null {
-  if (!target.includes(":")) {
-    const identity = identities.find(
-      (i) => i.name.toLowerCase() === target.toLowerCase(),
-    );
-    if (!identity) return null;
-    return {
-      sessionKey: `dm:${identity.name.toLowerCase()}`,
-      identityName: identity.name,
-    };
-  }
-  if (target.startsWith("dm:")) {
-    return { sessionKey: `dm:${target.slice(3).toLowerCase()}` };
-  }
-  return { sessionKey: target };
 }
 
 export class Agent {

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { config } from "../config.js";
 import type { Agent } from "../agent.js";
 import { buildCronTools } from "./cron-tools.js";
+import { buildPetTools } from "./pet-tools.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 
@@ -170,6 +171,7 @@ export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWit
         },
       ),
       ...buildCronTools(),
+      ...buildPetTools(),
     ],
   });
 }

@@ -50,6 +50,7 @@ async function startForeground(): Promise<void> {
   const { TelegramChannel } = await import("../channels/index.js");
   const { config } = await import("../config.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
+  const { PetScheduler } = await import("../mcp/pet-scheduler.js");
 
   // Ensure directories exist (handles upgrades where new dirs were added)
   const { mkdirSync } = await import("node:fs");
@@ -122,6 +123,7 @@ async function startForeground(): Promise<void> {
   }
 
   const scheduler = new CronScheduler(agent);
+  const petScheduler = new PetScheduler(agent);
 
   // Start continuity runner if enabled
   const { ContinuityRunner } = await import("../continuity.js");
@@ -147,6 +149,7 @@ async function startForeground(): Promise<void> {
     versionChecker.stop();
     rollupRunner.stop();
     continuity.stop();
+    petScheduler.stop();
     scheduler.stop();
     await agent.stop();
     try { unlinkSync(PID_FILE); } catch { /* ignore */ }
@@ -157,6 +160,7 @@ async function startForeground(): Promise<void> {
 
   await agent.start();
   scheduler.start();
+  petScheduler.start();
 }
 
 async function startDaemon(): Promise<void> {

@@ -90,6 +90,12 @@ export class PetStore {
   }
 
   // Apply time-based decay since last_tick. Skips if < 6 minutes elapsed.
+  //
+  // Time is split correctly for two offline-gap cases:
+  // 1. Sleep expired mid-interval: slept hours get energy recovery, remaining
+  //    awake hours get hunger/happiness/energy decay.
+  // 2. Starvation started mid-interval: health penalty only covers the time
+  //    actually spent at hunger=0, not the full elapsed window.
   tick(state: PetState): PetState {
     const now = Date.now();
     const last = new Date(state.last_tick).getTime();
@@ -97,26 +103,43 @@ export class PetStore {
 
     if (elapsedHours < 0.1) return this.checkEvolution(state);
 
+    let awakeHours: number;
+
     if (state.sleeping) {
-      // Check if sleep timer expired
       if (state.sleep_until && now >= new Date(state.sleep_until).getTime()) {
+        // Sleep expired during the interval — split into slept + awake portions.
+        const sleptHours = Math.max(0, (new Date(state.sleep_until).getTime() - last) / (1000 * 60 * 60));
+        awakeHours = elapsedHours - sleptHours;
+        state.energy = Math.min(100, state.energy + sleptHours * 15);
         state.sleeping = false;
         state.sleep_until = null;
-        state.energy = Math.min(100, state.energy + elapsedHours * 15);
         state = this.addDiary(state, `${state.name} woke up refreshed.`);
       } else {
+        // Still sleeping for the entire interval.
         state.energy = Math.min(100, state.energy + elapsedHours * 15);
+        awakeHours = 0;
       }
     } else {
-      state.hunger    = Math.max(0, state.hunger    - elapsedHours * 5);
-      state.happiness = Math.max(0, state.happiness - elapsedHours * 3);
-      state.energy    = Math.max(0, state.energy    - elapsedHours * 4);
+      awakeHours = elapsedHours;
     }
 
-    if (state.hunger === 0) {
-      state.health = Math.max(0, state.health - elapsedHours * 8);
-    } else if (state.hunger > 60 && state.health < 100) {
-      state.health = Math.min(100, state.health + elapsedHours * 2);
+    if (awakeHours > 0) {
+      const hungerBefore = state.hunger;
+      state.hunger    = Math.max(0, state.hunger    - awakeHours * 5);
+      state.happiness = Math.max(0, state.happiness - awakeHours * 3);
+      state.energy    = Math.max(0, state.energy    - awakeHours * 4);
+
+      // Health: penalize only for the time actually spent at hunger=0.
+      // If hunger was > 0 at the start, starvation began after hungerBefore/5 hours.
+      const starvingHours = hungerBefore > 0
+        ? Math.max(0, awakeHours - hungerBefore / 5)
+        : awakeHours;
+
+      if (starvingHours > 0) {
+        state.health = Math.max(0, state.health - starvingHours * 8);
+      } else if (state.hunger > 60 && state.health < 100) {
+        state.health = Math.min(100, state.health + awakeHours * 2);
+      }
     }
 
     state.last_tick = new Date().toISOString();

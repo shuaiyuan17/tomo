@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.11 (2026-05-26)
+
+### Bug fixes
+
+- **Normalize iMessage image orientation** (#108). iMessage/BlueBubbles forwards iPhone photos with their original EXIF Orientation tag intact and no pixel rotation baked in, so a portrait shot the model saw sideways via iMessage (Telegram's client pre-rotates and strips the tag, so it looked fine there). Normalization is now a buffer-level operation (`normalizeJpegBuffer` in `src/channels/imageStore.ts`) that runs in the channel layer before *either* base64-encoding for the model or writing to disk, so both paths get the same upright bytes — including when image persistence is off. A portrait iPhone shot (orientation=6, 5712×4284 landscape pixels) now becomes a 4284×5712 portrait buffer with orientation=1.
+- **Clear iMessage typing indicator on silent replies** (#105). When a turn resolves to a silent reply (`NO_REPLY`), the iMessage typing indicator is now cleared instead of being left running, so Tomo no longer appears stuck "typing".
+- **Prevent duplicate `dm:` sessions from `send_message` target casing** (#109). `resolveSendTarget` built DM session keys as `dm:<name>` while the inbound router builds them as `dm:<name.toLowerCase()>`, so a caller using an identity name verbatim from config (e.g. target `"Shuai"`) spawned a parallel `dm:Shuai` session that never received inbound messages. A new side-effect-free `normalizeSendTarget` helper (`src/agent/send-target.ts`) lowercases both identity-name lookups and `dm:` keys, leaving channel keys unchanged.
+
+### Other
+
+- Bump `@anthropic-ai/claude-agent-sdk` 0.3.143 → 0.3.150 (#107).
+- Bump dev dependencies group (#106): `@types/node` 25.8.0 → 25.9.1, `tsx` 4.22.0 → 4.22.3, `typescript-eslint` 8.59.3 → 8.59.4, `vitest` & `@vitest/coverage-v8` 4.1.6 → 4.1.7.
+
 ## 0.5.10 (2026-05-17)
 
 ### Other

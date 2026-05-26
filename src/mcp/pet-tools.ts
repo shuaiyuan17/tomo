@@ -81,9 +81,6 @@ export function buildPetTools(petPath?: string) {
         "Bring a new pet companion into the world.",
         "",
         "Give it a name and optionally a species. Replaces any existing pet.",
-        "",
-        "After hatching, set up a recurring cron job (schedule_create, every 1h) that",
-        "prompts you to run pet_tick — this keeps stats decaying even during quiet periods.",
       ].join("\n"),
       {
         name: z.string().min(1).max(30).describe("The pet's name."),
@@ -323,58 +320,5 @@ export function buildPetTools(petPath?: string) {
       },
     ),
 
-    tool(
-      "pet_tick",
-      [
-        "Apply time-based stat decay and check for evolution. Called by the hourly cron job.",
-        "",
-        "Safe to call any time — has a 6-minute minimum interval to prevent over-decay.",
-        "Returns a brief status, or notable events (hunger warning, health drop, evolution).",
-        "If the pet is in a bad state, surface it to the user proactively.",
-      ].join("\n"),
-      {},
-      async () => {
-        const store = new PetStore(petPath);
-        let state = store.load();
-
-        if (!state) {
-          return {
-            content: [{ type: "text" as const, text: "No pet exists yet." }],
-          };
-        }
-
-        const prevStage = state.stage;
-        const prevHealth = Math.round(state.health);
-        state = store.tick(state);
-        store.save(state);
-
-        const events: string[] = [];
-        if (state.stage !== prevStage) {
-          events.push(`Evolved to ${state.stage}!`);
-        }
-        if (state.hunger < 20) {
-          events.push(`${state.name} is hungry (hunger: ${Math.round(state.hunger)})`);
-        }
-        if (Math.round(state.health) < prevHealth - 5) {
-          events.push(`${state.name}'s health dropped to ${Math.round(state.health)}`);
-        }
-        if (state.happiness < 20) {
-          events.push(`${state.name} seems very unhappy`);
-        }
-
-        const mood = store.computeMood(state);
-        return {
-          content: [{
-            type: "text" as const,
-            text: events.length > 0
-              ? events.join("\n")
-              : `tick ok — ${state.name} is ${mood}`,
-          }],
-        };
-      },
-      {
-        searchHint: "pet tick decay time update cron hourly",
-      },
-    ),
   ];
 }

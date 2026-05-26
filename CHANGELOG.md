@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0 (2026-05-26)
+
+### Features
+
+- **Virtual pet companion** (#111). Tomo now has a pet that lives at `~/.tomo/data/pet.json`. Five MCP tools on `tomo-internal` let the agent interact with it: `pet_hatch` (name and species), `pet_status` (current mood and stats), `pet_feed`, `pet_play`, and `pet_sleep`. Stats (hunger, happiness, energy, health) decay over time; affection accumulates through interactions and drives evolution through six stages: egg → baby → child → teen → adult → elder. A `PetScheduler` runs inside the tomo process and ticks every hour — no cron job setup required. When the pet needs attention (hunger, health drop, evolution), the scheduler sends a notification via `agent.sendNotification()`.
+
 ## 0.5.11 (2026-05-26)
 
 ### Bug fixes

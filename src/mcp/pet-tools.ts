@@ -9,9 +9,8 @@ import { PetStore } from "./pet-store.js";
  * state from disk, applies a tick (time-based decay), runs its action, then
  * saves — the file is always the single source of truth.
  *
- * Intended cron setup: after pet_hatch, tomo should create a cron job
- * (schedule_create) that fires every hour and prompts tomo to call pet_tick.
- * This ensures stats decay even when no user messages arrive.
+ * Time-based decay runs automatically via PetScheduler (started in startForeground),
+ * not through these MCP tools — the agent only interacts with the pet on user request.
  */
 export function buildPetTools(petPath?: string) {
   return [

@@ -10,13 +10,13 @@ export const LOG_PATH = join(TOMO_HOME, "logs", "tomo.log");
 
 export const MODELS: Record<string, string> = {
   "sonnet": "claude-sonnet-4-6",
-  "opus": "claude-opus-4-7",
+  "opus": "claude-opus-4-8",
   "haiku": "claude-haiku-4-5",
 };
 
 const MODEL_LABELS: Record<string, string> = {
   "claude-sonnet-4-6": "Sonnet 4.6 (fast)",
-  "claude-opus-4-7": "Opus 4.7 (most capable)",
+  "claude-opus-4-8": "Opus 4.8 (most capable)",
   "claude-haiku-4-5": "Haiku 4.5 (cheapest)",
 };
 

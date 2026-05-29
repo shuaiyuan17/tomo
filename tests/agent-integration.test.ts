@@ -1079,15 +1079,15 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-7");
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-opus-4-7");
+    expect(tg.sent[0].text).toBe("Switched to claude-opus-4-8");
 
     const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-7");
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8");
 
     await agent.stop();
   });

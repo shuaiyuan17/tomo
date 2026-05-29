@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1 (2026-05-28)
+
+### Other
+
+- Default Opus model upgraded from Claude Opus 4.7 to Claude Opus 4.8 (#113).
+
 ## 0.6.0 (2026-05-26)
 
 ### Features

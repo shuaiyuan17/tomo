@@ -53,7 +53,6 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
     }
   },
-  "mcpAllowedTools": ["mcp__github-copilot__*", "mcp__filesystem__*"],
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,

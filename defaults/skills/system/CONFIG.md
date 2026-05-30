@@ -8,7 +8,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 
 ```json
 {
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-4-6[1m]",
   "city": "Seattle",
   "continuity": false,
   "groupSecret": "tomo-a1b2c3d4",
@@ -36,7 +36,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
     }
   ],
   "sessionModelOverrides": {
-    "dm:alice": "claude-opus-4-8"
+    "dm:alice": "claude-opus-4-8[1m]"
   },
   "maxTurns": 50,
   "mcpServers": {
@@ -66,7 +66,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 
 | Field | Type | Allowed values / notes |
 |---|---|---|
-| `model` | string | `claude-sonnet-4-6`, `claude-opus-4-8`, `claude-haiku-4-5`. Default model for every session. |
+| `model` | string | `claude-sonnet-4-6[1m]`, `claude-sonnet-4-6`, `claude-opus-4-8[1m]`, `claude-opus-4-8`, `claude-haiku-4-5`. Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |

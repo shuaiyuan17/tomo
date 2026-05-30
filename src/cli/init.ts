@@ -244,7 +244,9 @@ export const initCommand = new Command("init")
       const model = await p.select({
         message: "Default model",
         options: [
-          { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "fast, recommended" },
+          { value: "claude-sonnet-4-6[1m]", label: "Claude Sonnet 4.6 1M", hint: "fast, recommended" },
+          { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "fast" },
+          { value: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 1M", hint: "most capable, long context" },
           { value: "claude-opus-4-8", label: "Claude Opus 4.8", hint: "most capable" },
           { value: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "cheapest" },
         ],

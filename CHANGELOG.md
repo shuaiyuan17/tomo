@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Add Sonnet 4.6 1M and Opus 4.8 1M model options, and make Sonnet 4.6 1M the default for new configs.
+
 ## 0.6.1 (2026-05-28)
 
 ### Other

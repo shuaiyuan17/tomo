@@ -136,7 +136,7 @@ function createMockQuery(prompt: AsyncGenerator) {
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
     telegramToken: "test-token",
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-4-6[1m]",
     workspaceDir: "",
     sessionsDir: "",
     historyLimit: 20,
@@ -1056,16 +1056,16 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-4-6");
+    await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-4-6");
+    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-4-6[1m]");
 
     const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-4-6");
-    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-4-6");
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-4-6[1m]");
+    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-4-6[1m]");
 
     const backup = JSON.parse(readFileSync(configBackupPath, "utf-8")) as { model?: string };
     expect(backup.model).toBe("claude-haiku-4-5");
@@ -1079,15 +1079,15 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8");
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8[1m]");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-opus-4-8");
+    expect(tg.sent[0].text).toBe("Switched to claude-opus-4-8[1m]");
 
     const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8");
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8[1m]");
 
     await agent.stop();
   });

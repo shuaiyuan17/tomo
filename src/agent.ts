@@ -54,7 +54,10 @@ export class Agent {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
     this.internalMcpServer = createTomoInternalMcpServer(this);
-    this.mcpOAuthManager = new McpOAuthManager({ workspaceDir: config.workspaceDir });
+    this.mcpOAuthManager = new McpOAuthManager({
+      workspaceDir: config.workspaceDir,
+      onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
+    });
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -401,6 +404,21 @@ export class Agent {
     });
   }
 
+  private async handleMcpAuthFailure(serverName: string, err: unknown): Promise<void> {
+    const detail = err instanceof Error ? err.message : String(err);
+    log.warn({ serverName, err }, "External MCP server omitted after OAuth failure");
+
+    const target = this.findPrivateReplyTarget();
+    if (!target) return;
+    const channel = this.getChannel(target.channelName);
+    if (!channel) return;
+
+    await channel.send({
+      chatId: target.chatId,
+      text: `MCP server "${serverName}" is unavailable because OAuth failed or timed out: ${detail}. Continuing without that server.`,
+    });
+  }
+
   private async handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult> {
     const target = this.resolvePrivateReplyTarget(key);
     if (!target) {
@@ -443,6 +461,19 @@ export class Agent {
 
     if (!isGroupSessionKey(key)) {
       return this.parseChannelKey(key);
+    }
+
+    for (const identity of config.identities) {
+      const target = this.router.deriveReplyTargetFromConfig(identity.name);
+      if (target) return target;
+    }
+    return undefined;
+  }
+
+  private findPrivateReplyTarget(): ReplyTarget | undefined {
+    for (const [key] of this.sessions.listSdkSessionIds()) {
+      const target = this.resolvePrivateReplyTarget(key);
+      if (target) return target;
     }
 
     for (const identity of config.identities) {

@@ -47,17 +47,20 @@ export interface McpOAuthManagerOptions {
   fetchImpl?: typeof fetch;
   now?: () => number;
   tokenStorePath?: string;
+  onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
 }
 
 export class McpOAuthManager {
   private fetchImpl: typeof fetch;
   private now: () => number;
   private tokenStorePath: string;
+  private onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
 
   constructor(options: McpOAuthManagerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? Date.now;
-    this.tokenStorePath = options.tokenStorePath ?? join(options.workspaceDir, "secrets", "keychain.json");
+    this.tokenStorePath = options.tokenStorePath ?? join(options.workspaceDir, "secrets", "mcp-oauth.json");
+    this.onServerAuthError = options.onServerAuthError;
   }
 
   async buildServersWithAuth(
@@ -71,7 +74,11 @@ export class McpOAuthManager {
         continue;
       }
 
-      result[name] = await this.withOAuthHeader(name, entry, sendAuthorizeUrl);
+      try {
+        result[name] = await this.withOAuthHeader(name, entry, sendAuthorizeUrl);
+      } catch (err) {
+        await this.onServerAuthError?.(name, err);
+      }
     }
     return result;
   }

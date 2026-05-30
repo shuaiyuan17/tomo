@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-05-29)
 
 ### Features
 
-- Add Sonnet 4.6 1M and Opus 4.8 1M model options, and make Sonnet 4.6 1M the default for new configs.
+- **External MCP server support with harness-managed OAuth** (#114, #115). Users can declare additional MCP servers in `~/.tomo/config.json` under `mcpServers` (also accepted as `mcp.servers`) for stdio, HTTP, streamable HTTP, and SSE transports; optional `mcpAllowedTools` restricts the surface, otherwise all configured tools are exposed. For OAuth-protected remotes (GitHub Copilot MCP, Robinhood MCP, etc.), a per-server `oauth` block drives authorization-code + PKCE with dynamic client registration and a localhost callback; the harness refreshes near-expiry tokens and injects `Authorization: Bearer …` into HTTP/SSE headers at session-build time. Tokens live in `~/.tomo/workspace/secrets/mcp-oauth.json` (mode `0600`), kept separate from `keychain.json` so keychain rewrites don't wipe MCP auth, and never reach the agent. Auth failures are isolated per server — a broken server is omitted with a one-line notice and the session still starts. Discovery follows RFC 9728 `WWW-Authenticate` challenges with a `/.well-known/oauth-protected-resource/...` fallback for POST-only endpoints like Robinhood MCP. The bundled `tomo-system` skill now tells the agent that user-configured tools appear as `mcp__<server>__<tool>` and that it should never ask users for tokens.
+- **1M context model options** (#116). New `/model` aliases `sonnet-1m` and `opus-1m` map to `claude-sonnet-4-6[1m]` and `claude-opus-4-8[1m]`. `claude-sonnet-4-6[1m]` is now the default for new/fallback configs. Init/config UI labels, the Telegram command description, README, and `tomo-system/CONFIG.md` are updated to match.
 
 ## 0.6.1 (2026-05-28)
 

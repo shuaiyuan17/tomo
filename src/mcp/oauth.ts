@@ -7,6 +7,16 @@ import type { ExternalMcpServerConfig, McpOAuthConfig } from "./external-config.
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
+const MCP_INITIALIZE_PROBE = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "tomo", version: "1.0" },
+  },
+};
 
 export interface OAuthTokenRecord {
   accessToken: string;
@@ -234,10 +244,16 @@ export class McpOAuthManager {
     if (existing?.resource) return { resource: existing.resource };
     if (oauth.authorizationServer) return {};
 
-    const res = await this.fetchImpl(server.url, { method: "GET", headers: { Accept: "application/json" } });
+    const res = await this.fetchImpl(server.url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(MCP_INITIALIZE_PROBE),
+    });
     const header = res.headers.get("www-authenticate") ?? "";
-    const metadataUrl = parseResourceMetadataUrl(header);
-    if (!metadataUrl) return {};
+    const metadataUrl = parseResourceMetadataUrl(header) ?? protectedResourceMetadataUrl(server.url);
 
     const metadataRes = await this.fetchImpl(metadataUrl, { method: "GET", headers: { Accept: "application/json" } });
     if (!metadataRes.ok) throw new Error(`Failed to fetch MCP protected-resource metadata: ${metadataRes.status}`);
@@ -353,6 +369,12 @@ function authorizationServerMetadataUrls(issuer: string): string[] {
     `${url.origin}/.well-known/oauth-authorization-server${suffix}`,
     `${url.origin}/.well-known/openid-configuration${suffix}`,
   ];
+}
+
+function protectedResourceMetadataUrl(resource: string): string {
+  const url = new URL(resource);
+  const suffix = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+  return `${url.origin}/.well-known/oauth-protected-resource${suffix}`;
 }
 
 function base64Url(buf: Buffer): string {

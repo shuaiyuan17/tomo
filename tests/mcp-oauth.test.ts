@@ -247,6 +247,63 @@ describe("McpOAuthManager", () => {
     expect(readFileSync(keychainPath, "utf-8")).toContain("\"entries\"");
   });
 
+  it("discovers protected-resource metadata via POST probe and RFC 9728 well-known fallback", async () => {
+    resetDir();
+    const calls: Array<{ url: string; method?: string; body?: string }> = [];
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      fetchImpl: async (input, init) => {
+        calls.push({ url: String(input), method: init?.method, body: String(init?.body ?? "") });
+        if (String(input) === "https://agent.robinhood.com/mcp/trading") {
+          return new Response("", { status: 401 });
+        }
+        if (String(input) === "https://agent.robinhood.com/.well-known/oauth-protected-resource/mcp/trading") {
+          return new Response(JSON.stringify({
+            resource: "https://agent.robinhood.com/mcp/trading",
+            authorization_servers: ["https://auth.robinhood.com"],
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (String(input) === "https://auth.robinhood.com/.well-known/oauth-authorization-server") {
+          return new Response(JSON.stringify({
+            authorization_endpoint: "https://auth.robinhood.com/authorize",
+            token_endpoint: "https://auth.robinhood.com/token",
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`unexpected fetch ${String(input)}`);
+      },
+    });
+
+    await expect(manager.withOAuthHeader("robinhood", {
+      server: { type: "http", url: "https://agent.robinhood.com/mcp/trading" },
+      oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "robinhood" },
+    }, async () => {
+      throw new Error("stop before waiting for callback");
+    })).rejects.toThrow("stop before waiting for callback");
+
+    expect(calls[0]).toEqual({
+      url: "https://agent.robinhood.com/mcp/trading",
+      method: "POST",
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "tomo", version: "1.0" },
+        },
+      }),
+    });
+    expect(calls.map((c) => c.url)).toContain("https://agent.robinhood.com/.well-known/oauth-protected-resource/mcp/trading");
+    expect(calls.some((c) => c.method === "GET" && c.url === "https://agent.robinhood.com/mcp/trading")).toBe(false);
+  });
+
   it("uses an unexpired stored token without refreshing", async () => {
     resetDir();
     const tokenStorePath = join(TEST_DIR, "secrets", "keychain.json");

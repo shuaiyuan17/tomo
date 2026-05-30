@@ -27,6 +27,17 @@ function mkEvent(day: string, hour: number, role: "user" | "assistant", extra: R
   };
 }
 
+function mkSummary(tag: string, timestamp = "2025-11-10T12:00:00.000Z") {
+  return {
+    type: "user",
+    uuid: randomUUID(),
+    timestamp,
+    isCompactSummary: true,
+    blockTag: tag,
+    message: { role: "user", content: `[${tag} — 1 event summarized]\n\nsummary` },
+  };
+}
+
 function writeArchive(sessionId: string, events: any[]): string {
   const path = getSdkSessionPath(sessionId);
   mkdirSync(dirname(path), { recursive: true });
@@ -125,6 +136,58 @@ describe("resolveBlockRange — daily fresh-tail behavior", () => {
     expect(result).not.toBeNull();
     expect(result!.description).toContain("50 events");
     expect(result!.description).not.toContain("kept raw");
+  });
+});
+
+describe("findDuePromotions — parent rebuild nudges", () => {
+  let sessionId: string;
+  let archivePath: string;
+
+  beforeEach(() => {
+    sessionId = `test-blocks-rebuild-${randomUUID()}`;
+  });
+
+  afterEach(() => {
+    if (archivePath && existsSync(archivePath)) unlinkSync(archivePath);
+  });
+
+  it("flags a weekly rebuild when new daily blocks exist beside an existing weekly block", () => {
+    const events = [
+      mkSummary("weekly 2025-W46", "2025-11-10T12:00:00.000Z"),
+      mkSummary("daily 2025-11-11", "2025-11-11T12:00:00.000Z"),
+    ];
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const weeklyDue = due.find((d) => d.level === "weekly" && d.period === "2025-W46");
+    expect(weeklyDue).toBeDefined();
+    expect(weeklyDue!.childCount).toBe(1);
+  });
+
+  it("flags a monthly rebuild when new weekly blocks exist beside an existing monthly block", () => {
+    const events = [
+      mkSummary("monthly 2025-11", "2025-11-01T12:00:00.000Z"),
+      mkSummary("weekly 2025-W46", "2025-11-13T12:00:00.000Z"),
+    ];
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const monthlyDue = due.find((d) => d.level === "monthly" && d.period === "2025-11");
+    expect(monthlyDue).toBeDefined();
+    expect(monthlyDue!.childCount).toBe(1);
+  });
+
+  it("flags a yearly rebuild when new monthly blocks exist beside an existing yearly block", () => {
+    const events = [
+      mkSummary("yearly 2025", "2025-01-01T12:00:00.000Z"),
+      mkSummary("monthly 2025-11", "2025-11-01T12:00:00.000Z"),
+    ];
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const yearlyDue = due.find((d) => d.level === "yearly" && d.period === "2025");
+    expect(yearlyDue).toBeDefined();
+    expect(yearlyDue!.childCount).toBe(1);
   });
 });
 

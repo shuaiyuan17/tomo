@@ -58,7 +58,7 @@ tomo sessions clear    # Reset all sessions
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
-| `/model` | Switch model (sonnet/opus/haiku) |
+| `/model` | Switch model (sonnet/sonnet-1m/opus/opus-1m/haiku) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/status` | Show session info (model, channel, message count) |
 
@@ -217,7 +217,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
       "replyPolicy": "last-active"
     }
   ],
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-4-6[1m]",
   "maxTurns": 50,
   "saveInboundImages": true,
   "groupSecret": "tomo-xxxxxxxx",

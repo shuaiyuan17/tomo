@@ -541,7 +541,7 @@ export class TelegramChannel implements Channel {
     // Register commands with Telegram so they show in the menu
     await this.bot.api.setMyCommands([
       { command: "new", description: "Start a new conversation" },
-      { command: "model", description: "Switch model (sonnet/opus/haiku)" },
+      { command: "model", description: "Switch model (sonnet/opus/haiku, 1m variants)" },
       { command: "restore", description: "Restore config from backup and restart" },
       { command: "status", description: "Show current session status" },
     ]);

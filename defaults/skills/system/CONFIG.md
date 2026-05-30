@@ -39,6 +39,20 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
     "dm:alice": "claude-opus-4-8"
   },
   "maxTurns": 50,
+  "mcpServers": {
+    "github-copilot": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "oauth": {
+        "scopes": ["read:user"],
+        "tokenStoreKey": "github-copilot"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
+    }
+  },
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,
@@ -68,6 +82,9 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). Written by `/model <name>` for the current chat and by the `tomo config` Sessions menu. |
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
+| `mcpServers` | object | External MCP servers keyed by server name. Supports stdio (`command`, `args`, `env`), HTTP (`type: "http"`, `url`, `headers`), and SSE (`type: "sse"`, `url`, `headers`). Environment variables like `${HOME}` expand in `url`, `headers`, `env`, and `args`. |
+| `mcpServers.<name>.oauth` | object | Optional harness-managed OAuth for HTTP/SSE MCP servers. Supports `authorizationServer` (optional; omitted = discover from the MCP server), `clientId` (optional if dynamic registration is available), `scopes`, `tokenStoreKey`, `redirectUri`, and `clientName`. Tokens are stored outside agent context in `workspace/secrets/mcp-oauth.json` (`0600`). |
+| `mcpAllowedTools` | string[] | Auto-allowed external MCP tools. If omitted, Tomo defaults to `mcp__<server>__*` for every configured external server. Set this to narrow tool access, e.g. `["mcp__github__list_issues"]`. |
 | `lcm.nudgeAtPct` | number | Context-usage % at which the harness nudges the agent to run `tomo lcm daily`. Default `70`. Lower = compact earlier and more often. |
 | `lcm.nudgeResetPct` | number | Hysteresis reset threshold — the "already nudged" flag clears once usage drops below this %. Default `60`. Must be less than `nudgeAtPct`; invalid values fall back to defaults. |
 | `lcm.groupCompactStyle` | string | `"sdk"` (default) or `"lcm"`. `"sdk"` lets the SDK auto-compact group sessions; `"lcm"` opts groups into the same hierarchical LCM flow as DMs (disables SDK auto-compact and fires all three harness nudges: 70% daily, 80% safety net, and the periodic rollup runner). DMs always use LCM regardless. |

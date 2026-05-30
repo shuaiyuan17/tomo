@@ -107,6 +107,11 @@ In-process MCP tools let you message outside the current conversation:
 
 Pass identity name (`"alice"`) or session key (`"telegram:-1001234567"`) as `target`. Call `list_sessions` first if unsure. Tool result lines (with `is_error` flag) appear in `tomo logs` immediately after the corresponding tool call.
 
+### External MCP tools
+Users may configure additional MCP servers in `~/.tomo/config.json`; their tools appear as `mcp__<server>__<tool>`. Use them normally when relevant.
+
+OAuth/token handling is harness-managed. Never ask the user for bearer tokens, OAuth codes, refresh tokens, or MCP auth headers. If a configured MCP server needs login, Tomo sends the user a private login link and injects tokens outside your context. If a server is unavailable, continue with other tools and explain the limitation only if it affects the answer.
+
 ## Skills
 
 ### Built-in skills (`tomo-*`)

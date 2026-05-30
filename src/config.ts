@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { parseExternalMcpServers } from "./mcp/external-config.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -55,6 +57,10 @@ interface TomoConfig {
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
+  /** External MCP servers from ~/.tomo/config.json. */
+  mcpServers: Record<string, McpServerConfig>;
+  /** MCP tool allowlist entries for external servers. Defaults to mcp__<server>__* for each server. */
+  mcpAllowedTools: string[];
   lcm: LcmConfig;
 }
 
@@ -109,6 +115,12 @@ function parsePassiveGroups(channels: Record<string, Record<string, unknown>>): 
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
   const channels = (file.channels ?? {}) as Record<string, Record<string, unknown>>;
+  const mcp = (file.mcp ?? {}) as Record<string, unknown>;
+  const mcpServers = parseExternalMcpServers(file.mcpServers ?? mcp.servers);
+  const rawMcpAllowedTools = file.mcpAllowedTools ?? mcp.allowedTools;
+  const mcpAllowedTools = Array.isArray(rawMcpAllowedTools)
+    ? rawMcpAllowedTools.map(String)
+    : Object.keys(mcpServers).map((serverName) => `mcp__${serverName}__*`);
 
   const telegramToken =
     process.env.TELEGRAM_BOT_TOKEN ??
@@ -172,6 +184,8 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
+    mcpServers,
+    mcpAllowedTools,
     lcm: parseLcmConfig(file.lcm),
   };
 }

@@ -1,4 +1,4 @@
-import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -367,12 +367,64 @@ export class Agent {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.buildGroupContext(key),
+      onMcpElicitation: (request) => this.handleMcpElicitation(key, request),
     }, turnBudget);
 
     session = new LiveSession(opts, key, turnBudget);
     this.liveSessions.set(key, session);
     log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
     return session;
+  }
+
+  private async handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult> {
+    const target = this.resolvePrivateReplyTarget(key);
+    if (!target) {
+      log.warn({ key, server: request.serverName }, "MCP elicitation requested but no private reply target is available");
+      return { action: "decline" };
+    }
+
+    const channel = this.getChannel(target.channelName);
+    if (!channel) {
+      log.warn({ key, channelName: target.channelName, server: request.serverName }, "MCP elicitation requested but channel is not connected");
+      return { action: "decline" };
+    }
+
+    if (request.mode === "url" && request.url) {
+      const lines = [
+        `MCP login required for ${request.serverName}.`,
+        request.message,
+        "",
+        request.url,
+        "",
+        "Open the link and finish login. If Tomo does not continue automatically, retry your request after login completes.",
+      ];
+      await channel.send({ chatId: target.chatId, text: lines.filter(Boolean).join("\n") });
+      log.info({ key, server: request.serverName }, "Forwarded MCP login URL to user");
+      return { action: "accept" };
+    }
+
+    await channel.send({
+      chatId: target.chatId,
+      text: `MCP server ${request.serverName} requested additional input, but Tomo can only forward browser login links right now.`,
+    });
+    log.warn({ key, server: request.serverName, mode: request.mode }, "Declined unsupported MCP elicitation");
+    return { action: "decline" };
+  }
+
+  private resolvePrivateReplyTarget(key: string): ReplyTarget | undefined {
+    if (key.startsWith("dm:")) {
+      return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(key.slice(3));
+    }
+
+    if (!isGroupSessionKey(key)) {
+      return this.parseChannelKey(key);
+    }
+
+    for (const identity of config.identities) {
+      const target = this.router.deriveReplyTargetFromConfig(identity.name);
+      if (target) return target;
+    }
+    return undefined;
   }
 
   private closeLiveSession(key: string): void {

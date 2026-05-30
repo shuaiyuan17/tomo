@@ -119,6 +119,36 @@ Tomo has access to Claude's built-in tools:
 | `send_message` (MCP) | Proactively send a message to another session/identity |
 | `list_sessions` (MCP) | List active identities and group sessions |
 
+### External MCP Servers
+
+Add remote or local MCP servers directly to `~/.tomo/config.json` under `mcpServers`. Tomo passes them through to the Claude Agent SDK and, by default, auto-allows all tools from each configured server with `mcp__<server>__*`.
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "type": "http",
+      "url": "https://code.claude.com/docs/mcp"
+    },
+    "github": {
+      "type": "sse",
+      "url": "https://api.example.com/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
+    }
+  }
+}
+```
+
+Use `type: "http"` for streamable HTTP, `type: "sse"` for SSE, or omit `type` for stdio servers. Environment variables in `url`, `headers`, `env`, and `args` are expanded at runtime. To restrict auto-approval, set top-level `mcpAllowedTools`, for example `["mcp__github__list_issues"]`.
+
+If a remote MCP server requests browser-based login, Tomo forwards the login link to your private chat and accepts the SDK elicitation so the server can complete the flow.
+
 ### Scheduled Tasks
 
 Tomo can create scheduled tasks on its own — just ask "remind me in 30 minutes to stretch" or "check the weather every morning at 9am." Supports one-shot reminders, recurring intervals, and cron expressions.

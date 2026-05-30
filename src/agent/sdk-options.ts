@@ -1,4 +1,4 @@
-import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
@@ -53,6 +53,7 @@ export interface SessionContext {
      *  config.passiveGroups. Drives the "stay silent unless useful" rule. */
     isPassive: boolean;
   };
+  onMcpElicitation?: (request: ElicitationRequest) => Promise<ElicitationResult>;
 }
 
 export function sdkOptions(
@@ -61,6 +62,7 @@ export function sdkOptions(
   model?: string,
   sessionContext?: SessionContext,
   turnBudget?: TurnBudget,
+  externalMcpServersOverride?: Record<string, McpServerConfig>,
 ) {
   const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
   let systemPrompt = buildSystemPrompt({ isGroup });
@@ -92,6 +94,15 @@ export function sdkOptions(
     systemPrompt += lines.join("\n");
   }
 
+  const configuredMcpServers = Object.fromEntries(
+    Object.entries(config.mcpServers ?? {}).map(([name, entry]) => [name, entry.server]),
+  ) as Record<string, McpServerConfig>;
+  const externalMcpServers = Object.fromEntries(
+    Object.entries(externalMcpServersOverride ?? configuredMcpServers)
+      .filter(([name]) => name !== TOMO_INTERNAL_MCP_NAME),
+  );
+  const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
+
   return {
     model: model ?? config.model,
     cwd: config.workspaceDir,
@@ -109,6 +120,7 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_create`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_list`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_remove`,
+      ...externalMcpAllowedTools,
     ],
     // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path
     // is the top-level `skills` option. The SDK appends `"Skill"` (or
@@ -116,7 +128,7 @@ export function sdkOptions(
     // `skills` is defined, so we set it to "all" to keep every discovered
     // skill invocable (same surface as the old `"Skill"` allowedTools entry).
     skills: "all" as const,
-    mcpServers: { [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
+    mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: ["project"] as ("project")[],
     settings: {
       attribution: {
@@ -127,6 +139,7 @@ export function sdkOptions(
     // See ./permissions.ts — canUseTool re-allows `.claude/skills/` writes
     // that bypassPermissions otherwise routes here as denials.
     canUseTool: skillsCanUseTool,
+    ...(sessionContext?.onMcpElicitation ? { onElicitation: sessionContext.onMcpElicitation } : {}),
     includePartialMessages: true,
     maxTurns: config.maxTurns,
     ...buildHooksOption({

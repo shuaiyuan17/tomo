@@ -119,6 +119,46 @@ Tomo has access to Claude's built-in tools:
 | `send_message` (MCP) | Proactively send a message to another session/identity |
 | `list_sessions` (MCP) | List active identities and group sessions |
 
+### External MCP Servers
+
+Add remote or local MCP servers directly to `~/.tomo/config.json` under `mcpServers`. Tomo passes them through to the Claude Agent SDK and, by default, auto-allows all tools from each configured server with `mcp__<server>__*`.
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "type": "http",
+      "url": "https://code.claude.com/docs/mcp"
+    },
+    "github": {
+      "type": "sse",
+      "url": "https://api.example.com/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    },
+    "github-copilot": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "oauth": {
+        "scopes": ["read:user"],
+        "tokenStoreKey": "github-copilot"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
+    }
+  }
+}
+```
+
+Use `type: "http"` for streamable HTTP, `type: "sse"` for SSE, or omit `type` for stdio servers. Environment variables in `url`, `headers`, `env`, and `args` are expanded at runtime. To restrict auto-approval, set top-level `mcpAllowedTools`, for example `["mcp__github__list_issues"]`.
+
+Remote HTTP/SSE servers can also use harness-managed OAuth by adding an `oauth` block. Tomo discovers the authorization server from the MCP server's RFC 9728 `WWW-Authenticate` challenge unless `authorizationServer` is set explicitly, uses authorization-code + PKCE, registers a dynamic client when needed, stores tokens in `~/.tomo/workspace/secrets/mcp-oauth.json` with mode `0600`, silently refreshes near-expiry tokens, and injects `Authorization: Bearer <token>` into MCP headers. The agent never sees the tokens.
+
+If browser login is needed, Tomo forwards the authorize URL to your private chat and waits for the localhost callback before starting the agent session.
+
 ### Scheduled Tasks
 
 Tomo can create scheduled tasks on its own — just ask "remind me in 30 minutes to stretch" or "check the weather every morning at 9am." Supports one-shot reminders, recurring intervals, and cron expressions.

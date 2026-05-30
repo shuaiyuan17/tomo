@@ -1,4 +1,4 @@
-import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -8,6 +8,7 @@ import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
+import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
@@ -47,11 +48,16 @@ export class Agent {
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   private restoringConfig = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
+  private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
     this.internalMcpServer = createTomoInternalMcpServer(this);
+    this.mcpOAuthManager = new McpOAuthManager({
+      workspaceDir: config.workspaceDir,
+      onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
+    });
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -345,7 +351,7 @@ export class Agent {
     }
   }
 
-  private getOrCreateLiveSession(key: string): LiveSession {
+  private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
     let session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
 
@@ -363,16 +369,118 @@ export class Agent {
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
     const turnBudget = makeTurnBudget();
+    const externalMcpServers = await this.mcpOAuthManager.buildServersWithAuth(
+      config.mcpServers ?? {},
+      (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
+    );
     const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.buildGroupContext(key),
-    }, turnBudget);
+      onMcpElicitation: (request) => this.handleMcpElicitation(key, request),
+    }, turnBudget, externalMcpServers);
 
     session = new LiveSession(opts, key, turnBudget);
     this.liveSessions.set(key, session);
     log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
     return session;
+  }
+
+  private async forwardMcpAuthorizeUrl(key: string, serverName: string, url: string): Promise<void> {
+    const target = this.resolvePrivateReplyTarget(key);
+    if (!target) throw new Error(`No private reply target is available for MCP OAuth login (${serverName})`);
+    const channel = this.getChannel(target.channelName);
+    if (!channel) throw new Error(`Channel "${target.channelName}" is not connected for MCP OAuth login (${serverName})`);
+
+    await channel.send({
+      chatId: target.chatId,
+      text: [
+        `MCP login required for ${serverName}.`,
+        "",
+        url,
+        "",
+        "Open the link and finish login. Tomo will continue after the browser callback completes.",
+      ].join("\n"),
+    });
+  }
+
+  private async handleMcpAuthFailure(serverName: string, err: unknown): Promise<void> {
+    const detail = err instanceof Error ? err.message : String(err);
+    log.warn({ serverName, err }, "External MCP server omitted after OAuth failure");
+
+    const target = this.findPrivateReplyTarget();
+    if (!target) return;
+    const channel = this.getChannel(target.channelName);
+    if (!channel) return;
+
+    await channel.send({
+      chatId: target.chatId,
+      text: `MCP server "${serverName}" is unavailable because OAuth failed or timed out: ${detail}. Continuing without that server.`,
+    });
+  }
+
+  private async handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult> {
+    const target = this.resolvePrivateReplyTarget(key);
+    if (!target) {
+      log.warn({ key, server: request.serverName }, "MCP elicitation requested but no private reply target is available");
+      return { action: "decline" };
+    }
+
+    const channel = this.getChannel(target.channelName);
+    if (!channel) {
+      log.warn({ key, channelName: target.channelName, server: request.serverName }, "MCP elicitation requested but channel is not connected");
+      return { action: "decline" };
+    }
+
+    if (request.mode === "url" && request.url) {
+      const lines = [
+        `MCP login required for ${request.serverName}.`,
+        request.message,
+        "",
+        request.url,
+        "",
+        "Open the link and finish login. If Tomo does not continue automatically, retry your request after login completes.",
+      ];
+      await channel.send({ chatId: target.chatId, text: lines.filter(Boolean).join("\n") });
+      log.info({ key, server: request.serverName }, "Forwarded MCP login URL to user");
+      return { action: "accept" };
+    }
+
+    await channel.send({
+      chatId: target.chatId,
+      text: `MCP server ${request.serverName} requested additional input, but Tomo can only forward browser login links right now.`,
+    });
+    log.warn({ key, server: request.serverName, mode: request.mode }, "Declined unsupported MCP elicitation");
+    return { action: "decline" };
+  }
+
+  private resolvePrivateReplyTarget(key: string): ReplyTarget | undefined {
+    if (key.startsWith("dm:")) {
+      return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(key.slice(3));
+    }
+
+    if (!isGroupSessionKey(key)) {
+      return this.parseChannelKey(key);
+    }
+
+    for (const identity of config.identities) {
+      const target = this.router.deriveReplyTargetFromConfig(identity.name);
+      if (target) return target;
+    }
+    return undefined;
+  }
+
+  private findPrivateReplyTarget(): ReplyTarget | undefined {
+    for (const [key] of this.sessions.listSdkSessionIds()) {
+      const target = this.resolvePrivateReplyTarget(key);
+      if (target) return target;
+    }
+
+    for (const identity of config.identities) {
+      const target = this.router.deriveReplyTargetFromConfig(identity.name);
+      if (target) return target;
+    }
+    return undefined;
   }
 
   private closeLiveSession(key: string): void {
@@ -693,7 +801,7 @@ export class Agent {
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
   ): Promise<string> {
     try {
-      const session = this.getOrCreateLiveSession(key);
+      const session = await this.getOrCreateLiveSession(key);
       const response = await session.send(prompt, onText, images, onBlockComplete, documents);
 
       // Capture session ID if new
@@ -761,7 +869,7 @@ export class Agent {
         this.closeLiveSession(key);
         this.sessions.clearSdkSessionId(key);
 
-        const session = this.getOrCreateLiveSession(key);
+        const session = await this.getOrCreateLiveSession(key);
         return session.send(prompt, onText, images, onBlockComplete, documents);
       }
 

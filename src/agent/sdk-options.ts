@@ -62,6 +62,7 @@ export function sdkOptions(
   model?: string,
   sessionContext?: SessionContext,
   turnBudget?: TurnBudget,
+  externalMcpServersOverride?: Record<string, McpServerConfig>,
 ) {
   const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
   let systemPrompt = buildSystemPrompt({ isGroup });
@@ -93,8 +94,11 @@ export function sdkOptions(
     systemPrompt += lines.join("\n");
   }
 
+  const configuredMcpServers = Object.fromEntries(
+    Object.entries(config.mcpServers ?? {}).map(([name, entry]) => [name, entry.server]),
+  ) as Record<string, McpServerConfig>;
   const externalMcpServers = Object.fromEntries(
-    Object.entries((config.mcpServers ?? {}) as Record<string, McpServerConfig>)
+    Object.entries(externalMcpServersOverride ?? configuredMcpServers)
       .filter(([name]) => name !== TOMO_INTERNAL_MCP_NAME),
   );
   const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];

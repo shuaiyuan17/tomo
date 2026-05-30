@@ -4,6 +4,20 @@ type Env = Record<string, string | undefined>;
 
 type RawMcpServer = Record<string, unknown>;
 
+export interface McpOAuthConfig {
+  authorizationServer?: string;
+  clientId?: string;
+  scopes: string[];
+  tokenStoreKey: string;
+  redirectUri?: string;
+  clientName?: string;
+}
+
+export interface ExternalMcpServerConfig {
+  server: McpServerConfig;
+  oauth?: McpOAuthConfig;
+}
+
 const SERVER_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const ENV_VAR_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
 
@@ -16,16 +30,19 @@ export function expandEnvVars(value: string, env: Env = process.env): string {
 export function parseExternalMcpServers(
   raw: unknown,
   env: Env = process.env,
-): Record<string, McpServerConfig> {
+): Record<string, ExternalMcpServerConfig> {
   if (!isRecord(raw)) return {};
 
-  const servers: Record<string, McpServerConfig> = {};
+  const servers: Record<string, ExternalMcpServerConfig> = {};
   for (const [name, value] of Object.entries(raw)) {
     if (!SERVER_NAME_RE.test(name) || !isRecord(value)) continue;
     if (value.enabled === false || value.disabled === true) continue;
 
-    const parsed = parseServer(value, env);
-    if (parsed) servers[name] = parsed;
+    const server = parseServer(value, env);
+    if (server) {
+      const oauth = parseOAuthConfig(value.oauth, name, env);
+      servers[name] = stripUndefined({ server, oauth }) as ExternalMcpServerConfig;
+    }
   }
   return servers;
 }
@@ -58,6 +75,36 @@ function parseServer(raw: RawMcpServer, env: Env): McpServerConfig | null {
   }
 
   return null;
+}
+
+function parseOAuthConfig(raw: unknown, serverName: string, env: Env): McpOAuthConfig | undefined {
+  if (!isRecord(raw)) return undefined;
+  const scopes = Array.isArray(raw.scopes)
+    ? raw.scopes.map(String).map((s) => s.trim()).filter(Boolean)
+    : typeof raw.scopes === "string"
+      ? raw.scopes.split(/\s+/).map((s) => s.trim()).filter(Boolean)
+      : [];
+
+  const tokenStoreKey = typeof raw.tokenStoreKey === "string" && raw.tokenStoreKey.trim()
+    ? raw.tokenStoreKey.trim()
+    : serverName;
+
+  return stripUndefined({
+    authorizationServer: typeof raw.authorizationServer === "string" && raw.authorizationServer.trim()
+      ? expandEnvVars(raw.authorizationServer.trim(), env)
+      : undefined,
+    clientId: typeof raw.clientId === "string" && raw.clientId.trim()
+      ? expandEnvVars(raw.clientId.trim(), env)
+      : undefined,
+    scopes,
+    tokenStoreKey,
+    redirectUri: typeof raw.redirectUri === "string" && raw.redirectUri.trim()
+      ? expandEnvVars(raw.redirectUri.trim(), env)
+      : undefined,
+    clientName: typeof raw.clientName === "string" && raw.clientName.trim()
+      ? raw.clientName.trim()
+      : "Tomo",
+  }) as McpOAuthConfig;
 }
 
 function parseStringRecord(raw: unknown, env: Env): Record<string, string> | undefined {

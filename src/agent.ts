@@ -8,6 +8,7 @@ import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import { isGroupSessionKey } from "./lcm/blocks.js";
 import { IdentityRouter } from "./router.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
+import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
 import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
@@ -47,11 +48,13 @@ export class Agent {
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   private restoringConfig = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
+  private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
     this.internalMcpServer = createTomoInternalMcpServer(this);
+    this.mcpOAuthManager = new McpOAuthManager({ workspaceDir: config.workspaceDir });
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -345,7 +348,7 @@ export class Agent {
     }
   }
 
-  private getOrCreateLiveSession(key: string): LiveSession {
+  private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
     let session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
 
@@ -363,17 +366,39 @@ export class Agent {
     const resumeId = this.sessions.getSdkSessionId(key);
     const model = this.modelOverrides.get(key);
     const turnBudget = makeTurnBudget();
+    const externalMcpServers = await this.mcpOAuthManager.buildServersWithAuth(
+      config.mcpServers ?? {},
+      (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
+    );
     const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.buildGroupContext(key),
       onMcpElicitation: (request) => this.handleMcpElicitation(key, request),
-    }, turnBudget);
+    }, turnBudget, externalMcpServers);
 
     session = new LiveSession(opts, key, turnBudget);
     this.liveSessions.set(key, session);
     log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
     return session;
+  }
+
+  private async forwardMcpAuthorizeUrl(key: string, serverName: string, url: string): Promise<void> {
+    const target = this.resolvePrivateReplyTarget(key);
+    if (!target) throw new Error(`No private reply target is available for MCP OAuth login (${serverName})`);
+    const channel = this.getChannel(target.channelName);
+    if (!channel) throw new Error(`Channel "${target.channelName}" is not connected for MCP OAuth login (${serverName})`);
+
+    await channel.send({
+      chatId: target.chatId,
+      text: [
+        `MCP login required for ${serverName}.`,
+        "",
+        url,
+        "",
+        "Open the link and finish login. Tomo will continue after the browser callback completes.",
+      ].join("\n"),
+    });
   }
 
   private async handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult> {
@@ -745,7 +770,7 @@ export class Agent {
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
   ): Promise<string> {
     try {
-      const session = this.getOrCreateLiveSession(key);
+      const session = await this.getOrCreateLiveSession(key);
       const response = await session.send(prompt, onText, images, onBlockComplete, documents);
 
       // Capture session ID if new
@@ -813,7 +838,7 @@ export class Agent {
         this.closeLiveSession(key);
         this.sessions.clearSdkSessionId(key);
 
-        const session = this.getOrCreateLiveSession(key);
+        const session = await this.getOrCreateLiveSession(key);
         return session.send(prompt, onText, images, onBlockComplete, documents);
       }
 

@@ -137,6 +137,14 @@ Add remote or local MCP servers directly to `~/.tomo/config.json` under `mcpServ
         "Authorization": "Bearer ${GITHUB_TOKEN}"
       }
     },
+    "github-copilot": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "oauth": {
+        "scopes": ["read:user"],
+        "tokenStoreKey": "github-copilot"
+      }
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
@@ -147,7 +155,9 @@ Add remote or local MCP servers directly to `~/.tomo/config.json` under `mcpServ
 
 Use `type: "http"` for streamable HTTP, `type: "sse"` for SSE, or omit `type` for stdio servers. Environment variables in `url`, `headers`, `env`, and `args` are expanded at runtime. To restrict auto-approval, set top-level `mcpAllowedTools`, for example `["mcp__github__list_issues"]`.
 
-If a remote MCP server requests browser-based login, Tomo forwards the login link to your private chat and accepts the SDK elicitation so the server can complete the flow.
+Remote HTTP/SSE servers can also use harness-managed OAuth by adding an `oauth` block. Tomo discovers the authorization server from the MCP server's RFC 9728 `WWW-Authenticate` challenge unless `authorizationServer` is set explicitly, uses authorization-code + PKCE, registers a dynamic client when needed, stores tokens in `~/.tomo/workspace/secrets/keychain.json` with mode `0600`, silently refreshes near-expiry tokens, and injects `Authorization: Bearer <token>` into MCP headers. The agent never sees the tokens.
+
+If browser login is needed, Tomo forwards the authorize URL to your private chat and waits for the localhost callback before starting the agent session.
 
 ### Scheduled Tasks
 

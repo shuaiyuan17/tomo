@@ -1,8 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import { parseExternalMcpServers } from "./mcp/external-config.js";
+import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -58,7 +57,7 @@ interface TomoConfig {
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
   /** External MCP servers from ~/.tomo/config.json. */
-  mcpServers: Record<string, McpServerConfig>;
+  mcpServers: Record<string, ExternalMcpServerConfig>;
   /** MCP tool allowlist entries for external servers. Defaults to mcp__<server>__* for each server. */
   mcpAllowedTools: string[];
   lcm: LcmConfig;

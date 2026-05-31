@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { log } from "../logger.js";
+import type { SessionMessage } from "./types.js";
 import { getSdkSessionPath } from "./store.js";
 
 const EMPTY_TEXT_PLACEHOLDER = "[empty text block repaired by Tomo]";
@@ -9,19 +10,23 @@ export interface SdkSessionRepairResult {
   repaired: boolean;
   changedEvents: number;
   changedBlocks: number;
+  transcriptFilled: number;
+  placeholderFilled: number;
   error?: string;
 }
 
-export function repairSdkSessionForResume(sessionId: string): SdkSessionRepairResult {
-  return repairSdkSessionFile(getSdkSessionPath(sessionId));
+export function repairSdkSessionForResume(sessionId: string, transcript?: SessionMessage[]): SdkSessionRepairResult {
+  return repairSdkSessionFile(getSdkSessionPath(sessionId), transcript);
 }
 
-export function repairSdkSessionFile(path: string): SdkSessionRepairResult {
+export function repairSdkSessionFile(path: string, transcript: SessionMessage[] = []): SdkSessionRepairResult {
   const result: SdkSessionRepairResult = {
     path,
     repaired: false,
     changedEvents: 0,
     changedBlocks: 0,
+    transcriptFilled: 0,
+    placeholderFilled: 0,
   };
   if (!existsSync(path)) return result;
 
@@ -32,6 +37,10 @@ export function repairSdkSessionFile(path: string): SdkSessionRepairResult {
   const lines = raw.split("\n");
   if (trailingNewline) lines.pop();
 
+  const assistantTranscript = transcript
+    .filter((m) => m.role === "assistant" && m.content.trim())
+    .sort((a, b) => a.timestamp - b.timestamp);
+  let transcriptCursor = 0;
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -48,10 +57,18 @@ export function repairSdkSessionFile(path: string): SdkSessionRepairResult {
       return result;
     }
 
-    const changed = repairSdkEvent(event);
+    const replacement = chooseTranscriptReplacement(event, assistantTranscript, transcriptCursor);
+    if (replacement) transcriptCursor = replacement.nextCursor;
+
+    const changed = repairSdkEvent(event, replacement?.text);
     if (changed > 0) {
       result.changedEvents++;
       result.changedBlocks += changed;
+      if (replacement) {
+        result.transcriptFilled++;
+      } else {
+        result.placeholderFilled++;
+      }
     }
     out.push(JSON.stringify(event));
   }
@@ -68,14 +85,14 @@ export function repairSdkSessionFile(path: string): SdkSessionRepairResult {
   return result;
 }
 
-function repairSdkEvent(event: unknown): number {
+function repairSdkEvent(event: unknown, replacementText?: string): number {
   if (!isRecord(event)) return 0;
   const message = event.message;
   if (!isRecord(message)) return 0;
 
   const content = message.content;
   if (Array.isArray(content)) {
-    const repaired = repairContentArray(content);
+    const repaired = repairContentArray(content, replacementText);
     if (repaired.changedBlocks > 0) {
       message.content = repaired.content;
     }
@@ -83,20 +100,23 @@ function repairSdkEvent(event: unknown): number {
   }
 
   if (content === "") {
-    message.content = EMPTY_TEXT_PLACEHOLDER;
+    message.content = replacementText ?? EMPTY_TEXT_PLACEHOLDER;
     return 1;
   }
 
   return 0;
 }
 
-function repairContentArray(content: unknown[]): { content: unknown[]; changedBlocks: number } {
+function repairContentArray(
+  content: unknown[],
+  replacementText?: string,
+): { content: unknown[]; changedBlocks: number } {
   let changedBlocks = 0;
   const repairedBlocks = content.map((block) => {
     if (!isRecord(block)) return block;
     const nested = block.content;
     if (Array.isArray(nested)) {
-      const repaired = repairContentArray(nested);
+      const repaired = repairContentArray(nested, replacementText);
       if (repaired.changedBlocks > 0) {
         block.content = repaired.content;
         changedBlocks += repaired.changedBlocks;
@@ -118,9 +138,35 @@ function repairContentArray(content: unknown[]): { content: unknown[]; changedBl
 
   const first = emptyTextBlocks[0];
   if (isRecord(first)) {
-    first.text = EMPTY_TEXT_PLACEHOLDER;
+    first.text = replacementText ?? EMPTY_TEXT_PLACEHOLDER;
   }
   return { content: [first], changedBlocks };
+}
+
+function chooseTranscriptReplacement(
+  event: unknown,
+  assistantTranscript: SessionMessage[],
+  cursor: number,
+): { text: string; nextCursor: number } | null {
+  if (!isRecord(event) || event.type !== "assistant") return null;
+  const timestamp = typeof event.timestamp === "string" ? Date.parse(event.timestamp) : NaN;
+  if (!Number.isFinite(timestamp)) return null;
+
+  let bestIdx = -1;
+  let bestDelta = Number.POSITIVE_INFINITY;
+  const windowMs = 120_000;
+  for (let i = cursor; i < assistantTranscript.length; i++) {
+    const msg = assistantTranscript[i];
+    const delta = Math.abs(msg.timestamp - timestamp);
+    if (delta < bestDelta) {
+      bestIdx = i;
+      bestDelta = delta;
+    }
+    if (msg.timestamp > timestamp + windowMs) break;
+  }
+
+  if (bestIdx === -1 || bestDelta > windowMs) return null;
+  return { text: assistantTranscript[bestIdx].content, nextCursor: bestIdx + 1 };
 }
 
 function isEmptyTextBlock(value: unknown): boolean {
@@ -130,4 +176,3 @@ function isEmptyTextBlock(value: unknown): boolean {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-

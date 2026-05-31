@@ -376,7 +376,7 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     if (resumeId) {
-      const repair = repairSdkSessionForResume(resumeId);
+      const repair = repairSdkSessionForResume(resumeId, this.sessions.get(key).messages);
       if (repair.error) {
         log.warn({ key, sessionId: resumeId, error: repair.error }, "Could not repair SDK session before resume");
       }

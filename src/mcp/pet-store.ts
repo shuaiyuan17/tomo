@@ -7,6 +7,7 @@ const DEFAULT_PET_PATH = path.join(os.homedir(), ".tomo", "data", "pet.json");
 export type PetStage = "egg" | "baby" | "child" | "teen" | "adult" | "elder";
 export type PetMood =
   | "sleeping"
+  | "recovering"
   | "blissful"
   | "happy"
   | "content"
@@ -26,6 +27,9 @@ export interface PetState {
   energy: number;
   health: number;
   affection: number;
+  care_mistakes: number;
+  last_care_mistake_at: string | null;
+  recovering: boolean;
   sleeping: boolean;
   sleep_until: string | null;
   last_tick: string;
@@ -33,14 +37,19 @@ export interface PetState {
 }
 
 const STAGE_ORDER: PetStage[] = ["egg", "baby", "child", "teen", "adult", "elder"];
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const RECOVERY_EXIT_HEALTH = 25;
+const CARE_MISTAKE_INTERVAL_MS = 6 * HOUR_MS;
+const CARE_MISTAKE_AFFECTION_PENALTY = 5;
 
 // Thresholds to reach this stage (affection points + minimum age)
 const STAGE_THRESHOLDS: Partial<Record<PetStage, { affection: number; ageMs: number }>> = {
-  baby:  { affection: 1,   ageMs: 0 },
-  child: { affection: 20,  ageMs: 1  * 24 * 60 * 60 * 1000 },
-  teen:  { affection: 60,  ageMs: 3  * 24 * 60 * 60 * 1000 },
-  adult: { affection: 150, ageMs: 7  * 24 * 60 * 60 * 1000 },
-  elder: { affection: 0,   ageMs: 30 * 24 * 60 * 60 * 1000 },
+  baby:  { affection: 0,   ageMs: 1   * DAY_MS },
+  child: { affection: 20,  ageMs: 7   * DAY_MS },
+  teen:  { affection: 60,  ageMs: 14  * DAY_MS },
+  adult: { affection: 150, ageMs: 30  * DAY_MS },
+  elder: { affection: 600, ageMs: 180 * DAY_MS },
 };
 
 export class PetStore {
@@ -57,7 +66,8 @@ export class PetStore {
   load(): PetState | null {
     if (!this.exists()) return null;
     try {
-      return JSON.parse(fs.readFileSync(this.petPath, "utf-8")) as PetState;
+      const state = JSON.parse(fs.readFileSync(this.petPath, "utf-8")) as PetState;
+      return this.normalize(state);
     } catch {
       return null;
     }
@@ -74,16 +84,19 @@ export class PetStore {
       name,
       species,
       born_at: now,
-      stage: "baby",
-      hunger: 80,
+      stage: "egg",
+      hunger: 100,
       happiness: 70,
-      energy: 90,
+      energy: 100,
       health: 100,
-      affection: 1,
+      affection: 0,
+      care_mistakes: 0,
+      last_care_mistake_at: null,
+      recovering: false,
       sleeping: false,
       sleep_until: null,
       last_tick: now,
-      diary: [`${name} hatched!`],
+      diary: [`${name} appeared as a tiny egg.`],
     };
     this.save(state);
     return state;
@@ -97,11 +110,17 @@ export class PetStore {
   // 2. Starvation started mid-interval: health penalty only covers the time
   //    actually spent at hunger=0, not the full elapsed window.
   tick(state: PetState): PetState {
+    state = this.normalize(state);
     const now = Date.now();
     const last = new Date(state.last_tick).getTime();
     const elapsedHours = (now - last) / (1000 * 60 * 60);
 
-    if (elapsedHours < 0.1) return this.checkEvolution(state);
+    if (elapsedHours < 0.1) return this.checkEvolution(this.updateRecovery(state));
+
+    if (state.stage === "egg") {
+      state.last_tick = new Date().toISOString();
+      return this.checkEvolution(state);
+    }
 
     let awakeHours: number;
 
@@ -111,12 +130,14 @@ export class PetStore {
         const sleptHours = Math.max(0, (new Date(state.sleep_until).getTime() - last) / (1000 * 60 * 60));
         awakeHours = elapsedHours - sleptHours;
         state.energy = Math.min(100, state.energy + sleptHours * 15);
+        state = this.recoverHealth(state, sleptHours, 3);
         state.sleeping = false;
         state.sleep_until = null;
         state = this.addDiary(state, `${state.name} woke up refreshed.`);
       } else {
         // Still sleeping for the entire interval.
         state.energy = Math.min(100, state.energy + elapsedHours * 15);
+        state = this.recoverHealth(state, elapsedHours, 3);
         awakeHours = 0;
       }
     } else {
@@ -138,16 +159,21 @@ export class PetStore {
       if (starvingHours > 0) {
         state.health = Math.max(0, state.health - starvingHours * 8);
       } else if (state.hunger > 60 && state.health < 100) {
-        state.health = Math.min(100, state.health + awakeHours * 2);
+        state = this.recoverHealth(state, awakeHours, 2);
       }
     }
 
+    state = this.updateRecovery(state);
+    state = this.updateCareMistakes(state, now);
     state.last_tick = new Date().toISOString();
     return this.checkEvolution(state);
   }
 
   // Check whether the pet qualifies for the next stage and apply if so.
   checkEvolution(state: PetState): PetState {
+    state = this.normalize(state);
+    if (state.recovering) return state;
+
     const currentIdx = STAGE_ORDER.indexOf(state.stage);
     if (currentIdx >= STAGE_ORDER.length - 1) return state;
 
@@ -156,15 +182,21 @@ export class PetStore {
     if (!threshold) return state;
 
     const ageMs = Date.now() - new Date(state.born_at).getTime();
-    if (state.affection >= threshold.affection && ageMs >= threshold.ageMs) {
+    const effectiveAffection = this.effectiveAffection(state);
+    if (effectiveAffection >= threshold.affection && ageMs >= threshold.ageMs) {
       state.stage = nextStage;
-      state = this.addDiary(state, `✨ ${state.name} evolved into a ${nextStage}!`);
+      const entry = nextStage === "baby"
+        ? `${state.name} hatched into a baby ${state.species}!`
+        : `✨ ${state.name} evolved into a ${nextStage}!`;
+      state = this.addDiary(state, entry);
     }
     return state;
   }
 
   computeMood(state: PetState): PetMood {
+    state = this.normalize(state);
     if (state.sleeping) return "sleeping";
+    if (state.recovering) return "recovering";
     if (state.health < 40) return "sick";
     if (state.hunger < 20) return "hungry";
     const score =
@@ -182,6 +214,70 @@ export class PetStore {
 
   addDiary(state: PetState, entry: string): PetState {
     state.diary = [entry, ...state.diary].slice(0, 10);
+    return state;
+  }
+
+  effectiveAffection(state: PetState): number {
+    state = this.normalize(state);
+    return Math.max(0, state.affection - state.care_mistakes * CARE_MISTAKE_AFFECTION_PENALTY);
+  }
+
+  private normalize(state: PetState): PetState {
+    return {
+      ...state,
+      care_mistakes: state.care_mistakes ?? 0,
+      last_care_mistake_at: state.last_care_mistake_at ?? null,
+      recovering: state.recovering ?? state.health <= 0,
+    };
+  }
+
+  private recoverHealth(state: PetState, hours: number, rate: number): PetState {
+    if (hours > 0 && state.hunger > 60 && state.health < 100) {
+      state.health = Math.min(100, state.health + hours * rate);
+    }
+    return state;
+  }
+
+  private updateRecovery(state: PetState): PetState {
+    if (state.health <= 0 && !state.recovering) {
+      state.recovering = true;
+      state.care_mistakes += 3;
+      state.last_care_mistake_at = new Date().toISOString();
+      return this.addDiary(state, `${state.name} collapsed and needs recovery care.`);
+    }
+
+    if (state.recovering && state.health >= RECOVERY_EXIT_HEALTH) {
+      state.recovering = false;
+      state.last_care_mistake_at = new Date().toISOString();
+      return this.addDiary(state, `${state.name} is out of recovery.`);
+    }
+
+    return state;
+  }
+
+  private updateCareMistakes(state: PetState, nowMs: number): PetState {
+    if (state.stage === "egg" || state.recovering || state.sleeping) return state;
+
+    const neglected =
+      state.hunger < 20 ||
+      state.happiness < 20 ||
+      state.energy < 10 ||
+      state.health < 40;
+
+    if (!neglected) {
+      state.last_care_mistake_at = null;
+      return state;
+    }
+
+    const lastMistake = state.last_care_mistake_at
+      ? new Date(state.last_care_mistake_at).getTime()
+      : 0;
+    if (!lastMistake || nowMs - lastMistake >= CARE_MISTAKE_INTERVAL_MS) {
+      state.care_mistakes += 1;
+      state.last_care_mistake_at = new Date(nowMs).toISOString();
+      return this.addDiary(state, `${state.name} needed care and was left waiting.`);
+    }
+
     return state;
   }
 }

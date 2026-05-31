@@ -61,7 +61,10 @@ export function buildPetTools(petPath?: string) {
                 energy:    Math.round(state.energy),
                 health:    Math.round(state.health),
                 affection: state.affection,
+                effective_affection: store.effectiveAffection(state),
+                care_mistakes: state.care_mistakes,
               },
+              recovering: state.recovering,
               sleeping: state.sleeping,
               sleep_until: state.sleep_until,
               recent_diary: state.diary.slice(0, 3),
@@ -84,7 +87,7 @@ export function buildPetTools(petPath?: string) {
       {
         name: z.string().min(1).max(30).describe("The pet's name."),
         species: z.string().max(50).optional().describe(
-          "Optional species (e.g. 'cloud fox', 'pixel rabbit', 'tiny dragon'). Defaults to 'mystery creature'.",
+          "Optional species (e.g. 'cloud companion', 'pixel spirit', 'tiny dragon'). Defaults to 'mystery creature'.",
         ),
       },
       async ({ name, species }) => {
@@ -93,7 +96,7 @@ export function buildPetTools(petPath?: string) {
         return {
           content: [{
             type: "text" as const,
-            text: `${name} the ${state.species} has hatched! Say hello to your new companion.`,
+            text: `${name} the ${state.species} appeared as an egg. Keep an eye on them while they incubate.`,
           }],
         };
       },
@@ -109,7 +112,7 @@ export function buildPetTools(petPath?: string) {
         "",
         "Restores hunger and gives a small happiness boost.",
         "Pass treat=true for a bigger happiness boost (costs some energy).",
-        "Best when hunger is below 50. Overfeeding above 90 has no extra effect.",
+        "Only gives affection when hunger is below 50. Overfeeding above 90 has no extra effect.",
       ].join("\n"),
       {
         treat: z.boolean().optional().describe(
@@ -129,7 +132,18 @@ export function buildPetTools(petPath?: string) {
 
         state = store.tick(state);
 
+        if (state.stage === "egg") {
+          store.save(state);
+          return {
+            content: [{
+              type: "text" as const,
+              text: `${state.name} is still an egg. They do not need food yet.`,
+            }],
+          };
+        }
+
         if (state.sleeping) {
+          store.save(state);
           return {
             content: [{
               type: "text" as const,
@@ -138,11 +152,31 @@ export function buildPetTools(petPath?: string) {
           };
         }
 
+        if (state.hunger >= 90) {
+          const entry = `${state.name} was already full and ignored the food.`;
+          state = store.addDiary(state, entry);
+          store.save(state);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                event: "too full",
+                hunger:    Math.round(state.hunger),
+                happiness: Math.round(state.happiness),
+                affection: state.affection,
+                mood:      store.computeMood(state),
+                diary:     entry,
+              }, null, 2),
+            }],
+          };
+        }
+
         const wasHungry = state.hunger < 30;
+        const earnsAffection = !state.recovering && state.hunger < 50;
         state.hunger    = Math.min(100, state.hunger    + (treat ? 15 : 25));
         state.happiness = Math.min(100, state.happiness + (treat ? 15 : 5));
         if (treat) state.energy = Math.max(0, state.energy - 5);
-        state.affection += 1;
+        if (earnsAffection) state.affection += 1;
 
         const entry = treat
           ? `${state.name} gobbled up a treat with delight!`
@@ -160,6 +194,8 @@ export function buildPetTools(petPath?: string) {
               event: treat ? "fed (treat)" : "fed",
               hunger:    Math.round(state.hunger),
               happiness: Math.round(state.happiness),
+              affection: state.affection,
+              recovering: state.recovering,
               mood:      store.computeMood(state),
               diary:     entry,
             }, null, 2),
@@ -200,13 +236,35 @@ export function buildPetTools(petPath?: string) {
 
         state = store.tick(state);
 
+        if (state.stage === "egg") {
+          store.save(state);
+          return {
+            content: [{
+              type: "text" as const,
+              text: `${state.name} is still an egg. Play can start after they hatch.`,
+            }],
+          };
+        }
+
+        if (state.recovering) {
+          store.save(state);
+          return {
+            content: [{
+              type: "text" as const,
+              text: `${state.name} is recovering and cannot play yet. Feed them when hungry and let them rest.`,
+            }],
+          };
+        }
+
         if (state.sleeping) {
+          store.save(state);
           return {
             content: [{ type: "text" as const, text: `${state.name} is sleeping. Let them rest.` }],
           };
         }
 
         if (state.energy < 15) {
+          store.save(state);
           return {
             content: [{
               type: "text" as const,
@@ -275,8 +333,16 @@ export function buildPetTools(petPath?: string) {
 
         state = store.tick(state);
 
+        if (state.stage === "egg") {
+          store.save(state);
+          return {
+            content: [{ type: "text" as const, text: `${state.name} is still incubating.` }],
+          };
+        }
+
         if (action === "sleep") {
           if (state.sleeping) {
+            store.save(state);
             return {
               content: [{ type: "text" as const, text: `${state.name} is already sleeping.` }],
             };
@@ -294,6 +360,7 @@ export function buildPetTools(petPath?: string) {
           };
         } else {
           if (!state.sleeping) {
+            store.save(state);
             return {
               content: [{ type: "text" as const, text: `${state.name} is already awake.` }],
             };

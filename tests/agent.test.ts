@@ -3,6 +3,7 @@ import { normalizeSendTarget } from "../src/agent/send-target.js";
 import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+  inferLiteLlmMode,
   isChatGptSubscriptionModel,
   liteLlmModeLabel,
   parseLiteLlmMode,
@@ -255,6 +256,12 @@ describe("LiteLLM helpers", () => {
     expect(parseLiteLlmMode("chatgpt")).toBe("chatgpt-subscription");
     expect(parseLiteLlmMode("openai-subscription")).toBe("chatgpt-subscription");
     expect(liteLlmModeLabel("chatgpt-subscription")).toBe("ChatGPT subscription");
+  });
+
+  it("infers ChatGPT subscription mode for old chatgpt/* gateway configs", () => {
+    expect(inferLiteLlmMode(undefined, CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe("chatgpt-subscription");
+    expect(inferLiteLlmMode(undefined, "claude-sonnet-4-6[1m]")).toBe("anthropic-compatible");
+    expect(inferLiteLlmMode("anthropic-compatible", CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe("anthropic-compatible");
   });
 
   it("detects ChatGPT subscription model names", () => {

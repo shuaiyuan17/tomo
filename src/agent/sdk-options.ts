@@ -189,6 +189,11 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
     if (litellm.apiKey) {
       env.ANTHROPIC_API_KEY = litellm.apiKey;
     }
+  } else {
+    // If the parent daemon was started with ANTHROPIC_BASE_URL pointing at
+    // LiteLLM, a deliberate chatgpt-subscription bypass must scrub it so Claude
+    // models really go to Anthropic direct.
+    delete env.ANTHROPIC_BASE_URL;
   }
   if (args.disableAutoCompact) {
     env.DISABLE_AUTO_COMPACT = "1";

@@ -15,6 +15,12 @@ export function parseLiteLlmMode(raw: unknown): LiteLlmMode {
   return DEFAULT_LITELLM_MODE;
 }
 
+export function inferLiteLlmMode(raw: unknown, defaultModel: string): LiteLlmMode {
+  const explicit = String(raw ?? "").trim();
+  if (explicit) return parseLiteLlmMode(explicit);
+  return isChatGptSubscriptionModel(defaultModel) ? CHATGPT_SUBSCRIPTION_MODE : DEFAULT_LITELLM_MODE;
+}
+
 export function liteLlmModeLabel(mode: LiteLlmMode): string {
   return mode === CHATGPT_SUBSCRIPTION_MODE
     ? "ChatGPT subscription"
@@ -24,4 +30,3 @@ export function liteLlmModeLabel(mode: LiteLlmMode): string {
 export function isChatGptSubscriptionModel(model: string): boolean {
   return /^chatgpt\//i.test(model.trim());
 }
-

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
-import { DEFAULT_LITELLM_MODE, parseLiteLlmMode, type LiteLlmMode } from "./litellm.js";
+import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -75,13 +75,13 @@ interface TomoConfig {
   lcm: LcmConfig;
 }
 
-function parseLiteLlmConfig(raw: unknown): LiteLlmConfig | null {
+function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
   const r = (raw ?? {}) as Record<string, unknown>;
   const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? r.baseUrl ?? "").trim();
   if (!baseUrl) return null;
 
   return {
-    mode: parseLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? r.mode ?? DEFAULT_LITELLM_MODE),
+    mode: inferLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? r.mode, defaultModel),
     baseUrl,
     apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? r.apiKey ?? "").trim(),
   };
@@ -187,9 +187,11 @@ function buildConfig(): TomoConfig {
       replyPolicy: id.replyPolicy ?? "last-active",
     }));
 
+  const model = (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string;
+
   return {
     telegramToken,
-    model: (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string,
+    model,
     workspaceDir: process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace"),
     sessionsDir: process.env.SESSIONS_DIR ?? join(TOMO_HOME, "data", "sessions"),
     historyLimit: Number(process.env.HISTORY_LIMIT ?? "20"),
@@ -207,7 +209,7 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
-    litellm: parseLiteLlmConfig(file.litellm),
+    litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,
     lcm: parseLcmConfig(file.lcm),

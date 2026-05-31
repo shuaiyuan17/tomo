@@ -1104,31 +1104,41 @@ describe("chat commands", () => {
   });
 
   it("bypasses a chatgpt-subscription gateway for a Claude-model session", async () => {
-    resetConfig({
-      // Gateway only serves chatgpt/*, but this session resolves to a Claude model
-      // (default config.model) — it must hit Anthropic directly, not the proxy.
-      model: "claude-sonnet-4-6[1m]",
-      litellm: {
-        mode: "chatgpt-subscription",
-        baseUrl: "http://localhost:4000",
-        apiKey: "sk-litellm-test",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
+    const oldBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    process.env.ANTHROPIC_BASE_URL = "http://localhost:4000";
+    let agent: InstanceType<typeof Agent> | null = null;
+    try {
+      resetConfig({
+        // Gateway only serves chatgpt/*, but this session resolves to a Claude model
+        // (default config.model) — it must hit Anthropic directly, not the proxy.
+        model: "claude-sonnet-4-6[1m]",
+        litellm: {
+          mode: "chatgpt-subscription",
+          baseUrl: "http://localhost:4000",
+          apiKey: "sk-litellm-test",
+        },
+      });
+      agent = new Agent();
+      const tg = new MockChannel("telegram");
+      agent.addChannel(tg);
 
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+      await drainQueue(agent);
 
-    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as {
-      options?: { env?: Record<string, string | undefined> };
-    };
-    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
-    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe(process.env.ANTHROPIC_API_KEY);
-
-    await agent.stop();
+      const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+      const lastCall = calls[calls.length - 1]?.[0] as {
+        options?: { env?: Record<string, string | undefined> };
+      };
+      expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+      expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe(process.env.ANTHROPIC_API_KEY);
+    } finally {
+      if (oldBaseUrl === undefined) {
+        delete process.env.ANTHROPIC_BASE_URL;
+      } else {
+        process.env.ANTHROPIC_BASE_URL = oldBaseUrl;
+      }
+      await agent?.stop();
+    }
   });
 
   it("surfaces the resolved Claude model in the system prompt", async () => {

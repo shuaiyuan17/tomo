@@ -4,7 +4,7 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
-import { isLiteLlmProviderModel } from "../models.js";
+import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { CHATGPT_SUBSCRIPTION_MODE } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 
@@ -106,6 +106,16 @@ export function sdkOptions(
   const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
   const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
   const effectiveModel = model ?? config.model;
+
+  // Tell the agent which model is actually serving this session. A model can't
+  // reliably introspect its own identity, so surface it as a fact in the prompt
+  // rather than leaving the agent to guess. Reassembled every turn, so a /model
+  // switch (or a gateway re-route) is reflected on the next turn.
+  const resolvedModel = resolveModelName(effectiveModel) ?? effectiveModel;
+  const resolvedLabel = modelLabel(resolvedModel);
+  const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
+  systemPrompt += `\n\n# RUNTIME — Current Model\nYou are currently running on: ${modelDisplay}. This is the real model serving this session right now — trust it over any introspective guess about which model you are.`;
+
   const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact, model: effectiveModel });
 
   return {

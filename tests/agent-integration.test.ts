@@ -1131,6 +1131,47 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("surfaces the resolved Claude model in the system prompt", async () => {
+    resetConfig({ model: "sonnet" });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
+    expect(lastCall.options?.systemPrompt).toContain("# RUNTIME — Current Model");
+    // alias "sonnet" must be resolved to its concrete id, not echoed raw
+    expect(lastCall.options?.systemPrompt).toContain("claude-sonnet-4-6");
+
+    await agent.stop();
+  });
+
+  it("surfaces a LiteLLM gateway model in the system prompt", async () => {
+    resetConfig({
+      model: "chatgpt/gpt-5.5",
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
+    expect(lastCall.options?.systemPrompt).toContain("chatgpt/gpt-5.5");
+
+    await agent.stop();
+  });
+
   it("/status shows LiteLLM gateway mode", async () => {
     resetConfig({
       litellm: {

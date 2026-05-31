@@ -14,7 +14,7 @@ import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
-import { MODEL_ALIASES, modelHelpText, resolveModelName } from "./models.js";
+import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "./models.js";
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, liteLlmModeLabel } from "./litellm.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -279,8 +279,10 @@ export class Agent {
           const marker = fullName === current ? " (active)" : "";
           lines.push(`  ${shortName} — ${fullName}${marker}`);
         }
-        lines.push("");
-        lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
+        if (config.litellm?.baseUrl) {
+          lines.push("");
+          lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
+        }
         await channel.send({ chatId, text: lines.join("\n") });
         return;
       }
@@ -288,6 +290,13 @@ export class Agent {
       const resolved = resolveModelName(arg);
       if (!resolved) {
         await channel.send({ chatId, text: `Unknown model "${arg}". Use ${modelHelpText()}.` });
+        return;
+      }
+      if (isLiteLlmProviderModel(resolved) && !config.litellm?.baseUrl) {
+        await channel.send({
+          chatId,
+          text: `"${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
+        });
         return;
       }
       this.modelOverrides.set(key, resolved);

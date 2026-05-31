@@ -1077,6 +1077,60 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("routes a chatgpt-subscription gateway when the model is a LiteLLM model", async () => {
+    resetConfig({
+      model: "chatgpt/gpt-5.5",
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("bypasses a chatgpt-subscription gateway for a Claude-model session", async () => {
+    resetConfig({
+      // Gateway only serves chatgpt/*, but this session resolves to a Claude model
+      // (default config.model) — it must hit Anthropic directly, not the proxy.
+      model: "claude-sonnet-4-6[1m]",
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe(process.env.ANTHROPIC_API_KEY);
+
+    await agent.stop();
+  });
+
   it("/status shows LiteLLM gateway mode", async () => {
     resetConfig({
       litellm: {
@@ -1142,7 +1196,14 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/model accepts LiteLLM provider/model names", async () => {
+  it("/model accepts LiteLLM provider/model names when a gateway is configured", async () => {
+    resetConfig({
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1157,6 +1218,25 @@ describe("chat commands", () => {
       sessionModelOverrides?: Record<string, string>;
     };
     expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("chatgpt/gpt-5.5");
+
+    await agent.stop();
+  });
+
+  it("/model rejects LiteLLM provider/model names without a gateway and does not write config", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("needs a LiteLLM gateway");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides).toBeUndefined();
 
     await agent.stop();
   });

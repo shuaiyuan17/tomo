@@ -4,6 +4,8 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
+import { isLiteLlmProviderModel } from "../models.js";
+import { CHATGPT_SUBSCRIPTION_MODE } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -103,10 +105,11 @@ export function sdkOptions(
   );
   const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
   const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
-  const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact });
+  const effectiveModel = model ?? config.model;
+  const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact, model: effectiveModel });
 
   return {
-    model: model ?? config.model,
+    model: effectiveModel,
     cwd: config.workspaceDir,
     systemPrompt,
     permissionMode: "bypassPermissions" as const,
@@ -155,17 +158,26 @@ export function sdkOptions(
   };
 }
 
-function buildSdkEnv(args: { disableAutoCompact: boolean }): NodeJS.ProcessEnv | null {
-  if (!args.disableAutoCompact && !config.litellm?.baseUrl) return null;
+function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): NodeJS.ProcessEnv | null {
+  // Decide whether this session routes through the LiteLLM proxy. A generic
+  // anthropic-compatible proxy forwards every model (that's its purpose), so it
+  // routes all sessions. A chatgpt-subscription proxy only serves its LiteLLM
+  // provider/model (e.g. chatgpt/gpt-5.5), so a Claude-model session — such as a
+  // leftover per-session "opus" override — must bypass it and hit Anthropic
+  // directly rather than be sent to a proxy that can't serve Claude.
+  const litellm = config.litellm;
+  const useGateway = Boolean(litellm?.baseUrl)
+    && (litellm!.mode !== CHATGPT_SUBSCRIPTION_MODE || isLiteLlmProviderModel(args.model));
+  if (!args.disableAutoCompact && !useGateway) return null;
 
   // Note: SDK `env` fully replaces the child's env (not merged despite the
   // d.ts claim), so we must spread process.env ourselves — otherwise the
   // child CLI spawns with an empty env and fails to locate its runtime.
   const env: NodeJS.ProcessEnv = { ...process.env };
-  if (config.litellm?.baseUrl) {
-    env.ANTHROPIC_BASE_URL = config.litellm.baseUrl;
-    if (config.litellm.apiKey) {
-      env.ANTHROPIC_API_KEY = config.litellm.apiKey;
+  if (useGateway && litellm) {
+    env.ANTHROPIC_BASE_URL = litellm.baseUrl;
+    if (litellm.apiKey) {
+      env.ANTHROPIC_API_KEY = litellm.apiKey;
     }
   }
   if (args.disableAutoCompact) {

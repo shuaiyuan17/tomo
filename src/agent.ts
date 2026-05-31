@@ -301,8 +301,11 @@ export class Agent {
       }
       this.modelOverrides.set(key, resolved);
       this.persistModelOverride(key, resolved);
-      // Model change requires new session (process uses one model)
+      // Model/provider changes are not safely resumable across SDK JSONL files.
+      // In particular, chatgpt/* LiteLLM transcripts can contain empty text
+      // blocks that Anthropic rejects when switching back to a Claude model.
       this.closeLiveSession(key);
+      this.sessions.clearSdkSessionId(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `Switched to ${resolved}` });
       return;

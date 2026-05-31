@@ -1228,6 +1228,24 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/model unlinks the active SDK session so provider switches do not resume incompatible JSONL", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    const store = (agent as unknown as { sessions: { getSdkSessionId(key: string): string | undefined } }).sessions;
+    expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
+
+    expect(tg.sent.at(-1)?.text).toBe("Switched to claude-opus-4-8[1m]");
+    expect(store.getSdkSessionId("telegram:12345")).toBeUndefined();
+
+    await agent.stop();
+  });
+
   it("/model accepts known full model IDs", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

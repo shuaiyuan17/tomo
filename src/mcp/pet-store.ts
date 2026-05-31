@@ -29,11 +29,19 @@ export interface PetState {
   affection: number;
   care_mistakes: number;
   last_care_mistake_at: string | null;
+  neglect_started_at: string | null;
   recovering: boolean;
   sleeping: boolean;
   sleep_until: string | null;
   last_tick: string;
   diary: string[];
+}
+
+interface CareStats {
+  hunger: number;
+  happiness: number;
+  energy: number;
+  health: number;
 }
 
 const STAGE_ORDER: PetStage[] = ["egg", "baby", "child", "teen", "adult", "elder"];
@@ -92,6 +100,7 @@ export class PetStore {
       affection: 0,
       care_mistakes: 0,
       last_care_mistake_at: null,
+      neglect_started_at: null,
       recovering: false,
       sleeping: false,
       sleep_until: null,
@@ -123,12 +132,16 @@ export class PetStore {
     }
 
     let awakeHours: number;
+    let awakeStartMs = last;
+    let careBefore: CareStats | null = null;
 
     if (state.sleeping) {
       if (state.sleep_until && now >= new Date(state.sleep_until).getTime()) {
         // Sleep expired during the interval — split into slept + awake portions.
-        const sleptHours = Math.max(0, (new Date(state.sleep_until).getTime() - last) / (1000 * 60 * 60));
-        awakeHours = elapsedHours - sleptHours;
+        const sleepUntilMs = new Date(state.sleep_until).getTime();
+        const sleptHours = Math.max(0, (sleepUntilMs - last) / (1000 * 60 * 60));
+        awakeHours = Math.max(0, elapsedHours - sleptHours);
+        awakeStartMs = Math.max(last, sleepUntilMs);
         state.energy = Math.min(100, state.energy + sleptHours * 15);
         state = this.recoverHealth(state, sleptHours, 3);
         state.sleeping = false;
@@ -145,6 +158,7 @@ export class PetStore {
     }
 
     if (awakeHours > 0) {
+      careBefore = this.careSnapshot(state);
       const hungerBefore = state.hunger;
       state.hunger    = Math.max(0, state.hunger    - awakeHours * 5);
       state.happiness = Math.max(0, state.happiness - awakeHours * 3);
@@ -164,7 +178,7 @@ export class PetStore {
     }
 
     state = this.updateRecovery(state);
-    state = this.updateCareMistakes(state, now);
+    state = this.updateCareMistakes(state, now, awakeStartMs, careBefore);
     state.last_tick = new Date().toISOString();
     return this.checkEvolution(state);
   }
@@ -227,6 +241,7 @@ export class PetStore {
       ...state,
       care_mistakes: state.care_mistakes ?? 0,
       last_care_mistake_at: state.last_care_mistake_at ?? null,
+      neglect_started_at: state.neglect_started_at ?? null,
       recovering: state.recovering ?? state.health <= 0,
     };
   }
@@ -243,41 +258,93 @@ export class PetStore {
       state.recovering = true;
       state.care_mistakes += 3;
       state.last_care_mistake_at = new Date().toISOString();
+      state.neglect_started_at = null;
       return this.addDiary(state, `${state.name} collapsed and needs recovery care.`);
     }
 
     if (state.recovering && state.health >= RECOVERY_EXIT_HEALTH) {
       state.recovering = false;
       state.last_care_mistake_at = new Date().toISOString();
+      state.neglect_started_at = null;
       return this.addDiary(state, `${state.name} is out of recovery.`);
     }
 
     return state;
   }
 
-  private updateCareMistakes(state: PetState, nowMs: number): PetState {
-    if (state.stage === "egg" || state.recovering || state.sleeping) return state;
-
-    const neglected =
-      state.hunger < 20 ||
-      state.happiness < 20 ||
-      state.energy < 10 ||
-      state.health < 40;
-
-    if (!neglected) {
-      state.last_care_mistake_at = null;
+  private updateCareMistakes(
+    state: PetState,
+    nowMs: number,
+    awakeStartMs: number,
+    before: CareStats | null,
+  ): PetState {
+    if (state.stage === "egg" || state.recovering || state.sleeping || !before) {
+      state.neglect_started_at = null;
       return state;
     }
 
+    const neglected = this.isNeglected(this.careSnapshot(state));
+
+    if (!neglected) {
+      state.neglect_started_at = null;
+      return state;
+    }
+
+    if (!state.neglect_started_at) {
+      const startedAt = this.estimateNeglectStartMs(before, awakeStartMs, nowMs);
+      state.neglect_started_at = new Date(startedAt).toISOString();
+    }
+
+    const neglectStartedAt = new Date(state.neglect_started_at).getTime();
     const lastMistake = state.last_care_mistake_at
       ? new Date(state.last_care_mistake_at).getTime()
-      : 0;
-    if (!lastMistake || nowMs - lastMistake >= CARE_MISTAKE_INTERVAL_MS) {
-      state.care_mistakes += 1;
-      state.last_care_mistake_at = new Date(nowMs).toISOString();
-      return this.addDiary(state, `${state.name} needed care and was left waiting.`);
+      : neglectStartedAt;
+    const windowStart = Math.max(neglectStartedAt, lastMistake);
+    const elapsedWindows = Math.floor((nowMs - windowStart) / CARE_MISTAKE_INTERVAL_MS);
+
+    if (elapsedWindows > 0) {
+      state.care_mistakes += elapsedWindows;
+      state.last_care_mistake_at = new Date(
+        windowStart + elapsedWindows * CARE_MISTAKE_INTERVAL_MS,
+      ).toISOString();
+
+      const entry = elapsedWindows === 1
+        ? `${state.name} needed care and was left waiting.`
+        : `${state.name} needed care through ${elapsedWindows} neglect windows.`;
+      return this.addDiary(state, entry);
     }
 
     return state;
+  }
+
+  private careSnapshot(state: PetState): CareStats {
+    return {
+      hunger: state.hunger,
+      happiness: state.happiness,
+      energy: state.energy,
+      health: state.health,
+    };
+  }
+
+  private isNeglected(stats: CareStats): boolean {
+    return (
+      stats.hunger < 20 ||
+      stats.happiness < 20 ||
+      stats.energy < 10 ||
+      stats.health < 40
+    );
+  }
+
+  private estimateNeglectStartMs(before: CareStats, awakeStartMs: number, nowMs: number): number {
+    if (this.isNeglected(before)) return awakeStartMs;
+
+    const hoursUntilNeglect = [
+      before.hunger <= 20 ? 0 : (before.hunger - 20) / 5,
+      before.happiness <= 20 ? 0 : (before.happiness - 20) / 3,
+      before.energy <= 10 ? 0 : (before.energy - 10) / 4,
+    ];
+
+    const earliestMs = awakeStartMs + Math.min(...hoursUntilNeglect) * HOUR_MS;
+    return Math.min(nowMs, earliestMs);
   }
 }

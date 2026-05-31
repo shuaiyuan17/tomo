@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
 import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
+import {
+  CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+  isChatGptSubscriptionModel,
+  liteLlmModeLabel,
+  parseLiteLlmMode,
+} from "../src/litellm.js";
 
 // Test the silent reply detection (extracted logic)
 function isSilentReply(text: string): boolean {
@@ -229,12 +235,31 @@ describe("model resolution", () => {
   });
 
   it("accepts LiteLLM provider/model names", () => {
-    expect(resolveModelName("chatgpt/gpt-5.3-codex")).toBe("chatgpt/gpt-5.3-codex");
+    expect(resolveModelName(CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe(CHATGPT_SUBSCRIPTION_DEFAULT_MODEL);
     expect(resolveModelName("openrouter/openai/gpt-4o-mini")).toBe("openrouter/openai/gpt-4o-mini");
   });
 
   it("rejects typo-like Claude names that are not gateway provider/model names", () => {
     expect(resolveModelName("claude-sonnet-4.7")).toBeNull();
+  });
+});
+
+describe("LiteLLM helpers", () => {
+  it("defaults to a generic Anthropic-compatible proxy mode", () => {
+    expect(parseLiteLlmMode(undefined)).toBe("anthropic-compatible");
+    expect(parseLiteLlmMode("custom")).toBe("anthropic-compatible");
+    expect(liteLlmModeLabel("anthropic-compatible")).toBe("Anthropic-compatible proxy");
+  });
+
+  it("accepts aliases for ChatGPT subscription mode", () => {
+    expect(parseLiteLlmMode("chatgpt")).toBe("chatgpt-subscription");
+    expect(parseLiteLlmMode("openai-subscription")).toBe("chatgpt-subscription");
+    expect(liteLlmModeLabel("chatgpt-subscription")).toBe("ChatGPT subscription");
+  });
+
+  it("detects ChatGPT subscription model names", () => {
+    expect(isChatGptSubscriptionModel(CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe(true);
+    expect(isChatGptSubscriptionModel("openrouter/openai/gpt-4o-mini")).toBe(false);
   });
 });
 

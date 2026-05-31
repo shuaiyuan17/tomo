@@ -39,6 +39,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
     "dm:alice": "claude-opus-4-8[1m]"
   },
   "litellm": {
+    "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",
     "apiKey": "sk-tomo-local"
   },
@@ -70,7 +71,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 
 | Field | Type | Allowed values / notes |
 |---|---|---|
-| `model` | string | Claude model IDs/aliases, or a LiteLLM `provider/model` name such as `chatgpt/gpt-5.3-codex`. Default model for every session. |
+| `model` | string | Claude model IDs/aliases, or a LiteLLM `provider/model` name such as `chatgpt/gpt-5.5`. Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
@@ -85,6 +86,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `identities[].channels` | object | `{ channelName: chatId }` — maps each channel the identity uses to its chatId. |
 | `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). Written by `/model <name>` for the current chat and by the `tomo config` Sessions menu. |
+| `litellm.mode` | string | Optional mode label. `"anthropic-compatible"` (default) is a generic proxy; `"chatgpt-subscription"` is the tested OpenAI/ChatGPT subscription path through LiteLLM. Also settable with `TOMO_LITELLM_MODE`. |
 | `litellm.baseUrl` | string | Optional LiteLLM proxy base URL, e.g. `http://localhost:4000`. When set, Tomo still uses Claude Agent SDK but sends SDK model calls to the proxy via `ANTHROPIC_BASE_URL`. |
 | `litellm.apiKey` | string | LiteLLM proxy key sent as `ANTHROPIC_API_KEY`. This is the proxy key, not an Anthropic key. For ChatGPT subscription models, LiteLLM owns the OAuth device flow and token storage. |
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
@@ -96,8 +98,33 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `lcm.groupCompactStyle` | string | `"sdk"` (default) or `"lcm"`. `"sdk"` lets the SDK auto-compact group sessions; `"lcm"` opts groups into the same hierarchical LCM flow as DMs (disables SDK auto-compact and fires all three harness nudges: 70% daily, 80% safety net, and the periodic rollup runner). DMs always use LCM regardless. |
 | `lcm.dailyFreshTail` | number | Number of most-recent raw user/assistant events kept outside today's daily rollup so mid-day compacts don't wipe warm short-term texture. Default `32`. Counts SDK events (one tool round = multiple events), not user-typed messages. Set to `0` to compact every event into today's block. Past days are always compacted in full regardless of this value. |
 
+## ChatGPT subscription via LiteLLM
+
+For `litellm.mode: "chatgpt-subscription"`, the matching LiteLLM proxy config should include:
+
+```yaml
+environment_variables:
+  CHATGPT_DEFAULT_INSTRUCTIONS: >-
+    Follow the instructions supplied in this request.
+
+model_list:
+  - model_name: chatgpt/gpt-5.5
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.5
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: sk-tomo-local
+```
+
+Start it with `litellm --config ~/litellm-chatgpt.yaml`, then set Tomo's model to `chatgpt/gpt-5.5`. If LiteLLM rejects system messages, use a build with ChatGPT system-role normalization. Tomo uses streaming Anthropic `/v1/messages`, so non-streaming LiteLLM test requests can still fail while Tomo works.
+
 ## Requirements and overrides
 
 - **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.url`. Startup fails otherwise.
-- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`.
+- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`.
 - `workspaceDir`, `sessionsDir`, `historyLimit` are env-only — they're not read from the JSON file.

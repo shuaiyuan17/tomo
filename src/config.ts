@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
+import { DEFAULT_LITELLM_MODE, parseLiteLlmMode, type LiteLlmMode } from "./litellm.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -30,6 +31,8 @@ export interface LcmConfig {
 }
 
 export interface LiteLlmConfig {
+  /** Gateway mode. ChatGPT mode documents the subscription/OAuth LiteLLM setup; runtime env wiring is the same. */
+  mode: LiteLlmMode;
   /** Base URL for a LiteLLM proxy exposing Anthropic-compatible endpoints. */
   baseUrl: string;
   /** Proxy API key sent as ANTHROPIC_API_KEY to the Claude Agent SDK child. */
@@ -78,6 +81,7 @@ function parseLiteLlmConfig(raw: unknown): LiteLlmConfig | null {
   if (!baseUrl) return null;
 
   return {
+    mode: parseLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? r.mode ?? DEFAULT_LITELLM_MODE),
     baseUrl,
     apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? r.apiKey ?? "").trim(),
   };

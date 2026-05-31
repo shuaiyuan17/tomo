@@ -15,6 +15,7 @@ import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
 import { MODEL_ALIASES, modelHelpText, resolveModelName } from "./models.js";
+import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, liteLlmModeLabel } from "./litellm.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -279,7 +280,7 @@ export class Agent {
           lines.push(`  ${shortName} — ${fullName}${marker}`);
         }
         lines.push("");
-        lines.push("LiteLLM gateway models are also accepted, e.g. chatgpt/gpt-5.3-codex");
+        lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
         await channel.send({ chatId, text: lines.join("\n") });
         return;
       }
@@ -313,6 +314,9 @@ export class Agent {
       lines.push(`Session: ${key}`);
       lines.push(`Channel: ${channel.name}`);
       lines.push(`Model: ${model}`);
+      if (config.litellm?.baseUrl) {
+        lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
+      }
       lines.push(`Live: ${live?.isAlive() ? "yes" : "no"}`);
 
       const msgCount = session.messages.filter((m) => m.role === "user").length;

@@ -28,7 +28,7 @@ export const configCommand = new Command("config")
     for (;;) {
       const options: Array<{ value: string; label: string; hint?: string }> = [
         { value: "model", label: "Model", hint: "set default model" },
-        { value: "litellm", label: "LiteLLM gateway", hint: "route Claude SDK through a local proxy" },
+        { value: "litellm", label: "LiteLLM gateway", hint: "ChatGPT subscription or custom proxy" },
         { value: "channels", label: "Channels", hint: "manage channel connections" },
         { value: "identities", label: "Identities", hint: "bind DMs across channels" },
         { value: "groups", label: "Group chats", hint: "activation secret" },

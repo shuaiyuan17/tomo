@@ -1,3 +1,5 @@
+import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL } from "./litellm.js";
+
 export const MODEL_ALIASES: Record<string, string> = {
   "sonnet": "claude-sonnet-4-6",
   "sonnet-1m": "claude-sonnet-4-6[1m]",
@@ -44,6 +46,6 @@ export function modelLabel(model: string): string {
 export function modelHelpText(): string {
   return [
     Object.keys(MODEL_ALIASES).join(", "),
-    "or a LiteLLM provider/model name like chatgpt/gpt-5.3-codex",
+    `or a LiteLLM provider/model name like ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`,
   ].join(", ");
 }

@@ -219,6 +219,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
   ],
   "model": "claude-sonnet-4-6[1m]",
   "litellm": {
+    "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",
     "apiKey": "sk-tomo-local"
   },
@@ -242,30 +243,43 @@ Environment variables override config file values:
 | `CLAUDE_MODEL` | Override model |
 | `TOMO_LITELLM_BASE_URL` | Route Claude Agent SDK model calls through a LiteLLM proxy |
 | `TOMO_LITELLM_API_KEY` | API key sent to the LiteLLM proxy as `ANTHROPIC_API_KEY` |
+| `TOMO_LITELLM_MODE` | Optional LiteLLM mode: `anthropic-compatible` or `chatgpt-subscription` |
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
 
 ### LiteLLM / ChatGPT Subscription Models
 
-Tomo still runs through Claude Agent SDK, but you can point the SDK at a local LiteLLM proxy and select a LiteLLM model name such as `chatgpt/gpt-5.3-codex`.
+Tomo still runs through Claude Agent SDK, but you can point the SDK at a local LiteLLM proxy and select a LiteLLM model name such as `chatgpt/gpt-5.5`. This keeps Tomo's Claude SDK sessions, memory, workspace, MCP tools, and LCM behavior while LiteLLM translates Anthropic `/v1/messages` streaming calls to the ChatGPT subscription backend.
 
 ```yaml
-# litellm.yaml
+# ~/litellm-chatgpt.yaml
+environment_variables:
+  CHATGPT_DEFAULT_INSTRUCTIONS: >-
+    Follow the instructions supplied in this request.
+
 model_list:
-  - model_name: chatgpt/gpt-5.3-codex
+  - model_name: chatgpt/gpt-5.5
     model_info:
       mode: responses
     litellm_params:
-      model: chatgpt/gpt-5.3-codex
+      model: chatgpt/gpt-5.5
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: sk-tomo-local
 ```
 
 ```bash
-litellm --config litellm.yaml
-tomo config   # LiteLLM gateway -> http://localhost:4000
+litellm --config ~/litellm-chatgpt.yaml
+tomo config   # LiteLLM gateway -> ChatGPT subscription
 ```
 
-Then set the default model to `chatgpt/gpt-5.3-codex` from `tomo config`, or use `/model chatgpt/gpt-5.3-codex` in a chat. LiteLLM owns the ChatGPT OAuth device flow and token storage; Tomo only sends Anthropic-compatible requests to the local proxy.
+Then set the default model to `chatgpt/gpt-5.5` from `tomo config`, or use `/model chatgpt/gpt-5.5` in a chat. LiteLLM owns the ChatGPT OAuth device flow and token storage; Tomo only sends Anthropic-compatible requests to the local proxy.
+
+If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that includes ChatGPT system-role normalization. If non-streaming curl checks fail while streaming `/v1/messages` works, that is still compatible with Tomo because Claude Agent SDK uses streaming.
 
 ## Development
 

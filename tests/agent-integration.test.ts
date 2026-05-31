@@ -152,7 +152,7 @@ const { mockConfig } = vi.hoisted(() => ({
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
-    litellm: null as { baseUrl: string; apiKey: string } | null,
+    litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
     lcm: {
       nudgeAtPct: 70,
       nudgeResetPct: 60,
@@ -1055,6 +1055,7 @@ describe("chat commands", () => {
   it("passes LiteLLM gateway env to the Claude Agent SDK child", async () => {
     resetConfig({
       litellm: {
+        mode: "anthropic-compatible",
         baseUrl: "http://localhost:4000",
         apiKey: "sk-litellm-test",
       },
@@ -1072,6 +1073,29 @@ describe("chat commands", () => {
     };
     expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
     expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("/status shows LiteLLM gateway mode", async () => {
+    resetConfig({
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await tg.simulateCommand("status", "12345", "TestUser");
+
+    expect(tg.sent[0].text).toContain("Gateway: LiteLLM (ChatGPT subscription)");
 
     await agent.stop();
   });
@@ -1124,15 +1148,15 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.3-codex");
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to chatgpt/gpt-5.3-codex");
+    expect(tg.sent[0].text).toBe("Switched to chatgpt/gpt-5.5");
 
     const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("chatgpt/gpt-5.3-codex");
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("chatgpt/gpt-5.5");
 
     await agent.stop();
   });

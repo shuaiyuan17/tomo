@@ -33,6 +33,7 @@ export class PetScheduler {
 
     const prevStage = state.stage;
     const prevHealth = Math.round(state.health);
+    const prevRecovering = state.recovering;
     state = store.tick(state);
     store.save(state);
 
@@ -45,6 +46,12 @@ export class PetScheduler {
     }
     if (Math.round(state.health) < prevHealth - 5) {
       alerts.push(`${state.name}'s health dropped to ${Math.round(state.health)}`);
+    }
+    if (!prevRecovering && state.recovering) {
+      alerts.push(`${state.name} collapsed and needs recovery care`);
+    }
+    if (prevRecovering && !state.recovering) {
+      alerts.push(`${state.name} is out of recovery`);
     }
     if (state.happiness < 20) {
       alerts.push(`${state.name} seems very unhappy`);

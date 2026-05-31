@@ -1228,7 +1228,7 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/model unlinks the active SDK session so provider switches do not resume incompatible JSONL", async () => {
+  it("/model keeps the active SDK session so provider switches preserve continuity", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1241,7 +1241,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
 
     expect(tg.sent.at(-1)?.text).toBe("Switched to claude-opus-4-8[1m]");
-    expect(store.getSdkSessionId("telegram:12345")).toBeUndefined();
+    expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
 
     await agent.stop();
   });

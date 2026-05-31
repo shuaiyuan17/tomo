@@ -14,6 +14,7 @@ import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
+import { repairSdkSessionForResume } from "./sessions/repair.js";
 import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "./models.js";
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, liteLlmModeLabel } from "./litellm.js";
 import { dirname } from "node:path";
@@ -301,11 +302,11 @@ export class Agent {
       }
       this.modelOverrides.set(key, resolved);
       this.persistModelOverride(key, resolved);
-      // Model/provider changes are not safely resumable across SDK JSONL files.
-      // In particular, chatgpt/* LiteLLM transcripts can contain empty text
-      // blocks that Anthropic rejects when switching back to a Claude model.
+      // Model changes require a fresh SDK child process, but keep the SDK
+      // session ID so continuity survives switching between Claude and LiteLLM.
+      // getOrCreateLiveSession repairs provider-specific JSONL quirks before
+      // resuming.
       this.closeLiveSession(key);
-      this.sessions.clearSdkSessionId(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `Switched to ${resolved}` });
       return;
@@ -374,6 +375,12 @@ export class Agent {
     this.lastPromptHash = currentHash;
 
     const resumeId = this.sessions.getSdkSessionId(key);
+    if (resumeId) {
+      const repair = repairSdkSessionForResume(resumeId);
+      if (repair.error) {
+        log.warn({ key, sessionId: resumeId, error: repair.error }, "Could not repair SDK session before resume");
+      }
+    }
     const model = this.modelOverrides.get(key);
     const turnBudget = makeTurnBudget();
     const externalMcpServers = await this.mcpOAuthManager.buildServersWithAuth(

@@ -57,18 +57,22 @@ export function repairSdkSessionFile(path: string, transcript: SessionMessage[] 
       return result;
     }
 
-    const replacement = chooseTranscriptReplacement(event, assistantTranscript, transcriptCursor);
-    if (replacement) transcriptCursor = replacement.nextCursor;
+    let replacementConsumed = false;
+    const consumeReplacement = () => {
+      if (replacementConsumed) return undefined;
+      replacementConsumed = true;
+      const replacement = chooseTranscriptReplacement(event, assistantTranscript, transcriptCursor);
+      if (!replacement) return undefined;
+      transcriptCursor = replacement.nextCursor;
+      return replacement.text;
+    };
 
-    const changed = repairSdkEvent(event, replacement?.text);
-    if (changed > 0) {
+    const repaired = repairSdkEvent(event, consumeReplacement);
+    if (repaired.changedBlocks > 0) {
       result.changedEvents++;
-      result.changedBlocks += changed;
-      if (replacement) {
-        result.transcriptFilled++;
-      } else {
-        result.placeholderFilled++;
-      }
+      result.changedBlocks += repaired.changedBlocks;
+      result.transcriptFilled += repaired.transcriptFilled;
+      result.placeholderFilled += repaired.placeholderFilled;
     }
     out.push(JSON.stringify(event));
   }
@@ -85,41 +89,60 @@ export function repairSdkSessionFile(path: string, transcript: SessionMessage[] 
   return result;
 }
 
-function repairSdkEvent(event: unknown, replacementText?: string): number {
-  if (!isRecord(event)) return 0;
+interface RepairEventResult {
+  changedBlocks: number;
+  transcriptFilled: number;
+  placeholderFilled: number;
+}
+
+function emptyRepairResult(): RepairEventResult {
+  return { changedBlocks: 0, transcriptFilled: 0, placeholderFilled: 0 };
+}
+
+function repairSdkEvent(event: unknown, consumeReplacement: () => string | undefined): RepairEventResult {
+  if (!isRecord(event)) return emptyRepairResult();
   const message = event.message;
-  if (!isRecord(message)) return 0;
+  if (!isRecord(message)) return emptyRepairResult();
 
   const content = message.content;
   if (Array.isArray(content)) {
-    const repaired = repairContentArray(content, replacementText);
+    const repaired = repairContentArray(content, consumeReplacement);
     if (repaired.changedBlocks > 0) {
       message.content = repaired.content;
     }
-    return repaired.changedBlocks;
+    return repaired;
   }
 
   if (content === "") {
-    message.content = replacementText ?? EMPTY_TEXT_PLACEHOLDER;
-    return 1;
+    const replacement = consumeReplacement();
+    message.content = replacement ?? EMPTY_TEXT_PLACEHOLDER;
+    return {
+      changedBlocks: 1,
+      transcriptFilled: replacement ? 1 : 0,
+      placeholderFilled: replacement ? 0 : 1,
+    };
   }
 
-  return 0;
+  return emptyRepairResult();
 }
 
 function repairContentArray(
   content: unknown[],
-  replacementText?: string,
-): { content: unknown[]; changedBlocks: number } {
+  consumeReplacement: () => string | undefined,
+): { content: unknown[] } & RepairEventResult {
   let changedBlocks = 0;
+  let transcriptFilled = 0;
+  let placeholderFilled = 0;
   const repairedBlocks = content.map((block) => {
     if (!isRecord(block)) return block;
     const nested = block.content;
     if (Array.isArray(nested)) {
-      const repaired = repairContentArray(nested, replacementText);
+      const repaired = repairContentArray(nested, consumeReplacement);
       if (repaired.changedBlocks > 0) {
         block.content = repaired.content;
         changedBlocks += repaired.changedBlocks;
+        transcriptFilled += repaired.transcriptFilled;
+        placeholderFilled += repaired.placeholderFilled;
       }
     }
     return block;
@@ -127,20 +150,26 @@ function repairContentArray(
 
   const emptyTextBlocks = repairedBlocks.filter(isEmptyTextBlock);
   if (emptyTextBlocks.length === 0) {
-    return { content: repairedBlocks, changedBlocks };
+    return { content: repairedBlocks, changedBlocks, transcriptFilled, placeholderFilled };
   }
 
   const nonEmptyBlocks = repairedBlocks.filter((block) => !isEmptyTextBlock(block));
   changedBlocks += emptyTextBlocks.length;
   if (nonEmptyBlocks.length > 0) {
-    return { content: nonEmptyBlocks, changedBlocks };
+    return { content: nonEmptyBlocks, changedBlocks, transcriptFilled, placeholderFilled };
   }
 
   const first = emptyTextBlocks[0];
+  const replacement = consumeReplacement();
   if (isRecord(first)) {
-    first.text = replacementText ?? EMPTY_TEXT_PLACEHOLDER;
+    first.text = replacement ?? EMPTY_TEXT_PLACEHOLDER;
   }
-  return { content: [first], changedBlocks };
+  if (replacement) {
+    transcriptFilled++;
+  } else {
+    placeholderFilled++;
+  }
+  return { content: [first], changedBlocks, transcriptFilled, placeholderFilled };
 }
 
 function chooseTranscriptReplacement(

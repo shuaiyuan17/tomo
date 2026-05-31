@@ -110,6 +110,69 @@ describe("repairSdkSessionFile", () => {
     expect(events[1].message.content[0].text).toBe("second");
   });
 
+  it("does not let a preceding tool-use assistant event consume transcript text", () => {
+    const path = tempSessionPath();
+    writeFileSync(path, [
+      {
+        type: "assistant",
+        timestamp: "2026-05-31T21:45:40.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_123", name: "Bash", input: { command: "date" } }],
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-05-31T21:45:41.814Z",
+        message: { role: "assistant", content: [{ type: "text", text: "" }] },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+    const result = repairSdkSessionFile(path, [
+      { role: "assistant", content: "THE REAL REPLY", channel: "telegram", timestamp: Date.parse("2026-05-31T21:45:41.900Z") },
+    ]);
+
+    expect(result.transcriptFilled).toBe(1);
+    expect(result.placeholderFilled).toBe(0);
+    const events = readFileSync(path, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events[0].message.content[0].type).toBe("tool_use");
+    expect(events[1].message.content).toEqual([{ type: "text", text: "THE REAL REPLY" }]);
+  });
+
+  it("does not consume transcript text when dropping empty text before tool_use", () => {
+    const path = tempSessionPath();
+    writeFileSync(path, [
+      {
+        type: "assistant",
+        timestamp: "2026-05-31T21:45:40.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "" },
+            { type: "tool_use", id: "toolu_123", name: "Bash", input: { command: "date" } },
+          ],
+        },
+      },
+      {
+        type: "assistant",
+        timestamp: "2026-05-31T21:45:41.814Z",
+        message: { role: "assistant", content: [{ type: "text", text: "" }] },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+    const result = repairSdkSessionFile(path, [
+      { role: "assistant", content: "THE REAL REPLY", channel: "telegram", timestamp: Date.parse("2026-05-31T21:45:41.900Z") },
+    ]);
+
+    expect(result.transcriptFilled).toBe(1);
+    expect(result.placeholderFilled).toBe(0);
+    const events = readFileSync(path, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events[0].message.content).toEqual([
+      { type: "tool_use", id: "toolu_123", name: "Bash", input: { command: "date" } },
+    ]);
+    expect(events[1].message.content).toEqual([{ type: "text", text: "THE REAL REPLY" }]);
+  });
+
   it("repairs nested tool_result text content", () => {
     const path = tempSessionPath();
     writeFileSync(path, JSON.stringify({

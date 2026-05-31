@@ -29,7 +29,7 @@ Session stats show:
 
 **Note:** Context stats come from the SDK API and reflect the state at the end of the *previous* query. After compacting or other changes, you need to wait for a new query to complete before the numbers update.
 
-Per-session model overrides live in `sessionModelOverrides` in `~/.tomo/config.json`. Users can set them from chat with `/model <name>`; Tomo persists the override for the current session, closes the live SDK process, and uses the selected model on the next turn. `tomo config` can also set or clear model overrides from the Sessions menu.
+Per-session model overrides live in `sessionModelOverrides` in `~/.tomo/config.json`. Users can set them from chat with `/model <name>`; Tomo persists the override for the current session, closes the live SDK process, and uses the selected model on the next turn. Claude aliases and LiteLLM provider/model names such as `chatgpt/gpt-5.3-codex` are accepted. `tomo config` can also set or clear model overrides from the Sessions menu.
 
 When context crosses the nudge threshold (default 70%, set via `lcm.nudgeAtPct` in config.json), the harness sends a system message asking you to run `tomo lcm daily` — see the `tomo-lcm` skill. A second nudge at 80% asks you to use the `lcm compact` skill before the next user message. A periodic rollup runner also nudges you when daily/weekly/monthly/yearly blocks are due. Group sessions default to SDK auto-compact instead (override with `lcm.groupCompactStyle: "lcm"` to enroll groups in all three nudges).
 
@@ -49,7 +49,7 @@ The `tomo cron list / add / remove` CLI is still here for human debugging (audit
 
 | Path | Purpose |
 |------|---------|
-| `~/.tomo/config.json` | Configuration (channels, identities, model, session model overrides) |
+| `~/.tomo/config.json` | Configuration (channels, identities, model, LiteLLM gateway, session model overrides) |
 | `~/.tomo/workspace/` | Agent working directory (cwd) |
 | `~/.tomo/workspace/memory/` | Persistent memory files |
 | `~/.tomo/workspace/memory/MEMORY.md` | Memory index (loaded every conversation) |
@@ -63,7 +63,7 @@ The `tomo cron list / add / remove` CLI is still here for human debugging (audit
 
 ## Config file
 
-`~/.tomo/config.json` holds model, channels, identities, allowlists, session model overrides, and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, and env-var overrides see [CONFIG.md](CONFIG.md). Manual edits require `tomo restart` to take effect; `/model <name>` persists and applies the current session override without a restart.
+`~/.tomo/config.json` holds model, channels, identities, allowlists, LiteLLM gateway settings, session model overrides, and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, and env-var overrides see [CONFIG.md](CONFIG.md). Manual edits require `tomo restart` to take effect; `/model <name>` persists and applies the current session override without a restart.
 
 Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tomo/config.json.bak`, then write the updated config. If the new config breaks Tomo while the harness is still reachable, the user can send `/restore` to copy `config.json.bak` back to `config.json` and restart.
 

@@ -29,6 +29,13 @@ export interface LcmConfig {
   dailyFreshTail: number;
 }
 
+export interface LiteLlmConfig {
+  /** Base URL for a LiteLLM proxy exposing Anthropic-compatible endpoints. */
+  baseUrl: string;
+  /** Proxy API key sent as ANTHROPIC_API_KEY to the Claude Agent SDK child. */
+  apiKey: string;
+}
+
 interface TomoConfig {
   telegramToken: string;
   model: string;
@@ -56,11 +63,24 @@ interface TomoConfig {
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
+  /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
+  litellm: LiteLlmConfig | null;
   /** External MCP servers from ~/.tomo/config.json. */
   mcpServers: Record<string, ExternalMcpServerConfig>;
   /** MCP tool allowlist entries for external servers. Defaults to mcp__<server>__* for each server. */
   mcpAllowedTools: string[];
   lcm: LcmConfig;
+}
+
+function parseLiteLlmConfig(raw: unknown): LiteLlmConfig | null {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? r.baseUrl ?? "").trim();
+  if (!baseUrl) return null;
+
+  return {
+    baseUrl,
+    apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? r.apiKey ?? "").trim(),
+  };
 }
 
 function parseLcmConfig(raw: unknown): LcmConfig {
@@ -183,6 +203,7 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
+    litellm: parseLiteLlmConfig(file.litellm),
     mcpServers,
     mcpAllowedTools,
     lcm: parseLcmConfig(file.lcm),

@@ -14,6 +14,7 @@ import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
+import { MODEL_ALIASES, modelHelpText, resolveModelName } from "./models.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -194,23 +195,10 @@ export class Agent {
     }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
   }
 
-  private static readonly AVAILABLE_MODELS: Record<string, string> = {
-    "sonnet": "claude-sonnet-4-6",
-    "sonnet-1m": "claude-sonnet-4-6[1m]",
-    "opus": "claude-opus-4-8",
-    "opus-1m": "claude-opus-4-8[1m]",
-    "haiku": "claude-haiku-4-5",
-  };
-
   private backupConfig(): void {
     if (!existsSync(CONFIG_PATH)) return;
     mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
     copyFileSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
-  }
-
-  private resolveModelName(arg: string): string | null {
-    const resolved = Agent.AVAILABLE_MODELS[arg] ?? arg;
-    return Object.values(Agent.AVAILABLE_MODELS).includes(resolved) ? resolved : null;
   }
 
   private persistModelOverride(key: string, model: string): void {
@@ -282,22 +270,23 @@ export class Agent {
     }
 
     if (command === "model") {
-      const arg = args?.trim().toLowerCase();
+      const arg = args?.trim();
       if (!arg) {
         const current = this.modelOverrides.get(key) ?? config.model;
         const lines = [`Current: ${current}`, "", "Switch with: /model <name>", ""];
-        for (const [shortName, fullName] of Object.entries(Agent.AVAILABLE_MODELS)) {
+        for (const [shortName, fullName] of Object.entries(MODEL_ALIASES)) {
           const marker = fullName === current ? " (active)" : "";
           lines.push(`  ${shortName} — ${fullName}${marker}`);
         }
+        lines.push("");
+        lines.push("LiteLLM gateway models are also accepted, e.g. chatgpt/gpt-5.3-codex");
         await channel.send({ chatId, text: lines.join("\n") });
         return;
       }
 
-      const resolved = this.resolveModelName(arg);
+      const resolved = resolveModelName(arg);
       if (!resolved) {
-        const names = Object.keys(Agent.AVAILABLE_MODELS).join(", ");
-        await channel.send({ chatId, text: `Unknown model "${arg}". Use one of: ${names}` });
+        await channel.send({ chatId, text: `Unknown model "${arg}". Use ${modelHelpText()}.` });
         return;
       }
       this.modelOverrides.set(key, resolved);

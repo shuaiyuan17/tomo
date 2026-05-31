@@ -38,6 +38,10 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
   "sessionModelOverrides": {
     "dm:alice": "claude-opus-4-8[1m]"
   },
+  "litellm": {
+    "baseUrl": "http://localhost:4000",
+    "apiKey": "sk-tomo-local"
+  },
   "maxTurns": 50,
   "mcpServers": {
     "github-copilot": {
@@ -66,7 +70,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 
 | Field | Type | Allowed values / notes |
 |---|---|---|
-| `model` | string | `claude-sonnet-4-6[1m]`, `claude-sonnet-4-6`, `claude-opus-4-8[1m]`, `claude-opus-4-8`, `claude-haiku-4-5`. Default model for every session. |
+| `model` | string | Claude model IDs/aliases, or a LiteLLM `provider/model` name such as `chatgpt/gpt-5.3-codex`. Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
@@ -81,6 +85,8 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `identities[].channels` | object | `{ channelName: chatId }` — maps each channel the identity uses to its chatId. |
 | `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). Written by `/model <name>` for the current chat and by the `tomo config` Sessions menu. |
+| `litellm.baseUrl` | string | Optional LiteLLM proxy base URL, e.g. `http://localhost:4000`. When set, Tomo still uses Claude Agent SDK but sends SDK model calls to the proxy via `ANTHROPIC_BASE_URL`. |
+| `litellm.apiKey` | string | LiteLLM proxy key sent as `ANTHROPIC_API_KEY`. This is the proxy key, not an Anthropic key. For ChatGPT subscription models, LiteLLM owns the OAuth device flow and token storage. |
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
 | `mcpServers` | object | External MCP servers keyed by server name. Supports stdio (`command`, `args`, `env`), HTTP (`type: "http"`, `url`, `headers`), and SSE (`type: "sse"`, `url`, `headers`). Environment variables like `${HOME}` expand in `url`, `headers`, `env`, and `args`. |
 | `mcpServers.<name>.oauth` | object | Optional harness-managed OAuth for HTTP/SSE MCP servers. Supports `authorizationServer` (optional; omitted = discover from the MCP server), `clientId` (optional if dynamic registration is available), `scopes`, `tokenStoreKey`, `redirectUri`, and `clientName`. Tokens are stored outside agent context in `workspace/secrets/mcp-oauth.json` (`0600`). |
@@ -93,5 +99,5 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 ## Requirements and overrides
 
 - **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.url`. Startup fails otherwise.
-- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`.
+- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`.
 - `workspaceDir`, `sessionsDir`, `historyLimit` are env-only — they're not read from the JSON file.

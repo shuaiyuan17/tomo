@@ -152,6 +152,7 @@ const { mockConfig } = vi.hoisted(() => ({
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
+    litellm: null as { baseUrl: string; apiKey: string } | null,
     lcm: {
       nudgeAtPct: 70,
       nudgeResetPct: 60,
@@ -199,6 +200,7 @@ vi.mock("../src/logger.js", () => ({
 
 // Import Agent after mocks
 const { Agent } = await import("../src/agent.js");
+const sdkMock = await import("@anthropic-ai/claude-agent-sdk");
 
 // ---------------------------------------------------------------------------
 // MockChannel — tracks both send() and streaming deliveries
@@ -1050,6 +1052,30 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("passes LiteLLM gateway env to the Claude Agent SDK child", async () => {
+    resetConfig({
+      litellm: {
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
   it("/model persists a session override to config", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -1088,6 +1114,25 @@ describe("chat commands", () => {
       sessionModelOverrides?: Record<string, string>;
     };
     expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8[1m]");
+
+    await agent.stop();
+  });
+
+  it("/model accepts LiteLLM provider/model names", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.3-codex");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Switched to chatgpt/gpt-5.3-codex");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("chatgpt/gpt-5.3-codex");
 
     await agent.stop();
   });

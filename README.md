@@ -32,7 +32,7 @@ That's it. Open Telegram and message your bot.
 ## Requirements
 
 - Node.js 22+
-- [Claude Code](https://claude.com/claude-code) installed and authenticated (subscription plan — API keys are not currently supported)
+- [Claude Code](https://claude.com/claude-code) installed. Authenticate Claude Code for direct Claude models, or configure a LiteLLM gateway for non-Claude backends.
 - At least one channel:
   - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)
   - **iMessage** — [BlueBubbles](https://bluebubbles.app) server running on a Mac with iMessage signed in
@@ -41,7 +41,7 @@ That's it. Open Telegram and message your bot.
 
 ```bash
 tomo init              # First-time setup
-tomo config            # Interactive settings (model, channels, identities, groups)
+tomo config            # Interactive settings (model, LiteLLM, channels, identities, groups)
 tomo start             # Start in background (daemon)
 tomo start -f          # Start in foreground (for dev)
 tomo stop              # Stop the daemon
@@ -58,7 +58,7 @@ tomo sessions clear    # Reset all sessions
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
-| `/model` | Switch model (sonnet/sonnet-1m/opus/opus-1m/haiku) |
+| `/model` | Switch model (Claude aliases or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/status` | Show session info (model, channel, message count) |
 
@@ -218,6 +218,10 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     }
   ],
   "model": "claude-sonnet-4-6[1m]",
+  "litellm": {
+    "baseUrl": "http://localhost:4000",
+    "apiKey": "sk-tomo-local"
+  },
   "maxTurns": 50,
   "saveInboundImages": true,
   "groupSecret": "tomo-xxxxxxxx",
@@ -236,9 +240,32 @@ Environment variables override config file values:
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
 | `IMESSAGE_URL` | Override BlueBubbles URL |
 | `CLAUDE_MODEL` | Override model |
+| `TOMO_LITELLM_BASE_URL` | Route Claude Agent SDK model calls through a LiteLLM proxy |
+| `TOMO_LITELLM_API_KEY` | API key sent to the LiteLLM proxy as `ANTHROPIC_API_KEY` |
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
+
+### LiteLLM / ChatGPT Subscription Models
+
+Tomo still runs through Claude Agent SDK, but you can point the SDK at a local LiteLLM proxy and select a LiteLLM model name such as `chatgpt/gpt-5.3-codex`.
+
+```yaml
+# litellm.yaml
+model_list:
+  - model_name: chatgpt/gpt-5.3-codex
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.3-codex
+```
+
+```bash
+litellm --config litellm.yaml
+tomo config   # LiteLLM gateway -> http://localhost:4000
+```
+
+Then set the default model to `chatgpt/gpt-5.3-codex` from `tomo config`, or use `/model chatgpt/gpt-5.3-codex` in a chat. LiteLLM owns the ChatGPT OAuth device flow and token storage; Tomo only sends Anthropic-compatible requests to the local proxy.
 
 ## Development
 

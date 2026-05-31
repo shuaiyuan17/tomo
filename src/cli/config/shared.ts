@@ -1,6 +1,7 @@
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { MODEL_ALIASES, modelLabel } from "../../models.js";
 
 export const TOMO_HOME = join(homedir(), ".tomo");
 export const CONFIG_PATH = join(TOMO_HOME, "config.json");
@@ -8,21 +9,7 @@ export const CONFIG_BACKUP_PATH = join(TOMO_HOME, "config.json.bak");
 export const SESSIONS_DIR = join(TOMO_HOME, "data", "sessions");
 export const LOG_PATH = join(TOMO_HOME, "logs", "tomo.log");
 
-export const MODELS: Record<string, string> = {
-  "sonnet": "claude-sonnet-4-6",
-  "sonnet-1m": "claude-sonnet-4-6[1m]",
-  "opus": "claude-opus-4-8",
-  "opus-1m": "claude-opus-4-8[1m]",
-  "haiku": "claude-haiku-4-5",
-};
-
-const MODEL_LABELS: Record<string, string> = {
-  "claude-sonnet-4-6": "Sonnet 4.6 (fast)",
-  "claude-sonnet-4-6[1m]": "Sonnet 4.6 1M (fast, long context)",
-  "claude-opus-4-8": "Opus 4.8 (most capable)",
-  "claude-opus-4-8[1m]": "Opus 4.8 1M (most capable, long context)",
-  "claude-haiku-4-5": "Haiku 4.5 (cheapest)",
-};
+export const MODELS = MODEL_ALIASES;
 
 export function loadConfig(): Record<string, unknown> {
   if (!existsSync(CONFIG_PATH)) return {};
@@ -41,6 +28,4 @@ export function saveConfig(cfg: Record<string, unknown>): void {
   writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
 }
 
-export function modelLabel(model: string): string {
-  return MODEL_LABELS[model] ?? model;
-}
+export { modelLabel };

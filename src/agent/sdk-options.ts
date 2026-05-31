@@ -102,6 +102,8 @@ export function sdkOptions(
       .filter(([name]) => name !== TOMO_INTERNAL_MCP_NAME),
   );
   const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
+  const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
+  const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact });
 
   return {
     model: model ?? config.model,
@@ -149,13 +151,27 @@ export function sdkOptions(
       guardPrivateMemory: isGroup,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
-    // Note: SDK `env` fully replaces the child's env (not merged despite the
-    // d.ts claim), so we must spread process.env ourselves — otherwise the
-    // child CLI spawns with an empty env and fails to locate its runtime.
-    ...(sessionContext && usesLcmCompact(sessionContext.sessionKey)
-      ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
-      : {}),
+    ...(sdkEnv ? { env: sdkEnv } : {}),
   };
+}
+
+function buildSdkEnv(args: { disableAutoCompact: boolean }): NodeJS.ProcessEnv | null {
+  if (!args.disableAutoCompact && !config.litellm?.baseUrl) return null;
+
+  // Note: SDK `env` fully replaces the child's env (not merged despite the
+  // d.ts claim), so we must spread process.env ourselves — otherwise the
+  // child CLI spawns with an empty env and fails to locate its runtime.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (config.litellm?.baseUrl) {
+    env.ANTHROPIC_BASE_URL = config.litellm.baseUrl;
+    if (config.litellm.apiKey) {
+      env.ANTHROPIC_API_KEY = config.litellm.apiKey;
+    }
+  }
+  if (args.disableAutoCompact) {
+    env.DISABLE_AUTO_COMPACT = "1";
+  }
+  return env;
 }
 
 /** Combine the turn-budget PostToolBatch hook and the group-session

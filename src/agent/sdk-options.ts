@@ -4,6 +4,8 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
+import { resolveModelName, modelLabel } from "../models.js";
+import { CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -102,9 +104,22 @@ export function sdkOptions(
       .filter(([name]) => name !== TOMO_INTERNAL_MCP_NAME),
   );
   const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
+  const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
+  const effectiveModel = model ?? config.model;
+
+  // Tell the agent which model is actually serving this session. A model can't
+  // reliably introspect its own identity, so surface it as a fact in the prompt
+  // rather than leaving the agent to guess. Reassembled every turn, so a /model
+  // switch (or a gateway re-route) is reflected on the next turn.
+  const resolvedModel = resolveModelName(effectiveModel) ?? effectiveModel;
+  const resolvedLabel = modelLabel(resolvedModel);
+  const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
+  systemPrompt += `\n\n# RUNTIME — Current Model\nYou are currently running on: ${modelDisplay}. This is the real model serving this session right now — trust it over any introspective guess about which model you are.`;
+
+  const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact, model: effectiveModel });
 
   return {
-    model: model ?? config.model,
+    model: effectiveModel,
     cwd: config.workspaceDir,
     systemPrompt,
     permissionMode: "bypassPermissions" as const,
@@ -149,13 +164,41 @@ export function sdkOptions(
       guardPrivateMemory: isGroup,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
-    // Note: SDK `env` fully replaces the child's env (not merged despite the
-    // d.ts claim), so we must spread process.env ourselves — otherwise the
-    // child CLI spawns with an empty env and fails to locate its runtime.
-    ...(sessionContext && usesLcmCompact(sessionContext.sessionKey)
-      ? { env: { ...process.env, DISABLE_AUTO_COMPACT: "1" } }
-      : {}),
+    ...(sdkEnv ? { env: sdkEnv } : {}),
   };
+}
+
+function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): NodeJS.ProcessEnv | null {
+  // Decide whether this session routes through the LiteLLM proxy. A generic
+  // anthropic-compatible proxy forwards every model (that's its purpose), so it
+  // routes all sessions. A chatgpt-subscription proxy only serves its LiteLLM
+  // provider/model (e.g. chatgpt/gpt-5.5), so a Claude-model session — such as a
+  // leftover per-session "opus" override — must bypass it and hit Anthropic
+  // directly rather than be sent to a proxy that can't serve Claude.
+  const litellm = config.litellm;
+  const useGateway = Boolean(litellm?.baseUrl)
+    && (litellm!.mode !== CHATGPT_SUBSCRIPTION_MODE || isChatGptSubscriptionModel(args.model));
+  if (!args.disableAutoCompact && !useGateway) return null;
+
+  // Note: SDK `env` fully replaces the child's env (not merged despite the
+  // d.ts claim), so we must spread process.env ourselves — otherwise the
+  // child CLI spawns with an empty env and fails to locate its runtime.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (useGateway && litellm) {
+    env.ANTHROPIC_BASE_URL = litellm.baseUrl;
+    if (litellm.apiKey) {
+      env.ANTHROPIC_API_KEY = litellm.apiKey;
+    }
+  } else {
+    // If the parent daemon was started with ANTHROPIC_BASE_URL pointing at
+    // LiteLLM, a deliberate chatgpt-subscription bypass must scrub it so Claude
+    // models really go to Anthropic direct.
+    delete env.ANTHROPIC_BASE_URL;
+  }
+  if (args.disableAutoCompact) {
+    env.DISABLE_AUTO_COMPACT = "1";
+  }
+  return env;
 }
 
 /** Combine the turn-budget PostToolBatch hook and the group-session

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **LiteLLM gateway model support.** Tomo still runs on Claude Agent SDK, but `~/.tomo/config.json` can now include a `litellm` gateway block that maps to `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` for the SDK child process. The config UI now offers a first-class `chatgpt-subscription` mode, including the tested `chatgpt/gpt-5.5` model path and LiteLLM proxy setup notes, while still allowing generic Anthropic-compatible LiteLLM proxies. `/model` and config model pickers accept LiteLLM `provider/model` names.
+
 ## 0.7.0 (2026-05-29)
 
 ### Features

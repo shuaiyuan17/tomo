@@ -14,6 +14,14 @@ import { LiveSession } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
+import { repairSdkSessionForResume } from "./sessions/repair.js";
+import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "./models.js";
+import {
+  CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+  CHATGPT_SUBSCRIPTION_MODE,
+  isChatGptSubscriptionModel,
+  liteLlmModeLabel,
+} from "./litellm.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -194,23 +202,10 @@ export class Agent {
     }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
   }
 
-  private static readonly AVAILABLE_MODELS: Record<string, string> = {
-    "sonnet": "claude-sonnet-4-6",
-    "sonnet-1m": "claude-sonnet-4-6[1m]",
-    "opus": "claude-opus-4-8",
-    "opus-1m": "claude-opus-4-8[1m]",
-    "haiku": "claude-haiku-4-5",
-  };
-
   private backupConfig(): void {
     if (!existsSync(CONFIG_PATH)) return;
     mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
     copyFileSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
-  }
-
-  private resolveModelName(arg: string): string | null {
-    const resolved = Agent.AVAILABLE_MODELS[arg] ?? arg;
-    return Object.values(Agent.AVAILABLE_MODELS).includes(resolved) ? resolved : null;
   }
 
   private persistModelOverride(key: string, model: string): void {
@@ -282,27 +277,49 @@ export class Agent {
     }
 
     if (command === "model") {
-      const arg = args?.trim().toLowerCase();
+      const arg = args?.trim();
       if (!arg) {
         const current = this.modelOverrides.get(key) ?? config.model;
         const lines = [`Current: ${current}`, "", "Switch with: /model <name>", ""];
-        for (const [shortName, fullName] of Object.entries(Agent.AVAILABLE_MODELS)) {
+        for (const [shortName, fullName] of Object.entries(MODEL_ALIASES)) {
           const marker = fullName === current ? " (active)" : "";
           lines.push(`  ${shortName} — ${fullName}${marker}`);
+        }
+        if (config.litellm?.baseUrl) {
+          lines.push("");
+          lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
         }
         await channel.send({ chatId, text: lines.join("\n") });
         return;
       }
 
-      const resolved = this.resolveModelName(arg);
+      const resolved = resolveModelName(arg);
       if (!resolved) {
-        const names = Object.keys(Agent.AVAILABLE_MODELS).join(", ");
-        await channel.send({ chatId, text: `Unknown model "${arg}". Use one of: ${names}` });
+        await channel.send({ chatId, text: `Unknown model "${arg}". Use ${modelHelpText()}.` });
         return;
+      }
+      if (isLiteLlmProviderModel(resolved)) {
+        if (!config.litellm?.baseUrl) {
+          await channel.send({
+            chatId,
+            text: `"${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
+          });
+          return;
+        }
+        if (config.litellm.mode === CHATGPT_SUBSCRIPTION_MODE && !isChatGptSubscriptionModel(resolved)) {
+          await channel.send({
+            chatId,
+            text: `The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`,
+          });
+          return;
+        }
       }
       this.modelOverrides.set(key, resolved);
       this.persistModelOverride(key, resolved);
-      // Model change requires new session (process uses one model)
+      // Model changes require a fresh SDK child process, but keep the SDK
+      // session ID so continuity survives switching between Claude and LiteLLM.
+      // getOrCreateLiveSession repairs provider-specific JSONL quirks before
+      // resuming.
       this.closeLiveSession(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `Switched to ${resolved}` });
@@ -324,6 +341,9 @@ export class Agent {
       lines.push(`Session: ${key}`);
       lines.push(`Channel: ${channel.name}`);
       lines.push(`Model: ${model}`);
+      if (config.litellm?.baseUrl) {
+        lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
+      }
       lines.push(`Live: ${live?.isAlive() ? "yes" : "no"}`);
 
       const msgCount = session.messages.filter((m) => m.role === "user").length;
@@ -369,6 +389,12 @@ export class Agent {
     this.lastPromptHash = currentHash;
 
     const resumeId = this.sessions.getSdkSessionId(key);
+    if (resumeId) {
+      const repair = repairSdkSessionForResume(resumeId, this.sessions.get(key).messages);
+      if (repair.error) {
+        log.warn({ key, sessionId: resumeId, error: repair.error }, "Could not repair SDK session before resume");
+      }
+    }
     const model = this.modelOverrides.get(key);
     const turnBudget = makeTurnBudget();
     const externalMcpServers = await this.mcpOAuthManager.buildServersWithAuth(
@@ -384,7 +410,15 @@ export class Agent {
 
     session = new LiveSession(opts, key, turnBudget);
     this.liveSessions.set(key, session);
-    log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
+    log.info(
+      {
+        key,
+        resume: !!resumeId,
+        model: opts.model,
+        gateway: opts.env?.ANTHROPIC_BASE_URL ? "litellm" : "native",
+      },
+      "Live session created",
+    );
     return session;
   }
 

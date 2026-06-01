@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
+import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
+import {
+  CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+  inferLiteLlmMode,
+  isChatGptSubscriptionModel,
+  liteLlmModeLabel,
+  parseLiteLlmMode,
+} from "../src/litellm.js";
 
 // Test the silent reply detection (extracted logic)
 function isSilentReply(text: string): boolean {
@@ -214,26 +222,51 @@ describe("summarizeToolInput", () => {
   });
 });
 
-// Test AVAILABLE_MODELS (extracted from Agent class)
-describe("AVAILABLE_MODELS", () => {
-  const AVAILABLE_MODELS: Record<string, string> = {
-    "sonnet": "claude-sonnet-4-6",
-    "sonnet-1m": "claude-sonnet-4-6[1m]",
-    "opus": "claude-opus-4-8",
-    "opus-1m": "claude-opus-4-8[1m]",
-    "haiku": "claude-haiku-4-5",
-  };
-
+describe("model resolution", () => {
   it("maps short names to full model IDs", () => {
-    expect(AVAILABLE_MODELS["sonnet"]).toBe("claude-sonnet-4-6");
-    expect(AVAILABLE_MODELS["sonnet-1m"]).toBe("claude-sonnet-4-6[1m]");
-    expect(AVAILABLE_MODELS["opus"]).toBe("claude-opus-4-8");
-    expect(AVAILABLE_MODELS["opus-1m"]).toBe("claude-opus-4-8[1m]");
-    expect(AVAILABLE_MODELS["haiku"]).toBe("claude-haiku-4-5");
+    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-4-6");
+    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-4-6[1m]");
+    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-4-8");
+    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-4-8[1m]");
+    expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-4-5");
   });
 
   it("does not have unknown model keys", () => {
-    expect(Object.keys(AVAILABLE_MODELS)).toEqual(["sonnet", "sonnet-1m", "opus", "opus-1m", "haiku"]);
+    expect(Object.keys(MODEL_ALIASES)).toEqual(["sonnet", "sonnet-1m", "opus", "opus-1m", "haiku"]);
+  });
+
+  it("accepts LiteLLM provider/model names", () => {
+    expect(resolveModelName(CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe(CHATGPT_SUBSCRIPTION_DEFAULT_MODEL);
+    expect(resolveModelName("openrouter/openai/gpt-4o-mini")).toBe("openrouter/openai/gpt-4o-mini");
+  });
+
+  it("rejects typo-like Claude names that are not gateway provider/model names", () => {
+    expect(resolveModelName("claude-sonnet-4.7")).toBeNull();
+  });
+});
+
+describe("LiteLLM helpers", () => {
+  it("defaults to a generic Anthropic-compatible proxy mode", () => {
+    expect(parseLiteLlmMode(undefined)).toBe("anthropic-compatible");
+    expect(parseLiteLlmMode("custom")).toBe("anthropic-compatible");
+    expect(liteLlmModeLabel("anthropic-compatible")).toBe("Anthropic-compatible proxy");
+  });
+
+  it("accepts aliases for ChatGPT subscription mode", () => {
+    expect(parseLiteLlmMode("chatgpt")).toBe("chatgpt-subscription");
+    expect(parseLiteLlmMode("openai-subscription")).toBe("chatgpt-subscription");
+    expect(liteLlmModeLabel("chatgpt-subscription")).toBe("ChatGPT subscription");
+  });
+
+  it("infers ChatGPT subscription mode for old chatgpt/* gateway configs", () => {
+    expect(inferLiteLlmMode(undefined, CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe("chatgpt-subscription");
+    expect(inferLiteLlmMode(undefined, "claude-sonnet-4-6[1m]")).toBe("anthropic-compatible");
+    expect(inferLiteLlmMode("anthropic-compatible", CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe("anthropic-compatible");
+  });
+
+  it("detects ChatGPT subscription model names", () => {
+    expect(isChatGptSubscriptionModel(CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe(true);
+    expect(isChatGptSubscriptionModel("openrouter/openai/gpt-4o-mini")).toBe(false);
   });
 });
 

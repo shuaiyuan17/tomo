@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
+import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -27,6 +28,15 @@ export interface LcmConfig {
    *  rollup so mid-day compacts don't wipe warm short-term texture. Counts SDK
    *  events (one tool round = multiple events), not user-typed messages. */
   dailyFreshTail: number;
+}
+
+export interface LiteLlmConfig {
+  /** Gateway mode. ChatGPT mode documents the subscription/OAuth LiteLLM setup; runtime env wiring is the same. */
+  mode: LiteLlmMode;
+  /** Base URL for a LiteLLM proxy exposing Anthropic-compatible endpoints. */
+  baseUrl: string;
+  /** Proxy API key sent as ANTHROPIC_API_KEY to the Claude Agent SDK child. */
+  apiKey: string;
 }
 
 interface TomoConfig {
@@ -56,11 +66,25 @@ interface TomoConfig {
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
+  /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
+  litellm: LiteLlmConfig | null;
   /** External MCP servers from ~/.tomo/config.json. */
   mcpServers: Record<string, ExternalMcpServerConfig>;
   /** MCP tool allowlist entries for external servers. Defaults to mcp__<server>__* for each server. */
   mcpAllowedTools: string[];
   lcm: LcmConfig;
+}
+
+function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? r.baseUrl ?? "").trim();
+  if (!baseUrl) return null;
+
+  return {
+    mode: inferLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? r.mode, defaultModel),
+    baseUrl,
+    apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? r.apiKey ?? "").trim(),
+  };
 }
 
 function parseLcmConfig(raw: unknown): LcmConfig {
@@ -163,9 +187,11 @@ function buildConfig(): TomoConfig {
       replyPolicy: id.replyPolicy ?? "last-active",
     }));
 
+  const model = (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string;
+
   return {
     telegramToken,
-    model: (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string,
+    model,
     workspaceDir: process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace"),
     sessionsDir: process.env.SESSIONS_DIR ?? join(TOMO_HOME, "data", "sessions"),
     historyLimit: Number(process.env.HISTORY_LIMIT ?? "20"),
@@ -183,6 +209,7 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
+    litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,
     lcm: parseLcmConfig(file.lcm),

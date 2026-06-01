@@ -1,6 +1,7 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
-import { loadConfig, saveConfig, modelLabel, MODELS, SESSIONS_DIR } from "./shared.js";
+import { loadConfig, saveConfig, modelLabel, SESSIONS_DIR } from "./shared.js";
+import { promptForModel } from "./model-picker.js";
 
 export async function configSessions(): Promise<void> {
   const store = new SessionStore(SESSIONS_DIR, 0);
@@ -53,19 +54,12 @@ export async function configSessions(): Promise<void> {
     if (p.isCancel(action) || action === "back") continue;
 
     if (action === "model") {
-      const model = await p.select({
-        message: "Select model for this session",
-        options: Object.entries(MODELS).map(([short, full]) => ({
-          value: full,
-          label: `${short} — ${modelLabel(full)}`,
-          hint: full === currentModel ? "current" : undefined,
-        })),
-      });
-      if (p.isCancel(model)) continue;
-      overrides[key] = model as string;
+      const model = await promptForModel("Select model for this session", currentModel);
+      if (!model) continue;
+      overrides[key] = model;
       cfg.sessionModelOverrides = overrides;
       saveConfig(cfg);
-      p.log.success(`Model for ${key} set to ${modelLabel(model as string)}`);
+      p.log.success(`Model for ${key} set to ${modelLabel(model)}`);
     }
 
     if (action === "clear-model") {

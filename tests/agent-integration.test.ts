@@ -152,6 +152,7 @@ const { mockConfig } = vi.hoisted(() => ({
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
+    litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
     lcm: {
       nudgeAtPct: 70,
       nudgeResetPct: 60,
@@ -199,6 +200,7 @@ vi.mock("../src/logger.js", () => ({
 
 // Import Agent after mocks
 const { Agent } = await import("../src/agent.js");
+const sdkMock = await import("@anthropic-ai/claude-agent-sdk");
 
 // ---------------------------------------------------------------------------
 // MockChannel — tracks both send() and streaming deliveries
@@ -1050,6 +1052,202 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("passes LiteLLM gateway env to the Claude Agent SDK child", async () => {
+    resetConfig({
+      litellm: {
+        mode: "anthropic-compatible",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("routes a chatgpt-subscription gateway when the model is a LiteLLM model", async () => {
+    resetConfig({
+      model: "chatgpt/gpt-5.5",
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("bypasses a chatgpt-subscription gateway for a Claude-model session", async () => {
+    const oldBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    process.env.ANTHROPIC_BASE_URL = "http://localhost:4000";
+    let agent: InstanceType<typeof Agent> | null = null;
+    try {
+      resetConfig({
+        // Gateway only serves chatgpt/*, but this session resolves to a Claude model
+        // (default config.model) — it must hit Anthropic directly, not the proxy.
+        model: "claude-sonnet-4-6[1m]",
+        litellm: {
+          mode: "chatgpt-subscription",
+          baseUrl: "http://localhost:4000",
+          apiKey: "sk-litellm-test",
+        },
+      });
+      agent = new Agent();
+      const tg = new MockChannel("telegram");
+      agent.addChannel(tg);
+
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+      await drainQueue(agent);
+
+      const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+      const lastCall = calls[calls.length - 1]?.[0] as {
+        options?: { env?: Record<string, string | undefined> };
+      };
+      expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+      expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe(process.env.ANTHROPIC_API_KEY);
+    } finally {
+      if (oldBaseUrl === undefined) {
+        delete process.env.ANTHROPIC_BASE_URL;
+      } else {
+        process.env.ANTHROPIC_BASE_URL = oldBaseUrl;
+      }
+      await agent?.stop();
+    }
+  });
+
+  it("routes back through the ChatGPT gateway after switching from a Claude model", async () => {
+    resetConfig({
+      model: "chatgpt/gpt-5.5",
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "ChatGPT turn" }));
+    await drainQueue(agent);
+
+    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Claude turn" }));
+    await drainQueue(agent);
+
+    let calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    let lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined>; model?: string };
+    };
+    expect(lastCall.options?.model).toBe("claude-opus-4-8[1m]");
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Back to ChatGPT" }));
+    await drainQueue(agent);
+
+    calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined>; model?: string; resume?: string };
+    };
+    expect(lastCall.options?.model).toBe("chatgpt/gpt-5.5");
+    expect(lastCall.options?.resume).toBe("mock-sdk-session-123");
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("surfaces the resolved Claude model in the system prompt", async () => {
+    resetConfig({ model: "sonnet" });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
+    expect(lastCall.options?.systemPrompt).toContain("# RUNTIME — Current Model");
+    // alias "sonnet" must be resolved to its concrete id, not echoed raw
+    expect(lastCall.options?.systemPrompt).toContain("claude-sonnet-4-6");
+
+    await agent.stop();
+  });
+
+  it("surfaces a LiteLLM gateway model in the system prompt", async () => {
+    resetConfig({
+      model: "chatgpt/gpt-5.5",
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
+    expect(lastCall.options?.systemPrompt).toContain("chatgpt/gpt-5.5");
+
+    await agent.stop();
+  });
+
+  it("/status shows LiteLLM gateway mode", async () => {
+    resetConfig({
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await tg.simulateCommand("status", "12345", "TestUser");
+
+    expect(tg.sent[0].text).toContain("Gateway: LiteLLM (ChatGPT subscription)");
+
+    await agent.stop();
+  });
+
   it("/model persists a session override to config", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -1073,6 +1271,24 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/model keeps the active SDK session so provider switches preserve continuity", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    const store = (agent as unknown as { sessions: { getSdkSessionId(key: string): string | undefined } }).sessions;
+    expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
+
+    expect(tg.sent.at(-1)?.text).toBe("Switched to claude-opus-4-8[1m]");
+    expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
+
+    await agent.stop();
+  });
+
   it("/model accepts known full model IDs", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -1088,6 +1304,77 @@ describe("chat commands", () => {
       sessionModelOverrides?: Record<string, string>;
     };
     expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8[1m]");
+
+    await agent.stop();
+  });
+
+  it("/model accepts LiteLLM provider/model names when a gateway is configured", async () => {
+    resetConfig({
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Switched to chatgpt/gpt-5.5");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("chatgpt/gpt-5.5");
+
+    await agent.stop();
+  });
+
+  it("/model rejects non-chatgpt provider models in ChatGPT subscription mode", async () => {
+    resetConfig({
+      litellm: {
+        mode: "chatgpt-subscription",
+        baseUrl: "http://localhost:4000",
+        apiKey: "sk-litellm-test",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "openrouter/openai/gpt-4o-mini");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("only routes chatgpt/* models");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides).toBeUndefined();
+
+    await agent.stop();
+  });
+
+  it("/model rejects LiteLLM provider/model names without a gateway and does not write config", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("needs a LiteLLM gateway");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides).toBeUndefined();
 
     await agent.stop();
   });

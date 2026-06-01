@@ -16,7 +16,12 @@ import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/te
 import { normalizeSendTarget } from "./agent/send-target.js";
 import { repairSdkSessionForResume } from "./sessions/repair.js";
 import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "./models.js";
-import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, liteLlmModeLabel } from "./litellm.js";
+import {
+  CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+  CHATGPT_SUBSCRIPTION_MODE,
+  isChatGptSubscriptionModel,
+  liteLlmModeLabel,
+} from "./litellm.js";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -293,12 +298,21 @@ export class Agent {
         await channel.send({ chatId, text: `Unknown model "${arg}". Use ${modelHelpText()}.` });
         return;
       }
-      if (isLiteLlmProviderModel(resolved) && !config.litellm?.baseUrl) {
-        await channel.send({
-          chatId,
-          text: `"${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
-        });
-        return;
+      if (isLiteLlmProviderModel(resolved)) {
+        if (!config.litellm?.baseUrl) {
+          await channel.send({
+            chatId,
+            text: `"${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
+          });
+          return;
+        }
+        if (config.litellm.mode === CHATGPT_SUBSCRIPTION_MODE && !isChatGptSubscriptionModel(resolved)) {
+          await channel.send({
+            chatId,
+            text: `The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`,
+          });
+          return;
+        }
       }
       this.modelOverrides.set(key, resolved);
       this.persistModelOverride(key, resolved);
@@ -396,7 +410,15 @@ export class Agent {
 
     session = new LiveSession(opts, key, turnBudget);
     this.liveSessions.set(key, session);
-    log.info({ key, resume: !!resumeId, model: opts.model }, "Live session created");
+    log.info(
+      {
+        key,
+        resume: !!resumeId,
+        model: opts.model,
+        gateway: opts.env?.ANTHROPIC_BASE_URL ? "litellm" : "native",
+      },
+      "Live session created",
+    );
     return session;
   }
 

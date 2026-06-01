@@ -4,8 +4,8 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
-import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
-import { CHATGPT_SUBSCRIPTION_MODE } from "../litellm.js";
+import { resolveModelName, modelLabel } from "../models.js";
+import { CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -177,7 +177,7 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   // directly rather than be sent to a proxy that can't serve Claude.
   const litellm = config.litellm;
   const useGateway = Boolean(litellm?.baseUrl)
-    && (litellm!.mode !== CHATGPT_SUBSCRIPTION_MODE || isLiteLlmProviderModel(args.model));
+    && (litellm!.mode !== CHATGPT_SUBSCRIPTION_MODE || isChatGptSubscriptionModel(args.model));
   if (!args.disableAutoCompact && !useGateway) return null;
 
   // Note: SDK `env` fully replaces the child's env (not merged despite the

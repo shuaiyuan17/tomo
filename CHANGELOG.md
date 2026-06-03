@@ -1,10 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 (2026-06-03)
 
 ### Features
 
-- **LiteLLM gateway model support.** Tomo still runs on Claude Agent SDK, but `~/.tomo/config.json` can now include a `litellm` gateway block that maps to `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` for the SDK child process. The config UI now offers a first-class `chatgpt-subscription` mode, including the tested `chatgpt/gpt-5.5` model path and LiteLLM proxy setup notes, while still allowing generic Anthropic-compatible LiteLLM proxies. `/model` and config model pickers accept LiteLLM `provider/model` names.
+- **LiteLLM gateway / ChatGPT subscription support** (#126). Tomo still runs on the Claude Agent SDK, but `~/.tomo/config.json` can now include a `litellm` gateway block that points the SDK child process at a LiteLLM proxy via `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` (also overridable with `TOMO_LITELLM_BASE_URL` / `_API_KEY` / `_MODE`), keeping sessions, memory, workspace, MCP tools, and LCM behavior intact while routing model calls through the proxy. The config UI offers a first-class `chatgpt-subscription` mode (including the tested `chatgpt/gpt-5.5` path and proxy setup notes) alongside generic Anthropic-compatible proxies; `/model` and the config model pickers accept LiteLLM `provider/model` names, and `/status` shows the active gateway/mode. Model alias/label resolution moved out of the `Agent` class into `src/models.ts`, and `buildSdkEnv` (`src/agent/sdk-options.ts`) composes the gateway env cleanly with the existing `DISABLE_AUTO_COMPACT` logic. Two guardrails added during review: `/model` and the config picker reject/hide LiteLLM model names when no gateway is configured (instead of silently saving an override the real Anthropic endpoint can't serve), and routing is mode-aware — an `anthropic-compatible` proxy routes all models, while a `chatgpt-subscription` proxy routes only LiteLLM models and lets Claude-model sessions hit Anthropic directly (so an Opus request never lands on a chatgpt-only proxy). The current model is now surfaced in the system prompt.
+- **Virtual pet growth & recovery overhaul** (#124). New pets now start as an actual `egg` and hatch into `baby` after 1 day, with slower stage gates: `child` at 7 days, `teen` at 14, `adult` at 30, and `elder` at 180. Care quality — not just raw affection — now drives evolution: a new `care_mistakes` counter feeds an `effective_affection` value (each mistake subtracts 5) that evolution checks read instead of raw affection. When health reaches 0 the pet enters a recovery state where it can't play or evolve until health climbs back to 25, and feed-based affection farming is blocked (food above 90 hunger is ignored; feed affection is only granted below 50 hunger and never while recovering). Recovery state, effective affection, and care mistakes are surfaced through `pet_status`.
+
+### Bug fixes
+
+- **Prevent thinking blocks from leaking to chat** (#128). Tomo streamed SDK partial text deltas straight to Telegram/iMessage without tracking the active content-block type, so thinking-like content exposed through a text-shaped partial event could be delivered as public reply text. Adaptive-thinking display is now omitted for supported Claude Sonnet/Opus models, live streaming forwards only deltas from active `text` blocks, and final assistant aggregation accepts explicit `type: "text"` blocks only — with regression coverage for thinking-block leakage.
+
+### Other
+
+- Bump `@anthropic-ai/claude-agent-sdk` 0.3.150 → 0.3.158 → 0.3.161 (#121, #127).
+- Bump `@clack/prompts` 1.4.0 → 1.5.0 (#122).
+- npm audit lockfile remediation: resolve vulnerable transitive packages to patched versions (#125).
+- Bump dev-dependencies group (#120): `eslint` 10.4.0 → 10.4.1, `typescript-eslint` 8.59.4 → 8.60.0.
 
 ## 0.7.0 (2026-05-29)
 

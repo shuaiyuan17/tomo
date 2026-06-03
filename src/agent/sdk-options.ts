@@ -4,7 +4,7 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../lcm/blocks.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
-import { resolveModelName, modelLabel } from "../models.js";
+import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 
@@ -117,6 +117,7 @@ export function sdkOptions(
   systemPrompt += `\n\n# RUNTIME — Current Model\nYou are currently running on: ${modelDisplay}. This is the real model serving this session right now — trust it over any introspective guess about which model you are.`;
 
   const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact, model: effectiveModel });
+  const thinking = omittedAdaptiveThinkingForModel(effectiveModel);
 
   return {
     model: effectiveModel,
@@ -156,6 +157,7 @@ export function sdkOptions(
     canUseTool: skillsCanUseTool,
     ...(sessionContext?.onMcpElicitation ? { onElicitation: sessionContext.onMcpElicitation } : {}),
     includePartialMessages: true,
+    ...(thinking ? { thinking } : {}),
     maxTurns: config.maxTurns,
     ...buildHooksOption({
       turnBudget,
@@ -166,6 +168,20 @@ export function sdkOptions(
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
   };
+}
+
+function omittedAdaptiveThinkingForModel(model: string): { type: "adaptive"; display: "omitted" } | undefined {
+  const resolved = resolveModelName(model) ?? model;
+  if (isLiteLlmProviderModel(resolved)) return undefined;
+
+  const base = resolved.replace(/\[[^\]]+\]$/, "");
+  const adaptiveThinkingModel =
+    /^claude-sonnet-4-(?:[6-9]|\d{2,})$/.test(base) ||
+    /^claude-opus-4-(?:[6-9]|\d{2,})$/.test(base);
+
+  return adaptiveThinkingModel
+    ? { type: "adaptive", display: "omitted" }
+    : undefined;
 }
 
 function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): NodeJS.ProcessEnv | null {

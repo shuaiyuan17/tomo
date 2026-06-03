@@ -8,11 +8,22 @@ import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, Stream
 // Mock SDK — queue-based approach avoids async-generator timing issues
 // ---------------------------------------------------------------------------
 
+type MockTextBlock = { type: "text"; text: string };
+type MockThinkingBlock = {
+  type: "thinking";
+  thinking: string;
+  signature?: string;
+  /** Test hook: simulate a thinking block whose stream delta is text-shaped. */
+  streamAsTextDelta?: boolean;
+};
+type MockResponseBlock = string | MockTextBlock | MockThinkingBlock;
+type MockResponse = string | MockResponseBlock[];
+
 /** Controls what the mock SDK returns for each user message. Returning a
  *  string emits a single text block; returning an array emits one assistant
- *  event per element (each becomes its own text block, stitched into the
- *  same turn — the SDK only fires `result` once at the end). */
-let mockResponseFn: (text: string) => string | string[] | Promise<string | string[]> = () => "mock response";
+ *  event per element (each becomes its own block, stitched into the same turn
+ *  — the SDK only fires `result` once at the end). */
+let mockResponseFn: (text: string) => MockResponse | Promise<MockResponse> = () => "mock response";
 let mockEmitStreamDeltas = true;
 
 /** Track in-flight mock queries so tests can assert no concurrency */
@@ -51,20 +62,46 @@ function createMockQuery(prompt: AsyncGenerator) {
         const responseValue = await mockResponseFn(text);
         const blocks = Array.isArray(responseValue) ? responseValue : [responseValue];
 
-        // For each block, emit a stream delta + an assistant event. This
+        // For each block, emit stream events + an assistant event. This
         // mirrors how the real SDK reports multi-block turns: text deltas
         // arrive, then an `assistant` event consolidates the just-completed
         // block(s). Only one `result` fires at the end of the whole turn.
         for (const block of blocks) {
+          const rawBlock: MockTextBlock | MockThinkingBlock =
+            typeof block === "string" ? { type: "text", text: block } : block;
+          const assistantBlock = rawBlock.type === "thinking"
+            ? { type: rawBlock.type, thinking: rawBlock.thinking, signature: rawBlock.signature }
+            : rawBlock;
+
           if (mockEmitStreamDeltas) {
             eventQueue.push({
               type: "stream_event",
-              event: { type: "content_block_delta", delta: { type: "text_delta", text: block } },
+              event: {
+                type: "content_block_start",
+                index: 0,
+                content_block: assistantBlock,
+              },
+            });
+            eventQueue.push({
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                index: 0,
+                delta: rawBlock.type === "text"
+                  ? { type: "text_delta", text: rawBlock.text }
+                  : rawBlock.streamAsTextDelta
+                    ? { type: "text_delta", text: rawBlock.thinking }
+                    : { type: "thinking_delta", thinking: rawBlock.thinking },
+              },
+            });
+            eventQueue.push({
+              type: "stream_event",
+              event: { type: "content_block_stop", index: 0 },
             });
           }
           eventQueue.push({
             type: "assistant",
-            message: { content: [{ text: block }] },
+            message: { content: [assistantBlock] },
           });
         }
 
@@ -221,6 +258,8 @@ class MockChannel implements Channel {
   sent: OutgoingMessage[] = [];
   /** All delivered messages (both streamed and sent) */
   delivered: Delivery[] = [];
+  /** Raw streaming update calls before a block is committed. */
+  streamUpdates: Delivery[] = [];
   typingStarts: string[] = [];
   typingStops: Array<{ chatId: string; options?: StopTypingOptions }> = [];
   renamed: Array<{ chatId: string; title: string }> = [];
@@ -259,7 +298,12 @@ class MockChannel implements Channel {
       text = "";
     };
     return {
-      update: (t: string) => { if (!canceled && !finished) text = t; },
+      update: (t: string) => {
+        if (!canceled && !finished) {
+          text = t;
+          this.streamUpdates.push({ chatId, text: t });
+        }
+      },
       commitBlock: async () => { if (!canceled && !finished) ship(); },
       finish: async () => { if (finished) return; finished = true; ship(); },
       cancel: async () => { canceled = true; text = ""; },
@@ -283,6 +327,7 @@ class MockChannel implements Channel {
   clearDelivered() {
     this.sent = [];
     this.delivered = [];
+    this.streamUpdates = [];
     this.typingStarts = [];
     this.typingStops = [];
     this.renamed = [];
@@ -991,6 +1036,23 @@ describe("NO_REPLY suppression", () => {
 
     expect(tg.delivered).toHaveLength(1);
     expect(tg.delivered[0].text).toBe("A real answer");
+
+    await agent.stop();
+  });
+
+  it("asks the SDK to omit adaptive thinking display for Claude models", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { thinking?: { type: string; display?: string } };
+    };
+    expect(lastCall.options?.thinking).toEqual({ type: "adaptive", display: "omitted" });
 
     await agent.stop();
   });
@@ -1887,6 +1949,25 @@ describe("per-block streaming delivery", () => {
 
     expect(tg.delivered).toHaveLength(3);
     expect(tg.delivered.map((d) => d.text)).toEqual(["alpha", "beta", "gamma"]);
+
+    await agent.stop();
+  });
+
+  it("does not stream text-shaped deltas from thinking blocks", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => [
+      { type: "thinking", thinking: "private reasoning that must not be sent", streamAsTextDelta: true },
+      "public answer",
+    ];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.streamUpdates.map((d) => d.text)).toEqual(["public answer"]);
+    expect(tg.delivered.map((d) => d.text)).toEqual(["public answer"]);
 
     await agent.stop();
   });

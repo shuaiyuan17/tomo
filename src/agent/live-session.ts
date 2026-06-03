@@ -66,6 +66,18 @@ function summarizeToolInput(name: string, input?: Record<string, unknown>): stri
   }
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isTextBlock(block: unknown): block is { type: "text"; text: string } {
+  return isObject(block) && block.type === "text" && typeof block.text === "string";
+}
+
+function isToolUseBlock(block: unknown): block is { type: "tool_use"; id?: string; name: string; input?: Record<string, unknown> } {
+  return isObject(block) && block.type === "tool_use" && typeof block.name === "string";
+}
+
 export class LiveSession {
   private q: Query;
   private pendingMessage: ((msg: SDKUserMessage) => void) | null = null;
@@ -82,6 +94,7 @@ export class LiveSession {
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
+  private activeStreamBlockTypes = new Map<number, string>();
 
   constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string, turnBudget?: TurnBudget) {
     this.sessionKey = sessionKey;
@@ -119,10 +132,35 @@ export class LiveSession {
     const req = this.currentRequest;
 
     if (event.type === "stream_event") {
-      const se = event as unknown as { event: { type: string; delta?: { type: string; text?: string } } };
-      if (se.event?.type === "content_block_delta" && se.event.delta?.type === "text_delta" && se.event.delta.text) {
-        this.streamingText += se.event.delta.text;
-        req?.onText?.(this.streamingText);
+      const se = event as unknown as {
+        event?: {
+          type: string;
+          index?: number;
+          content_block?: { type?: string };
+          delta?: { type: string; text?: string };
+        };
+      };
+      const streamEvent = se.event;
+
+      if (streamEvent?.type === "content_block_start" && typeof streamEvent.index === "number") {
+        const blockType = streamEvent.content_block?.type;
+        if (blockType) this.activeStreamBlockTypes.set(streamEvent.index, blockType);
+      }
+
+      if (streamEvent?.type === "content_block_delta" && streamEvent.delta?.type === "text_delta" && streamEvent.delta.text) {
+        const blockType = typeof streamEvent.index === "number"
+          ? this.activeStreamBlockTypes.get(streamEvent.index)
+          : undefined;
+        if (blockType === "text") {
+          this.streamingText += streamEvent.delta.text;
+          req?.onText?.(this.streamingText);
+        }
+      }
+
+      if (streamEvent?.type === "content_block_stop" && typeof streamEvent.index === "number") {
+        this.activeStreamBlockTypes.delete(streamEvent.index);
+      } else if (streamEvent?.type === "message_start" || streamEvent?.type === "message_stop") {
+        this.activeStreamBlockTypes.clear();
       }
     }
 
@@ -130,7 +168,7 @@ export class LiveSession {
       const hadStreamDeltas = this.streamingText.length > 0;
       this.streamingText = "";
       for (const block of event.message.content) {
-        if ("text" in block) {
+        if (isTextBlock(block)) {
           this.parts.push(block.text);
           // Some SDK-originated errors arrive as an assistant text block
           // without preceding stream deltas. Push the full block into the
@@ -141,10 +179,9 @@ export class LiveSession {
           if (req?.onBlockComplete) {
             await req.onBlockComplete(block.text);
           }
-        } else if ("type" in block && block.type === "tool_use") {
-          const tool = block as { id?: string; name: string; input?: Record<string, unknown> };
-          if (tool.id && tool.name) this.pendingToolNames.set(tool.id, tool.name);
-          log.info({ tool: tool.name }, summarizeToolInput(tool.name, tool.input));
+        } else if (isToolUseBlock(block)) {
+          if (block.id) this.pendingToolNames.set(block.id, block.name);
+          log.info({ tool: block.name }, summarizeToolInput(block.name, block.input));
         }
       }
     }
@@ -222,6 +259,7 @@ export class LiveSession {
       const response = trimmed.join("\n").trim() || "I'm not sure how to respond to that.";
       this.parts = [];
       this.streamingText = "";
+      this.activeStreamBlockTypes.clear();
       req?.resolve(response);
       this.currentRequest = null;
     }
@@ -327,6 +365,7 @@ export class LiveSession {
       };
       this.parts = [];
       this.streamingText = "";
+      this.activeStreamBlockTypes.clear();
 
       if (this.pendingMessage && this.currentRequest) {
         this.pendingMessage(this.currentRequest.message);

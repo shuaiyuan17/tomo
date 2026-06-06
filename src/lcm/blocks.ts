@@ -130,9 +130,19 @@ export function isWarmTailCandidate(e: SdkEvent): boolean {
   }
   // user event
   if (!text) return false; // tool_result-only turn = machinery
-  // Strip an optional leading "[channel · weekday MM/DD HH:MM TZ] " stamp, then
-  // a System: prefix means heartbeat/cron (both injected, not conversation).
-  const stripped = text.replace(/^\[[^\]]*\]\s*/, "");
+  // Strip ALL leading bracketed prefixes (+ whitespace), then a System: prefix
+  // means heartbeat/cron (both injected, not conversation). Looping matters:
+  // a cron turn with a pending note prepended looks like
+  //   "[System: <note>]\n\n[imessage · …] System: Scheduled task …"
+  // so stripping just one bracket would leave "[imessage · …] System:" and
+  // misclassify the cron as conversational. Coalesced real msgs
+  //   "[imessage · …] [User sent 2 messages …] real text"
+  // strip down to "real text" → still correctly a candidate.
+  let stripped = text;
+  for (let prev = ""; stripped !== prev; ) {
+    prev = stripped;
+    stripped = stripped.replace(/^\[[^\]]*\]\s*/, "");
+  }
   if (stripped.startsWith("System:")) return false;
   return true;
 }
@@ -379,6 +389,22 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     if (e.isCompactSummary && e.blockTag) haveTags.add(e.blockTag);
   }
 
+  // Days that still have ANY raw (non-summary) user/assistant events present —
+  // including raw intentionally kept warm by the global fresh tail. A daily
+  // block for such a day is PARTIAL (its newest turns aren't summarized yet), so
+  // it must NOT be promoted to its parent week: a weekly rollup would summarize
+  // the partial block and then never re-run (haveTags) even after the daily
+  // block later rebuilds to absorb the aged-out raw. Gate weekly eligibility on
+  // "day fully promoted." (No-op under today-only behavior: past days have no
+  // remaining raw, so they're never in this set.)
+  const daysWithRaw = new Set<string>();
+  for (const e of events) {
+    if (e.type !== "user" && e.type !== "assistant") continue;
+    if (e.isCompactSummary) continue;
+    if (!e.timestamp) continue;
+    daysWithRaw.add(localDateTag(new Date(e.timestamp)));
+  }
+
   // Candidate periods: for each source block, derive its parent period.
   const weeklyChildrenByWeek = new Map<string, number>();
   const monthlyChildrenByMonth = new Map<string, number>();
@@ -390,6 +416,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
 
     let m = /^daily (\d{4}-\d{2}-\d{2})$/.exec(tag);
     if (m) {
+      // Skip partial daily blocks (their day still has un-promoted raw).
+      if (daysWithRaw.has(m[1])) continue;
       const wk = isoWeekTag(new Date(m[1] + "T12:00:00"));
       if (wk !== currentWeek) {
         weeklyChildrenByWeek.set(wk, (weeklyChildrenByWeek.get(wk) ?? 0) + 1);

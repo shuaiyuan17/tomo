@@ -239,6 +239,14 @@ describe("isWarmTailCandidate — classifier", () => {
   it("rejects a continuity heartbeat (raw System:)", () => {
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: "System: It is Fri, Jun 5, 22:22 PDT. Weather outside ..." } } as any)).toBe(false);
   });
+  it("rejects a cron turn with a pending note prepended (multi-bracket strip)", () => {
+    const content = `[System: You proactively sent the following message …]\n\n${stamp} System: Scheduled task "daily-backup" triggered.`;
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content } } as any)).toBe(false);
+  });
+  it("still counts a real message with a pending note prepended", () => {
+    const content = `[System: You proactively sent the following message …]\n\n${stamp} hey what's up`;
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content } } as any)).toBe(true);
+  });
   it("rejects a tool_result-only user turn (no text)", () => {
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "..." }] } } as any)).toBe(false);
   });
@@ -355,5 +363,46 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
     expect(dailyDue).toBeDefined();
     // All 6 of the past day's raw are outside the newest-4 window.
     expect(dailyDue!.childCount).toBe(6);
+  });
+
+  it("does NOT promote a PARTIAL daily block to its week (day still has warm raw)", () => {
+    // A past-week day has a daily block AND warm raw still present → the block is
+    // partial → the weekly rollup must NOT be considered due (else it'd summarize
+    // an incomplete day and never re-run after the daily block rebuilds).
+    const day = "2026-04-08"; // ISO week 2026-W15, well in the past
+    const events: any[] = [];
+    events.push({
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly part` },
+    });
+    // 2 warm raw candidates (≤ N=4) → daily not due, but day is "not fully promoted"
+    for (let i = 0; i < 2; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] warm ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "weekly")).toBeUndefined();
+  });
+
+  it("DOES promote a complete daily block to its week (no remaining raw)", () => {
+    // Same week, but the day is fully promoted (block only, no raw) → weekly due.
+    const day = "2026-04-08";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nfull day` },
+    }];
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeDefined();
   });
 });

@@ -44,7 +44,9 @@ export class Agent {
   // queued task; later tasks find nothing and no-op.
   private pendingBatches = new Map<string, Array<{ channel: Channel; message: IncomingMessage }>>();
   private pendingBatchSettleUntil = new Map<string, number>();
+  private pendingBatchSettleStartedAt = new Map<string, number>();
   private pendingBatchDrainScheduled = new Set<string>();
+  private lastImessageReceiptAt = new Map<string, number>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
@@ -166,6 +168,7 @@ export class Agent {
    * coalescing because per-message mention filtering would be lost.
    */
   private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+    const receivedAt = Date.now();
     const isGroup = message.isGroup ?? false;
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
 
@@ -188,18 +191,29 @@ export class Agent {
     this.pendingBatches.set(sessionKey, batch);
 
     const settleMs = this.messageBatchSettleMs(channel.name);
+    const maxSettleMs = this.messageBatchMaxSettleMs(channel.name);
+    if (channel.name === "imessage") {
+      this.logImessageReceipt(sessionKey, message, receivedAt, batch.length, settleMs, maxSettleMs);
+    }
     if (settleMs <= 0) {
       this.enqueueBatchDrain(sessionKey);
       return;
     }
 
-    this.pendingBatchSettleUntil.set(sessionKey, Date.now() + settleMs);
+    const settleStartedAt = this.pendingBatchSettleStartedAt.get(sessionKey) ?? receivedAt;
+    this.pendingBatchSettleStartedAt.set(sessionKey, settleStartedAt);
+    const uncappedSettleUntil = receivedAt + settleMs;
+    const cappedSettleUntil = maxSettleMs > 0
+      ? Math.min(uncappedSettleUntil, settleStartedAt + maxSettleMs)
+      : uncappedSettleUntil;
+    this.pendingBatchSettleUntil.set(sessionKey, cappedSettleUntil);
     if (this.pendingBatchDrainScheduled.has(sessionKey)) return;
 
     this.pendingBatchDrainScheduled.add(sessionKey);
     this.enqueueForSession(sessionKey, async () => {
       await this.waitForBatchSettle(sessionKey);
       this.pendingBatchSettleUntil.delete(sessionKey);
+      this.pendingBatchSettleStartedAt.delete(sessionKey);
       this.pendingBatchDrainScheduled.delete(sessionKey);
       await this.drainPendingBatch(sessionKey);
     }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
@@ -209,6 +223,38 @@ export class Agent {
     if (channelName !== "imessage") return 0;
     const ms = config.imessageInboundSettleMs;
     return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+
+  private messageBatchMaxSettleMs(channelName: string): number {
+    if (channelName !== "imessage") return 0;
+    const ms = config.imessageInboundMaxSettleMs;
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+
+  private logImessageReceipt(
+    sessionKey: string,
+    message: IncomingMessage,
+    receivedAt: number,
+    batchSize: number,
+    settleMs: number,
+    maxSettleMs: number,
+  ): void {
+    const previousReceivedAt = this.lastImessageReceiptAt.get(sessionKey);
+    this.lastImessageReceiptAt.set(sessionKey, receivedAt);
+
+    const providerLagMs = Number.isFinite(message.timestamp) ? receivedAt - message.timestamp : undefined;
+    log.debug({
+      sessionKey,
+      messageId: message.id,
+      receivedAt,
+      receivedAtIso: new Date(receivedAt).toISOString(),
+      providerTimestamp: message.timestamp,
+      providerLagMs,
+      interReceiptMs: previousReceivedAt === undefined ? undefined : receivedAt - previousReceivedAt,
+      batchSize,
+      settleMs,
+      maxSettleMs: maxSettleMs > 0 ? maxSettleMs : undefined,
+    }, "iMessage inbound fragment received");
   }
 
   private async waitForBatchSettle(sessionKey: string): Promise<void> {

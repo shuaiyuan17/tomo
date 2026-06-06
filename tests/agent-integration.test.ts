@@ -188,6 +188,7 @@ const { mockConfig } = vi.hoisted(() => ({
     imessagePassword: "",
     imessageWebhookPort: 3100,
     imessageInboundSettleMs: 0,
+    imessageInboundMaxSettleMs: 0,
     sessionModelOverrides: {} as Record<string, string>,
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
@@ -1542,7 +1543,7 @@ describe("chat commands", () => {
 describe("message queueing", () => {
   it("settles split iMessage text and media fragments before starting a turn", async () => {
     vi.useFakeTimers();
-    resetConfig({ imessageInboundSettleMs: 750 });
+    resetConfig({ imessageInboundSettleMs: 1500, imessageInboundMaxSettleMs: 5000 });
 
     const agent = new Agent();
     const im = new MockChannel("imessage");
@@ -1561,7 +1562,7 @@ describe("message queueing", () => {
       text: "what do you think?",
     }));
 
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(1000);
     await im.simulateMessage(makeMsg({
       id: "im-image",
       chatId,
@@ -1569,7 +1570,7 @@ describe("message queueing", () => {
       images: [{ data: Buffer.from("image").toString("base64"), mediaType: "image/jpeg" }],
     }));
 
-    await vi.advanceTimersByTimeAsync(749);
+    await vi.advanceTimersByTimeAsync(1499);
     expect(turnTexts).toHaveLength(0);
 
     await vi.advanceTimersByTimeAsync(1);
@@ -1581,6 +1582,42 @@ describe("message queueing", () => {
     expect(turnTexts[0]).toContain("[Sent an image]");
     expect(mockUserContents[0].some((block) => block.type === "image")).toBe(true);
     expect(im.delivered).toHaveLength(1);
+
+    await agent.stop();
+  });
+
+  it("caps continuously extended iMessage settle windows", async () => {
+    vi.useFakeTimers();
+    resetConfig({ imessageInboundSettleMs: 1500, imessageInboundMaxSettleMs: 2500 });
+
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const turnTexts: string[] = [];
+    mockResponseFn = (text) => {
+      turnTexts.push(text);
+      return "reply";
+    };
+
+    const chatId = "iMessage;-;+15551234567";
+    await im.simulateMessage(makeMsg({ id: "im-1", chatId, text: "first" }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await im.simulateMessage(makeMsg({ id: "im-2", chatId, text: "second" }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await im.simulateMessage(makeMsg({ id: "im-3", chatId, text: "third" }));
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(turnTexts).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await drainQueue(agent);
+
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("User sent 3 messages in quick succession");
+    expect(turnTexts[0]).toContain("first");
+    expect(turnTexts[0]).toContain("second");
+    expect(turnTexts[0]).toContain("third");
 
     await agent.stop();
   });

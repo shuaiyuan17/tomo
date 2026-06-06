@@ -9,6 +9,8 @@ export const TOMO_HOME = join(HOME, ".tomo");
 export const CONFIG_PATH = join(TOMO_HOME, "config.json");
 export const CONFIG_BACKUP_PATH = join(TOMO_HOME, "config.json.bak");
 export const RESTART_REASON_FILE = join(TOMO_HOME, "data", ".restart-reason");
+const DEFAULT_IMESSAGE_INBOUND_SETTLE_MS = 1500;
+const DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS = 5000;
 
 export interface IdentityConfig {
   name: string;
@@ -55,6 +57,8 @@ interface TomoConfig {
   imessageWebhookPort: number;
   /** Delay before processing inbound iMessage bursts, so split text/link/media fragments coalesce. */
   imessageInboundSettleMs: number;
+  /** Maximum total delay for one continuously extended iMessage inbound burst. */
+  imessageInboundMaxSettleMs: number;
   sessionModelOverrides: Record<string, string>;
   /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
   channelAllowlists: Record<string, string[]>;
@@ -87,6 +91,11 @@ function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig |
     baseUrl,
     apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? r.apiKey ?? "").trim(),
   };
+}
+
+function parseNonNegativeMs(raw: unknown, fallback: number): number {
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : fallback;
 }
 
 function parseLcmConfig(raw: unknown): LcmConfig {
@@ -167,10 +176,17 @@ function buildConfig(): TomoConfig {
     (channels.imessage?.webhookPort as string | undefined) ??
     "3100",
   );
-  const imessageInboundSettleMs = Number(
+  const imessageInboundSettleMs = parseNonNegativeMs(
     process.env.IMESSAGE_INBOUND_SETTLE_MS ??
     (channels.imessage?.inboundSettleMs as string | number | undefined) ??
-    "750",
+    DEFAULT_IMESSAGE_INBOUND_SETTLE_MS,
+    DEFAULT_IMESSAGE_INBOUND_SETTLE_MS,
+  );
+  const imessageInboundMaxSettleMs = parseNonNegativeMs(
+    process.env.IMESSAGE_INBOUND_MAX_SETTLE_MS ??
+    (channels.imessage?.inboundMaxSettleMs as string | number | undefined) ??
+    DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
+    DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
   );
 
   // At least one channel must be configured
@@ -210,9 +226,8 @@ function buildConfig(): TomoConfig {
     imessageUrl,
     imessagePassword,
     imessageWebhookPort,
-    imessageInboundSettleMs: Number.isFinite(imessageInboundSettleMs) && imessageInboundSettleMs >= 0
-      ? Math.floor(imessageInboundSettleMs)
-      : 750,
+    imessageInboundSettleMs,
+    imessageInboundMaxSettleMs,
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
     channelAllowlists: parseAllowlists(channels),
     passiveGroups: parsePassiveGroups(channels),

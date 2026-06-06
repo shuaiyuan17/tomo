@@ -30,6 +30,11 @@ export interface LcmConfig {
    *  rollup so mid-day compacts don't wipe warm short-term texture. Counts SDK
    *  events (one tool round = multiple events), not user-typed messages. */
   dailyFreshTail: number;
+  /** When true, the fresh tail is kept GLOBALLY (newest N conversational turns
+   *  across all days) instead of only for today's rollup — so a new day doesn't
+   *  cold-start with summaries only. N reuses `dailyFreshTail`. Default false
+   *  (preserves the today-only behavior). */
+  globalFreshTail: boolean;
 }
 
 export interface LiteLlmConfig {
@@ -114,6 +119,7 @@ function parseLcmConfig(raw: unknown): LcmConfig {
     nudgeResetPct: validHigh && validLow ? nudgeReset : (validHigh ? Math.max(0, nudgeAt - 10) : 60),
     groupCompactStyle: style,
     dailyFreshTail: validTail ? tail : 32,
+    globalFreshTail: r.globalFreshTail === true,
   };
 }
 

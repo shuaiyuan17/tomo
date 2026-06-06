@@ -4,10 +4,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 // module so tests don't need a populated ~/.tomo/config.json or channel env
 // vars (CI has neither, so the real buildConfig() throws at import).
 vi.mock("../src/config.js", () => ({
-  config: { lcm: { dailyFreshTail: 32 } },
+  config: { lcm: { dailyFreshTail: 32, globalFreshTail: false } },
 }));
 
-import { resolveBlockRange, findDuePromotions } from "../src/lcm/blocks.js";
+import { resolveBlockRange, findDuePromotions, isWarmTailCandidate, globalFreshTailStartIdx } from "../src/lcm/blocks.js";
+import { config as mockedConfig } from "../src/config.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
@@ -23,6 +24,19 @@ function mkEvent(day: string, hour: number, role: "user" | "assistant", extra: R
     type: role,
     uuid: randomUUID(),
     timestamp: ts,
+    ...extra,
+  };
+}
+
+// Build a candidate (real conversational) event with text content.
+function mkTextEvent(day: string, hour: number, role: "user" | "assistant", text: string, extra: Record<string, any> = {}) {
+  const [y, m, d] = day.split("-").map(Number);
+  const ts = new Date(y, m - 1, d, hour, 0, 0).toISOString();
+  return {
+    type: role,
+    uuid: randomUUID(),
+    timestamp: ts,
+    message: { role, content: text },
     ...extra,
   };
 }
@@ -208,5 +222,138 @@ describe("findDuePromotions — past-day nudging", () => {
     const due = findDuePromotions(sessionId);
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeUndefined();
+  });
+});
+
+describe("isWarmTailCandidate — classifier", () => {
+  const stamp = "[imessage · Fri 06/05 22:18 PDT]";
+  it("counts a real user message", () => {
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: `${stamp} 🧱做好了` } } as any)).toBe(true);
+  });
+  it("counts a coalesced real-message turn", () => {
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: `${stamp} [User sent 2 messages in quick succession] hi` } } as any)).toBe(true);
+  });
+  it("rejects a cron turn (System: after the stamp)", () => {
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: `${stamp} System: Scheduled task "daily-backup" triggered.` } } as any)).toBe(false);
+  });
+  it("rejects a continuity heartbeat (raw System:)", () => {
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: "System: It is Fri, Jun 5, 22:22 PDT. Weather outside ..." } } as any)).toBe(false);
+  });
+  it("rejects a tool_result-only user turn (no text)", () => {
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "..." }] } } as any)).toBe(false);
+  });
+  it("counts an assistant text reply", () => {
+    expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "好的 🦀" }] } } as any)).toBe(true);
+  });
+  it("rejects a tool_use-only assistant turn (no text)", () => {
+    expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "x", name: "Bash", input: {} }] } } as any)).toBe(false);
+  });
+  it("rejects compact summaries and non-conv events", () => {
+    expect(isWarmTailCandidate({ type: "user", isCompactSummary: true, message: { role: "user", content: "[daily ...]" } } as any)).toBe(false);
+    expect(isWarmTailCandidate({ type: "system" } as any)).toBe(false);
+  });
+});
+
+describe("globalFreshTailStartIdx", () => {
+  it("returns events.length when no candidates", () => {
+    const evs = [{ type: "system" }, { type: "user", message: { role: "user", content: [{ type: "tool_result" }] } }] as any[];
+    expect(globalFreshTailStartIdx(evs, 4)).toBe(evs.length);
+  });
+  it("returns the oldest candidate index when candidates <= N", () => {
+    const evs = [
+      { type: "user", message: { role: "user", content: "[imessage · x] a" } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "b" }] } },
+    ] as any[];
+    expect(globalFreshTailStartIdx(evs, 4)).toBe(0);
+  });
+  it("returns the Nth-newest candidate index, counting only candidates", () => {
+    // candidates at idx 0,2,3 (idx1 is a tool_result = non-candidate)
+    const evs = [
+      { type: "user", message: { role: "user", content: "[imessage · x] a" } },       // 0 cand
+      { type: "user", message: { role: "user", content: [{ type: "tool_result" }] } }, // 1 non-cand
+      { type: "user", message: { role: "user", content: "[imessage · x] b" } },       // 2 cand
+      { type: "user", message: { role: "user", content: "[imessage · x] c" } },       // 3 cand
+    ] as any[];
+    // N=2 → 2nd-newest candidate is idx 2
+    expect(globalFreshTailStartIdx(evs, 2)).toBe(2);
+  });
+});
+
+describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
+  let sessionId: string;
+  let archivePath: string;
+
+  beforeEach(() => {
+    sessionId = `test-blocks-global-${randomUUID()}`;
+    (mockedConfig as any).lcm.globalFreshTail = true;
+    (mockedConfig as any).lcm.dailyFreshTail = 4; // small N for readable tests
+  });
+
+  afterEach(() => {
+    (mockedConfig as any).lcm.globalFreshTail = false;
+    (mockedConfig as any).lcm.dailyFreshTail = 32;
+    if (archivePath && existsSync(archivePath)) unlinkSync(archivePath);
+  });
+
+  it("keeps the newest N conversational turns warm across a PAST day", () => {
+    // 10 candidate events on a past day, N=4 → compact 6, keep newest 4 raw.
+    // (Today-only behavior would compact all 10 for a past day.)
+    const pastDay = "2026-04-15";
+    const events: any[] = [];
+    for (let i = 0; i < 10; i++) {
+      events.push(mkTextEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] msg ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const result = resolveBlockRange(sessionId, "daily", pastDay);
+    expect(result).not.toBeNull();
+    expect(result!.description).toContain("6 events");
+    expect(result!.description).toContain("4 most-recent events kept raw");
+  });
+
+  it("returns null for a past day entirely within the global warm window", () => {
+    // Only 3 candidates total, N=4 → all warm → nothing to promote yet.
+    const pastDay = "2026-04-16";
+    const events: any[] = [];
+    for (let i = 0; i < 3; i++) {
+      events.push(mkTextEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] m ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    expect(resolveBlockRange(sessionId, "daily", pastDay)).toBeNull();
+  });
+
+  it("findDuePromotions does NOT nudge while a past day's raw is inside the warm window", () => {
+    // 3 candidates total (≤ N=4) → all warm → no nudge (would be a re-nudge loop).
+    const pastDay = "2026-04-16";
+    const events: any[] = [];
+    for (let i = 0; i < 3; i++) {
+      events.push(mkTextEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] m ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "daily" && d.period === pastDay)).toBeUndefined();
+  });
+
+  it("findDuePromotions DOES nudge once newer turns push the past day out of the window (GC trigger)", () => {
+    // Past day has 6 candidates; a later day adds 4 more (= N). The past day's
+    // events now fall outside the newest-4 window → should be flagged for rollup.
+    const pastDay = "2026-04-16";
+    const laterDay = "2026-04-18";
+    const events: any[] = [];
+    for (let i = 0; i < 6; i++) {
+      events.push(mkTextEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] old ${i}`));
+    }
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent(laterDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
+    expect(dailyDue).toBeDefined();
+    // All 6 of the past day's raw are outside the newest-4 window.
+    expect(dailyDue!.childCount).toBe(6);
   });
 });

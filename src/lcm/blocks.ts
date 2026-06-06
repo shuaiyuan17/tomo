@@ -89,6 +89,72 @@ function dailyFreshTail(): number {
   return config.lcm.dailyFreshTail;
 }
 
+/** Concatenate text-block content from an event (SDK or simple shape). */
+function extractText(e: SdkEvent): string {
+  const c = e.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c
+      .filter((b) => b && typeof b === "object" && b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("");
+  }
+  return "";
+}
+
+/**
+ * Is this event a real CONVERSATIONAL turn — something the user actually said,
+ * or an assistant text reply — as opposed to a system/heartbeat/cron injection
+ * or pure tool machinery (tool_result user turns, tool_use-only assistant turns)?
+ *
+ * Used to COUNT the global fresh tail window (the newest N such turns). Retention
+ * is positional from the Nth-newest candidate, so non-candidate events that fall
+ * inside the retained suffix are still kept (chain continuity) — they just don't
+ * advance the count.
+ *
+ * Classification (verified against real SDK session shapes 2026-06-05):
+ *   - real user msg:   "[imessage · Fri 06/05 22:18 PDT] 🧱做好了"            → candidate
+ *   - coalesced msgs:  "[imessage · …] [User sent 2 messages in quick succ…]" → candidate (real text)
+ *   - cron:            "[imessage · …] System: Scheduled task …"             → NOT (System: after prefix)
+ *   - continuity beat: "System: It is Fri … Weather …"                       → NOT (raw System:)
+ *   - tool_result turn: user event with no text block                        → NOT (machinery)
+ *   - tool_use-only assistant turn: no text                                  → NOT (machinery)
+ */
+export function isWarmTailCandidate(e: SdkEvent): boolean {
+  if (e.type !== "user" && e.type !== "assistant") return false;
+  if (e.isCompactSummary) return false;
+  const text = extractText(e);
+  if (e.type === "assistant") {
+    // A real reply has text; pure tool_use turns are machinery.
+    return text.trim().length > 0;
+  }
+  // user event
+  if (!text) return false; // tool_result-only turn = machinery
+  // Strip an optional leading "[channel · weekday MM/DD HH:MM TZ] " stamp, then
+  // a System: prefix means heartbeat/cron (both injected, not conversation).
+  const stripped = text.replace(/^\[[^\]]*\]\s*/, "");
+  if (stripped.startsWith("System:")) return false;
+  return true;
+}
+
+/**
+ * Global index where the warm tail begins: the index of the Nth-newest
+ * warm-tail-candidate event. Everything at this index or later (candidates plus
+ * interleaved machinery/system events) is the retained contiguous suffix.
+ * Returns events.length when there's nothing to keep (n<=0 or no candidates) so
+ * callers treat the tail as empty.
+ */
+export function globalFreshTailStartIdx(events: SdkEvent[], n: number): number {
+  if (n <= 0) return events.length;
+  const candidateIdx: number[] = [];
+  for (let i = 0; i < events.length; i++) {
+    if (isWarmTailCandidate(events[i])) candidateIdx.push(i);
+  }
+  if (candidateIdx.length === 0) return events.length;
+  if (candidateIdx.length <= n) return candidateIdx[0];
+  return candidateIdx[candidateIdx.length - n];
+}
+
 /**
  * Resolve the event range for a given rollup level + optional explicit period.
  * Returns null if there's nothing to compact (no matching events / children).
@@ -136,7 +202,29 @@ export function resolveBlockRange(
   // with ≤ tail raw events can never be rolled up and stays forever in the
   // hot context as un-promoted raw events.
   let effectiveMatches = matches;
-  if (level === "daily" && resolvedPeriod === localDateTag(new Date())) {
+  if (level === "daily" && config.lcm.globalFreshTail) {
+    // Global fresh tail: keep the newest N conversational turns warm across ALL
+    // days (not just today), so a new day doesn't cold-start with summaries only.
+    // The tail start is a session-global boundary; this day's raw is compacted
+    // only up to (not into) that boundary. When the boundary later advances past
+    // this day's leftovers, a rebuild rollup (triggered by findDuePromotions,
+    // which uses the same boundary) absorbs them — that's the "GC" path.
+    const tailStart = globalFreshTailStartIdx(events, dailyFreshTail());
+    const rawOutsideTail = matches.filter(
+      (idx) => !events[idx].isCompactSummary && idx < tailStart,
+    );
+    if (rawOutsideTail.length === 0) {
+      // All of this day's raw is within the global warm tail → nothing to promote.
+      if (!matches.some((idx) => events[idx].isCompactSummary)) {
+        return null;
+      }
+      effectiveMatches = matches.filter((idx) => events[idx].isCompactSummary);
+    } else {
+      effectiveMatches = matches.filter(
+        (idx) => idx < tailStart || events[idx].isCompactSummary,
+      );
+    }
+  } else if (level === "daily" && resolvedPeriod === localDateTag(new Date())) {
     const tail = dailyFreshTail();
     const rawOnly = matches.filter((idx) => !events[idx].isCompactSummary);
     if (rawOnly.length <= tail) {
@@ -356,11 +444,23 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
   const FLOOR_WITH_BLOCK = 8;   // block exists — only nudge if meaningful leftover
   const FLOOR_WITHOUT_BLOCK = 1; // no block — any raw event is a reason to nudge
 
+  // With the global fresh tail on, raw events inside the warm-tail suffix are
+  // intentionally kept un-promoted — they must NOT trigger a daily nudge (else
+  // we'd re-nudge forever while they sit warm). Once the boundary advances past
+  // them, they fall outside the suffix and DO get counted → the rollup rebuild
+  // absorbs them. So this single boundary check is both the no-nudge guard and
+  // the GC trigger.
+  const tailStart = config.lcm.globalFreshTail
+    ? globalFreshTailStartIdx(events, dailyFreshTail())
+    : events.length;
+
   const rawDays = new Map<string, number>();
-  for (const e of events) {
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
     if (e.type !== "user" && e.type !== "assistant") continue;
     if (e.isCompactSummary) continue;
     if (!e.timestamp) continue;
+    if (i >= tailStart) continue; // inside the global warm tail → not due
     const day = localDateTag(new Date(e.timestamp));
     if (day !== currentDay) {
       rawDays.set(day, (rawDays.get(day) ?? 0) + 1);

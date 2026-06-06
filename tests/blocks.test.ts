@@ -253,6 +253,9 @@ describe("isWarmTailCandidate — classifier", () => {
   it("counts an assistant text reply", () => {
     expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "好的 🦀" }] } } as any)).toBe(true);
   });
+  it("rejects an assistant silent housekeeping reply", () => {
+    expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] } } as any)).toBe(false);
+  });
   it("rejects a tool_use-only assistant turn (no text)", () => {
     expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "x", name: "Bash", input: {} }] } } as any)).toBe(false);
   });
@@ -387,6 +390,40 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
 
     const due = findDuePromotions(sessionId);
     expect(due.find((d) => d.level === "weekly")).toBeUndefined();
+  });
+
+  it("does NOT promote a week when any daily child in that week is still warm-partial", () => {
+    // One complete daily child plus one partial daily child in the same week.
+    // The week must wait; otherwise resolveBlockRange("weekly") would absorb
+    // the partial child too and the weekly block would never rebuild.
+    const completeDay = "2026-04-07";
+    const partialDay = "2026-04-08"; // both ISO week 2026-W15
+    const events: any[] = [
+      {
+        type: "user",
+        uuid: randomUUID(),
+        timestamp: new Date(2026, 3, 7, 1, 0, 0).toISOString(),
+        isCompactSummary: true,
+        blockTag: `daily ${completeDay}`,
+        message: { role: "user", content: `[daily ${completeDay} — 40 events summarized]\n\nfull` },
+      },
+      {
+        type: "user",
+        uuid: randomUUID(),
+        timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+        isCompactSummary: true,
+        blockTag: `daily ${partialDay}`,
+        message: { role: "user", content: `[daily ${partialDay} — 40 events summarized]\n\nearly` },
+      },
+    ];
+    for (let i = 0; i < 2; i++) {
+      events.push(mkTextEvent(partialDay, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] warm ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeUndefined();
+    expect(resolveBlockRange(sessionId, "weekly", "2026-W15")).toBeNull();
   });
 
   it("DOES promote a complete daily block to its week (no remaining raw)", () => {

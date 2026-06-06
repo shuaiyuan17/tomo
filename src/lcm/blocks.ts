@@ -126,7 +126,11 @@ export function isWarmTailCandidate(e: SdkEvent): boolean {
   const text = extractText(e);
   if (e.type === "assistant") {
     // A real reply has text; pure tool_use turns are machinery.
-    return text.trim().length > 0;
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    // Housekeeping cron/rollup/heartbeat turns often resolve silently.
+    if (/^NO_REPLY$/i.test(trimmed)) return false;
+    return true;
   }
   // user event
   if (!text) return false; // tool_result-only turn = machinery
@@ -165,6 +169,41 @@ export function globalFreshTailStartIdx(events: SdkEvent[], n: number): number {
   return candidateIdx[candidateIdx.length - n];
 }
 
+function monthForIsoWeekTag(weekTag: string): string | null {
+  const m = /^(\d{4})-W(\d{2})$/.exec(weekTag);
+  if (!m) return null;
+  return localMonthTag(isoWeekThursday(Number(m[1]), Number(m[2])));
+}
+
+function warmSuffixParentPeriods(events: SdkEvent[], tailStart: number): {
+  weeks: Set<string>;
+  months: Set<string>;
+  years: Set<string>;
+} {
+  const weeks = new Set<string>();
+  const months = new Set<string>();
+  const years = new Set<string>();
+
+  for (let i = tailStart; i < events.length; i++) {
+    const e = events[i];
+    if (e.type !== "user" && e.type !== "assistant") continue;
+    if (e.isCompactSummary) continue;
+    if (!e.timestamp) continue;
+
+    const day = localDateTag(new Date(e.timestamp));
+    const week = isoWeekTag(new Date(day + "T12:00:00"));
+    weeks.add(week);
+
+    const month = monthForIsoWeekTag(week);
+    if (month) {
+      months.add(month);
+      years.add(month.slice(0, 4));
+    }
+  }
+
+  return { weeks, months, years };
+}
+
 /**
  * Resolve the event range for a given rollup level + optional explicit period.
  * Returns null if there's nothing to compact (no matching events / children).
@@ -191,6 +230,18 @@ export function resolveBlockRange(
 
   const resolvedPeriod = period ?? defaultPeriod(level);
   const tag = `${level} ${resolvedPeriod}`;
+
+  if (config.lcm.globalFreshTail && level !== "daily") {
+    const tailStart = globalFreshTailStartIdx(events, dailyFreshTail());
+    const warmPeriods = warmSuffixParentPeriods(events, tailStart);
+    if (
+      (level === "weekly" && warmPeriods.weeks.has(resolvedPeriod)) ||
+      (level === "monthly" && warmPeriods.months.has(resolvedPeriod)) ||
+      (level === "yearly" && warmPeriods.years.has(resolvedPeriod))
+    ) {
+      return null;
+    }
+  }
 
   // Find source events to compact for this level.
   const matches: number[] = []; // global indices
@@ -394,11 +445,11 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     ? globalFreshTailStartIdx(events, dailyFreshTail())
     : events.length;
 
-  // Days that have raw events still INSIDE the global warm suffix. A daily block
-  // for such a day is partial *by design* (its newest turns are intentionally
-  // kept warm, not yet summarized), so it must NOT be promoted to its parent
-  // week — else the weekly would summarize an incomplete day and never re-run
-  // (haveTags) after the daily block later rebuilds to absorb the aged-out raw.
+  // Parent periods that still contain raw events INSIDE the global warm suffix.
+  // Child blocks in such periods are partial *by design* (their newest turns are
+  // intentionally kept warm, not yet summarized), so they must NOT be promoted
+  // upward — else the parent would summarize an incomplete child and never
+  // re-run (haveTags) after the child later rebuilds to absorb the aged-out raw.
   //
   // Scope to in-suffix raw ONLY (not all raw): aged-out leftover raw must NOT
   // block weekly, or we'd deadlock — the daily path suppresses sub-floor
@@ -407,14 +458,7 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
   // tolerated (weekly promotes a near-complete block) exactly as in the
   // today-only path. Under flag-off, tailStart=length → this set is empty →
   // default behavior fully preserved.
-  const daysWarmInSuffix = new Set<string>();
-  for (let i = tailStart; i < events.length; i++) {
-    const e = events[i];
-    if (e.type !== "user" && e.type !== "assistant") continue;
-    if (e.isCompactSummary) continue;
-    if (!e.timestamp) continue;
-    daysWarmInSuffix.add(localDateTag(new Date(e.timestamp)));
-  }
+  const warmPeriods = warmSuffixParentPeriods(events, tailStart);
 
   // Candidate periods: for each source block, derive its parent period.
   const weeklyChildrenByWeek = new Map<string, number>();
@@ -427,9 +471,9 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
 
     let m = /^daily (\d{4}-\d{2}-\d{2})$/.exec(tag);
     if (m) {
-      // Skip blocks whose day is still warm-by-design (raw inside the suffix).
-      if (daysWarmInSuffix.has(m[1])) continue;
       const wk = isoWeekTag(new Date(m[1] + "T12:00:00"));
+      // Skip the whole week while any raw in that week is still warm-by-design.
+      if (warmPeriods.weeks.has(wk)) continue;
       if (wk !== currentWeek) {
         weeklyChildrenByWeek.set(wk, (weeklyChildrenByWeek.get(wk) ?? 0) + 1);
       }
@@ -439,6 +483,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     if (m) {
       const thursday = isoWeekThursday(Number(m[1]), Number(m[2]));
       const month = localMonthTag(thursday);
+      // Skip the whole month while any raw in a child week is still warm.
+      if (warmPeriods.months.has(month)) continue;
       if (month !== currentMonth) {
         monthlyChildrenByMonth.set(month, (monthlyChildrenByMonth.get(month) ?? 0) + 1);
       }
@@ -447,6 +493,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     m = /^monthly (\d{4})-\d{2}$/.exec(tag);
     if (m) {
       const year = m[1];
+      // Skip the whole year while any raw in a child month is still warm.
+      if (warmPeriods.years.has(year)) continue;
       if (year !== currentYear) {
         yearlyChildrenByYear.set(year, (yearlyChildrenByYear.get(year) ?? 0) + 1);
       }

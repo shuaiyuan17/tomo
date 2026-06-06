@@ -25,6 +25,7 @@ type MockResponse = string | MockResponseBlock[];
  *  — the SDK only fires `result` once at the end). */
 let mockResponseFn: (text: string) => MockResponse | Promise<MockResponse> = () => "mock response";
 let mockEmitStreamDeltas = true;
+let mockUserContents: Array<Array<{ type: string; text?: string }>> = [];
 
 /** Track in-flight mock queries so tests can assert no concurrency */
 const queryState = {
@@ -54,6 +55,7 @@ function createMockQuery(prompt: AsyncGenerator) {
         const content = (userMsg as { message?: { content?: Array<{ type: string; text?: string }> } })
           ?.message?.content;
         if (Array.isArray(content)) {
+          mockUserContents.push(content);
           for (const block of content) {
             if (block.type === "text") text += block.text;
           }
@@ -185,6 +187,7 @@ const { mockConfig } = vi.hoisted(() => ({
     imessageUrl: "",
     imessagePassword: "",
     imessageWebhookPort: 3100,
+    imessageInboundSettleMs: 0,
     sessionModelOverrides: {} as Record<string, string>,
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
@@ -389,10 +392,12 @@ beforeEach(() => {
   resetConfig();
   mockResponseFn = () => "mock response";
   mockEmitStreamDeltas = true;
+  mockUserContents = [];
   queryState.reset();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -1535,6 +1540,51 @@ describe("chat commands", () => {
 // ===== Message queueing =====
 
 describe("message queueing", () => {
+  it("settles split iMessage text and media fragments before starting a turn", async () => {
+    vi.useFakeTimers();
+    resetConfig({ imessageInboundSettleMs: 750 });
+
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const turnTexts: string[] = [];
+    mockResponseFn = (text) => {
+      turnTexts.push(text);
+      return "reply";
+    };
+
+    const chatId = "iMessage;-;+15551234567";
+    await im.simulateMessage(makeMsg({
+      id: "im-text",
+      chatId,
+      text: "what do you think?",
+    }));
+
+    await vi.advanceTimersByTimeAsync(500);
+    await im.simulateMessage(makeMsg({
+      id: "im-image",
+      chatId,
+      text: "[Sent an image]",
+      images: [{ data: Buffer.from("image").toString("base64"), mediaType: "image/jpeg" }],
+    }));
+
+    await vi.advanceTimersByTimeAsync(749);
+    expect(turnTexts).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await drainQueue(agent);
+
+    expect(turnTexts).toHaveLength(1);
+    expect(turnTexts[0]).toContain("User sent 2 messages in quick succession");
+    expect(turnTexts[0]).toContain("what do you think?");
+    expect(turnTexts[0]).toContain("[Sent an image]");
+    expect(mockUserContents[0].some((block) => block.type === "image")).toBe(true);
+    expect(im.delivered).toHaveLength(1);
+
+    await agent.stop();
+  });
+
   it("coalesces concurrent DM messages into one turn", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

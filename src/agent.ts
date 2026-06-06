@@ -43,6 +43,8 @@ export class Agent {
   // coalesced into one user turn. Keyed by sessionKey. Drained by the next
   // queued task; later tasks find nothing and no-op.
   private pendingBatches = new Map<string, Array<{ channel: Channel; message: IncomingMessage }>>();
+  private pendingBatchSettleUntil = new Map<string, number>();
+  private pendingBatchDrainScheduled = new Set<string>();
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
@@ -185,21 +187,62 @@ export class Agent {
     batch.push({ channel, message });
     this.pendingBatches.set(sessionKey, batch);
 
-    this.enqueueForSession(sessionKey, async () => {
-      const items = this.pendingBatches.get(sessionKey);
-      if (!items || items.length === 0) return;
-      this.pendingBatches.delete(sessionKey);
+    const settleMs = this.messageBatchSettleMs(channel.name);
+    if (settleMs <= 0) {
+      this.enqueueBatchDrain(sessionKey);
+      return;
+    }
 
-      if (items.length === 1) {
-        await this.handleMessage(items[0].channel, items[0].message);
-      } else {
-        log.info(
-          { sessionKey, count: items.length },
-          `Coalescing ${items.length} queued messages into one turn`,
-        );
-        await this.handleBatchedMessages(items);
-      }
+    this.pendingBatchSettleUntil.set(sessionKey, Date.now() + settleMs);
+    if (this.pendingBatchDrainScheduled.has(sessionKey)) return;
+
+    this.pendingBatchDrainScheduled.add(sessionKey);
+    this.enqueueForSession(sessionKey, async () => {
+      await this.waitForBatchSettle(sessionKey);
+      this.pendingBatchSettleUntil.delete(sessionKey);
+      this.pendingBatchDrainScheduled.delete(sessionKey);
+      await this.drainPendingBatch(sessionKey);
     }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+  }
+
+  private messageBatchSettleMs(channelName: string): number {
+    if (channelName !== "imessage") return 0;
+    const ms = config.imessageInboundSettleMs;
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+
+  private async waitForBatchSettle(sessionKey: string): Promise<void> {
+    while (true) {
+      const settleUntil = this.pendingBatchSettleUntil.get(sessionKey);
+      if (!settleUntil) return;
+
+      const delay = settleUntil - Date.now();
+      if (delay <= 0) return;
+
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  private enqueueBatchDrain(sessionKey: string): void {
+    this.enqueueForSession(sessionKey, () => this.drainPendingBatch(sessionKey))
+      .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+  }
+
+  private async drainPendingBatch(sessionKey: string): Promise<void> {
+    const items = this.pendingBatches.get(sessionKey);
+    if (!items || items.length === 0) return;
+    this.pendingBatches.delete(sessionKey);
+
+    if (items.length === 1) {
+      await this.handleMessage(items[0].channel, items[0].message);
+      return;
+    }
+
+    log.info(
+      { sessionKey, count: items.length },
+      `Coalescing ${items.length} queued messages into one turn`,
+    );
+    await this.handleBatchedMessages(items);
   }
 
   private backupConfig(): void {

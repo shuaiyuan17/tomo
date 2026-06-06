@@ -53,6 +53,8 @@ interface TomoConfig {
   imessageUrl: string;
   imessagePassword: string;
   imessageWebhookPort: number;
+  /** Delay before processing inbound iMessage bursts, so split text/link/media fragments coalesce. */
+  imessageInboundSettleMs: number;
   sessionModelOverrides: Record<string, string>;
   /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
   channelAllowlists: Record<string, string[]>;
@@ -165,6 +167,11 @@ function buildConfig(): TomoConfig {
     (channels.imessage?.webhookPort as string | undefined) ??
     "3100",
   );
+  const imessageInboundSettleMs = Number(
+    process.env.IMESSAGE_INBOUND_SETTLE_MS ??
+    (channels.imessage?.inboundSettleMs as string | number | undefined) ??
+    "750",
+  );
 
   // At least one channel must be configured
   if (!telegramToken && !imessageUrl) {
@@ -203,6 +210,9 @@ function buildConfig(): TomoConfig {
     imessageUrl,
     imessagePassword,
     imessageWebhookPort,
+    imessageInboundSettleMs: Number.isFinite(imessageInboundSettleMs) && imessageInboundSettleMs >= 0
+      ? Math.floor(imessageInboundSettleMs)
+      : 750,
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
     channelAllowlists: parseAllowlists(channels),
     passiveGroups: parsePassiveGroups(channels),

@@ -389,20 +389,31 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     if (e.isCompactSummary && e.blockTag) haveTags.add(e.blockTag);
   }
 
-  // Days that still have ANY raw (non-summary) user/assistant events present —
-  // including raw intentionally kept warm by the global fresh tail. A daily
-  // block for such a day is PARTIAL (its newest turns aren't summarized yet), so
-  // it must NOT be promoted to its parent week: a weekly rollup would summarize
-  // the partial block and then never re-run (haveTags) even after the daily
-  // block later rebuilds to absorb the aged-out raw. Gate weekly eligibility on
-  // "day fully promoted." (No-op under today-only behavior: past days have no
-  // remaining raw, so they're never in this set.)
-  const daysWithRaw = new Set<string>();
-  for (const e of events) {
+  // Global fresh tail boundary (events.length when the flag is off → inert).
+  const tailStart = config.lcm.globalFreshTail
+    ? globalFreshTailStartIdx(events, dailyFreshTail())
+    : events.length;
+
+  // Days that have raw events still INSIDE the global warm suffix. A daily block
+  // for such a day is partial *by design* (its newest turns are intentionally
+  // kept warm, not yet summarized), so it must NOT be promoted to its parent
+  // week — else the weekly would summarize an incomplete day and never re-run
+  // (haveTags) after the daily block later rebuilds to absorb the aged-out raw.
+  //
+  // Scope to in-suffix raw ONLY (not all raw): aged-out leftover raw must NOT
+  // block weekly, or we'd deadlock — the daily path suppresses sub-floor
+  // (<FLOOR_WITH_BLOCK) rebuilds, so a day with a block + 2 aged-out raw would
+  // be neither daily-due nor weekly-eligible. Sub-floor aged-out residue is
+  // tolerated (weekly promotes a near-complete block) exactly as in the
+  // today-only path. Under flag-off, tailStart=length → this set is empty →
+  // default behavior fully preserved.
+  const daysWarmInSuffix = new Set<string>();
+  for (let i = tailStart; i < events.length; i++) {
+    const e = events[i];
     if (e.type !== "user" && e.type !== "assistant") continue;
     if (e.isCompactSummary) continue;
     if (!e.timestamp) continue;
-    daysWithRaw.add(localDateTag(new Date(e.timestamp)));
+    daysWarmInSuffix.add(localDateTag(new Date(e.timestamp)));
   }
 
   // Candidate periods: for each source block, derive its parent period.
@@ -416,8 +427,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
 
     let m = /^daily (\d{4}-\d{2}-\d{2})$/.exec(tag);
     if (m) {
-      // Skip partial daily blocks (their day still has un-promoted raw).
-      if (daysWithRaw.has(m[1])) continue;
+      // Skip blocks whose day is still warm-by-design (raw inside the suffix).
+      if (daysWarmInSuffix.has(m[1])) continue;
       const wk = isoWeekTag(new Date(m[1] + "T12:00:00"));
       if (wk !== currentWeek) {
         weeklyChildrenByWeek.set(wk, (weeklyChildrenByWeek.get(wk) ?? 0) + 1);
@@ -476,12 +487,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
   // intentionally kept un-promoted — they must NOT trigger a daily nudge (else
   // we'd re-nudge forever while they sit warm). Once the boundary advances past
   // them, they fall outside the suffix and DO get counted → the rollup rebuild
-  // absorbs them. So this single boundary check is both the no-nudge guard and
-  // the GC trigger.
-  const tailStart = config.lcm.globalFreshTail
-    ? globalFreshTailStartIdx(events, dailyFreshTail())
-    : events.length;
-
+  // absorbs them. So the `i >= tailStart` check (tailStart computed above) is
+  // both the no-nudge guard and the GC trigger.
   const rawDays = new Map<string, number>();
   for (let i = 0; i < events.length; i++) {
     const e = events[i];

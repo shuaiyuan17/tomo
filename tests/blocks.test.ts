@@ -405,4 +405,67 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
     const due = findDuePromotions(sessionId);
     expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeDefined();
   });
+
+  it("does NOT deadlock: aged-out sub-floor leftover still lets the week promote", () => {
+    // Block for 2026-04-08 + 2 raw on that day, but 4 NEWER candidates push those
+    // 2 out of the newest-4 window. Aged-out + sub-floor (2<8) → daily not due,
+    // but weekly must NOT be blocked (their raw is no longer in the warm suffix).
+    const day = "2026-04-08";
+    const laterDay = "2026-04-18";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly` },
+    }];
+    for (let i = 0; i < 2; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent(laterDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    // weekly for 2026-W15 should be due (not blocked by aged-out leftovers)
+    expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeDefined();
+  });
+});
+
+describe("findDuePromotions — default-off weekly behavior unchanged", () => {
+  let sessionId: string;
+  let archivePath: string;
+
+  beforeEach(() => {
+    sessionId = `test-blocks-defoff-${randomUUID()}`;
+    // flag stays false (module default) — explicit for clarity
+    (mockedConfig as any).lcm.globalFreshTail = false;
+  });
+  afterEach(() => {
+    if (archivePath && existsSync(archivePath)) unlinkSync(archivePath);
+  });
+
+  it("still promotes a past day's block to its week despite a small (<8) raw leftover", () => {
+    // Regression guard: with the flag OFF, the partial-block weekly gate must be
+    // inert — a past day with a block + a few leftover raw events still promotes
+    // to its week (matches pre-feature behavior).
+    const day = "2026-04-08";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nx` },
+    }];
+    for (let i = 0; i < 3; i++) {
+      events.push(mkEvent(day, 14, i % 2 === 0 ? "user" : "assistant"));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeDefined();
+  });
 });

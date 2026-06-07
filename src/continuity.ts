@@ -3,9 +3,14 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { log } from "./logger.js";
 import type { Agent } from "./agent.js";
+import { runContinuityScript, type ContinuityScriptConfig } from "./continuity-script.js";
 
 const CONTINUITY_INTERVAL_MS = 55 * 60 * 1000; // 55 minutes
-const TRIGGER_FILE = join(homedir(), ".tomo", "continuity.trigger");
+const DEFAULT_TRIGGER_DIR = join(homedir(), ".tomo");
+
+interface ContinuityRunnerOptions {
+  triggerDir?: string;
+}
 
 async function fetchWeather(city: string): Promise<string | null> {
   try {
@@ -22,12 +27,21 @@ async function fetchWeather(city: string): Promise<string | null> {
 export class ContinuityRunner {
   private agent: Agent;
   private city: string | null;
+  private script: ContinuityScriptConfig | null;
+  private triggerDir: string;
   private timer: ReturnType<typeof setInterval> | null = null;
   private watcher: FSWatcher | null = null;
 
-  constructor(agent: Agent, city?: string | null) {
+  constructor(
+    agent: Agent,
+    city?: string | null,
+    script?: ContinuityScriptConfig | null,
+    options: ContinuityRunnerOptions = {},
+  ) {
     this.agent = agent;
     this.city = city ?? null;
+    this.script = script ?? null;
+    this.triggerDir = options.triggerDir ?? DEFAULT_TRIGGER_DIR;
   }
 
   start(): void {
@@ -48,11 +62,11 @@ export class ContinuityRunner {
 
   /** Watch for manual trigger file */
   private watchTrigger(): void {
-    const dir = join(homedir(), ".tomo");
+    const triggerFile = join(this.triggerDir, "continuity.trigger");
     try {
-      this.watcher = watch(dir, (_event, filename) => {
-        if (filename === "continuity.trigger" && existsSync(TRIGGER_FILE)) {
-          try { unlinkSync(TRIGGER_FILE); } catch { /* ignore */ }
+      this.watcher = watch(this.triggerDir, (_event, filename) => {
+        if (filename === "continuity.trigger" && existsSync(triggerFile)) {
+          try { unlinkSync(triggerFile); } catch { /* ignore */ }
           log.info("Continuity manually triggered");
           this.fire();
         }
@@ -82,9 +96,18 @@ export class ContinuityRunner {
       }
     }
 
-    const prompt = `System: It is ${timestamp}.${weatherLine} Read CONTINUITY.md. This is free time — reflect, research, or prepare something useful.`;
+    let scriptLine = "";
+    if (this.script) {
+      scriptLine = `\n\n${await runContinuityScript(this.script)}`;
+    }
 
-    log.info({ city: this.city, weather: weatherLine || "(none)" }, "Continuity heartbeat fired");
+    const prompt = `System: It is ${timestamp}.${weatherLine} Read CONTINUITY.md. This is free time — reflect, research, or prepare something useful.${scriptLine}`;
+
+    log.info({
+      city: this.city,
+      weather: weatherLine || "(none)",
+      script: this.script?.path ?? "(none)",
+    }, "Continuity heartbeat fired");
 
     try {
       await this.agent.handleContinuity(prompt);

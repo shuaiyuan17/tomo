@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Continuity script hook.** `~/.tomo/config.json` can now include an optional `continuityScript` path or object. On each scheduled heartbeat or manual `tomo continuity` trigger, Tomo runs the script once, captures bounded stdout/stderr or failure status, and appends that result to the normal continuity prompt before sending it to the agent.
+
 ## 0.8.1 (2026-06-07)
 
 ### Bug fixes

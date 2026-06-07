@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.1 (2026-06-07)
+
+### Bug fixes
+
+- **Coalesce split iMessage fragments into one turn** (#130). iMessage/BlueBubbles often delivers a single user message as several rapid-fire webhooks (text, then a link preview, then an attachment), which Tomo processed as separate turns. Inbound iMessage bursts now wait a short settle window so the fragments coalesce into a single user turn before the agent runs. The window is configurable via `imessage.inboundSettleMs` / `IMESSAGE_INBOUND_SETTLE_MS` (default 1500ms) with a per-burst ceiling via `imessage.inboundMaxSettleMs` / `IMESSAGE_INBOUND_MAX_SETTLE_MS` (default 5000ms) so a continuously extended burst can't be delayed indefinitely.
+
+### Other
+
+- Bump `@anthropic-ai/claude-agent-sdk` 0.3.161 → 0.3.168 (#133).
+- Bump `@clack/prompts` 1.5.0 → 1.5.1 (#134).
+- Bump dev-dependencies group (#132): `@types/node` 25.9.1 → 25.9.2, `@vitest/coverage-v8` & `vitest` 4.1.7 → 4.1.8, `tsx` 4.22.3 → 4.22.4, `typescript-eslint` 8.60.0 → 8.60.1.
+
 ## 0.8.0 (2026-06-03)
 
 ### Features

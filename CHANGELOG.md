@@ -2,9 +2,12 @@
 
 ## Unreleased
 
+## 0.8.2 (2026-06-08)
+
 ### Features
 
 - **Continuity script hook.** `~/.tomo/config.json` can now include an optional `continuityScript` path or object. On each scheduled heartbeat or manual `tomo continuity` trigger, Tomo runs the script once, captures bounded stdout/stderr or failure status, and appends that result to the normal continuity prompt before sending it to the agent.
+- **LCM global fresh tail (cross-day warm context)** (#131). New `config.lcm.globalFreshTail` (default `false` — today-only behavior unchanged when unset) makes the LCM fresh tail a session-global boundary instead of a per-day one. With it on, the newest N conversational turns stay warm across day boundaries, so a new day starts with warm raw context instead of cold-starting from summaries. Implemented without a `compactSession` API change: daily rollups simply stop their range before the warm suffix, and `findDuePromotions` defers promotion of raw inside the window (serving as both the no-re-nudge guard and the GC trigger). A new `isWarmTailCandidate` classifier counts real user/assistant turns while ignoring cron/heartbeat injections and tool machinery; retention is positional so interleaved events and the `parentUuid` chain are preserved.
 
 ## 0.8.1 (2026-06-07)
 

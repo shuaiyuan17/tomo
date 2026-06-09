@@ -707,26 +707,6 @@ export class Agent {
     };
   }
 
-  /**
-   * If the live session's last turn pushed context past 80%, fire a one-shot
-   * compact nudge (fire-and-forget). Skips when SDK auto-compact owns this
-   * session. Shared by handleMessage and handleBatchedMessages.
-   */
-  private maybeNudgeCompact(key: string): void {
-    const liveSession = this.liveSessions.get(key);
-    const ctx = liveSession?.lastResult;
-    if (!ctx || ctx.contextMax <= 0 || !usesLcmCompact(key)) return;
-    const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
-    if (pct < 80) return;
-    const groupNote = isGroupSessionKey(key)
-      ? " This is a group session — scope the rollup to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
-      : "";
-    this.runWithRetry(
-      key,
-      `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
-    ).catch(() => {});
-  }
-
   private async handleMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     if (this.restoringConfig) return;
 
@@ -801,8 +781,6 @@ export class Agent {
         message.documents,
       );
       await stopTyping({ clear: isSilentReply(response) });
-
-      this.maybeNudgeCompact(key);
 
       this.sessions.append(key, {
         role: "assistant",
@@ -897,8 +875,6 @@ export class Agent {
         allDocuments.length > 0 ? allDocuments : undefined,
       );
       await stopTyping({ clear: isSilentReply(response) });
-
-      this.maybeNudgeCompact(key);
 
       this.sessions.append(key, {
         role: "assistant",

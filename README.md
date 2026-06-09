@@ -31,7 +31,7 @@ That's it. Open Telegram and message your bot.
 
 ## Requirements
 
-- Node.js 22+
+- Node.js 22.12+
 - [Claude Code](https://claude.com/claude-code) installed. Authenticate Claude Code for direct Claude models, or configure a LiteLLM gateway for non-Claude backends.
 - At least one channel:
   - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)

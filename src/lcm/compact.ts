@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath, getSdkSessionDir } from "../sessions/index.js";
 import { log } from "../logger.js";
+import { parseJsonl } from "../jsonl.js";
 
 /** Path to the compact trigger file for a given session */
 export function getCompactTriggerPath(sdkSessionId: string): string {
@@ -102,12 +103,7 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // (counted in `allEvents` AND in the late tail), producing duplicate uuids.
   const snapshot = readWholeFileFromFd(sourceFd);
   const bytesAtRead = snapshot.size;
-  const allEvents: SdkEvent[] = [];
-  for (const line of snapshot.text.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    try { allEvents.push(JSON.parse(t)); } catch { continue; }
-  }
+  const allEvents = parseJsonl<SdkEvent>(snapshot.text);
 
   // Separate conversation events (user/assistant) from metadata events
   // We need to track the original indices so we can reconstruct
@@ -440,12 +436,7 @@ function readSinceOffsetFromFd(
     return { events: [], readUpTo: offset, hasPartialTail: total > 0 };
   }
   const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
-  const events: SdkEvent[] = [];
-  for (const line of completeBytes.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    try { events.push(JSON.parse(t)); } catch { /* malformed but complete — skip */ }
-  }
+  const events = parseJsonl<SdkEvent>(completeBytes);
   return {
     events,
     readUpTo: offset + lastNl + 1,

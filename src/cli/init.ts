@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
+import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TOMO_HOME = join(homedir(), ".tomo");
@@ -307,10 +308,9 @@ export const initCommand = new Command("init")
         config.groupSecret = groupSecret;
       }
 
-      if (existsSync(configPath)) {
-        copyFileSync(configPath, join(TOMO_HOME, "config.json.bak"));
-      }
-      writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+      mkdirSync(dirname(configPath), { recursive: true });
+      backupFileIfExistsSync(configPath, join(TOMO_HOME, "config.json.bak"));
+      writeJsonAtomicSync(configPath, config);
       p.log.success("Config saved");
     }
 

@@ -1,7 +1,13 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
-import { formatImageMarker, normalizeJpegBuffer, saveInboundImage } from "./imageStore.js";
-import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
+import { formatImageMarker } from "./imageStore.js";
+import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
+import {
+  buildDocumentAttachment,
+  buildImageAttachment,
+  isDeclaredDocumentTooLarge,
+  readDocumentResponseWithCap,
+} from "./attachments.js";
 import { log } from "../logger.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -425,13 +431,7 @@ export class BlueBubblesChannel implements Channel {
       // cannot make us start streaming bytes.
       if (isDocument) {
         const declared = att.totalBytes;
-        if (typeof declared === "number" && declared > MAX_DOCUMENT_BYTES) {
-          log.warn(
-            { guid: attGuid, mimeType, declaredBytes: declared, max: MAX_DOCUMENT_BYTES },
-            "Skipping oversized document attachment (pre-download)",
-          );
-          continue;
-        }
+        if (isDeclaredDocumentTooLarge(declared, { guid: attGuid, mimeType, declaredBytes: declared })) continue;
       }
 
       try {
@@ -439,71 +439,34 @@ export class BlueBubblesChannel implements Channel {
         const res = await fetch(url);
         if (!res.ok) continue;
 
-        // For documents, also enforce the cap via Content-Length before we
-        // materialize the body, then stream with a running cap as a belt-and-
-        // suspenders guard against missing/lying Content-Length.
-        if (isDocument) {
-          const contentLengthHeader = res.headers.get("content-length");
-          const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
-          if (Number.isFinite(contentLength) && contentLength > MAX_DOCUMENT_BYTES) {
-            log.warn(
-              { guid: attGuid, mimeType, contentLength, max: MAX_DOCUMENT_BYTES },
-              "Skipping oversized document attachment (Content-Length)",
-            );
-            // Drain to free the socket — best-effort, never throws.
-            res.body?.cancel().catch(() => {});
-            continue;
-          }
-        }
-
         const buffer = isDocument
-          ? await readBodyWithCap(res, MAX_DOCUMENT_BYTES)
+          ? await readDocumentResponseWithCap(res, { guid: attGuid, mimeType })
           : Buffer.from(await res.arrayBuffer());
 
-        if (!buffer) {
-          log.warn(
-            { guid: attGuid, mimeType, max: MAX_DOCUMENT_BYTES },
-            "Skipping oversized document attachment (streaming cap exceeded)",
-          );
-          continue;
-        }
+        if (!buffer) continue;
 
         if (isImage) {
-          // Normalize EXIF orientation BEFORE both base64 encoding and disk
-          // save so the model and the saved file see the same pixels.
-          // iMessage/BlueBubbles preserves the original EXIF Orientation tag
-          // without baking rotation into pixels; without this, portrait
-          // iPhone shots reach the model sideways.
-          const normalizedBuffer = await normalizeJpegBuffer(buffer, mimeType);
-          // Additively persist to disk if configured. Never blocks the return.
-          let savedPath: string | undefined;
-          if (this.imageStoreBaseDir) {
-            savedPath = (await saveInboundImage(normalizedBuffer, mimeType, {
+          images.push(await buildImageAttachment(
+            buffer,
+            mimeType,
+            {
               sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
               guid: attGuid,
-            }, this.imageStoreBaseDir)) ?? undefined;
-          }
-          images.push({
-            data: normalizedBuffer.toString("base64"),
-            mediaType: mimeType,
-            savedPath,
-          });
+            },
+            this.imageStoreBaseDir,
+          ));
         } else {
           const filename = (att.transferName as string | undefined) ?? undefined;
-          let savedPath: string | undefined;
-          if (this.imageStoreBaseDir) {
-            savedPath = (await saveInboundDocument(buffer, mimeType, {
+          documents.push(await buildDocumentAttachment(
+            buffer,
+            mimeType,
+            {
               sessionKey: chatGuid ? `imessage_${chatGuid}` : "imessage",
               guid: attGuid,
               filename,
-            }, this.imageStoreBaseDir)) ?? undefined;
-          }
-          documents.push({
-            data: buffer.toString("base64"),
-            mediaType: mimeType,
-            filename,
-            savedPath,
-          });
+            },
+            this.imageStoreBaseDir,
+          ));
         }
       } catch (err) {
         log.error({ err, guid: attGuid }, "Failed to download attachment");

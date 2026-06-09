@@ -1,6 +1,7 @@
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { config } from "../config.js";
+import { readJsonlFileSync } from "../jsonl.js";
 
 /**
  * Hierarchical rollup block tags live on compact summary events. Each level
@@ -34,12 +35,7 @@ interface SdkEvent {
 function loadEvents(sdkSessionId: string): SdkEvent[] {
   const path = getSdkSessionPath(sdkSessionId);
   if (!existsSync(path)) return [];
-  const events: SdkEvent[] = [];
-  for (const line of readFileSync(path, "utf-8").split("\n")) {
-    if (!line) continue;
-    try { events.push(JSON.parse(line)); } catch { /* skip */ }
-  }
-  return events;
+  return readJsonlFileSync<SdkEvent>(path);
 }
 
 /** Return 0-based conv-index for every user/assistant event. */
@@ -384,23 +380,6 @@ function matchesLevelPeriod(e: SdkEvent, level: BlockLevel, period: string): boo
       return m[1] === period;
     }
   }
-}
-
-/**
- * Identifies group sessions. Groups run the same hierarchical LCM flow as DMs
- * by default (rollup nudges scope summaries to the group's own conversation);
- * set config.lcm.groupCompactStyle="sdk" to fall back to SDK auto-compact, in
- * which case the harness nudges (RollupRunner, hot-tail cap) skip groups.
- */
-export function isGroupSessionKey(key: string): boolean {
-  if (key.startsWith("dm:")) return false;
-  const colonIdx = key.indexOf(":");
-  if (colonIdx < 0) return false;
-  const channel = key.slice(0, colonIdx);
-  const chatId = key.slice(colonIdx + 1);
-  if (channel === "telegram" && chatId.startsWith("-")) return true;
-  if (channel === "imessage" && chatId.includes(";+;")) return true;
-  return false;
 }
 
 /** Date of the Thursday (local) for a given ISO year + week. */

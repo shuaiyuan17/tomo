@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { getCompactTriggerPath } from "./compact.js";
 import { log } from "../logger.js";
+import { readJsonlFileSync } from "../jsonl.js";
 
 export interface PruneToolsRequest {
   sdkSessionId: string;
@@ -56,12 +57,7 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
     return { success: false, pruned: [], totalCharsRemoved: 0, error: "Session file not found" };
   }
 
-  const lines = readFileSync(path, "utf-8").trim().split("\n");
-  const events: SdkEvent[] = [];
-  for (const line of lines) {
-    if (!line) continue;
-    try { events.push(JSON.parse(line)); } catch { continue; }
-  }
+  const events = readJsonlFileSync<SdkEvent>(path);
 
   // Build a map of tool_use_id -> tool name from assistant tool_use events
   const toolNameById = new Map<string, string>();

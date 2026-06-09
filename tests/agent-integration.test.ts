@@ -384,6 +384,31 @@ async function drainQueue(agent: InstanceType<typeof Agent>): Promise<void> {
   }
 }
 
+async function waitFor(assertion: () => void, timeoutMs = 250): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() <= deadline) {
+    try {
+      assertion();
+      return;
+    } catch (err) {
+      lastError = err;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
+  if (lastError) throw lastError;
+  assertion();
+}
+
+async function expectNoChangeFor(assertion: () => void, durationMs = 20): Promise<void> {
+  const deadline = Date.now() + durationMs;
+  while (Date.now() <= deadline) {
+    assertion();
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  assertion();
+}
+
 // ---------------------------------------------------------------------------
 // Setup / Teardown
 // ---------------------------------------------------------------------------
@@ -1668,7 +1693,7 @@ describe("message queueing", () => {
 
     // Turn 1 starts and blocks
     const p1 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "help me to xyz" }));
-    await new Promise((r) => setTimeout(r, 20));
+    await waitFor(() => expect(turnTexts).toHaveLength(1));
     expect(turnTexts).toHaveLength(1);
     expect(turnTexts[0]).toContain("help me to xyz");
     expect(turnTexts[0]).not.toContain("quick succession");
@@ -1738,13 +1763,16 @@ describe("message queueing", () => {
 
     // Serial channel-side dispatch: await each handler before the next.
     // With the bug, msg2/msg3 would never be queued until msg1's SDK done.
+    let channelLoopDone = false;
     const channelLoop = (async () => {
       await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg one" }));
       await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg two" }));
       await tg.simulateMessage(makeMsg({ chatId: "12345", text: "msg three" }));
+      channelLoopDone = true;
     })();
 
-    await new Promise((r) => setTimeout(r, 30));
+    await waitFor(() => expect(turnTexts).toHaveLength(1));
+    await waitFor(() => expect(channelLoopDone).toBe(true));
     // Turn 1 in flight; msg2 + msg3 should already be queued (not blocked
     // behind the SDK call).
     expect(turnTexts).toHaveLength(1);
@@ -1836,12 +1864,11 @@ describe("ingress isolation", () => {
     };
 
     const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "FROM_USER" }));
-    await new Promise((r) => setTimeout(r, 20));
+    await waitFor(() => expect(order).toEqual(["user-start"]));
     expect(order).toEqual(["user-start"]);
 
     const cronP = agent.handleCronMessage("FROM_CRON", "telegram:12345");
-    await new Promise((r) => setTimeout(r, 20));
-    expect(order).toEqual(["user-start"]);
+    await expectNoChangeFor(() => expect(order).toEqual(["user-start"]));
 
     release!();
     await Promise.all([userP, cronP]);
@@ -1886,12 +1913,11 @@ describe("ingress isolation", () => {
     };
 
     const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "FROM_USER" }));
-    await new Promise((r) => setTimeout(r, 20));
+    await waitFor(() => expect(order).toEqual(["user-start"]));
     expect(order).toEqual(["user-start"]);
 
     const contP = agent.handleContinuity("System: Free time.");
-    await new Promise((r) => setTimeout(r, 20));
-    expect(order).toEqual(["user-start"]);
+    await expectNoChangeFor(() => expect(order).toEqual(["user-start"]));
 
     release!();
     await Promise.all([userP, contP]);
@@ -1933,12 +1959,11 @@ describe("ingress isolation", () => {
     tg.clearDelivered();
 
     const cronP = agent.handleCronMessage("SLOW_CRON", "telegram:12345");
-    await new Promise((r) => setTimeout(r, 20));
+    await waitFor(() => expect(order).toEqual(["cron-start"]));
     expect(order).toEqual(["cron-start"]);
 
     const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "USER_AFTER" }));
-    await new Promise((r) => setTimeout(r, 20));
-    expect(order).toEqual(["cron-start"]);
+    await expectNoChangeFor(() => expect(order).toEqual(["cron-start"]));
 
     release!();
     await Promise.all([cronP, userP]);

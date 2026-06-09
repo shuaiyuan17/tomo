@@ -1,5 +1,14 @@
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
+import { readJsonlFileSync } from "../jsonl.js";
+
+interface SdkEvent {
+  type?: string;
+  timestamp?: string;
+  message?: {
+    content?: unknown;
+  };
+}
 
 /**
  * Resolve a time range to conversation event indices in the SDK JSONL.
@@ -19,15 +28,12 @@ export function resolveTimeRange(
   const toMs = new Date(toTime).getTime();
   if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) return null;
 
-  const lines = readFileSync(path, "utf-8").trim().split("\n");
+  const events = readJsonlFileSync<SdkEvent>(path);
   let convIdx = 0;
   let firstIdx = -1;
   let lastIdx = -1;
 
-  for (const line of lines) {
-    if (!line) continue;
-    let e: any;
-    try { e = JSON.parse(line); } catch { continue; }
+  for (const e of events) {
     if (e.type !== "user" && e.type !== "assistant") continue;
 
     const tsMs = e.timestamp ? new Date(e.timestamp).getTime() : NaN;
@@ -87,14 +93,10 @@ export function computeContextStats(sdkSessionId: string): ContextStatsResult | 
   const path = getSdkSessionPath(sdkSessionId);
   if (!existsSync(path)) return null;
 
-  const lines = readFileSync(path, "utf-8").trim().split("\n");
+  const sdkEvents = readJsonlFileSync<SdkEvent>(path);
   const events: ParsedEvent[] = [];
 
-  for (const line of lines) {
-    if (!line) continue;
-    let e: any;
-    try { e = JSON.parse(line); } catch { continue; }
-
+  for (const e of sdkEvents) {
     const type = e.type;
     if (type !== "user" && type !== "assistant") continue;
 

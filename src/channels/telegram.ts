@@ -1,8 +1,14 @@
 import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction } from "./types.js";
-import { formatImageMarker, normalizeJpegBuffer, saveInboundImage } from "./imageStore.js";
-import { formatDocumentMarker, saveInboundDocument, isSupportedDocumentMime, readBodyWithCap, MAX_DOCUMENT_BYTES } from "./documentStore.js";
+import { formatImageMarker } from "./imageStore.js";
+import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
+import {
+  buildDocumentAttachment,
+  buildImageAttachment,
+  isDeclaredDocumentTooLarge,
+  readDocumentResponseWithCap,
+} from "./attachments.js";
 import { log } from "../logger.js";
 
 export interface TelegramChannelOptions {
@@ -227,11 +233,7 @@ export class TelegramChannel implements Channel {
     // Pre-check declared file_size before any HTTP work. Telegram's Document
     // object reliably includes file_size; if it's already over the cap we
     // skip getFile + download entirely.
-    if (typeof declaredFileSize === "number" && declaredFileSize > MAX_DOCUMENT_BYTES) {
-      log.warn(
-        { fileId, mediaType, declaredFileSize, max: MAX_DOCUMENT_BYTES },
-        "Skipping oversized document attachment (pre-download)",
-      );
+    if (isDeclaredDocumentTooLarge(declaredFileSize, { fileId, mediaType, declaredFileSize })) {
       return undefined;
     }
 
@@ -243,40 +245,19 @@ export class TelegramChannel implements Channel {
       const res = await fetch(url);
       if (!res.ok) return undefined;
 
-      // Belt-and-suspenders: enforce the cap via Content-Length, then via a
-      // streaming reader cap, in case the Telegram CDN omits the header or
-      // declared file_size disagreed with reality.
-      const contentLengthHeader = res.headers.get("content-length");
-      const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
-      if (Number.isFinite(contentLength) && contentLength > MAX_DOCUMENT_BYTES) {
-        log.warn(
-          { fileId, mediaType, contentLength, max: MAX_DOCUMENT_BYTES },
-          "Skipping oversized document attachment (Content-Length)",
-        );
-        res.body?.cancel().catch(() => {});
-        return undefined;
-      }
+      const buffer = await readDocumentResponseWithCap(res, { fileId, mediaType });
+      if (!buffer) return undefined;
 
-      const buffer = await readBodyWithCap(res, MAX_DOCUMENT_BYTES);
-      if (!buffer) {
-        log.warn(
-          { fileId, mediaType, max: MAX_DOCUMENT_BYTES },
-          "Skipping oversized document attachment (streaming cap exceeded)",
-        );
-        return undefined;
-      }
-
-      // Additively persist to disk if configured. Never blocks the return.
-      let savedPath: string | undefined;
-      if (this.imageStoreBaseDir) {
-        savedPath = (await saveInboundDocument(buffer, mediaType, {
+      return await buildDocumentAttachment(
+        buffer,
+        mediaType,
+        {
           sessionKey: chatId ? `telegram_${chatId}` : "telegram",
           guid: fileId,
           filename,
-        }, this.imageStoreBaseDir)) ?? undefined;
-      }
-
-      return { data: buffer.toString("base64"), mediaType, filename, savedPath };
+        },
+        this.imageStoreBaseDir,
+      );
     } catch (err) {
       log.error({ err }, "Failed to download document");
       return undefined;
@@ -296,22 +277,15 @@ export class TelegramChannel implements Channel {
       const ext = file.file_path.split(".").pop()?.toLowerCase();
       const mediaType = ext === "png" ? "image/png" : "image/jpeg";
 
-      // Normalize EXIF orientation BEFORE both base64 and disk save so the
-      // model and the saved file see the same pixels. Telegram's own client
-      // typically pre-rotates, but normalizing is cheap and covers edge cases
-      // (forwarded photos, file uploads that bypass the client's transcode).
-      const normalizedBuffer = await normalizeJpegBuffer(buffer, mediaType);
-
-      // Additively persist to disk if configured. Never blocks the return.
-      let savedPath: string | undefined;
-      if (this.imageStoreBaseDir) {
-        savedPath = (await saveInboundImage(normalizedBuffer, mediaType, {
+      return await buildImageAttachment(
+        buffer,
+        mediaType,
+        {
           sessionKey: chatId ? `telegram_${chatId}` : "telegram",
           guid: fileId,
-        }, this.imageStoreBaseDir)) ?? undefined;
-      }
-
-      return { data: normalizedBuffer.toString("base64"), mediaType, savedPath };
+        },
+        this.imageStoreBaseDir,
+      );
     } catch (err) {
       log.error({ err }, "Failed to download photo");
       return undefined;

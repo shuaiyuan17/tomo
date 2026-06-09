@@ -5,7 +5,12 @@ import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
-import { isGroupSessionKey } from "./lcm/blocks.js";
+import {
+  isGroupSessionKey,
+  parseRawSessionKey,
+  privateReplyTargetFromSessionKey,
+  replyTargetFromRawSessionKey,
+} from "./sessions/keys.js";
 import { IdentityRouter } from "./router.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
@@ -25,12 +30,26 @@ import {
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { backupFileIfExistsSync, writeJsonAtomicSync } from "./fs-utils.js";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
 
 export interface SessionCatalog {
   identities: Array<{ name: string }>;
   groups: Array<{ key: string; title?: string; participants?: string[] }>;
+}
+
+interface UserTurnRequest {
+  key: string;
+  promptText: string;
+  sourceChannelName: string;
+  replyChannel: Channel;
+  replyChatId: string;
+  replyToMessageId?: string;
+  images?: IncomingMessage["images"];
+  documents?: IncomingMessage["documents"];
+  suppressErrors: boolean;
+  errorLogMessage: string;
 }
 
 export class Agent {
@@ -96,14 +115,12 @@ export class Agent {
   /** Snapshot of group metadata for the system prompt — null for non-group sessions. */
   private buildGroupContext(sessionKey: string): { chatTitle?: string; participants?: string[]; isPassive: boolean } | undefined {
     if (!isGroupSessionKey(sessionKey)) return undefined;
-    const colonIdx = sessionKey.indexOf(":");
-    const channelName = colonIdx >= 0 ? sessionKey.slice(0, colonIdx) : "";
-    const chatId = colonIdx >= 0 ? sessionKey.slice(colonIdx + 1) : "";
+    const parsed = parseRawSessionKey(sessionKey);
     const entry = this.sessions.getEntry(sessionKey);
     return {
       ...(entry?.chatTitle ? { chatTitle: entry.chatTitle } : {}),
       ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
-      isPassive: channelName ? this.isPassiveListenGroup(channelName, chatId) : false,
+      isPassive: parsed ? this.isPassiveListenGroup(parsed.channelName, parsed.chatId) : false,
     };
   }
 
@@ -119,7 +136,7 @@ export class Agent {
         channels[channel.name].allowlist = allowlist;
         cfg.channels = channels;
         this.backupConfig();
-        writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+        writeJsonAtomicSync(CONFIG_PATH, cfg);
         // Update the router's in-memory allowlist
         this.router.addToAllowlist(channel.name, chatId);
       }
@@ -292,9 +309,8 @@ export class Agent {
   }
 
   private backupConfig(): void {
-    if (!existsSync(CONFIG_PATH)) return;
     mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
-    copyFileSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
+    backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
   }
 
   private persistModelOverride(key: string, model: string): void {
@@ -309,7 +325,7 @@ export class Agent {
 
     mkdirSync(dirname(CONFIG_PATH), { recursive: true });
     this.backupConfig();
-    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+    writeJsonAtomicSync(CONFIG_PATH, cfg);
   }
 
   private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
@@ -585,7 +601,7 @@ export class Agent {
     }
 
     if (!isGroupSessionKey(key)) {
-      return this.parseChannelKey(key);
+      return privateReplyTargetFromSessionKey(key);
     }
 
     for (const identity of config.identities) {
@@ -727,6 +743,46 @@ export class Agent {
     ).catch(() => {});
   }
 
+  private async runUserTurn(req: UserTurnRequest): Promise<void> {
+    const stopTyping = req.replyChannel.startTyping(req.replyChatId);
+
+    try {
+      const stampedText = this.drainPendingNotes(req.key) + this.injectTimestamp(req.promptText, req.sourceChannelName);
+      const stream = req.replyChannel.createStreamingMessage(req.replyChatId, req.replyToMessageId);
+      const response = await this.runWithRetry(
+        req.key,
+        stampedText,
+        (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
+        req.images,
+        this.makeBlockHandler(req.replyChannel, req.replyChatId, stream),
+        req.documents,
+      );
+      await stopTyping({ clear: isSilentReply(response) });
+
+      this.maybeNudgeCompact(req.key);
+
+      this.sessions.append(req.key, {
+        role: "assistant",
+        content: response,
+        channel: req.replyChannel.name,
+        timestamp: Date.now(),
+      });
+
+      await this.deliverResponse(req.replyChannel, req.replyChatId, response, stream);
+    } catch (err) {
+      await stopTyping();
+      log.error({ err }, req.errorLogMessage);
+
+      if (req.suppressErrors) return;
+
+      const detail = err instanceof Error ? err.message : String(err);
+      await req.replyChannel.send({
+        chatId: req.replyChatId,
+        text: `[error] ${detail}`,
+      });
+    }
+  }
+
   private async handleMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     if (this.restoringConfig) return;
 
@@ -786,45 +842,18 @@ export class Agent {
       return;
     }
 
-    const stopTyping = replyChannel.startTyping(replyChatId);
-
-    try {
-      const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(textForAgent, channel.name);
-
-      const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? message.id : undefined);
-      const response = await this.runWithRetry(
-        key,
-        stampedText,
-        (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
-        message.images,
-        this.makeBlockHandler(replyChannel, replyChatId, stream),
-        message.documents,
-      );
-      await stopTyping({ clear: isSilentReply(response) });
-
-      this.maybeNudgeCompact(key);
-
-      this.sessions.append(key, {
-        role: "assistant",
-        content: response,
-        channel: replyChannel.name,
-        timestamp: Date.now(),
-      });
-
-      await this.deliverResponse(replyChannel, replyChatId, response, stream);
-    } catch (err) {
-      await stopTyping();
-      log.error({ err }, "Error handling message");
-
-      // Passive groups: suppress error messages to avoid polluting the chat
-      if (isPassiveGroup) return;
-
-      const detail = err instanceof Error ? err.message : String(err);
-      await replyChannel.send({
-        chatId: replyChatId,
-        text: `[error] ${detail}`,
-      });
-    }
+    await this.runUserTurn({
+      key,
+      promptText: textForAgent,
+      sourceChannelName: channel.name,
+      replyChannel,
+      replyChatId,
+      replyToMessageId: isGroup ? message.id : undefined,
+      images: message.images,
+      documents: message.documents,
+      suppressErrors: isPassiveGroup,
+      errorLogMessage: "Error handling message",
+    });
   }
 
   /**
@@ -872,49 +901,29 @@ export class Agent {
       });
     }
 
-    const stopTyping = replyChannel.startTyping(replyChatId);
+    const numbered = items.map((it, i) => {
+      const text = isGroup ? `${it.message.senderName}: ${it.message.text}` : it.message.text;
+      return `${i + 1}. ${text}`;
+    }).join("\n");
+    const subject = isGroup
+      ? `${items.length} messages arrived from this group in quick succession`
+      : `User sent ${items.length} messages in quick succession`;
+    const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
+    const allImages = items.flatMap((it) => it.message.images ?? []);
+    const allDocuments = items.flatMap((it) => it.message.documents ?? []);
 
-    try {
-      const numbered = items.map((it, i) => {
-        const text = isGroup ? `${it.message.senderName}: ${it.message.text}` : it.message.text;
-        return `${i + 1}. ${text}`;
-      }).join("\n");
-      const subject = isGroup
-        ? `${items.length} messages arrived from this group in quick succession`
-        : `User sent ${items.length} messages in quick succession`;
-      const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
-      const stampedText = this.drainPendingNotes(key) + this.injectTimestamp(combined, lastChannel.name);
-      const allImages = items.flatMap((it) => it.message.images ?? []);
-      const allDocuments = items.flatMap((it) => it.message.documents ?? []);
-
-      const stream = replyChannel.createStreamingMessage(replyChatId, isGroup ? lastMessage.id : undefined);
-      const response = await this.runWithRetry(
-        key,
-        stampedText,
-        (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
-        allImages.length > 0 ? allImages : undefined,
-        this.makeBlockHandler(replyChannel, replyChatId, stream),
-        allDocuments.length > 0 ? allDocuments : undefined,
-      );
-      await stopTyping({ clear: isSilentReply(response) });
-
-      this.maybeNudgeCompact(key);
-
-      this.sessions.append(key, {
-        role: "assistant",
-        content: response,
-        channel: replyChannel.name,
-        timestamp: Date.now(),
-      });
-
-      await this.deliverResponse(replyChannel, replyChatId, response, stream);
-    } catch (err) {
-      await stopTyping();
-      log.error({ err }, "Error handling batched messages");
-      if (isPassiveGroup) return;
-      const detail = err instanceof Error ? err.message : String(err);
-      await replyChannel.send({ chatId: replyChatId, text: `[error] ${detail}` });
-    }
+    await this.runUserTurn({
+      key,
+      promptText: combined,
+      sourceChannelName: lastChannel.name,
+      replyChannel,
+      replyChatId,
+      replyToMessageId: isGroup ? lastMessage.id : undefined,
+      images: allImages.length > 0 ? allImages : undefined,
+      documents: allDocuments.length > 0 ? allDocuments : undefined,
+      suppressErrors: isPassiveGroup,
+      errorLogMessage: "Error handling batched messages",
+    });
   }
 
   private async runWithRetry(
@@ -1062,20 +1071,18 @@ export class Agent {
       deliveryChatId = target.chatId;
     } else {
       // Raw per-channel key: <channel>:<chatId> (DM without identity, or group chat)
-      const colonIdx = sessionKey.indexOf(":");
-      if (colonIdx < 0) {
+      const target = replyTargetFromRawSessionKey(sessionKey);
+      if (!target) {
         log.warn({ sessionKey }, "Cron: invalid session key");
         return;
       }
-      const channelName = sessionKey.slice(0, colonIdx);
-      const chatId = sessionKey.slice(colonIdx + 1);
-      const ch = this.getChannel(channelName);
+      const ch = this.getChannel(target.channelName);
       if (!ch) {
-        log.warn({ sessionKey, channelName }, "Cron: channel not loaded");
+        log.warn({ sessionKey, channelName: target.channelName }, "Cron: channel not loaded");
         return;
       }
       deliveryChannel = ch;
-      deliveryChatId = chatId;
+      deliveryChatId = target.chatId;
     }
 
     const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
@@ -1143,7 +1150,7 @@ export class Agent {
       if (!isSilentReply(response) && !response.includes("NO_REPLY")) {
         const replyTarget = this.router.getReplyTarget(key)
           ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined)
-          ?? this.parseChannelKey(key);
+          ?? privateReplyTargetFromSessionKey(key);
 
         if (replyTarget) {
           const channel = this.getChannel(replyTarget.channelName);
@@ -1181,27 +1188,10 @@ export class Agent {
     }
   }
 
-  /** Parse a "channel:chatId" key into a reply target (fallback for non-identity users).
-   *  Skips group chats (Telegram negative IDs, iMessage group GUIDs). */
-  private parseChannelKey(key: string): ReplyTarget | undefined {
-    if (key.startsWith("dm:")) return undefined; // dm keys use deriveReplyTargetFromConfig
-    const colonIdx = key.indexOf(":");
-    if (colonIdx < 0) return undefined;
-    const channelName = key.slice(0, colonIdx);
-    const chatId = key.slice(colonIdx + 1);
-    if (!channelName || !chatId) return undefined;
-    // Skip Telegram group chats (negative IDs)
-    if (channelName === "telegram" && chatId.startsWith("-")) return undefined;
-    // Skip iMessage group chats (GUID contains ";+;")
-    if (channelName === "imessage" && chatId.includes(";+;")) return undefined;
-    return { channelName, chatId };
-  }
-
   private findLastChatId(channelName: string): string | undefined {
     for (const [key] of this.sessions.listSdkSessionIds()) {
-      if (key.startsWith(`${channelName}:`)) {
-        return key.slice(channelName.length + 1);
-      }
+      const parsed = parseRawSessionKey(key);
+      if (parsed?.channelName === channelName) return parsed.chatId;
     }
     return undefined;
   }
@@ -1354,25 +1344,11 @@ export class Agent {
       return replyTarget ? { sessionKey, replyTarget } : undefined;
     }
 
-    // Non-dm session key (channel:<chatId> form, possibly a group)
-    // Use parseRawChannelKey, NOT parseChannelKey — the latter rejects group
-    // chats by design (it's for sendNotification's "find any DM" fallback).
-    // Here the caller explicitly named a target; honor it even if it's a group.
+    // Non-dm session key (channel:<chatId> form, possibly a group). The caller
+    // explicitly named a target, so honor group chats too.
     const replyTarget = this.router.getReplyTarget(sessionKey)
-      ?? this.parseRawChannelKey(sessionKey);
+      ?? replyTargetFromRawSessionKey(sessionKey);
     return replyTarget ? { sessionKey, replyTarget } : undefined;
-  }
-
-  /** Parse a "<channel>:<chatId>" key into a ReplyTarget. Group-friendly; for
-   *  explicit-target paths only. Use parseChannelKey for notification fallbacks. */
-  private parseRawChannelKey(key: string): ReplyTarget | undefined {
-    if (key.startsWith("dm:")) return undefined;
-    const colonIdx = key.indexOf(":");
-    if (colonIdx < 0) return undefined;
-    const channelName = key.slice(0, colonIdx);
-    const chatId = key.slice(colonIdx + 1);
-    if (!channelName || !chatId) return undefined;
-    return { channelName, chatId };
   }
 
   /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool. */
@@ -1424,13 +1400,13 @@ export class Agent {
     if (dmKey) {
       target = this.router.getReplyTarget(dmKey)
         ?? (dmKey.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(dmKey.slice(3)) : undefined)
-        ?? this.parseChannelKey(dmKey);
+        ?? privateReplyTargetFromSessionKey(dmKey);
     }
 
     if (!target) {
       // No identity session — find the first DM (non-group) session across all channels
       for (const [key] of this.sessions.listSdkSessionIds()) {
-        const parsed = this.parseChannelKey(key);
+        const parsed = privateReplyTargetFromSessionKey(key);
         if (parsed) { target = parsed; break; }
       }
     }

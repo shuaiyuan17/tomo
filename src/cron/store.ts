@@ -1,9 +1,10 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
 import type { CronJob, CronSchedule } from "./types.js";
+import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
 
@@ -123,7 +124,7 @@ export class CronStore {
   private save(): void {
     const dir = dirname(this.path);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(this.path, JSON.stringify({ version: 1, jobs: this.jobs }, null, 2) + "\n");
+    writeJsonAtomicSync(this.path, { version: 1, jobs: this.jobs });
   }
 }
 

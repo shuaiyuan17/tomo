@@ -1,6 +1,7 @@
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
-import { findDuePromotions, isGroupSessionKey, type DuePromotion } from "./blocks.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
+import { findDuePromotions, type DuePromotion } from "./blocks.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 
 /**

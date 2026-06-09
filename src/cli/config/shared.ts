@@ -1,7 +1,8 @@
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
+import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
 
 export const TOMO_HOME = join(homedir(), ".tomo");
 export const CONFIG_PATH = join(TOMO_HOME, "config.json");
@@ -22,10 +23,8 @@ export function loadConfig(): Record<string, unknown> {
 
 export function saveConfig(cfg: Record<string, unknown>): void {
   mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  if (existsSync(CONFIG_PATH)) {
-    copyFileSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
-  }
-  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
+  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
+  writeJsonAtomicSync(CONFIG_PATH, cfg);
 }
 
 export { modelLabel };

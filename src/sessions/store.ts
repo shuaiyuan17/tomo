@@ -1,8 +1,10 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { log } from "../logger.js";
+import { readJsonlFileSync } from "../jsonl.js";
+import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
@@ -123,15 +125,12 @@ export class SessionStore {
     const archivePath = join(this.dir, `_archive_${sdkSessionId}.jsonl`);
     if (!existsSync(archivePath)) return [];
 
-    const lines = readFileSync(archivePath, "utf-8").trim().split("\n");
     const limit = opts.limit ?? 50;
     const results: SessionMessage[] = [];
     const queryLower = opts.query?.toLowerCase();
 
-    for (const line of lines) {
-      if (!line) continue;
+    for (const event of readJsonlFileSync<Record<string, any>>(archivePath)) {
       try {
-        const event = JSON.parse(line);
         if (event.type !== "user" && event.type !== "assistant") continue;
 
         // Extract text from SDK event format
@@ -448,7 +447,7 @@ export class SessionStore {
 
   private saveRegistry(): void {
     const data: SessionRegistry = { version: 1, sessions: this.registry };
-    writeFileSync(this.registryPath, JSON.stringify(data, null, 2) + "\n");
+    writeJsonAtomicSync(this.registryPath, data);
   }
 
   /** Migrate from the old simple key→value format */
@@ -494,18 +493,6 @@ export class SessionStore {
     const file = this.transcriptPath(key);
     if (!existsSync(file)) return [];
 
-    const lines = readFileSync(file, "utf-8").trim().split("\n");
-    const messages: SessionMessage[] = [];
-
-    for (const line of lines) {
-      if (!line) continue;
-      try {
-        messages.push(JSON.parse(line) as SessionMessage);
-      } catch {
-        // Skip malformed lines
-      }
-    }
-
-    return messages;
+    return readJsonlFileSync<SessionMessage>(file);
   }
 }

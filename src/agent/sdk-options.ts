@@ -2,7 +2,7 @@ import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInsta
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
-import { isGroupSessionKey } from "../lcm/blocks.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";

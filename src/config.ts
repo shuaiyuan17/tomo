@@ -1,8 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
 import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
+import {
+  DEFAULT_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS,
+  DEFAULT_CONTINUITY_SCRIPT_TIMEOUT_MS,
+  type ContinuityScriptConfig,
+} from "./continuity-script.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -30,6 +35,11 @@ export interface LcmConfig {
    *  rollup so mid-day compacts don't wipe warm short-term texture. Counts SDK
    *  events (one tool round = multiple events), not user-typed messages. */
   dailyFreshTail: number;
+  /** When true, the fresh tail is kept GLOBALLY (newest N conversational turns
+   *  across all days) instead of only for today's rollup — so a new day doesn't
+   *  cold-start with summaries only. N reuses `dailyFreshTail`. Default false
+   *  (preserves the today-only behavior). */
+  globalFreshTail: boolean;
 }
 
 export interface LiteLlmConfig {
@@ -50,6 +60,8 @@ interface TomoConfig {
   logsDir: string;
   tomoHome: string;
   continuity: boolean;
+  /** Optional local script to run once per continuity heartbeat and append to the heartbeat prompt. */
+  continuityScript: ContinuityScriptConfig | null;
   city: string | null;
   identities: IdentityConfig[];
   imessageUrl: string;
@@ -114,6 +126,46 @@ function parseLcmConfig(raw: unknown): LcmConfig {
     nudgeResetPct: validHigh && validLow ? nudgeReset : (validHigh ? Math.max(0, nudgeAt - 10) : 60),
     groupCompactStyle: style,
     dailyFreshTail: validTail ? tail : 32,
+    globalFreshTail: r.globalFreshTail === true,
+  };
+}
+
+function parsePositiveInt(raw: unknown, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function expandConfigPath(rawPath: string): string {
+  const withEnv = rawPath.replace(/\$(\w+)|\$\{([^}]+)\}/g, (_match, bare: string | undefined, braced: string | undefined) => {
+    const name = bare ?? braced ?? "";
+    return process.env[name] ?? "";
+  });
+  const withHome = withEnv === "~"
+    ? HOME
+    : (withEnv.startsWith("~/") ? join(HOME, withEnv.slice(2)) : withEnv);
+  return isAbsolute(withHome) ? withHome : join(TOMO_HOME, withHome);
+}
+
+function parseContinuityScriptConfig(raw: unknown): ContinuityScriptConfig | null {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const rawPath = String(
+    process.env.TOMO_CONTINUITY_SCRIPT
+    ?? (typeof raw === "string" ? raw : r.path)
+    ?? "",
+  ).trim();
+
+  if (!rawPath) return null;
+
+  return {
+    path: expandConfigPath(rawPath),
+    timeoutMs: parsePositiveInt(
+      process.env.TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS ?? r.timeoutMs,
+      DEFAULT_CONTINUITY_SCRIPT_TIMEOUT_MS,
+    ),
+    maxOutputChars: parsePositiveInt(
+      process.env.TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS ?? r.maxOutputChars,
+      DEFAULT_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS,
+    ),
   };
 }
 
@@ -221,6 +273,7 @@ function buildConfig(): TomoConfig {
     logsDir: join(TOMO_HOME, "logs"),
     tomoHome: TOMO_HOME,
     continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
+    continuityScript: parseContinuityScriptConfig(file.continuityScript),
     city: (process.env.TOMO_CITY ?? file.city ?? null) as string | null,
     identities,
     imessageUrl,

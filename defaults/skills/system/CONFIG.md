@@ -11,6 +11,11 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
   "model": "claude-sonnet-4-6[1m]",
   "city": "Seattle",
   "continuity": false,
+  "continuityScript": {
+    "path": "~/bin/tomo-continuity.sh",
+    "timeoutMs": 30000,
+    "maxOutputChars": 8000
+  },
   "groupSecret": "tomo-a1b2c3d4",
   "channels": {
     "telegram": {
@@ -74,6 +79,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `model` | string | Claude model IDs/aliases, or a LiteLLM `provider/model` name such as `chatgpt/gpt-5.5`. Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
+| `continuityScript` | string \| object \| null | Optional script run once per scheduled continuity heartbeat and manual `tomo continuity` trigger before the prompt is sent to Tomo. Use a string path (`"~/bin/tomo-continuity.sh"`) or `{ "path": "...", "timeoutMs": 30000, "maxOutputChars": 8000 }`. Relative paths resolve under `~/.tomo`; `~`, `$VAR`, and `${VAR}` expand. The script runs as the Tomo OS user with `TOMO_CONTINUITY=true`; stdout/stderr are appended to the heartbeat prompt and capped separately by `maxOutputChars`. Non-zero exits, missing files, and timeouts are passed to Tomo as script status instead of aborting the heartbeat. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
 | `channels.telegram.token` | string | BotFather token (`123456:...`). Required to enable the Telegram channel. |
 | `channels.telegram.allowlist` | string[] | Telegram user IDs (as strings) permitted to DM the bot. Identity-bound chatIds are auto-allowed even if missing here. |

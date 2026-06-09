@@ -89,6 +89,121 @@ function dailyFreshTail(): number {
   return config.lcm.dailyFreshTail;
 }
 
+/** Concatenate text-block content from an event (SDK or simple shape). */
+function extractText(e: SdkEvent): string {
+  const c = e.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c
+      .filter((b) => b && typeof b === "object" && b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("");
+  }
+  return "";
+}
+
+/**
+ * Is this event a real CONVERSATIONAL turn — something the user actually said,
+ * or an assistant text reply — as opposed to a system/heartbeat/cron injection
+ * or pure tool machinery (tool_result user turns, tool_use-only assistant turns)?
+ *
+ * Used to COUNT the global fresh tail window (the newest N such turns). Retention
+ * is positional from the Nth-newest candidate, so non-candidate events that fall
+ * inside the retained suffix are still kept (chain continuity) — they just don't
+ * advance the count.
+ *
+ * Classification (verified against real SDK session shapes 2026-06-05):
+ *   - real user msg:   "[imessage · Fri 06/05 22:18 PDT] 🧱做好了"            → candidate
+ *   - coalesced msgs:  "[imessage · …] [User sent 2 messages in quick succ…]" → candidate (real text)
+ *   - cron:            "[imessage · …] System: Scheduled task …"             → NOT (System: after prefix)
+ *   - continuity beat: "System: It is Fri … Weather …"                       → NOT (raw System:)
+ *   - tool_result turn: user event with no text block                        → NOT (machinery)
+ *   - tool_use-only assistant turn: no text                                  → NOT (machinery)
+ */
+export function isWarmTailCandidate(e: SdkEvent): boolean {
+  if (e.type !== "user" && e.type !== "assistant") return false;
+  if (e.isCompactSummary) return false;
+  const text = extractText(e);
+  if (e.type === "assistant") {
+    // A real reply has text; pure tool_use turns are machinery.
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    // Housekeeping cron/rollup/heartbeat turns often resolve silently.
+    if (/^NO_REPLY$/i.test(trimmed)) return false;
+    return true;
+  }
+  // user event
+  if (!text) return false; // tool_result-only turn = machinery
+  // Strip ALL leading bracketed prefixes (+ whitespace), then a System: prefix
+  // means heartbeat/cron (both injected, not conversation). Looping matters:
+  // a cron turn with a pending note prepended looks like
+  //   "[System: <note>]\n\n[imessage · …] System: Scheduled task …"
+  // so stripping just one bracket would leave "[imessage · …] System:" and
+  // misclassify the cron as conversational. Coalesced real msgs
+  //   "[imessage · …] [User sent 2 messages …] real text"
+  // strip down to "real text" → still correctly a candidate.
+  let stripped = text;
+  for (let prev = ""; stripped !== prev; ) {
+    prev = stripped;
+    stripped = stripped.replace(/^\[[^\]]*\]\s*/, "");
+  }
+  if (stripped.startsWith("System:")) return false;
+  return true;
+}
+
+/**
+ * Global index where the warm tail begins: the index of the Nth-newest
+ * warm-tail-candidate event. Everything at this index or later (candidates plus
+ * interleaved machinery/system events) is the retained contiguous suffix.
+ * Returns events.length when there's nothing to keep (n<=0 or no candidates) so
+ * callers treat the tail as empty.
+ */
+export function globalFreshTailStartIdx(events: SdkEvent[], n: number): number {
+  if (n <= 0) return events.length;
+  const candidateIdx: number[] = [];
+  for (let i = 0; i < events.length; i++) {
+    if (isWarmTailCandidate(events[i])) candidateIdx.push(i);
+  }
+  if (candidateIdx.length === 0) return events.length;
+  if (candidateIdx.length <= n) return candidateIdx[0];
+  return candidateIdx[candidateIdx.length - n];
+}
+
+function monthForIsoWeekTag(weekTag: string): string | null {
+  const m = /^(\d{4})-W(\d{2})$/.exec(weekTag);
+  if (!m) return null;
+  return localMonthTag(isoWeekThursday(Number(m[1]), Number(m[2])));
+}
+
+function warmSuffixParentPeriods(events: SdkEvent[], tailStart: number): {
+  weeks: Set<string>;
+  months: Set<string>;
+  years: Set<string>;
+} {
+  const weeks = new Set<string>();
+  const months = new Set<string>();
+  const years = new Set<string>();
+
+  for (let i = tailStart; i < events.length; i++) {
+    const e = events[i];
+    if (e.type !== "user" && e.type !== "assistant") continue;
+    if (e.isCompactSummary) continue;
+    if (!e.timestamp) continue;
+
+    const day = localDateTag(new Date(e.timestamp));
+    const week = isoWeekTag(new Date(day + "T12:00:00"));
+    weeks.add(week);
+
+    const month = monthForIsoWeekTag(week);
+    if (month) {
+      months.add(month);
+      years.add(month.slice(0, 4));
+    }
+  }
+
+  return { weeks, months, years };
+}
+
 /**
  * Resolve the event range for a given rollup level + optional explicit period.
  * Returns null if there's nothing to compact (no matching events / children).
@@ -116,6 +231,18 @@ export function resolveBlockRange(
   const resolvedPeriod = period ?? defaultPeriod(level);
   const tag = `${level} ${resolvedPeriod}`;
 
+  if (config.lcm.globalFreshTail && level !== "daily") {
+    const tailStart = globalFreshTailStartIdx(events, dailyFreshTail());
+    const warmPeriods = warmSuffixParentPeriods(events, tailStart);
+    if (
+      (level === "weekly" && warmPeriods.weeks.has(resolvedPeriod)) ||
+      (level === "monthly" && warmPeriods.months.has(resolvedPeriod)) ||
+      (level === "yearly" && warmPeriods.years.has(resolvedPeriod))
+    ) {
+      return null;
+    }
+  }
+
   // Find source events to compact for this level.
   const matches: number[] = []; // global indices
   for (let i = 0; i < events.length; i++) {
@@ -136,7 +263,29 @@ export function resolveBlockRange(
   // with ≤ tail raw events can never be rolled up and stays forever in the
   // hot context as un-promoted raw events.
   let effectiveMatches = matches;
-  if (level === "daily" && resolvedPeriod === localDateTag(new Date())) {
+  if (level === "daily" && config.lcm.globalFreshTail) {
+    // Global fresh tail: keep the newest N conversational turns warm across ALL
+    // days (not just today), so a new day doesn't cold-start with summaries only.
+    // The tail start is a session-global boundary; this day's raw is compacted
+    // only up to (not into) that boundary. When the boundary later advances past
+    // this day's leftovers, a rebuild rollup (triggered by findDuePromotions,
+    // which uses the same boundary) absorbs them — that's the "GC" path.
+    const tailStart = globalFreshTailStartIdx(events, dailyFreshTail());
+    const rawOutsideTail = matches.filter(
+      (idx) => !events[idx].isCompactSummary && idx < tailStart,
+    );
+    if (rawOutsideTail.length === 0) {
+      // All of this day's raw is within the global warm tail → nothing to promote.
+      if (!matches.some((idx) => events[idx].isCompactSummary)) {
+        return null;
+      }
+      effectiveMatches = matches.filter((idx) => events[idx].isCompactSummary);
+    } else {
+      effectiveMatches = matches.filter(
+        (idx) => idx < tailStart || events[idx].isCompactSummary,
+      );
+    }
+  } else if (level === "daily" && resolvedPeriod === localDateTag(new Date())) {
     const tail = dailyFreshTail();
     const rawOnly = matches.filter((idx) => !events[idx].isCompactSummary);
     if (rawOnly.length <= tail) {
@@ -291,6 +440,26 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     if (e.isCompactSummary && e.blockTag) haveTags.add(e.blockTag);
   }
 
+  // Global fresh tail boundary (events.length when the flag is off → inert).
+  const tailStart = config.lcm.globalFreshTail
+    ? globalFreshTailStartIdx(events, dailyFreshTail())
+    : events.length;
+
+  // Parent periods that still contain raw events INSIDE the global warm suffix.
+  // Child blocks in such periods are partial *by design* (their newest turns are
+  // intentionally kept warm, not yet summarized), so they must NOT be promoted
+  // upward — else the parent would summarize an incomplete child and never
+  // re-run (haveTags) after the child later rebuilds to absorb the aged-out raw.
+  //
+  // Scope to in-suffix raw ONLY (not all raw): aged-out leftover raw must NOT
+  // block weekly, or we'd deadlock — the daily path suppresses sub-floor
+  // (<FLOOR_WITH_BLOCK) rebuilds, so a day with a block + 2 aged-out raw would
+  // be neither daily-due nor weekly-eligible. Sub-floor aged-out residue is
+  // tolerated (weekly promotes a near-complete block) exactly as in the
+  // today-only path. Under flag-off, tailStart=length → this set is empty →
+  // default behavior fully preserved.
+  const warmPeriods = warmSuffixParentPeriods(events, tailStart);
+
   // Candidate periods: for each source block, derive its parent period.
   const weeklyChildrenByWeek = new Map<string, number>();
   const monthlyChildrenByMonth = new Map<string, number>();
@@ -303,6 +472,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     let m = /^daily (\d{4}-\d{2}-\d{2})$/.exec(tag);
     if (m) {
       const wk = isoWeekTag(new Date(m[1] + "T12:00:00"));
+      // Skip the whole week while any raw in that week is still warm-by-design.
+      if (warmPeriods.weeks.has(wk)) continue;
       if (wk !== currentWeek) {
         weeklyChildrenByWeek.set(wk, (weeklyChildrenByWeek.get(wk) ?? 0) + 1);
       }
@@ -312,6 +483,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     if (m) {
       const thursday = isoWeekThursday(Number(m[1]), Number(m[2]));
       const month = localMonthTag(thursday);
+      // Skip the whole month while any raw in a child week is still warm.
+      if (warmPeriods.months.has(month)) continue;
       if (month !== currentMonth) {
         monthlyChildrenByMonth.set(month, (monthlyChildrenByMonth.get(month) ?? 0) + 1);
       }
@@ -320,6 +493,8 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
     m = /^monthly (\d{4})-\d{2}$/.exec(tag);
     if (m) {
       const year = m[1];
+      // Skip the whole year while any raw in a child month is still warm.
+      if (warmPeriods.years.has(year)) continue;
       if (year !== currentYear) {
         yearlyChildrenByYear.set(year, (yearlyChildrenByYear.get(year) ?? 0) + 1);
       }
@@ -356,11 +531,19 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
   const FLOOR_WITH_BLOCK = 8;   // block exists — only nudge if meaningful leftover
   const FLOOR_WITHOUT_BLOCK = 1; // no block — any raw event is a reason to nudge
 
+  // With the global fresh tail on, raw events inside the warm-tail suffix are
+  // intentionally kept un-promoted — they must NOT trigger a daily nudge (else
+  // we'd re-nudge forever while they sit warm). Once the boundary advances past
+  // them, they fall outside the suffix and DO get counted → the rollup rebuild
+  // absorbs them. So the `i >= tailStart` check (tailStart computed above) is
+  // both the no-nudge guard and the GC trigger.
   const rawDays = new Map<string, number>();
-  for (const e of events) {
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
     if (e.type !== "user" && e.type !== "assistant") continue;
     if (e.isCompactSummary) continue;
     if (!e.timestamp) continue;
+    if (i >= tailStart) continue; // inside the global warm tail → not due
     const day = localDateTag(new Date(e.timestamp));
     if (day !== currentDay) {
       rawDays.set(day, (rawDays.get(day) ?? 0) + 1);

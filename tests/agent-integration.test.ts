@@ -182,6 +182,7 @@ const { mockConfig } = vi.hoisted(() => ({
     logsDir: "",
     tomoHome: "",
     continuity: false,
+    continuityScript: null,
     city: null as string | null,
     identities: [] as Array<{ name: string; channels: Record<string, string>; replyPolicy: string }>,
     imessageUrl: "",

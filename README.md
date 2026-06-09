@@ -225,6 +225,12 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
   },
   "maxTurns": 50,
   "saveInboundImages": true,
+  "continuity": true,
+  "continuityScript": {
+    "path": "~/bin/tomo-continuity.sh",
+    "timeoutMs": 30000,
+    "maxOutputChars": 8000
+  },
   "groupSecret": "tomo-xxxxxxxx",
   "lcm": {
     "nudgeAtPct": 70,
@@ -246,7 +252,12 @@ Environment variables override config file values:
 | `TOMO_LITELLM_MODE` | Optional LiteLLM mode: `anthropic-compatible` or `chatgpt-subscription` |
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
+| `TOMO_CONTINUITY_SCRIPT` | Override the optional continuity script path |
+| `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Override continuity script timeout (default: `30000`) |
+| `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Override continuity script stdout/stderr cap (default: `8000`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
+
+`continuityScript` can also be a simple path string, e.g. `"continuityScript": "~/bin/tomo-continuity.sh"`. Relative paths resolve under `~/.tomo`; the script runs once per scheduled heartbeat and manual `tomo continuity` trigger, and its stdout/stderr or failure status is appended to the normal continuity prompt.
 
 ### LiteLLM / ChatGPT Subscription Models
 

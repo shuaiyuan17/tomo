@@ -328,19 +328,20 @@ export function findDuePromotions(sdkSessionId: string): DuePromotion[] {
 
   const due: DuePromotion[] = [];
 
-  // Child blocks that are still present in the live chain are un-promoted,
-  // even if the parent tag already exists. That happens when a parent rollup
-  // was written early, then missed daily/weekly/monthly children were created
-  // later. Re-running the parent command replaces the existing block and
-  // absorbs the newly-visible children.
   for (const [wk, count] of weeklyChildrenByWeek) {
-    due.push({ level: "weekly", period: wk, childCount: count });
+    if (!haveTags.has(`weekly ${wk}`)) {
+      due.push({ level: "weekly", period: wk, childCount: count });
+    }
   }
   for (const [m, count] of monthlyChildrenByMonth) {
-    due.push({ level: "monthly", period: m, childCount: count });
+    if (!haveTags.has(`monthly ${m}`)) {
+      due.push({ level: "monthly", period: m, childCount: count });
+    }
   }
   for (const [y, count] of yearlyChildrenByYear) {
-    due.push({ level: "yearly", period: y, childCount: count });
+    if (!haveTags.has(`yearly ${y}`)) {
+      due.push({ level: "yearly", period: y, childCount: count });
+    }
   }
 
   // Nudge for any past day that has raw (non-summary) user/assistant events

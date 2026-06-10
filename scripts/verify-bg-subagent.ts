@@ -77,12 +77,14 @@ async function main() {
   //     effectively blocking in long-lived query() mode.
   const startedAt = Date.now();
   sendUserText(
-    "Use the Agent tool with run_in_background: true to launch a subagent " +
-      "whose task is: run `sleep 15 && echo DONE_FROM_BG` in Bash. " +
-      "The MOMENT you have launched it, reply to me with exactly: LAUNCHED — " +
-      "then STOP and end your turn. Do NOT wait for the subagent. Do NOT " +
-      "report its output. Do NOT call any more tools. Just say LAUNCHED and " +
-      "finish.",
+    "Use the Agent tool with run_in_background: true to launch a subagent. " +
+      "The subagent's task prompt must be EXACTLY this: \"Run this single Bash " +
+      "command in the FOREGROUND and wait for it to finish — do NOT run it in " +
+      "the background, do NOT use run_in_background: `sleep 15 && echo " +
+      "DONE_FROM_BG`. Then report the exact stdout.\" " +
+      "After you have launched that background subagent, reply to me with " +
+      "exactly: LAUNCHED — then STOP and end your turn. Do NOT wait for the " +
+      "subagent, do NOT report its output, do NOT call any more tools.",
   );
 
   let eventNum = 0;
@@ -113,9 +115,14 @@ async function main() {
     if (type === "assistant") {
       const content = (e as { message?: { content?: unknown[] } }).message?.content ?? [];
       for (const b of content) {
-        const blk = b as { type?: string; text?: string; name?: string };
+        const blk = b as { type?: string; text?: string; name?: string; input?: Record<string, unknown> };
         if (blk.type === "text" && blk.text) textPreview += blk.text;
-        if (blk.type === "tool_use") textPreview += `[tool_use:${blk.name}]`;
+        if (blk.type === "tool_use") {
+          // Print the INPUT for Agent/Bash so we can CONFIRM whether
+          // run_in_background was actually set (the load-bearing fact).
+          const inp = blk.input ? ` input=${JSON.stringify(blk.input).slice(0, 200)}` : "";
+          textPreview += `[tool_use:${blk.name}${inp}]`;
+        }
       }
     }
     if (textPreview.includes("DONE_FROM_BG")) sawDoneMarker = true;

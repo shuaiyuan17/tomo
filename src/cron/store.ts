@@ -66,6 +66,7 @@ export class CronStore {
   }
 
   remove(id: string): boolean {
+    this.load();
     const before = this.jobs.length;
     this.jobs = this.jobs.filter((j) => j.id !== id);
     if (this.jobs.length < before) {
@@ -76,6 +77,10 @@ export class CronStore {
   }
 
   markRun(id: string, status: "ok" | "error"): void {
+    // Reload before mutating: jobs are added/removed by separate CLI
+    // processes (tomo cron add) while the daemon's run is in flight; saving
+    // the stale poll-time snapshot would silently delete them.
+    this.load();
     const job = this.get(id);
     if (!job) return;
 

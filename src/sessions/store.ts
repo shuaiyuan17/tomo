@@ -214,7 +214,7 @@ export class SessionStore {
 
   /** Link a new SDK session to a channel key */
   setSdkSessionId(key: string, sessionId: string): void {
-    // Unlink any existing session for this key
+    // Unlink any existing session for this key (reloads the registry first)
     this.clearSdkSessionId(key);
 
     const now = Date.now();
@@ -250,6 +250,10 @@ export class SessionStore {
     contextMax: number;
     contextBreakdown?: { name: string; tokens: number }[];
   }): void {
+    // Reload before mutating: other processes (tomo sessions clear, tomo
+    // config) rewrite the registry; saving a stale in-memory copy would
+    // silently revert their changes.
+    this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (!entry) return;
 
@@ -280,6 +284,7 @@ export class SessionStore {
 
   /** Touch the active session (update lastActiveAt) */
   touchSession(key: string): void {
+    this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (entry) {
       entry.lastActiveAt = Date.now();
@@ -301,6 +306,7 @@ export class SessionStore {
 
   /** Unlink a session (marks for deletion after TTL) */
   clearSdkSessionId(key: string): void {
+    this.loadRegistry();
     const now = Date.now();
     for (const entry of this.registry) {
       if (entry.channelKey === key && entry.unlinkedAt === null) {
@@ -366,17 +372,20 @@ export class SessionStore {
     return entry?.replyTarget;
   }
 
-  /** Set and persist the reply target for a session key */
+  /** Set and persist the reply target for a session key. No-op if unchanged. */
   setReplyTarget(key: string, target: ReplyTarget): void {
+    this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    if (entry) {
-      entry.replyTarget = target;
-      this.saveRegistry();
-    }
+    if (!entry) return;
+    const prev = entry.replyTarget;
+    if (prev && prev.channelName === target.channelName && prev.chatId === target.chatId) return;
+    entry.replyTarget = target;
+    this.saveRegistry();
   }
 
   /** Persist a friendly chat title for a session (mainly groups). No-op if unchanged. */
   setChatTitle(key: string, title: string): void {
+    this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (entry && entry.chatTitle !== title) {
       entry.chatTitle = title;
@@ -386,6 +395,7 @@ export class SessionStore {
 
   /** Add a participant name to a session. No-op if already present. */
   addParticipant(key: string, name: string): void {
+    this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (!entry) return;
     const list = entry.participants ?? [];
@@ -396,6 +406,7 @@ export class SessionStore {
 
   /** Migrate a session from one key to another (for identity-based session unification) */
   migrateSessionKey(oldKey: string, newKey: string): void {
+    this.loadRegistry();
     const idx = this.registry.findIndex((e) => e.channelKey === oldKey && e.unlinkedAt === null);
     if (idx === -1) return;
     const entry = this.registry[idx];

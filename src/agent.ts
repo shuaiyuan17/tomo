@@ -724,9 +724,14 @@ export class Agent {
   }
 
   /**
-   * If the live session's last turn pushed context past 80%, fire a one-shot
-   * compact nudge (fire-and-forget). Skips when SDK auto-compact owns this
-   * session. Shared by handleMessage and handleBatchedMessages.
+   * If the live session's last turn pushed context past 80%, fire a compact
+   * nudge. Skips when SDK auto-compact owns this session. Shared by
+   * handleMessage and handleBatchedMessages.
+   *
+   * The nudge goes through handleCronMessage so it runs in the per-session
+   * queue. Calling runWithRetry directly here would overlap with the next
+   * user message's send() and stomp LiveSession's single currentRequest slot,
+   * silently swallowing one of the two responses.
    */
   private maybeNudgeCompact(key: string): void {
     const liveSession = this.liveSessions.get(key);
@@ -737,10 +742,12 @@ export class Agent {
     const groupNote = isGroupSessionKey(key)
       ? " This is a group session — scope the rollup to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
       : "";
-    this.runWithRetry(
-      key,
+    this.handleCronMessage(
       `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
-    ).catch(() => {});
+      key,
+    ).catch((err) => {
+      log.warn({ err, key }, "Compact nudge failed");
+    });
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {

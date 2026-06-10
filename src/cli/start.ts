@@ -46,9 +46,18 @@ async function startForeground(): Promise<void> {
     process.exit(1);
   }
 
+  // Validate config before loading the heavy daemon modules so a fresh
+  // install fails with a clear message instead of a module-load crash.
+  const { config, assertChannelsConfigured } = await import("../config.js");
+  try {
+    assertChannelsConfigured();
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+  }
+
   const { Agent } = await import("../agent.js");
   const { TelegramChannel } = await import("../channels/index.js");
-  const { config } = await import("../config.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
   const { PetScheduler } = await import("../mcp/pet-scheduler.js");
 

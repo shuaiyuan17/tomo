@@ -9,6 +9,7 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
+import { splitText } from "./text-utils.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 
@@ -107,7 +108,7 @@ export class BlueBubblesChannel implements Channel {
     if (!text) return;
 
     // Split long messages
-    const chunks = this.splitText(text, TEXT_CHUNK_LIMIT);
+    const chunks = splitText(text, TEXT_CHUNK_LIMIT);
     for (const chunk of chunks) {
       await this.api("POST", "/message/text", {
         chatGuid: message.chatId,
@@ -256,7 +257,11 @@ export class BlueBubblesChannel implements Channel {
         reject(err);
       });
 
-      this.server.listen(this.webhookPort, () => {
+      // Loopback only — the webhook is registered as http://localhost:<port>,
+      // so there is no reason to accept connections from other hosts. The
+      // handler has no authentication; binding 0.0.0.0 would let anyone on
+      // the LAN inject forged messages into the agent.
+      this.server.listen(this.webhookPort, "127.0.0.1", () => {
         log.info({ port: this.webhookPort }, "Webhook server listening");
         resolve();
       });
@@ -270,9 +275,25 @@ export class BlueBubblesChannel implements Channel {
       return;
     }
 
+    const MAX_BODY_BYTES = 1024 * 1024;
     let body = "";
-    req.on("data", (chunk) => { body += chunk; });
+    let bodyBytes = 0;
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > MAX_BODY_BYTES) {
+        if (!tooLarge) {
+          tooLarge = true;
+          res.writeHead(413);
+          res.end();
+          req.destroy();
+        }
+        return;
+      }
+      body += chunk;
+    });
     req.on("end", () => {
+      if (tooLarge) return;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end('{"status":"ok"}');
 
@@ -595,22 +616,4 @@ export class BlueBubblesChannel implements Channel {
     }
   }
 
-  private splitText(text: string, limit: number): string[] {
-    if (text.length <= limit) return [text];
-    const chunks: string[] = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= limit) {
-        chunks.push(remaining);
-        break;
-      }
-      // Try to split at a newline or space
-      let splitAt = remaining.lastIndexOf("\n", limit);
-      if (splitAt < limit * 0.5) splitAt = remaining.lastIndexOf(" ", limit);
-      if (splitAt < limit * 0.5) splitAt = limit;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
-    }
-    return chunks;
-  }
 }

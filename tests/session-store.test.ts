@@ -105,6 +105,41 @@ describe("SessionStore", () => {
     expect(store2.getSdkSessionId("key1")).toBe("session-xyz");
   });
 
+  it("list APIs see external registry changes from another store instance", () => {
+    // Simulates the daemon's long-lived store vs a CLI process (`tomo
+    // sessions clear`) rewriting the same registry file.
+    const daemonStore = new SessionStore(TEST_DIR, 20);
+    daemonStore.setSdkSessionId("telegram:1", "session-1");
+
+    const cliStore = new SessionStore(TEST_DIR, 20);
+    expect(cliStore.listSdkSessionIds()).toEqual([["telegram:1", "session-1"]]);
+    cliStore.clearSdkSessionId("telegram:1");
+
+    // The daemon's store must observe the external clear without any
+    // intervening mutation of its own.
+    expect(daemonStore.listSdkSessionIds()).toEqual([]);
+    const all = daemonStore.listAllSessions();
+    expect(all).toHaveLength(1);
+    expect(all[0].unlinkedAt).toBeTruthy();
+  });
+
+  it("mutators do not resurrect an externally cleared session", () => {
+    const daemonStore = new SessionStore(TEST_DIR, 20);
+    daemonStore.setSdkSessionId("telegram:1", "session-1");
+
+    const cliStore = new SessionStore(TEST_DIR, 20);
+    cliStore.clearSdkSessionId("telegram:1");
+
+    // updateStats on the stale daemon store must not revert the clear.
+    daemonStore.updateStats("telegram:1", {
+      costUsd: 1, inputTokens: 1, outputTokens: 1,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      contextUsed: 10, contextMax: 100,
+    });
+    expect(cliStore.getSdkSessionId("telegram:1")).toBeUndefined();
+    expect(daemonStore.listSdkSessionIds()).toEqual([]);
+  });
+
   it("touches session lastActiveAt", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setSdkSessionId("key1", "session-abc");

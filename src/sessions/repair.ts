@@ -1,5 +1,6 @@
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { log } from "../logger.js";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import type { SessionMessage } from "./types.js";
 import { getSdkSessionPath } from "./store.js";
 
@@ -80,7 +81,7 @@ export function repairSdkSessionFile(path: string, transcript: SessionMessage[] 
   if (result.changedBlocks === 0) return result;
 
   copyFileSync(path, `${path}.repair.bak`);
-  writeFileSync(path, out.join("\n") + (trailingNewline ? "\n" : ""));
+  writeFileAtomicSync(path, out.join("\n") + (trailingNewline ? "\n" : ""));
   result.repaired = true;
   log.warn(
     { path, changedEvents: result.changedEvents, changedBlocks: result.changedBlocks },

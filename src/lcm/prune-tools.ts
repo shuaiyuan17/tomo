@@ -1,9 +1,16 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { writeFileSync, appendFileSync, existsSync, mkdirSync, openSync, closeSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
-import { getCompactTriggerPath } from "./compact.js";
+import {
+  drainOldInodeAfterRename,
+  getCompactTriggerPath,
+  readSinceOffsetFromFd,
+  readWholeFileFromFd,
+  sleepMs,
+} from "./compact.js";
 import { log } from "../logger.js";
-import { readJsonlFileSync } from "../jsonl.js";
+import { parseJsonl } from "../jsonl.js";
 
 export interface PruneToolsRequest {
   sdkSessionId: string;
@@ -49,15 +56,35 @@ interface SdkEvent {
  *
  * Replaces bulky tool_result content with a short stub while preserving
  * the event structure, parentUuid chain, and tool_use_id pairing.
+ *
+ * The rewrite uses the same concurrent-append machinery as compactSession:
+ * this typically runs (via `tomo lcm prune-tools` from the agent's Bash tool)
+ * while the daemon's SDK is appending the very turn that triggered it to the
+ * same file. A plain read + in-place write would truncate those appends.
  */
 export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
-  const minSize = req.minSize ?? 500;
   const path = getSdkSessionPath(req.sdkSessionId);
   if (!existsSync(path)) {
     return { success: false, pruned: [], totalCharsRemoved: 0, error: "Session file not found" };
   }
 
-  const events = readJsonlFileSync<SdkEvent>(path);
+  const sourceFd = openSync(path, "r");
+  try {
+    return pruneToolsWithFd(req, path, sourceFd);
+  } finally {
+    // Keeping this fd open across the rename lets us drain SDK writes that
+    // land on the old inode (see compactSession for the full rationale).
+    closeSync(sourceFd);
+  }
+}
+
+function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number): PruneToolsResult {
+  const minSize = req.minSize ?? 500;
+
+  // Pinned snapshot up to the last complete line; partial mid-write bytes
+  // stay outside it and are handled by the late-splice loop below.
+  const snapshot = readWholeFileFromFd(sourceFd);
+  const events = parseJsonl<SdkEvent>(snapshot.text);
 
   // Build a map of tool_use_id -> tool name from assistant tool_use events
   const toolNameById = new Map<string, string>();
@@ -154,34 +181,88 @@ export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
 
   const totalCharsRemoved = pruned.reduce((sum, p) => sum + p.originalSize, 0);
 
-  if (!req.dryRun) {
-    // Archive originals if requested
-    if (req.archivePath) {
-      archiveOriginals(req.archivePath, path, req.sdkSessionId);
-    }
-
-    // Write modified session file
-    const output = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
-    writeFileSync(path, output);
-
-    // Write trigger file so the harness reloads the live session on next turn
-    writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
-
-    log.info({
-      sessionId: req.sdkSessionId,
-      prunedCount: pruned.length,
-      charsRemoved: totalCharsRemoved,
-    }, "Tool results pruned");
+  if (req.dryRun) {
+    return { success: true, pruned, totalCharsRemoved };
   }
+
+  // Late-arrival splice: pick up events the SDK appended after our snapshot
+  // so the rewrite doesn't truncate them. Mirrors compactSession's loop;
+  // late events are appended as-is (they're this turn's fresh activity).
+  const lateEvents: SdkEvent[] = [];
+  const seenLateUuids = new Set<string>();
+  let cursor = snapshot.size;
+  let partialStillPending = false;
+  for (let pass = 0; pass < 8; pass++) {
+    const { events: late, readUpTo, hasPartialTail } = readSinceOffsetFromFd(sourceFd, cursor);
+    for (const e of late) {
+      if (e.uuid && seenLateUuids.has(e.uuid)) continue;
+      lateEvents.push(e as SdkEvent);
+      if (e.uuid) seenLateUuids.add(e.uuid);
+    }
+    cursor = readUpTo;
+    partialStillPending = hasPartialTail;
+    if (!hasPartialTail) break;
+    if (pass < 7) sleepMs(5);
+  }
+
+  // An SDK write is still mid-flight: rewriting now would clobber it.
+  // Abort with no side effects; the caller can simply retry.
+  if (partialStillPending) {
+    log.warn({ sessionId: req.sdkSessionId }, "Prune aborted: SDK partial write still pending after retries");
+    return { success: false, pruned: [], totalCharsRemoved: 0, error: "Partial SDK write in flight; retry" };
+  }
+
+  // Archive the snapshot if requested (from the pinned read, not a re-read
+  // of the file, which could race with further appends).
+  if (req.archivePath) {
+    archiveOriginals(req.archivePath, snapshot.text, req.sdkSessionId);
+  }
+
+  // Atomic write: stage in a sibling temp file and rename into place, so the
+  // SDK's appender sees the old file fully or the new file fully — never a
+  // half-written state. The temp name is per-process/per-call so two
+  // concurrent prune invocations can't overwrite or rename each other's file.
+  const output = [...events, ...lateEvents].map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const tmp = `${path}.${process.pid}.${randomUUID()}.pruning.tmp`;
+  try {
+    writeFileSync(tmp, output);
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+
+  // Drain any appends that landed on the old inode around the rename.
+  const postRenameDrain = drainOldInodeAfterRename({
+    sourceFd,
+    startOffset: cursor,
+    path,
+    removedUuids: new Set(),
+    summaryUuid: "",
+    seenLateUuids,
+  });
+  if (postRenameDrain.partialStillPending) {
+    log.warn({ sessionId: req.sdkSessionId }, "Post-rename old-inode drain stopped with partial SDK write still pending");
+  }
+
+  // Write trigger file so the harness reloads the live session on next turn
+  writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
+
+  log.info({
+    sessionId: req.sdkSessionId,
+    prunedCount: pruned.length,
+    charsRemoved: totalCharsRemoved,
+    lateAppended: lateEvents.length,
+    postRenameDrained: postRenameDrain.appended,
+  }, "Tool results pruned");
 
   return { success: true, pruned, totalCharsRemoved };
 }
 
-/** Save a copy of the original session file before pruning */
-function archiveOriginals(archivePath: string, sessionPath: string, sessionId: string): void {
+/** Archive the pre-prune snapshot text (already read via the pinned fd) */
+function archiveOriginals(archivePath: string, snapshotText: string, sessionId: string): void {
   const dir = dirname(archivePath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const original = readFileSync(sessionPath, "utf-8");
   appendFileSync(archivePath, `# pre-prune snapshot of ${sessionId} at ${new Date().toISOString()}\n`);
-  appendFileSync(archivePath, original);
+  appendFileSync(archivePath, snapshotText);
 }

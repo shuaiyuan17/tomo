@@ -1,17 +1,19 @@
 import { chmodSync, copyFileSync, existsSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-export function writeFileAtomicSync(path: string, content: string): void {
+export function writeFileAtomicSync(path: string, content: string, opts?: { mode?: number }): void {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const existingMode = fileMode(path);
+  // Explicit mode wins (e.g. 0600 for secrets, applied even on first write);
+  // otherwise preserve the existing file's mode.
+  const mode = opts?.mode ?? fileMode(path);
   try {
-    if (existingMode === undefined) {
+    if (mode === undefined) {
       writeFileSync(tmp, content);
     } else {
-      writeFileSync(tmp, content, { mode: existingMode });
+      writeFileSync(tmp, content, { mode });
     }
     renameSync(tmp, path);
-    if (existingMode !== undefined) chmodSync(path, existingMode);
+    if (mode !== undefined) chmodSync(path, mode);
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
     throw err;

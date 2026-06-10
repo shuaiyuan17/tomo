@@ -389,7 +389,8 @@ export function readSinceOffset(
   }
 }
 
-function readWholeFileFromFd(fd: number): {
+/** Shared with prune-tools, which rewrites the same live JSONL files. */
+export function readWholeFileFromFd(fd: number): {
   text: string;
   size: number;
   hasPartialTail: boolean;
@@ -414,7 +415,8 @@ function readWholeFileFromFd(fd: number): {
   };
 }
 
-function readSinceOffsetFromFd(
+/** Shared with prune-tools, which rewrites the same live JSONL files. */
+export function readSinceOffsetFromFd(
   fd: number,
   offset: number,
 ): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
@@ -444,7 +446,12 @@ function readSinceOffsetFromFd(
   };
 }
 
-function drainOldInodeAfterRename(args: {
+/**
+ * Shared with prune-tools. Pass empty `removedUuids` (and any value for
+ * `summaryUuid`) when the rewrite removed no events — the re-stitch is then
+ * a no-op and this purely drains late appends from the old inode.
+ */
+export function drainOldInodeAfterRename(args: {
   sourceFd: number;
   startOffset: number;
   path: string;
@@ -493,7 +500,7 @@ function drainOldInodeAfterRename(args: {
  * wall time so the SDK's separate-process appends get scheduled, without
  * restructuring the caller as async.
  */
-function sleepMs(ms: number): void {
+export function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 

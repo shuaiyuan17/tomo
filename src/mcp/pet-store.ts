@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { writeFileAtomicSync } from "../fs-utils.js";
 
 const DEFAULT_PET_PATH = path.join(os.homedir(), ".tomo", "data", "pet.json");
 
@@ -83,7 +84,10 @@ export class PetStore {
 
   save(state: PetState): void {
     fs.mkdirSync(path.dirname(this.petPath), { recursive: true });
-    fs.writeFileSync(this.petPath, JSON.stringify(state, null, 2), "utf-8");
+    // Atomic: load() treats corrupt JSON as "no pet", and pet_status then
+    // steers the user toward pet_hatch, which overwrites the file — a torn
+    // write would turn a crash into permanent pet loss.
+    writeFileAtomicSync(this.petPath, JSON.stringify(state, null, 2));
   }
 
   create(name: string, species: string): PetState {

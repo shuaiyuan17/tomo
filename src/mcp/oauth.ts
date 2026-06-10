@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { ExternalMcpServerConfig, McpOAuthConfig } from "./external-config.js";
 
@@ -324,13 +325,16 @@ export class McpOAuthManager {
   }
 
   private writeToken(key: string, token: OAuthTokenRecord): void {
+    // Read-merge-write on the freshest copy, written atomically: a crash
+    // mid-write must not truncate a file holding every server's refresh
+    // token (readStore treats corrupt JSON as an empty store, so a torn
+    // write would otherwise silently discard all stored credentials).
     const store = this.readStore();
     store.mcpOAuth = store.mcpOAuth ?? {};
     store.mcpOAuth[key] = token;
 
     mkdirSync(dirname(this.tokenStorePath), { recursive: true, mode: 0o700 });
-    writeFileSync(this.tokenStorePath, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
-    chmodSync(this.tokenStorePath, 0o600);
+    writeFileAtomicSync(this.tokenStorePath, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
   }
 }
 

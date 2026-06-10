@@ -257,7 +257,7 @@ export class BlueBubblesChannel implements Channel {
         reject(err);
       });
 
-      // Loopback only — the webhook is registered as http://localhost:<port>,
+      // Loopback only — the webhook is registered as http://127.0.0.1:<port>,
       // so there is no reason to accept connections from other hosts. The
       // handler has no authentication; binding 0.0.0.0 would let anyone on
       // the LAN inject forged messages into the agent.
@@ -309,14 +309,20 @@ export class BlueBubblesChannel implements Channel {
   }
 
   private async registerWebhook(): Promise<void> {
-    const webhookUrl = `http://localhost:${this.webhookPort}/bluebubbles/webhook`;
+    // Literal IPv4 loopback, NOT "localhost": our server binds 127.0.0.1
+    // only, and BlueBubbles may resolve "localhost" to ::1 first — which
+    // would get connection refused even though the server is up.
+    const webhookUrl = `http://127.0.0.1:${this.webhookPort}/bluebubbles/webhook`;
+    // Stale registration from versions that registered the localhost form.
+    const legacyWebhookUrl = `http://localhost:${this.webhookPort}/bluebubbles/webhook`;
 
     try {
-      // Clean up existing webhooks for our URL
+      // Clean up existing webhooks for our URL (current and legacy forms,
+      // so an upgrade doesn't leave a duplicate registration behind)
       const existing = await this.api("GET", "/webhook");
       const webhooks = (existing?.data ?? []) as Array<{ id: number; url: string }>;
       for (const wh of webhooks) {
-        if (wh.url === webhookUrl) {
+        if (wh.url === webhookUrl || wh.url === legacyWebhookUrl) {
           await this.api("DELETE", `/webhook/${wh.id}`);
         }
       }

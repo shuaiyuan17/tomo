@@ -64,22 +64,34 @@ async function main() {
     },
   });
 
-  // Ask for a background subagent that takes ~15s, and tell the model to
-  // return to us IMMEDIATELY without waiting. The question is what happens
-  // ~15s later when that subagent finishes.
+  // TRUE fire-and-forget: launch a ~15s background subagent and END THE TURN
+  // immediately. We deliberately do NOT ask the model to report the output —
+  // that phrasing (in the first version of this probe) made the model keep its
+  // turn open and wait, which masked the real question. Now the discriminator
+  // is TIMING of the first `result`:
+  //   - first result fast (~2s)  => turn closed at LAUNCHED; SDK did NOT force
+  //     a wait. Then we watch whether bg completion produces a SEPARATE later
+  //     turn (the true unsolicited-turn path) or nothing (silent drop).
+  //   - first result slow (~15s) => SDK held the turn open until the bg task
+  //     drained regardless of the model's intent => backgrounding is
+  //     effectively blocking in long-lived query() mode.
+  const startedAt = Date.now();
   sendUserText(
     "Use the Agent tool with run_in_background: true to launch a subagent " +
-      "whose task is: run `sleep 15 && echo DONE_FROM_BG` in Bash and report " +
-      "the output. As soon as you've LAUNCHED it (do not wait for it), reply " +
-      "to me with exactly: LAUNCHED. Later, when the background subagent " +
-      "finishes, tell me what its output was.",
+      "whose task is: run `sleep 15 && echo DONE_FROM_BG` in Bash. " +
+      "The MOMENT you have launched it, reply to me with exactly: LAUNCHED — " +
+      "then STOP and end your turn. Do NOT wait for the subagent. Do NOT " +
+      "report its output. Do NOT call any more tools. Just say LAUNCHED and " +
+      "finish.",
   );
 
   let eventNum = 0;
   let firstResultSeen = false;
   let firstResultAt = 0;
+  let firstResultLatencyMs = 0;
   let sawUnsolicitedTurn = false;
   let sawDoneMarker = false;
+  let postResultAssistantTurns = 0;
 
   // Safety: stop iterating ~40s after the first result so the script always
   // terminates even if no second turn ever arrives.
@@ -108,6 +120,14 @@ async function main() {
     }
     if (textPreview.includes("DONE_FROM_BG")) sawDoneMarker = true;
 
+    // Any top-level (non-subagent) assistant turn AFTER the first result, with
+    // no user message sent in between, is the unsolicited-turn signal claw's
+    // design hinges on.
+    if (firstResultSeen && type === "assistant" && !parentId) {
+      postResultAssistantTurns++;
+      sawUnsolicitedTurn = true;
+    }
+
     const sinceFirstResult = firstResultAt ? `+${((Date.now() - firstResultAt) / 1000).toFixed(1)}s` : "";
     console.log(
       `#${eventNum} [${type}${subtype ? ":" + subtype : ""}]` +
@@ -120,11 +140,16 @@ async function main() {
       if (!firstResultSeen) {
         firstResultSeen = true;
         firstResultAt = Date.now();
+        firstResultLatencyMs = firstResultAt - startedAt;
+        const secs = (firstResultLatencyMs / 1000).toFixed(1);
         console.log(
-          "\n>>> First `result` arrived (foreground turn done). NOT sending " +
-            "another user message. Watching for an unsolicited turn...\n",
+          `\n>>> First \`result\` arrived after ${secs}s. ` +
+            (firstResultLatencyMs > 10_000
+              ? "(SLOW — SDK appears to have held the turn open until the bg task drained.)"
+              : "(FAST — turn closed at LAUNCHED; bg task should still be running.)") +
+            "\n>>> NOT sending another user message. Watching ~40s for a separate turn...\n",
         );
-        // Arm watchdog: give the bg subagent time to finish + wake us.
+        // Arm watchdog: give the bg subagent time to finish + (maybe) wake us.
         watchdog = setTimeout(() => {
           console.log("\n>>> Watchdog fired (40s) — closing.\n");
           stop();
@@ -139,29 +164,43 @@ async function main() {
     }
   }
 
+  const heldTurn = firstResultLatencyMs > 10_000;
   console.log("\n================ VERDICT ================");
-  console.log(`Unsolicited turn after first result : ${sawUnsolicitedTurn ? "YES ✅" : "NO ❌"}`);
-  console.log(`Saw background output (DONE_FROM_BG) : ${sawDoneMarker ? "YES" : "NO"}`);
-  if (sawUnsolicitedTurn) {
+  console.log(`Time to first result                 : ${(firstResultLatencyMs / 1000).toFixed(1)}s ${heldTurn ? "(SDK HELD the turn)" : "(turn closed early)"}`);
+  console.log(`Separate turn after first result     : ${sawUnsolicitedTurn ? `YES ✅ (${postResultAssistantTurns} assistant turn(s))` : "NO ❌"}`);
+  console.log(`Saw background output (DONE_FROM_BG)  : ${sawDoneMarker ? "YES" : "NO"}`);
+
+  console.log("\n---- interpretation ----");
+  if (heldTurn) {
     console.log(
-      "\nThe SDK DOES wake the model on background completion. Background-subagent\n" +
-        "support is viable: LiveSession needs an unsolicited-turn path (route the\n" +
-        "result to the channel via the cron-style delivery queue) + turn-attribution\n" +
-        "guard + lifecycle protection.",
+      "SDK held the turn open until the background task finished, even though we\n" +
+        "told the model to fire-and-forget. In long-lived query() mode, " +
+        "run_in_background\nis effectively BLOCKING: send() won't resolve until the bg task drains.\n" +
+        "=> The bg result is NOT dropped (good — no silent-drift), but you get little\n" +
+        "   over a foreground subagent. True async delivery would need a different\n" +
+        "   mechanism (separate query() per task, or agent-scheduled cron follow-up).\n" +
+        "   At minimum, raise LiveSession's 10-min send() timeout for long tasks.",
+    );
+  } else if (sawUnsolicitedTurn) {
+    console.log(
+      "Turn closed at LAUNCHED AND a separate later turn arrived when the bg task\n" +
+        "finished. This is the real deal: true async is viable. LiveSession needs an\n" +
+        "unsolicited-turn path (route to channel via the cron-style delivery queue) +\n" +
+        "turn-attribution guard + lifecycle protection. Hand this to claw for the PR.",
     );
   } else {
     console.log(
-      "\nNo unsolicited turn observed. Before building anything, dig into WHY:\n" +
-        " - Did the model actually use Agent with run_in_background:true? (check the\n" +
-        "   tool_use lines above — if it ran sleep inline/foreground, the test is\n" +
-        "   invalid; tighten the prompt and retry.)\n" +
-        " - Did the foreground turn end before the bg subagent finished? (compare\n" +
-        "   timestamps.)\n" +
-        " - If Agent genuinely backgrounded and still no wake-up: the SDK does not\n" +
-        "   auto-resume in this mode, and the feature needs a different mechanism\n" +
-        "   (e.g. polling subagent state) — flag this to the user before proceeding.",
+      "Turn closed at LAUNCHED but NO later turn ever arrived — the bg result was\n" +
+        "SILENTLY DROPPED. This is exactly claw's silent-drift, and confirms the SDK\n" +
+        "does NOT auto-wake in this mode. run_in_background fire-and-forget is unsafe\n" +
+        "as-is; the feature needs an explicit delivery mechanism (poll subagent state,\n" +
+        "or have the subagent itself send to the channel via the internal MCP tool).",
     );
   }
+  console.log(
+    "\n(Sanity check the tool_use lines above: confirm the model used Agent with\n" +
+      "run_in_background, not an inline foreground Bash. If it ran inline, retest.)",
+  );
 }
 
 main().catch((err) => {

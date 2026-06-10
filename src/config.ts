@@ -241,13 +241,6 @@ function buildConfig(): TomoConfig {
     DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
   );
 
-  // At least one channel must be configured
-  if (!telegramToken && !imessageUrl) {
-    throw new Error(
-      "No channels configured. Run 'tomo init' or set TELEGRAM_BOT_TOKEN / IMESSAGE_URL.",
-    );
-  }
-
   // Parse identities
   const rawIdentities = (file.identities ?? []) as Array<{
     name?: string;
@@ -295,3 +288,16 @@ function buildConfig(): TomoConfig {
 }
 
 export const config = buildConfig();
+
+/**
+ * Validate that at least one channel is configured. Called at daemon startup —
+ * NOT during config build, so that `tomo init`, `tomo --help`, and other CLI
+ * commands work on a fresh install with no config at all.
+ */
+export function assertChannelsConfigured(cfg: TomoConfig = config): void {
+  if (!cfg.telegramToken && !cfg.imessageUrl) {
+    throw new Error(
+      "No channels configured. Run 'tomo init' or set TELEGRAM_BOT_TOKEN / IMESSAGE_URL.",
+    );
+  }
+}

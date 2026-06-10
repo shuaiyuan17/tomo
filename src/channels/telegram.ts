@@ -10,6 +10,10 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
+import { splitText } from "./text-utils.js";
+
+/** Telegram rejects sendMessage/editMessageText beyond 4096 chars. */
+const TELEGRAM_TEXT_LIMIT = 4096;
 
 export interface TelegramChannelOptions {
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
@@ -355,35 +359,62 @@ export class TelegramChannel implements Channel {
     const NO_REPLY_PREFIX_RE = /^\s*(N(O(_(R(E(P(L(Y)?)?)?)?)?)?)?)?\s*$/i;
     let messageId: number | null = null;
     let buffer = "";
+    // Chars of `buffer` already finalized into earlier messages when a block
+    // overflowed Telegram's per-message limit.
+    let offset = 0;
     let lastSent = "";
     let editTimer: ReturnType<typeof setInterval> | null = null;
     let finished = false;
     let canceled = false;
     let flushPending: Promise<void> = Promise.resolve();
 
+    // Send or edit the current message. Throws on failure so callers don't
+    // mark unsent content as delivered; "message is not modified" is a
+    // success (content is already on screen).
+    const sendOrEdit = async (text: string): Promise<void> => {
+      try {
+        if (!messageId) {
+          const replyParams = replyTo
+            ? { reply_parameters: { message_id: Number(replyTo) } }
+            : {};
+          const sent = await this.bot.api.sendMessage(chatId, text, replyParams);
+          messageId = sent.message_id;
+        } else {
+          await this.bot.api.editMessageText(chatId, messageId, text);
+        }
+      } catch (err) {
+        if (err instanceof Error && /not modified/i.test(err.message)) return;
+        throw err;
+      }
+    };
+
     const flush = () => {
       flushPending = flushPending.then(async () => {
-        if (canceled) return;
-        if (buffer === lastSent || !buffer) return;
-        // Don't send while the buffer might still resolve to a NO_REPLY token —
-        // the agent uses NO_REPLY to suppress delivery, and Telegram's
-        // first-frame send would race ahead and surface it before suppression.
-        if (NO_REPLY_PREFIX_RE.test(buffer)) return;
-        const text = buffer;
-        lastSent = text;
-
         try {
-          if (!messageId) {
-            const replyParams = replyTo
-              ? { reply_parameters: { message_id: Number(replyTo) } }
-              : {};
-            const sent = await this.bot.api.sendMessage(chatId, text, replyParams);
-            messageId = sent.message_id;
-          } else {
-            await this.bot.api.editMessageText(chatId, messageId, text);
+          while (!canceled) {
+            const pending = buffer.slice(offset);
+            if (pending === lastSent || !pending) return;
+            // Don't send while the buffer might still resolve to a NO_REPLY token —
+            // the agent uses NO_REPLY to suppress delivery, and Telegram's
+            // first-frame send would race ahead and surface it before suppression.
+            if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
+            if (pending.length <= TELEGRAM_TEXT_LIMIT) {
+              await sendOrEdit(pending);
+              lastSent = pending;
+              return;
+            }
+            // Over Telegram's limit: finalize the current message with the
+            // first chunk, then roll the remainder into a fresh message.
+            const head = splitText(pending, TELEGRAM_TEXT_LIMIT)[0];
+            await sendOrEdit(head);
+            offset += head.length;
+            messageId = null;
+            lastSent = "";
           }
-        } catch {
-          // Telegram may reject edits if content unchanged or too fast
+        } catch (err) {
+          // Transient failure (rate limit, network): state was not advanced,
+          // so the next timer tick or commit retries the same content.
+          log.warn({ err, chatId }, "Telegram streaming flush failed; will retry");
         }
       });
       return flushPending;
@@ -399,6 +430,23 @@ export class TelegramChannel implements Channel {
         editTimer = null;
       }
       await flushPending;
+    };
+
+    /**
+     * Final flush for commitBlock/finish. The edit timer is stopped by then,
+     * so a swallowed flush failure has no later tick to retry it — retry here
+     * with backoff, and log loudly if the tail content is truly lost.
+     */
+    const finalFlush = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (canceled) return;
+        await flush();
+        const pending = buffer.slice(offset);
+        if (!pending || pending === lastSent) return;
+        if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      }
+      log.error({ chatId }, "Telegram final flush failed after retries; trailing content was not delivered");
     };
 
     return {
@@ -419,17 +467,17 @@ export class TelegramChannel implements Channel {
         // Final flush for this block, then reset state so the next update()
         // starts a fresh sendMessage instead of editing the previous block.
         await stopAndDrain();
-        await flush();
-        await flushPending;
+        await finalFlush();
         messageId = null;
         lastSent = "";
         buffer = "";
+        offset = 0;
       },
       finish: async () => {
         if (finished) return;
         finished = true;
         await stopAndDrain();
-        await flush();
+        await finalFlush();
       },
       cancel: async () => {
         canceled = true;
@@ -470,14 +518,21 @@ export class TelegramChannel implements Channel {
       return;
     }
 
-    try {
-      await this.bot.api.sendMessage(message.chatId, message.text, {
-        ...replyParams,
-        parse_mode: "Markdown",
-      });
-    } catch {
-      // Fallback to plain text if Markdown parsing fails
-      await this.bot.api.sendMessage(message.chatId, message.text, replyParams);
+    // Telegram caps messages at 4096 chars; oversized sends are rejected
+    // outright, so chunk like the iMessage channel does. Only the first
+    // chunk carries the reply reference.
+    const chunks = splitText(message.text, TELEGRAM_TEXT_LIMIT);
+    for (const [i, chunk] of chunks.entries()) {
+      const params = i === 0 ? replyParams : {};
+      try {
+        await this.bot.api.sendMessage(message.chatId, chunk, {
+          ...params,
+          parse_mode: "Markdown",
+        });
+      } catch {
+        // Fallback to plain text if Markdown parsing fails
+        await this.bot.api.sendMessage(message.chatId, chunk, params);
+      }
     }
   }
 

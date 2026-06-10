@@ -8,6 +8,7 @@ export class CronScheduler {
   private store: CronStore;
   private agent: Agent;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private ticking = false;
 
   constructor(agent: Agent) {
     this.store = new CronStore();
@@ -17,8 +18,8 @@ export class CronScheduler {
   start(): void {
     log.info("Cron scheduler started");
     // Check immediately on start
-    this.tick();
-    this.timer = setInterval(() => this.tick(), POLL_INTERVAL_MS);
+    void this.tick();
+    this.timer = setInterval(() => void this.tick(), POLL_INTERVAL_MS);
   }
 
   stop(): void {
@@ -30,9 +31,22 @@ export class CronScheduler {
   }
 
   private async tick(): Promise<void> {
-    const dueJobs = this.store.getDueJobs();
-    for (const job of dueJobs) {
-      await this.execute(job.id);
+    // A job run can outlast the 30s poll (agent queries are slow), and
+    // nextRunAt only advances after the run completes — without this guard
+    // every overlapping tick re-fires the same still-due job.
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      const dueJobs = this.store.getDueJobs();
+      for (const job of dueJobs) {
+        await this.execute(job.id);
+      }
+    } catch (err) {
+      // markRun can throw on disk errors; don't let it become an unhandled
+      // rejection that kills the daemon.
+      log.error({ err }, "Cron tick failed");
+    } finally {
+      this.ticking = false;
     }
   }
 

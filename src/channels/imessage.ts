@@ -9,6 +9,7 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
+import { splitText } from "./text-utils.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 
@@ -107,7 +108,7 @@ export class BlueBubblesChannel implements Channel {
     if (!text) return;
 
     // Split long messages
-    const chunks = this.splitText(text, TEXT_CHUNK_LIMIT);
+    const chunks = splitText(text, TEXT_CHUNK_LIMIT);
     for (const chunk of chunks) {
       await this.api("POST", "/message/text", {
         chatGuid: message.chatId,
@@ -256,7 +257,11 @@ export class BlueBubblesChannel implements Channel {
         reject(err);
       });
 
-      this.server.listen(this.webhookPort, () => {
+      // Loopback only — the webhook is registered as http://127.0.0.1:<port>,
+      // so there is no reason to accept connections from other hosts. The
+      // handler has no authentication; binding 0.0.0.0 would let anyone on
+      // the LAN inject forged messages into the agent.
+      this.server.listen(this.webhookPort, "127.0.0.1", () => {
         log.info({ port: this.webhookPort }, "Webhook server listening");
         resolve();
       });
@@ -270,9 +275,25 @@ export class BlueBubblesChannel implements Channel {
       return;
     }
 
+    const MAX_BODY_BYTES = 1024 * 1024;
     let body = "";
-    req.on("data", (chunk) => { body += chunk; });
+    let bodyBytes = 0;
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > MAX_BODY_BYTES) {
+        if (!tooLarge) {
+          tooLarge = true;
+          res.writeHead(413);
+          res.end();
+          req.destroy();
+        }
+        return;
+      }
+      body += chunk;
+    });
     req.on("end", () => {
+      if (tooLarge) return;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end('{"status":"ok"}');
 
@@ -288,14 +309,20 @@ export class BlueBubblesChannel implements Channel {
   }
 
   private async registerWebhook(): Promise<void> {
-    const webhookUrl = `http://localhost:${this.webhookPort}/bluebubbles/webhook`;
+    // Literal IPv4 loopback, NOT "localhost": our server binds 127.0.0.1
+    // only, and BlueBubbles may resolve "localhost" to ::1 first — which
+    // would get connection refused even though the server is up.
+    const webhookUrl = `http://127.0.0.1:${this.webhookPort}/bluebubbles/webhook`;
+    // Stale registration from versions that registered the localhost form.
+    const legacyWebhookUrl = `http://localhost:${this.webhookPort}/bluebubbles/webhook`;
 
     try {
-      // Clean up existing webhooks for our URL
+      // Clean up existing webhooks for our URL (current and legacy forms,
+      // so an upgrade doesn't leave a duplicate registration behind)
       const existing = await this.api("GET", "/webhook");
       const webhooks = (existing?.data ?? []) as Array<{ id: number; url: string }>;
       for (const wh of webhooks) {
-        if (wh.url === webhookUrl) {
+        if (wh.url === webhookUrl || wh.url === legacyWebhookUrl) {
           await this.api("DELETE", `/webhook/${wh.id}`);
         }
       }
@@ -595,22 +622,4 @@ export class BlueBubblesChannel implements Channel {
     }
   }
 
-  private splitText(text: string, limit: number): string[] {
-    if (text.length <= limit) return [text];
-    const chunks: string[] = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= limit) {
-        chunks.push(remaining);
-        break;
-      }
-      // Try to split at a newline or space
-      let splitAt = remaining.lastIndexOf("\n", limit);
-      if (splitAt < limit * 0.5) splitAt = remaining.lastIndexOf(" ", limit);
-      if (splitAt < limit * 0.5) splitAt = limit;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
-    }
-    return chunks;
-  }
 }

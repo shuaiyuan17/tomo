@@ -256,18 +256,34 @@ backupCommand
     if (existsSync(workspaceSrc)) {
       const workspaceDest = join(TOMO_HOME, "workspace");
       const claudeDir = join(workspaceDest, ".claude");
-      const claudePreserve = join(workspaceDest, ".claude.preserve");
-      if (existsSync(claudeDir)) renameSync(claudeDir, claudePreserve);
+      // Park the live .claude OUTSIDE the workspace tree — anywhere inside
+      // workspaceDest would be deleted by the rmSync below.
+      const claudePreserve = join(TOMO_HOME, ".claude.preserve");
+      rmSync(claudePreserve, { recursive: true, force: true });
+      const hadLiveClaude = existsSync(claudeDir);
+      if (hadLiveClaude) renameSync(claudeDir, claudePreserve);
+
       rmSync(workspaceDest, { recursive: true, force: true });
       cpSync(workspaceSrc, workspaceDest, { recursive: true });
-      if (existsSync(claudePreserve)) renameSync(claudePreserve, claudeDir);
 
-      // Merge backed-up custom skills into restored workspace
-      const skillsBackup = join(workspaceSrc, ".claude", "skills");
-      const skillsTarget = join(workspaceDest, ".claude", "skills");
-      if (existsSync(skillsBackup)) {
-        mkdirSync(skillsTarget, { recursive: true });
-        cpSync(skillsBackup, skillsTarget, { recursive: true });
+      if (hadLiveClaude) {
+        // The live .claude (settings, current skills) wins; merge in only
+        // the backup's skills that don't exist live, then move it back into
+        // place. Merge at skill granularity — overwriting (or per-file
+        // merging) would let an older backed-up copy replace or contaminate
+        // a currently live skill.
+        const backupSkills = join(claudeDir, "skills");
+        if (existsSync(backupSkills)) {
+          const preservedSkills = join(claudePreserve, "skills");
+          mkdirSync(preservedSkills, { recursive: true });
+          for (const entry of readdirSync(backupSkills, { withFileTypes: true })) {
+            const dest = join(preservedSkills, entry.name);
+            if (existsSync(dest)) continue;
+            cpSync(join(backupSkills, entry.name), dest, { recursive: true });
+          }
+        }
+        rmSync(claudeDir, { recursive: true, force: true });
+        renameSync(claudePreserve, claudeDir);
       }
 
       console.log("  [ok] workspace/");

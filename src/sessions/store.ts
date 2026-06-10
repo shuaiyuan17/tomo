@@ -294,6 +294,9 @@ export class SessionStore {
 
   /** List all SDK session entries */
   listSdkSessionIds(): [string, string][] {
+    // Reload so long-lived daemon paths (continuity, notifications, session
+    // catalog, router DM lookup) see external changes like `tomo sessions clear`.
+    this.loadRegistry();
     return this.registry
       .filter((e) => e.unlinkedAt === null)
       .map((e) => [e.channelKey, e.sdkSessionId]);
@@ -301,6 +304,7 @@ export class SessionStore {
 
   /** List all sessions including unlinked */
   listAllSessions(): SessionEntry[] {
+    this.loadRegistry();
     return [...this.registry];
   }
 

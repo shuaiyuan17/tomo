@@ -267,13 +267,20 @@ backupCommand
       cpSync(workspaceSrc, workspaceDest, { recursive: true });
 
       if (hadLiveClaude) {
-        // The live .claude (settings, current skills) wins; merge the
-        // backup's custom skills into it, then move it back into place.
+        // The live .claude (settings, current skills) wins; merge in only
+        // the backup's skills that don't exist live, then move it back into
+        // place. Merge at skill granularity — overwriting (or per-file
+        // merging) would let an older backed-up copy replace or contaminate
+        // a currently live skill.
         const backupSkills = join(claudeDir, "skills");
         if (existsSync(backupSkills)) {
           const preservedSkills = join(claudePreserve, "skills");
           mkdirSync(preservedSkills, { recursive: true });
-          cpSync(backupSkills, preservedSkills, { recursive: true });
+          for (const entry of readdirSync(backupSkills, { withFileTypes: true })) {
+            const dest = join(preservedSkills, entry.name);
+            if (existsSync(dest)) continue;
+            cpSync(join(backupSkills, entry.name), dest, { recursive: true });
+          }
         }
         rmSync(claudeDir, { recursive: true, force: true });
         renameSync(claudePreserve, claudeDir);

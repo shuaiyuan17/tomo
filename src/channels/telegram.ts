@@ -432,6 +432,23 @@ export class TelegramChannel implements Channel {
       await flushPending;
     };
 
+    /**
+     * Final flush for commitBlock/finish. The edit timer is stopped by then,
+     * so a swallowed flush failure has no later tick to retry it — retry here
+     * with backoff, and log loudly if the tail content is truly lost.
+     */
+    const finalFlush = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (canceled) return;
+        await flush();
+        const pending = buffer.slice(offset);
+        if (!pending || pending === lastSent) return;
+        if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      }
+      log.error({ chatId }, "Telegram final flush failed after retries; trailing content was not delivered");
+    };
+
     return {
       update: (text: string) => {
         if (canceled || finished) return;
@@ -450,8 +467,7 @@ export class TelegramChannel implements Channel {
         // Final flush for this block, then reset state so the next update()
         // starts a fresh sendMessage instead of editing the previous block.
         await stopAndDrain();
-        await flush();
-        await flushPending;
+        await finalFlush();
         messageId = null;
         lastSent = "";
         buffer = "";
@@ -461,7 +477,7 @@ export class TelegramChannel implements Channel {
         if (finished) return;
         finished = true;
         await stopAndDrain();
-        await flush();
+        await finalFlush();
       },
       cancel: async () => {
         canceled = true;

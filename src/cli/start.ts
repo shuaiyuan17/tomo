@@ -179,6 +179,16 @@ async function startDaemon(): Promise<void> {
     process.exit(1);
   }
 
+  // Validate config before spawning: the detached child would die instantly
+  // with this error buried in tomo.err while we print "started in background".
+  const { assertChannelsConfigured } = await import("../config.js");
+  try {
+    assertChannelsConfigured();
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+  }
+
   const logFile = join(TOMO_HOME, "logs", "tomo.log");
   const errFile = join(TOMO_HOME, "logs", "tomo.err");
 

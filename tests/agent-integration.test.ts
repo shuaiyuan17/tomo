@@ -353,8 +353,8 @@ class MockChannel implements Channel {
 
   // Test helpers
   async simulateMessage(msg: IncomingMessage) { await this.messageHandler?.(msg); }
-  async simulateCommand(cmd: string, chatId: string, sender: string, args?: string) {
-    await this.commandHandler?.(cmd, chatId, sender, args);
+  async simulateCommand(cmd: string, chatId: string, sender: string, args?: string, senderId?: string) {
+    await this.commandHandler?.(cmd, chatId, sender, args, senderId);
   }
   clearDelivered() {
     this.sent = [];

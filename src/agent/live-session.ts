@@ -21,7 +21,10 @@ export interface MessageRequest {
 /**
  * Sentinel resolution for a steered message that merged into the in-flight
  * turn: that turn's owner request receives (and delivers) the combined
- * response, so the steered caller gets this empty marker instead.
+ * response, so the steered caller gets this empty marker instead. The empty
+ * string is safe as a sentinel only because send()/steer() can never
+ * legitimately resolve with "" — empty turns fall back to "I'm not sure how
+ * to respond to that." in the result handler.
  */
 export const STEER_MERGED = "";
 
@@ -134,6 +137,10 @@ export class LiveSession {
   // miss the in-flight turn's tool boundaries, the CLI queues them and runs
   // them as the next turn (promoted at result time).
   private pendingSteers: Array<{ req: MessageRequest; text: string }> = [];
+  // Text of the steered request promoted to own the current turn, if any.
+  // Used to detect the CLI batching the remaining queued steers into that
+  // turn (see matchSteerEchoes).
+  private promotedSteerText: string | null = null;
   // send() callers waiting for the session to go idle (steered messages can
   // keep the session busy past the turn the agent-level queue saw finish).
   private idleWaiters: Array<() => void> = [];
@@ -201,8 +208,16 @@ export class LiveSession {
     this.currentRequest = null;
     this.mergedRequests = [];
     this.pendingSteers = [];
+    this.promotedSteerText = null;
     for (const r of requests) r.reject(err);
     this.notifyIdle();
+  }
+
+  /** Resolves when no turn is in flight (or the session dies). */
+  async waitForIdle(): Promise<void> {
+    while (this.alive && this.isBusy()) {
+      await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+    }
   }
 
   private notifyIdle(): void {
@@ -277,21 +292,11 @@ export class LiveSession {
       }
     }
 
+    if (event.type === "user" && event.message?.content && (event as { isReplay?: boolean }).isReplay === true) {
+      this.matchSteerEchoes(event.message.content);
+    }
+
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
-      // A steered message echoed back mid-turn means the CLI injected it into
-      // the in-flight turn (rather than queueing it as a follow-up turn) —
-      // its response arrives as part of this turn's result.
-      if (this.pendingSteers.length > 0) {
-        for (const block of event.message.content) {
-          if (!isTextBlock(block)) continue;
-          const idx = this.pendingSteers.findIndex((e) => e.text === block.text);
-          if (idx !== -1) {
-            const [entry] = this.pendingSteers.splice(idx, 1);
-            this.mergedRequests.push(entry.req);
-            log.info({ session: this.sessionKey }, "Steered message joined the in-flight turn");
-          }
-        }
-      }
       for (const block of event.message.content) {
         if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
           const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
@@ -369,18 +374,65 @@ export class LiveSession {
       for (const m of this.mergedRequests) m.resolve(STEER_MERGED);
       this.mergedRequests = [];
       this.currentRequest = null;
+      this.promotedSteerText = null;
 
       if (this.pendingSteers.length > 0) {
         // Steered messages that missed this turn's tool boundaries were
-        // queued by the CLI and run as the next turn. Promote the first as
-        // that turn's owner (its callbacks receive the stream); fold the
-        // rest in as merged.
+        // queued by the CLI and run next. Promote only the FIRST as the
+        // next turn's owner (its callbacks receive the stream); the rest
+        // stay pending — if the CLI batches them into the promoted turn we
+        // detect it via replay echoes (see matchSteerEchoes), otherwise
+        // they're promoted in order by subsequent results.
         const [first, ...rest] = this.pendingSteers;
-        this.pendingSteers = [];
+        this.pendingSteers = rest;
         this.currentRequest = first.req;
-        this.mergedRequests = rest.map((e) => e.req);
+        this.promotedSteerText = first.text;
       } else {
         this.notifyIdle();
+      }
+    }
+  }
+
+  /**
+   * Steered-message bookkeeping from the CLI's replay events (requires the
+   * --replay-user-messages flag, passed via extraArgs when config.steering
+   * is on; non-replay user events never carry steered text verbatim, so
+   * matching is restricted to isReplay events to avoid false positives).
+   * Two shapes appear:
+   *   - A pending steer's text echoed mid-turn → the CLI injected it into
+   *     the in-flight turn at a tool boundary; fold it into this turn.
+   *   - The promoted steer's own text echoed at its turn's start → the CLI
+   *     batched ALL remaining queued steers into that turn. (The batch echo
+   *     skips its last member, so the members can't each be matched
+   *     individually — the promoted owner's echo is the reliable signal.)
+   */
+  private matchSteerEchoes(content: unknown): void {
+    if (this.pendingSteers.length === 0) return;
+
+    const texts: string[] = [];
+    if (typeof content === "string") {
+      texts.push(content);
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (isTextBlock(block)) texts.push(block.text);
+      }
+    }
+
+    for (const text of texts) {
+      if (this.promotedSteerText !== null && text === this.promotedSteerText) {
+        log.info(
+          { session: this.sessionKey, count: this.pendingSteers.length },
+          "Queued steered messages batched into the promoted turn",
+        );
+        this.mergedRequests.push(...this.pendingSteers.map((e) => e.req));
+        this.pendingSteers = [];
+        return;
+      }
+      const idx = this.pendingSteers.findIndex((e) => e.text === text);
+      if (idx !== -1) {
+        const [entry] = this.pendingSteers.splice(idx, 1);
+        this.mergedRequests.push(entry.req);
+        log.info({ session: this.sessionKey }, "Steered message joined the in-flight turn");
       }
     }
   }
@@ -442,9 +494,7 @@ export class LiveSession {
     // Steered messages can keep the session busy past the turn that the
     // agent-level queue serialized against (they may run as a follow-up
     // turn), so wait for true idleness before dispatching.
-    while (this.alive && this.isBusy()) {
-      await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
-    }
+    await this.waitForIdle();
     if (!this.alive) throw new Error("Session is closed");
 
     // Fresh maxTurns budget per user message — warnings fire once per send().
@@ -507,7 +557,10 @@ export class LiveSession {
       }, TIMEOUT_MS);
 
       req = {
-        message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
+        // priority "next" is the CLI's default for queued commands; set it
+        // explicitly so mid-turn injection (drained at tool boundaries via
+        // getCommandsByMaxPriority("next")) doesn't depend on the default.
+        message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
         onText,
         onBlockComplete,
         resolve: (val: string) => { clearTimeout(timer); resolve(val); },

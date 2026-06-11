@@ -79,7 +79,7 @@ function createMockQuery(prompt: AsyncGenerator) {
             const extraContent = (extra.value as { message?: { content?: Array<{ type: string; text?: string }> } })
               ?.message?.content ?? [];
             mockUserContents.push(extraContent);
-            eventQueue.push({ type: "user", message: { content: extraContent } });
+            eventQueue.push({ type: "user", isReplay: true, message: { content: extraContent } });
             let extraText = "";
             for (const b of extraContent) {
               if (b.type === "text") extraText += b.text ?? "";

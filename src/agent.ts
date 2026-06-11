@@ -1015,10 +1015,22 @@ export class Agent {
         this.sessions.updateStats(key, session.lastResult);
       }
 
-      // If compact happened during this turn, reload the session on next turn
+      // If compact happened during this turn, reload the session on next
+      // turn. With steering, a promoted steered turn may already be running
+      // on this session — closing now would kill it, so defer the reload
+      // until the session is truly idle.
       if (sid && checkAndClearCompactTrigger(sid)) {
-        this.closeLiveSession(key);
-        log.info({ key }, "Session reloaded after compact");
+        if (session.isBusy()) {
+          void session.waitForIdle().then(() => {
+            if (this.liveSessions.get(key) === session) {
+              this.closeLiveSession(key);
+              log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
+            }
+          });
+        } else {
+          this.closeLiveSession(key);
+          log.info({ key }, "Session reloaded after compact");
+        }
       }
 
       // Context-usage hysteresis: nudge agent to run `tomo lcm daily` when

@@ -196,8 +196,7 @@ describe("LiveSession steering", () => {
     await expect(p1).resolves.toBe("reply one");
 
     // Turn 2 starts with the CLI batching the queued steers into one turn;
-    // the batch echo re-emits the promoted steer's own text (the echo skips
-    // the batch's last member, so that's the reliable signal).
+    // the batch echo includes the promoted steer's own text.
     harness.pushEvent(userEcho("second"));
     harness.pushEvent(assistantEvent("reply two+three"));
     harness.pushEvent(resultEvent());

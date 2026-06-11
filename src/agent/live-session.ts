@@ -402,9 +402,7 @@ export class LiveSession {
    *   - A pending steer's text echoed mid-turn → the CLI injected it into
    *     the in-flight turn at a tool boundary; fold it into this turn.
    *   - The promoted steer's own text echoed at its turn's start → the CLI
-   *     batched ALL remaining queued steers into that turn. (The batch echo
-   *     skips its last member, so the members can't each be matched
-   *     individually — the promoted owner's echo is the reliable signal.)
+   *     batched the remaining queued steers into that promoted turn.
    */
   private matchSteerEchoes(content: unknown): void {
     if (this.pendingSteers.length === 0) return;

@@ -1,6 +1,6 @@
 import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
-import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
+import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
@@ -19,18 +19,11 @@ import { LiveSession, STEER_MERGED } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
+import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
+import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { repairSdkSessionForResume } from "./sessions/repair.js";
-import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "./models.js";
-import {
-  CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
-  CHATGPT_SUBSCRIPTION_MODE,
-  isChatGptSubscriptionModel,
-  liteLlmModeLabel,
-} from "./litellm.js";
-import { dirname } from "node:path";
-import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "./fs-utils.js";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { writeJsonAtomicSync } from "./fs-utils.js";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
 
@@ -62,14 +55,15 @@ export class Agent {
   private liveSessions = new Map<string, LiveSession>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private messageQueues = new Map<string, Promise<void>>();
-  // DM messages that arrived while a turn was in flight, waiting to be
-  // coalesced into one user turn. Keyed by sessionKey. Drained by the next
-  // queued task; later tasks find nothing and no-op.
-  private pendingBatches = new Map<string, Array<{ channel: Channel; message: IncomingMessage }>>();
-  private pendingBatchSettleUntil = new Map<string, number>();
-  private pendingBatchSettleStartedAt = new Map<string, number>();
-  private pendingBatchDrainScheduled = new Set<string>();
-  private lastImessageReceiptAt = new Map<string, number>();
+  private batcher = new InboundBatcher({
+    enqueueForSession: (key, task) => this.enqueueForSession(key, task),
+    processInboundItems: (items, steer) => this.processInboundItems(items, steer),
+    hasBusyLiveSession: (key) => {
+      const live = this.liveSessions.get(key);
+      return !!live?.isAlive() && live.isBusy();
+    },
+  });
+  private commands: ChatCommandHandler;
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
@@ -81,13 +75,19 @@ export class Agent {
   // proactive message went out.
   private pendingNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
-  private restoringConfig = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
+    this.commands = new ChatCommandHandler({
+      router: this.router,
+      sessions: this.sessions,
+      modelOverrides: this.modelOverrides,
+      closeLiveSession: (key) => this.closeLiveSession(key),
+      isSessionLive: (key) => this.liveSessions.get(key)?.isAlive() ?? false,
+    });
     this.internalMcpServer = createTomoInternalMcpServer(this);
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
@@ -139,7 +139,7 @@ export class Agent {
         allowlist.push(chatId);
         channels[channel.name].allowlist = allowlist;
         cfg.channels = channels;
-        this.backupConfig();
+        backupConfigFile();
         writeJsonAtomicSync(CONFIG_PATH, cfg);
         // Update the router's in-memory allowlist
         this.router.addToAllowlist(channel.name, chatId);
@@ -153,7 +153,7 @@ export class Agent {
 
   addChannel(channel: Channel): void {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
-    channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
+    channel.onCommand((cmd, chatId, senderName, args) => this.commands.handle(channel, cmd, chatId, senderName, args));
     this.channels.push(channel);
   }
 
@@ -182,161 +182,21 @@ export class Agent {
   }
 
   /**
-   * Queue messages per session key so they process sequentially. For DMs, also
-   * coalesce: messages that pile up behind an in-flight turn are merged into a
-   * single follow-up turn so the agent sees them together (e.g. "do X" → "wait"
-   * → "nevermind" all become one prompt). Passive groups (iMessage, opt-in
-   * Telegram) coalesce too — every message reaches Tomo there anyway, so
-   * batching just reduces turn count. Mention-required groups bypass
-   * coalescing because per-message mention filtering would be lost.
+   * Route an inbound message into the InboundBatcher: DMs and passive groups
+   * coalesce rapid messages into one turn; mention-required groups process
+   * per-message (mention filtering would be lost otherwise). Resolves once
+   * queued, not when the turn completes.
    */
   private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
-    const receivedAt = Date.now();
     const isGroup = message.isGroup ?? false;
     const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
-
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
     const canCoalesce = !isGroup || isPassiveGroup;
-
-    // Fire-and-forget: the returned promise resolves as soon as the message is
-    // queued, NOT when the SDK turn completes. If a caller (e.g. a channel
-    // adapter) awaits this, that's fine — they don't block the next ingress
-    // on an in-flight turn, which is what lets rapid messages pile up for the
-    // queue to coalesce.
-    if (!canCoalesce) {
-      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
-        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      return;
-    }
-
-    const batch = this.pendingBatches.get(sessionKey) ?? [];
-    batch.push({ channel, message });
-    this.pendingBatches.set(sessionKey, batch);
-
-    // With steering on, the drain runs OUTSIDE the per-session queue so it
-    // can inject into an in-flight turn instead of waiting behind it. The
-    // settle window still applies either way (iMessage fragments must
-    // coalesce before they reach the model). Without steering, queueing the
-    // drain behind the in-flight turn is what coalesces rapid messages into
-    // one follow-up turn.
-    const steerable = config.steering;
-    const dispatchDrain = (task: () => Promise<void>): void => {
-      if (steerable) {
-        task().catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      } else {
-        this.enqueueForSession(sessionKey, task)
-          .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      }
-    };
-
-    const settleMs = this.messageBatchSettleMs(channel.name);
-    const maxSettleMs = this.messageBatchMaxSettleMs(channel.name);
-    if (channel.name === "imessage") {
-      this.logImessageReceipt(sessionKey, message, receivedAt, batch.length, settleMs, maxSettleMs);
-    }
-    if (settleMs <= 0) {
-      dispatchDrain(() => this.drainPendingBatch(sessionKey, steerable));
-      return;
-    }
-
-    const settleStartedAt = this.pendingBatchSettleStartedAt.get(sessionKey) ?? receivedAt;
-    this.pendingBatchSettleStartedAt.set(sessionKey, settleStartedAt);
-    const uncappedSettleUntil = receivedAt + settleMs;
-    const cappedSettleUntil = maxSettleMs > 0
-      ? Math.min(uncappedSettleUntil, settleStartedAt + maxSettleMs)
-      : uncappedSettleUntil;
-    this.pendingBatchSettleUntil.set(sessionKey, cappedSettleUntil);
-    if (this.pendingBatchDrainScheduled.has(sessionKey)) return;
-
-    this.pendingBatchDrainScheduled.add(sessionKey);
-    dispatchDrain(async () => {
-      await this.waitForBatchSettle(sessionKey);
-      this.pendingBatchSettleUntil.delete(sessionKey);
-      this.pendingBatchSettleStartedAt.delete(sessionKey);
-      this.pendingBatchDrainScheduled.delete(sessionKey);
-      await this.drainPendingBatch(sessionKey, steerable);
-    });
-  }
-
-  private messageBatchSettleMs(channelName: string): number {
-    if (channelName !== "imessage") return 0;
-    const ms = config.imessageInboundSettleMs;
-    return Number.isFinite(ms) && ms > 0 ? ms : 0;
-  }
-
-  private messageBatchMaxSettleMs(channelName: string): number {
-    if (channelName !== "imessage") return 0;
-    const ms = config.imessageInboundMaxSettleMs;
-    return Number.isFinite(ms) && ms > 0 ? ms : 0;
-  }
-
-  private logImessageReceipt(
-    sessionKey: string,
-    message: IncomingMessage,
-    receivedAt: number,
-    batchSize: number,
-    settleMs: number,
-    maxSettleMs: number,
-  ): void {
-    const previousReceivedAt = this.lastImessageReceiptAt.get(sessionKey);
-    this.lastImessageReceiptAt.set(sessionKey, receivedAt);
-
-    const providerLagMs = Number.isFinite(message.timestamp) ? receivedAt - message.timestamp : undefined;
-    log.debug({
-      sessionKey,
-      messageId: message.id,
-      receivedAt,
-      receivedAtIso: new Date(receivedAt).toISOString(),
-      providerTimestamp: message.timestamp,
-      providerLagMs,
-      interReceiptMs: previousReceivedAt === undefined ? undefined : receivedAt - previousReceivedAt,
-      batchSize,
-      settleMs,
-      maxSettleMs: maxSettleMs > 0 ? maxSettleMs : undefined,
-    }, "iMessage inbound fragment received");
-  }
-
-  private async waitForBatchSettle(sessionKey: string): Promise<void> {
-    while (true) {
-      const settleUntil = this.pendingBatchSettleUntil.get(sessionKey);
-      if (!settleUntil) return;
-
-      const delay = settleUntil - Date.now();
-      if (delay <= 0) return;
-
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
-    }
-  }
-
-  private async drainPendingBatch(sessionKey: string, steerable = false): Promise<void> {
-    const items = this.pendingBatches.get(sessionKey);
-    if (!items || items.length === 0) return;
-    this.pendingBatches.delete(sessionKey);
-
-    if (items.length > 1) {
-      log.info(
-        { sessionKey, count: items.length },
-        `Coalescing ${items.length} queued messages into one turn`,
-      );
-    }
-
-    if (steerable) {
-      const live = this.liveSessions.get(sessionKey);
-      if (live?.isAlive() && live.isBusy()) {
-        await this.processInboundItems(items, true);
-        return;
-      }
-      // No turn in flight — process through the ordinary per-session queue.
-      this.enqueueForSession(sessionKey, () => this.processInboundItems(items))
-        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      return;
-    }
-
-    await this.processInboundItems(items);
+    this.batcher.enqueue(sessionKey, channel, message, canCoalesce);
   }
 
   private async processInboundItems(
-    items: Array<{ channel: Channel; message: IncomingMessage }>,
+    items: InboundItem[],
     steer = false,
   ): Promise<void> {
     if (items.length === 1) {
@@ -344,176 +204,6 @@ export class Agent {
       return;
     }
     await this.handleBatchedMessages(items, steer);
-  }
-
-  private backupConfig(): void {
-    mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
-    backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
-  }
-
-  private persistModelOverride(key: string, model: string): void {
-    config.sessionModelOverrides[key] = model;
-
-    const cfg = existsSync(CONFIG_PATH)
-      ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
-      : {};
-    const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-    overrides[key] = model;
-    cfg.sessionModelOverrides = overrides;
-
-    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-    this.backupConfig();
-    writeJsonAtomicSync(CONFIG_PATH, cfg);
-  }
-
-  private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
-    if (!existsSync(CONFIG_BACKUP_PATH)) {
-      await channel.send({ chatId, text: "No config backup found at ~/.tomo/config.json.bak." });
-      return;
-    }
-
-    try {
-      mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-      copyFileSync(CONFIG_BACKUP_PATH, CONFIG_PATH);
-
-      const reason = "Restored ~/.tomo/config.json from ~/.tomo/config.json.bak";
-      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
-      writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
-
-      this.restoringConfig = true;
-      await channel.send({ chatId, text: "Restored config.json from config.json.bak. Restarting Tomo..." });
-
-      if (process.env.NODE_ENV === "test") return;
-
-      setTimeout(() => {
-        const cli = process.argv[1];
-        if (!cli) {
-          process.kill(process.pid, "SIGTERM");
-          return;
-        }
-        const child = spawn(process.execPath, [cli, "restart"], {
-          detached: true,
-          stdio: "ignore",
-        });
-        child.unref();
-      }, 100);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      await channel.send({ chatId, text: `[error] restore failed: ${detail}` });
-    }
-  }
-
-  private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
-    const { sessionKey: key } = this.router.resolve(channel.name, chatId, false);
-
-    if (this.restoringConfig) {
-      await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
-      return;
-    }
-
-    if (command === "new") {
-      this.closeLiveSession(key);
-      this.sessions.clearSdkSessionId(key);
-      log.info({ channel: channel.name, chatId, sender: senderName }, "New session started via /new");
-      await channel.send({ chatId, text: "New session started." });
-      return;
-    }
-
-    if (command === "model") {
-      const arg = args?.trim();
-      if (!arg) {
-        const current = this.modelOverrides.get(key) ?? config.model;
-        const lines = [`Current: ${current}`, "", "Switch with: /model <name>", ""];
-        for (const [shortName, fullName] of Object.entries(MODEL_ALIASES)) {
-          const marker = fullName === current ? " (active)" : "";
-          lines.push(`  ${shortName} — ${fullName}${marker}`);
-        }
-        if (config.litellm?.baseUrl) {
-          lines.push("");
-          lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
-        }
-        await channel.send({ chatId, text: lines.join("\n") });
-        return;
-      }
-
-      const resolved = resolveModelName(arg);
-      if (!resolved) {
-        await channel.send({ chatId, text: `Unknown model "${arg}". Use ${modelHelpText()}.` });
-        return;
-      }
-      if (isLiteLlmProviderModel(resolved)) {
-        if (!config.litellm?.baseUrl) {
-          await channel.send({
-            chatId,
-            text: `"${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
-          });
-          return;
-        }
-        if (config.litellm.mode === CHATGPT_SUBSCRIPTION_MODE && !isChatGptSubscriptionModel(resolved)) {
-          await channel.send({
-            chatId,
-            text: `The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`,
-          });
-          return;
-        }
-      }
-      this.modelOverrides.set(key, resolved);
-      this.persistModelOverride(key, resolved);
-      // Model changes require a fresh SDK child process, but keep the SDK
-      // session ID so continuity survives switching between Claude and LiteLLM.
-      // getOrCreateLiveSession repairs provider-specific JSONL quirks before
-      // resuming.
-      this.closeLiveSession(key);
-      log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
-      await channel.send({ chatId, text: `Switched to ${resolved}` });
-      return;
-    }
-
-    if (command === "restore") {
-      await this.restoreConfigAndRestart(channel, chatId);
-      return;
-    }
-
-    if (command === "status") {
-      const model = this.modelOverrides.get(key) ?? config.model;
-      const session = this.sessions.get(key);
-      const entry = this.sessions.getEntry(key);
-      const live = this.liveSessions.get(key);
-
-      const lines: string[] = [];
-      lines.push(`Session: ${key}`);
-      lines.push(`Channel: ${channel.name}`);
-      lines.push(`Model: ${model}`);
-      if (config.litellm?.baseUrl) {
-        lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
-      }
-      lines.push(`Live: ${live?.isAlive() ? "yes" : "no"}`);
-
-      const msgCount = session.messages.filter((m) => m.role === "user").length;
-      lines.push(`Messages: ${msgCount} user turns`);
-
-      if (session.createdAt) {
-        lines.push(`Created: ${new Date(session.createdAt).toLocaleString()}`);
-      }
-      if (session.updatedAt) {
-        lines.push(`Last active: ${new Date(session.updatedAt).toLocaleString()}`);
-      }
-
-      if (entry?.stats) {
-        const s = entry.stats;
-        lines.push("");
-        lines.push(`Queries: ${s.totalQueries}`);
-        lines.push(`Cost: $${s.totalCostUsd.toFixed(4)}`);
-        lines.push(`Tokens: ${s.totalInputTokens.toLocaleString()} in / ${s.totalOutputTokens.toLocaleString()} out`);
-        if (s.contextMax > 0) {
-          const pct = ((s.contextUsed / s.contextMax) * 100).toFixed(0);
-          lines.push(`Context: ${pct}% (${s.contextUsed.toLocaleString()} / ${s.contextMax.toLocaleString()})`);
-        }
-      }
-
-      await channel.send({ chatId, text: lines.join("\n") });
-      return;
-    }
   }
 
   private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
@@ -857,7 +547,7 @@ export class Agent {
   }
 
   private async handleMessage(channel: Channel, message: IncomingMessage, steer = false): Promise<void> {
-    if (this.restoringConfig) return;
+    if (this.commands.isRestoring) return;
 
     const hasImages = message.images && message.images.length > 0;
     const hasDocuments = message.documents && message.documents.length > 0;
@@ -936,7 +626,7 @@ export class Agent {
    * never reach this path.
    */
   private async handleBatchedMessages(
-    items: Array<{ channel: Channel; message: IncomingMessage }>,
+    items: InboundItem[],
     steer = false,
   ): Promise<void> {
     const last = items[items.length - 1];

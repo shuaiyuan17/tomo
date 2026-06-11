@@ -1279,6 +1279,11 @@ export class Agent {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "";
 
+      if (this.stopping && errMsg.includes("closed")) {
+        log.info({ key }, "Session closed during shutdown; preserving SDK session link");
+        return "NO_REPLY";
+      }
+
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
         return "I ran out of steps trying to complete that. Can you try a simpler request?";
@@ -1756,8 +1761,8 @@ export class Agent {
   }
 
   async stop(): Promise<void> {
-    log.info("Shutting down");
     this.stopping = true;
+    log.info("Shutting down");
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
     await Promise.all(this.channels.map((ch) => ch.stop()));

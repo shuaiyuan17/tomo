@@ -268,6 +268,7 @@ vi.mock("../src/logger.js", () => ({
 
 // Import Agent after mocks
 const { Agent } = await import("../src/agent.js");
+const { SessionStore } = await import("../src/sessions/store.js");
 const sdkMock = await import("@anthropic-ai/claude-agent-sdk");
 
 // ---------------------------------------------------------------------------
@@ -2208,6 +2209,35 @@ describe("per-block streaming delivery", () => {
     expect(im.delivered[0].text).toBe("block-b");
 
     await agent.stop();
+  });
+
+  it("preserves the sdk session link when stopping during an in-flight turn", async () => {
+    resetConfig({
+      identities: [{ name: "Shuai", channels: { imessage: "+15551112222" }, replyPolicy: "last-active" }],
+    });
+    const store = new SessionStore(mockConfig.sessionsDir, 20);
+    store.setSdkSessionId("dm:shuai", "old-session-id");
+    store.setReplyTarget("dm:shuai", { channelName: "imessage", chatId: "+15551112222" });
+
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    let release: (() => void) | undefined;
+    mockResponseFn = async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return "late reply";
+    };
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "restart now" }));
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+
+    await agent.stop();
+    release?.();
+
+    const after = new SessionStore(mockConfig.sessionsDir, 20).getEntry("dm:shuai");
+    expect(after?.sdkSessionId).toBe("old-session-id");
+    expect(after?.unlinkedAt).toBeNull();
   });
 
   it("ships STICKER tags as sticker sends without leaking the tag into text", async () => {

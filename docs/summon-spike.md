@@ -47,7 +47,11 @@ reminder, the summon-time pending note, the `send_message` tool description, and
    `sessionKey: dm:<identity>` + the dm session's private reply target. Group traffic touches
    the summon's activity clock; expiry is detected lazily on the next lookup (no timer) and
    fires `onSummonExpired`, which posts a handback notice to the group and queues a pending
-   note for the dm session.
+   note for the dm session. Two hardening details: routing is resolved **once, at receipt
+   time**, and carried with the queued message — a `/summon` or `/dismiss` that lands while a
+   message waits (in-flight turn, iMessage settle window) cannot re-route it; and a **stale
+   summon** (identity renamed/removed since `summons.json` was written, so no private reply
+   target exists) is dropped rather than falling back to replying in the group.
 2. **Persistence** (`src/sessions/summon-store.ts`): summon state lives in
    `~/.tomo/data/summons.json` (atomic writes, corrupt-file tolerant) and survives daemon
    restarts. Activity touches are persisted at most once per minute per key.
@@ -63,7 +67,10 @@ reminder, the summon-time pending note, the `send_message` tool description, and
    groups, or mix audiences inside one coalesced batch) — the switch moment is where tone or
    private context is most likely to be carried across by mistake.
 5. **Group bookkeeping stays put**: participants/title tracking is keyed by the raw group key
-   even while summoned, so the group's own session entry stays fresh for handback.
+   even while summoned, so the group's own session entry stays fresh for handback. For groups
+   that never ran their own session, the store creates a metadata-only stub entry (upgraded in
+   place when a real SDK session is linked), so titles/participants persist and the group shows
+   up in `list_sessions`.
 
 Passive-listen vs mention-required semantics are unchanged — they key off (channel, chatId),
 not the session key.

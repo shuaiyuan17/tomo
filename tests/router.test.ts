@@ -260,6 +260,18 @@ describe("IdentityRouter", () => {
       expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
     });
 
+    it("drops a stale summon when no private reply target exists for the identity", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      // Simulates a summons.json written before the identity was renamed/removed
+      router.summonGroup("telegram", "-987", "Ghost");
+
+      const result = router.resolve("telegram", "-987", true);
+      // Must NOT route dm output to the group — the summon is dropped instead
+      expect(result.sessionKey).toBe("telegram:-987");
+      expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "-987" });
+      expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
+    });
+
     it("dismiss on a non-summoned group returns false", () => {
       const router = new IdentityRouter(identities, sessions, {});
       expect(router.dismissGroup("telegram", "-987")).toBe(false);

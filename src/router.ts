@@ -110,11 +110,20 @@ export class IdentityRouter {
       if (summoned) {
         const dmKey = `dm:${summoned}`;
         const replyTarget = this.sessions.getReplyTarget(dmKey)
-          ?? this.deriveReplyTargetFromConfig(summoned)
-          // Unreachable in practice (summon requires a configured identity);
-          // fall back to the group rather than dropping the reply.
-          ?? { channelName, chatId };
-        return { sessionKey: dmKey, replyTarget, identityName: summoned };
+          ?? this.deriveReplyTargetFromConfig(summoned);
+        if (replyTarget) {
+          return { sessionKey: dmKey, replyTarget, identityName: summoned };
+        }
+        // Stale summon: the identity was renamed/removed since summons.json
+        // was written, so there is no private DM target. Falling back to the
+        // group would route dm-session output (which the prompt promises is
+        // private) into the group — drop the summon instead and route the
+        // message to the group's own session.
+        this.summons.delete(`${channelName}:${chatId}`);
+        log.warn(
+          { channel: channelName, chatId, identity: summoned },
+          "Dropped stale summon: no private reply target for identity",
+        );
       }
       return {
         sessionKey: `${channelName}:${chatId}`,

@@ -11,7 +11,7 @@ import {
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
-import { IdentityRouter } from "./router.js";
+import { IdentityRouter, type SessionResolution } from "./router.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
@@ -35,6 +35,13 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFil
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "./fs-utils.js";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
+
+/** An inbound message plus the SessionResolution captured at receipt time. */
+interface InboundItem {
+  channel: Channel;
+  message: IncomingMessage;
+  resolution: SessionResolution;
+}
 
 export interface SessionCatalog {
   identities: Array<{ name: string }>;
@@ -66,8 +73,11 @@ export class Agent {
   private messageQueues = new Map<string, Promise<void>>();
   // DM messages that arrived while a turn was in flight, waiting to be
   // coalesced into one user turn. Keyed by sessionKey. Drained by the next
-  // queued task; later tasks find nothing and no-op.
-  private pendingBatches = new Map<string, Array<{ channel: Channel; message: IncomingMessage }>>();
+  // queued task; later tasks find nothing and no-op. Each item carries its
+  // receipt-time SessionResolution: routing (especially summon state) is
+  // decided when the message ARRIVES, not when it finally processes — a
+  // /summon or /dismiss in between must not re-route already-queued messages.
+  private pendingBatches = new Map<string, Array<InboundItem>>();
   private pendingBatchSettleUntil = new Map<string, number>();
   private pendingBatchSettleStartedAt = new Map<string, number>();
   private pendingBatchDrainScheduled = new Set<string>();
@@ -205,7 +215,12 @@ export class Agent {
   private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const receivedAt = Date.now();
     const isGroup = message.isGroup ?? false;
-    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
+    // Resolve ONCE, at receipt — this decides both which queue the message
+    // waits in and which session eventually processes it. Re-resolving at
+    // processing time would let a /summon or /dismiss that lands while the
+    // message waits (in-flight turn, iMessage settle window) re-route it.
+    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    const sessionKey = resolution.sessionKey;
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
     const canCoalesce = !isGroup || isPassiveGroup;
@@ -216,13 +231,13 @@ export class Agent {
     // on an in-flight turn, which is what lets rapid messages pile up for the
     // queue to coalesce.
     if (!canCoalesce) {
-      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message))
+      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message, false, resolution))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
       return;
     }
 
     const batch = this.pendingBatches.get(sessionKey) ?? [];
-    batch.push({ channel, message });
+    batch.push({ channel, message, resolution });
     this.pendingBatches.set(sessionKey, batch);
 
     // With steering on, the drain runs OUTSIDE the per-session queue so it
@@ -347,12 +362,9 @@ export class Agent {
     await this.processInboundItems(items);
   }
 
-  private async processInboundItems(
-    items: Array<{ channel: Channel; message: IncomingMessage }>,
-    steer = false,
-  ): Promise<void> {
+  private async processInboundItems(items: InboundItem[], steer = false): Promise<void> {
     if (items.length === 1) {
-      await this.handleMessage(items[0].channel, items[0].message, steer);
+      await this.handleMessage(items[0].channel, items[0].message, steer, items[0].resolution);
       return;
     }
     await this.handleBatchedMessages(items, steer);
@@ -986,7 +998,12 @@ export class Agent {
     }
   }
 
-  private async handleMessage(channel: Channel, message: IncomingMessage, steer = false): Promise<void> {
+  private async handleMessage(
+    channel: Channel,
+    message: IncomingMessage,
+    steer = false,
+    receiptResolution?: SessionResolution,
+  ): Promise<void> {
     if (this.restoringConfig) return;
 
     const hasImages = message.images && message.images.length > 0;
@@ -1018,7 +1035,9 @@ export class Agent {
       return;
     }
 
-    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    // Prefer the receipt-time resolution (see enqueueMessage) so summon state
+    // changes can't re-route a message that was already queued.
+    const resolution = receiptResolution ?? this.router.resolve(channel.name, message.chatId, isGroup);
     const key = resolution.sessionKey;
     const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? channel;
     const replyChatId = resolution.replyTarget.chatId;
@@ -1078,10 +1097,7 @@ export class Agent {
    * follow-up turn. Handles DMs and passive groups; mention-required groups
    * never reach this path.
    */
-  private async handleBatchedMessages(
-    items: Array<{ channel: Channel; message: IncomingMessage }>,
-    steer = false,
-  ): Promise<void> {
+  private async handleBatchedMessages(items: InboundItem[], steer = false): Promise<void> {
     const last = items[items.length - 1];
     const lastChannel = last.channel;
     const lastMessage = last.message;
@@ -1101,7 +1117,10 @@ export class Agent {
       return;
     }
 
-    const resolution = this.router.resolve(lastChannel.name, lastMessage.chatId, isGroup);
+    // All items in a batch share a receipt-time session key (that's how the
+    // batch was keyed); use the last item's resolution rather than re-resolving
+    // so summon changes can't re-route an already-queued batch.
+    const resolution = last.resolution;
     const key = resolution.sessionKey;
     const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? lastChannel;
     const replyChatId = resolution.replyTarget.chatId;
@@ -1615,17 +1634,20 @@ export class Agent {
     return replyTarget ? { sessionKey, replyTarget } : undefined;
   }
 
-  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool. */
+  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool.
+   *  Uses active entries (not just linked SDK sessions) so groups known only
+   *  through metadata — e.g. summoned before ever running their own turn —
+   *  are still listed as send targets. */
   listSessionCatalog(): SessionCatalog {
     const identities = config.identities.map((i) => ({ name: i.name }));
     const groups: SessionCatalog["groups"] = [];
-    for (const [key] of this.sessions.listSdkSessionIds()) {
+    for (const entry of this.sessions.listActiveEntries()) {
+      const key = entry.channelKey;
       if (!isGroupSessionKey(key)) continue;
-      const entry = this.sessions.getEntry(key);
       groups.push({
         key,
-        ...(entry?.chatTitle ? { title: entry.chatTitle } : {}),
-        ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+        ...(entry.chatTitle ? { title: entry.chatTitle } : {}),
+        ...(entry.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
       });
     }
     return { identities, groups };

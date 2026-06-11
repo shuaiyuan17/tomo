@@ -721,9 +721,12 @@ describe("group chat handling", () => {
 
     expect(result.ok).toBe(true);
     expect(tg.renamed).toEqual([{ chatId: "-100123", title: "New Title" }]);
+    // Participants persist via the metadata stub even before an SDK session id
+    // is captured for the group.
     expect(agent.listSessionCatalog().groups).toContainEqual({
       key: "telegram:-100123",
       title: "New Title",
+      participants: ["Alice"],
     });
 
     await agent.stop();

@@ -1,104 +1,112 @@
-# Spike: Summon — pull the main DM session into a group
+# Summon — pull the main DM session into a group
 
-Status: **spike / prototype** — working end-to-end, but with deliberate shortcuts (see Open Questions).
+Status: **prototype, second iteration** — tool-based replies, persistent state, inactivity expiry.
 
 ## What it is
 
 Normally a group chat has its own isolated Tomo session (`telegram:-987`), with no access to
 the owner's personal context. **Summon** lets the owner temporarily route a group's messages
-to their main `dm:<identity>` session instead — full personal memory and conversation context —
-while replies still post to the group. When done, the group is handed back to its own session.
+to their main `dm:<identity>` session instead — full personal memory and conversation context.
+When done, the group is handed back to its own session.
 
 - `/summon` (in a group) — the sender's main session takes over the group.
 - `/dismiss` (in a group) — hand back to the group's own session.
+- Auto-handback after `summonExpiryMinutes` (default 60) of group inactivity; `0` disables.
 - `/status` (in a group) — shows `Summoned: messages route to dm:<identity>` when active.
 
-Naming alternatives considered: "travel", "takeover", "visit". "Summon" reads naturally as a
-pair of commands (`/summon` / `/dismiss`) and describes the direction (you pull your Tomo *in*).
+## Reply model: nothing auto-posts to the group
+
+The first iteration had the harness deliver the dm session's turn output to the group
+(`replyTarget` = group). That created a family of wrong-audience hazards: coalesced batches
+mixing DM and group messages reply to one target, steered messages merge into an in-flight
+turn owned by a different audience, etc.
+
+The current model inverts it:
+
+- **Inbound**: summoned group messages arrive in the dm session tagged
+  `[group "Title"] Sender: ...`, with a short per-turn system reminder appended to the prompt
+  (not the transcript) explaining the routing.
+- **Group-facing replies** happen only via an explicit `send_message` tool call with mode
+  `direct` and the group's session key. The model composes the reply itself — it *is* the
+  session with the context. (`delegate` mode would wake the group's own dormant session,
+  which is exactly what summoning bypasses — the tool description and AGENT.md call this out.)
+- **Direct turn output** goes to the owner's **private DM** (`replyTarget` = the dm session's
+  persisted/derived private target). That's a useful side-channel ("FYI I told the group X");
+  the model replies `NO_REPLY` when there's nothing to say privately.
+
+This makes batching and steering audience-safe by construction: a merged or mixed turn can't
+deliver to the wrong place because the only path into the group is an explicit, per-message
+tool call. The trade-offs: no streaming or typing indicator in the group, no reply-threading,
+and group replies depend on the model following the reminder — mitigated by the per-turn
+reminder, the summon-time pending note, the `send_message` tool description, and AGENT.md.
 
 ## How it works
 
-The whole feature hinges on one fact: `IdentityRouter.resolve(channel, chatId, isGroup)` is the
-single choke point that every ingress path (messages, batching, queueing) goes through to get a
-`sessionKey` + `replyTarget`.
-
-1. **Routing override** (`src/router.ts`): the router keeps an in-memory map
-   `summonedGroups: rawGroupKey → identityName`. For a summoned group, `resolve()` returns
-   `sessionKey: dm:<identity>` with `replyTarget` still pointing at the group. Crucially it does
-   **not** persist that replyTarget on the dm session — cron jobs and continuity heartbeats keep
-   delivering to the private DM, never the group.
-
-2. **Serialization for free**: the per-session message queue and coalescing in `Agent` are keyed
-   by resolved sessionKey, so summoned group traffic and DM traffic automatically serialize onto
-   the same `LiveSession` — no concurrent `send()` on one SDK session.
-
-3. **Owner gating** (`src/agent.ts` → `handleSummonCommand`): `CommandHandler` now carries a
+1. **Routing override** (`src/router.ts`): `IdentityRouter.resolve()` is the single choke point
+   every ingress path goes through. For a summoned group it returns
+   `sessionKey: dm:<identity>` + the dm session's private reply target. Group traffic touches
+   the summon's activity clock; expiry is detected lazily on the next lookup (no timer) and
+   fires `onSummonExpired`, which posts a handback notice to the group and queues a pending
+   note for the dm session.
+2. **Persistence** (`src/sessions/summon-store.ts`): summon state lives in
+   `~/.tomo/data/summons.json` (atomic writes, corrupt-file tolerant) and survives daemon
+   restarts. Activity touches are persisted at most once per minute per key.
+3. **Owner gating** (`src/agent.ts` → `handleSummonCommand`): `CommandHandler` carries a
    provider-verified `senderId` (Telegram `from.id`, iMessage handle address). `/summon` only
-   succeeds if that id is bound to a configured identity — and that identity's session is the one
-   summoned. Display names are never trusted.
+   succeeds if that id is bound to a configured identity — and that identity's session is the
+   one summoned. Display names are never trusted.
+4. **Context briefing**: the dm session's system prompt has no group context, so four layers
+   compensate: a pending note on summon/dismiss/expiry (existing `pendingNotes` mechanism), the
+   per-message `[group "Title"] Sender:` tag, the per-turn reply-routing reminder, and an
+   **audience-switch note** (`src/agent/audience.ts`) injected whenever consecutive inbound
+   messages on the dm session hop between the private DM and a group (or between two summoned
+   groups, or mix audiences inside one coalesced batch) — the switch moment is where tone or
+   private context is most likely to be carried across by mistake.
+5. **Group bookkeeping stays put**: participants/title tracking is keyed by the raw group key
+   even while summoned, so the group's own session entry stays fresh for handback.
 
-4. **Context briefing**: the dm session's system prompt has no group context (it was built as a
-   DM session). Two mechanisms compensate:
-   - On summon/dismiss, a *pending note* (existing `pendingNotes` mechanism) is queued on the dm
-     key, so the model's next turn opens with "you've been summoned into group X; everyone can
-     read your replies; keep private memory out of them".
-   - Every summoned group message is prefixed `[group "Title"] Sender: ...` (see
-     `Agent.formatGroupText`), so the model knows per-message which audience it's writing for.
+Passive-listen vs mention-required semantics are unchanged — they key off (channel, chatId),
+not the session key.
 
-5. **Group bookkeeping stays put**: participants/title tracking is keyed by the raw group key even
-   while summoned, so the group's own session entry stays fresh for when it takes back over.
+## Config
 
-Passive-listen vs mention-required semantics are unchanged — they key off (channel, chatId), not
-the session key, so a passive iMessage group stays passive while summoned.
+```jsonc
+// ~/.tomo/config.json
+{
+  "summonExpiryMinutes": 60   // default 60; 0 = summons never expire
+}
+```
 
-## What was touched
+Env override: `TOMO_SUMMON_EXPIRY_MINUTES`.
 
-| File | Change |
-|---|---|
-| `src/router.ts` | `summonGroup` / `dismissGroup` / `getSummonedIdentity` / `identityForSender`; summon override in `resolve()` |
-| `src/agent.ts` | `/summon` & `/dismiss` handling, pending-note briefings, `[group ...]` message tagging, status line |
-| `src/channels/types.ts` | `CommandHandler` gains optional provider-verified `senderId` |
-| `src/channels/telegram.ts` | register commands, pass `ctx.from.id` |
-| `src/channels/imessage.ts` | whitelist commands, pass handle address |
-| `tests/router.test.ts` | summon routing tests |
+## Privacy model
 
-## Privacy model (read this before productionizing)
-
-Summoning is *deliberately* a privacy trade: the whole point is that the group gets answers
-informed by the owner's personal context. Current guardrails:
+Summoning is *deliberately* a privacy trade: the group gets answers informed by the owner's
+personal context. Guardrails:
 
 - Only the owner (provider-verified id) can summon, and only their own session.
-- Cron/continuity replies never leak to the group (replyTarget not persisted).
-- The model is explicitly told the audience changed (pending note + per-message tag).
+- Nothing auto-posts to the group — every group-facing message is an explicit tool call.
+- Cron/continuity/direct replies all go to the private DM (group reply target never persisted).
+- Summons lapse after inactivity by default, so a forgotten summon isn't a standing hole.
+- The model is briefed at summon time and reminded per turn that group output is public.
 
 Known gaps:
 
 - **Private-memory tool guard is not active.** Group sessions run with a `privateMemoryGuardHooks`
-  PreToolUse guard; the dm `LiveSession` was created without it and hooks can't be added to a
-  live SDK session. The model is *asked* not to leak, not *prevented*. A real version could close
-  the dm LiveSession on summon and recreate it with the guard (cost: loses warm in-flight state).
-- **Group conversation lands in the DM transcript/context permanently.** That's arguably the
-  feature (the owner wants continuity), but it pollutes DM rollups; LCM summaries may mix group
-  threads into personal memory.
+  PreToolUse guard; the dm `LiveSession` doesn't have it. The model is *asked* not to leak
+  (and group output now requires a deliberate tool call, which helps), but not *prevented*.
+- **Group conversation lands in the DM transcript/context permanently.** Arguably the feature,
+  but LCM rollups may mix group threads into personal memory.
 
-## Open questions for productionizing
+## Open questions
 
-1. **Persistence across restarts.** Summon state is in-memory only — a daemon restart silently
-   dismisses. Safe default for a spike (a summon can't outlive the daemon that granted it), but
-   surprising. Option: persist on the group's `SessionEntry` with a TTL.
-2. **Auto-expiry.** Should a summon expire after N hours of group inactivity? Probably yes —
-   a forgotten summon is a standing privacy hole.
-3. **Steering edge.** With `config.steering` on, a summoned group message could steer into an
-   in-flight DM turn (and vice versa), and the merged reply is delivered to the *owning* turn's
-   target. Mixed-audience merge is the one real correctness wart. Cheapest fix: never steer
-   group-originated messages (force the queue path when `message.isGroup`).
-4. **Mixed batches.** A summoned passive group's messages can coalesce into one batch with DM
-   messages (same session key). Per-item `[group ...]` tagging keeps the model oriented, but the
-   batch's reply target is the *last* message's — a reply meant partly for the DM could post to
-   the group. Could split batches by reply target before draining.
-5. **`/new` and `/model` in a summoned group** still operate on the raw group key (pre-existing
-   `resolve(..., isGroup: false)` quirk in `handleCommand`), not the summoned dm session. Probably
-   correct, but worth deciding deliberately.
-6. **Multi-identity groups.** Two owners in one group: last `/summon` wins? Currently a second
-   summon is refused until `/dismiss`. Fine, but the refusal message reveals whose session is
-   active — acceptable?
+1. **Multi-identity groups.** Two owners in one group: a second `/summon` is refused until
+   `/dismiss`. The refusal reveals whose session is active — acceptable?
+2. **Reminder fatigue.** The per-turn reminder costs ~60 tokens per summoned message. Could be
+   dropped to every-Nth-turn once confidence in the AGENT.md instructions is established.
+3. **`/new` and `/model` in a summoned group** still operate on the raw group key (pre-existing
+   `resolve(..., isGroup: false)` quirk in `handleCommand`), not the summoned dm session.
+   Probably correct, but worth deciding deliberately.
+4. **Expiry notice timing.** Expiry is lazy, so the "summon expired" group notice posts when the
+   next group message arrives (just before the group session's reply) — slightly after the fact.
+   A timer could make it prompt, at the cost of timer bookkeeping.

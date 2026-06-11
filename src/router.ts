@@ -1,6 +1,7 @@
 import type { IdentityConfig } from "./config.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
+import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
 
 export interface SessionResolution {
@@ -11,15 +12,18 @@ export interface SessionResolution {
 
 export class IdentityRouter {
   private allowlists: Record<string, Set<string>>;
-  // Groups temporarily routed to a dm:<identity> session via /summon.
-  // Keyed by raw "<channel>:<chatId>". In-memory only — cleared on restart,
-  // so a summon never silently outlives the daemon that granted it.
-  private summonedGroups = new Map<string, string>();
+  /** Notified when a summon lapses from group inactivity. Expiry is detected
+   *  lazily (on the next routing/status lookup), so this fires at most once
+   *  per lapsed summon, right before the group's own session takes back over. */
+  onSummonExpired?: (channelName: string, chatId: string, identityName: string) => void;
 
   constructor(
     private identities: IdentityConfig[],
     private sessions: SessionStore,
     channelAllowlists: Record<string, string[]>,
+    // Groups temporarily routed to a dm:<identity> session via /summon,
+    // keyed by raw "<channel>:<chatId>". Defaults to in-memory (tests).
+    private summons: SummonStore = new SummonStore(null),
   ) {
     // Build fast lookup sets: explicit allowlist + all identity-bound chatIds per channel
     this.allowlists = {};
@@ -58,20 +62,20 @@ export class IdentityRouter {
 
   /** Mark a group as summoned: its messages route to the identity's dm: session until dismissed. */
   summonGroup(channelName: string, chatId: string, identityName: string): void {
-    this.summonedGroups.set(`${channelName}:${chatId}`, identityName.toLowerCase());
+    this.summons.set(`${channelName}:${chatId}`, identityName.toLowerCase());
     log.info({ channel: channelName, chatId, identity: identityName }, "Group summoned to main session");
   }
 
   /** Hand a summoned group back to its own session. Returns false if it wasn't summoned. */
   dismissGroup(channelName: string, chatId: string): boolean {
-    const dismissed = this.summonedGroups.delete(`${channelName}:${chatId}`);
+    const dismissed = this.summons.delete(`${channelName}:${chatId}`);
     if (dismissed) log.info({ channel: channelName, chatId }, "Group dismissed back to group session");
     return dismissed;
   }
 
   /** The identity (lowercased) whose main session currently owns this group, if summoned. */
   getSummonedIdentity(channelName: string, chatId: string): string | undefined {
-    return this.summonedGroups.get(`${channelName}:${chatId}`);
+    return this.resolveSummon(channelName, chatId, false);
   }
 
   /** Find the identity bound to a sender's id on a channel (owner check for /summon). */
@@ -79,20 +83,38 @@ export class IdentityRouter {
     return this.findIdentity(channelName, senderId);
   }
 
+  /** Active summoned identity for a group, handling lazy inactivity expiry.
+   *  `touch` resets the expiry clock — pass true only for real group traffic. */
+  private resolveSummon(channelName: string, chatId: string, touch: boolean): string | undefined {
+    const rawKey = `${channelName}:${chatId}`;
+    const { entry, expired } = this.summons.get(rawKey);
+    if (expired) {
+      log.info({ channel: channelName, chatId, identity: expired.identity }, "Summon expired after inactivity");
+      this.onSummonExpired?.(channelName, chatId, expired.identity);
+      return undefined;
+    }
+    if (!entry) return undefined;
+    if (touch) this.summons.touch(rawKey);
+    return entry.identity;
+  }
+
   /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
   resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {
     // Group chats: always separate sessions — unless summoned, in which case
-    // the turn runs on the unified dm: session while replies still go to the
-    // group. Deliberately do NOT persist this as the dm session's replyTarget:
-    // cron/continuity must keep delivering to the private DM, not the group.
+    // the turn runs on the unified dm: session. The reply target stays the
+    // identity's PRIVATE DM: direct turn output is a side-note to the owner
+    // (or NO_REPLY), and group-facing replies happen only via an explicit
+    // send_message tool call. Nothing auto-posts to the group.
     if (isGroup) {
-      const summoned = this.summonedGroups.get(`${channelName}:${chatId}`);
+      const summoned = this.resolveSummon(channelName, chatId, true);
       if (summoned) {
-        return {
-          sessionKey: `dm:${summoned}`,
-          replyTarget: { channelName, chatId },
-          identityName: summoned,
-        };
+        const dmKey = `dm:${summoned}`;
+        const replyTarget = this.sessions.getReplyTarget(dmKey)
+          ?? this.deriveReplyTargetFromConfig(summoned)
+          // Unreachable in practice (summon requires a configured identity);
+          // fall back to the group rather than dropping the reply.
+          ?? { channelName, chatId };
+        return { sessionKey: dmKey, replyTarget, identityName: summoned };
       }
       return {
         sessionKey: `${channelName}:${chatId}`,

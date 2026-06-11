@@ -80,6 +80,9 @@ interface TomoConfig {
   passiveGroups: Record<string, string[]>;
   /** Secret phrase to activate tomo in a group chat. Null = group chat disabled. */
   groupSecret: string | null;
+  /** Minutes of group inactivity after which a /summon lapses and the group is
+   *  handed back to its own session. 0 disables expiry. Default 60. */
+  summonExpiryMinutes: number;
   /** If true, inbound image attachments are also persisted to workspace/memory/incoming-images/. Default true. */
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
@@ -282,6 +285,7 @@ function buildConfig(): TomoConfig {
     channelAllowlists: parseAllowlists(channels),
     passiveGroups: parsePassiveGroups(channels),
     groupSecret: (file.groupSecret as string) ?? null,
+    summonExpiryMinutes: parseNonNegativeMs(process.env.TOMO_SUMMON_EXPIRY_MINUTES ?? file.summonExpiryMinutes ?? 60, 60),
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
     steering: (process.env.TOMO_STEERING ?? file.steering ?? false) === true || process.env.TOMO_STEERING === "true",

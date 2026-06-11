@@ -12,6 +12,7 @@ import {
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { IdentityRouter } from "./router.js";
+import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
@@ -19,6 +20,7 @@ import { LiveSession, STEER_MERGED } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
+import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { repairSdkSessionForResume } from "./sessions/repair.js";
 import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "./models.js";
 import {
@@ -27,7 +29,7 @@ import {
   isChatGptSubscriptionModel,
   liteLlmModeLabel,
 } from "./litellm.js";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "./fs-utils.js";
@@ -81,13 +83,23 @@ export class Agent {
   // proactive message went out.
   private pendingNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
+  // Last inbound audience per dm: session ("dm" or a raw group key). With
+  // summoning, one session interleaves private and group traffic — this is
+  // how the harness detects the hop and reminds the model the audience changed.
+  private lastAudiences = new Map<string, string>();
   private restoringConfig = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
-    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
+    const summons = new SummonStore(
+      join(config.tomoHome, "data", "summons.json"),
+      config.summonExpiryMinutes * 60_000,
+    );
+    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons);
+    this.router.onSummonExpired = (channelName, chatId, identity) =>
+      this.handleSummonExpired(channelName, chatId, identity);
     this.internalMcpServer = createTomoInternalMcpServer(this);
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
@@ -578,15 +590,60 @@ export class Agent {
     }
 
     this.router.summonGroup(channel.name, chatId, identity.name);
+    const expiryNote = config.summonExpiryMinutes > 0
+      ? ` or after ${config.summonExpiryMinutes} minutes of group inactivity`
+      : "";
     this.queuePendingNote(
       `dm:${identity.name.toLowerCase()}`,
-      `[System: ${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed, messages from that group arrive in this session tagged [group ...] with the sender's name, and your replies to those messages are posted to the group. Everyone in the group can read them — keep private DM context and private memory out of group-facing replies.]`,
+      `[System: ${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed${expiryNote}, messages from that group arrive in this session tagged [group ...] with the sender's name. To reply in the group, call send_message with mode "direct" and target "${rawKey}" — compose the reply yourself, with your context. Plain text you output goes to ${identity.name}'s private DM, not the group. Everyone in the group can read what you send it — keep private memory and DM context out of group-facing messages.]`,
     );
     log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
     await channel.send({
       chatId,
-      text: `${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session.`,
+      text: `${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
     });
+  }
+
+  /** A summon lapsed from inactivity (lazy-detected by the router on the next
+   *  group message). Brief the dm session and post a handback notice. */
+  private handleSummonExpired(channelName: string, chatId: string, identity: string): void {
+    const rawKey = `${channelName}:${chatId}`;
+    const groupLabel = this.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
+    this.queuePendingNote(
+      `dm:${identity}`,
+      `[System: Your summon into the group "${groupLabel}" expired after inactivity — its messages no longer reach this session; the group's own Tomo session has taken back over.]`,
+    );
+    const channel = this.getChannel(channelName);
+    if (!channel) return;
+    channel.send({ chatId, text: "Summon expired after inactivity — handed back to this group's own Tomo session." })
+      .catch((err) => log.warn({ err, channel: channelName, chatId }, "Could not post summon expiry notice"));
+  }
+
+  /**
+   * Per-turn reminder appended to summoned-group prompts. The reply-routing
+   * inversion (text → private DM, group → explicit tool call) is the part the
+   * model must not get wrong, and pending notes only fire once — this rides
+   * along with every summoned message.
+   */
+  private summonReminder(targets: string[]): string {
+    const list = targets.map((t) => `"${t}"`).join(", ");
+    return `[System: summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them.]`;
+  }
+
+  /** Audience-switch prefix for a dm session turn (see agent/audience.ts).
+   *  Updates tracking state; returns "" when the audience didn't change. */
+  private noteAudienceSwitch(key: string, audiences: string[]): string {
+    if (!key.startsWith("dm:") || audiences.length === 0) return "";
+    const prev = this.lastAudiences.get(key);
+    this.lastAudiences.set(key, audiences[audiences.length - 1]);
+    const note = audienceSwitchNote(prev, audiences, (a) => this.audienceLabel(a));
+    return note ? `${note}\n` : "";
+  }
+
+  private audienceLabel(audience: string): string {
+    if (audience === "dm") return "the private DM";
+    const title = this.sessions.getEntry(audience)?.chatTitle;
+    return title ? `the group "${title}" (${audience})` : `the group ${audience}`;
   }
 
   private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
@@ -990,13 +1047,24 @@ export class Agent {
       return;
     }
 
+    // Summoned group message running on the dm session: remind the model how
+    // reply routing works this turn, and flag audience hops (DM ↔ group).
+    // Prompt-only — the transcript keeps the clean tagged message.
+    const isSummoned = isGroup && key.startsWith("dm:");
+    const switchNote = this.noteAudienceSwitch(key, [audienceOf(channel.name, message)]);
+    const promptText = switchNote + (isSummoned
+      ? `${textForAgent}\n${this.summonReminder([`${channel.name}:${message.chatId}`])}`
+      : textForAgent);
+
     await this.runUserTurn({
       key,
-      promptText: textForAgent,
+      promptText,
       sourceChannelName: channel.name,
       replyChannel,
+      // Reply-threading only makes sense when the reply lands in the chat the
+      // message came from — not for summoned groups (reply goes to the DM).
+      replyToMessageId: isGroup && replyChatId === message.chatId ? message.id : undefined,
       replyChatId,
-      replyToMessageId: isGroup ? message.id : undefined,
       images: message.images,
       documents: message.documents,
       suppressErrors: isPassiveGroup,
@@ -1058,7 +1126,16 @@ export class Agent {
     const subject = isGroup
       ? `${items.length} messages arrived from this group in quick succession`
       : `User sent ${items.length} messages in quick succession`;
-    const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
+    // On a dm: session any group-originated item is necessarily summoned
+    // (non-summoned groups have their own session keys). A batch can even mix
+    // DM messages with messages from multiple summoned groups — the per-item
+    // [group ...] tags disambiguate; the reminder lists every group target.
+    const summonTargets = key.startsWith("dm:")
+      ? [...new Set(items.filter((it) => it.message.isGroup).map((it) => `${it.channel.name}:${it.message.chatId}`))]
+      : [];
+    const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
+    const switchNote = this.noteAudienceSwitch(key, items.map((it) => audienceOf(it.channel.name, it.message)));
+    const combined = `${switchNote}[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}${reminder}`;
     const allImages = items.flatMap((it) => it.message.images ?? []);
     const allDocuments = items.flatMap((it) => it.message.documents ?? []);
 
@@ -1068,7 +1145,7 @@ export class Agent {
       sourceChannelName: lastChannel.name,
       replyChannel,
       replyChatId,
-      replyToMessageId: isGroup ? lastMessage.id : undefined,
+      replyToMessageId: isGroup && replyChatId === lastMessage.chatId ? lastMessage.id : undefined,
       images: allImages.length > 0 ? allImages : undefined,
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       suppressErrors: isPassiveGroup,
@@ -1186,8 +1263,9 @@ export class Agent {
    * Prompt/transcript text for an inbound message. Group messages carry the
    * sender's name; summoned group messages (group message running on a dm:
    * session) additionally carry a [group ...] tag — the dm session's system
-   * prompt has no group context, so the tag is what tells the model this
-   * message (and its reply) is group-facing.
+   * prompt has no group context, so the tag is what tells the model which
+   * audience the message came from. Reply routing is covered by the per-turn
+   * summonReminder, which is appended to the prompt but kept out of transcripts.
    */
   private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
     if (!message.isGroup) return message.text;

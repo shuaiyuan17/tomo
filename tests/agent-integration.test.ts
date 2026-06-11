@@ -2245,6 +2245,44 @@ function getLiveSession(agent: InstanceType<typeof Agent>, key: string): Steerab
 }
 
 describe("steering", () => {
+  it("dedupes concurrent live-session creation during steered retry storms", async () => {
+    resetConfig({ steering: true });
+    const agent = new Agent();
+    const internals = agent as unknown as {
+      getOrCreateLiveSession: (key: string) => Promise<unknown>;
+      mcpOAuthManager: {
+        buildServersWithAuth: (...args: unknown[]) => Promise<unknown>;
+      };
+    };
+
+    let releaseBuild: (() => void) | null = null;
+    const buildGate = new Promise<void>((resolve) => { releaseBuild = resolve; });
+    const originalBuild = internals.mcpOAuthManager.buildServersWithAuth.bind(internals.mcpOAuthManager);
+    let buildCalls = 0;
+    internals.mcpOAuthManager.buildServersWithAuth = vi.fn(async (...args: unknown[]) => {
+      buildCalls++;
+      await buildGate;
+      return originalBuild(...args);
+    });
+
+    const p1 = internals.getOrCreateLiveSession("telegram:12345");
+    await waitFor(() => expect(buildCalls).toBe(1));
+
+    const p2 = internals.getOrCreateLiveSession("telegram:12345");
+    const p3 = internals.getOrCreateLiveSession("telegram:12345");
+    await expectNoChangeFor(() => expect(buildCalls).toBe(1));
+
+    releaseBuild!();
+    const [s1, s2, s3] = await Promise.all([p1, p2, p3]);
+
+    expect(s2).toBe(s1);
+    expect(s3).toBe(s1);
+    expect(buildCalls).toBe(1);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
   it("steers a mid-turn message instead of queueing it (follow-up turn outcome)", async () => {
     resetConfig({ steering: true });
     const agent = new Agent();

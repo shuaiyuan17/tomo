@@ -60,6 +60,7 @@ export class Agent {
   private sessions: SessionStore;
   private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
+  private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private messageQueues = new Map<string, Promise<void>>();
   // DM messages that arrived while a turn was in flight, waiting to be
   // coalesced into one user turn. Keyed by sessionKey. Drained by the next
@@ -516,6 +517,24 @@ export class Agent {
   }
 
   private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
+    const session = this.liveSessions.get(key);
+    if (session?.isAlive()) return session;
+
+    const creating = this.liveSessionCreates.get(key);
+    if (creating) return creating;
+
+    const create = this.createLiveSession(key);
+    this.liveSessionCreates.set(key, create);
+    try {
+      return await create;
+    } finally {
+      if (this.liveSessionCreates.get(key) === create) {
+        this.liveSessionCreates.delete(key);
+      }
+    }
+  }
+
+  private async createLiveSession(key: string): Promise<LiveSession> {
     let session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
 

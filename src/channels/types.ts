@@ -84,7 +84,12 @@ export interface StreamingMessage {
 }
 
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;
-export type CommandHandler = (command: string, chatId: string, senderName: string, args?: string) => Promise<void>;
+/**
+ * Slash command handler. `senderId` is the channel's provider-verified sender
+ * identifier (Telegram user id, iMessage handle address) — unlike
+ * `senderName` (a display name), it is safe to use for owner checks.
+ */
+export type CommandHandler = (command: string, chatId: string, senderName: string, args?: string, senderId?: string) => Promise<void>;
 
 export interface Channel {
   /** Channel identifier (e.g. "telegram", "imessage") */

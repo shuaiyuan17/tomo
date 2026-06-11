@@ -153,7 +153,7 @@ export class Agent {
 
   addChannel(channel: Channel): void {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
-    channel.onCommand((cmd, chatId, senderName, args) => this.handleCommand(channel, cmd, chatId, senderName, args));
+    channel.onCommand((cmd, chatId, senderName, args, senderId) => this.handleCommand(channel, cmd, chatId, senderName, args, senderId));
     this.channels.push(channel);
   }
 
@@ -403,11 +403,16 @@ export class Agent {
     }
   }
 
-  private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
+  private async handleCommand(channel: Channel, command: string, chatId: string, senderName: string, args?: string, senderId?: string): Promise<void> {
     const { sessionKey: key } = this.router.resolve(channel.name, chatId, false);
 
     if (this.restoringConfig) {
       await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
+      return;
+    }
+
+    if (command === "summon" || command === "dismiss") {
+      await this.handleSummonCommand(channel, command, chatId, senderName, senderId);
       return;
     }
 
@@ -483,6 +488,8 @@ export class Agent {
       const lines: string[] = [];
       lines.push(`Session: ${key}`);
       lines.push(`Channel: ${channel.name}`);
+      const summoned = this.router.getSummonedIdentity(channel.name, chatId);
+      if (summoned) lines.push(`Summoned: messages route to dm:${summoned} (/dismiss to hand back)`);
       lines.push(`Model: ${model}`);
       if (config.litellm?.baseUrl) {
         lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
@@ -514,6 +521,72 @@ export class Agent {
       await channel.send({ chatId, text: lines.join("\n") });
       return;
     }
+  }
+
+  /**
+   * /summon pulls the owner's main dm: session into a group: subsequent group
+   * messages run on the dm session (full personal context) while replies still
+   * post to the group. /dismiss hands the group back to its own session.
+   * Owner-gated: only a sender whose provider-verified id is bound to an
+   * identity may summon — their dm session is the one that travels.
+   */
+  private async handleSummonCommand(
+    channel: Channel,
+    command: "summon" | "dismiss",
+    chatId: string,
+    senderName: string,
+    senderId?: string,
+  ): Promise<void> {
+    const rawKey = `${channel.name}:${chatId}`;
+    if (!isGroupSessionKey(rawKey)) {
+      await channel.send({ chatId, text: `/${command} only works in group chats.` });
+      return;
+    }
+    if (!this.router.isAllowed(channel.name, chatId)) {
+      log.debug({ channel: channel.name, chatId }, `/${command} blocked (group not in allowlist)`);
+      return;
+    }
+
+    const groupLabel = this.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
+
+    if (command === "dismiss") {
+      const summoned = this.router.getSummonedIdentity(channel.name, chatId);
+      if (!summoned) {
+        await channel.send({ chatId, text: "No main session is summoned here." });
+        return;
+      }
+      this.router.dismissGroup(channel.name, chatId);
+      this.queuePendingNote(
+        `dm:${summoned}`,
+        `[System: You have been dismissed from the group "${groupLabel}" — its messages no longer reach this session, and the group's own Tomo session has taken back over.]`,
+      );
+      await channel.send({ chatId, text: "Handed back to this group's own Tomo session." });
+      return;
+    }
+
+    const identity = senderId ? this.router.identityForSender(channel.name, senderId) : undefined;
+    if (!identity) {
+      log.info({ channel: channel.name, chatId, sender: senderName }, "/summon refused (sender is not a configured identity)");
+      await channel.send({ chatId, text: "Only the owner of a configured identity can summon their main session." });
+      return;
+    }
+
+    const already = this.router.getSummonedIdentity(channel.name, chatId);
+    if (already) {
+      await channel.send({ chatId, text: `Main session dm:${already} is already summoned here. /dismiss first to hand back.` });
+      return;
+    }
+
+    this.router.summonGroup(channel.name, chatId, identity.name);
+    this.queuePendingNote(
+      `dm:${identity.name.toLowerCase()}`,
+      `[System: ${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed, messages from that group arrive in this session tagged [group ...] with the sender's name, and your replies to those messages are posted to the group. Everyone in the group can read them — keep private DM context and private memory out of group-facing replies.]`,
+    );
+    log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
+    await channel.send({
+      chatId,
+      text: `${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session.`,
+    });
   }
 
   private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
@@ -893,10 +966,12 @@ export class Agent {
     const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? channel;
     const replyChatId = resolution.replyTarget.chatId;
 
-    const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
+    const textForAgent = this.formatGroupText(channel, message, key);
 
     if (isGroup) {
-      this.updateGroupContext(key, message.senderName, message.chatTitle);
+      // Track group metadata under the raw group key even while summoned, so
+      // the group's own session entry stays fresh for when it takes back over.
+      this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle);
     }
     this.recordLatestInboundMessage(key, channel, message);
 
@@ -964,9 +1039,9 @@ export class Agent {
     const replyChatId = resolution.replyTarget.chatId;
 
     for (const { channel, message } of items) {
-      if (isGroup) this.updateGroupContext(key, message.senderName, message.chatTitle);
+      if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle);
       this.recordLatestInboundMessage(key, channel, message);
-      const transcriptText = isGroup ? `${message.senderName}: ${message.text}` : message.text;
+      const transcriptText = this.formatGroupText(channel, message, key);
       this.sessions.append(key, {
         role: "user",
         content: transcriptText,
@@ -977,7 +1052,7 @@ export class Agent {
     }
 
     const numbered = items.map((it, i) => {
-      const text = isGroup ? `${it.message.senderName}: ${it.message.text}` : it.message.text;
+      const text = this.formatGroupText(it.channel, it.message, key);
       return `${i + 1}. ${text}`;
     }).join("\n");
     const subject = isGroup
@@ -1105,6 +1180,21 @@ export class Agent {
 
       throw err;
     }
+  }
+
+  /**
+   * Prompt/transcript text for an inbound message. Group messages carry the
+   * sender's name; summoned group messages (group message running on a dm:
+   * session) additionally carry a [group ...] tag — the dm session's system
+   * prompt has no group context, so the tag is what tells the model this
+   * message (and its reply) is group-facing.
+   */
+  private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
+    if (!message.isGroup) return message.text;
+    const prefixed = `${message.senderName}: ${message.text}`;
+    if (!sessionKey.startsWith("dm:")) return prefixed;
+    const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
+    return `[group${label ? ` "${label}"` : ""}] ${prefixed}`;
   }
 
   /** Track participants and chat title for a group session. The actual rules

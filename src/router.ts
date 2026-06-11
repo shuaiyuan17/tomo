@@ -11,6 +11,10 @@ export interface SessionResolution {
 
 export class IdentityRouter {
   private allowlists: Record<string, Set<string>>;
+  // Groups temporarily routed to a dm:<identity> session via /summon.
+  // Keyed by raw "<channel>:<chatId>". In-memory only — cleared on restart,
+  // so a summon never silently outlives the daemon that granted it.
+  private summonedGroups = new Map<string, string>();
 
   constructor(
     private identities: IdentityConfig[],
@@ -52,10 +56,44 @@ export class IdentityRouter {
     this.allowlists[channelName].add(chatId);
   }
 
+  /** Mark a group as summoned: its messages route to the identity's dm: session until dismissed. */
+  summonGroup(channelName: string, chatId: string, identityName: string): void {
+    this.summonedGroups.set(`${channelName}:${chatId}`, identityName.toLowerCase());
+    log.info({ channel: channelName, chatId, identity: identityName }, "Group summoned to main session");
+  }
+
+  /** Hand a summoned group back to its own session. Returns false if it wasn't summoned. */
+  dismissGroup(channelName: string, chatId: string): boolean {
+    const dismissed = this.summonedGroups.delete(`${channelName}:${chatId}`);
+    if (dismissed) log.info({ channel: channelName, chatId }, "Group dismissed back to group session");
+    return dismissed;
+  }
+
+  /** The identity (lowercased) whose main session currently owns this group, if summoned. */
+  getSummonedIdentity(channelName: string, chatId: string): string | undefined {
+    return this.summonedGroups.get(`${channelName}:${chatId}`);
+  }
+
+  /** Find the identity bound to a sender's id on a channel (owner check for /summon). */
+  identityForSender(channelName: string, senderId: string): IdentityConfig | undefined {
+    return this.findIdentity(channelName, senderId);
+  }
+
   /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
   resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {
-    // Group chats: always separate sessions
+    // Group chats: always separate sessions — unless summoned, in which case
+    // the turn runs on the unified dm: session while replies still go to the
+    // group. Deliberately do NOT persist this as the dm session's replyTarget:
+    // cron/continuity must keep delivering to the private DM, not the group.
     if (isGroup) {
+      const summoned = this.summonedGroups.get(`${channelName}:${chatId}`);
+      if (summoned) {
+        return {
+          sessionKey: `dm:${summoned}`,
+          replyTarget: { channelName, chatId },
+          identityName: summoned,
+        };
+      }
       return {
         sessionKey: `${channelName}:${chatId}`,
         replyTarget: { channelName, chatId },

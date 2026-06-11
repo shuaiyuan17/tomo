@@ -176,6 +176,63 @@ describe("IdentityRouter", () => {
     });
   });
 
+  describe("summon", () => {
+    const identities = [
+      { name: "Alice", channels: { telegram: "111" }, replyPolicy: "last-active" },
+    ];
+
+    it("routes a summoned group to the dm: session but replies to the group", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+
+      const result = router.resolve("telegram", "-987", true);
+      expect(result.sessionKey).toBe("dm:alice");
+      expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "-987" });
+      expect(result.identityName).toBe("alice");
+    });
+
+    it("does not persist the group as the dm session's reply target", () => {
+      sessions.setSdkSessionId("dm:alice", "session-alice");
+      sessions.setReplyTarget("dm:alice", { channelName: "telegram", chatId: "111" });
+
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+      router.resolve("telegram", "-987", true);
+
+      // Cron/continuity must still deliver to the private DM
+      expect(router.getReplyTarget("dm:alice")).toEqual({ channelName: "telegram", chatId: "111" });
+    });
+
+    it("does not affect other groups or DMs", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+
+      expect(router.resolve("telegram", "-555", true).sessionKey).toBe("telegram:-555");
+      expect(router.resolve("telegram", "111", false).sessionKey).toBe("dm:alice");
+    });
+
+    it("dismiss restores group routing", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+      expect(router.dismissGroup("telegram", "-987")).toBe(true);
+
+      const result = router.resolve("telegram", "-987", true);
+      expect(result.sessionKey).toBe("telegram:-987");
+      expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
+    });
+
+    it("dismiss on a non-summoned group returns false", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      expect(router.dismissGroup("telegram", "-987")).toBe(false);
+    });
+
+    it("identityForSender matches provider-verified sender ids", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      expect(router.identityForSender("telegram", "111")?.name).toBe("Alice");
+      expect(router.identityForSender("telegram", "222")).toBeUndefined();
+    });
+  });
+
   describe("session migration", () => {
     it("migrates old channel-scoped session to unified dm: key", () => {
       // Simulate an existing session under the old key

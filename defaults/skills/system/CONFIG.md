@@ -49,6 +49,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
     "apiKey": "sk-tomo-local"
   },
   "maxTurns": 50,
+  "steering": false,
   "mcpServers": {
     "github-copilot": {
       "type": "http",
@@ -96,6 +97,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `litellm.baseUrl` | string | Optional LiteLLM proxy base URL, e.g. `http://localhost:4000`. When set, Tomo still uses Claude Agent SDK but sends SDK model calls to the proxy via `ANTHROPIC_BASE_URL`. |
 | `litellm.apiKey` | string | LiteLLM proxy key sent as `ANTHROPIC_API_KEY`. This is the proxy key, not an Anthropic key. For ChatGPT subscription models, LiteLLM owns the OAuth device flow and token storage. |
 | `maxTurns` | number | Max agent turns per single user message (one turn ≈ one tool-use round). Default `50`. Raise if you see "max turns exceeded" on long tool chains. |
+| `steering` | boolean | Experimental. Default `false`. When `true`, user messages that arrive while a turn is in flight bypass the per-session queue and are injected at the next tool-call boundary. If the current turn has no boundary left, the message runs as a follow-up turn. Cron, continuity, and other system-originated turns still queue normally. Also settable with `TOMO_STEERING=true`. |
 | `mcpServers` | object | External MCP servers keyed by server name. Supports stdio (`command`, `args`, `env`), HTTP (`type: "http"`, `url`, `headers`), and SSE (`type: "sse"`, `url`, `headers`). Environment variables like `${HOME}` expand in `url`, `headers`, `env`, and `args`. |
 | `mcpServers.<name>.oauth` | object | Optional harness-managed OAuth for HTTP/SSE MCP servers. Supports `authorizationServer` (optional; omitted = discover from the MCP server), `clientId` (optional if dynamic registration is available), `scopes`, `tokenStoreKey`, `redirectUri`, and `clientName`. Tokens are stored outside agent context in `workspace/secrets/mcp-oauth.json` (`0600`). |
 | `mcpAllowedTools` | string[] | Auto-allowed external MCP tools. If omitted, Tomo defaults to `mcp__<server>__*` for every configured external server. Set this to narrow tool access, e.g. `["mcp__github__list_issues"]`. |
@@ -132,5 +134,5 @@ Start it with `litellm --config ~/litellm-chatgpt.yaml`, then set Tomo's model t
 ## Requirements and overrides
 
 - **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.url`. Startup fails otherwise.
-- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`.
+- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`, `TOMO_STEERING`.
 - `workspaceDir`, `sessionsDir`, `historyLimit` are env-only — they're not read from the JSON file.

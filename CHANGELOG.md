@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Features
+
+- **Experimental message steering.** New `steering` config (`TOMO_STEERING=true`, default off) lets user messages that arrive during an in-flight tool-using turn bypass the per-session queue and inject at the next tool-call boundary. If the current turn has no boundary left, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns continue to queue normally.
+
 ## 0.8.2 (2026-06-08)
 
 ### Features

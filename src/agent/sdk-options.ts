@@ -167,6 +167,13 @@ export function sdkOptions(
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
+    // Steering needs the CLI to re-emit consumed user messages as
+    // isReplay events — that's how LiveSession detects whether a steered
+    // message merged into the in-flight turn or spilled to a follow-up
+    // turn. The CLI flag defaults to off and the SDK has no typed option
+    // for it, so pass it through extraArgs. Scoped to config.steering so
+    // default behavior is untouched.
+    ...(config.steering ? { extraArgs: { "replay-user-messages": null } } : {}),
   };
 }
 

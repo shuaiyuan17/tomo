@@ -84,6 +84,10 @@ interface TomoConfig {
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
+  /** Experimental: steer messages that arrive while a turn is in flight into
+   *  that turn at the next tool-call boundary, instead of queueing them behind
+   *  it. Relies on the Claude Agent SDK/CLI mid-turn message queue. Default false. */
+  steering: boolean;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
   litellm: LiteLlmConfig | null;
   /** External MCP servers from ~/.tomo/config.json. */
@@ -280,6 +284,7 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
+    steering: (process.env.TOMO_STEERING ?? file.steering ?? false) === true || process.env.TOMO_STEERING === "true",
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,

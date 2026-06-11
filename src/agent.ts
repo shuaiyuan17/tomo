@@ -15,7 +15,7 @@ import { IdentityRouter } from "./router.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession } from "./agent/live-session.js";
+import { LiveSession, STEER_MERGED } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
@@ -50,6 +50,9 @@ interface UserTurnRequest {
   documents?: IncomingMessage["documents"];
   suppressErrors: boolean;
   errorLogMessage: string;
+  /** Steer this turn into the session's in-flight turn (config `steering`)
+   *  instead of running through the per-session queue. */
+  steer?: boolean;
 }
 
 export class Agent {
@@ -162,7 +165,9 @@ export class Agent {
    * Serialize work on a session key across ALL ingress paths (user, cron,
    * continuity). Each task runs FIFO so only one send() is in flight per
    * key at any time — prevents LiveSession's shared currentRequest slot
-   * from being stomped by overlapping callers.
+   * from being stomped by overlapping callers. (With config `steering`,
+   * user messages may bypass this queue via LiveSession.steer(), which is
+   * the one sanctioned concurrent path.)
    */
   private enqueueForSession<T>(sessionKey: string, task: () => Promise<T>): Promise<T> {
     const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
@@ -207,13 +212,29 @@ export class Agent {
     batch.push({ channel, message });
     this.pendingBatches.set(sessionKey, batch);
 
+    // With steering on, the drain runs OUTSIDE the per-session queue so it
+    // can inject into an in-flight turn instead of waiting behind it. The
+    // settle window still applies either way (iMessage fragments must
+    // coalesce before they reach the model). Without steering, queueing the
+    // drain behind the in-flight turn is what coalesces rapid messages into
+    // one follow-up turn.
+    const steerable = config.steering;
+    const dispatchDrain = (task: () => Promise<void>): void => {
+      if (steerable) {
+        task().catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      } else {
+        this.enqueueForSession(sessionKey, task)
+          .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      }
+    };
+
     const settleMs = this.messageBatchSettleMs(channel.name);
     const maxSettleMs = this.messageBatchMaxSettleMs(channel.name);
     if (channel.name === "imessage") {
       this.logImessageReceipt(sessionKey, message, receivedAt, batch.length, settleMs, maxSettleMs);
     }
     if (settleMs <= 0) {
-      this.enqueueBatchDrain(sessionKey);
+      dispatchDrain(() => this.drainPendingBatch(sessionKey, steerable));
       return;
     }
 
@@ -227,13 +248,13 @@ export class Agent {
     if (this.pendingBatchDrainScheduled.has(sessionKey)) return;
 
     this.pendingBatchDrainScheduled.add(sessionKey);
-    this.enqueueForSession(sessionKey, async () => {
+    dispatchDrain(async () => {
       await this.waitForBatchSettle(sessionKey);
       this.pendingBatchSettleUntil.delete(sessionKey);
       this.pendingBatchSettleStartedAt.delete(sessionKey);
       this.pendingBatchDrainScheduled.delete(sessionKey);
-      await this.drainPendingBatch(sessionKey);
-    }).catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      await this.drainPendingBatch(sessionKey, steerable);
+    });
   }
 
   private messageBatchSettleMs(channelName: string): number {
@@ -286,26 +307,42 @@ export class Agent {
     }
   }
 
-  private enqueueBatchDrain(sessionKey: string): void {
-    this.enqueueForSession(sessionKey, () => this.drainPendingBatch(sessionKey))
-      .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-  }
-
-  private async drainPendingBatch(sessionKey: string): Promise<void> {
+  private async drainPendingBatch(sessionKey: string, steerable = false): Promise<void> {
     const items = this.pendingBatches.get(sessionKey);
     if (!items || items.length === 0) return;
     this.pendingBatches.delete(sessionKey);
 
-    if (items.length === 1) {
-      await this.handleMessage(items[0].channel, items[0].message);
+    if (items.length > 1) {
+      log.info(
+        { sessionKey, count: items.length },
+        `Coalescing ${items.length} queued messages into one turn`,
+      );
+    }
+
+    if (steerable) {
+      const live = this.liveSessions.get(sessionKey);
+      if (live?.isAlive() && live.isBusy()) {
+        await this.processInboundItems(items, true);
+        return;
+      }
+      // No turn in flight — process through the ordinary per-session queue.
+      this.enqueueForSession(sessionKey, () => this.processInboundItems(items))
+        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
       return;
     }
 
-    log.info(
-      { sessionKey, count: items.length },
-      `Coalescing ${items.length} queued messages into one turn`,
-    );
-    await this.handleBatchedMessages(items);
+    await this.processInboundItems(items);
+  }
+
+  private async processInboundItems(
+    items: Array<{ channel: Channel; message: IncomingMessage }>,
+    steer = false,
+  ): Promise<void> {
+    if (items.length === 1) {
+      await this.handleMessage(items[0].channel, items[0].message, steer);
+      return;
+    }
+    await this.handleBatchedMessages(items, steer);
   }
 
   private backupConfig(): void {
@@ -763,7 +800,17 @@ export class Agent {
         req.images,
         this.makeBlockHandler(req.replyChannel, req.replyChatId, stream),
         req.documents,
+        req.steer,
       );
+
+      if (req.steer && response === STEER_MERGED) {
+        // Steered message merged into the in-flight turn — that turn's owner
+        // streams and records the combined reply; nothing to deliver here.
+        await stopTyping({ clear: true });
+        await stream.cancel();
+        return;
+      }
+
       await stopTyping({ clear: isSilentReply(response) });
 
       this.maybeNudgeCompact(req.key);
@@ -790,7 +837,7 @@ export class Agent {
     }
   }
 
-  private async handleMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+  private async handleMessage(channel: Channel, message: IncomingMessage, steer = false): Promise<void> {
     if (this.restoringConfig) return;
 
     const hasImages = message.images && message.images.length > 0;
@@ -860,6 +907,7 @@ export class Agent {
       documents: message.documents,
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling message",
+      steer,
     });
   }
 
@@ -870,6 +918,7 @@ export class Agent {
    */
   private async handleBatchedMessages(
     items: Array<{ channel: Channel; message: IncomingMessage }>,
+    steer = false,
   ): Promise<void> {
     const last = items[items.length - 1];
     const lastChannel = last.channel;
@@ -930,6 +979,7 @@ export class Agent {
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling batched messages",
+      steer,
     });
   }
 
@@ -940,10 +990,18 @@ export class Agent {
     images?: Array<{ data: string; mediaType: string }>,
     onBlockComplete?: (text: string) => void | Promise<void>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
+    steer = false,
   ): Promise<string> {
     try {
       const session = await this.getOrCreateLiveSession(key);
-      const response = await session.send(prompt, onText, images, onBlockComplete, documents);
+      const response = steer
+        ? await session.steer(prompt, onText, images, onBlockComplete, documents)
+        : await session.send(prompt, onText, images, onBlockComplete, documents);
+
+      // Merged into another request's in-flight turn — that turn's owner
+      // does the per-turn bookkeeping (stats, compact triggers) when it
+      // resolves; nothing to record for this caller.
+      if (steer && response === STEER_MERGED) return response;
 
       // Capture session ID if new
       const sid = session.getSessionId();

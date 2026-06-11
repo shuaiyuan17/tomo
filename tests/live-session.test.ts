@@ -308,3 +308,71 @@ describe("LiveSession steering", () => {
     expect(session.isBusy()).toBe(false);
   });
 });
+
+// Subagent events carry parent_tool_use_id. Their narration must never reach
+// the channel callbacks or the resolved response — only the main agent's own
+// blocks are deliverable.
+const subagentAssistantEvent = (text: string) => ({
+  type: "assistant",
+  parent_tool_use_id: "toolu_parent",
+  message: { content: [textBlock(text)] },
+});
+
+describe("LiveSession subagent events", () => {
+  it("keeps subagent narration out of callbacks and the response", async () => {
+    const { session, harness } = makeSession();
+    const texts: string[] = [];
+    const blocks: string[] = [];
+
+    const p = session.send("first", (t) => { texts.push(t); }, undefined, (b) => { blocks.push(b); });
+    await waitFor(() => harness.inputs.length === 1);
+
+    harness.pushEvent(subagentAssistantEvent("inner monologue"));
+    // Subagent stream deltas must not pollute the top-level streaming text.
+    harness.pushEvent({
+      type: "stream_event",
+      parent_tool_use_id: "toolu_parent",
+      event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+    });
+    harness.pushEvent({
+      type: "stream_event",
+      parent_tool_use_id: "toolu_parent",
+      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "leaky delta" } },
+    });
+    harness.pushEvent(assistantEvent("real reply"));
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("real reply");
+    expect(blocks).toEqual(["real reply"]);
+    for (const t of texts) {
+      expect(t).not.toContain("inner monologue");
+      expect(t).not.toContain("leaky delta");
+    }
+  });
+
+  it("ignores subagent replay echoes for steer merge detection", async () => {
+    const { session, harness } = makeSession();
+
+    const p1 = session.send("first");
+    await waitFor(() => harness.inputs.length === 1);
+    const p2 = session.steer("second");
+    await waitFor(() => harness.inputs.length === 2);
+
+    // Same text, replay-flagged, but from inside a subagent — must not merge.
+    harness.pushEvent({
+      type: "user",
+      isReplay: true,
+      parent_tool_use_id: "toolu_parent",
+      message: { content: [textBlock("second")] },
+    });
+    harness.pushEvent(assistantEvent("reply one"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("reply one");
+
+    // The steer spills to its own follow-up turn instead of resolving merged.
+    expect(session.isBusy()).toBe(true);
+    harness.pushEvent(assistantEvent("reply two"));
+    harness.pushEvent(resultEvent());
+    await expect(p2).resolves.toBe("reply two");
+  });
+});

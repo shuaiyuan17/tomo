@@ -235,6 +235,20 @@ export class LiveSession {
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
+    // Events originating inside a subagent (Agent tool) carry
+    // parent_tool_use_id. They must never reach the channel-facing callbacks:
+    // the subagent's interim narration would ship to the user as Tomo's own
+    // words mid-turn, and its text would pollute `parts` (so it could also
+    // surface in the final response — or be silently dropped, depending on
+    // whether a request happened to be in flight when the block arrived).
+    // The subagent's outcome reaches the user when the main agent folds the
+    // Agent tool result into its own reply.
+    const parentToolUseId = (event as { parent_tool_use_id?: string | null }).parent_tool_use_id ?? null;
+    if (parentToolUseId) {
+      this.logSubagentEvent(event);
+      return;
+    }
+
     const req = this.currentRequest;
 
     if (event.type === "stream_event") {
@@ -297,17 +311,7 @@ export class LiveSession {
     }
 
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
-      for (const block of event.message.content) {
-        if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
-          const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
-          const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
-          if (tr.tool_use_id) this.pendingToolNames.delete(tr.tool_use_id);
-          log.info(
-            { tool: name ?? "?", is_error: tr.is_error ?? false },
-            `result: ${summarizeToolResult(tr.content)}`,
-          );
-        }
-      }
+      this.logToolResults(event.message.content, false);
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
@@ -389,6 +393,39 @@ export class LiveSession {
         this.promotedSteerText = first.text;
       } else {
         this.notifyIdle();
+      }
+    }
+  }
+
+  /**
+   * Observability-only path for subagent events (parent_tool_use_id set):
+   * log tool activity so subagent work shows up in the logs, but never touch
+   * turn state (parts/streamingText) or channel-facing callbacks.
+   */
+  private logSubagentEvent(event: SDKMessage): void {
+    if (event.type === "assistant" && event.message?.content) {
+      for (const block of event.message.content) {
+        if (isToolUseBlock(block)) {
+          if (block.id) this.pendingToolNames.set(block.id, block.name);
+          log.info({ tool: block.name, subagent: true }, summarizeToolInput(block.name, block.input));
+        }
+      }
+    }
+    if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
+      this.logToolResults(event.message.content, true);
+    }
+  }
+
+  private logToolResults(content: unknown[], subagent: boolean): void {
+    for (const block of content) {
+      if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
+        const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
+        const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
+        if (tr.tool_use_id) this.pendingToolNames.delete(tr.tool_use_id);
+        log.info(
+          { tool: name ?? "?", is_error: tr.is_error ?? false, ...(subagent ? { subagent: true } : {}) },
+          `result: ${summarizeToolResult(tr.content)}`,
+        );
       }
     }
   }

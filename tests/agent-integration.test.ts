@@ -26,6 +26,12 @@ type MockResponse = string | MockResponseBlock[];
 let mockResponseFn: (text: string) => MockResponse | Promise<MockResponse> = () => "mock response";
 let mockEmitStreamDeltas = true;
 let mockUserContents: Array<Array<{ type: string; text?: string }>> = [];
+/** When true, the mock pulls one extra pending user message mid-turn and
+ *  echoes it back as a `user` event before the turn's result — simulating the
+ *  CLI injecting a steered message at a tool boundary. Tests MUST guarantee
+ *  the steered message is already pending before the turn unblocks; a
+ *  timed-out race here would otherwise swallow a later message. */
+let mockSteerEcho = false;
 
 /** Track in-flight mock queries so tests can assert no concurrency */
 const queryState = {
@@ -62,7 +68,26 @@ function createMockQuery(prompt: AsyncGenerator) {
         }
 
         const responseValue = await mockResponseFn(text);
-        const blocks = Array.isArray(responseValue) ? responseValue : [responseValue];
+        let blocks = Array.isArray(responseValue) ? [...responseValue] : [responseValue];
+
+        if (mockSteerEcho) {
+          const extra = await Promise.race([
+            prompt.next() as Promise<IteratorResult<unknown>>,
+            new Promise<null>((r) => setTimeout(() => r(null), 25)),
+          ]);
+          if (extra && !extra.done) {
+            const extraContent = (extra.value as { message?: { content?: Array<{ type: string; text?: string }> } })
+              ?.message?.content ?? [];
+            mockUserContents.push(extraContent);
+            eventQueue.push({ type: "user", isReplay: true, message: { content: extraContent } });
+            let extraText = "";
+            for (const b of extraContent) {
+              if (b.type === "text") extraText += b.text ?? "";
+            }
+            const extraResp = await mockResponseFn(extraText);
+            blocks = blocks.concat(Array.isArray(extraResp) ? extraResp : [extraResp]);
+          }
+        }
 
         // For each block, emit stream events + an assistant event. This
         // mirrors how the real SDK reports multi-block turns: text deltas
@@ -194,6 +219,7 @@ const { mockConfig } = vi.hoisted(() => ({
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
+    steering: false,
     litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
     lcm: {
       nudgeAtPct: 70,
@@ -419,6 +445,7 @@ beforeEach(() => {
   resetConfig();
   mockResponseFn = () => "mock response";
   mockEmitStreamDeltas = true;
+  mockSteerEcho = false;
   mockUserContents = [];
   queryState.reset();
 });
@@ -2195,6 +2222,192 @@ describe("per-block streaming delivery", () => {
       { chatId: "12345", text: "", photo: undefined, sticker: "CAACAgQAAxkBAAE123" },
     ]);
 
+    await agent.stop();
+  });
+});
+
+// ===== Steering (config.steering) =====
+//
+// With steering enabled, a message that arrives while a turn is in flight is
+// injected into the live session via LiveSession.steer() instead of waiting
+// in the per-session queue. Two outcomes exist: the CLI merges it into the
+// in-flight turn (echoed back as a `user` event, one combined result), or it
+// misses the turn's tool boundaries and runs as its own follow-up turn.
+
+type SteerableSession = {
+  isBusy(): boolean;
+  pendingSteers: unknown[];
+};
+
+function getLiveSession(agent: InstanceType<typeof Agent>, key: string): SteerableSession {
+  const sessions = (agent as unknown as { liveSessions: Map<string, SteerableSession> }).liveSessions;
+  return sessions.get(key)!;
+}
+
+describe("steering", () => {
+  it("dedupes concurrent live-session creation during steered retry storms", async () => {
+    resetConfig({ steering: true });
+    const agent = new Agent();
+    const internals = agent as unknown as {
+      getOrCreateLiveSession: (key: string) => Promise<unknown>;
+      mcpOAuthManager: {
+        buildServersWithAuth: (...args: unknown[]) => Promise<unknown>;
+      };
+    };
+
+    let releaseBuild: (() => void) | null = null;
+    const buildGate = new Promise<void>((resolve) => { releaseBuild = resolve; });
+    const originalBuild = internals.mcpOAuthManager.buildServersWithAuth.bind(internals.mcpOAuthManager);
+    let buildCalls = 0;
+    internals.mcpOAuthManager.buildServersWithAuth = vi.fn(async (...args: unknown[]) => {
+      buildCalls++;
+      await buildGate;
+      return originalBuild(...args);
+    });
+
+    const p1 = internals.getOrCreateLiveSession("telegram:12345");
+    await waitFor(() => expect(buildCalls).toBe(1));
+
+    const p2 = internals.getOrCreateLiveSession("telegram:12345");
+    const p3 = internals.getOrCreateLiveSession("telegram:12345");
+    await expectNoChangeFor(() => expect(buildCalls).toBe(1));
+
+    releaseBuild!();
+    const [s1, s2, s3] = await Promise.all([p1, p2, p3]);
+
+    expect(s2).toBe(s1);
+    expect(s3).toBe(s1);
+    expect(buildCalls).toBe(1);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("steers a mid-turn message instead of queueing it (follow-up turn outcome)", async () => {
+    resetConfig({ steering: true });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const order: string[] = [];
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      if (text.includes("FIRST")) {
+        order.push("first-start");
+        await gate;
+        order.push("first-end");
+        return "reply one";
+      }
+      if (text.includes("SECOND")) {
+        order.push("second-run");
+        return "reply two";
+      }
+      return "misc";
+    };
+
+    await tg.simulateMessage(makeMsg({ text: "FIRST" }));
+    await waitFor(() => expect(order).toEqual(["first-start"]));
+
+    await tg.simulateMessage(makeMsg({ text: "SECOND" }));
+
+    // The steered message is injected while the first turn is still gated —
+    // it does NOT wait in the per-session queue.
+    await waitFor(() => expect(getLiveSession(agent, "telegram:12345").pendingSteers).toHaveLength(1));
+    expect(order).toEqual(["first-start"]);
+
+    release!();
+    await waitFor(() => {
+      const texts = tg.delivered.map((d) => d.text);
+      expect(texts).toContain("reply one");
+      expect(texts).toContain("reply two");
+    });
+
+    expect(order).toEqual(["first-start", "first-end", "second-run"]);
+    // The steered message ran as its own turn — no coalescing banner.
+    expect(tg.delivered.map((d) => d.text).join("\n")).not.toContain("quick succession");
+    expect(tg.delivered.some((d) => d.text.startsWith("[error]"))).toBe(false);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("delivers a merged steered message once, through the owning turn's stream", async () => {
+    resetConfig({ steering: true });
+    mockSteerEcho = true;
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      if (text.includes("FIRST")) {
+        await gate;
+        return "reply one";
+      }
+      if (text.includes("SECOND")) return "reply two";
+      return "misc";
+    };
+
+    await tg.simulateMessage(makeMsg({ text: "FIRST" }));
+    await waitFor(() => expect(getLiveSession(agent, "telegram:12345").isBusy()).toBe(true));
+
+    await tg.simulateMessage(makeMsg({ text: "SECOND" }));
+    await waitFor(() => expect(getLiveSession(agent, "telegram:12345").pendingSteers).toHaveLength(1));
+
+    release!();
+    await waitFor(() => {
+      const texts = tg.delivered.map((d) => d.text);
+      expect(texts).toContain("reply one");
+      expect(texts).toContain("reply two");
+    });
+
+    // Both replies came from the SAME turn; the steered request resolved as
+    // merged and must not deliver anything extra (no duplicate, no error).
+    await expectNoChangeFor(() => {
+      expect(tg.delivered.filter((d) => d.text === "reply two")).toHaveLength(1);
+      expect(tg.delivered.some((d) => d.text.startsWith("[error]"))).toBe(false);
+    });
+    expect(getLiveSession(agent, "telegram:12345").isBusy()).toBe(false);
+    expect(queryState.maxConcurrent).toBe(1);
+
+    await agent.stop();
+  });
+
+  it("keeps queueing mid-turn messages when steering is disabled (default)", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const order: string[] = [];
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((r) => { release = r; });
+
+    mockResponseFn = async (text) => {
+      if (text.includes("FIRST")) {
+        order.push("first-start");
+        await gate;
+        order.push("first-end");
+        return "reply one";
+      }
+      order.push("second-run");
+      return "reply two";
+    };
+
+    await tg.simulateMessage(makeMsg({ text: "FIRST" }));
+    await waitFor(() => expect(order).toEqual(["first-start"]));
+
+    await tg.simulateMessage(makeMsg({ text: "SECOND" }));
+    await expectNoChangeFor(() => expect(order).toEqual(["first-start"]));
+    expect(getLiveSession(agent, "telegram:12345").pendingSteers).toHaveLength(0);
+
+    release!();
+    await drainAllSessions(agent);
+
+    expect(order).toEqual(["first-start", "first-end", "second-run"]);
     await agent.stop();
   });
 });

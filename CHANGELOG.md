@@ -1,10 +1,31 @@
 # Changelog
 
-## Unreleased
+## 0.8.3 (2026-06-11)
 
 ### Features
 
-- **Experimental message steering.** New `steering` config (`TOMO_STEERING=true`, default off) lets user messages that arrive during an in-flight tool-using turn bypass the per-session queue and inject at the next tool-call boundary. If the current turn has no boundary left, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns continue to queue normally.
+- **Experimental message steering** (#142). New `steering` config (`TOMO_STEERING=true`, default off) lets user messages that arrive during an in-flight tool-using turn bypass the per-session queue and inject at the next tool-call boundary. If the current turn has no boundary left, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns continue to queue normally.
+
+### Bug fixes
+
+- **Six high-severity fixes from a codebase review** (#140):
+  - Fresh installs no longer crash on every CLI command (including `tomo init` and `--help`) when no channel is configured — channel validation moved from config load to daemon startup, and `tomo start` now validates before spawning the background child instead of printing "started" while the daemon silently dies.
+  - The iMessage webhook server binds `127.0.0.1` instead of all interfaces and caps request bodies at 1 MB; the webhook is also registered as the literal `127.0.0.1` (BlueBubbles could resolve `localhost` to `::1` and get connection refused), with stale `localhost`-form registrations from earlier versions cleaned up on upgrade.
+  - The cron scheduler no longer re-fires a due job on every 30s poll while a long agent run is still in flight (re-entrancy guard on `tick()`), and tick errors are caught instead of becoming unhandled rejections.
+  - Telegram streaming no longer silently drops content when a send/edit fails: progress is only advanced on success, the final flush retries with backoff, blocks over 4096 chars roll over into a new message, and `send()` chunks long text like iMessage does.
+  - `tomo backup restore` no longer deletes the preserved `.claude` directory along with the workspace tree; the backup's custom skills are merged in without overwriting live ones.
+  - The LCM compact nudge goes through the per-session queue instead of a fire-and-forget run that could overlap the next user message.
+- **Multi-process race and atomic-write fixes** (#141). The daemon and CLI commands (`tomo cron add`, `tomo sessions clear`, `tomo config`, `tomo lcm prune-tools`) mutate the same files and could clobber each other:
+  - `SessionStore` registry mutators and list APIs reload from disk before acting, so CLI-side changes are no longer reverted by the daemon's next stale save.
+  - `CronStore.markRun`/`remove` reload before saving, so a job added while the daemon executes another job is no longer silently deleted.
+  - The MCP OAuth token store, pet store, and SDK session repair now write atomically (temp + rename) — a crash mid-write previously left truncated JSON that could permanently discard every MCP server's refresh token.
+  - `tomo lcm prune-tools` rewrites the live SDK JSONL with the same concurrent-append-safe machinery as compaction, instead of a plain read/write that could truncate events the SDK was appending mid-prune.
+
+### Other
+
+- Raise minimum Node version to 22.12 (#139).
+- Internal cleanup: extracted shared `fs-utils`, `jsonl`, and session-key helpers (#138).
+- Bump `commander` 14.0.3 → 15.0.0 (#123).
 
 ## 0.8.2 (2026-06-08)
 

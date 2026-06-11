@@ -98,6 +98,7 @@ export class Agent {
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
   private restoringConfig = false;
+  private stopping = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
   private readonly mcpOAuthManager: McpOAuthManager;
 
@@ -215,6 +216,21 @@ export class Agent {
   private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const receivedAt = Date.now();
     const isGroup = message.isGroup ?? false;
+
+    // Allowlist gate at receipt, BEFORE resolving: a disallowed chat must not
+    // touch routing state (resolve() extends a summon's activity clock) or
+    // enter a coalesced batch. Group-secret activation still goes through
+    // handleMessage, which handles the secret before its own allowlist check.
+    if (!this.router.isAllowed(channel.name, message.chatId)) {
+      if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
+        this.enqueueForSession(`${channel.name}:${message.chatId}`, () => this.handleMessage(channel, message))
+          .catch((err) => log.error({ err, chatId: message.chatId }, "Unhandled error in message queue"));
+      } else {
+        log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked at receipt (not in allowlist)");
+      }
+      return;
+    }
+
     // Resolve ONCE, at receipt — this decides both which queue the message
     // waits in and which session eventually processes it. Re-resolving at
     // processing time would let a /summon or /dismiss that lands while the
@@ -363,11 +379,20 @@ export class Agent {
   }
 
   private async processInboundItems(items: InboundItem[], steer = false): Promise<void> {
-    if (items.length === 1) {
-      await this.handleMessage(items[0].channel, items[0].message, steer, items[0].resolution);
+    // Re-check the allowlist PER ITEM at processing time: it can change while
+    // a batch waits (settle window, in-flight turn), and dm: batches may mix
+    // items from several chats — a tail-only check would let a now-disallowed
+    // group's stale items ride along with an allowed DM message.
+    const allowed = items.filter((it) => this.router.isAllowed(it.channel.name, it.message.chatId));
+    if (allowed.length < items.length) {
+      log.debug({ dropped: items.length - allowed.length }, "Batched items dropped (no longer in allowlist)");
+    }
+    if (allowed.length === 0) return;
+    if (allowed.length === 1) {
+      await this.handleMessage(allowed[0].channel, allowed[0].message, steer, allowed[0].resolution);
       return;
     }
-    await this.handleBatchedMessages(items, steer);
+    await this.handleBatchedMessages(allowed, steer);
   }
 
   private backupConfig(): void {
@@ -1109,13 +1134,8 @@ export class Agent {
       `batched: ${items.map((it) => JSON.stringify(it.message.text.slice(0, 40))).join(" | ")}`,
     );
 
-    if (!this.router.isAllowed(lastChannel.name, lastMessage.chatId)) {
-      log.debug(
-        { channel: lastChannel.name, chatId: lastMessage.chatId },
-        "Batched messages blocked (not in allowlist)",
-      );
-      return;
-    }
+    // Allowlist is enforced per item by processInboundItems (the only caller)
+    // — a tail-only check here would miss mixed batches.
 
     // All items in a batch share a receipt-time session key (that's how the
     // batch was keyed); use the last item's resolution rather than re-resolving
@@ -1266,9 +1286,21 @@ export class Agent {
 
       // Session error — reset and retry once
       if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
+        // Shutdown closes live sessions while turns may still be in flight
+        // (e.g. the agent restarting itself via Bash). That "Session is
+        // closed" is not corruption — resetting here is what used to unlink
+        // the resume id and silently start the user over on a blank session.
+        if (this.stopping) throw err;
+
         log.warn({ err }, "Session error, resetting and retrying");
         this.closeLiveSession(key);
-        this.sessions.clearSdkSessionId(key);
+        // Only a true resume failure invalidates the persisted SDK session
+        // id. "Session is closed"-style errors just mean the child process
+        // went away; the JSONL history is intact and MUST be kept so the
+        // retry resumes it instead of discarding the conversation.
+        if (errMsg.includes("No conversation found")) {
+          this.sessions.clearSdkSessionId(key);
+        }
 
         const session = await this.getOrCreateLiveSession(key);
         return session.send(prompt, onText, images, onBlockComplete, documents);
@@ -1725,6 +1757,7 @@ export class Agent {
 
   async stop(): Promise<void> {
     log.info("Shutting down");
+    this.stopping = true;
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
     await Promise.all(this.channels.map((ch) => ch.stop()));

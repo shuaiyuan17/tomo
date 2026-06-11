@@ -329,10 +329,18 @@ export class SessionStore {
     return [...this.registry];
   }
 
-  /** Unlink a session (marks for deletion after TTL) */
+  /** Unlink a session (marks for deletion after TTL). Metadata-only stubs
+   *  have no SDK file to TTL — they are removed outright. */
   clearSdkSessionId(key: string): void {
     this.loadRegistry();
     const now = Date.now();
+    this.registry = this.registry.filter((entry) => {
+      if (entry.channelKey === key && entry.unlinkedAt === null && !entry.sdkSessionId) {
+        log.info({ key }, "Metadata-only session entry removed");
+        return false;
+      }
+      return true;
+    });
     for (const entry of this.registry) {
       if (entry.channelKey === key && entry.unlinkedAt === null) {
         entry.unlinkedAt = now;
@@ -354,6 +362,10 @@ export class SessionStore {
     const deletedFiles = new Set<string>();
 
     for (const entry of expired) {
+      // Metadata-only stubs have no SDK file (and an empty id would alias
+      // every other stub in the stillReferenced check below)
+      if (!entry.sdkSessionId) continue;
+
       // Skip deletion if any surviving entry still references this sdkSessionId
       // (e.g. shared after migrateSessionKey, or unlinked but not yet expired)
       const stillReferenced = this.registry.some(

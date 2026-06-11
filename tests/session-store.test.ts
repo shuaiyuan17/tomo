@@ -180,6 +180,18 @@ describe("SessionStore", () => {
       expect(store.listAllSessions().filter((e) => e.channelKey === "telegram:-987")).toHaveLength(1);
     });
 
+    it("clear removes a metadata-only stub outright (no 30-day TTL)", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setChatTitle("telegram:-987", "Ski Trip");
+
+      store.clearSdkSessionId("telegram:-987");
+
+      // Gone entirely — not lingering as an unlinked entry
+      expect(store.listAllSessions()).toHaveLength(0);
+      const reloaded = new SessionStore(TEST_DIR, 20);
+      expect(reloaded.getEntry("telegram:-987")).toBeUndefined();
+    });
+
     it("excludes stubs from listSdkSessionIds but lists them as active entries", () => {
       const store = new SessionStore(TEST_DIR, 20);
       store.setChatTitle("telegram:-987", "Ski Trip");

@@ -109,6 +109,12 @@ export class IdentityRouter {
       const summoned = this.resolveSummon(channelName, chatId, true);
       if (summoned) {
         const dmKey = `dm:${summoned}`;
+        // /summon may be the identity's first interaction after upgrading to
+        // unified dm: keys — run the same one-time migration as the DM path,
+        // or the summon would capture a fresh empty dm: session and block the
+        // old channel-scoped session from ever migrating.
+        const identity = this.identities.find((id) => id.name.toLowerCase() === summoned);
+        if (identity) this.maybeMigrate(identity, dmKey);
         const replyTarget = this.sessions.getReplyTarget(dmKey)
           ?? this.deriveReplyTargetFromConfig(summoned);
         if (replyTarget) {

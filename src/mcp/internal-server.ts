@@ -10,11 +10,12 @@ export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 /**
  * In-process MCP server exposing tomo-internal tools to the agent.
  *
- * Created once at Agent construction and shared across all LiveSessions.
- * Tool handlers do not receive caller session context; delegate-to-self is
- * intentionally not blocked (see Agent.delegateToSession for rationale).
+ * Created per LiveSession, bound to that session's key so tool handlers know
+ * which session is calling (the SDK itself passes no caller context).
+ * Delegate-to-self is intentionally not blocked (see Agent.delegateToSession
+ * for rationale).
  */
-export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWithInstance {
+export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: string): McpSdkServerConfigWithInstance {
   const identityList = config.identities.map((i) => i.name);
   const identityHint = identityList.length > 0
     ? `Known identity targets: ${identityList.map((n) => `"${n}"`).join(", ")}.`
@@ -79,7 +80,7 @@ export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWit
         },
         async ({ target, message, mode }) => {
           const result = mode === "direct"
-            ? await agent.sendToSession(target, message)
+            ? await agent.sendToSession(target, message, callerSessionKey)
             : await agent.delegateToSession(target, message);
 
           if (result.ok) {

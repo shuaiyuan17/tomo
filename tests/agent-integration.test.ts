@@ -494,6 +494,70 @@ describe("send_message direct mode", () => {
 
     await agent.stop();
   });
+
+  it("attributes a summoned-group send to the summoning dm session", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(ch: string, chatId: string, identity: string): void };
+      sessions: { get(key: string): { messages: Array<{ content: string }> } };
+      pendingNotes: Map<string, string[]>;
+    };
+    internals.router.summonGroup("telegram", "-987", "Alice");
+
+    const result = await agent.sendToSession("telegram:-987", "hello group", "dm:alice");
+
+    expect(result).toEqual({ ok: true });
+    expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
+      .toBe("[via dm:alice (summoned)] hello group");
+    expect(internals.pendingNotes.get("telegram:-987")).toEqual([
+      `[System: Tomo from alice's main session (dm:alice), summoned into this group at the time, sent the following message here: "hello group"]`,
+    ]);
+
+    await agent.stop();
+  });
+
+  it("keeps neutral attribution when the caller is not the summoning session", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(ch: string, chatId: string, identity: string): void };
+      sessions: { get(key: string): { messages: Array<{ content: string }> } };
+      pendingNotes: Map<string, string[]>;
+    };
+    internals.router.summonGroup("telegram", "-987", "Alice");
+
+    // Bob's own session direct-sends into Alice's summoned group
+    const result = await agent.sendToSession("telegram:-987", "hi from bob", "telegram:222");
+
+    expect(result).toEqual({ ok: true });
+    expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
+      .toBe("[proactive] hi from bob");
+    expect(internals.pendingNotes.get("telegram:-987")).toEqual([
+      `[System: Tomo from another session sent the following message to this conversation earlier: "hi from bob"]`,
+    ]);
+
+    await agent.stop();
+  });
+
+  it("caps pending notes at 15 per session, keeping the most recent", async () => {
+    const agent = new Agent();
+    const internals = agent as unknown as {
+      queuePendingNote(key: string, note: string): void;
+      pendingNotes: Map<string, string[]>;
+    };
+
+    for (let i = 0; i < 20; i++) internals.queuePendingNote("telegram:-987", `note-${i}`);
+
+    const notes = internals.pendingNotes.get("telegram:-987");
+    expect(notes).toHaveLength(15);
+    expect(notes?.[0]).toBe("note-5");
+    expect(notes?.at(-1)).toBe("note-19");
+
+    await agent.stop();
+  });
 });
 
 // ===== DM message routing =====

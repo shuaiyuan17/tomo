@@ -1,4 +1,4 @@
-import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -87,7 +87,6 @@ export class Agent {
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
   private stopping = false;
-  private readonly internalMcpServer: McpSdkServerConfigWithInstance;
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
@@ -107,7 +106,6 @@ export class Agent {
       isSessionLive: (key) => this.liveSessions.get(key)?.isAlive() ?? false,
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
     });
-    this.internalMcpServer = createTomoInternalMcpServer(this);
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
       onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
@@ -347,7 +345,9 @@ export class Agent {
       config.mcpServers ?? {},
       (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
     );
-    const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
+    // Per-session server instance: binds the caller's session key so tool
+    // handlers (e.g. send_message) can attribute cross-session sends.
+    const opts = sdkOptions(createTomoInternalMcpServer(this, key), resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.buildGroupContext(key),
@@ -1142,7 +1142,7 @@ export class Agent {
    * No Claude query is invoked for the recipient — the message arrives as-is.
    * A pending note is queued so the recipient's next Claude turn knows context.
    */
-  async sendToSession(target: string, text: string): Promise<SendResult> {
+  async sendToSession(target: string, text: string, callerSessionKey?: string): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
@@ -1180,21 +1180,24 @@ export class Agent {
       await channel.send({ chatId: replyTarget.chatId, text });
     }
 
-    // A direct send into a summoned group comes from the summoning identity's
-    // dm: session — attribute it there so the group's own session (which reads
-    // the note after dismiss) doesn't think it composed the message itself.
+    // Attribute the send in the target session's record. Only claim it came
+    // from the summoning identity's main session when the caller actually IS
+    // that session — any session can direct-send into a summoned group.
     const summoned = this.router.getSummonedIdentity(replyTarget.channelName, replyTarget.chatId);
+    const fromSummoner = summoned !== undefined && callerSessionKey === `dm:${summoned}`;
 
     this.sessions.append(sessionKey, {
       role: "assistant",
-      content: summoned ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
+      content: fromSummoner ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
       channel: replyTarget.channelName,
       timestamp: Date.now(),
     });
 
-    this.queuePendingNote(sessionKey, summoned
+    this.queuePendingNote(sessionKey, fromSummoner
       ? `[System: Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"]`
-      : `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`);
+      : callerSessionKey === sessionKey
+        ? `[System: You sent the following message to this conversation earlier as a direct send: "${text}"]`
+        : `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`);
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Proactive message sent (direct)");
     return { ok: true };

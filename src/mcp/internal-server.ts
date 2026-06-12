@@ -59,6 +59,8 @@ export function createTomoInternalMcpServer(agent: Agent): McpSdkServerConfigWit
           "",
           "When the user asks you to relay something to a group they're in, prefer `delegate` so the message fits the group's voice. Use `direct` when verbatim control matters or when the recipient session shouldn't be triggered into a Claude turn.",
           "",
+          "Summoned groups: when a group has been /summon-ed into your session (its messages arrive tagged `[group \"Title\"] Sender: ...`), this tool is how you reply there — use mode `direct` with the group's session key. You compose the reply yourself; you ARE the session with the context. Do not use `delegate` for a summoned group — it would wake the group's own dormant session instead.",
+          "",
           identityHint,
           "Groups are addressed by their full session key (e.g. \"telegram:-1001234567\"). Call `list_sessions` first if you don't know the right key — it returns chat titles and participants to help you pick.",
           "",

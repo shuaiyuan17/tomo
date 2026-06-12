@@ -6,6 +6,7 @@ import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "..
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { IdentityRouter } from "../router.js";
 import type { SessionStore } from "../sessions/index.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
 import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "../models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
@@ -28,6 +29,7 @@ export interface ChatCommandDeps {
   modelOverrides: Map<string, string>;
   closeLiveSession(key: string): void;
   isSessionLive(key: string): boolean;
+  queuePendingNote(sessionKey: string, note: string): void;
 }
 
 /**
@@ -44,11 +46,16 @@ export class ChatCommandHandler {
     return this.restoringConfig;
   }
 
-  async handle(channel: Channel, command: string, chatId: string, senderName: string, args?: string): Promise<void> {
+  async handle(channel: Channel, command: string, chatId: string, senderName: string, args?: string, senderId?: string): Promise<void> {
     const { sessionKey: key } = this.deps.router.resolve(channel.name, chatId, false);
 
     if (this.restoringConfig) {
       await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
+      return;
+    }
+
+    if (command === "summon" || command === "dismiss") {
+      await this.handleSummonCommand(channel, command, chatId, senderName, senderId);
       return;
     }
 
@@ -123,6 +130,8 @@ export class ChatCommandHandler {
       const lines: string[] = [];
       lines.push(`Session: ${key}`);
       lines.push(`Channel: ${channel.name}`);
+      const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
+      if (summoned) lines.push(`Summoned: messages route to dm:${summoned} (/dismiss to hand back)`);
       lines.push(`Model: ${model}`);
       if (config.litellm?.baseUrl) {
         lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
@@ -154,6 +163,74 @@ export class ChatCommandHandler {
       await channel.send({ chatId, text: lines.join("\n") });
       return;
     }
+  }
+
+  /**
+   * /summon pulls the owner's main dm: session into a group: subsequent group
+   * messages run on the dm session (full personal context) while turn output
+   * still goes to the owner's private DM. Group-facing replies require an
+   * explicit send_message direct tool call to the raw group session key.
+   */
+  private async handleSummonCommand(
+    channel: Channel,
+    command: "summon" | "dismiss",
+    chatId: string,
+    senderName: string,
+    senderId?: string,
+  ): Promise<void> {
+    const rawKey = `${channel.name}:${chatId}`;
+    if (!isGroupSessionKey(rawKey)) {
+      await channel.send({ chatId, text: `/${command} only works in group chats.` });
+      return;
+    }
+    if (!this.deps.router.isAllowed(channel.name, chatId)) {
+      log.debug({ channel: channel.name, chatId }, `/${command} blocked (group not in allowlist)`);
+      return;
+    }
+
+    const groupLabel = this.deps.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
+
+    if (command === "dismiss") {
+      const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
+      if (!summoned) {
+        await channel.send({ chatId, text: "No main session is summoned here." });
+        return;
+      }
+      this.deps.router.dismissGroup(channel.name, chatId);
+      this.deps.queuePendingNote(
+        `dm:${summoned}`,
+        `[System: You have been dismissed from the group "${groupLabel}" — its messages no longer reach this session, and the group's own Tomo session has taken back over.]`,
+      );
+      await channel.send({ chatId, text: "Handed back to this group's own Tomo session." });
+      return;
+    }
+
+    const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+    if (!identity) {
+      log.info({ channel: channel.name, chatId, sender: senderName }, "/summon refused (sender is not a configured identity)");
+      await channel.send({ chatId, text: "Only the owner of a configured identity can summon their main session." });
+      return;
+    }
+
+    const already = this.deps.router.getSummonedIdentity(channel.name, chatId);
+    if (already) {
+      await channel.send({ chatId, text: `Main session dm:${already} is already summoned here. /dismiss first to hand back.` });
+      return;
+    }
+
+    this.deps.router.summonGroup(channel.name, chatId, identity.name);
+    const expiryNote = config.summonExpiryMinutes > 0
+      ? ` or after ${config.summonExpiryMinutes} minutes of group inactivity`
+      : "";
+    this.deps.queuePendingNote(
+      `dm:${identity.name.toLowerCase()}`,
+      `[System: ${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed${expiryNote}, messages from that group arrive in this session tagged [group ...] with the sender's name. To reply in the group, call send_message with mode "direct" and target "${rawKey}" — compose the reply yourself, with your context. Plain text you output goes to ${identity.name}'s private DM, not the group. Everyone in the group can read what you send it — keep private memory and DM context out of group-facing messages.]`,
+    );
+    log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
+    await channel.send({
+      chatId,
+      text: `${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
+    });
   }
 
   private persistModelOverride(key: string, model: string): void {

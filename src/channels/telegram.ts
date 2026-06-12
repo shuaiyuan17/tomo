@@ -38,13 +38,14 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "model", "restore", "status"]) {
+    for (const cmd of ["new", "model", "restore", "status", "summon", "dismiss"]) {
       this.bot.command(cmd, async (ctx) => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
+        const senderId = ctx.from ? String(ctx.from.id) : undefined;
         const args = ctx.match as string;
         for (const handler of this.commandHandlers) {
-          await handler(cmd, chatId, senderName, args);
+          await handler(cmd, chatId, senderName, args, senderId);
         }
       });
     }
@@ -573,6 +574,8 @@ export class TelegramChannel implements Channel {
       { command: "model", description: "Switch model (Claude aliases or LiteLLM provider/model)" },
       { command: "restore", description: "Restore config from backup and restart" },
       { command: "status", description: "Show current session status" },
+      { command: "summon", description: "Pull your main Tomo session into this group" },
+      { command: "dismiss", description: "Hand this group back to its own Tomo session" },
     ]);
 
     this.startPolling();

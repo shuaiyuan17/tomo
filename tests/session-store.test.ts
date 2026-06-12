@@ -151,4 +151,55 @@ describe("SessionStore", () => {
 
     expect(after).toBeGreaterThanOrEqual(before);
   });
+
+  describe("metadata-only stubs", () => {
+    it("persists chat title and participants before any SDK session exists", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setChatTitle("telegram:-987", "Ski Trip");
+      store.addParticipant("telegram:-987", "Alice");
+      store.addParticipant("telegram:-987", "Bob");
+
+      const reloaded = new SessionStore(TEST_DIR, 20);
+      const entry = reloaded.getEntry("telegram:-987");
+      expect(entry?.chatTitle).toBe("Ski Trip");
+      expect(entry?.participants).toEqual(["Alice", "Bob"]);
+    });
+
+    it("upgrades the stub in place when an SDK session is linked", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setChatTitle("telegram:-987", "Ski Trip");
+      store.addParticipant("telegram:-987", "Alice");
+
+      store.setSdkSessionId("telegram:-987", "session-xyz");
+
+      const entry = store.getEntry("telegram:-987");
+      expect(entry?.sdkSessionId).toBe("session-xyz");
+      expect(entry?.chatTitle).toBe("Ski Trip");
+      expect(entry?.participants).toEqual(["Alice"]);
+      // Upgraded, not replaced — exactly one entry for the key
+      expect(store.listAllSessions().filter((e) => e.channelKey === "telegram:-987")).toHaveLength(1);
+    });
+
+    it("clear removes a metadata-only stub outright (no 30-day TTL)", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setChatTitle("telegram:-987", "Ski Trip");
+
+      store.clearSdkSessionId("telegram:-987");
+
+      // Gone entirely — not lingering as an unlinked entry
+      expect(store.listAllSessions()).toHaveLength(0);
+      const reloaded = new SessionStore(TEST_DIR, 20);
+      expect(reloaded.getEntry("telegram:-987")).toBeUndefined();
+    });
+
+    it("excludes stubs from listSdkSessionIds but lists them as active entries", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setChatTitle("telegram:-987", "Ski Trip");
+      store.setSdkSessionId("dm:alice", "session-alice");
+
+      expect(store.listSdkSessionIds()).toEqual([["dm:alice", "session-alice"]]);
+      const activeKeys = store.listActiveEntries().map((e) => e.channelKey).sort();
+      expect(activeKeys).toEqual(["dm:alice", "telegram:-987"]);
+    });
+  });
 });

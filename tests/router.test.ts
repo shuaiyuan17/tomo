@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { IdentityRouter } from "../src/router.js";
 import { SessionStore } from "../src/sessions/store.js";
+import { SummonStore } from "../src/sessions/summon-store.js";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -173,6 +174,113 @@ describe("IdentityRouter", () => {
       const result = router.resolve("imessage", "iMessage;-;+15551234567", false);
       expect(result.sessionKey).toBe("dm:eve");
       expect(result.identityName).toBe("Eve");
+    });
+  });
+
+  describe("summon", () => {
+    const identities = [
+      { name: "Alice", channels: { telegram: "111" }, replyPolicy: "last-active" },
+    ];
+
+    it("routes a summoned group to the dm: session with the PRIVATE dm reply target", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+
+      const result = router.resolve("telegram", "-987", true);
+      expect(result.sessionKey).toBe("dm:alice");
+      // Direct turn output goes to the owner's DM; group replies happen only
+      // via an explicit send_message tool call.
+      expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "111" });
+      expect(result.identityName).toBe("alice");
+    });
+
+    it("prefers the dm session's persisted reply target over the config-derived one", () => {
+      sessions.setSdkSessionId("dm:alice", "session-alice");
+      sessions.setReplyTarget("dm:alice", { channelName: "imessage", chatId: "+15551234567" });
+
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+
+      const result = router.resolve("telegram", "-987", true);
+      expect(result.replyTarget).toEqual({ channelName: "imessage", chatId: "+15551234567" });
+    });
+
+    it("expires after the configured group inactivity and notifies via callback", () => {
+      const summons = new SummonStore(null, 1000);
+      const router = new IdentityRouter(identities, sessions, {}, summons);
+      const expired: string[] = [];
+      router.onSummonExpired = (ch, chatId, identity) => expired.push(`${ch}:${chatId}:${identity}`);
+
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(1_000_000);
+        router.summonGroup("telegram", "-987", "Alice");
+
+        vi.setSystemTime(1_000_500);
+        expect(router.resolve("telegram", "-987", true).sessionKey).toBe("dm:alice");
+
+        // Activity above reset the clock; expiry counts from last activity
+        vi.setSystemTime(1_001_600);
+        const result = router.resolve("telegram", "-987", true);
+        expect(result.sessionKey).toBe("telegram:-987");
+        expect(expired).toEqual(["telegram:-987:alice"]);
+        expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not persist the group as the dm session's reply target", () => {
+      sessions.setSdkSessionId("dm:alice", "session-alice");
+      sessions.setReplyTarget("dm:alice", { channelName: "telegram", chatId: "111" });
+
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+      router.resolve("telegram", "-987", true);
+
+      // Cron/continuity must still deliver to the private DM
+      expect(router.getReplyTarget("dm:alice")).toEqual({ channelName: "telegram", chatId: "111" });
+    });
+
+    it("does not affect other groups or DMs", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+
+      expect(router.resolve("telegram", "-555", true).sessionKey).toBe("telegram:-555");
+      expect(router.resolve("telegram", "111", false).sessionKey).toBe("dm:alice");
+    });
+
+    it("dismiss restores group routing", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+      expect(router.dismissGroup("telegram", "-987")).toBe(true);
+
+      const result = router.resolve("telegram", "-987", true);
+      expect(result.sessionKey).toBe("telegram:-987");
+      expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
+    });
+
+    it("drops a stale summon when no private reply target exists for the identity", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      // Simulates a summons.json written before the identity was renamed/removed
+      router.summonGroup("telegram", "-987", "Ghost");
+
+      const result = router.resolve("telegram", "-987", true);
+      // Must NOT route dm output to the group — the summon is dropped instead
+      expect(result.sessionKey).toBe("telegram:-987");
+      expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "-987" });
+      expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
+    });
+
+    it("dismiss on a non-summoned group returns false", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      expect(router.dismissGroup("telegram", "-987")).toBe(false);
+    });
+
+    it("identityForSender matches provider-verified sender ids", () => {
+      const router = new IdentityRouter(identities, sessions, {});
+      expect(router.identityForSender("telegram", "111")?.name).toBe("Alice");
+      expect(router.identityForSender("telegram", "222")).toBeUndefined();
     });
   });
 

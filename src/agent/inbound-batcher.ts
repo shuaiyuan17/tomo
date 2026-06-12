@@ -1,10 +1,13 @@
 import type { Channel, IncomingMessage } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import type { SessionResolution } from "../router.js";
 
 export interface InboundItem {
   channel: Channel;
   message: IncomingMessage;
+  /** Resolution captured at receipt time so delayed batches cannot re-route. */
+  resolution: SessionResolution;
 }
 
 /**
@@ -49,17 +52,24 @@ export class InboundBatcher {
    * that's fine — they don't block the next ingress on an in-flight turn,
    * which is what lets rapid messages pile up for the queue to coalesce.
    */
-  enqueue(sessionKey: string, channel: Channel, message: IncomingMessage, canCoalesce: boolean): void {
+  enqueue(
+    sessionKey: string,
+    channel: Channel,
+    message: IncomingMessage,
+    canCoalesce: boolean,
+    resolution: SessionResolution,
+  ): void {
     const receivedAt = Date.now();
+    const item: InboundItem = { channel, message, resolution };
 
     if (!canCoalesce) {
-      this.host.enqueueForSession(sessionKey, () => this.host.processInboundItems([{ channel, message }]))
+      this.host.enqueueForSession(sessionKey, () => this.host.processInboundItems([item]))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
       return;
     }
 
     const batch = this.pendingBatches.get(sessionKey) ?? [];
-    batch.push({ channel, message });
+    batch.push(item);
     this.pendingBatches.set(sessionKey, batch);
 
     // With steering on, the drain runs OUTSIDE the per-session queue so it

@@ -268,6 +268,7 @@ vi.mock("../src/logger.js", () => ({
 
 // Import Agent after mocks
 const { Agent } = await import("../src/agent.js");
+const { SessionStore } = await import("../src/sessions/store.js");
 const sdkMock = await import("@anthropic-ai/claude-agent-sdk");
 
 // ---------------------------------------------------------------------------
@@ -352,8 +353,8 @@ class MockChannel implements Channel {
 
   // Test helpers
   async simulateMessage(msg: IncomingMessage) { await this.messageHandler?.(msg); }
-  async simulateCommand(cmd: string, chatId: string, sender: string, args?: string) {
-    await this.commandHandler?.(cmd, chatId, sender, args);
+  async simulateCommand(cmd: string, chatId: string, sender: string, args?: string, senderId?: string) {
+    await this.commandHandler?.(cmd, chatId, sender, args, senderId);
   }
   clearDelivered() {
     this.sent = [];
@@ -453,6 +454,46 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe("send_message direct mode", () => {
+  it("parses MEDIA/STICKER tags into ordered attachment sends", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(tmpDir, "photo with spaces.jpg");
+    writeFileSync(imagePath, "fake image");
+
+    const result = await agent.sendToSession(
+      "telegram:12345",
+      `here you go MEDIA:"${imagePath}" STICKER:CAACAgQAAxkBAAE123`,
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "here you go", photo: undefined, sticker: undefined },
+      { chatId: "12345", text: "", photo: imagePath, sticker: undefined },
+      { chatId: "12345", text: "", photo: undefined, sticker: "CAACAgQAAxkBAAE123" },
+    ]);
+
+    await agent.stop();
+  });
+
+  it("preserves verbatim direct text when there are no attachment tags", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const text = "  keep surrounding whitespace\n";
+
+    const result = await agent.sendToSession("telegram:12345", text);
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text, photo: undefined, sticker: undefined },
+    ]);
+
+    await agent.stop();
+  });
 });
 
 // ===== DM message routing =====
@@ -721,9 +762,12 @@ describe("group chat handling", () => {
 
     expect(result.ok).toBe(true);
     expect(tg.renamed).toEqual([{ chatId: "-100123", title: "New Title" }]);
+    // Participants persist via the metadata stub even before an SDK session id
+    // is captured for the group.
     expect(agent.listSessionCatalog().groups).toContainEqual({
       key: "telegram:-100123",
       title: "New Title",
+      participants: ["Alice"],
     });
 
     await agent.stop();
@@ -2205,6 +2249,35 @@ describe("per-block streaming delivery", () => {
     expect(im.delivered[0].text).toBe("block-b");
 
     await agent.stop();
+  });
+
+  it("preserves the sdk session link when stopping during an in-flight turn", async () => {
+    resetConfig({
+      identities: [{ name: "Shuai", channels: { imessage: "+15551112222" }, replyPolicy: "last-active" }],
+    });
+    const store = new SessionStore(mockConfig.sessionsDir, 20);
+    store.setSdkSessionId("dm:shuai", "old-session-id");
+    store.setReplyTarget("dm:shuai", { channelName: "imessage", chatId: "+15551112222" });
+
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    let release: (() => void) | undefined;
+    mockResponseFn = async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return "late reply";
+    };
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "restart now" }));
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+
+    await agent.stop();
+    release?.();
+
+    const after = new SessionStore(mockConfig.sessionsDir, 20).getEntry("dm:shuai");
+    expect(after?.sdkSessionId).toBe("old-session-id");
+    expect(after?.unlinkedAt).toBeNull();
   });
 
   it("ships STICKER tags as sticker sends without leaking the tag into text", async () => {

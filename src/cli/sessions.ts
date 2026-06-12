@@ -30,7 +30,7 @@ sessionsCommand
         const age = formatAge(Date.now() - e.createdAt);
         const lastActive = formatAge(Date.now() - e.lastActiveAt);
         console.log(`  ${e.channelKey}`);
-        console.log(`    Session:  ${e.sdkSessionId}`);
+        console.log(`    Session:  ${e.sdkSessionId || "(metadata only — no SDK session yet)"}`);
         console.log(`    Created:  ${age} ago`);
         console.log(`    Last use: ${lastActive} ago`);
         if (e.stats) {
@@ -71,22 +71,26 @@ sessionsCommand
     const store = new SessionStore(SESSIONS_DIR, 0);
 
     if (key) {
-      if (!store.getSdkSessionId(key)) {
+      // getEntry (not getSdkSessionId) so metadata-only stubs are clearable too
+      const entry = store.getEntry(key);
+      if (!entry) {
         console.error(`No active session for "${key}"`);
         process.exit(1);
       }
       store.clearSdkSessionId(key);
-      console.log(`Unlinked session for "${key}" (will be deleted in 30 days)`);
+      console.log(entry.sdkSessionId
+        ? `Unlinked session for "${key}" (will be deleted in 30 days)`
+        : `Removed metadata-only entry for "${key}"`);
     } else {
-      const entries = store.listSdkSessionIds();
+      const entries = store.listActiveEntries();
       if (entries.length === 0) {
         console.log("No active sessions.");
         return;
       }
-      for (const [k] of entries) {
-        store.clearSdkSessionId(k);
+      for (const e of entries) {
+        store.clearSdkSessionId(e.channelKey);
       }
-      console.log(`Unlinked ${entries.length} session(s) (will be deleted in 30 days)`);
+      console.log(`Cleared ${entries.length} session(s) (linked sessions will be deleted in 30 days)`);
     }
   });
 

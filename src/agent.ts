@@ -11,7 +11,8 @@ import {
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
-import { IdentityRouter } from "./router.js";
+import { IdentityRouter, type SessionResolution } from "./router.js";
+import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
@@ -19,9 +20,11 @@ import { LiveSession, STEER_MERGED } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
+import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { repairSdkSessionForResume } from "./sessions/repair.js";
+import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 
@@ -75,18 +78,30 @@ export class Agent {
   // proactive message went out.
   private pendingNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
+  // Last inbound audience per dm: session ("dm" or a raw group key). With
+  // summoning, one session interleaves private and group traffic — this is
+  // how the harness detects the hop and reminds the model the audience changed.
+  private lastAudiences = new Map<string, string>();
+  private stopping = false;
   private readonly internalMcpServer: McpSdkServerConfigWithInstance;
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
-    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists);
+    const summons = new SummonStore(
+      join(config.tomoHome, "data", "summons.json"),
+      config.summonExpiryMinutes * 60_000,
+    );
+    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons);
+    this.router.onSummonExpired = (channelName, chatId, identity) =>
+      this.handleSummonExpired(channelName, chatId, identity);
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
       modelOverrides: this.modelOverrides,
       closeLiveSession: (key) => this.closeLiveSession(key),
       isSessionLive: (key) => this.liveSessions.get(key)?.isAlive() ?? false,
+      queuePendingNote: (key, note) => this.queuePendingNote(key, note),
     });
     this.internalMcpServer = createTomoInternalMcpServer(this);
     this.mcpOAuthManager = new McpOAuthManager({
@@ -153,7 +168,8 @@ export class Agent {
 
   addChannel(channel: Channel): void {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
-    channel.onCommand((cmd, chatId, senderName, args) => this.commands.handle(channel, cmd, chatId, senderName, args));
+    channel.onCommand((cmd, chatId, senderName, args, senderId) =>
+      this.commands.handle(channel, cmd, chatId, senderName, args, senderId));
     this.channels.push(channel);
   }
 
@@ -189,23 +205,98 @@ export class Agent {
    */
   private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
     const isGroup = message.isGroup ?? false;
-    const { sessionKey } = this.router.resolve(channel.name, message.chatId, isGroup);
-    const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
-    const canCoalesce = !isGroup || isPassiveGroup;
-    this.batcher.enqueue(sessionKey, channel, message, canCoalesce);
-  }
 
-  private async processInboundItems(
-    items: InboundItem[],
-    steer = false,
-  ): Promise<void> {
-    if (items.length === 1) {
-      await this.handleMessage(items[0].channel, items[0].message, steer);
+    // Allowlist gate at receipt, BEFORE resolving: a disallowed chat must not
+    // touch routing state (resolve() extends a summon's activity clock) or
+    // enter a coalesced batch. Group-secret activation still goes through
+    // handleMessage, which handles the secret before its own allowlist check.
+    if (!this.router.isAllowed(channel.name, message.chatId)) {
+      if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
+        this.enqueueForSession(`${channel.name}:${message.chatId}`, () => this.handleMessage(channel, message))
+          .catch((err) => log.error({ err, chatId: message.chatId }, "Unhandled error in message queue"));
+      } else {
+        log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked at receipt (not in allowlist)");
+      }
       return;
     }
-    await this.handleBatchedMessages(items, steer);
+
+    // Resolve ONCE, at receipt — this decides both which queue the message
+    // waits in and which session eventually processes it. Re-resolving at
+    // processing time would let a /summon or /dismiss that lands while the
+    // message waits (in-flight turn, iMessage settle window) re-route it.
+    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    const sessionKey = resolution.sessionKey;
+
+    const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
+    const canCoalesce = !isGroup || isPassiveGroup;
+
+    if (!canCoalesce) {
+      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message, false, resolution))
+        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      return;
+    }
+
+    this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
   }
 
+  private async processInboundItems(items: InboundItem[], steer = false): Promise<void> {
+    // Re-check the allowlist PER ITEM at processing time: it can change while
+    // a batch waits (settle window, in-flight turn), and dm: batches may mix
+    // items from several chats — a tail-only check would let a now-disallowed
+    // group's stale items ride along with an allowed DM message.
+    const allowed = items.filter((it) => this.router.isAllowed(it.channel.name, it.message.chatId));
+    if (allowed.length < items.length) {
+      log.debug({ dropped: items.length - allowed.length }, "Batched items dropped (no longer in allowlist)");
+    }
+    if (allowed.length === 0) return;
+    if (allowed.length === 1) {
+      await this.handleMessage(allowed[0].channel, allowed[0].message, steer, allowed[0].resolution);
+      return;
+    }
+    await this.handleBatchedMessages(allowed, steer);
+  }
+
+  /** A summon lapsed from inactivity (lazy-detected by the router on the next
+   *  group message). Brief the dm session and post a handback notice. */
+  private handleSummonExpired(channelName: string, chatId: string, identity: string): void {
+    const rawKey = `${channelName}:${chatId}`;
+    const groupLabel = this.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
+    this.queuePendingNote(
+      `dm:${identity}`,
+      `[System: Your summon into the group "${groupLabel}" expired after inactivity — its messages no longer reach this session; the group's own Tomo session has taken back over.]`,
+    );
+    const channel = this.getChannel(channelName);
+    if (!channel) return;
+    channel.send({ chatId, text: "Summon expired after inactivity — handed back to this group's own Tomo session." })
+      .catch((err) => log.warn({ err, channel: channelName, chatId }, "Could not post summon expiry notice"));
+  }
+
+  /**
+   * Per-turn reminder appended to summoned-group prompts. The reply-routing
+   * inversion (text → private DM, group → explicit tool call) is the part the
+   * model must not get wrong, and pending notes only fire once — this rides
+   * along with every summoned message.
+   */
+  private summonReminder(targets: string[]): string {
+    const list = targets.map((t) => `"${t}"`).join(", ");
+    return `[System: summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them.]`;
+  }
+
+  /** Audience-switch prefix for a dm session turn (see agent/audience.ts).
+   *  Updates tracking state; returns "" when the audience didn't change. */
+  private noteAudienceSwitch(key: string, audiences: string[]): string {
+    if (!key.startsWith("dm:") || audiences.length === 0) return "";
+    const prev = this.lastAudiences.get(key);
+    this.lastAudiences.set(key, audiences[audiences.length - 1]);
+    const note = audienceSwitchNote(prev, audiences, (a) => this.audienceLabel(a));
+    return note ? `${note}\n` : "";
+  }
+
+  private audienceLabel(audience: string): string {
+    if (audience === "dm") return "the private DM";
+    const title = this.sessions.getEntry(audience)?.chatTitle;
+    return title ? `the group "${title}" (${audience})` : `the group ${audience}`;
+  }
   private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
     const session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
@@ -546,7 +637,12 @@ export class Agent {
     }
   }
 
-  private async handleMessage(channel: Channel, message: IncomingMessage, steer = false): Promise<void> {
+  private async handleMessage(
+    channel: Channel,
+    message: IncomingMessage,
+    steer = false,
+    receiptResolution?: SessionResolution,
+  ): Promise<void> {
     if (this.commands.isRestoring) return;
 
     const hasImages = message.images && message.images.length > 0;
@@ -578,15 +674,19 @@ export class Agent {
       return;
     }
 
-    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    // Prefer the receipt-time resolution (see enqueueMessage) so summon state
+    // changes can't re-route a message that was already queued.
+    const resolution = receiptResolution ?? this.router.resolve(channel.name, message.chatId, isGroup);
     const key = resolution.sessionKey;
     const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? channel;
     const replyChatId = resolution.replyTarget.chatId;
 
-    const textForAgent = isGroup ? `${message.senderName}: ${message.text}` : message.text;
+    const textForAgent = this.formatGroupText(channel, message, key);
 
     if (isGroup) {
-      this.updateGroupContext(key, message.senderName, message.chatTitle);
+      // Track group metadata under the raw group key even while summoned, so
+      // the group's own session entry stays fresh for when it takes back over.
+      this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle);
     }
     this.recordLatestInboundMessage(key, channel, message);
 
@@ -605,13 +705,24 @@ export class Agent {
       return;
     }
 
+    // Summoned group message running on the dm session: remind the model how
+    // reply routing works this turn, and flag audience hops (DM ↔ group).
+    // Prompt-only — the transcript keeps the clean tagged message.
+    const isSummoned = isGroup && key.startsWith("dm:");
+    const switchNote = this.noteAudienceSwitch(key, [audienceOf(channel.name, message)]);
+    const promptText = switchNote + (isSummoned
+      ? `${textForAgent}\n${this.summonReminder([`${channel.name}:${message.chatId}`])}`
+      : textForAgent);
+
     await this.runUserTurn({
       key,
-      promptText: textForAgent,
+      promptText,
       sourceChannelName: channel.name,
       replyChannel,
+      // Reply-threading only makes sense when the reply lands in the chat the
+      // message came from — not for summoned groups (reply goes to the DM).
+      replyToMessageId: isGroup && replyChatId === message.chatId ? message.id : undefined,
       replyChatId,
-      replyToMessageId: isGroup ? message.id : undefined,
       images: message.images,
       documents: message.documents,
       suppressErrors: isPassiveGroup,
@@ -640,23 +751,21 @@ export class Agent {
       `batched: ${items.map((it) => JSON.stringify(it.message.text.slice(0, 40))).join(" | ")}`,
     );
 
-    if (!this.router.isAllowed(lastChannel.name, lastMessage.chatId)) {
-      log.debug(
-        { channel: lastChannel.name, chatId: lastMessage.chatId },
-        "Batched messages blocked (not in allowlist)",
-      );
-      return;
-    }
+    // Allowlist is enforced per item by processInboundItems (the only caller)
+    // — a tail-only check here would miss mixed batches.
 
-    const resolution = this.router.resolve(lastChannel.name, lastMessage.chatId, isGroup);
+    // All items in a batch share a receipt-time session key (that's how the
+    // batch was keyed); use the last item's resolution rather than re-resolving
+    // so summon changes can't re-route an already-queued batch.
+    const resolution = last.resolution;
     const key = resolution.sessionKey;
     const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? lastChannel;
     const replyChatId = resolution.replyTarget.chatId;
 
     for (const { channel, message } of items) {
-      if (isGroup) this.updateGroupContext(key, message.senderName, message.chatTitle);
+      if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle);
       this.recordLatestInboundMessage(key, channel, message);
-      const transcriptText = isGroup ? `${message.senderName}: ${message.text}` : message.text;
+      const transcriptText = this.formatGroupText(channel, message, key);
       this.sessions.append(key, {
         role: "user",
         content: transcriptText,
@@ -667,13 +776,22 @@ export class Agent {
     }
 
     const numbered = items.map((it, i) => {
-      const text = isGroup ? `${it.message.senderName}: ${it.message.text}` : it.message.text;
+      const text = this.formatGroupText(it.channel, it.message, key);
       return `${i + 1}. ${text}`;
     }).join("\n");
     const subject = isGroup
       ? `${items.length} messages arrived from this group in quick succession`
       : `User sent ${items.length} messages in quick succession`;
-    const combined = `[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}`;
+    // On a dm: session any group-originated item is necessarily summoned
+    // (non-summoned groups have their own session keys). A batch can even mix
+    // DM messages with messages from multiple summoned groups — the per-item
+    // [group ...] tags disambiguate; the reminder lists every group target.
+    const summonTargets = key.startsWith("dm:")
+      ? [...new Set(items.filter((it) => it.message.isGroup).map((it) => `${it.channel.name}:${it.message.chatId}`))]
+      : [];
+    const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
+    const switchNote = this.noteAudienceSwitch(key, items.map((it) => audienceOf(it.channel.name, it.message)));
+    const combined = `${switchNote}[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}${reminder}`;
     const allImages = items.flatMap((it) => it.message.images ?? []);
     const allDocuments = items.flatMap((it) => it.message.documents ?? []);
 
@@ -683,7 +801,7 @@ export class Agent {
       sourceChannelName: lastChannel.name,
       replyChannel,
       replyChatId,
-      replyToMessageId: isGroup ? lastMessage.id : undefined,
+      replyToMessageId: isGroup && replyChatId === lastMessage.chatId ? lastMessage.id : undefined,
       images: allImages.length > 0 ? allImages : undefined,
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       suppressErrors: isPassiveGroup,
@@ -778,6 +896,11 @@ export class Agent {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "";
 
+      if (this.stopping && errMsg.includes("closed")) {
+        log.info({ key }, "Session closed during shutdown; preserving SDK session link");
+        return "NO_REPLY";
+      }
+
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
         return "I ran out of steps trying to complete that. Can you try a simpler request?";
@@ -785,9 +908,21 @@ export class Agent {
 
       // Session error — reset and retry once
       if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
+        // Shutdown closes live sessions while turns may still be in flight
+        // (e.g. the agent restarting itself via Bash). That "Session is
+        // closed" is not corruption — resetting here is what used to unlink
+        // the resume id and silently start the user over on a blank session.
+        if (this.stopping) throw err;
+
         log.warn({ err }, "Session error, resetting and retrying");
         this.closeLiveSession(key);
-        this.sessions.clearSdkSessionId(key);
+        // Only a true resume failure invalidates the persisted SDK session
+        // id. "Session is closed"-style errors just mean the child process
+        // went away; the JSONL history is intact and MUST be kept so the
+        // retry resumes it instead of discarding the conversation.
+        if (errMsg.includes("No conversation found")) {
+          this.sessions.clearSdkSessionId(key);
+        }
 
         const session = await this.getOrCreateLiveSession(key);
         return session.send(prompt, onText, images, onBlockComplete, documents);
@@ -795,6 +930,22 @@ export class Agent {
 
       throw err;
     }
+  }
+
+  /**
+   * Prompt/transcript text for an inbound message. Group messages carry the
+   * sender's name; summoned group messages (group message running on a dm:
+   * session) additionally carry a [group ...] tag — the dm session's system
+   * prompt has no group context, so the tag is what tells the model which
+   * audience the message came from. Reply routing is covered by the per-turn
+   * summonReminder, which is appended to the prompt but kept out of transcripts.
+   */
+  private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
+    if (!message.isGroup) return message.text;
+    const prefixed = `${message.senderName}: ${message.text}`;
+    if (!sessionKey.startsWith("dm:")) return prefixed;
+    const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
+    return `[group${label ? ` "${label}"` : ""}] ${prefixed}`;
   }
 
   /** Track participants and chat title for a group session. The actual rules
@@ -999,7 +1150,31 @@ export class Agent {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
-    await channel.send({ chatId: replyTarget.chatId, text });
+    const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
+    if (mediaPaths.length > 0 || stickerIds.length > 0) {
+      // Send text first (matches assistant response ordering)
+      if (cleanText) {
+        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+      }
+      const validPaths = mediaPaths.filter((p) => existsSync(p));
+      for (const path of validPaths) {
+        await channel.send({
+          chatId: replyTarget.chatId,
+          photo: path,
+          text: "",
+        });
+      }
+      for (const stickerId of stickerIds) {
+        await channel.send({
+          chatId: replyTarget.chatId,
+          sticker: stickerId,
+          text: "",
+        });
+      }
+    } else {
+      // No attachments: preserve verbatim text (direct-mode contract)
+      await channel.send({ chatId: replyTarget.chatId, text });
+    }
 
     this.sessions.append(sessionKey, {
       role: "assistant",
@@ -1137,17 +1312,20 @@ export class Agent {
     return replyTarget ? { sessionKey, replyTarget } : undefined;
   }
 
-  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool. */
+  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool.
+   *  Uses active entries (not just linked SDK sessions) so groups known only
+   *  through metadata — e.g. summoned before ever running their own turn —
+   *  are still listed as send targets. */
   listSessionCatalog(): SessionCatalog {
     const identities = config.identities.map((i) => ({ name: i.name }));
     const groups: SessionCatalog["groups"] = [];
-    for (const [key] of this.sessions.listSdkSessionIds()) {
+    for (const entry of this.sessions.listActiveEntries()) {
+      const key = entry.channelKey;
       if (!isGroupSessionKey(key)) continue;
-      const entry = this.sessions.getEntry(key);
       groups.push({
         key,
-        ...(entry?.chatTitle ? { title: entry.chatTitle } : {}),
-        ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+        ...(entry.chatTitle ? { title: entry.chatTitle } : {}),
+        ...(entry.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
       });
     }
     return { identities, groups };
@@ -1224,6 +1402,7 @@ export class Agent {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     log.info("Shutting down");
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();

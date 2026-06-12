@@ -214,6 +214,19 @@ export class SessionStore {
 
   /** Link a new SDK session to a channel key */
   setSdkSessionId(key: string, sessionId: string): void {
+    this.loadRegistry();
+
+    // A metadata-only stub (created by setChatTitle/addParticipant before any
+    // SDK session existed — e.g. a freshly summoned group) is upgraded in
+    // place so its title/participants survive the first real session.
+    const stub = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && !e.sdkSessionId);
+    if (stub) {
+      stub.sdkSessionId = sessionId;
+      stub.lastActiveAt = Date.now();
+      this.saveRegistry();
+      return;
+    }
+
     // Unlink any existing session for this key (reloads the registry first)
     this.clearSdkSessionId(key);
 
@@ -296,10 +309,18 @@ export class SessionStore {
   listSdkSessionIds(): [string, string][] {
     // Reload so long-lived daemon paths (continuity, notifications, session
     // catalog, router DM lookup) see external changes like `tomo sessions clear`.
+    // Metadata-only stubs (no SDK session yet) are excluded — consumers treat
+    // these pairs as resumable sessions.
     this.loadRegistry();
     return this.registry
-      .filter((e) => e.unlinkedAt === null)
+      .filter((e) => e.unlinkedAt === null && e.sdkSessionId)
       .map((e) => [e.channelKey, e.sdkSessionId]);
+  }
+
+  /** Active registry entries (linked sessions AND metadata-only stubs). */
+  listActiveEntries(): SessionEntry[] {
+    this.loadRegistry();
+    return this.registry.filter((e) => e.unlinkedAt === null);
   }
 
   /** List all sessions including unlinked */
@@ -308,10 +329,18 @@ export class SessionStore {
     return [...this.registry];
   }
 
-  /** Unlink a session (marks for deletion after TTL) */
+  /** Unlink a session (marks for deletion after TTL). Metadata-only stubs
+   *  have no SDK file to TTL — they are removed outright. */
   clearSdkSessionId(key: string): void {
     this.loadRegistry();
     const now = Date.now();
+    this.registry = this.registry.filter((entry) => {
+      if (entry.channelKey === key && entry.unlinkedAt === null && !entry.sdkSessionId) {
+        log.info({ key }, "Metadata-only session entry removed");
+        return false;
+      }
+      return true;
+    });
     for (const entry of this.registry) {
       if (entry.channelKey === key && entry.unlinkedAt === null) {
         entry.unlinkedAt = now;
@@ -333,6 +362,10 @@ export class SessionStore {
     const deletedFiles = new Set<string>();
 
     for (const entry of expired) {
+      // Metadata-only stubs have no SDK file (and an empty id would alias
+      // every other stub in the stillReferenced check below)
+      if (!entry.sdkSessionId) continue;
+
       // Skip deletion if any surviving entry still references this sdkSessionId
       // (e.g. shared after migrateSessionKey, or unlinked but not yet expired)
       const stillReferenced = this.registry.some(
@@ -389,9 +422,8 @@ export class SessionStore {
 
   /** Persist a friendly chat title for a session (mainly groups). No-op if unchanged. */
   setChatTitle(key: string, title: string): void {
-    this.loadRegistry();
-    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    if (entry && entry.chatTitle !== title) {
+    const entry = this.ensureActiveEntry(key);
+    if (entry.chatTitle !== title) {
       entry.chatTitle = title;
       this.saveRegistry();
     }
@@ -399,13 +431,43 @@ export class SessionStore {
 
   /** Add a participant name to a session. No-op if already present. */
   addParticipant(key: string, name: string): void {
-    this.loadRegistry();
-    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    if (!entry) return;
+    const entry = this.ensureActiveEntry(key);
     const list = entry.participants ?? [];
     if (list.includes(name)) return;
     entry.participants = [...list, name];
     this.saveRegistry();
+  }
+
+  /** Active entry for a key, creating a metadata-only stub (empty sdkSessionId)
+   *  when none exists — so group title/participants persist for sessions that
+   *  haven't run a turn yet (e.g. a group summoned before it ever had its own
+   *  session). setSdkSessionId upgrades the stub in place later. */
+  private ensureActiveEntry(key: string): SessionEntry {
+    this.loadRegistry();
+    const existing = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    if (existing) return existing;
+
+    const now = Date.now();
+    const entry: SessionEntry = {
+      sdkSessionId: "",
+      channelKey: key,
+      createdAt: now,
+      lastActiveAt: now,
+      unlinkedAt: null,
+      expiresAt: null,
+      stats: {
+        totalQueries: 0,
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        contextUsed: 0,
+        contextMax: 0,
+      },
+    };
+    this.registry.push(entry);
+    return entry;
   }
 
   /** Migrate a session from one key to another (for identity-based session unification) */

@@ -1152,15 +1152,17 @@ export class Agent {
 
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
     if (mediaPaths.length > 0 || stickerIds.length > 0) {
+      // Send text first (matches assistant response ordering)
+      if (cleanText) {
+        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+      }
       const validPaths = mediaPaths.filter((p) => existsSync(p));
-      let sentText = false;
       for (const path of validPaths) {
         await channel.send({
           chatId: replyTarget.chatId,
           photo: path,
-          text: !sentText ? cleanText : "",
+          text: "",
         });
-        sentText = true;
       }
       for (const stickerId of stickerIds) {
         await channel.send({
@@ -1169,11 +1171,9 @@ export class Agent {
           text: "",
         });
       }
-      if (!sentText && cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
-      }
     } else {
-      await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+      // No attachments: preserve verbatim text (direct-mode contract)
+      await channel.send({ chatId: replyTarget.chatId, text });
     }
 
     this.sessions.append(sessionKey, {

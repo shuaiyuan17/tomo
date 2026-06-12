@@ -51,6 +51,10 @@ interface UserTurnRequest {
   steer?: boolean;
 }
 
+/** Cap on queued pending notes per session — a session that goes a long time
+ *  without a turn (e.g. a busy summoned group) keeps only the most recent. */
+const MAX_PENDING_NOTES = 15;
+
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
@@ -1176,14 +1180,21 @@ export class Agent {
       await channel.send({ chatId: replyTarget.chatId, text });
     }
 
+    // A direct send into a summoned group comes from the summoning identity's
+    // dm: session — attribute it there so the group's own session (which reads
+    // the note after dismiss) doesn't think it composed the message itself.
+    const summoned = this.router.getSummonedIdentity(replyTarget.channelName, replyTarget.chatId);
+
     this.sessions.append(sessionKey, {
       role: "assistant",
-      content: `[proactive] ${text}`,
+      content: summoned ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
       channel: replyTarget.channelName,
       timestamp: Date.now(),
     });
 
-    this.queuePendingNote(sessionKey, `[System: You proactively sent the following message to this conversation earlier (initiated from another session): "${text}"]`);
+    this.queuePendingNote(sessionKey, summoned
+      ? `[System: Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"]`
+      : `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`);
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Proactive message sent (direct)");
     return { ok: true };
@@ -1345,6 +1356,10 @@ export class Agent {
   private queuePendingNote(sessionKey: string, note: string): void {
     const arr = this.pendingNotes.get(sessionKey) ?? [];
     arr.push(note);
+    if (arr.length > MAX_PENDING_NOTES) {
+      const dropped = arr.splice(0, arr.length - MAX_PENDING_NOTES).length;
+      log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
+    }
     this.pendingNotes.set(sessionKey, arr);
   }
 

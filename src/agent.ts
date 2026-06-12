@@ -1150,7 +1150,31 @@ export class Agent {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
-    await channel.send({ chatId: replyTarget.chatId, text });
+    const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
+    if (mediaPaths.length > 0 || stickerIds.length > 0) {
+      const validPaths = mediaPaths.filter((p) => existsSync(p));
+      let sentText = false;
+      for (const path of validPaths) {
+        await channel.send({
+          chatId: replyTarget.chatId,
+          photo: path,
+          text: !sentText ? cleanText : "",
+        });
+        sentText = true;
+      }
+      for (const stickerId of stickerIds) {
+        await channel.send({
+          chatId: replyTarget.chatId,
+          sticker: stickerId,
+          text: "",
+        });
+      }
+      if (!sentText && cleanText) {
+        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+      }
+    } else {
+      await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+    }
 
     this.sessions.append(sessionKey, {
       role: "assistant",

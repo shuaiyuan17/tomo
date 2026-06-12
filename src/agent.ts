@@ -1150,7 +1150,31 @@ export class Agent {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
-    await channel.send({ chatId: replyTarget.chatId, text });
+    const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
+    if (mediaPaths.length > 0 || stickerIds.length > 0) {
+      // Send text first (matches assistant response ordering)
+      if (cleanText) {
+        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+      }
+      const validPaths = mediaPaths.filter((p) => existsSync(p));
+      for (const path of validPaths) {
+        await channel.send({
+          chatId: replyTarget.chatId,
+          photo: path,
+          text: "",
+        });
+      }
+      for (const stickerId of stickerIds) {
+        await channel.send({
+          chatId: replyTarget.chatId,
+          sticker: stickerId,
+          text: "",
+        });
+      }
+    } else {
+      // No attachments: preserve verbatim text (direct-mode contract)
+      await channel.send({ chatId: replyTarget.chatId, text });
+    }
 
     this.sessions.append(sessionKey, {
       role: "assistant",

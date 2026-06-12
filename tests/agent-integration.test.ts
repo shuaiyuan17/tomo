@@ -456,6 +456,46 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe("send_message direct mode", () => {
+  it("parses MEDIA/STICKER tags into ordered attachment sends", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(tmpDir, "photo with spaces.jpg");
+    writeFileSync(imagePath, "fake image");
+
+    const result = await agent.sendToSession(
+      "telegram:12345",
+      `here you go MEDIA:"${imagePath}" STICKER:CAACAgQAAxkBAAE123`,
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "here you go", photo: undefined, sticker: undefined },
+      { chatId: "12345", text: "", photo: imagePath, sticker: undefined },
+      { chatId: "12345", text: "", photo: undefined, sticker: "CAACAgQAAxkBAAE123" },
+    ]);
+
+    await agent.stop();
+  });
+
+  it("preserves verbatim direct text when there are no attachment tags", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const text = "  keep surrounding whitespace\n";
+
+    const result = await agent.sendToSession("telegram:12345", text);
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text, photo: undefined, sticker: undefined },
+    ]);
+
+    await agent.stop();
+  });
+});
+
 // ===== DM message routing =====
 
 describe("DM message routing", () => {

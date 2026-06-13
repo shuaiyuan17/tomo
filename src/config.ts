@@ -87,9 +87,8 @@ interface TomoConfig {
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
-  /** Experimental: steer messages that arrive while a turn is in flight into
-   *  that turn at the next tool-call boundary, instead of queueing them behind
-   *  it. Relies on the Claude Agent SDK/CLI mid-turn message queue. Default false. */
+  /** Steer messages that arrive while a turn is in flight into that turn at the
+   *  next tool-call boundary, instead of queueing them behind it. Default true. */
   steering: boolean;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
   litellm: LiteLlmConfig | null;
@@ -140,6 +139,16 @@ function parseLcmConfig(raw: unknown): LcmConfig {
 function parsePositiveInt(raw: unknown, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function parseBoolean(raw: unknown, fallback: boolean): boolean {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "string") {
+    const normalized = raw.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+  }
+  return fallback;
 }
 
 function expandConfigPath(rawPath: string): string {
@@ -288,7 +297,7 @@ function buildConfig(): TomoConfig {
     summonExpiryMinutes: parseNonNegativeMs(process.env.TOMO_SUMMON_EXPIRY_MINUTES ?? file.summonExpiryMinutes ?? 60, 60),
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
-    steering: (process.env.TOMO_STEERING ?? file.steering ?? false) === true || process.env.TOMO_STEERING === "true",
+    steering: parseBoolean(process.env.TOMO_STEERING, parseBoolean(file.steering, true)),
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,

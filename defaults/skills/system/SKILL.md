@@ -73,7 +73,7 @@ Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tom
 Responses stream to Telegram in real-time — messages update every 1.5s as tokens arrive.
 
 ### Message steering
-If `steering: true` is set in `~/.tomo/config.json`, user messages that arrive during a long tool-using turn are injected into the in-flight turn at the next tool-call boundary instead of waiting behind it. Use this to treat mid-task corrections like "stop", "wait", or added context as immediately relevant. If there is no remaining tool boundary, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns still queue normally.
+By default, user messages that arrive during a long tool-using turn are injected into the in-flight turn at the next tool-call boundary instead of waiting behind it. Use this to treat mid-task corrections like "stop", "wait", or added context as immediately relevant. If there is no remaining tool boundary, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns still queue normally. Set `steering: false` in `~/.tomo/config.json` to keep mid-turn user messages queued.
 
 ### MEDIA: tag
 To send an image/file to the user, include `MEDIA:/path/to/file.png` in your response. The harness strips it from text and sends the file. Text before/after becomes the caption.

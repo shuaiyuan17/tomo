@@ -69,7 +69,7 @@ The `IdentityRouter` resolves (channel, chatId, isGroup) → sessionKey + replyT
 
 SDK session IDs are persisted in the session registry so conversations survive daemon restarts.
 
-With config `steering` (experimental, default off), user messages that arrive while a turn is in flight bypass the per-session queue via `session.steer(text)` — the SDK injects them at the next tool-call boundary. Two outcomes: the message merges into the in-flight turn (detected via the CLI's `isReplay` echo, enabled by passing `--replay-user-messages` through `extraArgs` when steering is on; the steered caller resolves with `STEER_MERGED` and the turn's owner delivers the combined response), or it misses the turn and runs as its own follow-up turn (promoted at `result` time). `send()` waits for true session idleness, so queued system turns (cron, continuity) never overlap a promoted steered turn.
+With config `steering` (default on), user messages that arrive while a turn is in flight bypass the per-session queue via `session.steer(text)` — the SDK injects them at the next tool-call boundary. Two outcomes: the message merges into the in-flight turn (detected via the CLI's `isReplay` echo, enabled by passing `--replay-user-messages` through `extraArgs` when steering is on; the steered caller resolves with `STEER_MERGED` and the turn's owner delivers the combined response), or it misses the turn and runs as its own follow-up turn (promoted at `result` time). `send()` waits for true session idleness, so queued system turns (cron, continuity) never overlap a promoted steered turn. Set `steering: false` or `TOMO_STEERING=false` to keep mid-turn user messages queued.
 
 ### Message Flow
 

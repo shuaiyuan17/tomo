@@ -73,9 +73,8 @@ export class Agent {
   // Context-usage hysteresis: track whether we've nudged the agent to compact
   // for the current over-threshold episode. Reset when usage drops below LOW.
   private contextNudged = new Map<string, boolean>();
-  // Notes queued by sendToSession() — drained and prepended to the recipient's
-  // next user/cron/continuity turn so their Claude has context that a
-  // proactive message went out.
+  // System notes queued by harness events (summon/dismiss/expiry), drained and
+  // prepended to the next user/cron/continuity turn.
   private pendingNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   // Last inbound audience per dm: session ("dm" or a raw group key). With
@@ -1136,7 +1135,6 @@ export class Agent {
   /**
    * Direct mode: post a verbatim message to a target session via Channel.send().
    * No Claude query is invoked for the recipient — the message arrives as-is.
-   * A pending note is queued so the recipient's next Claude turn knows context.
    */
   async sendToSession(target: string, text: string): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
@@ -1176,16 +1174,7 @@ export class Agent {
       await channel.send({ chatId: replyTarget.chatId, text });
     }
 
-    this.sessions.append(sessionKey, {
-      role: "assistant",
-      content: `[proactive] ${text}`,
-      channel: replyTarget.channelName,
-      timestamp: Date.now(),
-    });
-
-    this.queuePendingNote(sessionKey, `[System: You proactively sent the following message to this conversation earlier (initiated from another session): "${text}"]`);
-
-    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Proactive message sent (direct)");
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Message sent (direct)");
     return { ok: true };
   }
 
@@ -1348,7 +1337,7 @@ export class Agent {
     this.pendingNotes.set(sessionKey, arr);
   }
 
-  /** Drain notes queued for this session (e.g. by sendToSession) and return them as a prefix. */
+  /** Drain harness notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
     const notes = this.pendingNotes.get(sessionKey);
     if (!notes || notes.length === 0) return "";

@@ -48,6 +48,7 @@ interface CareStats {
 const STAGE_ORDER: PetStage[] = ["egg", "baby", "child", "teen", "adult", "elder"];
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
+const HUNGER_DECAY_PER_HOUR = 2;
 const RECOVERY_EXIT_HEALTH = 25;
 const CARE_MISTAKE_INTERVAL_MS = 6 * HOUR_MS;
 const CARE_MISTAKE_AFFECTION_PENALTY = 5;
@@ -164,14 +165,14 @@ export class PetStore {
     if (awakeHours > 0) {
       careBefore = this.careSnapshot(state);
       const hungerBefore = state.hunger;
-      state.hunger    = Math.max(0, state.hunger    - awakeHours * 5);
+      state.hunger    = Math.max(0, state.hunger    - awakeHours * HUNGER_DECAY_PER_HOUR);
       state.happiness = Math.max(0, state.happiness - awakeHours * 3);
       state.energy    = Math.max(0, state.energy    - awakeHours * 4);
 
       // Health: penalize only for the time actually spent at hunger=0.
-      // If hunger was > 0 at the start, starvation began after hungerBefore/5 hours.
+      // If hunger was > 0 at the start, starvation began once hunger decayed to zero.
       const starvingHours = hungerBefore > 0
-        ? Math.max(0, awakeHours - hungerBefore / 5)
+        ? Math.max(0, awakeHours - hungerBefore / HUNGER_DECAY_PER_HOUR)
         : awakeHours;
 
       if (starvingHours > 0) {
@@ -343,7 +344,7 @@ export class PetStore {
     if (this.isNeglected(before)) return awakeStartMs;
 
     const hoursUntilNeglect = [
-      before.hunger <= 20 ? 0 : (before.hunger - 20) / 5,
+      before.hunger <= 20 ? 0 : (before.hunger - 20) / HUNGER_DECAY_PER_HOUR,
       before.happiness <= 20 ? 0 : (before.happiness - 20) / 3,
       before.energy <= 10 ? 0 : (before.energy - 10) / 4,
     ];

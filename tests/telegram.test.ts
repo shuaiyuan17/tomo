@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { TelegramChannel } from "../src/channels/telegram.js";
 
 // Test @mention cleaning (extracted from TelegramChannel.cleanMention)
 function cleanMention(text: string, botUsername: string | undefined): string {
@@ -256,5 +257,104 @@ describe("streaming message NO_REPLY prefix suppression", () => {
 
     expect(calls).toEqual(["send:NO_REPLY just kidding, here's the answer"]);
     expect(messageId).toBe(1);
+  });
+});
+
+function makeTelegramChannel(api: Record<string, unknown>, options: { draftStreaming?: boolean } = {}): TelegramChannel {
+  const channel = new TelegramChannel("123:test", options) as unknown as TelegramChannel & {
+    bot: { api: Record<string, unknown>; token: string; botInfo: { id: number } };
+  };
+  channel.bot = { api, token: "123:test", botInfo: { id: 123 } };
+  return channel;
+}
+
+describe("Telegram draft streaming", () => {
+  it("leaves draft streaming off by default", async () => {
+    const api = {
+      sendMessageDraft: vi.fn().mockResolvedValue(true),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
+      editMessageText: vi.fn(),
+      deleteMessage: vi.fn(),
+    };
+    const channel = makeTelegramChannel(api);
+
+    const stream = channel.createStreamingMessage("12345", undefined, { draftId: 99 });
+    stream.update("Hello");
+    await stream.finish();
+
+    expect(api.sendMessageDraft).not.toHaveBeenCalled();
+    expect(api.sendMessage).toHaveBeenCalledWith("12345", "Hello", {});
+  });
+
+  it("streams private replies through drafts and persists the final text", async () => {
+    const api = {
+      sendMessageDraft: vi.fn().mockResolvedValue(true),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
+      editMessageText: vi.fn(),
+      deleteMessage: vi.fn(),
+    };
+    const channel = makeTelegramChannel(api, { draftStreaming: true });
+
+    const stream = channel.createStreamingMessage("12345", undefined, { draftId: 99 });
+    stream.update("Hello");
+    await stream.finish();
+
+    expect(api.sendMessageDraft).toHaveBeenNthCalledWith(1, 12345, 99, "");
+    expect(api.sendMessageDraft).toHaveBeenNthCalledWith(2, 12345, 99, "Hello");
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(api.sendMessage).toHaveBeenCalledWith("12345", "Hello", { parse_mode: "Markdown" });
+    expect(api.editMessageText).not.toHaveBeenCalled();
+  });
+
+  it("keeps group chats on the existing visible edit stream", async () => {
+    const api = {
+      sendMessageDraft: vi.fn().mockResolvedValue(true),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
+      editMessageText: vi.fn(),
+      deleteMessage: vi.fn(),
+    };
+    const channel = makeTelegramChannel(api, { draftStreaming: true });
+
+    const stream = channel.createStreamingMessage("-100123", undefined, { draftId: 99 });
+    stream.update("Hello group");
+    await stream.finish();
+
+    expect(api.sendMessageDraft).not.toHaveBeenCalled();
+    expect(api.sendMessage).toHaveBeenCalledWith("-100123", "Hello group", {});
+  });
+
+  it("falls back to visible streaming if the draft API fails", async () => {
+    const api = {
+      sendMessageDraft: vi.fn().mockRejectedValue(new Error("unsupported")),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
+      editMessageText: vi.fn(),
+      deleteMessage: vi.fn(),
+    };
+    const channel = makeTelegramChannel(api, { draftStreaming: true });
+
+    const stream = channel.createStreamingMessage("12345", undefined, { draftId: 99 });
+    stream.update("Hello fallback");
+    await stream.finish();
+
+    expect(api.sendMessageDraft).toHaveBeenCalledWith(12345, 99, "");
+    expect(api.sendMessage).toHaveBeenCalledWith("12345", "Hello fallback", {});
+  });
+
+  it("does not persist a NO_REPLY-only draft stream", async () => {
+    const api = {
+      sendMessageDraft: vi.fn().mockResolvedValue(true),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
+      editMessageText: vi.fn(),
+      deleteMessage: vi.fn(),
+    };
+    const channel = makeTelegramChannel(api, { draftStreaming: true });
+
+    const stream = channel.createStreamingMessage("12345", undefined, { draftId: 99 });
+    stream.update("NO_REPLY");
+    await stream.finish();
+
+    expect(api.sendMessageDraft).toHaveBeenCalledTimes(1);
+    expect(api.sendMessageDraft).toHaveBeenCalledWith(12345, 99, "");
+    expect(api.sendMessage).not.toHaveBeenCalled();
   });
 });

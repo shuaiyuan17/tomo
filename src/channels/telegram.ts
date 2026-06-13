@@ -1,6 +1,17 @@
 import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction } from "./types.js";
+import type {
+  Channel,
+  IncomingMessage,
+  OutgoingMessage,
+  MessageHandler,
+  CommandHandler,
+  ImageAttachment,
+  DocumentAttachment,
+  StreamingMessage,
+  StreamingMessageOptions,
+  MessageReaction,
+} from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
 import {
@@ -18,6 +29,8 @@ const TELEGRAM_TEXT_LIMIT = 4096;
 export interface TelegramChannelOptions {
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
   imageStoreBaseDir?: string;
+  /** Experimental Telegram Bot API draft streaming. Disabled by default because current clients can make the composer jump. */
+  draftStreaming?: boolean;
 }
 
 export class TelegramChannel implements Channel {
@@ -28,10 +41,12 @@ export class TelegramChannel implements Channel {
   private botUsername: string | undefined;
   private stopping = false;
   private imageStoreBaseDir: string | undefined;
+  private draftStreaming: boolean;
 
   constructor(token: string, options: TelegramChannelOptions = {}) {
     this.bot = new Bot(token);
     this.imageStoreBaseDir = options.imageStoreBaseDir;
+    this.draftStreaming = options.draftStreaming ?? false;
 
     this.bot.catch((err) => {
       log.error({ err: err.error }, "Telegram bot error");
@@ -66,6 +81,7 @@ export class TelegramChannel implements Channel {
         isGroup,
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+        streamingDraftId: ctx.update.update_id,
       });
     });
 
@@ -92,6 +108,7 @@ export class TelegramChannel implements Channel {
         isGroup,
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+        streamingDraftId: ctx.update.update_id,
       });
     });
 
@@ -118,6 +135,7 @@ export class TelegramChannel implements Channel {
           isGroup,
           isMentioned,
           chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+          streamingDraftId: ctx.update.update_id,
         });
         return;
       }
@@ -145,6 +163,7 @@ export class TelegramChannel implements Channel {
         isGroup,
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+        streamingDraftId: ctx.update.update_id,
       });
     });
 
@@ -171,6 +190,7 @@ export class TelegramChannel implements Channel {
         isGroup,
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+        streamingDraftId: ctx.update.update_id,
       });
     });
   }
@@ -352,7 +372,197 @@ export class TelegramChannel implements Channel {
     return cleanup;
   }
 
-  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
+  createStreamingMessage(chatId: string, replyTo?: string, options?: StreamingMessageOptions): StreamingMessage {
+    const draftTarget = this.draftStreaming ? this.resolveDraftTarget(chatId, options?.draftId) : undefined;
+    if (draftTarget) return this.createDraftStreamingMessage(chatId, replyTo, draftTarget);
+    return this.createEditingStreamingMessage(chatId, replyTo);
+  }
+
+  private resolveDraftTarget(chatId: string, draftId: number | undefined): { chatId: number; draftId: number } | undefined {
+    if (draftId === undefined || !Number.isSafeInteger(draftId) || draftId === 0) return undefined;
+    const numericChatId = Number(chatId);
+    // Telegram message drafts target private chats. Group/supergroup ids are negative.
+    if (!Number.isSafeInteger(numericChatId) || numericChatId <= 0) return undefined;
+    return { chatId: numericChatId, draftId };
+  }
+
+  private createDraftStreamingMessage(
+    chatId: string,
+    replyTo: string | undefined,
+    draft: { chatId: number; draftId: number },
+  ): StreamingMessage {
+    const DRAFT_INTERVAL_MS = 1500;
+    const NO_REPLY_PREFIX_RE = /^\s*(N(O(_(R(E(P(L(Y)?)?)?)?)?)?)?)?\s*$/i;
+    let buffer = "";
+    let offset = 0;
+    let lastDraft = "";
+    let draftTimer: ReturnType<typeof setInterval> | null = null;
+    let finished = false;
+    let canceled = false;
+    let draftEnabled = true;
+    let fallbackStream: StreamingMessage | null = null;
+    let flushPending: Promise<void> = Promise.resolve();
+
+    const pendingText = () => buffer.slice(offset);
+
+    const stopTimer = () => {
+      if (draftTimer) {
+        clearInterval(draftTimer);
+        draftTimer = null;
+      }
+    };
+
+    const sendPersisted = async (text: string): Promise<void> => {
+      if (!text) return;
+      const replyParams = replyTo
+        ? { reply_parameters: { message_id: Number(replyTo) } }
+        : {};
+      const chunks = splitText(text, TELEGRAM_TEXT_LIMIT);
+      for (const [i, chunk] of chunks.entries()) {
+        const params = i === 0 ? replyParams : {};
+        try {
+          await this.bot.api.sendMessage(chatId, chunk, {
+            ...params,
+            parse_mode: "Markdown",
+          });
+        } catch {
+          await this.bot.api.sendMessage(chatId, chunk, params);
+        }
+      }
+    };
+
+    const forwardToFallback = () => {
+      if (!fallbackStream) return;
+      const pending = pendingText();
+      if (!pending || (offset === 0 && NO_REPLY_PREFIX_RE.test(pending))) return;
+      fallbackStream.update(pending);
+    };
+
+    const switchToFallback = (err: unknown) => {
+      if (!fallbackStream) {
+        log.warn({ err, chatId }, "Telegram message draft failed; falling back to visible streaming");
+        fallbackStream = this.createEditingStreamingMessage(chatId, replyTo);
+      }
+      draftEnabled = false;
+      stopTimer();
+      forwardToFallback();
+    };
+
+    const sendDraft = async (text: string): Promise<boolean> => {
+      if (!draftEnabled || fallbackStream || canceled) return false;
+      try {
+        await this.bot.api.sendMessageDraft(draft.chatId, draft.draftId, text);
+        return true;
+      } catch (err) {
+        switchToFallback(err);
+        return false;
+      }
+    };
+
+    const flush = () => {
+      if (fallbackStream) return Promise.resolve();
+      flushPending = flushPending.then(async () => {
+        try {
+          while (!canceled && draftEnabled && !fallbackStream) {
+            const pending = pendingText();
+            if (!pending || pending === lastDraft) return;
+            if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
+
+            if (pending.length <= TELEGRAM_TEXT_LIMIT) {
+              if (await sendDraft(pending)) lastDraft = pending;
+              return;
+            }
+
+            const head = splitText(pending, TELEGRAM_TEXT_LIMIT)[0];
+            await sendPersisted(head);
+            offset += head.length;
+            lastDraft = "";
+          }
+        } catch (err) {
+          log.warn({ err, chatId }, "Telegram draft streaming flush failed; will retry");
+        }
+      });
+      return flushPending;
+    };
+
+    const stopAndDrain = async () => {
+      stopTimer();
+      await flushPending;
+    };
+
+    const persistFinalWithRetries = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (canceled || fallbackStream) return;
+        await flush();
+        if (fallbackStream) return;
+
+        const pending = pendingText();
+        if (!pending) return;
+        if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
+
+        try {
+          await sendPersisted(pending);
+          offset += pending.length;
+          lastDraft = "";
+          return;
+        } catch (err) {
+          log.warn({ err, chatId }, "Telegram final draft persistence failed; will retry");
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
+      log.error({ chatId }, "Telegram final draft persistence failed after retries; trailing content was not delivered");
+    };
+
+    flushPending = sendDraft("").then(() => undefined);
+
+    return {
+      update: (text: string) => {
+        if (canceled || finished) return;
+        buffer = text;
+        if (fallbackStream) {
+          forwardToFallback();
+          return;
+        }
+        if (!draftTimer) {
+          flush();
+          draftTimer = setInterval(flush, DRAFT_INTERVAL_MS);
+        }
+      },
+      commitBlock: async () => {
+        if (canceled || finished) return;
+        if (fallbackStream) {
+          await fallbackStream.commitBlock();
+          buffer = "";
+          offset = 0;
+          lastDraft = "";
+          return;
+        }
+        await stopAndDrain();
+        await persistFinalWithRetries();
+        buffer = "";
+        offset = 0;
+        lastDraft = "";
+      },
+      finish: async () => {
+        if (finished) return;
+        finished = true;
+        if (fallbackStream) {
+          await fallbackStream.finish();
+          return;
+        }
+        await stopAndDrain();
+        await persistFinalWithRetries();
+      },
+      cancel: async () => {
+        canceled = true;
+        stopTimer();
+        await flushPending;
+        if (fallbackStream) await fallbackStream.cancel();
+      },
+    };
+  }
+
+  private createEditingStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
     const EDIT_INTERVAL_MS = 1500;
     // Suppress flushing while the buffer looks like it might resolve to a
     // bare NO_REPLY. Once content grows past this prefix or diverges, we know

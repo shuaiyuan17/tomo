@@ -39,6 +39,8 @@ export interface IncomingMessage {
   isMentioned?: boolean;
   /** Group chat title */
   chatTitle?: string;
+  /** Provider-specific draft/preview id for ephemeral streaming, if supported. */
+  streamingDraftId?: number;
 }
 
 export interface OutgoingMessage {
@@ -83,6 +85,11 @@ export interface StreamingMessage {
   commitBlock(): Promise<void>;
 }
 
+export interface StreamingMessageOptions {
+  /** Provider-specific draft/preview id for ephemeral streaming, if supported. */
+  draftId?: number;
+}
+
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;
 /**
  * Slash command handler. `senderId` is the channel's provider-verified sender
@@ -111,7 +118,7 @@ export interface Channel {
   reactToMessage?(chatId: string, messageId: string, reaction: MessageReaction, remove?: boolean): Promise<void>;
 
   /** Create a streaming message that can be updated incrementally */
-  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage;
+  createStreamingMessage(chatId: string, replyTo?: string, options?: StreamingMessageOptions): StreamingMessage;
 
   /** Show typing indicator. Returns a stop function. */
   startTyping(chatId: string): StopTyping;

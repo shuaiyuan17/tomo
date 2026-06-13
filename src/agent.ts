@@ -42,6 +42,7 @@ interface UserTurnRequest {
   replyChannel: Channel;
   replyChatId: string;
   replyToMessageId?: string;
+  streamingDraftId?: number;
   images?: IncomingMessage["images"];
   documents?: IncomingMessage["documents"];
   suppressErrors: boolean;
@@ -591,7 +592,8 @@ export class Agent {
 
     try {
       const stampedText = this.drainPendingNotes(req.key) + this.injectTimestamp(req.promptText, req.sourceChannelName);
-      const stream = req.replyChannel.createStreamingMessage(req.replyChatId, req.replyToMessageId);
+      const streamOptions = req.streamingDraftId !== undefined ? { draftId: req.streamingDraftId } : undefined;
+      const stream = req.replyChannel.createStreamingMessage(req.replyChatId, req.replyToMessageId, streamOptions);
       const response = await this.runWithRetry(
         req.key,
         stampedText,
@@ -721,6 +723,9 @@ export class Agent {
       // Reply-threading only makes sense when the reply lands in the chat the
       // message came from — not for summoned groups (reply goes to the DM).
       replyToMessageId: isGroup && replyChatId === message.chatId ? message.id : undefined,
+      streamingDraftId: !isGroup && replyChannel.name === channel.name && replyChatId === message.chatId
+        ? message.streamingDraftId
+        : undefined,
       replyChatId,
       images: message.images,
       documents: message.documents,
@@ -801,6 +806,9 @@ export class Agent {
       replyChannel,
       replyChatId,
       replyToMessageId: isGroup && replyChatId === lastMessage.chatId ? lastMessage.id : undefined,
+      streamingDraftId: !isGroup && replyChannel.name === lastChannel.name && replyChatId === lastMessage.chatId
+        ? lastMessage.streamingDraftId
+        : undefined,
       images: allImages.length > 0 ? allImages : undefined,
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       suppressErrors: isPassiveGroup,

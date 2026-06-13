@@ -48,7 +48,7 @@
     "@clack/prompts": "^1.4.0",
     "commander": "^15.0.0",
     "croner": "^10.0.1",
-    "grammy": "^1.35.0",
+    "grammy": "^1.43.0",
     "minimatch": "^10.2.5",
     "pino": "^10.3.1",
     "pino-pretty": "^13.0.0",

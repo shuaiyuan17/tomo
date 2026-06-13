@@ -118,7 +118,10 @@ async function startForeground(): Promise<void> {
   const imageStoreBaseDir = config.saveInboundImages ? config.workspaceDir : undefined;
 
   if (config.telegramToken) {
-    agent.addChannel(new TelegramChannel(config.telegramToken, { imageStoreBaseDir }));
+    agent.addChannel(new TelegramChannel(config.telegramToken, {
+      imageStoreBaseDir,
+      draftStreaming: process.env.TOMO_TELEGRAM_DRAFTS === "true",
+    }));
   }
 
   if (config.imessageUrl) {

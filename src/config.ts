@@ -16,6 +16,8 @@ export const CONFIG_BACKUP_PATH = join(TOMO_HOME, "config.json.bak");
 export const RESTART_REASON_FILE = join(TOMO_HOME, "data", ".restart-reason");
 const DEFAULT_IMESSAGE_INBOUND_SETTLE_MS = 1500;
 const DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS = 5000;
+const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
+const DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS = 4000;
 
 export interface IdentityConfig {
   name: string;
@@ -71,6 +73,10 @@ interface TomoConfig {
   imessageInboundSettleMs: number;
   /** Maximum total delay for one continuously extended iMessage inbound burst. */
   imessageInboundMaxSettleMs: number;
+  /** Delay before showing iMessage typing for ordinary turns. */
+  imessageTypingStartDelayMs: number;
+  /** Longer delay before showing iMessage typing in passive group turns. */
+  imessagePassiveTypingStartDelayMs: number;
   sessionModelOverrides: Record<string, string>;
   /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
   channelAllowlists: Record<string, string[]>;
@@ -256,6 +262,18 @@ function buildConfig(): TomoConfig {
     DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
     DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
   );
+  const imessageTypingStartDelayMs = parseNonNegativeMs(
+    process.env.IMESSAGE_TYPING_START_DELAY_MS ??
+    (channels.imessage?.typingStartDelayMs as string | number | undefined) ??
+    DEFAULT_IMESSAGE_TYPING_START_DELAY_MS,
+    DEFAULT_IMESSAGE_TYPING_START_DELAY_MS,
+  );
+  const imessagePassiveTypingStartDelayMs = parseNonNegativeMs(
+    process.env.IMESSAGE_PASSIVE_TYPING_START_DELAY_MS ??
+    (channels.imessage?.passiveTypingStartDelayMs as string | number | undefined) ??
+    DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
+    DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
+  );
 
   // Parse identities
   const rawIdentities = (file.identities ?? []) as Array<{
@@ -290,6 +308,8 @@ function buildConfig(): TomoConfig {
     imessageWebhookPort,
     imessageInboundSettleMs,
     imessageInboundMaxSettleMs,
+    imessageTypingStartDelayMs,
+    imessagePassiveTypingStartDelayMs,
     sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
     channelAllowlists: parseAllowlists(channels),
     passiveGroups: parsePassiveGroups(channels),

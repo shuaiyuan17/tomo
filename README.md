@@ -246,6 +246,8 @@ Environment variables override config file values:
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
 | `IMESSAGE_URL` | Override BlueBubbles URL |
+| `IMESSAGE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for ordinary turns (default: `1200`) |
+| `IMESSAGE_PASSIVE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for passive iMessage group turns (default: `4000`) |
 | `CLAUDE_MODEL` | Override model |
 | `TOMO_LITELLM_BASE_URL` | Route Claude Agent SDK model calls through a LiteLLM proxy |
 | `TOMO_LITELLM_API_KEY` | API key sent to the LiteLLM proxy as `ANTHROPIC_API_KEY` |

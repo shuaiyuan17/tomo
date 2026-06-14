@@ -1,5 +1,5 @@
 import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import type { Channel, IncomingMessage, MessageReaction, StreamingMessage } from "./channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions, StreamingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -49,6 +49,8 @@ interface UserTurnRequest {
   /** Steer this turn into the session's in-flight turn (config `steering`)
    *  instead of running through the per-session queue. */
   steer?: boolean;
+  /** True for turns where most inputs are expected to resolve to NO_REPLY. */
+  passiveListen?: boolean;
 }
 
 export class Agent {
@@ -128,6 +130,39 @@ export class Agent {
   private isPassiveListenGroup(channelName: string, chatId: string): boolean {
     if (channelName === "imessage") return true;
     return (config.passiveGroups[channelName] ?? []).includes(chatId);
+  }
+
+  private typingStartDelayMs(channelName: string, passiveListen = false): number {
+    if (channelName !== "imessage") return 0;
+    const ms = passiveListen ? config.imessagePassiveTypingStartDelayMs : config.imessageTypingStartDelayMs;
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+
+  private isPassiveReplyTarget(channelName: string, chatId: string): boolean {
+    return isGroupSessionKey(`${channelName}:${chatId}`) && this.isPassiveListenGroup(channelName, chatId);
+  }
+
+  private startTurnTyping(channel: Channel, chatId: string, passiveListen = false): StopTyping {
+    const delayMs = this.typingStartDelayMs(channel.name, passiveListen);
+    if (delayMs <= 0) return channel.startTyping(chatId);
+
+    let sealed = false;
+    let started: StopTyping | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      timer = null;
+      if (sealed) return;
+      started = channel.startTyping(chatId);
+    }, delayMs);
+
+    return async (options?: StopTypingOptions) => {
+      if (sealed) return;
+      sealed = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (started) await started(options);
+    };
   }
 
   /** Snapshot of group metadata for the system prompt — null for non-group sessions. */
@@ -587,7 +622,7 @@ export class Agent {
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
-    const stopTyping = req.replyChannel.startTyping(req.replyChatId);
+    const stopTyping = this.startTurnTyping(req.replyChannel, req.replyChatId, req.passiveListen);
 
     try {
       const stampedText = this.drainPendingNotes(req.key) + this.injectTimestamp(req.promptText, req.sourceChannelName);
@@ -610,8 +645,6 @@ export class Agent {
         return;
       }
 
-      await stopTyping({ clear: isSilentReply(response) });
-
       this.maybeNudgeCompact(req.key);
 
       this.sessions.append(req.key, {
@@ -622,17 +655,24 @@ export class Agent {
       });
 
       await this.deliverResponse(req.replyChannel, req.replyChatId, response, stream);
+      await stopTyping({ clear: true });
     } catch (err) {
-      await stopTyping();
       log.error({ err }, req.errorLogMessage);
 
-      if (req.suppressErrors) return;
+      if (req.suppressErrors) {
+        await stopTyping({ clear: true });
+        return;
+      }
 
       const detail = err instanceof Error ? err.message : String(err);
-      await req.replyChannel.send({
-        chatId: req.replyChatId,
-        text: `[error] ${detail}`,
-      });
+      try {
+        await req.replyChannel.send({
+          chatId: req.replyChatId,
+          text: `[error] ${detail}`,
+        });
+      } finally {
+        await stopTyping({ clear: true });
+      }
     }
   }
 
@@ -727,6 +767,7 @@ export class Agent {
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling message",
       steer,
+      passiveListen: isPassiveGroup,
     });
   }
 
@@ -806,6 +847,7 @@ export class Agent {
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling batched messages",
       steer,
+      passiveListen: isPassiveGroup,
     });
   }
 
@@ -1024,17 +1066,21 @@ export class Agent {
     const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
-    const stopTyping = deliveryChannel.startTyping(deliveryChatId);
+    const stopTyping = this.startTurnTyping(
+      deliveryChannel,
+      deliveryChatId,
+      this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
+    );
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);
       const silentCronResponse = isSilentReply(response) || response.includes("NO_REPLY");
-      await stopTyping({ clear: silentCronResponse });
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
       if (silentCronResponse) {
         log.info("Cron completed silently (no reply sent)");
+        await stopTyping({ clear: true });
         return;
       }
 
@@ -1046,11 +1092,15 @@ export class Agent {
       });
 
       await deliveryChannel.send({ chatId: deliveryChatId, text: response });
+      await stopTyping({ clear: true });
     } catch (err) {
-      await stopTyping();
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
-      await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });
+      try {
+        await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });
+      } finally {
+        await stopTyping({ clear: true });
+      }
     }
   }
 

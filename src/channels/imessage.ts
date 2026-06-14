@@ -188,16 +188,28 @@ export class BlueBubblesChannel implements Channel {
     const STOP_WAIT_MS = 1000;
     const MAX_ERRORS = 10;
 
+    const clearTyping = async () => {
+      try {
+        await this.api("DELETE", `/chat/${encodeURIComponent(chatId)}/typing`);
+      } catch (err) {
+        log.debug({ err, chatId }, "Failed to clear iMessage typing indicator");
+      }
+    };
+
     const cleanup = async (options: { clear?: boolean } = {}) => {
       if (sealed) return;
       sealed = true;
       if (interval) clearInterval(interval);
       if (ttl) clearTimeout(ttl);
       const pendingTick = tickInFlight;
+      let pendingTickSettled = !pendingTick;
+      const markPendingTickSettled = pendingTick?.finally(() => {
+        pendingTickSettled = true;
+      });
       if (pendingTick) {
         let stopWaitTimer: ReturnType<typeof setTimeout> | null = null;
         await Promise.race([
-          pendingTick.finally(() => {
+          markPendingTickSettled!.finally(() => {
             if (stopWaitTimer) clearTimeout(stopWaitTimer);
           }),
           new Promise<void>((resolve) => {
@@ -206,16 +218,17 @@ export class BlueBubblesChannel implements Channel {
         ]);
       }
       if (options.clear) {
-        try {
-          await this.api("DELETE", `/chat/${encodeURIComponent(chatId)}/typing`);
-        } catch (err) {
-          log.debug({ err, chatId }, "Failed to clear iMessage typing indicator");
+        const needsPostSettleClear = !!pendingTick && !pendingTickSettled;
+        await clearTyping();
+        if (needsPostSettleClear) {
+          void markPendingTickSettled!.finally(() => {
+            void clearTyping();
+          });
         }
       }
-      // For normal sends, do not call DELETE /typing here. BlueBubbles clears
-      // typing when the message is sent or when its own timeout expires, while
-      // manual stop can race with an in-flight POST and produce a post-send
-      // typing flash. Silent turns pass clear=true because no message follows.
+      // Callers pass clear=true once they know no more typing should be
+      // visible. If a slow POST outlives STOP_WAIT_MS, the follow-up clear
+      // above prevents that late POST from re-enabling the indicator.
     };
 
     const sendTyping = () => {

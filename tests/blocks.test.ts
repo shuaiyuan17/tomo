@@ -240,11 +240,11 @@ describe("isWarmTailCandidate — classifier", () => {
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: "System: It is Fri, Jun 5, 22:22 PDT. Weather outside ..." } } as any)).toBe(false);
   });
   it("rejects a cron turn with a pending note prepended (multi-bracket strip)", () => {
-    const content = `[System: You proactively sent the following message …]\n\n${stamp} System: Scheduled task "daily-backup" triggered.`;
+    const content = `[System: Your summon into the group "Dinner" expired.]\n\n${stamp} System: Scheduled task "daily-backup" triggered.`;
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content } } as any)).toBe(false);
   });
   it("still counts a real message with a pending note prepended", () => {
-    const content = `[System: You proactively sent the following message …]\n\n${stamp} hey what's up`;
+    const content = `[System: Your summon into the group "Dinner" expired.]\n\n${stamp} hey what's up`;
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content } } as any)).toBe(true);
   });
   it("rejects a tool_result-only user turn (no text)", () => {

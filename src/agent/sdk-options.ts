@@ -171,8 +171,7 @@ export function sdkOptions(
     // isReplay events — that's how LiveSession detects whether a steered
     // message merged into the in-flight turn or spilled to a follow-up
     // turn. The CLI flag defaults to off and the SDK has no typed option
-    // for it, so pass it through extraArgs. Scoped to config.steering so
-    // default behavior is untouched.
+    // for it, so pass it through extraArgs when steering is enabled.
     ...(config.steering ? { extraArgs: { "replay-user-messages": null } } : {}),
   };
 }

@@ -119,6 +119,20 @@ describe("PetStore", () => {
     expect(pet.diary[0]).toContain("out of recovery");
   });
 
+  it("decays hunger by two points per awake hour before starvation damage", () => {
+    const store = new PetStore(TEST_PATH);
+    let pet = store.create("Mochi", "star");
+    pet.stage = "baby";
+    pet.hunger = 6;
+    pet.health = 100;
+    pet.last_tick = new Date(Date.now() - 4 * HOUR_MS).toISOString();
+
+    pet = store.tick(pet);
+
+    expect(pet.hunger).toBe(0);
+    expect(pet.health).toBe(92);
+  });
+
   it("counts each elapsed care-mistake window during offline neglect", () => {
     const store = new PetStore(TEST_PATH);
     let pet = store.create("Mochi", "star");
@@ -190,7 +204,7 @@ describe("PetStore", () => {
     store.save(pet);
     await runPetTool("pet_feed");
     pet = store.load()!;
-    expect(pet.hunger).toBe(70);
+    expect(pet.hunger).toBe(75);
     expect(pet.affection).toBe(1);
 
     pet.hunger = 45;
@@ -199,7 +213,7 @@ describe("PetStore", () => {
     store.save(pet);
     await runPetTool("pet_feed");
     pet = store.load()!;
-    expect(pet.hunger).toBe(70);
+    expect(pet.hunger).toBe(75);
     expect(pet.affection).toBe(1);
     expect(pet.recovering).toBe(true);
   });

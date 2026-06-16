@@ -2,6 +2,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { BlueBubblesChannel } from "../src/channels/imessage.js";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -303,6 +304,110 @@ describe("BlueBubbles typing indicator", () => {
 
     expect(calls).toEqual([
       { method: "POST", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+    ]);
+  });
+
+  it("clears again if a slow typing POST finishes after the stop wait", async () => {
+    vi.useFakeTimers();
+
+    let resolveTypingPost: ((response: Response) => void) | undefined;
+    const calls: Array<{ method: string; path: string }> = [];
+    const pendingTypingPost = new Promise<Response>((resolve) => {
+      resolveTypingPost = resolve;
+    });
+
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? "GET";
+      calls.push({ method, path: new URL(requestUrl).pathname });
+      if (method === "POST") return pendingTypingPost;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }));
+
+    const channel = new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+
+    const stopTyping = channel.startTyping("iMessage;+;group123");
+    const stopped = Promise.resolve(stopTyping({ clear: true }));
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    await stopped;
+
+    expect(calls).toEqual([
+      { method: "POST", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+    ]);
+
+    resolveTypingPost!(new Response(null, { status: 204 }));
+    for (let i = 0; i < 10 && calls.length < 3; i++) {
+      await Promise.resolve();
+    }
+
+    expect(calls).toEqual([
+      { method: "POST", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+    ]);
+  });
+
+  it("clears again if the typing POST settles during the first clear", async () => {
+    vi.useFakeTimers();
+
+    let resolveTypingPost: ((response: Response) => void) | undefined;
+    let resolveFirstDelete: ((response: Response) => void) | undefined;
+    const calls: Array<{ method: string; path: string }> = [];
+    const pendingTypingPost = new Promise<Response>((resolve) => {
+      resolveTypingPost = resolve;
+    });
+    const pendingFirstDelete = new Promise<Response>((resolve) => {
+      resolveFirstDelete = resolve;
+    });
+    let deleteCount = 0;
+
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? "GET";
+      calls.push({ method, path: new URL(requestUrl).pathname });
+      if (method === "POST") return pendingTypingPost;
+      deleteCount++;
+      if (deleteCount === 1) {
+        resolveTypingPost!(new Response(null, { status: 204 }));
+        return pendingFirstDelete;
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }));
+
+    const channel = new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+
+    const stopTyping = channel.startTyping("iMessage;+;group123");
+    const stopped = Promise.resolve(stopTyping({ clear: true }));
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(calls).toEqual([
+      { method: "POST", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+    ]);
+
+    await Promise.resolve();
+    resolveFirstDelete!(new Response(null, { status: 204 }));
+    await stopped;
+    for (let i = 0; i < 10 && calls.length < 3; i++) {
+      await Promise.resolve();
+    }
+
+    expect(calls).toEqual([
+      { method: "POST", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
+      { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
       { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
     ]);
   });

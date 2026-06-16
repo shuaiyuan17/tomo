@@ -2,6 +2,9 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { PetStore } from "./pet-store.js";
 
+const REGULAR_FEED_HUNGER_RESTORE = 30;
+const TREAT_HUNGER_RESTORE = 15;
+
 /**
  * MCP tools for the virtual pet companion system.
  *
@@ -173,7 +176,10 @@ export function buildPetTools(petPath?: string) {
 
         const wasHungry = state.hunger < 30;
         const earnsAffection = !state.recovering && state.hunger < 50;
-        state.hunger    = Math.min(100, state.hunger    + (treat ? 15 : 25));
+        state.hunger    = Math.min(
+          100,
+          state.hunger + (treat ? TREAT_HUNGER_RESTORE : REGULAR_FEED_HUNGER_RESTORE),
+        );
         state.happiness = Math.min(100, state.happiness + (treat ? 15 : 5));
         if (treat) state.energy = Math.max(0, state.energy - 5);
         if (earnsAffection) state.affection += 1;

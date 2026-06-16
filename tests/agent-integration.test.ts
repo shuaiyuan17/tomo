@@ -215,11 +215,13 @@ const { mockConfig } = vi.hoisted(() => ({
     imessageWebhookPort: 3100,
     imessageInboundSettleMs: 0,
     imessageInboundMaxSettleMs: 0,
+    imessageTypingStartDelayMs: 1200,
+    imessagePassiveTypingStartDelayMs: 4000,
     sessionModelOverrides: {} as Record<string, string>,
     channelAllowlists: {} as Record<string, string[]>,
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
-    steering: false,
+    steering: true,
     litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
     lcm: {
       nudgeAtPct: 70,
@@ -490,6 +492,16 @@ describe("send_message direct mode", () => {
     expect(result).toEqual({ ok: true });
     expect(tg.delivered).toEqual([
       { chatId: "12345", text, photo: undefined, sticker: undefined },
+    ]);
+    const messages = new SessionStore(mockConfig.sessionsDir, 20).get("telegram:12345").messages;
+    expect(messages).toHaveLength(1);
+    expect(messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: `[proactive] ${text}`,
+      channel: "telegram",
+    });
+    expect((agent as unknown as { pendingNotes: Map<string, string[]> }).pendingNotes.get("telegram:12345")).toEqual([
+      `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`,
     ]);
 
     await agent.stop();
@@ -1172,7 +1184,7 @@ describe("NO_REPLY suppression", () => {
     await agent.stop();
   });
 
-  it("clears iMessage group typing when the model returns NO_REPLY", async () => {
+  it("does not show iMessage group typing when a quick passive turn returns NO_REPLY", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
@@ -1183,7 +1195,38 @@ describe("NO_REPLY suppression", () => {
     await drainQueue(agent);
 
     expect(im.delivered).toHaveLength(0);
+    expect(im.typingStarts).toEqual([]);
+    expect(im.typingStops).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("delays iMessage typing and clears it when a slow passive turn returns NO_REPLY", async () => {
+    vi.useFakeTimers();
+    resetConfig({ imessagePassiveTypingStartDelayMs: 100 });
+
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return "NO_REPLY";
+    };
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;+;group123", text: "side chatter", isGroup: true }));
+    const drained = drainQueue(agent);
+
+    await vi.advanceTimersByTimeAsync(99);
+    expect(im.typingStarts).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
     expect(im.typingStarts).toEqual(["iMessage;+;group123"]);
+
+    await vi.advanceTimersByTimeAsync(50);
+    await drained;
+
+    expect(im.delivered).toHaveLength(0);
     expect(im.typingStops).toEqual([
       { chatId: "iMessage;+;group123", options: { clear: true } },
     ]);
@@ -1783,7 +1826,8 @@ describe("message queueing", () => {
     await agent.stop();
   });
 
-  it("coalesces concurrent DM messages into one turn", async () => {
+  it("coalesces concurrent DM messages into one turn when steering is disabled", async () => {
+    resetConfig({ steering: false });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1811,7 +1855,8 @@ describe("message queueing", () => {
     await agent.stop();
   });
 
-  it("coalesces DMs that arrive while a turn is in flight", async () => {
+  it("coalesces DMs that arrive while a turn is in flight when steering is disabled", async () => {
+    resetConfig({ steering: false });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1875,13 +1920,14 @@ describe("message queueing", () => {
     await agent.stop();
   });
 
-  it("regression: channel-side serialization does not block coalescing", async () => {
+  it("regression: channel-side serialization does not block coalescing when steering is disabled", async () => {
     // Models the grammy / iMessage pattern where a channel processes updates
     // sequentially, awaiting each handler before the next webhook is read.
     // Before the fix, awaiting enqueueMessage's returned promise would block
     // the next message until the SDK turn fully completed — defeating the
     // queue and preventing any pile-up. enqueueMessage is now fire-and-forget,
     // so a serial channel loop can still feed messages into the batch.
+    resetConfig({ steering: false });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1926,7 +1972,8 @@ describe("message queueing", () => {
     await agent.stop();
   });
 
-  it("coalesces passive group messages with sender prefixes", async () => {
+  it("coalesces passive group messages with sender prefixes when steering is disabled", async () => {
+    resetConfig({ steering: false });
     const agent = new Agent();
     // iMessage groups are always passive — every message reaches Tomo, so
     // batching is safe and just reduces turn count.
@@ -2420,8 +2467,8 @@ describe("steering", () => {
     await agent.stop();
   });
 
-  it("steers a mid-turn message instead of queueing it (follow-up turn outcome)", async () => {
-    resetConfig({ steering: true });
+  it("steers a mid-turn message by default instead of queueing it (follow-up turn outcome)", async () => {
+    resetConfig();
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -2514,7 +2561,8 @@ describe("steering", () => {
     await agent.stop();
   });
 
-  it("keeps queueing mid-turn messages when steering is disabled (default)", async () => {
+  it("keeps queueing mid-turn messages when steering is disabled", async () => {
+    resetConfig({ steering: false });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);

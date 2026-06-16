@@ -53,6 +53,10 @@ interface UserTurnRequest {
   passiveListen?: boolean;
 }
 
+interface CronTurnOptions {
+  /** False for silent housekeeping turns such as LCM rollups. */
+  showTyping?: boolean;
+}
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
@@ -616,6 +620,7 @@ export class Agent {
     this.handleCronMessage(
       `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
       key,
+      { showTyping: false },
     ).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });
@@ -927,7 +932,7 @@ export class Agent {
           const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
           log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
           // Fire-and-forget — don't block the current reply on the nudge
-          this.handleCronMessage(nudge, key).catch((err) => {
+          this.handleCronMessage(nudge, key, { showTyping: false }).catch((err) => {
             log.warn({ err, key }, "Context nudge failed");
           });
         }
@@ -1018,14 +1023,14 @@ export class Agent {
   }
 
   /** Handle a cron-triggered message (queued per session key) */
-  async handleCronMessage(message: string, sessionKey: string): Promise<void> {
-    return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey))
+  async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<void> {
+    return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey, options))
       .catch((err) => {
         log.error({ err, sessionKey }, "Cron message failed in queue");
       });
   }
 
-  private async processCronMessage(message: string, sessionKey: string): Promise<void> {
+  private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<void> {
     const key = sessionKey;
     let deliveryChannel: Channel;
     let deliveryChatId: string;
@@ -1066,11 +1071,13 @@ export class Agent {
     const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
-    const stopTyping = this.startTurnTyping(
-      deliveryChannel,
-      deliveryChatId,
-      this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
-    );
+    const stopTyping = options.showTyping === false
+      ? async () => {}
+      : this.startTurnTyping(
+          deliveryChannel,
+          deliveryChatId,
+          this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
+        );
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);

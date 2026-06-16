@@ -227,6 +227,17 @@ export class LiveSession {
   }
 
   /**
+   * A local timeout means the SDK child may still be working on input we have
+   * already yielded. Retire the live child instead of merely clearing request
+   * bookkeeping; otherwise later sends can be pushed into a stale in-flight
+   * conversation that this wrapper now believes is idle.
+   */
+  private timeoutTurn(err: Error): void {
+    this.close();
+    this.failTurn(err);
+  }
+
+  /**
    * True while a turn is in flight — including steered messages the CLI may
    * still run as a follow-up turn after the current one resolves.
    */
@@ -539,7 +550,7 @@ export class LiveSession {
 
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.failTurn(new Error("Query timed out after 10 minutes"));
+        this.timeoutTurn(new Error("Query timed out after 10 minutes"));
       }, TIMEOUT_MS);
 
       const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
@@ -588,7 +599,7 @@ export class LiveSession {
     return new Promise<string>((resolve, reject) => {
       let req: MessageRequest | null = null;
       const timer = setTimeout(() => {
-        if (req) this.dropRequest(req, new Error("Query timed out after 10 minutes"));
+        if (req) this.timeoutTurn(new Error("Query timed out after 10 minutes"));
       }, TIMEOUT_MS);
 
       req = {
@@ -604,23 +615,6 @@ export class LiveSession {
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);
     });
-  }
-
-  /**
-   * Timeout path for a steered request: detach it from whichever slot it
-   * occupies; if it owns the in-flight turn, fail the whole turn.
-   */
-  private dropRequest(req: MessageRequest, err: Error): void {
-    if (this.currentRequest === req) {
-      this.failTurn(err);
-      return;
-    }
-    const mi = this.mergedRequests.indexOf(req);
-    if (mi !== -1) this.mergedRequests.splice(mi, 1);
-    const si = this.pendingSteers.findIndex((e) => e.req === req);
-    if (si !== -1) this.pendingSteers.splice(si, 1);
-    req.reject(err);
-    if (!this.isBusy()) this.notifyIdle();
   }
 
   getSessionId(): string | null {

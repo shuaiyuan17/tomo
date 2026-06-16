@@ -922,6 +922,27 @@ describe("cron message delivery", () => {
 
     await agent.stop();
   });
+
+  it("suppresses typing for silent housekeeping cron turns", async () => {
+    resetConfig({ imessagePassiveTypingStartDelayMs: 0 });
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "NO_REPLY";
+
+    await agent.handleCronMessage(
+      "System: An LCM rollup is due. After the rollup finishes, reply NO_REPLY.",
+      "imessage:iMessage;+;group123",
+      { showTyping: false },
+    );
+
+    expect(im.sent).toHaveLength(0);
+    expect(im.typingStarts).toEqual([]);
+    expect(im.typingStops).toEqual([]);
+
+    await agent.stop();
+  });
 });
 
 // ===== Continuity delivery =====

@@ -8,6 +8,7 @@ import {
   DEFAULT_CONTINUITY_SCRIPT_TIMEOUT_MS,
   type ContinuityScriptConfig,
 } from "./continuity-script.js";
+import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } from "./continuity-defaults.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -62,6 +63,8 @@ interface TomoConfig {
   logsDir: string;
   tomoHome: string;
   continuity: boolean;
+  /** Minutes between scheduled continuity heartbeats. Default 55. */
+  continuityIntervalMs: number;
   /** Optional local script to run once per continuity heartbeat and append to the heartbeat prompt. */
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
@@ -145,6 +148,13 @@ function parseLcmConfig(raw: unknown): LcmConfig {
 function parsePositiveInt(raw: unknown, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function parsePositiveMinutesAsMs(raw: unknown, fallbackMinutes: number): number {
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) return fallbackMinutes * 60_000;
+  const ms = Math.round(Math.max(minutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000);
+  return ms > 0 ? ms : fallbackMinutes * 60_000;
 }
 
 function parseBoolean(raw: unknown, fallback: boolean): boolean {
@@ -300,6 +310,10 @@ function buildConfig(): TomoConfig {
     logsDir: join(TOMO_HOME, "logs"),
     tomoHome: TOMO_HOME,
     continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
+    continuityIntervalMs: parsePositiveMinutesAsMs(
+      process.env.TOMO_CONTINUITY_INTERVAL_MINUTES ?? file.continuityIntervalMinutes,
+      DEFAULT_CONTINUITY_INTERVAL_MINUTES,
+    ),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
     city: (process.env.TOMO_CITY ?? file.city ?? null) as string | null,
     identities,

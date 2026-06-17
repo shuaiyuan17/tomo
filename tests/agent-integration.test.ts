@@ -923,6 +923,93 @@ describe("cron message delivery", () => {
     await agent.stop();
   });
 
+  it("queues cron failures into the next turn as bounded operational context", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      runWithRetry: (...args: unknown[]) => Promise<string>;
+    };
+    const originalRunWithRetry = internals.runWithRetry.bind(agent);
+    internals.runWithRetry = vi.fn().mockRejectedValueOnce(
+      new Error("You've hit your session limit · resets 3:10pm (America/Los_Angeles)"),
+    ) as unknown as typeof internals.runWithRetry;
+
+    await agent.handleCronMessage("Check something", "telegram:12345");
+
+    expect(tg.sent[0].text).toBe(
+      "[error] cron failed: You've hit your session limit · resets 3:10pm (America/Los_Angeles)",
+    );
+
+    internals.runWithRetry = originalRunWithRetry;
+    const prompts: string[] = [];
+    mockResponseFn = (text) => {
+      prompts.push(text);
+      return "recovered";
+    };
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "are you back?" }));
+    await drainQueue(agent);
+
+    expect(prompts[0]).toContain("Recent Tomo errors before this turn");
+    expect(prompts[0]).toContain("[error] cron failed: You've hit your session limit");
+
+    await agent.stop();
+  });
+
+  it("treats successful SDK session-limit text as an error and briefs the next turn", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const prompts: string[] = [];
+
+    mockResponseFn = (text) => {
+      prompts.push(text);
+      return prompts.length === 1
+        ? "You've hit your session limit · resets 3:10pm (America/Los_Angeles)"
+        : "recovered";
+    };
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "first try" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered.map((d) => d.text)).toEqual([
+      "[error] You've hit your session limit · resets 3:10pm (America/Los_Angeles)",
+    ]);
+
+    tg.clearDelivered();
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "second try" }));
+    await drainQueue(agent);
+
+    expect(prompts[1]).toContain("Recent Tomo errors before this turn");
+    expect(prompts[1]).toContain("[error] You've hit your session limit");
+    expect(tg.delivered.map((d) => d.text)).toEqual(["recovered"]);
+
+    await agent.stop();
+  });
+
+  it("caps pending error notes before injecting them into a prompt", async () => {
+    const agent = new Agent();
+    const internals = agent as unknown as {
+      queuePendingErrorNote: (sessionKey: string, visibleError: string) => void;
+      drainPendingNotes: (sessionKey: string) => string;
+    };
+
+    for (let i = 0; i < 10; i++) {
+      internals.queuePendingErrorNote("telegram:12345", `[error] err-${i} ${"x".repeat(450)}`);
+    }
+
+    const drained = internals.drainPendingNotes("telegram:12345");
+    const bulletCount = drained.match(/\n- /g)?.length ?? 0;
+
+    expect(bulletCount).toBeLessThanOrEqual(3);
+    expect(drained.length).toBeLessThan(1500);
+    expect(drained).not.toContain("err-0");
+    expect(drained).toContain("err-9");
+
+    await agent.stop();
+  });
+
   it("suppresses typing for silent housekeeping cron turns", async () => {
     resetConfig({ imessagePassiveTypingStartDelayMs: 0 });
     const agent = new Agent();

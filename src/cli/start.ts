@@ -136,7 +136,9 @@ async function startForeground(): Promise<void> {
 
   // Start continuity runner if enabled
   const { ContinuityRunner } = await import("../continuity.js");
-  const continuity = new ContinuityRunner(agent, config.city, config.continuityScript);
+  const continuity = new ContinuityRunner(agent, config.city, config.continuityScript, {
+    intervalMs: config.continuityIntervalMs,
+  });
   if (config.continuity) {
     continuity.start();
   }

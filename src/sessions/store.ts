@@ -203,7 +203,7 @@ export class SessionStore {
     // Re-read from disk to pick up external changes (e.g. `tomo sessions clear`)
     this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    return entry?.sdkSessionId;
+    return entry?.sdkSessionId || undefined;
   }
 
   /** Get the active registry entry for a channel key */
@@ -352,6 +352,52 @@ export class SessionStore {
       }
     }
     this.saveRegistry();
+  }
+
+  /**
+   * Retire a poisoned SDK resume chain while preserving active routing/group
+   * metadata. Use this when the SDK JSONL likely ended mid-turn (for example a
+   * local query timeout): resuming that file can continue stale tool work, but
+   * the chat title, participants, and reply target are still valid.
+   */
+  retireSdkSessionId(key: string): string | undefined {
+    this.loadRegistry();
+    const now = Date.now();
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && e.sdkSessionId);
+    if (!entry) return undefined;
+
+    const retiredSessionId = entry.sdkSessionId;
+    entry.unlinkedAt = now;
+    entry.expiresAt = now + UNLINKED_TTL_MS;
+
+    this.registry.push({
+      sdkSessionId: "",
+      channelKey: key,
+      createdAt: now,
+      lastActiveAt: now,
+      unlinkedAt: null,
+      expiresAt: null,
+      stats: {
+        totalQueries: 0,
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        contextUsed: 0,
+        contextMax: 0,
+      },
+      ...(entry.replyTarget ? { replyTarget: entry.replyTarget } : {}),
+      ...(entry.chatTitle ? { chatTitle: entry.chatTitle } : {}),
+      ...(entry.participants ? { participants: [...entry.participants] } : {}),
+    });
+
+    this.saveRegistry();
+    log.warn(
+      { key, sessionId: retiredSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
+      "SDK session retired, metadata preserved",
+    );
+    return retiredSessionId;
   }
 
   /** Delete expired unlinked sessions and their SDK JSONL files */

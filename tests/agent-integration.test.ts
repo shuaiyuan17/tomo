@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../src/channels/types.js";
+import { PetStore } from "../src/mcp/pet-store.js";
 
 // ---------------------------------------------------------------------------
 // Mock SDK — queue-based approach avoids async-generator timing issues
@@ -1356,6 +1357,48 @@ describe("chat commands", () => {
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("Session:");
     expect(tg.sent[0].text).toContain("Model:");
+
+    await agent.stop();
+  });
+
+  it("/pet reports when Tomo has no pet", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pet", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Tomo doesn't have a pet yet. Ask Tomo to hatch one!");
+
+    await agent.stop();
+  });
+
+  it("/pet shows the current pet status", async () => {
+    const store = new PetStore(join(tmpDir, "data", "pet.json"));
+    const pet = store.create("Mochi", "star fox");
+    pet.stage = "baby";
+    pet.hunger = 82;
+    pet.happiness = 74;
+    pet.energy = 61;
+    pet.health = 95;
+    pet.affection = 12;
+    pet.care_mistakes = 1;
+    store.save(pet);
+
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pet", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("🐾 Mochi the star fox");
+    expect(tg.sent[0].text).toContain("Stage: baby");
+    expect(tg.sent[0].text).toContain("Mood: happy");
+    expect(tg.sent[0].text).toContain("Hunger: 82/100 · Happiness: 74/100");
+    expect(tg.sent[0].text).toContain("Energy: 61/100 · Health: 95/100");
+    expect(tg.sent[0].text).toContain("Bond: 7 · Care mistakes: 1");
 
     await agent.stop();
   });

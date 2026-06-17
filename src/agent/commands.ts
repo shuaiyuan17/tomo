@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
@@ -15,6 +15,7 @@ import {
   liteLlmModeLabel,
 } from "../litellm.js";
 import { log } from "../logger.js";
+import { PetStore } from "../mcp/pet-store.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export function backupConfigFile(): void {
@@ -33,7 +34,7 @@ export interface ChatCommandDeps {
 }
 
 /**
- * Handles slash commands typed in chat (/new, /model, /status, /restore).
+ * Handles slash commands typed in chat (/new, /model, /status, /pet, /restore).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -119,6 +120,39 @@ export class ChatCommandHandler {
 
     if (command === "restore") {
       await this.restoreConfigAndRestart(channel, chatId);
+      return;
+    }
+
+    if (command === "pet") {
+      const store = new PetStore(join(config.tomoHome, "data", "pet.json"));
+      let pet = store.load();
+      if (!pet) {
+        await channel.send({ chatId, text: "Tomo doesn't have a pet yet. Ask Tomo to hatch one!" });
+        return;
+      }
+
+      pet = store.tick(pet);
+      store.save(pet);
+
+      const ageDays = Math.max(0, Math.floor(
+        (Date.now() - new Date(pet.born_at).getTime()) / (24 * 60 * 60 * 1000),
+      ));
+      const dayLabel = ageDays === 1 ? "day" : "days";
+      const lines = [
+        `🐾 ${pet.name} the ${pet.species}`,
+        `Stage: ${pet.stage} · Age: ${ageDays} ${dayLabel} · Mood: ${store.computeMood(pet)}`,
+        `Hunger: ${Math.round(pet.hunger)}/100 · Happiness: ${Math.round(pet.happiness)}/100`,
+        `Energy: ${Math.round(pet.energy)}/100 · Health: ${Math.round(pet.health)}/100`,
+        `Bond: ${store.effectiveAffection(pet)} · Care mistakes: ${pet.care_mistakes}`,
+      ];
+
+      if (pet.sleeping && pet.sleep_until) {
+        lines.push(`Sleeping until: ${new Date(pet.sleep_until).toLocaleString()}`);
+      } else if (pet.recovering) {
+        lines.push("Recovering: yes");
+      }
+
+      await channel.send({ chatId, text: lines.join("\n") });
       return;
     }
 

@@ -92,6 +92,29 @@ describe("ContinuityRunner", () => {
     expect(prompt).toContain("runner-output");
   });
 
+  it("uses the configured interval for scheduled heartbeats", async () => {
+    vi.useFakeTimers();
+    const handleContinuity = vi.fn().mockResolvedValue(undefined);
+    const runner = new ContinuityRunner(
+      { handleContinuity } as unknown as ConstructorParameters<typeof ContinuityRunner>[0],
+      null,
+      null,
+      { triggerDir: tmpDir, intervalMs: 25 },
+    );
+
+    try {
+      runner.start();
+      await vi.advanceTimersByTimeAsync(24);
+      expect(handleContinuity).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(handleContinuity).toHaveBeenCalledTimes(1);
+    } finally {
+      runner.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("runs the script when the manual continuity trigger file is written", async () => {
     const triggerDir = join(tmpDir, "trigger");
     mkdirSync(triggerDir);

@@ -16,7 +16,7 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession, STEER_MERGED } from "./agent/live-session.js";
+import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
@@ -57,6 +57,26 @@ interface CronTurnOptions {
   /** False for silent housekeeping turns such as LCM rollups. */
   showTyping?: boolean;
 }
+
+const MAX_PENDING_ERROR_NOTES = 3;
+const MAX_PENDING_ERROR_CHARS = 1200;
+const MAX_SINGLE_PENDING_ERROR_CHARS = 600;
+
+function truncateForPendingError(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
+}
+
+function pendingErrorChars(notes: string[]): number {
+  return notes.reduce((sum, note) => sum + note.length, 0);
+}
+
+function isAgentErrorResponse(response: string): boolean {
+  const text = response.trim();
+  return /^API Error: \d+/i.test(text)
+    || /^\{"type":"error"/.test(text)
+    || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
+}
+
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
@@ -82,6 +102,9 @@ export class Agent {
   // System notes queued by harness events (summon/dismiss/expiry), drained and
   // prepended to the next user/cron/continuity turn.
   private pendingNotes = new Map<string, string[]>();
+  // Bounded operational errors from prior turns, drained into the next prompt
+  // so Tomo can recover with context instead of pretending nothing happened.
+  private pendingErrorNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
@@ -531,6 +554,7 @@ export class Agent {
    * we don't extract them here.
    */
   private async deliverResponse(
+    sessionKey: string,
     replyChannel: Channel,
     replyChatId: string,
     response: string,
@@ -544,10 +568,12 @@ export class Agent {
       return;
     }
 
-    // Surface API errors that the SDK returns as response text
-    if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
-      await stream.finish();
-      await replyChannel.send({ chatId: replyChatId, text: `[error] ${response}` });
+    // Surface SDK/API errors that arrive as response text.
+    if (isAgentErrorResponse(response)) {
+      const visibleError = `[error] ${response}`;
+      this.queuePendingErrorNote(sessionKey, visibleError);
+      await stream.cancel();
+      await replyChannel.send({ chatId: replyChatId, text: visibleError });
       return;
     }
 
@@ -590,6 +616,10 @@ export class Agent {
   ): (text: string) => Promise<void> {
     return async (blockText: string) => {
       try {
+        if (isAgentErrorResponse(blockText)) {
+          await stream.cancel();
+          return;
+        }
         await stream.commitBlock();
         await this.shipBlockAttachments(channel, chatId, blockText);
       } catch (err) {
@@ -659,7 +689,7 @@ export class Agent {
         timestamp: Date.now(),
       });
 
-      await this.deliverResponse(req.replyChannel, req.replyChatId, response, stream);
+      await this.deliverResponse(req.key, req.replyChannel, req.replyChatId, response, stream);
       await stopTyping({ clear: true });
     } catch (err) {
       log.error({ err }, req.errorLogMessage);
@@ -670,10 +700,12 @@ export class Agent {
       }
 
       const detail = err instanceof Error ? err.message : String(err);
+      const visibleError = `[error] ${detail}`;
+      this.queuePendingErrorNote(req.key, visibleError);
       try {
         await req.replyChannel.send({
           chatId: req.replyChatId,
-          text: `[error] ${detail}`,
+          text: visibleError,
         });
       } finally {
         await stopTyping({ clear: true });
@@ -952,6 +984,13 @@ export class Agent {
         return "I ran out of steps trying to complete that. Can you try a simpler request?";
       }
 
+      if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
+        log.warn({ err, key }, "Query timed out; retiring SDK session to avoid resuming stale in-flight work");
+        this.closeLiveSession(key);
+        this.sessions.retireSdkSessionId(key);
+        throw err;
+      }
+
       // Session error — reset and retry once
       if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
         // Shutdown closes live sessions while turns may still be in flight
@@ -1085,6 +1124,14 @@ export class Agent {
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
 
+      if (isAgentErrorResponse(response)) {
+        const visibleError = `[error] cron failed: ${response}`;
+        this.queuePendingErrorNote(key, visibleError);
+        await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
+        await stopTyping({ clear: true });
+        return;
+      }
+
       if (silentCronResponse) {
         log.info("Cron completed silently (no reply sent)");
         await stopTyping({ clear: true });
@@ -1103,8 +1150,10 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
+      const visibleError = `[error] cron failed: ${detail}`;
+      this.queuePendingErrorNote(key, visibleError);
       try {
-        await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });
+        await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
       } finally {
         await stopTyping({ clear: true });
       }
@@ -1137,6 +1186,12 @@ export class Agent {
     try {
       const response = await this.runWithRetry(key, this.drainPendingNotes(key) + prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
+
+      if (isAgentErrorResponse(response)) {
+        this.queuePendingErrorNote(key, `[error] continuity failed: ${response}`);
+        log.warn({ sessionKey: key }, "Continuity returned an agent error response");
+        return;
+      }
 
       // Send non-silent responses to the user (check includes() for multi-turn responses
       // where NO_REPLY may appear after earlier text output)
@@ -1394,12 +1449,37 @@ export class Agent {
     this.pendingNotes.set(sessionKey, arr);
   }
 
+  private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
+    const normalized = visibleError.replace(/\s+/g, " ").trim();
+    const clipped = truncateForPendingError(normalized, MAX_SINGLE_PENDING_ERROR_CHARS);
+    const notes = [...(this.pendingErrorNotes.get(sessionKey) ?? []), clipped].slice(-MAX_PENDING_ERROR_NOTES);
+
+    while (notes.length > 1 && pendingErrorChars(notes) > MAX_PENDING_ERROR_CHARS) {
+      notes.shift();
+    }
+    this.pendingErrorNotes.set(sessionKey, notes);
+  }
+
   /** Drain harness notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
+    const drained: string[] = [];
     const notes = this.pendingNotes.get(sessionKey);
-    if (!notes || notes.length === 0) return "";
-    this.pendingNotes.delete(sessionKey);
-    return notes.map((n) => `${n}\n\n`).join("");
+    if (notes && notes.length > 0) {
+      this.pendingNotes.delete(sessionKey);
+      drained.push(...notes);
+    }
+
+    const errorNotes = this.pendingErrorNotes.get(sessionKey);
+    if (errorNotes && errorNotes.length > 0) {
+      this.pendingErrorNotes.delete(sessionKey);
+      drained.push([
+        "[System: Recent Tomo errors before this turn (newest last, capped):",
+        ...errorNotes.map((note) => `- ${note}`),
+        "Use this as operational context; do not repeat the raw error unless it helps the user.]",
+      ].join("\n"));
+    }
+
+    return drained.map((n) => `${n}\n\n`).join("");
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */

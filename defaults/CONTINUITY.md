@@ -4,7 +4,7 @@ Read this file when a continuity heartbeat fires. This is your guide for free ti
 
 ## What is this?
 
-The system sends you a heartbeat every ~55 minutes. This is not a user message — it's the harness giving you unstructured time. Use it however you want.
+By default, the system sends you a heartbeat every ~55 minutes. This is not a user message — it's the harness giving you unstructured time. Use it however you want.
 
 ## Ideas for free time
 

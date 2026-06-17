@@ -11,6 +11,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
   "model": "claude-sonnet-4-6[1m]",
   "city": "Seattle",
   "continuity": false,
+  "continuityIntervalMinutes": 55,
   "continuityScript": {
     "path": "~/bin/tomo-continuity.sh",
     "timeoutMs": 30000,
@@ -79,6 +80,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `model` | string | Claude model IDs/aliases, or a LiteLLM `provider/model` name such as `chatgpt/gpt-5.5`. Default model for every session. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
+| `continuityIntervalMinutes` | number | Optional. Minutes between scheduled continuity heartbeats. Default `55`; minimum `1`. Ignored for manual `tomo continuity` triggers. |
 | `continuityScript` | string \| object \| null | Optional script run once per scheduled continuity heartbeat and manual `tomo continuity` trigger before the prompt is sent to Tomo. Use a string path (`"~/bin/tomo-continuity.sh"`) or `{ "path": "...", "timeoutMs": 30000, "maxOutputChars": 8000 }`. Relative paths resolve under `~/.tomo`; `~`, `$VAR`, and `${VAR}` expand. The script runs as the Tomo OS user with `TOMO_CONTINUITY=true`; stdout/stderr are appended to the heartbeat prompt and capped separately by `maxOutputChars`. Non-zero exits, missing files, and timeouts are passed to Tomo as script status instead of aborting the heartbeat. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
 | `channels.telegram.token` | string | BotFather token (`123456:...`). Required to enable the Telegram channel. |
@@ -133,5 +135,5 @@ Start it with `litellm --config ~/litellm-chatgpt.yaml`, then set Tomo's model t
 ## Requirements and overrides
 
 - **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.url`. Startup fails otherwise.
-- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`, `TOMO_STEERING`.
+- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_CONTINUITY_INTERVAL_MINUTES`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`, `TOMO_STEERING`.
 - `workspaceDir`, `sessionsDir`, `historyLimit` are env-only — they're not read from the JSON file.

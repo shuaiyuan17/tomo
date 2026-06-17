@@ -140,6 +140,28 @@ describe("SessionStore", () => {
     expect(daemonStore.listSdkSessionIds()).toEqual([]);
   });
 
+  it("retires a poisoned SDK session while preserving active metadata", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.setChatTitle("telegram:-987", "Ski Trip");
+    store.addParticipant("telegram:-987", "Alice");
+    store.setSdkSessionId("telegram:-987", "session-poisoned");
+
+    const retired = store.retireSdkSessionId("telegram:-987");
+
+    expect(retired).toBe("session-poisoned");
+    expect(store.getSdkSessionId("telegram:-987")).toBeUndefined();
+    expect(store.listSdkSessionIds()).toEqual([]);
+
+    const active = store.getEntry("telegram:-987");
+    expect(active?.sdkSessionId).toBe("");
+    expect(active?.chatTitle).toBe("Ski Trip");
+    expect(active?.participants).toEqual(["Alice"]);
+
+    const unlinked = store.listAllSessions().find((e) => e.sdkSessionId === "session-poisoned");
+    expect(unlinked?.unlinkedAt).toBeTruthy();
+    expect(unlinked?.expiresAt).toBeTruthy();
+  });
+
   it("touches session lastActiveAt", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setSdkSessionId("key1", "session-abc");

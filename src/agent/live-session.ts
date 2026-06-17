@@ -27,8 +27,10 @@ export interface MessageRequest {
  * to respond to that." in the result handler.
  */
 export const STEER_MERGED = "";
+export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
 
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
+const QUERY_TIMEOUT_ERROR = `${QUERY_TIMEOUT_ERROR_PREFIX} 10 minutes`;
 
 export interface QueryResult {
   costUsd: number;
@@ -550,7 +552,7 @@ export class LiveSession {
 
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.timeoutTurn(new Error("Query timed out after 10 minutes"));
+        this.timeoutTurn(new Error(QUERY_TIMEOUT_ERROR));
       }, TIMEOUT_MS);
 
       const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
@@ -599,7 +601,7 @@ export class LiveSession {
     return new Promise<string>((resolve, reject) => {
       let req: MessageRequest | null = null;
       const timer = setTimeout(() => {
-        if (req) this.timeoutTurn(new Error("Query timed out after 10 minutes"));
+        if (req) this.timeoutTurn(new Error(QUERY_TIMEOUT_ERROR));
       }, TIMEOUT_MS);
 
       req = {

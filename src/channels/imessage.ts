@@ -392,7 +392,7 @@ export class BlueBubblesChannel implements Channel {
       const parts = text.slice(1).split(/\s+/);
       const command = parts[0];
       const args = parts.slice(1).join(" ");
-      if (command === "new" || command === "model" || command === "restore" || command === "status" || command === "summon" || command === "dismiss") {
+      if (command === "new" || command === "model" || command === "restore" || command === "status" || command === "pet" || command === "summon" || command === "dismiss") {
         for (const handler of this.commandHandlers) {
           await handler(command, chatGuid, senderAddress, args, senderAddress);
         }

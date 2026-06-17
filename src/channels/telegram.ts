@@ -38,7 +38,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "model", "restore", "status", "summon", "dismiss"]) {
+    for (const cmd of ["new", "model", "restore", "status", "pet", "summon", "dismiss"]) {
       this.bot.command(cmd, async (ctx) => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
@@ -574,6 +574,7 @@ export class TelegramChannel implements Channel {
       { command: "model", description: "Switch model (Claude aliases or LiteLLM provider/model)" },
       { command: "restore", description: "Restore config from backup and restart" },
       { command: "status", description: "Show current session status" },
+      { command: "pet", description: "Check on Tomo's pet" },
       { command: "summon", description: "Pull your main Tomo session into this group" },
       { command: "dismiss", description: "Hand this group back to its own Tomo session" },
     ]);

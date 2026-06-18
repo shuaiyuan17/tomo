@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
@@ -20,7 +20,7 @@ import { PetStore } from "../mcp/pet-store.js";
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export function backupConfigFile(): void {
   mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
-  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
+  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
 }
 
 export interface ChatCommandDeps {
@@ -279,7 +279,7 @@ export class ChatCommandHandler {
 
     mkdirSync(dirname(CONFIG_PATH), { recursive: true });
     backupConfigFile();
-    writeJsonAtomicSync(CONFIG_PATH, cfg);
+    writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
   }
 
   private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
@@ -291,6 +291,7 @@ export class ChatCommandHandler {
     try {
       mkdirSync(dirname(CONFIG_PATH), { recursive: true });
       copyFileSync(CONFIG_BACKUP_PATH, CONFIG_PATH);
+      chmodSync(CONFIG_PATH, 0o600);
 
       const reason = "Restored ~/.tomo/config.json from ~/.tomo/config.json.bak";
       mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });

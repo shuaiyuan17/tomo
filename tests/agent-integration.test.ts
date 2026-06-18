@@ -200,6 +200,12 @@ function createMockQuery(prompt: AsyncGenerator) {
 
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
+    auth: {
+      method: "subscription" as "subscription" | "api-key",
+      apiKey: null as string | null,
+      apiKeySource: null as "environment" | "config" | null,
+      error: null as string | null,
+    },
     telegramToken: "test-token",
     model: "claude-sonnet-4-6[1m]",
     workspaceDir: "",
@@ -1405,6 +1411,12 @@ describe("chat commands", () => {
 
   it("passes LiteLLM gateway env to the Claude Agent SDK child", async () => {
     resetConfig({
+      auth: {
+        method: "api-key",
+        apiKey: "sk-anthropic-direct",
+        apiKeySource: "config",
+        error: null,
+      },
       litellm: {
         mode: "anthropic-compatible",
         baseUrl: "http://localhost:4000",
@@ -1424,6 +1436,41 @@ describe("chat commands", () => {
     };
     expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
     expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("passes a configured Anthropic API key to direct Claude sessions", async () => {
+    resetConfig({
+      auth: {
+        method: "api-key",
+        apiKey: "sk-anthropic-test",
+        apiKeySource: "config",
+        error: null,
+      },
+      lcm: {
+        ...mockConfig.lcm,
+        groupCompactStyle: "sdk",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100123",
+      text: "Hi",
+      isGroup: true,
+      isMentioned: true,
+    }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-anthropic-test");
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
 
     await agent.stop();
   });

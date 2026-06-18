@@ -200,7 +200,8 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   const litellm = config.litellm;
   const useGateway = Boolean(litellm?.baseUrl)
     && (litellm!.mode !== CHATGPT_SUBSCRIPTION_MODE || isChatGptSubscriptionModel(args.model));
-  if (!args.disableAutoCompact && !useGateway) return null;
+  const useDirectApiKey = !useGateway && config.auth.method === "api-key";
+  if (!args.disableAutoCompact && !useGateway && !useDirectApiKey) return null;
 
   // Note: SDK `env` fully replaces the child's env (not merged despite the
   // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -216,6 +217,11 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
     // LiteLLM, a deliberate chatgpt-subscription bypass must scrub it so Claude
     // models really go to Anthropic direct.
     delete env.ANTHROPIC_BASE_URL;
+    if (useDirectApiKey && config.auth.apiKey) {
+      env.ANTHROPIC_API_KEY = config.auth.apiKey;
+    } else {
+      delete env.ANTHROPIC_API_KEY;
+    }
   }
   if (args.disableAutoCompact) {
     env.DISABLE_AUTO_COMPACT = "1";

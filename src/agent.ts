@@ -216,7 +216,7 @@ export class Agent {
         channels[channel.name].allowlist = allowlist;
         cfg.channels = channels;
         backupConfigFile();
-        writeJsonAtomicSync(CONFIG_PATH, cfg);
+        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
         // Update the router's in-memory allowlist
         this.router.addToAllowlist(channel.name, chatId);
       }

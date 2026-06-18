@@ -44,7 +44,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.161",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.181",
     "@clack/prompts": "^1.4.0",
     "commander": "^15.0.0",
     "croner": "^10.0.1",

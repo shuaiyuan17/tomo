@@ -209,7 +209,8 @@ describe("IdentityRouter", () => {
       const summons = new SummonStore(null, 1000);
       const router = new IdentityRouter(identities, sessions, {}, summons);
       const expired: string[] = [];
-      router.onSummonExpired = (ch, chatId, identity) => expired.push(`${ch}:${chatId}:${identity}`);
+      router.onSummonExpired = (ch, chatId, identity, notifyGroup) =>
+        expired.push(`${ch}:${chatId}:${identity}:${notifyGroup}`);
 
       vi.useFakeTimers();
       try {
@@ -223,18 +224,20 @@ describe("IdentityRouter", () => {
         vi.setSystemTime(1_001_600);
         const result = router.resolve("telegram", "-987", true);
         expect(result.sessionKey).toBe("telegram:-987");
-        expect(expired).toEqual(["telegram:-987:alice"]);
+        // Routing path: notify the group as well as the dm session
+        expect(expired).toEqual(["telegram:-987:alice:true"]);
         expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
       } finally {
         vi.useRealTimers();
       }
     });
 
-    it("clears a lapsed summon on a guard read without firing the expiry notice", () => {
+    it("clears the dm session on a guard read but suppresses the group notice", () => {
       const summons = new SummonStore(null, 1000);
       const router = new IdentityRouter(identities, sessions, {}, summons);
       const expired: string[] = [];
-      router.onSummonExpired = (ch, chatId, identity) => expired.push(`${ch}:${chatId}:${identity}`);
+      router.onSummonExpired = (ch, chatId, identity, notifyGroup) =>
+        expired.push(`${ch}:${chatId}:${identity}:${notifyGroup}`);
 
       vi.useFakeTimers();
       try {
@@ -242,16 +245,17 @@ describe("IdentityRouter", () => {
         router.summonGroup("telegram", "-987", "Alice");
 
         // Past the inactivity window — a re-summon's "already summoned?" guard
-        // (getSummonedIdentity) must drop the stale entry silently, so the
-        // group never sees a spurious "expired — handed back" message.
+        // (getSummonedIdentity) still fires the callback so the dm session's
+        // stale "summoned" context is cleared, but with notifyGroup=false so
+        // the group never sees a spurious "expired — handed back" message.
         vi.setSystemTime(1_001_001);
         expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
-        expect(expired).toEqual([]);
+        expect(expired).toEqual(["telegram:-987:alice:false"]);
 
         // And the entry is gone, so a fresh summon proceeds cleanly.
         router.summonGroup("telegram", "-987", "Alice");
         expect(router.getSummonedIdentity("telegram", "-987")).toBe("alice");
-        expect(expired).toEqual([]);
+        expect(expired).toEqual(["telegram:-987:alice:false"]);
       } finally {
         vi.useRealTimers();
       }

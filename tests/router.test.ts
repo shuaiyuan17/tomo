@@ -230,6 +230,33 @@ describe("IdentityRouter", () => {
       }
     });
 
+    it("clears a lapsed summon on a guard read without firing the expiry notice", () => {
+      const summons = new SummonStore(null, 1000);
+      const router = new IdentityRouter(identities, sessions, {}, summons);
+      const expired: string[] = [];
+      router.onSummonExpired = (ch, chatId, identity) => expired.push(`${ch}:${chatId}:${identity}`);
+
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(1_000_000);
+        router.summonGroup("telegram", "-987", "Alice");
+
+        // Past the inactivity window — a re-summon's "already summoned?" guard
+        // (getSummonedIdentity) must drop the stale entry silently, so the
+        // group never sees a spurious "expired — handed back" message.
+        vi.setSystemTime(1_001_001);
+        expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
+        expect(expired).toEqual([]);
+
+        // And the entry is gone, so a fresh summon proceeds cleanly.
+        router.summonGroup("telegram", "-987", "Alice");
+        expect(router.getSummonedIdentity("telegram", "-987")).toBe("alice");
+        expect(expired).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("does not persist the group as the dm session's reply target", () => {
       sessions.setSdkSessionId("dm:alice", "session-alice");
       sessions.setReplyTarget("dm:alice", { channelName: "telegram", chatId: "111" });

@@ -13,8 +13,9 @@ export interface SessionResolution {
 export class IdentityRouter {
   private allowlists: Record<string, Set<string>>;
   /** Notified when a summon lapses from group inactivity. Expiry is detected
-   *  lazily (on the next routing/status lookup), so this fires at most once
-   *  per lapsed summon, right before the group's own session takes back over. */
+   *  lazily on the next group-message routing, so this fires at most once per
+   *  lapsed summon, right before the group's own session takes back over.
+   *  Guard reads (`/summon`, `/status`) clean up a lapsed entry silently. */
   onSummonExpired?: (channelName: string, chatId: string, identityName: string) => void;
 
   constructor(
@@ -84,13 +85,18 @@ export class IdentityRouter {
   }
 
   /** Active summoned identity for a group, handling lazy inactivity expiry.
-   *  `touch` resets the expiry clock — pass true only for real group traffic. */
+   *  `touch` resets the expiry clock and marks this as real group traffic —
+   *  pass true only when routing an actual group message. The store always
+   *  drops a lapsed entry on read, but the user-facing handback notice
+   *  (`onSummonExpired`) fires only on the routing path, never on guard reads
+   *  from `/summon`/`/status`, so re-summoning a lapsed group doesn't emit a
+   *  spurious "expired — handed back" message. */
   private resolveSummon(channelName: string, chatId: string, touch: boolean): string | undefined {
     const rawKey = `${channelName}:${chatId}`;
     const { entry, expired } = this.summons.get(rawKey);
     if (expired) {
       log.info({ channel: channelName, chatId, identity: expired.identity }, "Summon expired after inactivity");
-      this.onSummonExpired?.(channelName, chatId, expired.identity);
+      if (touch) this.onSummonExpired?.(channelName, chatId, expired.identity);
       return undefined;
     }
     if (!entry) return undefined;

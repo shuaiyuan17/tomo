@@ -32,6 +32,12 @@ export class BlueBubblesChannel implements Channel {
   private webhookPort: number;
   private imageStoreBaseDir: string | undefined;
   private contactCache = new Map<string, string>(); // address → display name
+  // BlueBubbles can re-POST the same new-message webhook multiple times (no
+  // ack → retries), re-injecting one message hours apart with growing provider
+  // lag. Track recently-seen guids so a duplicate webhook is dropped instead of
+  // spawning a fresh agent run. Bounded FIFO to cap memory.
+  private seenMessageGuids = new Set<string>();
+  private static readonly SEEN_GUID_LIMIT = 2000;
 
   constructor(config: BlueBubblesConfig) {
     this.apiUrl = config.url.replace(/\/+$/, "");
@@ -368,6 +374,23 @@ export class BlueBubblesChannel implements Channel {
     const text = (data.text as string) ?? "";
     const guid = data.guid as string;
 
+    // Drop duplicate webhook deliveries. BlueBubbles re-POSTs the same guid
+    // when it doesn't see an ack, which otherwise spawns a redundant agent run
+    // for a message we already handled (often re-delivered hours later with a
+    // huge provider lag).
+    if (guid) {
+      if (this.seenMessageGuids.has(guid)) {
+        log.debug({ guid }, "Dropping duplicate iMessage webhook (guid already seen)");
+        return;
+      }
+      this.seenMessageGuids.add(guid);
+      if (this.seenMessageGuids.size > BlueBubblesChannel.SEEN_GUID_LIMIT) {
+        // Evict oldest insertion (Set preserves insertion order).
+        const oldest = this.seenMessageGuids.values().next().value;
+        if (oldest !== undefined) this.seenMessageGuids.delete(oldest);
+      }
+    }
+
     // Resolve chat info
     const chats = data.chats as Array<Record<string, unknown>> | undefined;
     const chat = chats?.[0];
@@ -423,6 +446,14 @@ export class BlueBubblesChannel implements Channel {
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;
+
+    // Ignore empty messages (no text, no usable attachments). These are
+    // typically ghost/tapback/system rows that would otherwise spawn an agent
+    // run with a blank prompt.
+    if (!composedText.trim() && images.length === 0 && documents.length === 0) {
+      log.debug({ guid }, "Ignoring empty iMessage (no text or attachments)");
+      return;
+    }
 
     const message: IncomingMessage = {
       id: guid,

@@ -129,6 +129,7 @@ async function startForeground(): Promise<void> {
       password: config.imessagePassword,
       webhookPort: config.imessageWebhookPort,
       imageStoreBaseDir,
+      dedupeStorePath: join(config.tomoHome, "data", "imessage", "seen-message-guids.json"),
     }));
   }
 

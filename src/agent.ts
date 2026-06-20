@@ -121,8 +121,8 @@ export class Agent {
       config.summonExpiryMinutes * 60_000,
     );
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons);
-    this.router.onSummonExpired = (channelName, chatId, identity) =>
-      this.handleSummonExpired(channelName, chatId, identity);
+    this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
+      this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
@@ -317,15 +317,19 @@ export class Agent {
     await this.handleBatchedMessages(allowed, steer);
   }
 
-  /** A summon lapsed from inactivity (lazy-detected by the router on the next
-   *  group message). Brief the dm session and post a handback notice. */
-  private handleSummonExpired(channelName: string, chatId: string, identity: string): void {
+  /** A summon lapsed from inactivity (lazy-detected by the router). Always brief
+   *  the dm session so its "summoned" context is cleared; only post the
+   *  group-facing handback notice when the lapse was caught while routing a real
+   *  group message (`notifyGroup`) — a guard read from `/summon`/`/status`/
+   *  `/dismiss` must not emit a spurious group message. */
+  private handleSummonExpired(channelName: string, chatId: string, identity: string, notifyGroup: boolean): void {
     const rawKey = `${channelName}:${chatId}`;
     const groupLabel = this.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
     this.queuePendingNote(
       `dm:${identity}`,
       `[System: Your summon into the group "${groupLabel}" expired after inactivity — its messages no longer reach this session; the group's own Tomo session has taken back over.]`,
     );
+    if (!notifyGroup) return;
     const channel = this.getChannel(channelName);
     if (!channel) return;
     channel.send({ chatId, text: "Summon expired after inactivity — handed back to this group's own Tomo session." })

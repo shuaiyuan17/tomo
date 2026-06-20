@@ -1497,6 +1497,93 @@ describe("NO_REPLY suppression", () => {
 // ===== Commands =====
 
 describe("chat commands", () => {
+  it("/login runs a two-step owner-DM flow and schedules restart after verification", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const fakeLogin = {
+      start: vi.fn(async () => ({ url: "https://claude.com/login?state=test", reused: false })),
+      complete: vi.fn(async () => {}),
+      cancel: vi.fn(() => false),
+      stop: vi.fn(),
+    };
+    const internals = agent as unknown as {
+      commands: { claudeLogin: typeof fakeLogin };
+    };
+    internals.commands.claudeLogin = fakeLogin;
+
+    await tg.simulateCommand("login", "12345", "Shuai", undefined, "12345");
+
+    expect(fakeLogin.start).toHaveBeenCalledWith("shuai");
+    expect(tg.sent[0].text).toContain("https://claude.com/login?state=test");
+    expect(tg.sent[0].text).toContain("/login <code>");
+
+    await tg.simulateCommand("login", "12345", "Shuai", "secret-code#test", "12345");
+
+    expect(fakeLogin.complete).toHaveBeenCalledWith("shuai", "secret-code#test");
+    expect(tg.sent[1].text).toBe("Claude login verified. Restarting Tomo...");
+    expect(readFileSync(restartReasonFilePath, "utf-8")).toContain("Claude login refreshed");
+
+    await agent.stop();
+  });
+
+  it("/login rejects groups without starting auth or creating a session", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const fakeLogin = {
+      start: vi.fn(),
+      complete: vi.fn(),
+      cancel: vi.fn(),
+      stop: vi.fn(),
+    };
+    const internals = agent as unknown as {
+      commands: { claudeLogin: typeof fakeLogin };
+      sessions: InstanceType<typeof SessionStore>;
+    };
+    internals.commands.claudeLogin = fakeLogin;
+
+    await tg.simulateCommand("login", "-100123", "Shuai", undefined, "12345");
+
+    expect(fakeLogin.start).not.toHaveBeenCalled();
+    expect(tg.sent[0].text).toContain("private DM");
+    expect(internals.sessions.listActiveEntries()).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("/login rejects a private sender who is not a configured owner", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const fakeLogin = {
+      start: vi.fn(),
+      complete: vi.fn(),
+      cancel: vi.fn(),
+      stop: vi.fn(),
+    };
+    const internals = agent as unknown as {
+      commands: { claudeLogin: typeof fakeLogin };
+    };
+    internals.commands.claudeLogin = fakeLogin;
+
+    await tg.simulateCommand("login", "99999", "Other", undefined, "99999");
+
+    expect(fakeLogin.start).not.toHaveBeenCalled();
+    expect(tg.sent[0].text).toContain("configured owner");
+
+    await agent.stop();
+  });
+
   it("/new resets the session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

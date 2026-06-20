@@ -1624,6 +1624,7 @@ export class Agent {
   async stop(): Promise<void> {
     this.stopping = true;
     log.info("Shutting down");
+    this.commands.stop();
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
     await Promise.all(this.channels.map((ch) => ch.stop()));

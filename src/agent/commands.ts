@@ -16,6 +16,7 @@ import {
 } from "../litellm.js";
 import { log } from "../logger.js";
 import { PetStore } from "../mcp/pet-store.js";
+import { ClaudeLoginManager } from "./claude-login.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export function backupConfigFile(): void {
@@ -34,11 +35,13 @@ export interface ChatCommandDeps {
 }
 
 /**
- * Handles slash commands typed in chat (/new, /model, /status, /pet, /restore).
+ * Handles slash commands typed in chat (/new, /model, /status, /pet,
+ * /restore, /login).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
   private restoringConfig = false;
+  private readonly claudeLogin = new ClaudeLoginManager();
 
   constructor(private readonly deps: ChatCommandDeps) {}
 
@@ -47,13 +50,24 @@ export class ChatCommandHandler {
     return this.restoringConfig;
   }
 
-  async handle(channel: Channel, command: string, chatId: string, senderName: string, args?: string, senderId?: string): Promise<void> {
-    const { sessionKey: key } = this.deps.router.resolve(channel.name, chatId, false);
+  stop(): void {
+    this.claudeLogin.stop();
+  }
 
+  async handle(channel: Channel, command: string, chatId: string, senderName: string, args?: string, senderId?: string): Promise<void> {
     if (this.restoringConfig) {
       await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
       return;
     }
+
+    // Check /login before resolving a session: a rejected group login must not
+    // create or mutate a conversation entry as a side effect.
+    if (command === "login") {
+      await this.handleClaudeLogin(channel, chatId, senderId, args);
+      return;
+    }
+
+    const { sessionKey: key } = this.deps.router.resolve(channel.name, chatId, false);
 
     if (command === "summon" || command === "dismiss") {
       await this.handleSummonCommand(channel, command, chatId, senderName, senderId);
@@ -282,6 +296,83 @@ export class ChatCommandHandler {
     writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
   }
 
+  private async handleClaudeLogin(
+    channel: Channel,
+    chatId: string,
+    senderId?: string,
+    args?: string,
+  ): Promise<void> {
+    const rawKey = `${channel.name}:${chatId}`;
+    if (isGroupSessionKey(rawKey)) {
+      await channel.send({ chatId, text: "/login is only available in a configured owner's private DM." });
+      return;
+    }
+
+    const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+    if (!identity) {
+      log.warn({ channel: channel.name, chatId }, "/login refused (sender is not a configured identity)");
+      await channel.send({ chatId, text: "Only a configured owner can refresh Claude login." });
+      return;
+    }
+
+    const arg = args?.trim() ?? "";
+    if (arg.toLowerCase() === "cancel") {
+      const cancelled = this.claudeLogin.cancel(identity.name);
+      await channel.send({
+        chatId,
+        text: cancelled ? "Claude login cancelled." : "No Claude login is currently waiting.",
+      });
+      return;
+    }
+
+    try {
+      if (!arg) {
+        const { url, reused } = await this.claudeLogin.start(identity.name);
+        await channel.send({
+          chatId,
+          text: [
+            reused ? "Claude login is already waiting." : "Claude login started.",
+            "",
+            url,
+            "",
+            "Authorize in your browser, then send the returned code here as:",
+            "/login <code>",
+            "",
+            "The request expires after 10 minutes. Use /login cancel to abort it.",
+          ].join("\n"),
+        });
+        return;
+      }
+
+      await this.claudeLogin.complete(identity.name, arg);
+      const reason = "Claude login refreshed via owner DM";
+      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
+      writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
+      await channel.send({ chatId, text: "Claude login verified. Restarting Tomo..." });
+      this.scheduleRestart();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      log.warn({ err, identity: identity.name }, "Claude login command failed");
+      await channel.send({ chatId, text: `[error] Claude login failed: ${detail}` });
+    }
+  }
+
+  private scheduleRestart(): void {
+    if (process.env.NODE_ENV === "test") return;
+    setTimeout(() => {
+      const cli = process.argv[1];
+      if (!cli) {
+        process.kill(process.pid, "SIGTERM");
+        return;
+      }
+      const child = spawn(process.execPath, [cli, "restart"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+    }, 100);
+  }
+
   private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
     if (!existsSync(CONFIG_BACKUP_PATH)) {
       await channel.send({ chatId, text: "No config backup found at ~/.tomo/config.json.bak." });
@@ -300,20 +391,7 @@ export class ChatCommandHandler {
       this.restoringConfig = true;
       await channel.send({ chatId, text: "Restored config.json from config.json.bak. Restarting Tomo..." });
 
-      if (process.env.NODE_ENV === "test") return;
-
-      setTimeout(() => {
-        const cli = process.argv[1];
-        if (!cli) {
-          process.kill(process.pid, "SIGTERM");
-          return;
-        }
-        const child = spawn(process.execPath, [cli, "restart"], {
-          detached: true,
-          stdio: "ignore",
-        });
-        child.unref();
-      }, 100);
+      this.scheduleRestart();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       await channel.send({ chatId, text: `[error] restore failed: ${detail}` });

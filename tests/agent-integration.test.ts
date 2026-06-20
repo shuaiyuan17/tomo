@@ -1031,6 +1031,53 @@ describe("cron message delivery", () => {
 
     await agent.stop();
   });
+
+  it("never delivers LCM housekeeping output to a group", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const responses = [
+      "LCM compact completed, but I forgot to reply NO_REPLY",
+      "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+    ];
+    mockResponseFn = () => responses.shift()!;
+
+    await agent.handleCronMessage(
+      "System: An LCM rollup is due. After the rollup finishes, reply NO_REPLY.",
+      "imessage:iMessage;+;group123",
+      { showTyping: false, suppressDelivery: true },
+    );
+    await agent.handleCronMessage(
+      "System: Another LCM rollup is due. After the rollup finishes, reply NO_REPLY.",
+      "imessage:iMessage;+;group123",
+      { showTyping: false, suppressDelivery: true },
+    );
+
+    expect(im.sent).toHaveLength(0);
+    expect(im.typingStarts).toEqual([]);
+    expect(im.typingStops).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("never delivers thrown cron errors to a group", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      runWithRetry: (...args: unknown[]) => Promise<string>;
+    };
+    internals.runWithRetry = vi.fn().mockRejectedValueOnce(
+      new Error("Failed to authenticate. API Error: 401 Invalid authentication credentials"),
+    ) as unknown as typeof internals.runWithRetry;
+
+    await agent.handleCronMessage("Scheduled group task", "telegram:-100123");
+
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
 });
 
 // ===== Continuity delivery =====

@@ -238,6 +238,75 @@ describe("webhook event parsing", () => {
   });
 });
 
+describe("BlueBubbles inbound replay handling", () => {
+  const payload = (guid: string, text: string) => ({
+    type: "new-message",
+    data: {
+      guid,
+      text,
+      isFromMe: false,
+      dateCreated: 1_000,
+      handle: { address: "+15551234567" },
+      chats: [{ guid: "iMessage;-;+15551234567" }],
+      attachments: [],
+    },
+  });
+
+  const dispatch = (channel: BlueBubblesChannel, event: ReturnType<typeof payload>) =>
+    (channel as unknown as { handleWebhookEvent(payload: Record<string, unknown>): Promise<void> })
+      .handleWebhookEvent(event);
+
+  it("drops a repeated GUID after a channel restart", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imessage-channel-"));
+    const dedupeStorePath = join(dir, "seen.json");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+
+    try {
+      const first = new BlueBubblesChannel({
+        url: "http://bluebubbles.local",
+        password: "pw",
+        webhookPort: 3100,
+        dedupeStorePath,
+      });
+      const firstHandler = vi.fn(async () => {});
+      first.onMessage(firstHandler);
+      await dispatch(first, payload("guid-1", "hello"));
+      await dispatch(first, payload("guid-1", "hello"));
+      expect(firstHandler).toHaveBeenCalledTimes(1);
+
+      const afterRestart = new BlueBubblesChannel({
+        url: "http://bluebubbles.local",
+        password: "pw",
+        webhookPort: 3100,
+        dedupeStorePath,
+      });
+      const restartedHandler = vi.fn(async () => {});
+      afterRestart.onMessage(restartedHandler);
+      await dispatch(afterRestart, payload("guid-1", "hello"));
+      expect(restartedHandler).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("drops an empty new-message row", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    const channel = new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(channel, payload("guid-empty", ""));
+    expect(handler).not.toHaveBeenCalled();
+  });
+});
+
 describe("BlueBubbles typing indicator", () => {
   it("stops the local refresh loop without sending DELETE and waits for an in-flight POST", async () => {
     let resolveFetch: ((response: Response) => void) | undefined;

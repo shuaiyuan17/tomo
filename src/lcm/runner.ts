@@ -124,7 +124,10 @@ export class RollupRunner {
           { sessionKey, picking: `${next.level} ${next.period}`, deferred: fresh.length - 1 },
           "Rollup nudge (one level/tick)",
         );
-        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey, { showTyping: false });
+        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
+          showTyping: false,
+          suppressDelivery: isGroupSessionKey(sessionKey),
+        });
         this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
       } catch (err) {
         log.warn({ err, sessionKey }, "Rollup check failed");

@@ -23,8 +23,8 @@ export function loadConfig(): Record<string, unknown> {
 
 export function saveConfig(cfg: Record<string, unknown>): void {
   mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH);
-  writeJsonAtomicSync(CONFIG_PATH, cfg);
+  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
+  writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
 }
 
 export { modelLabel };

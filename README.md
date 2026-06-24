@@ -32,7 +32,7 @@ That's it. Open Telegram and message your bot.
 ## Requirements
 
 - Node.js 22.12+
-- [Claude Code](https://claude.com/claude-code) installed. Authenticate Claude Code for direct Claude models, or configure a LiteLLM gateway for non-Claude backends.
+- [Claude Code](https://claude.com/claude-code) installed. Direct Claude models can use a Claude subscription or an Anthropic API key; LiteLLM gateways support other backends.
 - At least one channel:
   - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)
   - **iMessage** — [BlueBubbles](https://bluebubbles.app) server running on a Mac with iMessage signed in
@@ -41,7 +41,7 @@ That's it. Open Telegram and message your bot.
 
 ```bash
 tomo init              # First-time setup
-tomo config            # Interactive settings (model, LiteLLM, channels, identities, groups)
+tomo config            # Interactive settings (authentication, model, LiteLLM, channels, identities, groups)
 tomo start             # Start in background (daemon)
 tomo start -f          # Start in foreground (for dev)
 tomo stop              # Stop the daemon
@@ -61,6 +61,7 @@ tomo sessions clear    # Reset all sessions
 | `/model` | Switch model (Claude aliases or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/status` | Show session info (model, channel, message count) |
+| `/pet` | Check Tomo's pet's mood, growth stage, and stats |
 
 ## Features
 
@@ -202,6 +203,10 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
 
 ```json
 {
+  "auth": {
+    "method": "api-key",
+    "apiKey": "sk-ant-..."
+  },
   "channels": {
     "telegram": {
       "token": "your-bot-token",
@@ -226,6 +231,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
   "maxTurns": 50,
   "saveInboundImages": true,
   "continuity": true,
+  "continuityIntervalMinutes": 55,
   "continuityScript": {
     "path": "~/bin/tomo-continuity.sh",
     "timeoutMs": 30000,
@@ -244,6 +250,7 @@ Environment variables override config file values:
 
 | Variable | Description |
 |----------|-------------|
+| `ANTHROPIC_API_KEY` | Use Anthropic API-key authentication; overrides the authentication stored in `config.json` |
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
 | `IMESSAGE_URL` | Override BlueBubbles URL |
 | `IMESSAGE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for ordinary turns (default: `1200`) |
@@ -255,10 +262,17 @@ Environment variables override config file values:
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
+| `TOMO_CONTINUITY_INTERVAL_MINUTES` | Override scheduled continuity heartbeat interval (default: `55`, minimum: `1`) |
 | `TOMO_CONTINUITY_SCRIPT` | Override the optional continuity script path |
 | `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Override continuity script timeout (default: `30000`) |
 | `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Override continuity script stdout/stderr cap (default: `8000`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
+
+### Anthropic Authentication
+
+Direct Claude models use your existing Claude Code subscription login by default. To use Anthropic API billing instead, run `tomo config`, choose **Anthropic authentication**, and enter an API key. Tomo stores the selected method under `auth` in `~/.tomo/config.json` and passes the key only to direct Claude Agent SDK child processes. `ANTHROPIC_API_KEY` remains supported and takes precedence over the saved setting.
+
+Because the config contains channel credentials and may now contain an Anthropic API key, Tomo writes both `config.json` and `config.json.bak` with owner-only (`0600`) permissions.
 
 `continuityScript` can also be a simple path string, e.g. `"continuityScript": "~/bin/tomo-continuity.sh"`. Relative paths resolve under `~/.tomo`; the script runs once per scheduled heartbeat and manual `tomo continuity` trigger, and its stdout/stderr or failure status is appended to the normal continuity prompt.
 

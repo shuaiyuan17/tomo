@@ -4,12 +4,26 @@ import { homedir } from "node:os";
 import { log } from "./logger.js";
 import type { Agent } from "./agent.js";
 import { runContinuityScript, type ContinuityScriptConfig } from "./continuity-script.js";
+import { DEFAULT_CONTINUITY_INTERVAL_MS } from "./continuity-defaults.js";
 
-const CONTINUITY_INTERVAL_MS = 55 * 60 * 1000; // 55 minutes
 const DEFAULT_TRIGGER_DIR = join(homedir(), ".tomo");
 
 interface ContinuityRunnerOptions {
   triggerDir?: string;
+  intervalMs?: number;
+}
+
+function normalizeIntervalMs(intervalMs: number | undefined): number {
+  if (intervalMs === undefined) return DEFAULT_CONTINUITY_INTERVAL_MS;
+  return Number.isFinite(intervalMs) && intervalMs > 0 ? Math.floor(intervalMs) : DEFAULT_CONTINUITY_INTERVAL_MS;
+}
+
+function formatIntervalMs(intervalMs: number): string {
+  const minutes = intervalMs / 60_000;
+  if (Number.isInteger(minutes)) return `${minutes}m`;
+  const seconds = intervalMs / 1_000;
+  if (Number.isInteger(seconds)) return `${seconds}s`;
+  return `${intervalMs}ms`;
 }
 
 async function fetchWeather(city: string): Promise<string | null> {
@@ -29,6 +43,7 @@ export class ContinuityRunner {
   private city: string | null;
   private script: ContinuityScriptConfig | null;
   private triggerDir: string;
+  private intervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private watcher: FSWatcher | null = null;
 
@@ -42,11 +57,12 @@ export class ContinuityRunner {
     this.city = city ?? null;
     this.script = script ?? null;
     this.triggerDir = options.triggerDir ?? DEFAULT_TRIGGER_DIR;
+    this.intervalMs = normalizeIntervalMs(options.intervalMs);
   }
 
   start(): void {
-    log.info("Continuity runner started (every 55m)");
-    this.timer = setInterval(() => this.fire(), CONTINUITY_INTERVAL_MS);
+    log.info({ intervalMs: this.intervalMs }, `Continuity runner started (every ${formatIntervalMs(this.intervalMs)})`);
+    this.timer = setInterval(() => this.fire(), this.intervalMs);
     this.watchTrigger();
   }
 

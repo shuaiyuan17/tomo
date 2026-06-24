@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // Controllable mock SDK — the test pushes events by hand and inspects the
@@ -74,6 +74,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const { LiveSession, STEER_MERGED } = await import("../src/agent/live-session.js");
+const TIMEOUT_MS = 10 * 60 * 1000;
 
 function makeSession() {
   const session = new LiveSession({} as never, "test:session");
@@ -87,6 +88,10 @@ async function waitFor(cond: () => boolean, ms = 500): Promise<void> {
     if (Date.now() > deadline) throw new Error("waitFor timed out");
     await new Promise((r) => setTimeout(r, 1));
   }
+}
+
+async function flushMicrotasks(times = 5): Promise<void> {
+  for (let i = 0; i < times; i++) await Promise.resolve();
 }
 
 const textBlock = (text: string) => ({ type: "text", text });
@@ -108,6 +113,58 @@ const resultEvent = () => ({
 
 beforeEach(() => {
   harnessRef.current = null;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("LiveSession timeouts", () => {
+  it("closes the live session when a send times out", async () => {
+    vi.useFakeTimers();
+    const { session, harness } = makeSession();
+
+    const p = session.send("slow");
+    const rejected = expect(p).rejects.toThrow("Query timed out after 10 minutes");
+    await flushMicrotasks();
+    expect(harness.inputs).toEqual(["slow"]);
+
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
+    await rejected;
+
+    expect(session.isAlive()).toBe(false);
+    expect(session.isBusy()).toBe(false);
+    await expect(session.send("next")).rejects.toThrow("Session is closed");
+    expect(harness.inputs).toEqual(["slow"]);
+  });
+
+  it("closes the live session when a promoted steered turn times out", async () => {
+    vi.useFakeTimers();
+    const { session, harness } = makeSession();
+
+    const p1 = session.send("first");
+    await flushMicrotasks();
+    expect(harness.inputs).toEqual(["first"]);
+
+    const p2 = session.steer("second");
+    const p2Rejected = expect(p2).rejects.toThrow("Query timed out after 10 minutes");
+    await flushMicrotasks();
+    expect(harness.inputs).toEqual(["first", "second"]);
+
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS - 1);
+    harness.pushEvent(assistantEvent("reply one"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("reply one");
+    expect(session.isBusy()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await p2Rejected;
+
+    expect(session.isAlive()).toBe(false);
+    expect(session.isBusy()).toBe(false);
+    await expect(session.send("third")).rejects.toThrow("Session is closed");
+    expect(harness.inputs).toEqual(["first", "second"]);
+  });
 });
 
 describe("LiveSession steering", () => {

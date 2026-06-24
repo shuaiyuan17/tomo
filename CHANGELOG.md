@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.4 (2026-06-19)
+
+### Features
+
+- **`/summon` — pull your main session into a group chat.** A configured identity's owner can `/summon` in an allowlisted group so the group's messages run on their unified `dm:` session (full personal context) until `/dismiss` or after `summonExpiryMinutes` of group inactivity (default 60; `0` disables, `TOMO_SUMMON_EXPIRY_MINUTES` to override). Turn output stays in the owner's private DM — group-facing replies require an explicit `send_message` direct-mode call — so private context never auto-posts to the group. Summon state is persisted across daemon restarts, lapses lazily, and an audience-switch note is injected when a `dm:` session's inbound audience flips between private DM and a summoned group.
+- **Configurable continuity heartbeat.** The continuity heartbeat interval is no longer hardcoded and can be tuned via config.
+- **`pet_status` chat command** (#157). Surface the virtual pet's current state directly from chat.
+- **Message steering on by default** (#150). `steering` now defaults to on (`TOMO_STEERING=false` to opt out), and direct sends were cleaned up alongside it.
+
+### Bug fixes
+
+- **`/summon` no longer emits a spurious "expired — handed back" notice on re-summon** (#160). The "already summoned?" guard read (also used by `/status` and `/dismiss`) lazily expired a lapsed summon and fired the group-facing handback notice, so re-summoning a group whose previous summon had gone stale posted a contradictory pair of messages. The handback notice now fires only on the real group-message routing path; guard reads still clear the `dm:` session's stale "summoned" context, but silently.
+- **Session timeout recovery and LCM typing fixes** (#155).
+- **iMessage typing-indicator lifecycle fix** (#154). The typing indicator is started and cleared correctly across the message lifecycle.
+- **`send_message` MEDIA/STICKER tag parsing in direct mode** (#147). Attachment tags are now parsed in direct sends, with regression coverage.
+- **Virtual pet hunger pacing tuned** (#149).
+
+### Other
+
+- Internal refactor: extracted inbound batching and chat-command handling out of the `Agent` class (#145).
+- Bump `@anthropic-ai/claude-agent-sdk` `0.3.168` → `0.3.177` → `0.3.181` (#159, #153).
+- Bump dev-dependencies group (#152).
+
 ## 0.8.3 (2026-06-11)
 
 ### Features

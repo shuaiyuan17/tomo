@@ -10,6 +10,7 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { splitText } from "./text-utils.js";
+import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 
@@ -19,6 +20,8 @@ interface BlueBubblesConfig {
   webhookPort: number;
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
   imageStoreBaseDir?: string;
+  /** Persistent cache for inbound message GUIDs. Null/undefined keeps it in memory only. */
+  dedupeStorePath?: string | null;
 }
 
 export class BlueBubblesChannel implements Channel {
@@ -32,12 +35,14 @@ export class BlueBubblesChannel implements Channel {
   private webhookPort: number;
   private imageStoreBaseDir: string | undefined;
   private contactCache = new Map<string, string>(); // address → display name
+  private messageGuidDedupe: MessageGuidDedupeStore;
 
   constructor(config: BlueBubblesConfig) {
     this.apiUrl = config.url.replace(/\/+$/, "");
     this.password = config.password;
     this.webhookPort = config.webhookPort;
     this.imageStoreBaseDir = config.imageStoreBaseDir;
+    this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
   }
 
   onMessage(handler: MessageHandler): void {
@@ -376,6 +381,15 @@ export class BlueBubblesChannel implements Channel {
     const chatGuid = chat.guid as string;
     if (!chatGuid) return;
 
+    // BlueBubbles' poller can replay a message row from its lookback window
+    // after a restart or reconnection. Persist the GUID before dispatch so the
+    // same inbound message cannot start another agent run, even after Tomo
+    // restarts.
+    if (guid && this.messageGuidDedupe.checkAndRecord(guid)) {
+      log.debug({ guid }, "Dropping replayed iMessage webhook (guid already seen)");
+      return;
+    }
+
     // Determine if group chat (iMessage;+; = group, iMessage;-; or SMS;-; = DM)
     const isGroup = chatGuid.includes(";+;");
 
@@ -392,7 +406,7 @@ export class BlueBubblesChannel implements Channel {
       const parts = text.slice(1).split(/\s+/);
       const command = parts[0];
       const args = parts.slice(1).join(" ");
-      if (command === "new" || command === "model" || command === "restore" || command === "status" || command === "summon" || command === "dismiss") {
+      if (command === "new" || command === "model" || command === "restore" || command === "status" || command === "pet" || command === "summon" || command === "dismiss") {
         for (const handler of this.commandHandlers) {
           await handler(command, chatGuid, senderAddress, args, senderAddress);
         }
@@ -423,6 +437,13 @@ export class BlueBubblesChannel implements Channel {
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;
+
+    // Ghost, tapback, and system rows may arrive as new-message events with no
+    // text or usable attachment. Do not turn them into blank agent prompts.
+    if (!composedText.trim() && images.length === 0 && documents.length === 0) {
+      log.debug({ guid }, "Ignoring empty iMessage (no text or attachments)");
+      return;
+    }
 
     const message: IncomingMessage = {
       id: guid,

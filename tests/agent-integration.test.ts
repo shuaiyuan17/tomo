@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../src/channels/types.js";
+import { PetStore } from "../src/mcp/pet-store.js";
 
 // ---------------------------------------------------------------------------
 // Mock SDK — queue-based approach avoids async-generator timing issues
@@ -199,6 +200,12 @@ function createMockQuery(prompt: AsyncGenerator) {
 
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
+    auth: {
+      method: "subscription" as "subscription" | "api-key",
+      apiKey: null as string | null,
+      apiKeySource: null as "environment" | "config" | null,
+      error: null as string | null,
+    },
     telegramToken: "test-token",
     model: "claude-sonnet-4-6[1m]",
     workspaceDir: "",
@@ -568,6 +575,52 @@ describe("send_message direct mode", () => {
     expect(notes?.[0]).toBe("note-5");
     expect(notes?.at(-1)).toBe("note-19");
 
+    await agent.stop();
+  });
+
+  it("restores pending direct-send context after a restart and drains it once", async () => {
+    const firstAgent = new Agent();
+    const tg = new MockChannel("telegram");
+    firstAgent.addChannel(tg);
+
+    await firstAgent.sendToSession("telegram:12345", "survive restart", "dm:alice");
+    await firstAgent.stop();
+
+    const secondAgent = new Agent();
+    const internals = secondAgent as unknown as {
+      drainPendingNotes(key: string): string;
+    };
+    expect(internals.drainPendingNotes("telegram:12345")).toContain(
+      'Tomo from another session sent the following message to this conversation earlier: "survive restart"',
+    );
+    await secondAgent.stop();
+
+    const thirdAgent = new Agent();
+    const thirdInternals = thirdAgent as unknown as {
+      drainPendingNotes(key: string): string;
+    };
+    expect(thirdInternals.drainPendingNotes("telegram:12345")).toBe("");
+    await thirdAgent.stop();
+  });
+
+  it("reports success after delivery when local persistence fails", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const sessions = (agent as unknown as { sessions: SessionStore }).sessions;
+    vi.spyOn(sessions, "append").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+    vi.spyOn(sessions, "setPendingNotes").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+
+    const result = await agent.sendToSession("telegram:12345", "delivered once", "dm:alice");
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "delivered once", photo: undefined, sticker: undefined },
+    ]);
     await agent.stop();
   });
 });
@@ -994,6 +1047,161 @@ describe("cron message delivery", () => {
 
     await agent.stop();
   });
+
+  it("queues cron failures into the next turn as bounded operational context", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      runWithRetry: (...args: unknown[]) => Promise<string>;
+    };
+    const originalRunWithRetry = internals.runWithRetry.bind(agent);
+    internals.runWithRetry = vi.fn().mockRejectedValueOnce(
+      new Error("You've hit your session limit · resets 3:10pm (America/Los_Angeles)"),
+    ) as unknown as typeof internals.runWithRetry;
+
+    await agent.handleCronMessage("Check something", "telegram:12345");
+
+    expect(tg.sent[0].text).toBe(
+      "[error] cron failed: You've hit your session limit · resets 3:10pm (America/Los_Angeles)",
+    );
+
+    internals.runWithRetry = originalRunWithRetry;
+    const prompts: string[] = [];
+    mockResponseFn = (text) => {
+      prompts.push(text);
+      return "recovered";
+    };
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "are you back?" }));
+    await drainQueue(agent);
+
+    expect(prompts[0]).toContain("Recent Tomo errors before this turn");
+    expect(prompts[0]).toContain("[error] cron failed: You've hit your session limit");
+
+    await agent.stop();
+  });
+
+  it("treats successful SDK session-limit text as an error and briefs the next turn", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const prompts: string[] = [];
+
+    mockResponseFn = (text) => {
+      prompts.push(text);
+      return prompts.length === 1
+        ? "You've hit your session limit · resets 3:10pm (America/Los_Angeles)"
+        : "recovered";
+    };
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "first try" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered.map((d) => d.text)).toEqual([
+      "[error] You've hit your session limit · resets 3:10pm (America/Los_Angeles)",
+    ]);
+
+    tg.clearDelivered();
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "second try" }));
+    await drainQueue(agent);
+
+    expect(prompts[1]).toContain("Recent Tomo errors before this turn");
+    expect(prompts[1]).toContain("[error] You've hit your session limit");
+    expect(tg.delivered.map((d) => d.text)).toEqual(["recovered"]);
+
+    await agent.stop();
+  });
+
+  it("caps pending error notes before injecting them into a prompt", async () => {
+    const agent = new Agent();
+    const internals = agent as unknown as {
+      queuePendingErrorNote: (sessionKey: string, visibleError: string) => void;
+      drainPendingNotes: (sessionKey: string) => string;
+    };
+
+    for (let i = 0; i < 10; i++) {
+      internals.queuePendingErrorNote("telegram:12345", `[error] err-${i} ${"x".repeat(450)}`);
+    }
+
+    const drained = internals.drainPendingNotes("telegram:12345");
+    const bulletCount = drained.match(/\n- /g)?.length ?? 0;
+
+    expect(bulletCount).toBeLessThanOrEqual(3);
+    expect(drained.length).toBeLessThan(1500);
+    expect(drained).not.toContain("err-0");
+    expect(drained).toContain("err-9");
+
+    await agent.stop();
+  });
+
+  it("suppresses typing for silent housekeeping cron turns", async () => {
+    resetConfig({ imessagePassiveTypingStartDelayMs: 0 });
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "NO_REPLY";
+
+    await agent.handleCronMessage(
+      "System: An LCM rollup is due. After the rollup finishes, reply NO_REPLY.",
+      "imessage:iMessage;+;group123",
+      { showTyping: false },
+    );
+
+    expect(im.sent).toHaveLength(0);
+    expect(im.typingStarts).toEqual([]);
+    expect(im.typingStops).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("never delivers LCM housekeeping output to a group", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const responses = [
+      "LCM compact completed, but I forgot to reply NO_REPLY",
+      "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+    ];
+    mockResponseFn = () => responses.shift()!;
+
+    await agent.handleCronMessage(
+      "System: An LCM rollup is due. After the rollup finishes, reply NO_REPLY.",
+      "imessage:iMessage;+;group123",
+      { showTyping: false, suppressDelivery: true },
+    );
+    await agent.handleCronMessage(
+      "System: Another LCM rollup is due. After the rollup finishes, reply NO_REPLY.",
+      "imessage:iMessage;+;group123",
+      { showTyping: false, suppressDelivery: true },
+    );
+
+    expect(im.sent).toHaveLength(0);
+    expect(im.typingStarts).toEqual([]);
+    expect(im.typingStops).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("never delivers thrown cron errors to a group", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      runWithRetry: (...args: unknown[]) => Promise<string>;
+    };
+    internals.runWithRetry = vi.fn().mockRejectedValueOnce(
+      new Error("Failed to authenticate. API Error: 401 Invalid authentication credentials"),
+    ) as unknown as typeof internals.runWithRetry;
+
+    await agent.handleCronMessage("Scheduled group task", "telegram:-100123");
+
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
 });
 
 // ===== Continuity delivery =====
@@ -1324,8 +1532,56 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/pet reports when Tomo has no pet", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pet", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Tomo doesn't have a pet yet. Ask Tomo to hatch one!");
+
+    await agent.stop();
+  });
+
+  it("/pet shows the current pet status", async () => {
+    const store = new PetStore(join(tmpDir, "data", "pet.json"));
+    const pet = store.create("Mochi", "star fox");
+    pet.stage = "baby";
+    pet.hunger = 82;
+    pet.happiness = 74;
+    pet.energy = 61;
+    pet.health = 95;
+    pet.affection = 12;
+    pet.care_mistakes = 1;
+    store.save(pet);
+
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pet", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("🐾 Mochi the star fox");
+    expect(tg.sent[0].text).toContain("Stage: baby");
+    expect(tg.sent[0].text).toContain("Mood: happy");
+    expect(tg.sent[0].text).toContain("Hunger: 82/100 · Happiness: 74/100");
+    expect(tg.sent[0].text).toContain("Energy: 61/100 · Health: 95/100");
+    expect(tg.sent[0].text).toContain("Bond: 7 · Care mistakes: 1");
+
+    await agent.stop();
+  });
+
   it("passes LiteLLM gateway env to the Claude Agent SDK child", async () => {
     resetConfig({
+      auth: {
+        method: "api-key",
+        apiKey: "sk-anthropic-direct",
+        apiKeySource: "config",
+        error: null,
+      },
       litellm: {
         mode: "anthropic-compatible",
         baseUrl: "http://localhost:4000",
@@ -1345,6 +1601,82 @@ describe("chat commands", () => {
     };
     expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
     expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
+
+    await agent.stop();
+  });
+
+  it("does not forward a parent Anthropic API key to a gateway without its own key", async () => {
+    const oldApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "sk-anthropic-parent";
+    let agent: InstanceType<typeof Agent> | null = null;
+    try {
+      resetConfig({
+        auth: {
+          method: "api-key",
+          apiKey: "sk-anthropic-parent",
+          apiKeySource: "environment",
+          error: null,
+        },
+        litellm: {
+          mode: "anthropic-compatible",
+          baseUrl: "http://localhost:4000",
+          apiKey: "",
+        },
+      });
+      agent = new Agent();
+      const tg = new MockChannel("telegram");
+      agent.addChannel(tg);
+
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+      await drainQueue(agent);
+
+      const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+      const lastCall = calls[calls.length - 1]?.[0] as {
+        options?: { env?: Record<string, string | undefined> };
+      };
+      expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+      expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+    } finally {
+      if (oldApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = oldApiKey;
+      }
+      await agent?.stop();
+    }
+  });
+
+  it("passes a configured Anthropic API key to direct Claude sessions", async () => {
+    resetConfig({
+      auth: {
+        method: "api-key",
+        apiKey: "sk-anthropic-test",
+        apiKeySource: "config",
+        error: null,
+      },
+      lcm: {
+        ...mockConfig.lcm,
+        groupCompactStyle: "sdk",
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100123",
+      text: "Hi",
+      isGroup: true,
+      isMentioned: true,
+    }));
+    await drainQueue(agent);
+
+    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as {
+      options?: { env?: Record<string, string | undefined> };
+    };
+    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-anthropic-test");
+    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
 
     await agent.stop();
   });

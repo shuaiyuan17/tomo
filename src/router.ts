@@ -12,10 +12,14 @@ export interface SessionResolution {
 
 export class IdentityRouter {
   private allowlists: Record<string, Set<string>>;
-  /** Notified when a summon lapses from group inactivity. Expiry is detected
-   *  lazily (on the next routing/status lookup), so this fires at most once
-   *  per lapsed summon, right before the group's own session takes back over. */
-  onSummonExpired?: (channelName: string, chatId: string, identityName: string) => void;
+  /** Notified when a summon lapses from group inactivity, so the dm: session's
+   *  "summoned" context can be cleared. Fires at most once per lapsed summon
+   *  (the store drops the entry on first detection). `notifyGroup` is true only
+   *  when the lapse is detected while routing a real group message — that's the
+   *  one path that should also post the group-facing "handed back" notice.
+   *  Guard reads (`/summon`, `/status`, `/dismiss`) pass false: they still need
+   *  the dm-side state update, but must not emit a group message. */
+  onSummonExpired?: (channelName: string, chatId: string, identityName: string, notifyGroup: boolean) => void;
 
   constructor(
     private identities: IdentityConfig[],
@@ -84,13 +88,19 @@ export class IdentityRouter {
   }
 
   /** Active summoned identity for a group, handling lazy inactivity expiry.
-   *  `touch` resets the expiry clock — pass true only for real group traffic. */
+   *  `touch` resets the expiry clock and marks this as real group traffic —
+   *  pass true only when routing an actual group message. On lapse the store
+   *  drops the entry and `onSummonExpired` always fires so the dm: session's
+   *  stale "summoned" context gets cleared; the group-facing handback notice,
+   *  though, only goes out on the routing path (`notifyGroup` = `touch`), so a
+   *  guard read from `/summon`/`/status`/`/dismiss` never emits a spurious
+   *  "expired — handed back" message to the group. */
   private resolveSummon(channelName: string, chatId: string, touch: boolean): string | undefined {
     const rawKey = `${channelName}:${chatId}`;
     const { entry, expired } = this.summons.get(rawKey);
     if (expired) {
       log.info({ channel: channelName, chatId, identity: expired.identity }, "Summon expired after inactivity");
-      this.onSummonExpired?.(channelName, chatId, expired.identity);
+      this.onSummonExpired?.(channelName, chatId, expired.identity, touch);
       return undefined;
     }
     if (!entry) return undefined;

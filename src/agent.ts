@@ -16,7 +16,7 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession, STEER_MERGED } from "./agent/live-session.js";
+import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
@@ -57,6 +57,35 @@ interface UserTurnRequest {
  *  without a turn (e.g. a busy summoned group) keeps only the most recent. */
 const MAX_PENDING_NOTES = 15;
 
+interface CronTurnOptions {
+  /** False for silent housekeeping turns such as LCM rollups. */
+  showTyping?: boolean;
+  /** Never deliver this turn's model output to the chat. The turn still runs
+   *  so housekeeping tools can complete; failures remain in logs/pending
+   *  operational context. */
+  suppressDelivery?: boolean;
+}
+
+const MAX_PENDING_ERROR_NOTES = 3;
+const MAX_PENDING_ERROR_CHARS = 1200;
+const MAX_SINGLE_PENDING_ERROR_CHARS = 600;
+
+function truncateForPendingError(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
+}
+
+function pendingErrorChars(notes: string[]): number {
+  return notes.reduce((sum, note) => sum + note.length, 0);
+}
+
+function isAgentErrorResponse(response: string): boolean {
+  const text = response.trim();
+  return /^API Error: \d+/i.test(text)
+    || /^Failed to authenticate\.\s+API Error: \d+/i.test(text)
+    || /^\{"type":"error"/.test(text)
+    || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
+}
+
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
@@ -82,6 +111,9 @@ export class Agent {
   // System notes queued by harness events and direct sends, drained and
   // prepended to the next user/cron/continuity turn.
   private pendingNotes = new Map<string, string[]>();
+  // Bounded operational errors from prior turns, drained into the next prompt
+  // so Tomo can recover with context instead of pretending nothing happened.
+  private pendingErrorNotes = new Map<string, string[]>();
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
@@ -97,8 +129,8 @@ export class Agent {
       config.summonExpiryMinutes * 60_000,
     );
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons);
-    this.router.onSummonExpired = (channelName, chatId, identity) =>
-      this.handleSummonExpired(channelName, chatId, identity);
+    this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
+      this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
@@ -191,7 +223,7 @@ export class Agent {
         channels[channel.name].allowlist = allowlist;
         cfg.channels = channels;
         backupConfigFile();
-        writeJsonAtomicSync(CONFIG_PATH, cfg);
+        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
         // Update the router's in-memory allowlist
         this.router.addToAllowlist(channel.name, chatId);
       }
@@ -292,15 +324,19 @@ export class Agent {
     await this.handleBatchedMessages(allowed, steer);
   }
 
-  /** A summon lapsed from inactivity (lazy-detected by the router on the next
-   *  group message). Brief the dm session and post a handback notice. */
-  private handleSummonExpired(channelName: string, chatId: string, identity: string): void {
+  /** A summon lapsed from inactivity (lazy-detected by the router). Always brief
+   *  the dm session so its "summoned" context is cleared; only post the
+   *  group-facing handback notice when the lapse was caught while routing a real
+   *  group message (`notifyGroup`) — a guard read from `/summon`/`/status`/
+   *  `/dismiss` must not emit a spurious group message. */
+  private handleSummonExpired(channelName: string, chatId: string, identity: string, notifyGroup: boolean): void {
     const rawKey = `${channelName}:${chatId}`;
     const groupLabel = this.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
     this.queuePendingNote(
       `dm:${identity}`,
       `[System: Your summon into the group "${groupLabel}" expired after inactivity — its messages no longer reach this session; the group's own Tomo session has taken back over.]`,
     );
+    if (!notifyGroup) return;
     const channel = this.getChannel(channelName);
     if (!channel) return;
     channel.send({ chatId, text: "Summon expired after inactivity — handed back to this group's own Tomo session." })
@@ -531,6 +567,7 @@ export class Agent {
    * we don't extract them here.
    */
   private async deliverResponse(
+    sessionKey: string,
     replyChannel: Channel,
     replyChatId: string,
     response: string,
@@ -544,10 +581,12 @@ export class Agent {
       return;
     }
 
-    // Surface API errors that the SDK returns as response text
-    if (/^API Error: \d+/i.test(response) || /^\{"type":"error"/.test(response)) {
-      await stream.finish();
-      await replyChannel.send({ chatId: replyChatId, text: `[error] ${response}` });
+    // Surface SDK/API errors that arrive as response text.
+    if (isAgentErrorResponse(response)) {
+      const visibleError = `[error] ${response}`;
+      this.queuePendingErrorNote(sessionKey, visibleError);
+      await stream.cancel();
+      await replyChannel.send({ chatId: replyChatId, text: visibleError });
       return;
     }
 
@@ -590,6 +629,10 @@ export class Agent {
   ): (text: string) => Promise<void> {
     return async (blockText: string) => {
       try {
+        if (isAgentErrorResponse(blockText)) {
+          await stream.cancel();
+          return;
+        }
         await stream.commitBlock();
         await this.shipBlockAttachments(channel, chatId, blockText);
       } catch (err) {
@@ -620,6 +663,7 @@ export class Agent {
     this.handleCronMessage(
       `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
       key,
+      { showTyping: false, suppressDelivery: isGroupSessionKey(key) },
     ).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });
@@ -658,7 +702,7 @@ export class Agent {
         timestamp: Date.now(),
       });
 
-      await this.deliverResponse(req.replyChannel, req.replyChatId, response, stream);
+      await this.deliverResponse(req.key, req.replyChannel, req.replyChatId, response, stream);
       await stopTyping({ clear: true });
     } catch (err) {
       log.error({ err }, req.errorLogMessage);
@@ -669,10 +713,12 @@ export class Agent {
       }
 
       const detail = err instanceof Error ? err.message : String(err);
+      const visibleError = `[error] ${detail}`;
+      this.queuePendingErrorNote(req.key, visibleError);
       try {
         await req.replyChannel.send({
           chatId: req.replyChatId,
-          text: `[error] ${detail}`,
+          text: visibleError,
         });
       } finally {
         await stopTyping({ clear: true });
@@ -931,7 +977,10 @@ export class Agent {
           const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
           log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
           // Fire-and-forget — don't block the current reply on the nudge
-          this.handleCronMessage(nudge, key).catch((err) => {
+          this.handleCronMessage(nudge, key, {
+            showTyping: false,
+            suppressDelivery: isGroupSessionKey(key),
+          }).catch((err) => {
             log.warn({ err, key }, "Context nudge failed");
           });
         }
@@ -949,6 +998,13 @@ export class Agent {
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
         return "I ran out of steps trying to complete that. Can you try a simpler request?";
+      }
+
+      if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
+        log.warn({ err, key }, "Query timed out; retiring SDK session to avoid resuming stale in-flight work");
+        this.closeLiveSession(key);
+        this.sessions.retireSdkSessionId(key);
+        throw err;
       }
 
       // Session error — reset and retry once
@@ -1022,14 +1078,14 @@ export class Agent {
   }
 
   /** Handle a cron-triggered message (queued per session key) */
-  async handleCronMessage(message: string, sessionKey: string): Promise<void> {
-    return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey))
+  async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<void> {
+    return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey, options))
       .catch((err) => {
         log.error({ err, sessionKey }, "Cron message failed in queue");
       });
   }
 
-  private async processCronMessage(message: string, sessionKey: string): Promise<void> {
+  private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<void> {
     const key = sessionKey;
     let deliveryChannel: Channel;
     let deliveryChatId: string;
@@ -1070,17 +1126,40 @@ export class Agent {
     const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
-    const stopTyping = this.startTurnTyping(
-      deliveryChannel,
-      deliveryChatId,
-      this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
-    );
+    const stopTyping = options.showTyping === false
+      ? async () => {}
+      : this.startTurnTyping(
+          deliveryChannel,
+          deliveryChatId,
+          this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
+        );
 
     try {
       const response = await this.runWithRetry(key, stampedMessage);
       const silentCronResponse = isSilentReply(response) || response.includes("NO_REPLY");
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
+
+      if (isAgentErrorResponse(response)) {
+        const visibleError = `[error] cron failed: ${response}`;
+        this.queuePendingErrorNote(key, visibleError);
+        // Scheduled infrastructure failures must never be posted into a group.
+        // Silent housekeeping turns suppress them in DMs as well when requested.
+        if (isGroupSessionKey(key) || options.suppressDelivery) {
+          log.warn({ sessionKey: key }, "Cron error suppressed from chat delivery");
+          await stopTyping({ clear: true });
+          return;
+        }
+        await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
+        await stopTyping({ clear: true });
+        return;
+      }
+
+      if (options.suppressDelivery) {
+        log.info({ sessionKey: key }, "Cron output suppressed from chat delivery");
+        await stopTyping({ clear: true });
+        return;
+      }
 
       if (silentCronResponse) {
         log.info("Cron completed silently (no reply sent)");
@@ -1100,8 +1179,15 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
+      const visibleError = `[error] cron failed: ${detail}`;
+      this.queuePendingErrorNote(key, visibleError);
+      if (isGroupSessionKey(key) || options.suppressDelivery) {
+        log.warn({ sessionKey: key }, "Thrown cron error suppressed from chat delivery");
+        await stopTyping({ clear: true });
+        return;
+      }
       try {
-        await deliveryChannel.send({ chatId: deliveryChatId, text: `[error] cron failed: ${detail}` });
+        await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
       } finally {
         await stopTyping({ clear: true });
       }
@@ -1134,6 +1220,12 @@ export class Agent {
     try {
       const response = await this.runWithRetry(key, this.drainPendingNotes(key) + prompt);
       log.info("Continuity response: %s", response.slice(0, 100));
+
+      if (isAgentErrorResponse(response)) {
+        this.queuePendingErrorNote(key, `[error] continuity failed: ${response}`);
+        log.warn({ sessionKey: key }, "Continuity returned an agent error response");
+        return;
+      }
 
       // Send non-silent responses to the user (check includes() for multi-turn responses
       // where NO_REPLY may appear after earlier text output)
@@ -1235,12 +1327,18 @@ export class Agent {
     const summoned = this.router.getSummonedIdentity(replyTarget.channelName, replyTarget.chatId);
     const fromSummoner = summoned !== undefined && callerSessionKey === `dm:${summoned}`;
 
-    this.sessions.append(sessionKey, {
-      role: "assistant",
-      content: fromSummoner ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
-      channel: replyTarget.channelName,
-      timestamp: Date.now(),
-    });
+    try {
+      this.sessions.append(sessionKey, {
+        role: "assistant",
+        content: fromSummoner ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
+        channel: replyTarget.channelName,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      // The channel send already succeeded. Reporting a tool failure here
+      // invites the caller to retry and duplicate the user-visible message.
+      log.warn({ err, sessionKey }, "Message delivered but transcript persistence failed");
+    }
 
     this.queuePendingNote(sessionKey, fromSummoner
       ? `[System: Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"]`
@@ -1406,21 +1504,76 @@ export class Agent {
   }
 
   private queuePendingNote(sessionKey: string, note: string): void {
-    const arr = this.pendingNotes.get(sessionKey) ?? [];
+    let arr = this.pendingNotes.get(sessionKey);
+    if (!arr) {
+      try {
+        arr = this.sessions.getPendingNotes(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Could not load durable pending notes");
+        arr = [];
+      }
+    }
     arr.push(note);
     if (arr.length > MAX_PENDING_NOTES) {
       const dropped = arr.splice(0, arr.length - MAX_PENDING_NOTES).length;
       log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
     }
     this.pendingNotes.set(sessionKey, arr);
+    try {
+      this.sessions.setPendingNotes(sessionKey, arr);
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Could not persist pending notes");
+    }
+  }
+
+  private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
+    const normalized = visibleError.replace(/\s+/g, " ").trim();
+    const clipped = truncateForPendingError(normalized, MAX_SINGLE_PENDING_ERROR_CHARS);
+    const notes = [...(this.pendingErrorNotes.get(sessionKey) ?? []), clipped].slice(-MAX_PENDING_ERROR_NOTES);
+
+    while (notes.length > 1 && pendingErrorChars(notes) > MAX_PENDING_ERROR_CHARS) {
+      notes.shift();
+    }
+    this.pendingErrorNotes.set(sessionKey, notes);
   }
 
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
-    const notes = this.pendingNotes.get(sessionKey);
-    if (!notes || notes.length === 0) return "";
-    this.pendingNotes.delete(sessionKey);
-    return notes.map((n) => `${n}\n\n`).join("");
+    const drained: string[] = [];
+    let notes = this.pendingNotes.get(sessionKey);
+    if (!notes) {
+      try {
+        notes = this.sessions.getPendingNotes(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Could not load durable pending notes");
+        notes = [];
+      }
+    }
+    if (notes && notes.length > 0) {
+      drained.push(...notes);
+      try {
+        this.sessions.setPendingNotes(sessionKey, []);
+        this.pendingNotes.delete(sessionKey);
+      } catch (err) {
+        // Avoid replaying the same note repeatedly in this process. If the
+        // durable clear failed, a restart may replay it, which is safer than
+        // silently losing context.
+        this.pendingNotes.set(sessionKey, []);
+        log.warn({ err, sessionKey }, "Could not clear durable pending notes");
+      }
+    }
+
+    const errorNotes = this.pendingErrorNotes.get(sessionKey);
+    if (errorNotes && errorNotes.length > 0) {
+      this.pendingErrorNotes.delete(sessionKey);
+      drained.push([
+        "[System: Recent Tomo errors before this turn (newest last, capped):",
+        ...errorNotes.map((note) => `- ${note}`),
+        "Use this as operational context; do not repeat the raw error unless it helps the user.]",
+      ].join("\n"));
+    }
+
+    return drained.map((n) => `${n}\n\n`).join("");
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */

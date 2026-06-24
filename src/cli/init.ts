@@ -309,8 +309,8 @@ export const initCommand = new Command("init")
       }
 
       mkdirSync(dirname(configPath), { recursive: true });
-      backupFileIfExistsSync(configPath, join(TOMO_HOME, "config.json.bak"));
-      writeJsonAtomicSync(configPath, config);
+      backupFileIfExistsSync(configPath, join(TOMO_HOME, "config.json.bak"), { mode: 0o600 });
+      writeJsonAtomicSync(configPath, config, { mode: 0o600 });
       p.log.success("Config saved");
     }
 

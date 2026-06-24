@@ -8,6 +8,11 @@ import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+interface PendingNotesFile {
+  version: 1;
+  notes: Record<string, string[]>;
+}
+
 /** Where the SDK stores its JSONL session files */
 export function getSdkSessionDir(): string {
   const home = homedir();
@@ -196,6 +201,31 @@ export class SessionStore {
     return messages.slice(cutoff);
   }
 
+  /** Load prompt notes that must survive daemon restarts until the session's
+   *  next turn drains them. Returns a defensive copy. */
+  getPendingNotes(key: string): string[] {
+    return [...(this.loadPendingNotes()[key] ?? [])];
+  }
+
+  /** Replace the durable prompt-note queue for one session. An empty list
+   *  removes the key and deletes the sidecar when no queues remain. */
+  setPendingNotes(key: string, notes: string[]): void {
+    const data = this.loadPendingNotes();
+    if (notes.length > 0) {
+      data[key] = [...notes];
+    } else {
+      delete data[key];
+    }
+
+    if (Object.keys(data).length === 0) {
+      if (existsSync(this.pendingNotesPath)) unlinkSync(this.pendingNotesPath);
+      return;
+    }
+
+    const file: PendingNotesFile = { version: 1, notes: data };
+    writeJsonAtomicSync(this.pendingNotesPath, file);
+  }
+
   // --- SDK Session Registry ---
 
   /** Get the active SDK session ID for a channel key */
@@ -203,7 +233,7 @@ export class SessionStore {
     // Re-read from disk to pick up external changes (e.g. `tomo sessions clear`)
     this.loadRegistry();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    return entry?.sdkSessionId;
+    return entry?.sdkSessionId || undefined;
   }
 
   /** Get the active registry entry for a channel key */
@@ -354,6 +384,52 @@ export class SessionStore {
     this.saveRegistry();
   }
 
+  /**
+   * Retire a poisoned SDK resume chain while preserving active routing/group
+   * metadata. Use this when the SDK JSONL likely ended mid-turn (for example a
+   * local query timeout): resuming that file can continue stale tool work, but
+   * the chat title, participants, and reply target are still valid.
+   */
+  retireSdkSessionId(key: string): string | undefined {
+    this.loadRegistry();
+    const now = Date.now();
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && e.sdkSessionId);
+    if (!entry) return undefined;
+
+    const retiredSessionId = entry.sdkSessionId;
+    entry.unlinkedAt = now;
+    entry.expiresAt = now + UNLINKED_TTL_MS;
+
+    this.registry.push({
+      sdkSessionId: "",
+      channelKey: key,
+      createdAt: now,
+      lastActiveAt: now,
+      unlinkedAt: null,
+      expiresAt: null,
+      stats: {
+        totalQueries: 0,
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        contextUsed: 0,
+        contextMax: 0,
+      },
+      ...(entry.replyTarget ? { replyTarget: entry.replyTarget } : {}),
+      ...(entry.chatTitle ? { chatTitle: entry.chatTitle } : {}),
+      ...(entry.participants ? { participants: [...entry.participants] } : {}),
+    });
+
+    this.saveRegistry();
+    log.warn(
+      { key, sessionId: retiredSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
+      "SDK session retired, metadata preserved",
+    );
+    return retiredSessionId;
+  }
+
   /** Delete expired unlinked sessions and their SDK JSONL files */
   private cleanupExpired(): void {
     const now = Date.now();
@@ -494,6 +570,17 @@ export class SessionStore {
       renameSync(oldPath, newPath);
     }
 
+    const pendingNotes = this.loadPendingNotes();
+    const oldNotes = pendingNotes[oldKey];
+    if (oldNotes) {
+      pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
+      delete pendingNotes[oldKey];
+      writeJsonAtomicSync(this.pendingNotesPath, {
+        version: 1,
+        notes: pendingNotes,
+      } satisfies PendingNotesFile);
+    }
+
     // Clear in-memory session cache for old key
     this.sessions.delete(oldKey);
 
@@ -505,6 +592,26 @@ export class SessionStore {
 
   private get registryPath(): string {
     return join(this.dir, "_sessions.json");
+  }
+
+  private get pendingNotesPath(): string {
+    return join(this.dir, "_pending_notes.json");
+  }
+
+  private loadPendingNotes(): Record<string, string[]> {
+    if (!existsSync(this.pendingNotesPath)) return {};
+    try {
+      const data = JSON.parse(readFileSync(this.pendingNotesPath, "utf-8")) as Partial<PendingNotesFile>;
+      if (!data.notes || typeof data.notes !== "object") return {};
+      return Object.fromEntries(
+        Object.entries(data.notes)
+          .filter((entry): entry is [string, string[]] =>
+            Array.isArray(entry[1]) && entry[1].every((note) => typeof note === "string")),
+      );
+    } catch (err) {
+      log.warn({ err, file: this.pendingNotesPath }, "Could not load pending notes");
+      return {};
+    }
   }
 
   private loadRegistry(): void {

@@ -48,8 +48,9 @@ async function startForeground(): Promise<void> {
 
   // Validate config before loading the heavy daemon modules so a fresh
   // install fails with a clear message instead of a module-load crash.
-  const { config, assertChannelsConfigured } = await import("../config.js");
+  const { config, assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
   try {
+    assertAuthConfigured();
     assertChannelsConfigured();
   } catch (err) {
     console.error((err as Error).message);
@@ -128,6 +129,7 @@ async function startForeground(): Promise<void> {
       password: config.imessagePassword,
       webhookPort: config.imessageWebhookPort,
       imageStoreBaseDir,
+      dedupeStorePath: join(config.tomoHome, "data", "imessage", "seen-message-guids.json"),
     }));
   }
 
@@ -136,7 +138,9 @@ async function startForeground(): Promise<void> {
 
   // Start continuity runner if enabled
   const { ContinuityRunner } = await import("../continuity.js");
-  const continuity = new ContinuityRunner(agent, config.city, config.continuityScript);
+  const continuity = new ContinuityRunner(agent, config.city, config.continuityScript, {
+    intervalMs: config.continuityIntervalMs,
+  });
   if (config.continuity) {
     continuity.start();
   }
@@ -181,8 +185,9 @@ async function startDaemon(): Promise<void> {
 
   // Validate config before spawning: the detached child would die instantly
   // with this error buried in tomo.err while we print "started in background".
-  const { assertChannelsConfigured } = await import("../config.js");
+  const { assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
   try {
+    assertAuthConfigured();
     assertChannelsConfigured();
   } catch (err) {
     console.error((err as Error).message);

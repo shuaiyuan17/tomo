@@ -56,6 +56,10 @@ interface UserTurnRequest {
 interface CronTurnOptions {
   /** False for silent housekeeping turns such as LCM rollups. */
   showTyping?: boolean;
+  /** Never deliver this turn's model output to the chat. The turn still runs
+   *  so housekeeping tools can complete; failures remain in logs/pending
+   *  operational context. */
+  suppressDelivery?: boolean;
 }
 
 const MAX_PENDING_ERROR_NOTES = 3;
@@ -73,6 +77,7 @@ function pendingErrorChars(notes: string[]): number {
 function isAgentErrorResponse(response: string): boolean {
   const text = response.trim();
   return /^API Error: \d+/i.test(text)
+    || /^Failed to authenticate\.\s+API Error: \d+/i.test(text)
     || /^\{"type":"error"/.test(text)
     || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
 }
@@ -654,7 +659,7 @@ export class Agent {
     this.handleCronMessage(
       `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
       key,
-      { showTyping: false },
+      { showTyping: false, suppressDelivery: isGroupSessionKey(key) },
     ).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });
@@ -968,7 +973,10 @@ export class Agent {
           const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
           log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
           // Fire-and-forget — don't block the current reply on the nudge
-          this.handleCronMessage(nudge, key, { showTyping: false }).catch((err) => {
+          this.handleCronMessage(nudge, key, {
+            showTyping: false,
+            suppressDelivery: isGroupSessionKey(key),
+          }).catch((err) => {
             log.warn({ err, key }, "Context nudge failed");
           });
         }
@@ -1131,7 +1139,20 @@ export class Agent {
       if (isAgentErrorResponse(response)) {
         const visibleError = `[error] cron failed: ${response}`;
         this.queuePendingErrorNote(key, visibleError);
+        // Scheduled infrastructure failures must never be posted into a group.
+        // Silent housekeeping turns suppress them in DMs as well when requested.
+        if (isGroupSessionKey(key) || options.suppressDelivery) {
+          log.warn({ sessionKey: key }, "Cron error suppressed from chat delivery");
+          await stopTyping({ clear: true });
+          return;
+        }
         await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
+        await stopTyping({ clear: true });
+        return;
+      }
+
+      if (options.suppressDelivery) {
+        log.info({ sessionKey: key }, "Cron output suppressed from chat delivery");
         await stopTyping({ clear: true });
         return;
       }
@@ -1156,6 +1177,11 @@ export class Agent {
       const detail = err instanceof Error ? err.message : String(err);
       const visibleError = `[error] cron failed: ${detail}`;
       this.queuePendingErrorNote(key, visibleError);
+      if (isGroupSessionKey(key) || options.suppressDelivery) {
+        log.warn({ sessionKey: key }, "Thrown cron error suppressed from chat delivery");
+        await stopTyping({ clear: true });
+        return;
+      }
       try {
         await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
       } finally {

@@ -18,8 +18,9 @@ export function resolveTimeRange(
   sdkSessionId: string,
   fromTime: string,
   toTime: string,
+  sdkSessionsDir: string,
 ): { fromIdx: number; toIdx: number } | null {
-  const path = getSdkSessionPath(sdkSessionId);
+  const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;
 
   // Parse inputs as Date. If no timezone is specified, JS treats them as
@@ -89,8 +90,11 @@ interface ParsedEvent {
  * Scan an SDK session JSONL file and segment messages by activity type.
  * Returns sections with token counts and labels.
  */
-export function computeContextStats(sdkSessionId: string): ContextStatsResult | null {
-  const path = getSdkSessionPath(sdkSessionId);
+export function computeContextStats(
+  sdkSessionId: string,
+  sdkSessionsDir: string,
+): ContextStatsResult | null {
+  const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;
 
   const sdkEvents = readJsonlFileSync<SdkEvent>(path);

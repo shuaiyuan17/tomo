@@ -1,14 +1,14 @@
 import { Command } from "commander";
 import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { RESTART_REASON_FILE } from "../config.js";
 import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
-const TOMO_HOME = join(homedir(), ".tomo");
-const PID_FILE = join(TOMO_HOME, "tomo.pid");
-const LOG_FILE = join(TOMO_HOME, "logs", "tomo.log");
+const TOMO_HOME = defaultRuntimePaths.tomoHome;
+const PID_FILE = defaultRuntimePaths.pidFile;
+const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
 
 function isRunning(pid: number): boolean {
   try {

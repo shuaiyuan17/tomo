@@ -14,6 +14,8 @@ import { parseJsonl } from "../jsonl.js";
 
 export interface PruneToolsRequest {
   sdkSessionId: string;
+  /** Claude SDK project directory derived from the configured workspace. */
+  sdkSessionsDir: string;
   /** Only prune results with content larger than this (default 500) */
   minSize?: number;
   /** Only prune these tool names (e.g. ["Read", "Bash"]). Prunes all if empty. */
@@ -63,7 +65,7 @@ interface SdkEvent {
  * same file. A plain read + in-place write would truncate those appends.
  */
 export function pruneTools(req: PruneToolsRequest): PruneToolsResult {
-  const path = getSdkSessionPath(req.sdkSessionId);
+  const path = getSdkSessionPath(req.sdkSessionId, req.sdkSessionsDir);
   if (!existsSync(path)) {
     return { success: false, pruned: [], totalCharsRemoved: 0, error: "Session file not found" };
   }
@@ -246,7 +248,7 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   }
 
   // Write trigger file so the harness reloads the live session on next turn
-  writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
+  writeFileSync(getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir), new Date().toISOString());
 
   log.info({
     sessionId: req.sdkSessionId,

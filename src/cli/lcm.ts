@@ -5,15 +5,13 @@ import { pruneTools } from "../lcm/prune-tools.js";
 import { resolveBlockRange, type BlockLevel } from "../lcm/blocks.js";
 import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
-import { homedir } from "node:os";
 
-async function getSessionsDir(): Promise<string> {
-  try {
-    const { config } = await import("../config.js");
-    return config.sessionsDir ?? join(homedir(), ".tomo", "data", "sessions");
-  } catch {
-    return join(homedir(), ".tomo", "data", "sessions");
-  }
+async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string }> {
+  const { config } = await import("../config.js");
+  return {
+    sessionsDir: config.sessionsDir,
+    sdkSessionsDir: config.sdkSessionsDir,
+  };
 }
 
 export const lcmCommand = new Command("lcm")
@@ -24,8 +22,8 @@ lcmCommand
   .description("Get the active SDK session ID for a channel")
   .requiredOption("--channel-key <key>", "Channel key (e.g. telegram_123456789)")
   .action(async (opts) => {
-    const sessionsDir = await getSessionsDir();
-    const store = new SessionStore(sessionsDir, 20);
+    const paths = await getRuntimeDirs();
+    const store = new SessionStore(paths.sessionsDir, 20, paths.sdkSessionsDir);
     const sid = store.getSdkSessionId(opts.channelKey);
     if (sid) {
       console.log(sid);
@@ -40,8 +38,9 @@ lcmCommand
   .description("Show context breakdown by section")
   .requiredOption("--session-id <id>", "SDK session ID")
   .option("--json", "Output raw JSON")
-  .action((opts) => {
-    const result = computeContextStats(opts.sessionId);
+  .action(async (opts) => {
+    const paths = await getRuntimeDirs();
+    const result = computeContextStats(opts.sessionId, paths.sdkSessionsDir);
     if (!result) {
       console.error("Session not found:", opts.sessionId);
       process.exit(1);
@@ -88,7 +87,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
     .requiredOption("--summary <text>", "Summary text")
     .option(periodOpt.flag, periodOpt.desc)
     .action(async (opts) => {
-      const sessionsDir = await getSessionsDir();
+      const paths = await getRuntimeDirs();
       // Option name is the part after `--`, converted to camelCase by commander.
       // (The earlier version used /<(\w+)>/ on the placeholder, which failed
       // on "YYYY-MM-DD" because \w+ doesn't cross hyphens — falling back to
@@ -98,7 +97,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
       const periodKey = rawKey.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       const period: string | undefined = opts[periodKey];
 
-      const resolved = resolveBlockRange(opts.sessionId, level, period);
+      const resolved = resolveBlockRange(opts.sessionId, level, period, paths.sdkSessionsDir);
       if (!resolved) {
         console.error(JSON.stringify({
           status: "error",
@@ -107,9 +106,10 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
         process.exit(1);
       }
 
-      const transcriptPath = join(sessionsDir, `_archive_${opts.sessionId}.jsonl`);
+      const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
       const result = compactSession({
         sdkSessionId: opts.sessionId,
+        sdkSessionsDir: paths.sdkSessionsDir,
         fromIdx: resolved.fromIdx,
         toIdx: resolved.toIdx,
         summary: opts.summary,
@@ -158,9 +158,9 @@ lcmCommand
   .option("--preview <chars>", "Preview length in chars (default 160)", (v) => parseInt(v, 10), 160)
   .action(async (opts) => {
     const { readFileSync, existsSync } = await import("node:fs");
-    const { join: joinPath } = await import("node:path");
-    const { homedir: home } = await import("node:os");
-    const sessionPath = joinPath(home(), ".claude", "projects", joinPath(home(), ".tomo", "workspace").replace(/[/.]/g, "-"), `${opts.sessionId}.jsonl`);
+    const { getSdkSessionPath } = await import("../sessions/store.js");
+    const paths = await getRuntimeDirs();
+    const sessionPath = getSdkSessionPath(opts.sessionId, paths.sdkSessionsDir);
     if (!existsSync(sessionPath)) {
       console.error(`Session file not found: ${sessionPath}`);
       process.exit(1);
@@ -224,9 +224,9 @@ lcmCommand
   .requiredOption("--summary <text>", "Summary text to replace the range")
   .option("--block-tag <tag>", 'Optional block tag (e.g. "monthly 2026-04") so the resulting summary joins the rollup hierarchy')
   .action(async (opts) => {
-    const sessionsDir = await getSessionsDir();
+    const paths = await getRuntimeDirs();
     // Resolve timestamps to indices using context_stats
-    const stats = computeContextStats(opts.sessionId);
+    const stats = computeContextStats(opts.sessionId, paths.sdkSessionsDir);
     if (!stats) {
       console.error(JSON.stringify({ status: "error", error: "Session not found" }));
       process.exit(1);
@@ -236,7 +236,7 @@ lcmCommand
     const toTime = opts.toTime;
 
     // Find the event index range that falls within the timestamps
-    const resolved = resolveTimeRange(opts.sessionId, fromTime, toTime);
+    const resolved = resolveTimeRange(opts.sessionId, fromTime, toTime, paths.sdkSessionsDir);
     if (!resolved) {
       console.error(JSON.stringify({ status: "error", error: `No events found in time range ${fromTime} to ${toTime}` }));
       process.exit(1);
@@ -246,10 +246,11 @@ lcmCommand
     // and the pattern used by prune-tools. Previously an optional --channel-key
     // branch wrote to `<channelKey>.jsonl`, colliding with the live transcript
     // namespace (e.g. `dm:shuai.jsonl` next to `dm_shuai.jsonl`).
-    const transcriptPath = join(sessionsDir, `_archive_${opts.sessionId}.jsonl`);
+    const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
 
     const result = compactSession({
       sdkSessionId: opts.sessionId,
+      sdkSessionsDir: paths.sdkSessionsDir,
       fromIdx: resolved.fromIdx,
       toIdx: resolved.toIdx,
       summary: opts.summary,
@@ -282,8 +283,8 @@ lcmCommand
   .option("--limit <n>", "Max results", parseInt)
   .option("--json", "Output raw JSON")
   .action(async (opts) => {
-    const sessionsDir = await getSessionsDir();
-    const store = new SessionStore(sessionsDir, 20);
+    const paths = await getRuntimeDirs();
+    const store = new SessionStore(paths.sessionsDir, 20, paths.sdkSessionsDir);
     const limit = opts.limit ?? 50;
     const results: Array<{ role: string; content: string; timestamp: number; seq?: number; source?: string }> = [];
 
@@ -345,16 +346,17 @@ lcmCommand
   .option("--dry-run", "Preview what would be pruned without modifying")
   .option("--channel-key <key>", "Channel key for archiving originals")
   .action(async (opts) => {
-    const sessionsDir = await getSessionsDir();
+    const paths = await getRuntimeDirs();
 
     const result = pruneTools({
       sdkSessionId: opts.sessionId,
+      sdkSessionsDir: paths.sdkSessionsDir,
       minSize: opts.minSize,
       tools: opts.tools ? opts.tools.split(",") : undefined,
       includeImages: opts.images !== false,
       dryRun: opts.dryRun,
       archivePath: opts.channelKey
-        ? join(sessionsDir, `_archive_${opts.sessionId}.jsonl`)
+        ? join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`)
         : undefined,
     });
 

@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { homedir } from "node:os";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
 import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
 import {
@@ -10,12 +9,13 @@ import {
 } from "./continuity-script.js";
 import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } from "./continuity-defaults.js";
 import { parseAnthropicAuthConfig, type AnthropicAuthConfig } from "./auth.js";
+import { defaultRuntimePaths } from "./runtime-paths.js";
 
-const HOME = homedir();
-export const TOMO_HOME = join(HOME, ".tomo");
-export const CONFIG_PATH = join(TOMO_HOME, "config.json");
-export const CONFIG_BACKUP_PATH = join(TOMO_HOME, "config.json.bak");
-export const RESTART_REASON_FILE = join(TOMO_HOME, "data", ".restart-reason");
+const HOME = defaultRuntimePaths.homeDir;
+export const TOMO_HOME = defaultRuntimePaths.tomoHome;
+export const CONFIG_PATH = defaultRuntimePaths.configPath;
+export const CONFIG_BACKUP_PATH = defaultRuntimePaths.configBackupPath;
+export const RESTART_REASON_FILE = defaultRuntimePaths.restartReasonFile;
 const DEFAULT_IMESSAGE_INBOUND_SETTLE_MS = 1500;
 const DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS = 5000;
 const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
@@ -62,6 +62,8 @@ export interface TomoConfig {
   model: string;
   workspaceDir: string;
   sessionsDir: string;
+  /** Claude Agent SDK JSONL directory derived from workspaceDir. */
+  sdkSessionsDir: string;
   historyLimit: number;
   logsDir: string;
   tomoHome: string;
@@ -235,6 +237,7 @@ function parsePassiveGroups(channels: Record<string, Record<string, unknown>>): 
 
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
+  const paths = defaultRuntimePaths;
   const channels = (file.channels ?? {}) as Record<string, Record<string, unknown>>;
   const mcp = (file.mcp ?? {}) as Record<string, unknown>;
   const mcpServers = parseExternalMcpServers(file.mcpServers ?? mcp.servers);
@@ -308,11 +311,12 @@ function buildConfig(): TomoConfig {
     auth: parseAnthropicAuthConfig(file.auth),
     telegramToken,
     model,
-    workspaceDir: process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace"),
-    sessionsDir: process.env.SESSIONS_DIR ?? join(TOMO_HOME, "data", "sessions"),
+    workspaceDir: paths.workspaceDir,
+    sessionsDir: paths.sessionsDir,
+    sdkSessionsDir: paths.sdkSessionsDir,
     historyLimit: Number(process.env.HISTORY_LIMIT ?? "20"),
-    logsDir: join(TOMO_HOME, "logs"),
-    tomoHome: TOMO_HOME,
+    logsDir: paths.logsDir,
+    tomoHome: paths.tomoHome,
     continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
     continuityIntervalMs: parsePositiveMinutesAsMs(
       process.env.TOMO_CONTINUITY_INTERVAL_MINUTES ?? file.continuityIntervalMinutes,

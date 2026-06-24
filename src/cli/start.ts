@@ -2,10 +2,10 @@ import { Command } from "commander";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
-const TOMO_HOME = join(homedir(), ".tomo");
-const PID_FILE = join(TOMO_HOME, "tomo.pid");
+const TOMO_HOME = defaultRuntimePaths.tomoHome;
+const PID_FILE = defaultRuntimePaths.pidFile;
 
 function isRunning(pid: number): boolean {
   try {
@@ -64,9 +64,9 @@ async function startForeground(): Promise<void> {
 
   // Ensure directories exist (handles upgrades where new dirs were added)
   const { mkdirSync } = await import("node:fs");
-  mkdirSync(join(TOMO_HOME, "workspace", "tmp"), { recursive: true });
-  mkdirSync(join(TOMO_HOME, "workspace", "memory"), { recursive: true });
-  mkdirSync(join(TOMO_HOME, "workspace", "memory", "journal"), { recursive: true });
+  mkdirSync(join(config.workspaceDir, "tmp"), { recursive: true });
+  mkdirSync(join(config.workspaceDir, "memory"), { recursive: true });
+  mkdirSync(join(config.workspaceDir, "memory", "journal"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "data", "cron"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "logs"), { recursive: true });
 
@@ -80,7 +80,7 @@ async function startForeground(): Promise<void> {
 
   // Copy missing workspace files (CONTINUITY.md, etc.)
   for (const file of ["CONTINUITY.md"]) {
-    const dest = join(TOMO_HOME, "workspace", file);
+    const dest = join(config.workspaceDir, file);
     const src = join(defaultsDir, file);
     if (!fileExists(dest) && fileExists(src)) {
       copyFileSync(src, dest);
@@ -90,7 +90,7 @@ async function startForeground(): Promise<void> {
   // Sync tomo- skills (always overwrite to pick up updates)
   const { rmSync } = await import("node:fs");
   const defaultSkillsDir = join(defaultsDir, "skills");
-  const targetSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
+  const targetSkillsDir = join(config.workspaceDir, ".claude", "skills");
   if (fileExists(defaultSkillsDir)) {
     mkdirSync(targetSkillsDir, { recursive: true });
     const expected = new Set<string>();

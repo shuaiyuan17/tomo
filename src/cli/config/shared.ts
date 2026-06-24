@@ -1,14 +1,16 @@
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
+import { defaultRuntimePaths } from "../../runtime-paths.js";
 
-export const TOMO_HOME = join(homedir(), ".tomo");
-export const CONFIG_PATH = join(TOMO_HOME, "config.json");
-export const CONFIG_BACKUP_PATH = join(TOMO_HOME, "config.json.bak");
-export const SESSIONS_DIR = join(TOMO_HOME, "data", "sessions");
-export const LOG_PATH = join(TOMO_HOME, "logs", "tomo.log");
+const paths = defaultRuntimePaths;
+export const TOMO_HOME = paths.tomoHome;
+export const CONFIG_PATH = paths.configPath;
+export const CONFIG_BACKUP_PATH = paths.configBackupPath;
+export const SESSIONS_DIR = paths.sessionsDir;
+export const SDK_SESSIONS_DIR = paths.sdkSessionsDir;
+export const LOG_PATH = join(paths.logsDir, "tomo.log");
 
 export const MODELS = MODEL_ALIASES;
 

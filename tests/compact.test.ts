@@ -3,7 +3,7 @@ import { compactSession, readSinceOffset, readWholeFile } from "../src/lcm/compa
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import {
   writeFileSync, mkdirSync, unlinkSync, existsSync, appendFileSync, readFileSync, statSync,
-  openSync, writeSync, closeSync,
+  openSync, writeSync, closeSync, rmSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -170,18 +170,18 @@ describe("compactSession", () => {
   let sessionId: string;
   let path: string;
   let archivePath: string;
+  let sdkSessionsDir: string;
 
   beforeEach(() => {
     sessionId = `test-compact-${randomUUID()}`;
-    path = getSdkSessionPath(sessionId);
+    sdkSessionsDir = join(tmpdir(), `tomo-test-compact-sdk-${randomUUID()}`);
+    path = getSdkSessionPath(sessionId, sdkSessionsDir);
     archivePath = join(tmpdir(), `archive-${sessionId}.jsonl`);
   });
 
   afterEach(() => {
-    if (existsSync(path)) unlinkSync(path);
+    rmSync(sdkSessionsDir, { recursive: true, force: true });
     if (existsSync(archivePath)) unlinkSync(archivePath);
-    const trigger = path.replace(".jsonl", ".compact-trigger");
-    if (existsSync(trigger)) unlinkSync(trigger);
     const tmp = path + ".compacting.tmp";
     if (existsSync(tmp)) unlinkSync(tmp);
   });
@@ -202,6 +202,7 @@ describe("compactSession", () => {
 
     const result = compactSession({
       sdkSessionId: sessionId,
+      sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
       summary: "compacted middle",
@@ -249,6 +250,7 @@ describe("compactSession", () => {
 
     const result = compactSession({
       sdkSessionId: sessionId,
+      sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
       summary: "should not be applied",
@@ -281,6 +283,7 @@ describe("compactSession", () => {
 
     const result = compactSession({
       sdkSessionId: sessionId,
+      sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
       summary: "removed tool chain",
@@ -310,6 +313,7 @@ describe("compactSession", () => {
 
     const result = compactSession({
       sdkSessionId: sessionId,
+      sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
       summary: "removed tool chain",
@@ -350,6 +354,7 @@ describe("compactSession", () => {
     let sdkFd: number | null = null;
     const result = compactSession({
       sdkSessionId: sessionId,
+      sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
       summary: "removed tool chain",

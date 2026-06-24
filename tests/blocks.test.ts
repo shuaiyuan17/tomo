@@ -7,12 +7,29 @@ vi.mock("../src/config.js", () => ({
   config: { lcm: { dailyFreshTail: 32, globalFreshTail: false } },
 }));
 
-import { resolveBlockRange, findDuePromotions, isWarmTailCandidate, globalFreshTailStartIdx } from "../src/lcm/blocks.js";
+import {
+  resolveBlockRange as resolveBlockRangeImpl,
+  findDuePromotions as findDuePromotionsImpl,
+  isWarmTailCandidate,
+  globalFreshTailStartIdx,
+  type BlockLevel,
+} from "../src/lcm/blocks.js";
 import { config as mockedConfig } from "../src/config.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+
+const SDK_SESSIONS_DIR = join(tmpdir(), `tomo-test-blocks-sdk-${process.pid}`);
+
+function resolveBlockRange(sessionId: string, level: BlockLevel, period?: string) {
+  return resolveBlockRangeImpl(sessionId, level, period, SDK_SESSIONS_DIR);
+}
+
+function findDuePromotions(sessionId: string) {
+  return findDuePromotionsImpl(sessionId, SDK_SESSIONS_DIR);
+}
 
 // Build a fake user/assistant event with a local-tz timestamp for a given day.
 function mkEvent(day: string, hour: number, role: "user" | "assistant", extra: Record<string, any> = {}) {
@@ -42,7 +59,7 @@ function mkTextEvent(day: string, hour: number, role: "user" | "assistant", text
 }
 
 function writeArchive(sessionId: string, events: any[]): string {
-  const path = getSdkSessionPath(sessionId);
+  const path = getSdkSessionPath(sessionId, SDK_SESSIONS_DIR);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
   return path;

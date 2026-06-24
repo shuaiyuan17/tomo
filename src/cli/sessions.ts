@@ -1,10 +1,6 @@
 import { Command } from "commander";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import { SessionStore } from "../sessions/store.js";
-
-const TOMO_HOME = join(homedir(), ".tomo");
-const SESSIONS_DIR = join(TOMO_HOME, "data", "sessions");
+import { config } from "../config.js";
 
 export const sessionsCommand = new Command("sessions")
   .description("Manage chat sessions");
@@ -13,7 +9,7 @@ sessionsCommand
   .command("list")
   .description("List all sessions")
   .action(() => {
-    const store = new SessionStore(SESSIONS_DIR, 0);
+    const store = new SessionStore(config.sessionsDir, 0, config.sdkSessionsDir);
     const entries = store.listAllSessions();
 
     if (entries.length === 0) {
@@ -68,7 +64,7 @@ sessionsCommand
   .command("clear [key]")
   .description("Unlink a session (or all sessions)")
   .action((key) => {
-    const store = new SessionStore(SESSIONS_DIR, 0);
+    const store = new SessionStore(config.sessionsDir, 0, config.sdkSessionsDir);
 
     if (key) {
       // getEntry (not getSdkSessionId) so metadata-only stubs are clearable too

@@ -1,6 +1,5 @@
 import { mkdirSync, appendFileSync, readFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { log } from "../logger.js";
 import { readJsonlFileSync } from "../jsonl.js";
@@ -13,18 +12,12 @@ interface PendingNotesFile {
   notes: Record<string, string[]>;
 }
 
-/** Where the SDK stores its JSONL session files */
-export function getSdkSessionDir(): string {
-  const home = homedir();
-  const workspacePath = join(home, ".tomo", "workspace");
-  // SDK encodes: replace / and . with -
-  const encoded = workspacePath.replace(/[/.]/g, "-");
-  return join(home, ".claude", "projects", encoded);
-}
-
 /** Get the full path to an SDK session JSONL file */
-export function getSdkSessionPath(sessionId: string): string {
-  return join(getSdkSessionDir(), `${sessionId}.jsonl`);
+export function getSdkSessionPath(
+  sessionId: string,
+  sdkSessionsDir: string,
+): string {
+  return join(sdkSessionsDir, `${sessionId}.jsonl`);
 }
 
 export class SessionStore {
@@ -32,10 +25,19 @@ export class SessionStore {
   private registry: SessionEntry[] = [];
   private dir: string;
   private historyLimit: number;
+  private sdkSessionsDir: string;
 
-  constructor(dir: string, historyLimit: number) {
+  constructor(
+    dir: string,
+    historyLimit: number,
+    sdkSessionsDir: string,
+  ) {
+    if (!sdkSessionsDir) {
+      throw new Error("SessionStore requires an explicit SDK sessions directory");
+    }
     this.dir = dir;
     this.historyLimit = historyLimit;
+    this.sdkSessionsDir = sdkSessionsDir;
     mkdirSync(dir, { recursive: true });
     this.loadRegistry();
     this.cleanupExpired();
@@ -433,7 +435,7 @@ export class SessionStore {
   /** Delete expired unlinked sessions and their SDK JSONL files */
   private cleanupExpired(): void {
     const now = Date.now();
-    const sdkDir = getSdkSessionDir();
+    const sdkDir = this.sdkSessionsDir;
     const expired = this.registry.filter((e) => e.expiresAt !== null && e.expiresAt <= now);
     const deletedFiles = new Set<string>();
 

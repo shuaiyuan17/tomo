@@ -123,7 +123,7 @@ export class Agent {
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
-    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit);
+    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir);
     const summons = new SummonStore(
       join(config.tomoHome, "data", "summons.json"),
       config.summonExpiryMinutes * 60_000,
@@ -404,7 +404,11 @@ export class Agent {
 
     const resumeId = this.sessions.getSdkSessionId(key);
     if (resumeId) {
-      const repair = repairSdkSessionForResume(resumeId, this.sessions.get(key).messages);
+      const repair = repairSdkSessionForResume(
+        resumeId,
+        this.sessions.get(key).messages,
+        config.sdkSessionsDir,
+      );
       if (repair.error) {
         log.warn({ key, sessionId: resumeId, error: repair.error }, "Could not repair SDK session before resume");
       }
@@ -937,7 +941,7 @@ export class Agent {
       // turn. With steering, a promoted steered turn may already be running
       // on this session — closing now would kill it, so defer the reload
       // until the session is truly idle.
-      if (sid && checkAndClearCompactTrigger(sid)) {
+      if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
         if (session.isBusy()) {
           void session.waitForIdle().then(() => {
             if (this.liveSessions.get(key) === session) {

@@ -3,6 +3,7 @@ import type { Agent } from "../agent.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
 import { findDuePromotions, type DuePromotion } from "./blocks.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
+import { config } from "../config.js";
 
 /**
  * Periodic rollup promotion checker.
@@ -97,7 +98,7 @@ export class RollupRunner {
       // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
       if (!usesLcmCompact(sessionKey)) continue;
       try {
-        const due = findDuePromotions(sdkSessionId);
+        const due = findDuePromotions(sdkSessionId, config.sdkSessionsDir);
         if (due.length === 0) continue;
 
         // Debounce — filter out ones we nudged recently

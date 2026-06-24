@@ -1,13 +1,11 @@
 import { Command } from "commander";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { disableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
-const TOMO_HOME = join(homedir(), ".tomo");
-const PID_FILE = join(TOMO_HOME, "tomo.pid");
+const PID_FILE = defaultRuntimePaths.pidFile;
 
 export const uninstallCommand = new Command("uninstall")
   .description("Stop Tomo and remove the login-item (keeps your data)")

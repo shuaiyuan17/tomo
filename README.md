@@ -60,6 +60,7 @@ tomo sessions clear    # Reset all sessions
 | `/new` | Start a new conversation (resets session) |
 | `/model` | Switch model (Claude aliases or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
+| `/login` | Refresh Claude login from a configured owner's private DM |
 | `/status` | Show session info (model, channel, message count) |
 | `/pet` | Check Tomo's pet's mood, growth stage, and stats |
 

@@ -209,6 +209,9 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (useGateway && litellm) {
     env.ANTHROPIC_BASE_URL = litellm.baseUrl;
+    // Never forward a direct Anthropic credential inherited by the daemon to
+    // a gateway. Only the gateway's explicitly configured key belongs here.
+    delete env.ANTHROPIC_API_KEY;
     if (litellm.apiKey) {
       env.ANTHROPIC_API_KEY = litellm.apiKey;
     }

@@ -1487,6 +1487,47 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("does not forward a parent Anthropic API key to a gateway without its own key", async () => {
+    const oldApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "sk-anthropic-parent";
+    let agent: InstanceType<typeof Agent> | null = null;
+    try {
+      resetConfig({
+        auth: {
+          method: "api-key",
+          apiKey: "sk-anthropic-parent",
+          apiKeySource: "environment",
+          error: null,
+        },
+        litellm: {
+          mode: "anthropic-compatible",
+          baseUrl: "http://localhost:4000",
+          apiKey: "",
+        },
+      });
+      agent = new Agent();
+      const tg = new MockChannel("telegram");
+      agent.addChannel(tg);
+
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+      await drainQueue(agent);
+
+      const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
+      const lastCall = calls[calls.length - 1]?.[0] as {
+        options?: { env?: Record<string, string | undefined> };
+      };
+      expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+      expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+    } finally {
+      if (oldApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = oldApiKey;
+      }
+      await agent?.stop();
+    }
+  });
+
   it("passes a configured Anthropic API key to direct Claude sessions", async () => {
     resetConfig({
       auth: {

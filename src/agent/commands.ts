@@ -344,11 +344,21 @@ export class ChatCommandHandler {
         return;
       }
 
-      await this.claudeLogin.complete(identity.name, arg);
-      const reason = "Claude login refreshed via owner DM";
+      const completion = await this.claudeLogin.complete(identity.name, arg);
+      const reason = completion.verified
+        ? "Claude login refreshed via owner DM"
+        : "Claude login refreshed via owner DM; verification probe failed";
       mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
       writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
-      await channel.send({ chatId, text: "Claude login verified. Restarting Tomo..." });
+      await channel.send({
+        chatId,
+        text: completion.verified
+          ? "Claude login verified. Restarting Tomo..."
+          : [
+            "[warning] Claude credentials were saved, but the verification probe failed. Restarting Tomo...",
+            completion.verificationError ? `\n${completion.verificationError}` : "",
+          ].join(""),
+      });
       this.scheduleRestart();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);

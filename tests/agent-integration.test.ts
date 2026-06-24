@@ -1506,7 +1506,7 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     const fakeLogin = {
       start: vi.fn(async () => ({ url: "https://claude.com/login?state=test", reused: false })),
-      complete: vi.fn(async () => {}),
+      complete: vi.fn(async () => ({ verified: true })),
       cancel: vi.fn(() => false),
       stop: vi.fn(),
     };
@@ -1526,6 +1526,43 @@ describe("chat commands", () => {
     expect(fakeLogin.complete).toHaveBeenCalledWith("shuai", "secret-code#test");
     expect(tg.sent[1].text).toBe("Claude login verified. Restarting Tomo...");
     expect(readFileSync(restartReasonFilePath, "utf-8")).toContain("Claude login refreshed");
+
+    await agent.stop();
+  });
+
+  it("/login distinguishes a saved login from a failed verification probe and still restarts", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const fakeLogin = {
+      start: vi.fn(),
+      complete: vi.fn(async () => ({
+        verified: false,
+        verificationError: "Claude login verification failed: network unavailable",
+      })),
+      cancel: vi.fn(() => false),
+      stop: vi.fn(),
+    };
+    const scheduleRestart = vi.fn();
+    const internals = agent as unknown as {
+      commands: {
+        claudeLogin: typeof fakeLogin;
+        scheduleRestart: typeof scheduleRestart;
+      };
+    };
+    internals.commands.claudeLogin = fakeLogin;
+    internals.commands.scheduleRestart = scheduleRestart;
+
+    await tg.simulateCommand("login", "12345", "Shuai", "secret-code#test", "12345");
+
+    expect(tg.sent[0].text).toContain("credentials were saved");
+    expect(tg.sent[0].text).toContain("verification probe failed");
+    expect(tg.sent[0].text).toContain("network unavailable");
+    expect(readFileSync(restartReasonFilePath, "utf-8")).toContain("verification probe failed");
+    expect(scheduleRestart).toHaveBeenCalledOnce();
 
     await agent.stop();
   });

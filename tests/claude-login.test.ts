@@ -52,10 +52,34 @@ describe("ClaudeLoginManager", () => {
     await expect(manager.complete("shuai", "one-time-code#wrong-state"))
       .rejects.toThrow("does not match");
 
-    await manager.complete("SHUAI", "one-time-code#test-state");
+    await expect(manager.complete("SHUAI", "one-time-code#test-state"))
+      .resolves.toEqual({ verified: true });
 
     expect(submitted).toBe("one-time-code#test-state\n");
     expect(verifyLogin).toHaveBeenCalledOnce();
+  });
+
+  it("reports a probe failure separately after the CLI saves credentials", async () => {
+    const fake = fakeLoginProcess();
+    const manager = new ClaudeLoginManager({
+      spawnLogin: () => fake.child,
+      verifyLogin: async () => {
+        throw new Error("verification network unavailable");
+      },
+      timeoutMs: 1_000,
+    });
+    fake.stdin.on("finish", () => {
+      fake.child.emit("exit", 0, null);
+    });
+
+    const startPromise = manager.start("shuai");
+    fake.stdout.write(`${LOGIN_URL}\n`);
+    await startPromise;
+
+    await expect(manager.complete("shuai", "one-time-code#test-state")).resolves.toEqual({
+      verified: false,
+      verificationError: "verification network unavailable",
+    });
   });
 
   it("reuses the active owner's URL and rejects a different owner", async () => {

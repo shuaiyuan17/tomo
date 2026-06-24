@@ -29,6 +29,11 @@ export interface ClaudeLoginStart {
   reused: boolean;
 }
 
+export interface ClaudeLoginCompletion {
+  verified: boolean;
+  verificationError?: string;
+}
+
 /**
  * Owns the single machine-global Claude OAuth flow. The PKCE verifier lives in
  * the waiting `claude auth login` child, so the process must stay alive between
@@ -135,7 +140,7 @@ export class ClaudeLoginManager {
     return { url: await urlPromise, reused: false };
   }
 
-  async complete(owner: string, code: string): Promise<void> {
+  async complete(owner: string, code: string): Promise<ClaudeLoginCompletion> {
     const pending = this.pending;
     if (!pending) throw new Error("No Claude login is waiting; send /login first");
     if (pending.owner !== owner.toLowerCase()) {
@@ -157,7 +162,15 @@ export class ClaudeLoginManager {
     pending.codeSubmitted = true;
     pending.child.stdin.end(`${trimmed}\n`);
     await pending.completionPromise;
-    await this.verifyLogin();
+    try {
+      await this.verifyLogin();
+      return { verified: true };
+    } catch (err) {
+      return {
+        verified: false,
+        verificationError: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   cancel(owner: string): boolean {

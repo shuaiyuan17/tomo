@@ -9,6 +9,7 @@ import {
   type ContinuityScriptConfig,
 } from "./continuity-script.js";
 import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } from "./continuity-defaults.js";
+import { parseAnthropicAuthConfig, type AnthropicAuthConfig } from "./auth.js";
 
 const HOME = homedir();
 export const TOMO_HOME = join(HOME, ".tomo");
@@ -54,7 +55,9 @@ export interface LiteLlmConfig {
   apiKey: string;
 }
 
-interface TomoConfig {
+export interface TomoConfig {
+  /** Anthropic authentication used for direct Claude model sessions. */
+  auth: AnthropicAuthConfig;
   telegramToken: string;
   model: string;
   workspaceDir: string;
@@ -302,6 +305,7 @@ function buildConfig(): TomoConfig {
   const model = (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string;
 
   return {
+    auth: parseAnthropicAuthConfig(file.auth),
     telegramToken,
     model,
     workspaceDir: process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace"),
@@ -340,6 +344,11 @@ function buildConfig(): TomoConfig {
 }
 
 export const config = buildConfig();
+
+/** Validate Anthropic auth at daemon startup without blocking config repair commands. */
+export function assertAuthConfigured(cfg: Pick<TomoConfig, "auth"> = config): void {
+  if (cfg.auth.error) throw new Error(cfg.auth.error);
+}
 
 /**
  * Validate that at least one channel is configured. Called at daemon startup —

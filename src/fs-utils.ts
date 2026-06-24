@@ -20,13 +20,14 @@ export function writeFileAtomicSync(path: string, content: string, opts?: { mode
   }
 }
 
-export function writeJsonAtomicSync(path: string, value: unknown): void {
-  writeFileAtomicSync(path, `${JSON.stringify(value, null, 2)}\n`);
+export function writeJsonAtomicSync(path: string, value: unknown, opts?: { mode?: number }): void {
+  writeFileAtomicSync(path, `${JSON.stringify(value, null, 2)}\n`, opts);
 }
 
-export function backupFileIfExistsSync(path: string, backupPath: string): void {
+export function backupFileIfExistsSync(path: string, backupPath: string, opts?: { mode?: number }): void {
   if (!existsSync(path)) return;
   copyFileSync(path, backupPath);
+  if (opts?.mode !== undefined) chmodSync(backupPath, opts.mode);
 }
 
 function fileMode(path: string): number | undefined {

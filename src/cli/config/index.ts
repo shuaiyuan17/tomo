@@ -12,6 +12,7 @@ import { configGroups } from "./groups.js";
 import { configSessions } from "./sessions.js";
 import { configCostAnalysis } from "./costs.js";
 import { configLiteLlm } from "./litellm.js";
+import { configAnthropicAuth } from "./auth.js";
 
 export const configCommand = new Command("config")
   .description("Interactive configuration")
@@ -27,6 +28,7 @@ export const configCommand = new Command("config")
 
     for (;;) {
       const options: Array<{ value: string; label: string; hint?: string }> = [
+        { value: "auth", label: "Anthropic authentication", hint: "Claude subscription or API key" },
         { value: "model", label: "Model", hint: "set default model" },
         { value: "litellm", label: "LiteLLM gateway", hint: "ChatGPT subscription or custom proxy" },
         { value: "channels", label: "Channels", hint: "manage channel connections" },
@@ -52,6 +54,7 @@ export const configCommand = new Command("config")
       if (p.isCancel(choice) || choice === "exit") break;
 
       if (choice === "model") await configModel();
+      if (choice === "auth") await configAnthropicAuth();
       if (choice === "litellm") await configLiteLlm();
       if (choice === "channels") await configChannels();
       if (choice === "identities") await configIdentities();

@@ -9,13 +9,13 @@ import { log } from "../logger.js";
 import { parseJsonl } from "../jsonl.js";
 
 /** Path to the compact trigger file for a given session */
-export function getCompactTriggerPath(sdkSessionId: string): string {
-  return join(getSdkSessionDir(), `${sdkSessionId}.compact-trigger`);
+export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir?: string): string {
+  return join(sdkSessionsDir ?? getSdkSessionDir(), `${sdkSessionId}.compact-trigger`);
 }
 
 /** Check if a compact happened and clear the trigger */
-export function checkAndClearCompactTrigger(sdkSessionId: string): boolean {
-  const triggerPath = getCompactTriggerPath(sdkSessionId);
+export function checkAndClearCompactTrigger(sdkSessionId: string, sdkSessionsDir?: string): boolean {
+  const triggerPath = getCompactTriggerPath(sdkSessionId, sdkSessionsDir);
   if (existsSync(triggerPath)) {
     unlinkSync(triggerPath);
     return true;
@@ -26,6 +26,8 @@ export function checkAndClearCompactTrigger(sdkSessionId: string): boolean {
 export interface CompactRequest {
   /** SDK session ID to compact */
   sdkSessionId: string;
+  /** Claude SDK project directory derived from the configured workspace. */
+  sdkSessionsDir?: string;
   /** Start index in the event list (inclusive, 0-based among user/assistant events) */
   fromIdx: number;
   /** End index in the event list (inclusive) */
@@ -75,7 +77,7 @@ interface SdkEvent {
  * summary message, fixes the parentUuid chain, and archives the originals.
  */
 export function compactSession(req: CompactRequest): CompactResult {
-  const path = getSdkSessionPath(req.sdkSessionId);
+  const path = getSdkSessionPath(req.sdkSessionId, req.sdkSessionsDir);
   if (!existsSync(path)) {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
@@ -309,7 +311,7 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   }
 
   // Write trigger file so the harness knows to reload the session
-  writeFileSync(getCompactTriggerPath(req.sdkSessionId), new Date().toISOString());
+  writeFileSync(getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir), new Date().toISOString());
 
   const eventsRemoved = removeSet.size;
   const eventsAfter = newEvents.length + postRenameDrain.appended;

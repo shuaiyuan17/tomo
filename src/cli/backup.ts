@@ -12,9 +12,9 @@ import {
   statSync,
 } from "node:fs";
 import { createInterface } from "node:readline";
-import { getSdkSessionDir } from "../sessions/store.js";
+import { config } from "../config.js";
 
-const TOMO_HOME = join(homedir(), ".tomo");
+const TOMO_HOME = config.tomoHome;
 const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
 const RETENTION_DAYS = 14;
 
@@ -133,7 +133,7 @@ backupCommand
     }
 
     // 2. workspace/ (excluding .claude/)
-    const workspaceSrc = join(TOMO_HOME, "workspace");
+    const workspaceSrc = config.workspaceDir;
     const workspaceDest = join(tmpDest, "workspace");
     if (copyIfExists(workspaceSrc, workspaceDest, {
       filter: (src) => !src.includes(`${sep}.claude${sep}`) && !src.endsWith(`${sep}.claude`),
@@ -162,7 +162,7 @@ backupCommand
     }
 
     // 4. SDK session files
-    const sdkDir = getSdkSessionDir();
+    const sdkDir = config.sdkSessionsDir;
     const sdkDest = join(tmpDest, "sdk-sessions");
     if (copyIfExists(sdkDir, sdkDest)) {
       console.log("  [ok] sdk-sessions/");
@@ -254,7 +254,7 @@ backupCommand
     // 2. workspace/ (preserve .claude/ which is populated by init/start)
     const workspaceSrc = join(backupPath, "workspace");
     if (existsSync(workspaceSrc)) {
-      const workspaceDest = join(TOMO_HOME, "workspace");
+      const workspaceDest = config.workspaceDir;
       const claudeDir = join(workspaceDest, ".claude");
       // Park the live .claude OUTSIDE the workspace tree — anywhere inside
       // workspaceDest would be deleted by the rmSync below.
@@ -301,7 +301,7 @@ backupCommand
     // 4. SDK session files
     const sdkSrc = join(backupPath, "sdk-sessions");
     if (existsSync(sdkSrc)) {
-      const sdkDest = getSdkSessionDir();
+      const sdkDest = config.sdkSessionsDir;
       rmSync(sdkDest, { recursive: true, force: true });
       mkdirSync(sdkDest, { recursive: true });
       cpSync(sdkSrc, sdkDest, { recursive: true });

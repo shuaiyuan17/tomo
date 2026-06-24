@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { pruneTools } from "../src/lcm/prune-tools.js";
-import { getCompactTriggerPath } from "../src/lcm/compact.js";
+import { pruneTools as pruneToolsImpl, type PruneToolsRequest } from "../src/lcm/prune-tools.js";
+import { getCompactTriggerPath as getCompactTriggerPathImpl } from "../src/lcm/compact.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import {
-  writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, readFileSync,
+  writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, readFileSync, rmSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -57,15 +57,26 @@ describe("pruneTools", () => {
   let sessionId: string;
   let path: string;
   let archivePath: string;
+  let sdkSessionsDir: string;
+
+  function pruneTools(req: PruneToolsRequest) {
+    return pruneToolsImpl({ ...req, sdkSessionsDir });
+  }
+
+  function getCompactTriggerPath(id: string) {
+    return getCompactTriggerPathImpl(id, sdkSessionsDir);
+  }
 
   beforeEach(() => {
     sessionId = `test-prune-${randomUUID()}`;
-    path = getSdkSessionPath(sessionId);
+    sdkSessionsDir = join(tmpdir(), `tomo-test-prune-sdk-${randomUUID()}`);
+    path = getSdkSessionPath(sessionId, sdkSessionsDir);
     archivePath = join(tmpdir(), `archive-${sessionId}.jsonl`);
   });
 
   afterEach(() => {
-    for (const p of [path, archivePath, getCompactTriggerPath(sessionId)]) {
+    rmSync(sdkSessionsDir, { recursive: true, force: true });
+    for (const p of [archivePath]) {
       if (existsSync(p)) unlinkSync(p);
     }
   });

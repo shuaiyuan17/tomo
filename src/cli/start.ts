@@ -64,9 +64,9 @@ async function startForeground(): Promise<void> {
 
   // Ensure directories exist (handles upgrades where new dirs were added)
   const { mkdirSync } = await import("node:fs");
-  mkdirSync(join(TOMO_HOME, "workspace", "tmp"), { recursive: true });
-  mkdirSync(join(TOMO_HOME, "workspace", "memory"), { recursive: true });
-  mkdirSync(join(TOMO_HOME, "workspace", "memory", "journal"), { recursive: true });
+  mkdirSync(join(config.workspaceDir, "tmp"), { recursive: true });
+  mkdirSync(join(config.workspaceDir, "memory"), { recursive: true });
+  mkdirSync(join(config.workspaceDir, "memory", "journal"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "data", "cron"), { recursive: true });
   mkdirSync(join(TOMO_HOME, "logs"), { recursive: true });
 
@@ -80,7 +80,7 @@ async function startForeground(): Promise<void> {
 
   // Copy missing workspace files (CONTINUITY.md, etc.)
   for (const file of ["CONTINUITY.md"]) {
-    const dest = join(TOMO_HOME, "workspace", file);
+    const dest = join(config.workspaceDir, file);
     const src = join(defaultsDir, file);
     if (!fileExists(dest) && fileExists(src)) {
       copyFileSync(src, dest);
@@ -90,7 +90,7 @@ async function startForeground(): Promise<void> {
   // Sync tomo- skills (always overwrite to pick up updates)
   const { rmSync } = await import("node:fs");
   const defaultSkillsDir = join(defaultsDir, "skills");
-  const targetSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
+  const targetSkillsDir = join(config.workspaceDir, ".claude", "skills");
   if (fileExists(defaultSkillsDir)) {
     mkdirSync(targetSkillsDir, { recursive: true });
     const expected = new Set<string>();

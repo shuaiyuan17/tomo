@@ -1,10 +1,10 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
-import { loadConfig, saveConfig, modelLabel, SESSIONS_DIR } from "./shared.js";
+import { loadConfig, saveConfig, modelLabel, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 import { promptForModel } from "./model-picker.js";
 
 export async function configSessions(): Promise<void> {
-  const store = new SessionStore(SESSIONS_DIR, 0);
+  const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
   const entries = store.listAllSessions().filter((e) => e.unlinkedAt === null);
   const cfg = loadConfig();
   const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;

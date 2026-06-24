@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { SessionStore } from "../src/sessions/store.js";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -84,6 +84,29 @@ describe("SessionStore", () => {
     expect(all[0].unlinkedAt).toBeTruthy();
     expect(all[0].expiresAt).toBeTruthy();
     expect(all[0].expiresAt! - all[0].unlinkedAt!).toBe(30 * 24 * 60 * 60 * 1000);
+  });
+
+  it("cleans expired SDK files from the injected SDK sessions directory", () => {
+    const sdkSessionsDir = join(TEST_DIR, "custom-sdk-sessions");
+    mkdirSync(sdkSessionsDir, { recursive: true });
+    const sdkFile = join(sdkSessionsDir, "expired-session.jsonl");
+    writeFileSync(sdkFile, "{}\n");
+    writeFileSync(join(TEST_DIR, "_sessions.json"), JSON.stringify({
+      version: 1,
+      sessions: [{
+        sdkSessionId: "expired-session",
+        channelKey: "dm:expired",
+        createdAt: 1,
+        lastActiveAt: 1,
+        unlinkedAt: 1,
+        expiresAt: 1,
+      }],
+    }));
+
+    const store = new SessionStore(TEST_DIR, 20, sdkSessionsDir);
+
+    expect(existsSync(sdkFile)).toBe(false);
+    expect(store.listAllSessions()).toEqual([]);
   });
 
   it("lists only active sessions", () => {

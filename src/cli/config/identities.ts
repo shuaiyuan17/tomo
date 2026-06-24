@@ -1,7 +1,7 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
 import { CronStore } from "../../cron/store.js";
-import { loadConfig, saveConfig, SESSIONS_DIR } from "./shared.js";
+import { loadConfig, saveConfig, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 
 export async function configIdentities(): Promise<void> {
   const cfg = loadConfig();
@@ -210,7 +210,7 @@ async function resolveUnifiedSession(identity: {
   name: string;
   channels: Record<string, string>;
 }): Promise<void> {
-  const store = new SessionStore(SESSIONS_DIR, 0);
+  const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
   const unifiedKey = `dm:${identity.name.toLowerCase()}`;
 
   if (store.getSdkSessionId(unifiedKey)) return; // already unified
@@ -281,7 +281,7 @@ function formatAge(ms: number): string {
 
 /** Pick a chat ID for a channel — shows existing sessions as selectable options, with fallback to manual input. Returns null if cancelled, empty string to skip. */
 async function pickChatId(channelName: string, currentValue?: string): Promise<string | null> {
-  const store = new SessionStore(SESSIONS_DIR, 20);
+  const store = new SessionStore(SESSIONS_DIR, 20, SDK_SESSIONS_DIR);
   const allSessions = store.listAllSessions().filter((e) => e.unlinkedAt === null);
 
   // Find sessions for this channel (non-group DMs)

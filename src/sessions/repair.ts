@@ -16,8 +16,12 @@ export interface SdkSessionRepairResult {
   error?: string;
 }
 
-export function repairSdkSessionForResume(sessionId: string, transcript?: SessionMessage[]): SdkSessionRepairResult {
-  return repairSdkSessionFile(getSdkSessionPath(sessionId), transcript);
+export function repairSdkSessionForResume(
+  sessionId: string,
+  transcript?: SessionMessage[],
+  sdkSessionsDir?: string,
+): SdkSessionRepairResult {
+  return repairSdkSessionFile(getSdkSessionPath(sessionId, sdkSessionsDir), transcript);
 }
 
 export function repairSdkSessionFile(path: string, transcript: SessionMessage[] = []): SdkSessionRepairResult {

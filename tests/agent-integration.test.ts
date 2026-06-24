@@ -210,6 +210,7 @@ const { mockConfig } = vi.hoisted(() => ({
     model: "claude-sonnet-4-6[1m]",
     workspaceDir: "",
     sessionsDir: "",
+    sdkSessionsDir: "",
     historyLimit: 20,
     logsDir: "",
     tomoHome: "",
@@ -387,6 +388,7 @@ function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
   Object.assign(mockConfig, {
     ...DEFAULT_CONFIG_VALUES,
     sessionsDir: join(tmpDir, "sessions"),
+    sdkSessionsDir: join(tmpDir, "sdk-sessions"),
     workspaceDir: join(tmpDir, "workspace"),
     logsDir: join(tmpDir, "logs"),
     tomoHome: tmpDir,

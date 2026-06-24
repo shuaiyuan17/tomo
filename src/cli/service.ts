@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,8 +15,7 @@ export const LAUNCH_AGENT_PLIST_PATH = join(
   `${LAUNCH_AGENT_LABEL}.plist`,
 );
 
-const TOMO_HOME = join(homedir(), ".tomo");
-const PID_FILE = join(TOMO_HOME, "tomo.pid");
+const PID_FILE = defaultRuntimePaths.pidFile;
 
 export function isMacOS(): boolean {
   return process.platform === "darwin";

@@ -18,8 +18,8 @@ export interface SdkSessionRepairResult {
 
 export function repairSdkSessionForResume(
   sessionId: string,
-  transcript?: SessionMessage[],
-  sdkSessionsDir?: string,
+  transcript: SessionMessage[] | undefined,
+  sdkSessionsDir: string,
 ): SdkSessionRepairResult {
   return repairSdkSessionFile(getSdkSessionPath(sessionId, sdkSessionsDir), transcript);
 }

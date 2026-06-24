@@ -13,7 +13,7 @@ describe("IdentityRouter", () => {
 
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
-    sessions = new SessionStore(TEST_DIR, 20);
+    sessions = new SessionStore(TEST_DIR, 20, join(TEST_DIR, "sdk-sessions"));
   });
 
   afterEach(() => {

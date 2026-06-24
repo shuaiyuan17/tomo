@@ -13,7 +13,7 @@ describe("runtime paths", () => {
   });
 
   it("keeps all default Tomo paths rooted under the selected home", () => {
-    const paths = createRuntimePaths({ homeDir: "/Users/tester" });
+    const paths = createRuntimePaths({ homeDir: "/Users/tester", env: {} });
 
     expect(paths.tomoHome).toBe("/Users/tester/.tomo");
     expect(paths.workspaceDir).toBe("/Users/tester/.tomo/workspace");
@@ -24,6 +24,27 @@ describe("runtime paths", () => {
   it("resolves relative workspaces before encoding the SDK project path", () => {
     expect(sdkSessionsDirForWorkspace("custom-workspace", "/Users/tester")).toBe(
       join("/Users/tester", ".claude", "projects", resolve("custom-workspace").replace(/[/.]/g, "-")),
+    );
+  });
+
+  it("owns and normalizes workspace/session environment overrides", () => {
+    const paths = createRuntimePaths({
+      homeDir: "/Users/tester",
+      env: {
+        TOMO_WORKSPACE: "relative-workspace/",
+        SESSIONS_DIR: "relative-sessions/",
+      },
+    });
+
+    expect(paths.workspaceDir).toBe(resolve("relative-workspace"));
+    expect(paths.sessionsDir).toBe(resolve("relative-sessions"));
+    expect(paths.sdkSessionsDir).toBe(
+      join(
+        "/Users/tester",
+        ".claude",
+        "projects",
+        resolve("relative-workspace").replace(/[/.]/g, "-"),
+      ),
     );
   });
 });

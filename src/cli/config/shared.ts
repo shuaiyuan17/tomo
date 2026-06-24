@@ -1,15 +1,10 @@
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
-import { createRuntimePaths, defaultRuntimePaths } from "../../runtime-paths.js";
+import { defaultRuntimePaths } from "../../runtime-paths.js";
 
-const paths = createRuntimePaths({
-  homeDir: homedir(),
-  workspaceDir: process.env.TOMO_WORKSPACE ?? defaultRuntimePaths.workspaceDir,
-  sessionsDir: process.env.SESSIONS_DIR ?? defaultRuntimePaths.sessionsDir,
-});
+const paths = defaultRuntimePaths;
 export const TOMO_HOME = paths.tomoHome;
 export const CONFIG_PATH = paths.configPath;
 export const CONFIG_BACKUP_PATH = paths.configBackupPath;

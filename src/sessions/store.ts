@@ -4,7 +4,6 @@ import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarge
 import { log } from "../logger.js";
 import { readJsonlFileSync } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
-import { defaultRuntimePaths, sdkSessionsDirForWorkspace } from "../runtime-paths.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
@@ -13,18 +12,10 @@ interface PendingNotesFile {
   notes: Record<string, string[]>;
 }
 
-/** Where the SDK stores its JSONL session files */
-export function getSdkSessionDir(
-  workspaceDir = defaultRuntimePaths.workspaceDir,
-  homeDir = defaultRuntimePaths.homeDir,
-): string {
-  return sdkSessionsDirForWorkspace(workspaceDir, homeDir);
-}
-
 /** Get the full path to an SDK session JSONL file */
 export function getSdkSessionPath(
   sessionId: string,
-  sdkSessionsDir = defaultRuntimePaths.sdkSessionsDir,
+  sdkSessionsDir: string,
 ): string {
   return join(sdkSessionsDir, `${sessionId}.jsonl`);
 }
@@ -39,8 +30,11 @@ export class SessionStore {
   constructor(
     dir: string,
     historyLimit: number,
-    sdkSessionsDir = defaultRuntimePaths.sdkSessionsDir,
+    sdkSessionsDir: string,
   ) {
+    if (!sdkSessionsDir) {
+      throw new Error("SessionStore requires an explicit SDK sessions directory");
+    }
     this.dir = dir;
     this.historyLimit = historyLimit;
     this.sdkSessionsDir = sdkSessionsDir;

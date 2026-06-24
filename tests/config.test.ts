@@ -40,4 +40,11 @@ describe("config", () => {
       sdkSessionsDir: expect.stringMatching(/\/\.claude\/projects\/-tmp-custom-tomo-workspace$/),
     });
   });
+
+  it("normalizes a relative TOMO_WORKSPACE once for every consumer", async () => {
+    await expect(loadWorkspacePaths("relative-workspace/")).resolves.toEqual({
+      workspaceDir: expect.stringMatching(/\/relative-workspace$/),
+      sdkSessionsDir: expect.stringMatching(/\/\.claude\/projects\/.*-relative-workspace$/),
+    });
+  });
 });

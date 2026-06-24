@@ -9,7 +9,7 @@ import {
 } from "./continuity-script.js";
 import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } from "./continuity-defaults.js";
 import { parseAnthropicAuthConfig, type AnthropicAuthConfig } from "./auth.js";
-import { createRuntimePaths, defaultRuntimePaths } from "./runtime-paths.js";
+import { defaultRuntimePaths } from "./runtime-paths.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -237,13 +237,7 @@ function parsePassiveGroups(channels: Record<string, Record<string, unknown>>): 
 
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
-  const paths = createRuntimePaths({
-    homeDir: HOME,
-    tomoHome: TOMO_HOME,
-    workspaceDir: process.env.TOMO_WORKSPACE ?? defaultRuntimePaths.workspaceDir,
-    sessionsDir: process.env.SESSIONS_DIR ?? defaultRuntimePaths.sessionsDir,
-    logsDir: defaultRuntimePaths.logsDir,
-  });
+  const paths = defaultRuntimePaths;
   const channels = (file.channels ?? {}) as Record<string, Record<string, unknown>>;
   const mcp = (file.mcp ?? {}) as Record<string, unknown>;
   const mcpServers = parseExternalMcpServers(file.mcpServers ?? mcp.servers);

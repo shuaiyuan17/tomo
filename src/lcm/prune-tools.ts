@@ -15,7 +15,7 @@ import { parseJsonl } from "../jsonl.js";
 export interface PruneToolsRequest {
   sdkSessionId: string;
   /** Claude SDK project directory derived from the configured workspace. */
-  sdkSessionsDir?: string;
+  sdkSessionsDir: string;
   /** Only prune results with content larger than this (default 500) */
   minSize?: number;
   /** Only prune these tool names (e.g. ["Read", "Bash"]). Prunes all if empty. */

@@ -15,6 +15,7 @@ export interface RuntimePaths {
 }
 
 export interface RuntimePathOptions {
+  env?: NodeJS.ProcessEnv;
   homeDir?: string;
   tomoHome?: string;
   workspaceDir?: string;
@@ -33,11 +34,16 @@ export function sdkSessionsDirForWorkspace(workspaceDir: string, homeDir = homed
 }
 
 export function createRuntimePaths(options: RuntimePathOptions = {}): RuntimePaths {
-  const homeDir = options.homeDir ?? homedir();
-  const tomoHome = options.tomoHome ?? join(homeDir, ".tomo");
-  const workspaceDir = options.workspaceDir ?? join(tomoHome, "workspace");
-  const sessionsDir = options.sessionsDir ?? join(tomoHome, "data", "sessions");
-  const logsDir = options.logsDir ?? join(tomoHome, "logs");
+  const env = options.env ?? process.env;
+  const homeDir = resolve(options.homeDir ?? homedir());
+  const tomoHome = resolve(options.tomoHome ?? join(homeDir, ".tomo"));
+  const workspaceDir = resolve(
+    options.workspaceDir ?? env.TOMO_WORKSPACE ?? join(tomoHome, "workspace"),
+  );
+  const sessionsDir = resolve(
+    options.sessionsDir ?? env.SESSIONS_DIR ?? join(tomoHome, "data", "sessions"),
+  );
+  const logsDir = resolve(options.logsDir ?? join(tomoHome, "logs"));
 
   return {
     homeDir,

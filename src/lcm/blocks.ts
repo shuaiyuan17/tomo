@@ -32,7 +32,7 @@ interface SdkEvent {
   [k: string]: any;
 }
 
-function loadEvents(sdkSessionId: string, sdkSessionsDir?: string): SdkEvent[] {
+function loadEvents(sdkSessionId: string, sdkSessionsDir: string): SdkEvent[] {
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return [];
   return readJsonlFileSync<SdkEvent>(path);
@@ -207,8 +207,8 @@ function warmSuffixParentPeriods(events: SdkEvent[], tailStart: number): {
 export function resolveBlockRange(
   sdkSessionId: string,
   level: BlockLevel,
-  period?: string,
-  sdkSessionsDir?: string,
+  period: string | undefined,
+  sdkSessionsDir: string,
 ): ResolvedRange | null {
   const events = loadEvents(sdkSessionId, sdkSessionsDir);
   if (events.length === 0) return null;
@@ -404,7 +404,7 @@ export interface DuePromotion {
   childCount: number;
 }
 
-export function findDuePromotions(sdkSessionId: string, sdkSessionsDir?: string): DuePromotion[] {
+export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string): DuePromotion[] {
   const events = loadEvents(sdkSessionId, sdkSessionsDir);
   if (events.length === 0) return [];
 
@@ -546,8 +546,8 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir?: string)
  * Count raw (non-summary) user/assistant events since the most recent
  * `daily <today>` block. Used to trigger the hot-tail cap nudge.
  */
-export function countRawTailToday(sdkSessionId: string): number {
-  const events = loadEvents(sdkSessionId);
+export function countRawTailToday(sdkSessionId: string, sdkSessionsDir: string): number {
+  const events = loadEvents(sdkSessionId, sdkSessionsDir);
   if (events.length === 0) return 0;
   const today = localDateTag(new Date());
 

@@ -13,8 +13,11 @@ import {
 } from "node:fs";
 import { createInterface } from "node:readline";
 import { config } from "../config.js";
+import { restoreWorkspaceFromBackup } from "./backup-workspace.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
 const TOMO_HOME = config.tomoHome;
+const PID_FILE = defaultRuntimePaths.pidFile;
 const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
 const RETENTION_DAYS = 14;
 
@@ -212,9 +215,8 @@ backupCommand
   .description("Restore from a backup (e.g. 2026-04-10_1430)")
   .action(async (date: string) => {
     // Refuse to restore while daemon is running
-    const pidFile = join(TOMO_HOME, "tomo.pid");
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, "utf-8").trim());
+    if (existsSync(PID_FILE)) {
+      const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
       if (!isNaN(pid)) {
         try {
           process.kill(pid, 0);
@@ -254,37 +256,7 @@ backupCommand
     // 2. workspace/ (preserve .claude/ which is populated by init/start)
     const workspaceSrc = join(backupPath, "workspace");
     if (existsSync(workspaceSrc)) {
-      const workspaceDest = config.workspaceDir;
-      const claudeDir = join(workspaceDest, ".claude");
-      // Park the live .claude OUTSIDE the workspace tree — anywhere inside
-      // workspaceDest would be deleted by the rmSync below.
-      const claudePreserve = join(TOMO_HOME, ".claude.preserve");
-      rmSync(claudePreserve, { recursive: true, force: true });
-      const hadLiveClaude = existsSync(claudeDir);
-      if (hadLiveClaude) renameSync(claudeDir, claudePreserve);
-
-      rmSync(workspaceDest, { recursive: true, force: true });
-      cpSync(workspaceSrc, workspaceDest, { recursive: true });
-
-      if (hadLiveClaude) {
-        // The live .claude (settings, current skills) wins; merge in only
-        // the backup's skills that don't exist live, then move it back into
-        // place. Merge at skill granularity — overwriting (or per-file
-        // merging) would let an older backed-up copy replace or contaminate
-        // a currently live skill.
-        const backupSkills = join(claudeDir, "skills");
-        if (existsSync(backupSkills)) {
-          const preservedSkills = join(claudePreserve, "skills");
-          mkdirSync(preservedSkills, { recursive: true });
-          for (const entry of readdirSync(backupSkills, { withFileTypes: true })) {
-            const dest = join(preservedSkills, entry.name);
-            if (existsSync(dest)) continue;
-            cpSync(join(backupSkills, entry.name), dest, { recursive: true });
-          }
-        }
-        rmSync(claudeDir, { recursive: true, force: true });
-        renameSync(claudePreserve, claudeDir);
-      }
+      restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
 
       console.log("  [ok] workspace/");
     }

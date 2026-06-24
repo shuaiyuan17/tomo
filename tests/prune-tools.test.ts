@@ -59,7 +59,7 @@ describe("pruneTools", () => {
   let archivePath: string;
   let sdkSessionsDir: string;
 
-  function pruneTools(req: PruneToolsRequest) {
+  function pruneTools(req: Omit<PruneToolsRequest, "sdkSessionsDir">) {
     return pruneToolsImpl({ ...req, sdkSessionsDir });
   }
 

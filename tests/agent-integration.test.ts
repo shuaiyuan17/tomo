@@ -502,7 +502,11 @@ describe("send_message direct mode", () => {
     expect(tg.delivered).toEqual([
       { chatId: "12345", text, photo: undefined, sticker: undefined },
     ]);
-    const messages = new SessionStore(mockConfig.sessionsDir, 20).get("telegram:12345").messages;
+    const messages = new SessionStore(
+      mockConfig.sessionsDir,
+      20,
+      mockConfig.sdkSessionsDir,
+    ).get("telegram:12345").messages;
     expect(messages).toHaveLength(1);
     expect(messages.at(-1)).toMatchObject({
       role: "assistant",
@@ -2824,7 +2828,7 @@ describe("per-block streaming delivery", () => {
     resetConfig({
       identities: [{ name: "Shuai", channels: { imessage: "+15551112222" }, replyPolicy: "last-active" }],
     });
-    const store = new SessionStore(mockConfig.sessionsDir, 20);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
     store.setSdkSessionId("dm:shuai", "old-session-id");
     store.setReplyTarget("dm:shuai", { channelName: "imessage", chatId: "+15551112222" });
 
@@ -2844,7 +2848,11 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
     release?.();
 
-    const after = new SessionStore(mockConfig.sessionsDir, 20).getEntry("dm:shuai");
+    const after = new SessionStore(
+      mockConfig.sessionsDir,
+      20,
+      mockConfig.sdkSessionsDir,
+    ).getEntry("dm:shuai");
     expect(after?.sdkSessionId).toBe("old-session-id");
     expect(after?.unlinkedAt).toBeNull();
   });

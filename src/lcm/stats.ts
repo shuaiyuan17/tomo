@@ -18,7 +18,7 @@ export function resolveTimeRange(
   sdkSessionId: string,
   fromTime: string,
   toTime: string,
-  sdkSessionsDir?: string,
+  sdkSessionsDir: string,
 ): { fromIdx: number; toIdx: number } | null {
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;
@@ -92,7 +92,7 @@ interface ParsedEvent {
  */
 export function computeContextStats(
   sdkSessionId: string,
-  sdkSessionsDir?: string,
+  sdkSessionsDir: string,
 ): ContextStatsResult | null {
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;

@@ -1,15 +1,22 @@
 import { Command } from "commander";
 import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const TOMO_HOME = join(homedir(), ".tomo");
+const {
+  tomoHome: TOMO_HOME,
+  workspaceDir: WORKSPACE_DIR,
+  sessionsDir: SESSIONS_DIR,
+  logsDir: LOGS_DIR,
+  configPath: CONFIG_PATH,
+  configBackupPath: CONFIG_BACKUP_PATH,
+} = defaultRuntimePaths;
 const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
 
 type Personality = {
@@ -40,7 +47,7 @@ export const initCommand = new Command("init")
     printBanner("your personal assistant, powered by Claude");
     p.intro("Welcome to Tomo");
 
-    const configPath = join(TOMO_HOME, "config.json");
+    const configPath = CONFIG_PATH;
     const isReinit = existsSync(configPath) && !opts.force;
 
     // 1. Prerequisites check (before anything else)
@@ -122,12 +129,12 @@ export const initCommand = new Command("init")
     s.start("Creating directory structure");
     const dirs = [
       TOMO_HOME,
-      join(TOMO_HOME, "workspace"),
-      join(TOMO_HOME, "workspace", "memory"),
-      join(TOMO_HOME, "workspace", "tmp"),
+      WORKSPACE_DIR,
+      join(WORKSPACE_DIR, "memory"),
+      join(WORKSPACE_DIR, "tmp"),
       join(TOMO_HOME, "data", "cron"),
-      join(TOMO_HOME, "data", "sessions"),
-      join(TOMO_HOME, "logs"),
+      SESSIONS_DIR,
+      LOGS_DIR,
     ];
     for (const dir of dirs) {
       mkdirSync(dir, { recursive: true });
@@ -139,7 +146,7 @@ export const initCommand = new Command("init")
     const templates = ["SOUL.md", "AGENT.md", "IDENTITY.md"];
     const copied: string[] = [];
     for (const file of templates) {
-      const dest = join(TOMO_HOME, "workspace", file);
+      const dest = join(WORKSPACE_DIR, file);
       const src = join(DEFAULTS_DIR, file);
       if ((!existsSync(dest) || opts.force) && existsSync(src)) {
         let content = readFileSync(src, "utf-8");
@@ -153,7 +160,7 @@ export const initCommand = new Command("init")
 
     // Skills — write directly to .claude/skills/ with tomo- prefix
     const skillsDir = join(DEFAULTS_DIR, "skills");
-    const claudeSkillsDir = join(TOMO_HOME, "workspace", ".claude", "skills");
+    const claudeSkillsDir = join(WORKSPACE_DIR, ".claude", "skills");
     if (existsSync(skillsDir)) {
       for (const skill of readdirSync(skillsDir, { withFileTypes: true })) {
         if (!skill.isDirectory()) continue;
@@ -170,7 +177,7 @@ export const initCommand = new Command("init")
     }
 
     // MEMORY.md with initial content
-    const memoryDir = join(TOMO_HOME, "workspace", "memory");
+    const memoryDir = join(WORKSPACE_DIR, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
     if (!existsSync(memoryFile) || opts.force) {
       if (personality) {
@@ -309,7 +316,7 @@ export const initCommand = new Command("init")
       }
 
       mkdirSync(dirname(configPath), { recursive: true });
-      backupFileIfExistsSync(configPath, join(TOMO_HOME, "config.json.bak"), { mode: 0o600 });
+      backupFileIfExistsSync(configPath, CONFIG_BACKUP_PATH, { mode: 0o600 });
       writeJsonAtomicSync(configPath, config, { mode: 0o600 });
       p.log.success("Config saved");
     }
@@ -338,12 +345,12 @@ export const initCommand = new Command("init")
     const agentLabel = personality ? personality.agentName : "your assistant";
     p.note(
       [
-        `Personality:  ~/.tomo/workspace/SOUL.md`,
-        `Agent rules:  ~/.tomo/workspace/AGENT.md`,
-        `Identity:     ~/.tomo/workspace/IDENTITY.md`,
-        `Memory:       ~/.tomo/workspace/memory/`,
-        `Config:       ~/.tomo/config.json`,
-        `Logs:         ~/.tomo/logs/`,
+        `Personality:  ${join(WORKSPACE_DIR, "SOUL.md")}`,
+        `Agent rules:  ${join(WORKSPACE_DIR, "AGENT.md")}`,
+        `Identity:     ${join(WORKSPACE_DIR, "IDENTITY.md")}`,
+        `Memory:       ${join(WORKSPACE_DIR, "memory")}/`,
+        `Config:       ${CONFIG_PATH}`,
+        `Logs:         ${LOGS_DIR}/`,
       ].join("\n"),
       "Your files",
     );

@@ -1,12 +1,11 @@
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const TOMO_HOME = join(homedir(), ".tomo");
-const WORKSPACE_DIR = process.env.TOMO_WORKSPACE ?? join(TOMO_HOME, "workspace");
+const WORKSPACE_DIR = defaultRuntimePaths.workspaceDir;
 const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
 /** Absolute path to the memory root. Exported so the group-session guard hook
  *  can reason about scans rooted in or descending into this tree. */

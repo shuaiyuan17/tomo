@@ -7,19 +7,11 @@ import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
 
 async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string }> {
-  try {
-    const { config } = await import("../config.js");
-    return {
-      sessionsDir: config.sessionsDir,
-      sdkSessionsDir: config.sdkSessionsDir,
-    };
-  } catch {
-    const { defaultRuntimePaths } = await import("../runtime-paths.js");
-    return {
-      sessionsDir: defaultRuntimePaths.sessionsDir,
-      sdkSessionsDir: defaultRuntimePaths.sdkSessionsDir,
-    };
-  }
+  const { config } = await import("../config.js");
+  return {
+    sessionsDir: config.sessionsDir,
+    sdkSessionsDir: config.sdkSessionsDir,
+  };
 }
 
 export const lcmCommand = new Command("lcm")

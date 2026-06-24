@@ -4,17 +4,17 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { getSdkSessionPath, getSdkSessionDir } from "../sessions/index.js";
+import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
 import { parseJsonl } from "../jsonl.js";
 
 /** Path to the compact trigger file for a given session */
-export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir?: string): string {
-  return join(sdkSessionsDir ?? getSdkSessionDir(), `${sdkSessionId}.compact-trigger`);
+export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: string): string {
+  return join(sdkSessionsDir, `${sdkSessionId}.compact-trigger`);
 }
 
 /** Check if a compact happened and clear the trigger */
-export function checkAndClearCompactTrigger(sdkSessionId: string, sdkSessionsDir?: string): boolean {
+export function checkAndClearCompactTrigger(sdkSessionId: string, sdkSessionsDir: string): boolean {
   const triggerPath = getCompactTriggerPath(sdkSessionId, sdkSessionsDir);
   if (existsSync(triggerPath)) {
     unlinkSync(triggerPath);
@@ -27,7 +27,7 @@ export interface CompactRequest {
   /** SDK session ID to compact */
   sdkSessionId: string;
   /** Claude SDK project directory derived from the configured workspace. */
-  sdkSessionsDir?: string;
+  sdkSessionsDir: string;
   /** Start index in the event list (inclusive, 0-based among user/assistant events) */
   fromIdx: number;
   /** End index in the event list (inclusive) */

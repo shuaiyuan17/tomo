@@ -1,10 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { SessionStore } from "../src/sessions/store.js";
+import { SessionStore as SessionStoreImpl } from "../src/sessions/store.js";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-sessions");
+
+class SessionStore extends SessionStoreImpl {
+  constructor(dir: string, historyLimit: number, sdkSessionsDir = join(dir, "sdk-sessions")) {
+    super(dir, historyLimit, sdkSessionsDir);
+  }
+}
 
 describe("SessionStore", () => {
   beforeEach(() => {

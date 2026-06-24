@@ -500,9 +500,127 @@ describe("send_message direct mode", () => {
     expect(tg.delivered).toEqual([
       { chatId: "12345", text, photo: undefined, sticker: undefined },
     ]);
-    expect(new SessionStore(mockConfig.sessionsDir, 20).get("telegram:12345").messages).toEqual([]);
-    expect((agent as unknown as { pendingNotes: Map<string, string[]> }).pendingNotes.get("telegram:12345")).toBeUndefined();
+    const messages = new SessionStore(mockConfig.sessionsDir, 20).get("telegram:12345").messages;
+    expect(messages).toHaveLength(1);
+    expect(messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: `[proactive] ${text}`,
+      channel: "telegram",
+    });
+    expect((agent as unknown as { pendingNotes: Map<string, string[]> }).pendingNotes.get("telegram:12345")).toEqual([
+      `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`,
+    ]);
 
+    await agent.stop();
+  });
+
+  it("attributes a summoned-group send to the summoning dm session", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(ch: string, chatId: string, identity: string): void };
+      sessions: { get(key: string): { messages: Array<{ content: string }> } };
+      pendingNotes: Map<string, string[]>;
+    };
+    internals.router.summonGroup("telegram", "-987", "Alice");
+
+    const result = await agent.sendToSession("telegram:-987", "hello group", "dm:alice");
+
+    expect(result).toEqual({ ok: true });
+    expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
+      .toBe("[via dm:alice (summoned)] hello group");
+    expect(internals.pendingNotes.get("telegram:-987")).toEqual([
+      `[System: Tomo from alice's main session (dm:alice), summoned into this group at the time, sent the following message here: "hello group"]`,
+    ]);
+
+    await agent.stop();
+  });
+
+  it("keeps neutral attribution when the caller is not the summoning session", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(ch: string, chatId: string, identity: string): void };
+      sessions: { get(key: string): { messages: Array<{ content: string }> } };
+      pendingNotes: Map<string, string[]>;
+    };
+    internals.router.summonGroup("telegram", "-987", "Alice");
+
+    // Bob's own session direct-sends into Alice's summoned group
+    const result = await agent.sendToSession("telegram:-987", "hi from bob", "telegram:222");
+
+    expect(result).toEqual({ ok: true });
+    expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
+      .toBe("[proactive] hi from bob");
+    expect(internals.pendingNotes.get("telegram:-987")).toEqual([
+      `[System: Tomo from another session sent the following message to this conversation earlier: "hi from bob"]`,
+    ]);
+
+    await agent.stop();
+  });
+
+  it("caps pending notes at 15 per session, keeping the most recent", async () => {
+    const agent = new Agent();
+    const internals = agent as unknown as {
+      queuePendingNote(key: string, note: string): void;
+      pendingNotes: Map<string, string[]>;
+    };
+
+    for (let i = 0; i < 20; i++) internals.queuePendingNote("telegram:-987", `note-${i}`);
+
+    const notes = internals.pendingNotes.get("telegram:-987");
+    expect(notes).toHaveLength(15);
+    expect(notes?.[0]).toBe("note-5");
+    expect(notes?.at(-1)).toBe("note-19");
+
+    await agent.stop();
+  });
+
+  it("restores pending direct-send context after a restart and drains it once", async () => {
+    const firstAgent = new Agent();
+    const tg = new MockChannel("telegram");
+    firstAgent.addChannel(tg);
+
+    await firstAgent.sendToSession("telegram:12345", "survive restart", "dm:alice");
+    await firstAgent.stop();
+
+    const secondAgent = new Agent();
+    const internals = secondAgent as unknown as {
+      drainPendingNotes(key: string): string;
+    };
+    expect(internals.drainPendingNotes("telegram:12345")).toContain(
+      'Tomo from another session sent the following message to this conversation earlier: "survive restart"',
+    );
+    await secondAgent.stop();
+
+    const thirdAgent = new Agent();
+    const thirdInternals = thirdAgent as unknown as {
+      drainPendingNotes(key: string): string;
+    };
+    expect(thirdInternals.drainPendingNotes("telegram:12345")).toBe("");
+    await thirdAgent.stop();
+  });
+
+  it("reports success after delivery when local persistence fails", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const sessions = (agent as unknown as { sessions: SessionStore }).sessions;
+    vi.spyOn(sessions, "append").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+    vi.spyOn(sessions, "setPendingNotes").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+
+    const result = await agent.sendToSession("telegram:12345", "delivered once", "dm:alice");
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "delivered once", photo: undefined, sticker: undefined },
+    ]);
     await agent.stop();
   });
 });

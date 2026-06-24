@@ -232,6 +232,21 @@ describe("IdentityRouter", () => {
       }
     });
 
+    it("migrates an old channel-scoped session when summon is the first dm: interaction", () => {
+      // Upgraded user: session still lives under the old channel-scoped key
+      sessions.setSdkSessionId("telegram:111", "old-session");
+      sessions.setReplyTarget("telegram:111", { channelName: "telegram", chatId: "111" });
+
+      const router = new IdentityRouter(identities, sessions, {});
+      router.summonGroup("telegram", "-987", "Alice");
+
+      const result = router.resolve("telegram", "-987", true);
+      expect(result.sessionKey).toBe("dm:alice");
+      // The summon must resume the real main session, not capture a fresh one
+      expect(sessions.getSdkSessionId("dm:alice")).toBe("old-session");
+      expect(sessions.getSdkSessionId("telegram:111")).toBeUndefined();
+    });
+
     it("clears the dm session on a guard read but suppresses the group notice", () => {
       const summons = new SummonStore(null, 1000);
       const router = new IdentityRouter(identities, sessions, {}, summons);

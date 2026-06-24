@@ -105,6 +105,18 @@ describe("SessionStore", () => {
     expect(store2.getSdkSessionId("key1")).toBe("session-xyz");
   });
 
+  it("persists pending notes across instances until cleared", () => {
+    const store1 = new SessionStore(TEST_DIR, 20);
+    store1.setPendingNotes("telegram:-987", ["first", "second"]);
+
+    const store2 = new SessionStore(TEST_DIR, 20);
+    expect(store2.getPendingNotes("telegram:-987")).toEqual(["first", "second"]);
+
+    store2.setPendingNotes("telegram:-987", []);
+    const store3 = new SessionStore(TEST_DIR, 20);
+    expect(store3.getPendingNotes("telegram:-987")).toEqual([]);
+  });
+
   it("list APIs see external registry changes from another store instance", () => {
     // Simulates the daemon's long-lived store vs a CLI process (`tomo
     // sessions clear`) rewriting the same registry file.
@@ -160,6 +172,17 @@ describe("SessionStore", () => {
     const unlinked = store.listAllSessions().find((e) => e.sdkSessionId === "session-poisoned");
     expect(unlinked?.unlinkedAt).toBeTruthy();
     expect(unlinked?.expiresAt).toBeTruthy();
+  });
+
+  it("migrates pending notes with a unified session key", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.setSdkSessionId("telegram:111", "session-old");
+    store.setPendingNotes("telegram:111", ["queued before migration"]);
+
+    store.migrateSessionKey("telegram:111", "dm:alice");
+
+    expect(store.getPendingNotes("telegram:111")).toEqual([]);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
   });
 
   it("touches session lastActiveAt", () => {

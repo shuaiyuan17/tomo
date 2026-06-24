@@ -1,4 +1,4 @@
-import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions, StreamingMessage } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -53,6 +53,10 @@ interface UserTurnRequest {
   passiveListen?: boolean;
 }
 
+/** Cap on queued pending notes per session — a session that goes a long time
+ *  without a turn (e.g. a busy summoned group) keeps only the most recent. */
+const MAX_PENDING_NOTES = 15;
+
 interface CronTurnOptions {
   /** False for silent housekeeping turns such as LCM rollups. */
   showTyping?: boolean;
@@ -104,7 +108,7 @@ export class Agent {
   // Context-usage hysteresis: track whether we've nudged the agent to compact
   // for the current over-threshold episode. Reset when usage drops below LOW.
   private contextNudged = new Map<string, boolean>();
-  // System notes queued by harness events (summon/dismiss/expiry), drained and
+  // System notes queued by harness events and direct sends, drained and
   // prepended to the next user/cron/continuity turn.
   private pendingNotes = new Map<string, string[]>();
   // Bounded operational errors from prior turns, drained into the next prompt
@@ -116,7 +120,6 @@ export class Agent {
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
   private stopping = false;
-  private readonly internalMcpServer: McpSdkServerConfigWithInstance;
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
@@ -136,7 +139,6 @@ export class Agent {
       isSessionLive: (key) => this.liveSessions.get(key)?.isAlive() ?? false,
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
     });
-    this.internalMcpServer = createTomoInternalMcpServer(this);
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
       onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
@@ -413,7 +415,9 @@ export class Agent {
       config.mcpServers ?? {},
       (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
     );
-    const opts = sdkOptions(this.internalMcpServer, resumeId ?? undefined, model, {
+    // Per-session server instance: binds the caller's session key so tool
+    // handlers (e.g. send_message) can attribute cross-session sends.
+    const opts = sdkOptions(createTomoInternalMcpServer(this, key), resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.buildGroupContext(key),
@@ -1277,8 +1281,9 @@ export class Agent {
   /**
    * Direct mode: post a verbatim message to a target session via Channel.send().
    * No Claude query is invoked for the recipient — the message arrives as-is.
+   * A pending note is queued so the recipient's next Claude turn has context.
    */
-  async sendToSession(target: string, text: string): Promise<SendResult> {
+  async sendToSession(target: string, text: string, callerSessionKey?: string): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
@@ -1315,6 +1320,31 @@ export class Agent {
       // No attachments: preserve verbatim text (direct-mode contract)
       await channel.send({ chatId: replyTarget.chatId, text });
     }
+
+    // Attribute the send in the target session's record. Only claim it came
+    // from the summoning identity's main session when the caller actually IS
+    // that session — any session can direct-send into a summoned group.
+    const summoned = this.router.getSummonedIdentity(replyTarget.channelName, replyTarget.chatId);
+    const fromSummoner = summoned !== undefined && callerSessionKey === `dm:${summoned}`;
+
+    try {
+      this.sessions.append(sessionKey, {
+        role: "assistant",
+        content: fromSummoner ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
+        channel: replyTarget.channelName,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      // The channel send already succeeded. Reporting a tool failure here
+      // invites the caller to retry and duplicate the user-visible message.
+      log.warn({ err, sessionKey }, "Message delivered but transcript persistence failed");
+    }
+
+    this.queuePendingNote(sessionKey, fromSummoner
+      ? `[System: Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"]`
+      : callerSessionKey === sessionKey
+        ? `[System: You sent the following message to this conversation earlier as a direct send: "${text}"]`
+        : `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`);
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Message sent (direct)");
     return { ok: true };
@@ -1474,9 +1504,26 @@ export class Agent {
   }
 
   private queuePendingNote(sessionKey: string, note: string): void {
-    const arr = this.pendingNotes.get(sessionKey) ?? [];
+    let arr = this.pendingNotes.get(sessionKey);
+    if (!arr) {
+      try {
+        arr = this.sessions.getPendingNotes(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Could not load durable pending notes");
+        arr = [];
+      }
+    }
     arr.push(note);
+    if (arr.length > MAX_PENDING_NOTES) {
+      const dropped = arr.splice(0, arr.length - MAX_PENDING_NOTES).length;
+      log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
+    }
     this.pendingNotes.set(sessionKey, arr);
+    try {
+      this.sessions.setPendingNotes(sessionKey, arr);
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Could not persist pending notes");
+    }
   }
 
   private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
@@ -1490,13 +1537,30 @@ export class Agent {
     this.pendingErrorNotes.set(sessionKey, notes);
   }
 
-  /** Drain harness notes queued for this session and return them as a prefix. */
+  /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
     const drained: string[] = [];
-    const notes = this.pendingNotes.get(sessionKey);
+    let notes = this.pendingNotes.get(sessionKey);
+    if (!notes) {
+      try {
+        notes = this.sessions.getPendingNotes(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Could not load durable pending notes");
+        notes = [];
+      }
+    }
     if (notes && notes.length > 0) {
-      this.pendingNotes.delete(sessionKey);
       drained.push(...notes);
+      try {
+        this.sessions.setPendingNotes(sessionKey, []);
+        this.pendingNotes.delete(sessionKey);
+      } catch (err) {
+        // Avoid replaying the same note repeatedly in this process. If the
+        // durable clear failed, a restart may replay it, which is safer than
+        // silently losing context.
+        this.pendingNotes.set(sessionKey, []);
+        log.warn({ err, sessionKey }, "Could not clear durable pending notes");
+      }
     }
 
     const errorNotes = this.pendingErrorNotes.get(sessionKey);

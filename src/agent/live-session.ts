@@ -2,8 +2,7 @@ import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthro
 import { log } from "../logger.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
 
-export interface MessageRequest {
-  message: SDKUserMessage;
+export interface TurnRequest {
   /** Called for each text-delta as it streams (cumulative running text). */
   onText?: (text: string) => void;
   /**
@@ -14,9 +13,15 @@ export interface MessageRequest {
    * instead of a single edit-in-place that drops earlier blocks.
    */
   onBlockComplete?: (text: string) => void | Promise<void>;
-  resolve: (response: string) => void;
-  reject: (err: Error) => void;
+  resolve: (response: string) => void | Promise<void>;
+  reject: (err: Error) => void | Promise<void>;
 }
+
+export interface MessageRequest extends TurnRequest {
+  message: SDKUserMessage;
+}
+
+export type UnownedTurnFactory = () => TurnRequest | undefined;
 
 /**
  * Sentinel resolution for a steered message that merged into the in-flight
@@ -131,7 +136,7 @@ export class LiveSession {
   private inputWaiter: (() => void) | null = null;
   // The request that owns the in-flight turn: its callbacks receive the
   // stream and it resolves with the turn's full response.
-  private currentRequest: MessageRequest | null = null;
+  private currentRequest: TurnRequest | null = null;
   // Steered requests confirmed merged into the in-flight turn (we saw the CLI
   // echo their message back mid-turn). Resolved with STEER_MERGED at result.
   private mergedRequests: MessageRequest[] = [];
@@ -155,14 +160,22 @@ export class LiveSession {
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
   private turnBudget: TurnBudget | undefined;
+  private unownedTurnDropLogged = false;
+  private unownedTurnFactory: UnownedTurnFactory | undefined;
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
   private activeStreamBlockTypes = new Map<number, string>();
 
-  constructor(options: ReturnType<typeof sdkOptions>, sessionKey?: string, turnBudget?: TurnBudget) {
+  constructor(
+    options: ReturnType<typeof sdkOptions>,
+    sessionKey?: string,
+    turnBudget?: TurnBudget,
+    unownedTurnFactory?: UnownedTurnFactory,
+  ) {
     this.sessionKey = sessionKey;
     this.turnBudget = turnBudget;
+    this.unownedTurnFactory = unownedTurnFactory;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -204,7 +217,7 @@ export class LiveSession {
    * requests, clear turn state, and wake idle waiters. No-op when idle.
    */
   private failTurn(err: Error): void {
-    const requests: MessageRequest[] = [];
+    const requests: TurnRequest[] = [];
     if (this.currentRequest) requests.push(this.currentRequest);
     requests.push(...this.mergedRequests, ...this.pendingSteers.map((e) => e.req));
     this.currentRequest = null;
@@ -247,6 +260,22 @@ export class LiveSession {
     return this.currentRequest !== null || this.mergedRequests.length > 0 || this.pendingSteers.length > 0;
   }
 
+  private claimUnownedTurn(reason: string): TurnRequest | null {
+    if (this.currentRequest) return this.currentRequest;
+    const req = this.unownedTurnFactory?.();
+    if (req) {
+      this.currentRequest = req;
+      this.unownedTurnDropLogged = false;
+      log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
+      return req;
+    }
+    if (!this.unownedTurnDropLogged) {
+      this.unownedTurnDropLogged = true;
+      log.warn({ session: this.sessionKey, reason }, "Unowned SDK turn has no default delivery target");
+    }
+    return null;
+  }
+
   private async handleEvent(event: SDKMessage): Promise<void> {
     // Events originating inside a subagent (Agent tool) carry
     // parent_tool_use_id. They must never reach the channel-facing callbacks:
@@ -261,8 +290,6 @@ export class LiveSession {
       this.logSubagentEvent(event);
       return;
     }
-
-    const req = this.currentRequest;
 
     if (event.type === "stream_event") {
       const se = event as unknown as {
@@ -286,6 +313,7 @@ export class LiveSession {
           : undefined;
         if (blockType === "text") {
           this.streamingText += streamEvent.delta.text;
+          const req = this.currentRequest ?? this.claimUnownedTurn("stream_delta");
           req?.onText?.(this.streamingText);
         }
       }
@@ -302,6 +330,7 @@ export class LiveSession {
       this.streamingText = "";
       for (const block of event.message.content) {
         if (isTextBlock(block)) {
+          const req = this.currentRequest ?? this.claimUnownedTurn("assistant_text");
           this.parts.push(block.text);
           // Some SDK-originated errors arrive as an assistant text block
           // without preceding stream deltas. Push the full block into the
@@ -387,8 +416,10 @@ export class LiveSession {
       this.parts = [];
       this.streamingText = "";
       this.activeStreamBlockTypes.clear();
-      req?.resolve(response);
-      for (const m of this.mergedRequests) m.resolve(STEER_MERGED);
+      this.unownedTurnDropLogged = false;
+      const req = this.currentRequest;
+      await req?.resolve(response);
+      for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
       this.currentRequest = null;
       this.promotedSteerText = null;
@@ -558,17 +589,18 @@ export class LiveSession {
       const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
       const wrappedReject = (err: Error) => { clearTimeout(timer); reject(err); };
 
-      this.currentRequest = {
+      const req: MessageRequest = {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
         onText,
         onBlockComplete,
         resolve: wrappedResolve,
         reject: wrappedReject,
       };
+      this.currentRequest = req;
       this.parts = [];
       this.streamingText = "";
       this.activeStreamBlockTypes.clear();
-      this.pushInput(this.currentRequest.message);
+      this.pushInput(req.message);
     });
   }
 

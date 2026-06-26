@@ -41,11 +41,104 @@ const queryState = {
   reset() { this.inFlight = 0; this.maxConcurrent = 0; },
 };
 
+interface MockQueryController {
+  pushTaskNotificationTurn(response: MockResponse, notification?: string): void;
+}
+
+let mockQueryControllers: MockQueryController[] = [];
+
+function responseBlocks(responseValue: MockResponse): MockResponseBlock[] {
+  return Array.isArray(responseValue) ? [...responseValue] : [responseValue];
+}
+
+function enqueueAssistantTurnEvents(
+  eventQueue: unknown[],
+  blocks: MockResponseBlock[],
+  wakeConsumer: () => void,
+): void {
+  // For each block, emit stream events + an assistant event. This mirrors how
+  // the real SDK reports multi-block turns: text deltas arrive, then an
+  // `assistant` event consolidates the just-completed block(s). Only one
+  // `result` fires at the end of the whole turn.
+  for (const block of blocks) {
+    const rawBlock: MockTextBlock | MockThinkingBlock =
+      typeof block === "string" ? { type: "text", text: block } : block;
+    const assistantBlock = rawBlock.type === "thinking"
+      ? { type: rawBlock.type, thinking: rawBlock.thinking, signature: rawBlock.signature }
+      : rawBlock;
+
+    if (mockEmitStreamDeltas) {
+      eventQueue.push({
+        type: "stream_event",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: assistantBlock,
+        },
+      });
+      eventQueue.push({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: rawBlock.type === "text"
+            ? { type: "text_delta", text: rawBlock.text }
+            : rawBlock.streamAsTextDelta
+              ? { type: "text_delta", text: rawBlock.thinking }
+              : { type: "thinking_delta", thinking: rawBlock.thinking },
+        },
+      });
+      eventQueue.push({
+        type: "stream_event",
+        event: { type: "content_block_stop", index: 0 },
+      });
+    }
+    eventQueue.push({
+      type: "assistant",
+      message: { content: [assistantBlock] },
+    });
+  }
+
+  eventQueue.push({
+    type: "result",
+    subtype: "end_turn",
+    session_id: "mock-sdk-session-123",
+    total_cost_usd: 0.001,
+    num_turns: 1,
+    duration_ms: 100,
+    usage: {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+  });
+
+  wakeConsumer();
+}
+
 function createMockQuery(prompt: AsyncGenerator) {
   // Event queue + waiter for the consumer side
   const eventQueue: unknown[] = [];
   let waitResolve: (() => void) | null = null;
   let closed = false;
+  const wakeConsumer = () => {
+    if (waitResolve) {
+      const r = waitResolve;
+      waitResolve = null;
+      r();
+    }
+  };
+
+  mockQueryControllers.push({
+    pushTaskNotificationTurn(response, notification = "<task-notification>background task complete</task-notification>") {
+      eventQueue.push({
+        type: "user",
+        message: { content: [{ type: "text", text: notification }] },
+      });
+      enqueueAssistantTurnEvents(eventQueue, responseBlocks(response), wakeConsumer);
+    },
+  });
 
   // Background consumer: read from the prompt generator, push events to queue
   queryState.inFlight++;
@@ -69,7 +162,7 @@ function createMockQuery(prompt: AsyncGenerator) {
         }
 
         const responseValue = await mockResponseFn(text);
-        let blocks = Array.isArray(responseValue) ? [...responseValue] : [responseValue];
+        let blocks = responseBlocks(responseValue);
 
         if (mockSteerEcho) {
           const extra = await Promise.race([
@@ -86,70 +179,11 @@ function createMockQuery(prompt: AsyncGenerator) {
               if (b.type === "text") extraText += b.text ?? "";
             }
             const extraResp = await mockResponseFn(extraText);
-            blocks = blocks.concat(Array.isArray(extraResp) ? extraResp : [extraResp]);
+            blocks = blocks.concat(responseBlocks(extraResp));
           }
         }
 
-        // For each block, emit stream events + an assistant event. This
-        // mirrors how the real SDK reports multi-block turns: text deltas
-        // arrive, then an `assistant` event consolidates the just-completed
-        // block(s). Only one `result` fires at the end of the whole turn.
-        for (const block of blocks) {
-          const rawBlock: MockTextBlock | MockThinkingBlock =
-            typeof block === "string" ? { type: "text", text: block } : block;
-          const assistantBlock = rawBlock.type === "thinking"
-            ? { type: rawBlock.type, thinking: rawBlock.thinking, signature: rawBlock.signature }
-            : rawBlock;
-
-          if (mockEmitStreamDeltas) {
-            eventQueue.push({
-              type: "stream_event",
-              event: {
-                type: "content_block_start",
-                index: 0,
-                content_block: assistantBlock,
-              },
-            });
-            eventQueue.push({
-              type: "stream_event",
-              event: {
-                type: "content_block_delta",
-                index: 0,
-                delta: rawBlock.type === "text"
-                  ? { type: "text_delta", text: rawBlock.text }
-                  : rawBlock.streamAsTextDelta
-                    ? { type: "text_delta", text: rawBlock.thinking }
-                    : { type: "thinking_delta", thinking: rawBlock.thinking },
-              },
-            });
-            eventQueue.push({
-              type: "stream_event",
-              event: { type: "content_block_stop", index: 0 },
-            });
-          }
-          eventQueue.push({
-            type: "assistant",
-            message: { content: [assistantBlock] },
-          });
-        }
-
-        eventQueue.push({
-          type: "result",
-          subtype: "end_turn",
-          session_id: "mock-sdk-session-123",
-          total_cost_usd: 0.001,
-          num_turns: 1,
-          duration_ms: 100,
-          usage: {
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-          },
-        });
-
-        // Wake the consumer
-        if (waitResolve) { const r = waitResolve; waitResolve = null; r(); }
+        enqueueAssistantTurnEvents(eventQueue, blocks, wakeConsumer);
       }
     } catch {
       // prompt generator closed
@@ -179,7 +213,7 @@ function createMockQuery(prompt: AsyncGenerator) {
     },
     close() {
       closed = true;
-      if (waitResolve) { const r = waitResolve; waitResolve = null; r(); }
+      wakeConsumer();
     },
     async getContextUsage() {
       return {
@@ -459,6 +493,7 @@ beforeEach(() => {
   mockEmitStreamDeltas = true;
   mockSteerEcho = false;
   mockUserContents = [];
+  mockQueryControllers = [];
   queryState.reset();
 });
 
@@ -1204,6 +1239,58 @@ describe("cron message delivery", () => {
 
     await agent.handleCronMessage("Scheduled group task", "telegram:-100123");
 
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
+});
+
+// ===== Background task notification delivery =====
+
+describe("background task notification delivery", () => {
+  it("routes task-notification-triggered output to the session reply target", async () => {
+    resetConfig({
+      identities: [
+        { name: "shuai", channels: { telegram: "12345", imessage: "+15551234567" }, replyPolicy: "last-active" },
+      ],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+
+    mockResponseFn = () => "seeded";
+    await im.simulateMessage(makeMsg({ chatId: "+15551234567", text: "Hi from iMessage" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+    im.clearDelivered();
+
+    expect(mockQueryControllers).toHaveLength(1);
+    mockQueryControllers[0].pushTaskNotificationTurn("Background task is done.");
+
+    await waitFor(() => expect(im.delivered).toHaveLength(1));
+    expect(im.delivered[0]).toMatchObject({ chatId: "+15551234567", text: "Background task is done." });
+    expect(tg.delivered).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("suppresses NO_REPLY from task-notification-triggered turns", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    expect(mockQueryControllers).toHaveLength(1);
+    mockQueryControllers[0].pushTaskNotificationTurn("NO_REPLY");
+
+    await waitFor(() => expect(tg.typingStops).toHaveLength(1));
+    expect(tg.delivered).toHaveLength(0);
     expect(tg.sent).toHaveLength(0);
 
     await agent.stop();

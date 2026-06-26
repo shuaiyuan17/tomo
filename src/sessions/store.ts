@@ -489,9 +489,7 @@ export class SessionStore {
 
   /** Set and persist the reply target for a session key. No-op if unchanged. */
   setReplyTarget(key: string, target: ReplyTarget): void {
-    this.loadRegistry();
-    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    if (!entry) return;
+    const entry = this.ensureActiveEntry(key);
     const prev = entry.replyTarget;
     if (prev && prev.channelName === target.channelName && prev.chatId === target.chatId) return;
     entry.replyTarget = target;

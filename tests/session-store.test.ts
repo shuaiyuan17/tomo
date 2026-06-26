@@ -239,6 +239,18 @@ describe("SessionStore", () => {
       expect(entry?.participants).toEqual(["Alice", "Bob"]);
     });
 
+    it("persists reply target before any SDK session exists", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setReplyTarget("dm:alice", { channelName: "imessage", chatId: "+15551234567" });
+
+      const reloaded = new SessionStore(TEST_DIR, 20);
+      expect(reloaded.getReplyTarget("dm:alice")).toEqual({
+        channelName: "imessage",
+        chatId: "+15551234567",
+      });
+      expect(reloaded.listSdkSessionIds()).toEqual([]);
+    });
+
     it("upgrades the stub in place when an SDK session is linked", () => {
       const store = new SessionStore(TEST_DIR, 20);
       store.setChatTitle("telegram:-987", "Ski Trip");

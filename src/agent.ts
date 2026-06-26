@@ -16,7 +16,7 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED } from "./agent/live-session.js";
+import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type TurnRequest } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
@@ -428,7 +428,7 @@ export class Agent {
       onMcpElicitation: (request) => this.handleMcpElicitation(key, request),
     }, turnBudget, externalMcpServers);
 
-    session = new LiveSession(opts, key, turnBudget);
+    session = new LiveSession(opts, key, turnBudget, () => this.createUnownedTurnRequest(key));
     this.liveSessions.set(key, session);
     log.info(
       {
@@ -508,6 +508,97 @@ export class Agent {
     });
     log.warn({ key, server: request.serverName, mode: request.mode }, "Declined unsupported MCP elicitation");
     return { action: "decline" };
+  }
+
+  private resolveDeliveryTargetForSession(
+    sessionKey: string,
+    source: string,
+  ): { channel: Channel; chatId: string } | undefined {
+    let target: ReplyTarget | undefined;
+
+    if (sessionKey.startsWith("dm:")) {
+      const identityName = sessionKey.slice(3);
+      target = this.router.getReplyTarget(sessionKey)
+        ?? this.router.deriveReplyTargetFromConfig(identityName);
+      if (!target) {
+        log.warn({ sessionKey }, "%s: no reply target for dm session", source);
+        return undefined;
+      }
+    } else {
+      target = replyTargetFromRawSessionKey(sessionKey);
+      if (!target) {
+        log.warn({ sessionKey }, "%s: invalid session key", source);
+        return undefined;
+      }
+    }
+
+    const channel = this.getChannel(target.channelName);
+    if (!channel) {
+      log.warn({ sessionKey, channelName: target.channelName }, "%s: channel not loaded", source);
+      return undefined;
+    }
+
+    return { channel, chatId: target.chatId };
+  }
+
+  private createUnownedTurnRequest(key: string): TurnRequest | undefined {
+    const target = this.resolveDeliveryTargetForSession(key, "Background task");
+    if (!target) return undefined;
+
+    const { channel, chatId } = target;
+    const stream = channel.createStreamingMessage(chatId);
+    const stopTyping = this.startTurnTyping(channel, chatId, this.isPassiveReplyTarget(channel.name, chatId));
+    let settled = false;
+
+    const stop = async () => {
+      try {
+        await stopTyping({ clear: true });
+      } catch (err) {
+        log.warn({ err, key, channel: channel.name }, "Background task typing cleanup failed");
+      }
+    };
+
+    return {
+      onText: (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
+      onBlockComplete: this.makeBlockHandler(channel, chatId, stream),
+      resolve: async (response) => {
+        if (settled) return;
+        settled = true;
+        try {
+          this.maybeNudgeCompact(key);
+          if (!isSilentReply(response) && !isAgentErrorResponse(response)) {
+            this.sessions.append(key, {
+              role: "assistant",
+              content: response,
+              channel: channel.name,
+              timestamp: Date.now(),
+            });
+          }
+          await this.deliverResponse(key, channel, chatId, response, stream);
+        } catch (err) {
+          log.error({ err, key }, "Background task response delivery failed");
+          try {
+            await stream.cancel();
+          } catch {
+            // Best effort: the delivery failure was already logged above.
+          }
+        } finally {
+          await stop();
+        }
+      },
+      reject: async (err) => {
+        if (settled) return;
+        settled = true;
+        log.error({ err, key }, "Background task turn failed");
+        try {
+          await stream.cancel();
+        } catch {
+          // Best effort; keep the SDK event loop alive.
+        } finally {
+          await stop();
+        }
+      },
+    };
   }
 
   private resolvePrivateReplyTarget(key: string): ReplyTarget | undefined {
@@ -1091,41 +1182,9 @@ export class Agent {
 
   private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<void> {
     const key = sessionKey;
-    let deliveryChannel: Channel;
-    let deliveryChatId: string;
-
-    if (sessionKey.startsWith("dm:")) {
-      // Unified identity session — read persisted replyTarget, fall back to identity config
-      const identityName = sessionKey.slice(3);
-      const target =
-        this.router.getReplyTarget(sessionKey) ??
-        this.router.deriveReplyTargetFromConfig(identityName);
-      if (!target) {
-        log.warn({ sessionKey }, "Cron: no reply target for dm session");
-        return;
-      }
-      const ch = this.getChannel(target.channelName);
-      if (!ch) {
-        log.warn({ sessionKey, channelName: target.channelName }, "Cron: channel not loaded");
-        return;
-      }
-      deliveryChannel = ch;
-      deliveryChatId = target.chatId;
-    } else {
-      // Raw per-channel key: <channel>:<chatId> (DM without identity, or group chat)
-      const target = replyTargetFromRawSessionKey(sessionKey);
-      if (!target) {
-        log.warn({ sessionKey }, "Cron: invalid session key");
-        return;
-      }
-      const ch = this.getChannel(target.channelName);
-      if (!ch) {
-        log.warn({ sessionKey, channelName: target.channelName }, "Cron: channel not loaded");
-        return;
-      }
-      deliveryChannel = ch;
-      deliveryChatId = target.chatId;
-    }
+    const delivery = this.resolveDeliveryTargetForSession(sessionKey, "Cron");
+    if (!delivery) return;
+    const { channel: deliveryChannel, chatId: deliveryChatId } = delivery;
 
     const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);

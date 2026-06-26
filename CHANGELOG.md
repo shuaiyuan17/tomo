@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.5 (2026-06-26)
+
+### Features
+
+- **API key authentication config** (#158). Adds explicit API-key auth configuration and prevents the Anthropic API key from leaking to custom gateways/base URLs.
+- **Claude login from the owner DM** (#165). The owner can authenticate Claude directly through a DM command instead of the CLI only, with clearer messaging when login verification fails.
+- **Custom workspace for SDK sessions** (#175). SDK sessions now honor a configured custom workspace path. Runtime path resolution was consolidated into a new `runtime-paths` module.
+
+### Bug fixes
+
+- **iMessage inbound webhook dedupe is now persisted** (#163). Webhook dedupe state survives daemon restarts instead of living only in memory, so restarts no longer risk re-processing recently seen messages.
+- **Direct-send note attribution** (#148). Summoned-group direct sends are attributed to the correct caller, attribution is caller-aware, and pending notes are capped.
+- **Suppress group LCM output** (#164). Lifecycle-management chatter no longer leaks into group chats.
+
+### Other
+
+- Test against Node 26 in CI and align Node typings (#171).
+- Extract `backup-workspace` out of the backup command.
+- Bump `@anthropic-ai/claude-agent-sdk` `0.3.181` → `0.3.195` (#173, #169, #176).
+- Bump `grammy` `1.44.0` (#168), `@clack/prompts` `1.6.0` (#170), `eslint` `10.6.0`, `actions/checkout` v7 (#166), and the dev-dependencies group (#174).
+
 ## 0.8.4 (2026-06-19)
 
 ### Features

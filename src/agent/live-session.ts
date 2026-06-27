@@ -485,6 +485,12 @@ export class LiveSession {
       for (const block of event.message.content) {
         if (isToolUseBlock(block)) {
           if (block.id) this.pendingToolNames.set(block.id, block.name);
+          // A subagent can itself spawn a subagent — track the nested
+          // Agent/Task id so its descendants log the right agent name too.
+          if (block.id && (block.name === "Agent" || block.name === "Task")) {
+            const subType = (block.input as { subagent_type?: string } | undefined)?.subagent_type;
+            if (subType) this.subagentTypeById.set(block.id, subType);
+          }
           log.info({ tool: block.name, agent: agentName }, summarizeToolInput(block.name, block.input));
         }
       }
@@ -505,7 +511,7 @@ export class LiveSession {
         }
         log.info(
           { tool: name ?? "?", ...(tr.is_error ? { is_error: true } : {}), ...(agent ? { agent } : {}) },
-          `${tr.is_error ? "[ERR] " : ""}result: ${summarizeToolResult(tr.content)}`,
+          `${tr.is_error ? "[ERR] " : ""}${name ?? "?"} result: ${summarizeToolResult(tr.content)}`,
         );
       }
     }

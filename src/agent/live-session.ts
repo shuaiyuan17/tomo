@@ -166,6 +166,7 @@ export class LiveSession {
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
   private activeStreamBlockTypes = new Map<number, string>();
+  private activityTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     options: ReturnType<typeof sdkOptions>,
@@ -224,6 +225,7 @@ export class LiveSession {
     this.mergedRequests = [];
     this.pendingSteers = [];
     this.promotedSteerText = null;
+    this.clearActivityTimeout();
     for (const r of requests) r.reject(err);
     this.notifyIdle();
   }
@@ -239,6 +241,26 @@ export class LiveSession {
     const waiters = this.idleWaiters;
     this.idleWaiters = [];
     for (const w of waiters) w();
+  }
+
+  private clearActivityTimeout(): void {
+    if (!this.activityTimer) return;
+    clearTimeout(this.activityTimer);
+    this.activityTimer = null;
+  }
+
+  private refreshActivityTimeout(): void {
+    if (!this.alive || !this.isBusy()) {
+      this.clearActivityTimeout();
+      return;
+    }
+    this.clearActivityTimeout();
+    this.activityTimer = setTimeout(() => {
+      this.activityTimer = null;
+      if (this.alive && this.isBusy()) {
+        this.timeoutTurn(new Error(QUERY_TIMEOUT_ERROR));
+      }
+    }, TIMEOUT_MS);
   }
 
   /**
@@ -266,6 +288,7 @@ export class LiveSession {
     if (req) {
       this.currentRequest = req;
       this.unownedTurnDropLogged = false;
+      this.refreshActivityTimeout();
       log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
       return req;
     }
@@ -277,6 +300,8 @@ export class LiveSession {
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
+    this.refreshActivityTimeout();
+
     // Events originating inside a subagent (Agent tool) carry
     // parent_tool_use_id. They must never reach the channel-facing callbacks:
     // the subagent's interim narration would ship to the user as Tomo's own
@@ -418,6 +443,7 @@ export class LiveSession {
       this.activeStreamBlockTypes.clear();
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
+      if (this.pendingSteers.length === 0) this.clearActivityTimeout();
       await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
@@ -436,6 +462,7 @@ export class LiveSession {
         this.currentRequest = first.req;
         this.promotedSteerText = first.text;
       } else {
+        this.clearActivityTimeout();
         this.notifyIdle();
       }
     }
@@ -582,24 +609,18 @@ export class LiveSession {
     const content = buildContentBlocks(text, images, documents);
 
     return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.timeoutTurn(new Error(QUERY_TIMEOUT_ERROR));
-      }, TIMEOUT_MS);
-
-      const wrappedResolve = (val: string) => { clearTimeout(timer); resolve(val); };
-      const wrappedReject = (err: Error) => { clearTimeout(timer); reject(err); };
-
       const req: MessageRequest = {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
         onText,
         onBlockComplete,
-        resolve: wrappedResolve,
-        reject: wrappedReject,
+        resolve,
+        reject,
       };
       this.currentRequest = req;
       this.parts = [];
       this.streamingText = "";
       this.activeStreamBlockTypes.clear();
+      this.refreshActivityTimeout();
       this.pushInput(req.message);
     });
   }
@@ -631,20 +652,15 @@ export class LiveSession {
     const content = buildContentBlocks(text, images, documents);
 
     return new Promise<string>((resolve, reject) => {
-      let req: MessageRequest | null = null;
-      const timer = setTimeout(() => {
-        if (req) this.timeoutTurn(new Error(QUERY_TIMEOUT_ERROR));
-      }, TIMEOUT_MS);
-
-      req = {
+      const req: MessageRequest = {
         // priority "next" is the CLI's default for queued commands; set it
         // explicitly so mid-turn injection (drained at tool boundaries via
         // getCommandsByMaxPriority("next")) doesn't depend on the default.
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
         onText,
         onBlockComplete,
-        resolve: (val: string) => { clearTimeout(timer); resolve(val); },
-        reject: (err: Error) => { clearTimeout(timer); reject(err); },
+        resolve,
+        reject,
       };
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);

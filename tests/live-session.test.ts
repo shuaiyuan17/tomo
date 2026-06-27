@@ -74,6 +74,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const { LiveSession, STEER_MERGED } = await import("../src/agent/live-session.js");
+const { log } = await import("../src/logger.js");
 const TIMEOUT_MS = 10 * 60 * 1000;
 
 function makeSession() {
@@ -96,6 +97,15 @@ async function flushMicrotasks(times = 5): Promise<void> {
 
 const textBlock = (text: string) => ({ type: "text", text });
 const assistantEvent = (text: string) => ({ type: "assistant", message: { content: [textBlock(text)] } });
+const toolUseBlock = (name: string, id: string, input: Record<string, unknown> = {}) => ({ type: "tool_use", id, name, input });
+const assistantToolEvent = (name: string, id: string, input?: Record<string, unknown>) => ({
+  type: "assistant",
+  message: { content: [toolUseBlock(name, id, input)] },
+});
+const toolResultEvent = (id: string, content = "ok") => ({
+  type: "user",
+  message: { content: [{ type: "tool_result", tool_use_id: id, content }] },
+});
 // The CLI only echoes consumed steered messages as isReplay user events
 // (and only with --replay-user-messages); plain user events are tool
 // results or synthetic context and must never trigger merge detection.
@@ -112,6 +122,7 @@ const resultEvent = () => ({
 });
 
 beforeEach(() => {
+  vi.clearAllMocks();
   harnessRef.current = null;
 });
 
@@ -138,7 +149,43 @@ describe("LiveSession timeouts", () => {
     expect(harness.inputs).toEqual(["slow"]);
   });
 
-  it("closes the live session when a promoted steered turn times out", async () => {
+  it("resets the timeout when SDK activity arrives during a long send", async () => {
+    vi.useFakeTimers();
+    const { session, harness } = makeSession();
+
+    const p = session.send("research");
+    await flushMicrotasks();
+    expect(harness.inputs).toEqual(["research"]);
+
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS - 2000);
+    harness.pushEvent(assistantToolEvent("WebSearch", "tool-1", { query: "long research" }));
+    await flushMicrotasks(20);
+    expect(vi.mocked(log.info)).toHaveBeenCalledWith({ tool: "WebSearch" }, "WebSearch: long research");
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(session.isAlive()).toBe(true);
+    expect(session.isBusy()).toBe(true);
+    await flushMicrotasks(20);
+
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS - 2000);
+    harness.pushEvent(toolResultEvent("tool-1", "done"));
+    await flushMicrotasks(20);
+    expect(vi.mocked(log.info)).toHaveBeenCalledWith(
+      { tool: "WebSearch", is_error: false },
+      "result: done",
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(session.isAlive()).toBe(true);
+    expect(session.isBusy()).toBe(true);
+
+    harness.pushEvent(assistantEvent("done"));
+    harness.pushEvent(resultEvent());
+    await expect(p).resolves.toBe("done");
+    expect(session.isBusy()).toBe(false);
+  });
+
+  it("closes the live session when a promoted steered turn goes inactive", async () => {
     vi.useFakeTimers();
     const { session, harness } = makeSession();
 
@@ -156,6 +203,9 @@ describe("LiveSession timeouts", () => {
     harness.pushEvent(resultEvent());
     await expect(p1).resolves.toBe("reply one");
     expect(session.isBusy()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(TIMEOUT_MS - 1);
+    expect(session.isAlive()).toBe(true);
 
     await vi.advanceTimersByTimeAsync(1);
     await p2Rejected;

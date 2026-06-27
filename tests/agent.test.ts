@@ -177,6 +177,13 @@ describe("splitOutboundMessageText", () => {
       "next",
     ]);
   });
+
+  it("does not split when [[NL]] is followed by a source newline", () => {
+    expect(splitOutboundMessageText("intro[[NL]]\ndetail\nnext")).toEqual([
+      "intro\ndetail",
+      "next",
+    ]);
+  });
 });
 
 // Test tool input summarization (extracted logic from agent.ts)

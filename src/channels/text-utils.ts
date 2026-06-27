@@ -5,14 +5,17 @@
 export const LITERAL_NEWLINE_TOKEN = "[[NL]]";
 
 const LITERAL_NEWLINE_SENTINEL = "\0TOMO_LITERAL_NEWLINE\0";
+// Models often write the token at the end of a source line; that physical
+// newline is formatting, not an extra message separator.
+const LITERAL_NEWLINE_TOKEN_RE = /\[\[NL\]\](?:[ \t]*(?:\r\n|\r|\n))?/g;
 
 export function restoreLiteralNewlines(text: string): string {
-  return text.replaceAll(LITERAL_NEWLINE_TOKEN, "\n");
+  return text.replace(LITERAL_NEWLINE_TOKEN_RE, "\n");
 }
 
 export function splitOutboundMessageText(text: string): string[] {
   if (!text) return [];
-  const protectedText = text.replaceAll(LITERAL_NEWLINE_TOKEN, LITERAL_NEWLINE_SENTINEL);
+  const protectedText = text.replace(LITERAL_NEWLINE_TOKEN_RE, LITERAL_NEWLINE_SENTINEL);
   return protectedText
     .split(/\r\n|\r|\n/g)
     .map((part) => part.replaceAll(LITERAL_NEWLINE_SENTINEL, "\n").trim())

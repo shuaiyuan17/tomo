@@ -19,7 +19,8 @@ import { log } from "./logger.js";
 import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type TurnRequest } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
-import { restoreLiteralNewlines, splitOutboundMessageText } from "./channels/text-utils.js";
+import { deliverTextParts } from "./channels/delivery.js";
+import { restoreLiteralNewlines } from "./channels/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
 import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
@@ -690,15 +691,14 @@ export class Agent {
   }
 
   /**
-   * Ship MEDIA:/STICKER: attachments referenced in a single block. Caption text
-   * before a MEDIA tag rides with the first media send instead of becoming a
-   * separate newline-split text message.
+   * Deliver assistant text that bypasses StreamingMessage. Caption text rides
+   * with the first MEDIA send; plain text is split the same way streamed text is.
    */
-  private async shipBlockAttachments(
+  private async deliverAssistantContent(
     channel: Channel,
     chatId: string,
-    blockText: string,
-    parsed = extractAttachments(blockText),
+    text: string,
+    parsed = extractAttachments(text),
   ): Promise<void> {
     const { cleanText, mediaPaths, stickerIds } = parsed;
     const validPaths = mediaPaths.filter((path) => existsSync(path));
@@ -710,10 +710,8 @@ export class Agent {
       if (i === 0 && caption) textSent = true;
     }
 
-    if (!textSent && cleanText) {
-      for (const part of splitOutboundMessageText(cleanText)) {
-        await channel.send({ chatId, text: part });
-      }
+    if (!textSent) {
+      await deliverTextParts(channel, chatId, cleanText);
     }
 
     for (const stickerId of stickerIds) {
@@ -743,7 +741,7 @@ export class Agent {
         const attachments = extractAttachments(blockText);
         if (attachments.mediaPaths.length > 0 || attachments.stickerIds.length > 0) {
           await stream.discardBlock();
-          await this.shipBlockAttachments(channel, chatId, blockText, attachments);
+          await this.deliverAssistantContent(channel, chatId, blockText, attachments);
           return;
         }
         await stream.commitBlock();
@@ -1254,7 +1252,7 @@ export class Agent {
         timestamp: Date.now(),
       });
 
-      await deliveryChannel.send({ chatId: deliveryChatId, text: response });
+      await this.deliverAssistantContent(deliveryChannel, deliveryChatId, response);
       await stopTyping({ clear: true });
     } catch (err) {
       log.error({ err }, "Cron message handling failed");
@@ -1317,31 +1315,7 @@ export class Agent {
         if (replyTarget) {
           const channel = this.getChannel(replyTarget.channelName);
           if (channel) {
-            const { cleanText, mediaPaths, stickerIds } = extractAttachments(response);
-            if (mediaPaths.length > 0 || stickerIds.length > 0) {
-              const validPaths = mediaPaths.filter((p) => existsSync(p));
-              let sentText = false;
-              for (const path of validPaths) {
-                await channel.send({
-                  chatId: replyTarget.chatId,
-                  photo: path,
-                  text: !sentText ? cleanText : "",
-                });
-                sentText = true;
-              }
-              for (const stickerId of stickerIds) {
-                await channel.send({
-                  chatId: replyTarget.chatId,
-                  sticker: stickerId,
-                  text: "",
-                });
-              }
-              if (!sentText && cleanText) {
-                await channel.send({ chatId: replyTarget.chatId, text: cleanText });
-              }
-            } else {
-              await channel.send({ chatId: replyTarget.chatId, text: cleanText });
-            }
+            await this.deliverAssistantContent(channel, replyTarget.chatId, response);
           }
         }
       }

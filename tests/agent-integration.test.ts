@@ -1051,6 +1051,55 @@ describe("cron message delivery", () => {
     await agent.stop();
   });
 
+  it("splits newline-delimited cron responses and preserves literal newline escapes", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockResponseFn = () => "  first brief  \nsecond[[NL]]detail\n\n  third brief  ";
+
+    await agent.handleCronMessage("Morning briefing", "telegram:12345");
+
+    expect(tg.sent.map((msg) => msg.text)).toEqual([
+      "first brief",
+      "second\ndetail",
+      "third brief",
+    ]);
+
+    await agent.stop();
+  });
+
+  it("keeps cron MEDIA captions attached instead of newline-splitting them away from the photo", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(tmpDir, "cron-captioned-photo.png");
+    writeFileSync(imagePath, "fake image");
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockResponseFn = () => `caption line 1\ncaption line 2 MEDIA:"${imagePath}"`;
+
+    await agent.handleCronMessage("Morning briefing", "telegram:12345");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0]).toMatchObject({
+      chatId: "12345",
+      text: "caption line 1\ncaption line 2",
+      photo: imagePath,
+    });
+
+    await agent.stop();
+  });
+
   it("delivers cron response to dm: session via identity", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
@@ -1323,6 +1372,61 @@ describe("continuity delivery", () => {
     // Continuity uses channel.send()
     expect(tg.sent.length).toBeGreaterThanOrEqual(1);
     expect(tg.sent[0].chatId).toBe("12345");
+
+    await agent.stop();
+  });
+
+  it("splits newline-delimited continuity responses and preserves literal newline escapes", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockResponseFn = () => "  first thought  \nsecond[[NL]]detail\n\n  third thought  ";
+
+    await agent.handleContinuity("System: Free time.");
+
+    expect(tg.sent.map((msg) => msg.text)).toEqual([
+      "first thought",
+      "second\ndetail",
+      "third thought",
+    ]);
+
+    await agent.stop();
+  });
+
+  it("keeps continuity MEDIA captions attached instead of newline-splitting them away from the photo", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(tmpDir, "continuity-captioned-photo.png");
+    writeFileSync(imagePath, "fake image");
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockResponseFn = () => `caption line 1\ncaption line 2 MEDIA:"${imagePath}"`;
+
+    await agent.handleContinuity("System: Free time.");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0]).toMatchObject({
+      chatId: "12345",
+      text: "caption line 1\ncaption line 2",
+      photo: imagePath,
+    });
 
     await agent.stop();
   });

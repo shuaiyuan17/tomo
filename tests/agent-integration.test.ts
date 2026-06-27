@@ -2950,6 +2950,34 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
+  it("keeps [[NL]] line-formatted lists together in iMessage groups", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => [
+      "清单 🦀[[NL]]",
+      "· Lululemon ×3[[NL]]",
+      "· Canada Goose ×1[[NL]]",
+      "[[NL]]",
+      "取货：国庆自取。",
+    ].join("\n");
+
+    await im.simulateMessage(makeMsg({
+      chatId: "iMessage;+;group123",
+      text: "go",
+      isGroup: true,
+      senderName: "Alice",
+    }));
+    await drainQueue(agent);
+
+    expect(im.delivered.map((d) => d.text)).toEqual([
+      "清单 🦀\n· Lululemon ×3\n· Canada Goose ×1\n\n取货：国庆自取。",
+    ]);
+
+    await agent.stop();
+  });
+
   it("keeps MEDIA captions attached instead of newline-splitting them away from the photo", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

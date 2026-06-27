@@ -171,8 +171,8 @@ describe("LiveSession timeouts", () => {
     harness.pushEvent(toolResultEvent("tool-1", "done"));
     await flushMicrotasks(20);
     expect(vi.mocked(log.info)).toHaveBeenCalledWith(
-      { tool: "WebSearch", is_error: false },
-      "result: done",
+      { tool: "WebSearch" },
+      "WebSearch result: done",
     );
     await vi.advanceTimersByTimeAsync(1000);
 

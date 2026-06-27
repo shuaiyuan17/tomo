@@ -143,7 +143,12 @@ export const logsCommand = new Command("logs")
     tailArgs.push(LOG_FILE);
 
     const tail = spawn("tail", tailArgs, { stdio: ["ignore", "pipe", "inherit"] });
-    const pretty = spawn("npx", ["pino-pretty", "--ignore", "pid,hostname", "--translateTime", "SYS:HH:MM:ss"], {
+    const pretty = spawn("npx", [
+      "pino-pretty",
+      "--ignore", "pid,hostname,channel,chatTitle,session,sender,tool,agent,is_error,group,mentioned,images,documents",
+      "--translateTime", "SYS:HH:MM:ss",
+      "--messageFormat", "{if channel}[{channel}] {end}{if chatTitle}({chatTitle}) {end}{if session}→{session} {end}{if sender}{sender}: {end}{if agent}{agent} ▸ {end}{msg}",
+    ], {
       stdio: ["pipe", "inherit", "inherit"],
     });
     tail.stdout.pipe(pretty.stdin);

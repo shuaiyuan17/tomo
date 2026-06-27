@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../src/channels/types.js";
+import { splitOutboundMessageText } from "../src/channels/text-utils.js";
 import { PetStore } from "../src/mcp/pet-store.js";
 
 // ---------------------------------------------------------------------------
@@ -370,7 +371,9 @@ class MockChannel implements Channel {
     const ship = () => {
       if (canceled || !text) return;
       if (NO_REPLY_RE.test(text)) { text = ""; return; }
-      this.delivered.push({ chatId, text });
+      for (const part of splitOutboundMessageText(text)) {
+        this.delivered.push({ chatId, text: part });
+      }
       text = "";
     };
     return {
@@ -383,6 +386,7 @@ class MockChannel implements Channel {
       commitBlock: async () => { if (!canceled && !finished) ship(); },
       finish: async () => { if (finished) return; finished = true; ship(); },
       cancel: async () => { canceled = true; text = ""; },
+      discardBlock: async () => { if (!canceled && !finished) text = ""; },
     };
   }
 
@@ -2793,6 +2797,71 @@ describe("per-block streaming delivery", () => {
 
     expect(tg.delivered).toHaveLength(3);
     expect(tg.delivered.map((d) => d.text)).toEqual(["alpha", "beta", "gamma"]);
+
+    await agent.stop();
+  });
+
+  it("splits newline-delimited text within a block into separate iMessages", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "line A\nline B\nline C";
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered.map((d) => d.text)).toEqual(["line A", "line B", "line C"]);
+
+    await agent.stop();
+  });
+
+  it("trims newline-split pieces and drops blank Telegram messages", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "  first burst  \n\n \n  second burst  ";
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered.map((d) => d.text)).toEqual(["first burst", "second burst"]);
+
+    await agent.stop();
+  });
+
+  it("keeps [[NL]] as a literal newline within one outbound message", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockResponseFn = () => "intro[[NL]]detail\nnext";
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered.map((d) => d.text)).toEqual(["intro\ndetail", "next"]);
+
+    await agent.stop();
+  });
+
+  it("keeps MEDIA captions attached instead of newline-splitting them away from the photo", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(tmpDir, "captioned-photo.png");
+    writeFileSync(imagePath, "fake image");
+
+    mockResponseFn = () => `caption line 1\ncaption line 2 MEDIA:"${imagePath}"`;
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "send photo" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "caption line 1\ncaption line 2", photo: imagePath, sticker: undefined },
+    ]);
+    expect(tg.delivered.map((d) => d.text).join("\n")).not.toContain("MEDIA:");
 
     await agent.stop();
   });

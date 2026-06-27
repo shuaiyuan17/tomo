@@ -74,6 +74,13 @@ export interface StreamingMessage {
    */
   cancel(): Promise<void>;
   /**
+   * Drop only the current in-flight block and reset state for the next block.
+   * Used when a block is delivered through a non-text path (for example, as a
+   * captioned media attachment) after any speculative streamed text must be
+   * cleared.
+   */
+  discardBlock(): Promise<void>;
+  /**
    * Seal the current text block and reset state for the next block in the
    * same turn. Called between text blocks of a multi-block assistant turn
    * (text → tool → text). Channels that ship text per block (Telegram,

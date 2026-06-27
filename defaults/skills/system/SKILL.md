@@ -72,6 +72,9 @@ Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tom
 ### Streaming
 Responses stream to Telegram in real-time — messages update every 1.5s as tokens arrive.
 
+### Message splitting (newlines)
+A newline in your reply splits the text into **separate chat messages** — natural texting rhythm instead of one block with linebreaks. Blank lines are separators (no empty messages are sent); each piece is trimmed. To keep a line break *inside* a single message (e.g. a code snippet or a list that must stay together), use the literal token `[[NL]]` — the harness restores it to a real newline and does **not** split there. Caption text before a `MEDIA:` tag still rides with the media as one captioned message rather than being split.
+
 ### Message steering
 By default, user messages that arrive during a long tool-using turn are injected into the in-flight turn at the next tool-call boundary instead of waiting behind it. Use this to treat mid-task corrections like "stop", "wait", or added context as immediately relevant. If there is no remaining tool boundary, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns still queue normally. Set `steering: false` in `~/.tomo/config.json` to keep mid-turn user messages queued.
 

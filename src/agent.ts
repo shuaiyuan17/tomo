@@ -670,7 +670,7 @@ export class Agent {
     response: string,
     stream: StreamingMessage,
   ): Promise<void> {
-    log.info({ channel: replyChannel.name }, "Tomo: %s", response);
+    log.info({ channel: replyChannel.name, session: sessionKey }, "Tomo: %s", response);
 
     if (isSilentReply(response)) {
       log.info("Silent reply (no message sent)");
@@ -853,6 +853,7 @@ export class Agent {
       {
         channel: channel.name,
         sender: message.senderName,
+        chatTitle: isGroup ? message.chatTitle : undefined,
         group: isGroup || undefined,
         mentioned: isMentioned || undefined,
         images: hasImages ? message.images!.length : undefined,

@@ -81,6 +81,7 @@ function summarizeToolInput(name: string, input?: Record<string, unknown>): stri
     case "Grep": return `Grep "${input.pattern}"`;
     case "WebSearch": return `WebSearch: ${input.query}`;
     case "WebFetch": return `WebFetch: ${input.url}`;
+    case "Agent": case "Task": return `Agent → ${input.subagent_type ?? "?"}: ${String(input.description ?? "").slice(0, 80)}`;
     default: return `${name}: ${JSON.stringify(input).slice(0, 500)}`;
   }
 }
@@ -165,6 +166,8 @@ export class LiveSession {
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
+  /** Agent tool_use id → subagent_type, so a subagent's tool logs can name which agent ran them. */
+  private subagentTypeById = new Map<string, string>();
   private activeStreamBlockTypes = new Map<number, string>();
   private activityTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -312,7 +315,7 @@ export class LiveSession {
     // Agent tool result into its own reply.
     const parentToolUseId = (event as { parent_tool_use_id?: string | null }).parent_tool_use_id ?? null;
     if (parentToolUseId) {
-      this.logSubagentEvent(event);
+      this.logSubagentEvent(event, this.subagentTypeById.get(parentToolUseId) ?? "subagent");
       return;
     }
 
@@ -368,6 +371,10 @@ export class LiveSession {
           }
         } else if (isToolUseBlock(block)) {
           if (block.id) this.pendingToolNames.set(block.id, block.name);
+          if (block.id && (block.name === "Agent" || block.name === "Task")) {
+            const subType = (block.input as { subagent_type?: string } | undefined)?.subagent_type;
+            if (subType) this.subagentTypeById.set(block.id, subType);
+          }
           log.info({ tool: block.name }, summarizeToolInput(block.name, block.input));
         }
       }
@@ -378,7 +385,7 @@ export class LiveSession {
     }
 
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
-      this.logToolResults(event.message.content, false);
+      this.logToolResults(event.message.content);
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
@@ -473,29 +480,32 @@ export class LiveSession {
    * log tool activity so subagent work shows up in the logs, but never touch
    * turn state (parts/streamingText) or channel-facing callbacks.
    */
-  private logSubagentEvent(event: SDKMessage): void {
+  private logSubagentEvent(event: SDKMessage, agentName: string): void {
     if (event.type === "assistant" && event.message?.content) {
       for (const block of event.message.content) {
         if (isToolUseBlock(block)) {
           if (block.id) this.pendingToolNames.set(block.id, block.name);
-          log.info({ tool: block.name, subagent: true }, summarizeToolInput(block.name, block.input));
+          log.info({ tool: block.name, agent: agentName }, summarizeToolInput(block.name, block.input));
         }
       }
     }
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
-      this.logToolResults(event.message.content, true);
+      this.logToolResults(event.message.content, agentName);
     }
   }
 
-  private logToolResults(content: unknown[], subagent: boolean): void {
+  private logToolResults(content: unknown[], agent?: string): void {
     for (const block of content) {
       if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
         const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
         const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
-        if (tr.tool_use_id) this.pendingToolNames.delete(tr.tool_use_id);
+        if (tr.tool_use_id) {
+          this.pendingToolNames.delete(tr.tool_use_id);
+          this.subagentTypeById.delete(tr.tool_use_id);
+        }
         log.info(
-          { tool: name ?? "?", is_error: tr.is_error ?? false, ...(subagent ? { subagent: true } : {}) },
-          `result: ${summarizeToolResult(tr.content)}`,
+          { tool: name ?? "?", ...(tr.is_error ? { is_error: true } : {}), ...(agent ? { agent } : {}) },
+          `${tr.is_error ? "[ERR] " : ""}result: ${summarizeToolResult(tr.content)}`,
         );
       }
     }

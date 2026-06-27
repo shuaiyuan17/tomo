@@ -9,7 +9,7 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
-import { splitText } from "./text-utils.js";
+import { splitOutboundMessageText, splitText } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -153,7 +153,9 @@ export class BlueBubblesChannel implements Channel {
       if (NO_REPLY_RE.test(buffer)) { buffer = ""; return; }
       const text = buffer;
       buffer = "";
-      await this.send({ chatId, text });
+      for (const part of splitOutboundMessageText(text)) {
+        await this.send({ chatId, text: part });
+      }
     };
 
     return {
@@ -173,6 +175,10 @@ export class BlueBubblesChannel implements Channel {
         // iMessage buffers until ship, so nothing visible has been sent yet —
         // just mark canceled and drop the buffer.
         canceled = true;
+        buffer = "";
+      },
+      discardBlock: async () => {
+        if (canceled) return;
         buffer = "";
       },
     };

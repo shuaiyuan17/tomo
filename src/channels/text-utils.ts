@@ -1,4 +1,25 @@
 /**
+ * Placeholder the assistant can use when it wants a literal newline to remain
+ * inside one outbound chat message instead of acting as a message separator.
+ */
+export const LITERAL_NEWLINE_TOKEN = "[[NL]]";
+
+const LITERAL_NEWLINE_SENTINEL = "\0TOMO_LITERAL_NEWLINE\0";
+
+export function restoreLiteralNewlines(text: string): string {
+  return text.replaceAll(LITERAL_NEWLINE_TOKEN, "\n");
+}
+
+export function splitOutboundMessageText(text: string): string[] {
+  if (!text) return [];
+  const protectedText = text.replaceAll(LITERAL_NEWLINE_TOKEN, LITERAL_NEWLINE_SENTINEL);
+  return protectedText
+    .split(/\r\n|\r|\n/g)
+    .map((part) => part.replaceAll(LITERAL_NEWLINE_SENTINEL, "\n").trim())
+    .filter((part) => part.length > 0);
+}
+
+/**
  * Split text into chunks of at most `limit` characters, preferring to break
  * at a newline, then a space, falling back to a hard cut. Shared by channels
  * whose APIs cap message length (Telegram: 4096, BlueBubbles: 4000).

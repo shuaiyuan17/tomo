@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
+import { splitOutboundMessageText } from "../src/channels/text-utils.js";
 import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
@@ -154,6 +155,27 @@ describe("extractAttachments", () => {
   it("strips only the sticker tag from streamed text", () => {
     const streamed = "here is STICKER:CAAC123 and more text".replace(ATTACHMENT_TAG_RE, "").trim();
     expect(streamed).toBe("here is  and more text");
+  });
+});
+
+describe("splitOutboundMessageText", () => {
+  it("splits newline-delimited text into separate trimmed messages", () => {
+    expect(splitOutboundMessageText(" line A \nline B\n  line C  ")).toEqual([
+      "line A",
+      "line B",
+      "line C",
+    ]);
+  });
+
+  it("drops blank lines instead of creating empty messages", () => {
+    expect(splitOutboundMessageText("first\n\n \nsecond")).toEqual(["first", "second"]);
+  });
+
+  it("keeps [[NL]] as a literal newline inside one message", () => {
+    expect(splitOutboundMessageText("intro[[NL]]detail\nnext")).toEqual([
+      "intro\ndetail",
+      "next",
+    ]);
   });
 });
 

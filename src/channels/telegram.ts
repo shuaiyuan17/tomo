@@ -10,7 +10,7 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
-import { splitText } from "./text-utils.js";
+import { LITERAL_NEWLINE_TOKEN, splitOutboundMessageText, splitText } from "./text-utils.js";
 
 /** Telegram rejects sendMessage/editMessageText beyond 4096 chars. */
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -369,6 +369,18 @@ export class TelegramChannel implements Channel {
     let canceled = false;
     let flushPending: Promise<void> = Promise.resolve();
 
+    const deleteCurrentMessage = async (): Promise<void> => {
+      if (messageId === null) return;
+      const id = messageId;
+      messageId = null;
+      lastSent = "";
+      try {
+        await this.bot.api.deleteMessage(chatId, id);
+      } catch {
+        // Best-effort — message may already be gone or too old to delete.
+      }
+    };
+
     // Send or edit the current message. Throws on failure so callers don't
     // mark unsent content as delivered; "message is not modified" is a
     // success (content is already on screen).
@@ -399,14 +411,20 @@ export class TelegramChannel implements Channel {
             // the agent uses NO_REPLY to suppress delivery, and Telegram's
             // first-frame send would race ahead and surface it before suppression.
             if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
-            if (pending.length <= TELEGRAM_TEXT_LIMIT) {
-              await sendOrEdit(pending);
-              lastSent = pending;
+            const messageParts = splitOutboundMessageText(pending);
+            if (messageParts.length !== 1 || pending.includes(LITERAL_NEWLINE_TOKEN)) {
+              await deleteCurrentMessage();
+              return;
+            }
+            const visiblePending = messageParts[0];
+            if (visiblePending.length <= TELEGRAM_TEXT_LIMIT) {
+              await sendOrEdit(visiblePending);
+              lastSent = visiblePending;
               return;
             }
             // Over Telegram's limit: finalize the current message with the
             // first chunk, then roll the remainder into a fresh message.
-            const head = splitText(pending, TELEGRAM_TEXT_LIMIT)[0];
+            const head = splitText(visiblePending, TELEGRAM_TEXT_LIMIT)[0];
             await sendOrEdit(head);
             offset += head.length;
             messageId = null;
@@ -439,6 +457,27 @@ export class TelegramChannel implements Channel {
      * with backoff, and log loudly if the tail content is truly lost.
      */
     const finalFlush = async () => {
+      const parts = splitOutboundMessageText(buffer);
+      if (parts.length !== 1) {
+        await deleteCurrentMessage();
+        for (const [i, part] of parts.entries()) {
+          await this.send({ chatId, text: part, replyTo: i === 0 ? replyTo : undefined });
+        }
+        buffer = "";
+        offset = 0;
+        lastSent = "";
+        return;
+      }
+
+      if (buffer.includes(LITERAL_NEWLINE_TOKEN)) {
+        await deleteCurrentMessage();
+        await this.send({ chatId, text: parts[0], replyTo });
+        buffer = "";
+        offset = 0;
+        lastSent = "";
+        return;
+      }
+
       for (let attempt = 0; attempt < 3; attempt++) {
         if (canceled) return;
         await flush();
@@ -488,13 +527,15 @@ export class TelegramChannel implements Channel {
         }
         // Wait for any in-flight flush so we know whether messageId got set.
         await flushPending;
-        if (messageId !== null) {
-          try {
-            await this.bot.api.deleteMessage(chatId, messageId);
-          } catch {
-            // Best-effort — message may already be gone or too old to delete.
-          }
-        }
+        await deleteCurrentMessage();
+      },
+      discardBlock: async () => {
+        if (canceled || finished) return;
+        await stopAndDrain();
+        await deleteCurrentMessage();
+        buffer = "";
+        offset = 0;
+        lastSent = "";
       },
     };
   }

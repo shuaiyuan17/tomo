@@ -19,6 +19,7 @@ import { log } from "./logger.js";
 import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type TurnRequest } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
+import { restoreLiteralNewlines, splitOutboundMessageText } from "./channels/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
 import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
@@ -689,21 +690,32 @@ export class Agent {
   }
 
   /**
-   * Ship MEDIA:/STICKER: attachments referenced in a single block. The block's text is
-   * already going through the streamed message (with attachment tags stripped at
-   * `update()` time), so attachments here go without a caption — the matching
-   * text shows up alongside as its own streamed message.
+   * Ship MEDIA:/STICKER: attachments referenced in a single block. Caption text
+   * before a MEDIA tag rides with the first media send instead of becoming a
+   * separate newline-split text message.
    */
   private async shipBlockAttachments(
     channel: Channel,
     chatId: string,
     blockText: string,
+    parsed = extractAttachments(blockText),
   ): Promise<void> {
-    const { mediaPaths, stickerIds } = extractAttachments(blockText);
-    for (const path of mediaPaths) {
-      if (!existsSync(path)) continue;
-      await channel.send({ chatId, photo: path, text: "" });
+    const { cleanText, mediaPaths, stickerIds } = parsed;
+    const validPaths = mediaPaths.filter((path) => existsSync(path));
+    const caption = restoreLiteralNewlines(cleanText);
+    let textSent = false;
+
+    for (const [i, path] of validPaths.entries()) {
+      await channel.send({ chatId, photo: path, text: i === 0 ? caption : "" });
+      if (i === 0 && caption) textSent = true;
     }
+
+    if (!textSent && cleanText) {
+      for (const part of splitOutboundMessageText(cleanText)) {
+        await channel.send({ chatId, text: part });
+      }
+    }
+
     for (const stickerId of stickerIds) {
       await channel.send({ chatId, text: "", sticker: stickerId });
     }
@@ -728,8 +740,13 @@ export class Agent {
           await stream.cancel();
           return;
         }
+        const attachments = extractAttachments(blockText);
+        if (attachments.mediaPaths.length > 0 || attachments.stickerIds.length > 0) {
+          await stream.discardBlock();
+          await this.shipBlockAttachments(channel, chatId, blockText, attachments);
+          return;
+        }
         await stream.commitBlock();
-        await this.shipBlockAttachments(channel, chatId, blockText);
       } catch (err) {
         log.warn({ err, channel: channel.name }, "Block delivery failed");
       }

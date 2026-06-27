@@ -10,6 +10,7 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
+import { deliverTextParts } from "./delivery.js";
 import { LITERAL_NEWLINE_TOKEN, splitOutboundMessageText, splitText } from "./text-utils.js";
 
 /** Telegram rejects sendMessage/editMessageText beyond 4096 chars. */
@@ -458,20 +459,9 @@ export class TelegramChannel implements Channel {
      */
     const finalFlush = async () => {
       const parts = splitOutboundMessageText(buffer);
-      if (parts.length !== 1) {
+      if (parts.length !== 1 || buffer.includes(LITERAL_NEWLINE_TOKEN)) {
         await deleteCurrentMessage();
-        for (const [i, part] of parts.entries()) {
-          await this.send({ chatId, text: part, replyTo: i === 0 ? replyTo : undefined });
-        }
-        buffer = "";
-        offset = 0;
-        lastSent = "";
-        return;
-      }
-
-      if (buffer.includes(LITERAL_NEWLINE_TOKEN)) {
-        await deleteCurrentMessage();
-        await this.send({ chatId, text: parts[0], replyTo });
+        await deliverTextParts(this, chatId, buffer, { replyTo });
         buffer = "";
         offset = 0;
         lastSent = "";

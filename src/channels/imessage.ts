@@ -9,7 +9,8 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
-import { splitOutboundMessageText, splitText } from "./text-utils.js";
+import { deliverTextParts } from "./delivery.js";
+import { splitText } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -153,9 +154,7 @@ export class BlueBubblesChannel implements Channel {
       if (NO_REPLY_RE.test(buffer)) { buffer = ""; return; }
       const text = buffer;
       buffer = "";
-      for (const part of splitOutboundMessageText(text)) {
-        await this.send({ chatId, text: part });
-      }
+      await deliverTextParts(this, chatId, text);
     };
 
     return {

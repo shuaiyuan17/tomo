@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Sonnet 5 default and flexible model IDs.** `sonnet` now resolves to `claude-sonnet-5`, the fallback/default model and `sonnet-1m` resolve to `claude-sonnet-5[1m]`, and `/model` accepts future direct model IDs without requiring a code update while keeping LiteLLM `provider/model` names behind the gateway guard.
+- **Chat cost command.** `/cost` reports the current session's 1d, 7d, and 1mo cost totals from daemon usage logs.
+
 ## 0.8.6 (2026-06-30)
 
 ### Features

@@ -8,7 +8,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 
 ```json
 {
-  "model": "claude-sonnet-4-6[1m]",
+  "model": "claude-sonnet-5[1m]",
   "city": "Seattle",
   "continuity": false,
   "continuityIntervalMinutes": 55,

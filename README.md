@@ -58,10 +58,11 @@ tomo sessions clear    # Reset all sessions
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
-| `/model` | Switch model (Claude aliases or LiteLLM `provider/model` names) |
+| `/model` | Switch model (Claude aliases, direct model IDs, or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/login` | Refresh Claude login from a configured owner's private DM |
 | `/status` | Show session info (model, channel, message count) |
+| `/cost` | Show current-session cost for 1d / 7d / 1mo |
 | `/pet` | Check Tomo's pet's mood, growth stage, and stats |
 
 ## Features
@@ -223,7 +224,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
       "replyPolicy": "last-active"
     }
   ],
-  "model": "claude-sonnet-4-6[1m]",
+  "model": "claude-sonnet-5[1m]",
   "litellm": {
     "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",

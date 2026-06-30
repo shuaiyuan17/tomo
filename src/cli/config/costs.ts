@@ -1,86 +1,12 @@
-import { readFileSync, existsSync } from "node:fs";
 import * as p from "@clack/prompts";
-import { LOG_PATH } from "./shared.js";
-
-interface CostEntry {
-  time: number;
-  session: string;
-  cost: number;
-}
-
-function parseCostEntries(): CostEntry[] {
-  if (!existsSync(LOG_PATH)) return [];
-
-  const raw = readFileSync(LOG_PATH, "utf-8");
-  const entries: CostEntry[] = [];
-
-  for (const line of raw.split("\n")) {
-    if (!line || !line.includes("Run completed")) continue;
-    try {
-      const obj = JSON.parse(line);
-      if (typeof obj.cost !== "string" || typeof obj.time !== "number") continue;
-      const cost = parseFloat(obj.cost.replace("$", ""));
-      if (isNaN(cost)) continue;
-      entries.push({
-        time: obj.time,
-        session: obj.session ?? "unknown",
-        cost,
-      });
-    } catch {
-      // skip malformed lines
-    }
-  }
-
-  return entries;
-}
-
-function filterByRange(entries: CostEntry[], range: string): CostEntry[] {
-  const now = Date.now();
-  let cutoff: number;
-  switch (range) {
-    case "day": cutoff = now - 24 * 60 * 60 * 1000; break;
-    case "week": cutoff = now - 7 * 24 * 60 * 60 * 1000; break;
-    case "month": cutoff = now - 30 * 24 * 60 * 60 * 1000; break;
-    default: cutoff = 0;
-  }
-  return entries.filter((e) => e.time >= cutoff);
-}
-
-function formatCost(usd: number): string {
-  return `$${usd.toFixed(4)}`;
-}
-
-function buildCostSummary(entries: CostEntry[]): string {
-  if (entries.length === 0) return "  No usage data.";
-
-  const totalCost = entries.reduce((s, e) => s + e.cost, 0);
-  const avgCost = totalCost / entries.length;
-
-  // Group by session
-  const bySession = new Map<string, { cost: number; count: number }>();
-  for (const e of entries) {
-    const s = bySession.get(e.session) ?? { cost: 0, count: 0 };
-    s.cost += e.cost;
-    s.count++;
-    bySession.set(e.session, s);
-  }
-
-  const lines: string[] = [
-    `  Total cost:         ${formatCost(totalCost)}`,
-    `  Total messages:     ${entries.length}`,
-    `  Avg per message:    ${formatCost(avgCost)}`,
-    "",
-  ];
-
-  // Sort sessions by cost descending
-  const sorted = [...bySession.entries()].sort((a, b) => b[1].cost - a[1].cost);
-  for (const [session, stats] of sorted) {
-    const avg = stats.count > 0 ? formatCost(stats.cost / stats.count) : "$0.00";
-    lines.push(`  ${session.padEnd(24)} ${formatCost(stats.cost).padStart(10)}  (${stats.count} msgs, ${avg}/msg)`);
-  }
-
-  return lines.join("\n");
-}
+import {
+  buildCostSummary,
+  filterCostEntriesByRange,
+  formatCost,
+  parseCostEntries,
+  type CostEntry,
+  type CostRange,
+} from "../../costs.js";
 
 export async function configCostAnalysis(): Promise<void> {
   const allEntries = parseCostEntries();
@@ -104,7 +30,7 @@ export async function configCostAnalysis(): Promise<void> {
 
     if (p.isCancel(choice) || choice === "back") break;
 
-    const filtered = filterByRange(allEntries, choice as string);
+    const filtered = filterCostEntriesByRange(allEntries, choice as CostRange);
     const rangeLabel = choice === "total" ? "All time" : choice === "day" ? "Last 24 hours" : choice === "week" ? "Last 7 days" : "Last 30 days";
 
     p.log.info(`${rangeLabel}\n${buildCostSummary(filtered)}`);

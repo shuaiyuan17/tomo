@@ -242,7 +242,7 @@ const { mockConfig } = vi.hoisted(() => ({
       error: null as string | null,
     },
     telegramToken: "test-token",
-    model: "claude-sonnet-5",
+    model: "claude-sonnet-5[1m]",
     workspaceDir: "",
     sessionsDir: "",
     sdkSessionsDir: "",
@@ -2073,7 +2073,7 @@ describe("chat commands", () => {
       resetConfig({
         // Gateway only serves chatgpt/*, but this session resolves to a Claude model
         // (default config.model) — it must hit Anthropic directly, not the proxy.
-        model: "claude-sonnet-5",
+        model: "claude-sonnet-5[1m]",
         litellm: {
           mode: "chatgpt-subscription",
           baseUrl: "http://localhost:4000",
@@ -2219,13 +2219,13 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-5");
+    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-5[1m]");
 
     const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-5");
-    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-5");
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-5[1m]");
+    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-5[1m]");
 
     const backup = JSON.parse(readFileSync(configBackupPath, "utf-8")) as { model?: string };
     expect(backup.model).toBe("claude-haiku-4-5");

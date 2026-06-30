@@ -224,7 +224,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
       "replyPolicy": "last-active"
     }
   ],
-  "model": "claude-sonnet-5",
+  "model": "claude-sonnet-5[1m]",
   "litellm": {
     "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",

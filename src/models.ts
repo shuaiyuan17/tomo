@@ -1,9 +1,9 @@
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL } from "./litellm.js";
 
-export const DEFAULT_MODEL = "claude-sonnet-5";
+export const DEFAULT_MODEL = "claude-sonnet-5[1m]";
 
 export const MODEL_ALIASES: Record<string, string> = {
-  "sonnet": DEFAULT_MODEL,
+  "sonnet": "claude-sonnet-5",
   "sonnet-1m": DEFAULT_MODEL,
   "opus": "claude-opus-4-8",
   "opus-1m": "claude-opus-4-8[1m]",
@@ -11,7 +11,8 @@ export const MODEL_ALIASES: Record<string, string> = {
 };
 
 const MODEL_LABELS: Record<string, string> = {
-  "claude-sonnet-5": "Sonnet 5 (fast, 1M context)",
+  "claude-sonnet-5": "Sonnet 5 (fast)",
+  "claude-sonnet-5[1m]": "Sonnet 5 1M (fast, long context)",
   "claude-opus-4-8": "Opus 4.8 (most capable)",
   "claude-opus-4-8[1m]": "Opus 4.8 1M (most capable, long context)",
   "claude-haiku-4-5": "Haiku 4.5 (cheapest)",

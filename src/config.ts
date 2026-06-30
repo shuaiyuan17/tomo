@@ -10,6 +10,7 @@ import {
 import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } from "./continuity-defaults.js";
 import { parseAnthropicAuthConfig, type AnthropicAuthConfig } from "./auth.js";
 import { defaultRuntimePaths } from "./runtime-paths.js";
+import { DEFAULT_MODEL } from "./models.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -305,7 +306,7 @@ function buildConfig(): TomoConfig {
       replyPolicy: id.replyPolicy ?? "last-active",
     }));
 
-  const model = (process.env.CLAUDE_MODEL ?? file.model ?? "claude-sonnet-4-6[1m]") as string;
+  const model = (process.env.CLAUDE_MODEL ?? file.model ?? DEFAULT_MODEL) as string;
 
   return {
     auth: parseAnthropicAuthConfig(file.auth),

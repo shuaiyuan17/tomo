@@ -182,8 +182,8 @@ function omittedAdaptiveThinkingForModel(model: string): { type: "adaptive"; dis
 
   const base = resolved.replace(/\[[^\]]+\]$/, "");
   const adaptiveThinkingModel =
-    /^claude-sonnet-4-(?:[6-9]|\d{2,})$/.test(base) ||
-    /^claude-opus-4-(?:[6-9]|\d{2,})$/.test(base);
+    /^claude-sonnet-(?:4-(?:[6-9]|\d{2,})|[5-9](?:-\d+)?|\d{2,}(?:-\d+)?)$/.test(base) ||
+    /^claude-opus-(?:4-(?:[6-9]|\d{2,})|[5-9](?:-\d+)?|\d{2,}(?:-\d+)?)$/.test(base);
 
   return adaptiveThinkingModel
     ? { type: "adaptive", display: "omitted" }

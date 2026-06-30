@@ -1,23 +1,30 @@
 import * as p from "@clack/prompts";
-import { resolveModelName } from "../../models.js";
+import { isLiteLlmProviderModel, resolveModelName } from "../../models.js";
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL } from "../../litellm.js";
 import { loadConfig, modelLabel, MODELS } from "./shared.js";
 
 const CUSTOM_MODEL = "__custom_model__";
 
 export async function promptForModel(message: string, current?: string): Promise<string | null> {
-  // LiteLLM provider/model names only work when a gateway is configured to
-  // route them; without one the SDK would send them straight to Anthropic and
-  // fail, so only offer them when a gateway exists.
+  // Direct model IDs can be passed through immediately. LiteLLM provider/model
+  // names still need a configured gateway; without one the SDK would send them
+  // straight to Anthropic and fail.
   const cfg = loadConfig();
   const gatewayConfigured = Boolean((cfg.litellm as { baseUrl?: string } | undefined)?.baseUrl);
+  const seenModelValues = new Set<string>();
 
   const options = [
-    ...Object.entries(MODELS).map(([short, full]) => ({
-      value: full,
-      label: `${short} — ${modelLabel(full)}`,
-      hint: full === current ? "current" : undefined,
-    })),
+    ...Object.entries(MODELS)
+      .filter(([, full]) => {
+        if (seenModelValues.has(full)) return false;
+        seenModelValues.add(full);
+        return true;
+      })
+      .map(([short, full]) => ({
+        value: full,
+        label: `${short} — ${modelLabel(full)}`,
+        hint: full === current ? "current" : undefined,
+      })),
     ...(gatewayConfigured
       ? [
           {
@@ -27,11 +34,17 @@ export async function promptForModel(message: string, current?: string): Promise
           },
           {
             value: CUSTOM_MODEL,
-            label: "Custom LiteLLM model",
-            hint: `e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`,
+            label: "Custom model ID",
+            hint: `e.g. claude-sonnet-5 or ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`,
           },
         ]
-      : []),
+      : [
+          {
+            value: CUSTOM_MODEL,
+            label: "Custom model ID",
+            hint: "e.g. claude-sonnet-5",
+          },
+        ]),
   ];
 
   const choice = await p.select({ message, options });
@@ -40,11 +53,17 @@ export async function promptForModel(message: string, current?: string): Promise
   if (choice !== CUSTOM_MODEL) return choice as string;
 
   const custom = await p.text({
-    message: "LiteLLM model name",
-    placeholder: CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+    message: "Model ID",
+    placeholder: gatewayConfigured ? CHATGPT_SUBSCRIPTION_DEFAULT_MODEL : "claude-sonnet-5",
     validate: (value) => {
-      if (resolveModelName(String(value ?? ""))) return undefined;
-      return `Use a Claude alias/model or a LiteLLM provider/model name like ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`;
+      const resolved = resolveModelName(String(value ?? ""));
+      if (!resolved) {
+        return `Use a Claude alias/model or a LiteLLM provider/model name like ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`;
+      }
+      if (isLiteLlmProviderModel(resolved) && !gatewayConfigured) {
+        return "LiteLLM provider/model names need a configured LiteLLM gateway.";
+      }
+      return undefined;
     },
   });
 

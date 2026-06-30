@@ -253,8 +253,8 @@ describe("summarizeToolInput", () => {
 
 describe("model resolution", () => {
   it("maps short names to full model IDs", () => {
-    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-4-6");
-    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-4-6[1m]");
+    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5");
+    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5");
     expect(MODEL_ALIASES["opus"]).toBe("claude-opus-4-8");
     expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-4-8[1m]");
     expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-4-5");
@@ -269,8 +269,15 @@ describe("model resolution", () => {
     expect(resolveModelName("openrouter/openai/gpt-4o-mini")).toBe("openrouter/openai/gpt-4o-mini");
   });
 
-  it("rejects typo-like Claude names that are not gateway provider/model names", () => {
-    expect(resolveModelName("claude-sonnet-4.7")).toBeNull();
+  it("accepts arbitrary direct model IDs", () => {
+    expect(resolveModelName("claude-sonnet-5")).toBe("claude-sonnet-5");
+    expect(resolveModelName("claude-sonnet-5-1")).toBe("claude-sonnet-5-1");
+    expect(resolveModelName("future-model-20270101")).toBe("future-model-20270101");
+  });
+
+  it("rejects unsafe model names", () => {
+    expect(resolveModelName("claude sonnet 5")).toBeNull();
+    expect(resolveModelName("../claude-sonnet-5")).toBeNull();
   });
 });
 
@@ -289,7 +296,7 @@ describe("LiteLLM helpers", () => {
 
   it("infers ChatGPT subscription mode for old chatgpt/* gateway configs", () => {
     expect(inferLiteLlmMode(undefined, CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe("chatgpt-subscription");
-    expect(inferLiteLlmMode(undefined, "claude-sonnet-4-6[1m]")).toBe("anthropic-compatible");
+    expect(inferLiteLlmMode(undefined, "claude-sonnet-5")).toBe("anthropic-compatible");
     expect(inferLiteLlmMode("anthropic-compatible", CHATGPT_SUBSCRIPTION_DEFAULT_MODEL)).toBe("anthropic-compatible");
   });
 

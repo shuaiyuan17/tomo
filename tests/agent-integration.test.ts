@@ -242,7 +242,7 @@ const { mockConfig } = vi.hoisted(() => ({
       error: null as string | null,
     },
     telegramToken: "test-token",
-    model: "claude-sonnet-4-6[1m]",
+    model: "claude-sonnet-5",
     workspaceDir: "",
     sessionsDir: "",
     sdkSessionsDir: "",
@@ -1857,6 +1857,39 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/cost shows current-session cost windows", async () => {
+    const logsDir = join(tmpDir, "logs");
+    mkdirSync(logsDir, { recursive: true });
+    const now = Date.now();
+    const run = (time: number, session: string, cost: string) => JSON.stringify({
+      time,
+      session,
+      cost,
+      msg: "Run completed (end_turn)",
+    });
+    writeFileSync(join(logsDir, "tomo.log"), [
+      run(now - 2 * 60 * 60 * 1000, "telegram:12345", "$0.1000"),
+      run(now - 3 * 24 * 60 * 60 * 1000, "telegram:12345", "$0.2000"),
+      run(now - 20 * 24 * 60 * 60 * 1000, "telegram:12345", "$0.3000"),
+      run(now - 2 * 60 * 60 * 1000, "telegram:99999", "$9.0000"),
+    ].join("\n") + "\n");
+
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("cost", "12345", "TestUser");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("Cost for telegram:12345");
+    expect(tg.sent[0].text).toContain("1d: $0.1000 (1 run, $0.1000/run)");
+    expect(tg.sent[0].text).toContain("7d: $0.3000 (2 runs, $0.1500/run)");
+    expect(tg.sent[0].text).toContain("1mo: $0.6000 (3 runs, $0.2000/run)");
+    expect(tg.sent[0].text).not.toContain("$9.0000");
+
+    await agent.stop();
+  });
+
   it("/pet reports when Tomo has no pet", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -2040,7 +2073,7 @@ describe("chat commands", () => {
       resetConfig({
         // Gateway only serves chatgpt/*, but this session resolves to a Claude model
         // (default config.model) — it must hit Anthropic directly, not the proxy.
-        model: "claude-sonnet-4-6[1m]",
+        model: "claude-sonnet-5",
         litellm: {
           mode: "chatgpt-subscription",
           baseUrl: "http://localhost:4000",
@@ -2126,7 +2159,7 @@ describe("chat commands", () => {
     const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
     expect(lastCall.options?.systemPrompt).toContain("# RUNTIME — Current Model");
     // alias "sonnet" must be resolved to its concrete id, not echoed raw
-    expect(lastCall.options?.systemPrompt).toContain("claude-sonnet-4-6");
+    expect(lastCall.options?.systemPrompt).toContain("claude-sonnet-5");
 
     await agent.stop();
   });
@@ -2186,13 +2219,13 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-4-6[1m]");
+    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-5");
 
     const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-4-6[1m]");
-    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-4-6[1m]");
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-5");
+    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-5");
 
     const backup = JSON.parse(readFileSync(configBackupPath, "utf-8")) as { model?: string };
     expect(backup.model).toBe("claude-haiku-4-5");
@@ -2233,6 +2266,25 @@ describe("chat commands", () => {
       sessionModelOverrides?: Record<string, string>;
     };
     expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8[1m]");
+
+    await agent.stop();
+  });
+
+  it("/model accepts future direct model IDs", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-5-1");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-5-1");
+
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-5-1");
 
     await agent.stop();
   });
@@ -2308,13 +2360,13 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/model rejects unknown model names without writing config", async () => {
+  it("/model rejects invalid model names without writing config", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-4.7");
+    await tg.simulateCommand("model", "12345", "TestUser", "not a model");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("Unknown model");

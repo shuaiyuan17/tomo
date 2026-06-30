@@ -7,7 +7,8 @@ import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { IdentityRouter } from "../router.js";
 import type { SessionStore } from "../sessions/index.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
-import { MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "../models.js";
+import { DEFAULT_MODEL, MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "../models.js";
+import { buildSessionCostReport } from "../costs.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
   CHATGPT_SUBSCRIPTION_MODE,
@@ -36,7 +37,7 @@ export interface ChatCommandDeps {
 
 /**
  * Handles slash commands typed in chat (/new, /model, /status, /pet,
- * /restore, /login).
+ * /cost, /restore, /login).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -95,6 +96,8 @@ export class ChatCommandHandler {
           lines.push("");
           lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
         }
+        lines.push("");
+        lines.push(`You can also pass any direct model ID, e.g. ${DEFAULT_MODEL}.`);
         await channel.send({ chatId, text: lines.join("\n") });
         return;
       }
@@ -167,6 +170,12 @@ export class ChatCommandHandler {
       }
 
       await channel.send({ chatId, text: lines.join("\n") });
+      return;
+    }
+
+    if (command === "cost") {
+      const logPath = join(config.logsDir, "tomo.log");
+      await channel.send({ chatId, text: buildSessionCostReport(key, { logPath }) });
       return;
     }
 

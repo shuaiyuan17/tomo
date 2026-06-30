@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.6 (2026-06-30)
+
+### Features
+
+- **Newline message-splitting** (#179). A line break in the assistant's reply is now delivered as a *separate* chat message, mimicking natural texting rhythm instead of one block with linebreaks. Blank lines act as separators (never producing empty messages) and each piece is trimmed. The literal token `[[NL]]` is an escape hatch — it is restored to a real newline and does **not** split there, so code snippets and lists that must stay together can live in one message. Caption text before a `MEDIA:` tag still rides with the media as one captioned message. Wired through both iMessage (buffer-on-finish) and Telegram (streaming edit-in-place), documented in the default `AGENT.md` and the system skill, and extended to the direct/system delivery paths (#182).
+- **Deliver SDK background task replies** (#178). Unowned SDK turns — output produced by the SDK with no waiting request, such as background task replies — are now routed to a default delivery target instead of being silently dropped.
+
+### Bug fixes
+
+- **Activity-based live-session timeout** (#181). The session timeout now refreshes on SDK activity rather than firing on a fixed per-turn deadline, so long-but-legitimate turns are no longer killed prematurely.
+- **Literal newline token splitting** (#183). Fixes `[[NL]]` token handling in the outbound message splitter.
+
+### Other
+
+- **More readable `tomo logs`** (#184). `tomo logs -f` now renders sender, group title, outbound session key, and subagent name inline instead of burying them in raw JSON. Subagent tool calls are attributed to the spawning agent (`agent=<subagent_type>`, including nested spawns), and tool-result errors get an `[ERR]` prefix.
+- Remove dead `AGENT`/`SOUL`/`IDENTITY` templates under `src/workspace` (#180).
+
 ## 0.8.5 (2026-06-26)
 
 ### Features

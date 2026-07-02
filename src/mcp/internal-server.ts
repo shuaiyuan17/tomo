@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import type { Agent } from "../agent.js";
 import { buildCronTools } from "./cron-tools.js";
 import { buildPetTools } from "./pet-tools.js";
+import { buildRecallTools } from "./recall-tools.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 
@@ -175,6 +176,9 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ),
       ...buildCronTools(),
       ...buildPetTools(),
+      // Bound to the calling session's key: recall can only read the caller's
+      // own transcript, so group sessions cannot search DM history.
+      ...buildRecallTools({ search: (opts) => agent.searchSessionTranscript(callerSessionKey, opts) }),
     ],
   });
 }

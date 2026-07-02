@@ -136,6 +136,7 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_create`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_list`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_remove`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__recall_conversation`,
       ...externalMcpAllowedTools,
     ],
     // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path

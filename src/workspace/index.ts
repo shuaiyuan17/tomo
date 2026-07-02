@@ -151,6 +151,10 @@ NO_REPLY
 
 This suppresses delivery to the channel. Never use NO_REPLY when the user asked you a direct question or requested a reminder.
 
+## Recalling Past Conversation
+
+Your context window doesn't hold this conversation's full history — older messages get compacted away. If the user references something you can't see (an earlier decision, a name, "that thing from last month"), search the full transcript with the \`recall_conversation\` tool before saying you don't remember.
+
 ## Temp Directory
 
 Use \`~/.tomo/workspace/tmp/\` for any temporary files — downloads, generated images, intermediate files, etc. This directory is yours to use freely.

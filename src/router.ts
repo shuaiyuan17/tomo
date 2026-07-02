@@ -1,6 +1,7 @@
 import type { IdentityConfig } from "./config.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
+import { isDmSessionKey } from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
 
@@ -206,7 +207,7 @@ export class IdentityRouter {
   /** Find the first active dm: session key (for continuity) */
   findFirstDmSession(): string | undefined {
     for (const [key] of this.sessions.listSdkSessionIds()) {
-      if (key.startsWith("dm:")) return key;
+      if (isDmSessionKey(key)) return key;
     }
     return undefined;
   }

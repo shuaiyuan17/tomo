@@ -77,8 +77,8 @@ const { LiveSession, STEER_MERGED } = await import("../src/agent/live-session.js
 const { log } = await import("../src/logger.js");
 const TIMEOUT_MS = 10 * 60 * 1000;
 
-function makeSession() {
-  const session = new LiveSession({} as never, "test:session");
+function makeSession(settings?: { timeoutMs?: number }) {
+  const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
   return { session, harness };
 }
@@ -131,6 +131,26 @@ afterEach(() => {
 });
 
 describe("LiveSession timeouts", () => {
+  it("uses a configured inactivity timeout", async () => {
+    vi.useFakeTimers();
+    const { session, harness } = makeSession({ timeoutMs: 250 });
+
+    const p = session.send("short timeout");
+    const rejected = expect(p).rejects.toThrow("Query timed out after 250ms");
+    await flushMicrotasks();
+    expect(harness.inputs).toEqual(["short timeout"]);
+
+    await vi.advanceTimersByTimeAsync(249);
+    expect(session.isAlive()).toBe(true);
+    expect(session.isBusy()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+
+    expect(session.isAlive()).toBe(false);
+    expect(session.isBusy()).toBe(false);
+  });
+
   it("closes the live session when a send times out", async () => {
     vi.useFakeTimers();
     const { session, harness } = makeSession();

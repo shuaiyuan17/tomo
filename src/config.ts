@@ -21,6 +21,7 @@ const DEFAULT_IMESSAGE_INBOUND_SETTLE_MS = 1500;
 const DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS = 5000;
 const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
 const DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS = 4000;
+const DEFAULT_LIVE_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface IdentityConfig {
   name: string;
@@ -105,6 +106,8 @@ export interface TomoConfig {
   /** Steer messages that arrive while a turn is in flight into that turn at the
    *  next tool-call boundary, instead of queueing them behind it. Default true. */
   steering: boolean;
+  /** Inactivity timeout for one LiveSession send()/steer() turn. Default 10 minutes. */
+  liveSessionTimeoutMs: number;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
   litellm: LiteLlmConfig | null;
   /** External MCP servers from ~/.tomo/config.json. */
@@ -341,6 +344,10 @@ function buildConfig(): TomoConfig {
     saveInboundImages: file.saveInboundImages !== false,
     maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
     steering: parseBoolean(process.env.TOMO_STEERING, parseBoolean(file.steering, true)),
+    liveSessionTimeoutMs: parsePositiveInt(
+      process.env.TOMO_LIVE_SESSION_TIMEOUT_MS ?? file.liveSessionTimeoutMs,
+      DEFAULT_LIVE_SESSION_TIMEOUT_MS,
+    ),
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,

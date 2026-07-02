@@ -1,5 +1,5 @@
 import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
-import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions, StreamingMessage } from "./channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -7,6 +7,8 @@ import type { ReplyTarget } from "./sessions/types.js";
 import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import {
   isGroupSessionKey,
+  isDmSessionKey,
+  dmIdentityFromSessionKey,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -19,12 +21,13 @@ import { log } from "./logger.js";
 import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
-import { deliverTextParts } from "./channels/delivery.js";
-import { restoreLiteralNewlines } from "./channels/text-utils.js";
 import { normalizeSendTarget } from "./agent/send-target.js";
 import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
+import { SessionQueue } from "./agent/session-queue.js";
+import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
+import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
 import { repairSdkSessionForResume } from "./sessions/repair.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
@@ -55,9 +58,15 @@ interface UserTurnRequest {
   passiveListen?: boolean;
 }
 
-/** Cap on queued pending notes per session — a session that goes a long time
- *  without a turn (e.g. a busy summoned group) keeps only the most recent. */
-const MAX_PENDING_NOTES = 15;
+interface RunWithRetryRequest {
+  key: string;
+  prompt: string;
+  onText?: (text: string) => void;
+  images?: Array<{ data: string; mediaType: string }>;
+  onBlockComplete?: (text: string) => void | Promise<void>;
+  documents?: Array<{ data: string; mediaType: string; filename?: string }>;
+  steer?: boolean;
+}
 
 interface CronTurnOptions {
   /** False for silent housekeeping turns such as LCM rollups. */
@@ -71,25 +80,6 @@ interface CronTurnOptions {
 // Context-usage percentage at which the nudge escalates from a daily rollup
 // (config.lcm.nudgeAtPct) to a full lcm compact.
 const COMPACT_NUDGE_PCT = 80;
-const MAX_PENDING_ERROR_NOTES = 3;
-const MAX_PENDING_ERROR_CHARS = 1200;
-const MAX_SINGLE_PENDING_ERROR_CHARS = 600;
-
-function truncateForPendingError(text: string, maxChars: number): string {
-  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
-}
-
-function pendingErrorChars(notes: string[]): number {
-  return notes.reduce((sum, note) => sum + note.length, 0);
-}
-
-function isAgentErrorResponse(response: string): boolean {
-  const text = response.trim();
-  return /^API Error: \d+/i.test(text)
-    || /^Failed to authenticate\.\s+API Error: \d+/i.test(text)
-    || /^\{"type":"error"/.test(text)
-    || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
-}
 
 export class Agent {
   private channels: Channel[] = [];
@@ -101,7 +91,7 @@ export class Agent {
   // Tracked so stop() can close them — they'd otherwise outlive shutdown.
   private retiringSessions = new Set<LiveSession>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
-  private messageQueues = new Map<string, Promise<void>>();
+  private sessionQueue = new SessionQueue();
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
@@ -118,12 +108,8 @@ export class Agent {
   // current over-threshold episode. Cleared when usage drops back below
   // config.lcm.nudgeResetPct.
   private contextNudged = new Map<string, "daily" | "compact">();
-  // System notes queued by harness events and direct sends, drained and
-  // prepended to the next user/cron/continuity turn.
-  private pendingNotes = new Map<string, string[]>();
-  // Bounded operational errors from prior turns, drained into the next prompt
-  // so Tomo can recover with context instead of pretending nothing happened.
-  private pendingErrorNotes = new Map<string, string[]>();
+  private pendingNotesQueue: PendingNotesQueue;
+  private delivery: DeliveryPipeline;
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
@@ -134,6 +120,10 @@ export class Agent {
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir);
+    this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
+    this.delivery = new DeliveryPipeline({
+      queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
+    });
     const summons = new SummonStore(
       join(config.tomoHome, "data", "summons.json"),
       config.summonExpiryMinutes * 60_000,
@@ -265,14 +255,7 @@ export class Agent {
    * the one sanctioned concurrent path.)
    */
   private enqueueForSession<T>(sessionKey: string, task: () => Promise<T>): Promise<T> {
-    const prev = this.messageQueues.get(sessionKey) ?? Promise.resolve();
-    const result = prev.then(() => task());
-    // Keep the queue alive even if this task throws
-    const next = result.then(() => {}, (err) => {
-      log.error({ err, sessionKey }, "Unhandled error in session queue");
-    });
-    this.messageQueues.set(sessionKey, next);
-    return result;
+    return this.sessionQueue.enqueue(sessionKey, task);
   }
 
   /**
@@ -367,7 +350,7 @@ export class Agent {
   /** Audience-switch prefix for a dm session turn (see agent/audience.ts).
    *  Updates tracking state; returns "" when the audience didn't change. */
   private noteAudienceSwitch(key: string, audiences: string[]): string {
-    if (!key.startsWith("dm:") || audiences.length === 0) return "";
+    if (!isDmSessionKey(key) || audiences.length === 0) return "";
     const prev = this.lastAudiences.get(key);
     this.lastAudiences.set(key, audiences[audiences.length - 1]);
     const note = audienceSwitchNote(prev, audiences, (a) => this.audienceLabel(a));
@@ -453,7 +436,9 @@ export class Agent {
       onMcpElicitation: (request) => this.handleMcpElicitation(key, request),
     }, turnBudget, externalMcpServers);
 
-    session = new LiveSession(opts, key, turnBudget, () => this.createUnownedTurnRequest(key));
+    session = new LiveSession(opts, key, turnBudget, () => this.createUnownedTurnRequest(key), {
+      timeoutMs: config.liveSessionTimeoutMs,
+    });
     this.liveSessions.set(key, session);
     log.info(
       {
@@ -541,8 +526,8 @@ export class Agent {
   ): { channel: Channel; chatId: string } | undefined {
     let target: ReplyTarget | undefined;
 
-    if (sessionKey.startsWith("dm:")) {
-      const identityName = sessionKey.slice(3);
+    const identityName = dmIdentityFromSessionKey(sessionKey);
+    if (identityName !== undefined) {
       target = this.router.getReplyTarget(sessionKey)
         ?? this.router.deriveReplyTargetFromConfig(identityName);
       if (!target) {
@@ -585,7 +570,7 @@ export class Agent {
 
     return {
       onText: (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
-      onBlockComplete: this.makeBlockHandler(channel, chatId, stream),
+      onBlockComplete: this.delivery.makeBlockHandler(channel, chatId, stream),
       resolve: async (response) => {
         if (settled) return;
         settled = true;
@@ -599,7 +584,7 @@ export class Agent {
               timestamp: Date.now(),
             });
           }
-          await this.deliverResponse(key, channel, chatId, response, stream);
+          await this.delivery.deliverResponse(key, channel, chatId, response, stream);
         } catch (err) {
           log.error({ err, key }, "Background task response delivery failed");
           try {
@@ -627,8 +612,9 @@ export class Agent {
   }
 
   private resolvePrivateReplyTarget(key: string): ReplyTarget | undefined {
-    if (key.startsWith("dm:")) {
-      return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(key.slice(3));
+    const identityName = dmIdentityFromSessionKey(key);
+    if (identityName !== undefined) {
+      return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(identityName);
     }
 
     if (!isGroupSessionKey(key)) {
@@ -669,109 +655,6 @@ export class Agent {
       hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0;
     }
     return String(hash);
-  }
-
-  /**
-   * Finalize the streaming message after a turn completes. Per-block delivery
-   * happens during the run (each `assistant` event triggers `commitBlock` via
-   * the `onBlockComplete` callback below), so by the time we get here the
-   * stream's only remaining job is flushing any trailing buffer state.
-   *
-   * Handles three special cases:
-   *   - Bare NO_REPLY response: cancel the stream (drops in-flight Telegram
-   *     edits, no-op for iMessage's already-shipped buffer).
-   *   - API errors surfaced as response text: finish + send a clean `[error]`.
-   *   - Otherwise: stream.finish() flushes any final-block buffer.
-   *
-   * MEDIA tags are shipped per block via `shipBlockMedia` during the run, so
-   * we don't extract them here.
-   */
-  private async deliverResponse(
-    sessionKey: string,
-    replyChannel: Channel,
-    replyChatId: string,
-    response: string,
-    stream: StreamingMessage,
-  ): Promise<void> {
-    log.info({ channel: replyChannel.name, session: sessionKey }, "Tomo: %s", response);
-
-    if (isSilentReply(response)) {
-      log.info("Silent reply (no message sent)");
-      await stream.cancel();
-      return;
-    }
-
-    // Surface SDK/API errors that arrive as response text.
-    if (isAgentErrorResponse(response)) {
-      const visibleError = `[error] ${response}`;
-      this.queuePendingErrorNote(sessionKey, visibleError);
-      await stream.cancel();
-      await replyChannel.send({ chatId: replyChatId, text: visibleError });
-      return;
-    }
-
-    await stream.finish();
-  }
-
-  /**
-   * Deliver assistant text that bypasses StreamingMessage. Caption text rides
-   * with the first MEDIA send; plain text is split the same way streamed text is.
-   */
-  private async deliverAssistantContent(
-    channel: Channel,
-    chatId: string,
-    text: string,
-    parsed = extractAttachments(text),
-  ): Promise<void> {
-    const { cleanText, mediaPaths, stickerIds } = parsed;
-    const validPaths = mediaPaths.filter((path) => existsSync(path));
-    const caption = restoreLiteralNewlines(cleanText);
-    let textSent = false;
-
-    for (const [i, path] of validPaths.entries()) {
-      await channel.send({ chatId, photo: path, text: i === 0 ? caption : "" });
-      if (i === 0 && caption) textSent = true;
-    }
-
-    if (!textSent) {
-      await deliverTextParts(channel, chatId, cleanText);
-    }
-
-    for (const stickerId of stickerIds) {
-      await channel.send({ chatId, text: "", sticker: stickerId });
-    }
-  }
-
-  /**
-   * Build the per-block handler passed to the live session. The handler runs
-   * inside the SDK event loop (`live-session.handleEvent`); any error it
-   * throws would propagate up and kill the session mid-turn — which then
-   * trips `runWithRetry`'s "session error" branch and double-fires the whole
-   * turn. So channel-side delivery errors are caught + logged here and never
-   * leave this boundary.
-   */
-  private makeBlockHandler(
-    channel: Channel,
-    chatId: string,
-    stream: StreamingMessage,
-  ): (text: string) => Promise<void> {
-    return async (blockText: string) => {
-      try {
-        if (isAgentErrorResponse(blockText)) {
-          await stream.cancel();
-          return;
-        }
-        const attachments = extractAttachments(blockText);
-        if (attachments.mediaPaths.length > 0 || attachments.stickerIds.length > 0) {
-          await stream.discardBlock();
-          await this.deliverAssistantContent(channel, chatId, blockText, attachments);
-          return;
-        }
-        await stream.commitBlock();
-      } catch (err) {
-        log.warn({ err, channel: channel.name }, "Block delivery failed");
-      }
-    };
   }
 
   /**
@@ -845,15 +728,15 @@ export class Agent {
     try {
       const stampedText = this.drainPendingNotes(req.key) + this.injectTimestamp(req.promptText, req.sourceChannelName);
       const stream = req.replyChannel.createStreamingMessage(req.replyChatId, req.replyToMessageId);
-      const response = await this.runWithRetry(
-        req.key,
-        stampedText,
-        (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
-        req.images,
-        this.makeBlockHandler(req.replyChannel, req.replyChatId, stream),
-        req.documents,
-        req.steer,
-      );
+      const response = await this.runWithRetry({
+        key: req.key,
+        prompt: stampedText,
+        onText: (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
+        images: req.images,
+        onBlockComplete: this.delivery.makeBlockHandler(req.replyChannel, req.replyChatId, stream),
+        documents: req.documents,
+        steer: req.steer,
+      });
 
       if (req.steer && response === STEER_MERGED) {
         // Steered message merged into the in-flight turn — that turn's owner
@@ -870,7 +753,7 @@ export class Agent {
         timestamp: Date.now(),
       });
 
-      await this.deliverResponse(req.key, req.replyChannel, req.replyChatId, response, stream);
+      await this.delivery.deliverResponse(req.key, req.replyChannel, req.replyChatId, response, stream);
       await stopTyping({ clear: true });
     } catch (err) {
       log.error({ err }, req.errorLogMessage);
@@ -966,7 +849,7 @@ export class Agent {
     // Summoned group message running on the dm session: remind the model how
     // reply routing works this turn, and flag audience hops (DM ↔ group).
     // Prompt-only — the transcript keeps the clean tagged message.
-    const isSummoned = isGroup && key.startsWith("dm:");
+    const isSummoned = isGroup && isDmSessionKey(key);
     const switchNote = this.noteAudienceSwitch(key, [audienceOf(channel.name, message)]);
     const promptText = switchNote + (isSummoned
       ? `${textForAgent}\n${this.summonReminder([`${channel.name}:${message.chatId}`])}`
@@ -1045,7 +928,7 @@ export class Agent {
     // (non-summoned groups have their own session keys). A batch can even mix
     // DM messages with messages from multiple summoned groups — the per-item
     // [group ...] tags disambiguate; the reminder lists every group target.
-    const summonTargets = key.startsWith("dm:")
+    const summonTargets = isDmSessionKey(key)
       ? [...new Set(items.filter((it) => it.message.isGroup).map((it) => `${it.channel.name}:${it.message.chatId}`))]
       : [];
     const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
@@ -1070,15 +953,17 @@ export class Agent {
     });
   }
 
-  private async runWithRetry(
-    key: string,
-    prompt: string,
-    onText?: (text: string) => void,
-    images?: Array<{ data: string; mediaType: string }>,
-    onBlockComplete?: (text: string) => void | Promise<void>,
-    documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    steer = false,
-  ): Promise<string> {
+  private async runWithRetry(req: RunWithRetryRequest): Promise<string> {
+    const {
+      key,
+      prompt,
+      onText,
+      images,
+      onBlockComplete,
+      documents,
+      steer = false,
+    } = req;
+
     try {
       const session = await this.getOrCreateLiveSession(key);
       const response = steer
@@ -1193,7 +1078,7 @@ export class Agent {
   private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
     if (!message.isGroup) return message.text;
     const prefixed = `${message.senderName}: ${message.text}`;
-    if (!sessionKey.startsWith("dm:")) return prefixed;
+    if (!isDmSessionKey(sessionKey)) return prefixed;
     const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
     return `[group${label ? ` "${label}"` : ""}] ${prefixed}`;
   }
@@ -1257,7 +1142,7 @@ export class Agent {
         );
 
     try {
-      const response = await this.runWithRetry(key, stampedMessage);
+      const response = await this.runWithRetry({ key, prompt: stampedMessage });
       const silentCronResponse = isSilentReply(response) || response.includes("NO_REPLY");
 
       log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
@@ -1296,7 +1181,7 @@ export class Agent {
         timestamp: Date.now(),
       });
 
-      await this.deliverAssistantContent(deliveryChannel, deliveryChatId, response);
+      await this.delivery.deliverAssistantContent(deliveryChannel, deliveryChatId, response);
       await stopTyping({ clear: true });
       return true;
     } catch (err) {
@@ -1342,7 +1227,7 @@ export class Agent {
 
   private async processContinuity(prompt: string, key: string): Promise<void> {
     try {
-      const response = await this.runWithRetry(key, this.drainPendingNotes(key) + prompt);
+      const response = await this.runWithRetry({ key, prompt: this.drainPendingNotes(key) + prompt });
       log.info("Continuity response: %s", response.slice(0, 100));
 
       if (isAgentErrorResponse(response)) {
@@ -1354,14 +1239,15 @@ export class Agent {
       // Send non-silent responses to the user (check includes() for multi-turn responses
       // where NO_REPLY may appear after earlier text output)
       if (!isSilentReply(response) && !response.includes("NO_REPLY")) {
+        const identityName = dmIdentityFromSessionKey(key);
         const replyTarget = this.router.getReplyTarget(key)
-          ?? (key.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(key.slice(3)) : undefined)
+          ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
           ?? privateReplyTargetFromSessionKey(key);
 
         if (replyTarget) {
           const channel = this.getChannel(replyTarget.channelName);
           if (channel) {
-            await this.deliverAssistantContent(channel, replyTarget.chatId, response);
+            await this.delivery.deliverAssistantContent(channel, replyTarget.chatId, response);
           }
         }
       }
@@ -1560,9 +1446,10 @@ export class Agent {
     if (!normalized) return undefined;
     const { sessionKey, identityName } = normalized;
 
-    if (sessionKey.startsWith("dm:")) {
+    const dmIdentityName = dmIdentityFromSessionKey(sessionKey);
+    if (dmIdentityName !== undefined) {
       const replyTarget = this.router.getReplyTarget(sessionKey)
-        ?? this.router.deriveReplyTargetFromConfig(identityName ?? sessionKey.slice(3));
+        ?? this.router.deriveReplyTargetFromConfig(identityName ?? dmIdentityName);
       return replyTarget ? { sessionKey, replyTarget } : undefined;
     }
 
@@ -1604,76 +1491,16 @@ export class Agent {
   }
 
   private queuePendingNote(sessionKey: string, note: string): void {
-    let arr = this.pendingNotes.get(sessionKey);
-    if (!arr) {
-      try {
-        arr = this.sessions.getPendingNotes(sessionKey);
-      } catch (err) {
-        log.warn({ err, sessionKey }, "Could not load durable pending notes");
-        arr = [];
-      }
-    }
-    arr.push(note);
-    if (arr.length > MAX_PENDING_NOTES) {
-      const dropped = arr.splice(0, arr.length - MAX_PENDING_NOTES).length;
-      log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
-    }
-    this.pendingNotes.set(sessionKey, arr);
-    try {
-      this.sessions.setPendingNotes(sessionKey, arr);
-    } catch (err) {
-      log.warn({ err, sessionKey }, "Could not persist pending notes");
-    }
+    this.pendingNotesQueue.queueNote(sessionKey, note);
   }
 
   private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
-    const normalized = visibleError.replace(/\s+/g, " ").trim();
-    const clipped = truncateForPendingError(normalized, MAX_SINGLE_PENDING_ERROR_CHARS);
-    const notes = [...(this.pendingErrorNotes.get(sessionKey) ?? []), clipped].slice(-MAX_PENDING_ERROR_NOTES);
-
-    while (notes.length > 1 && pendingErrorChars(notes) > MAX_PENDING_ERROR_CHARS) {
-      notes.shift();
-    }
-    this.pendingErrorNotes.set(sessionKey, notes);
+    this.pendingNotesQueue.queueError(sessionKey, visibleError);
   }
 
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
-    const drained: string[] = [];
-    let notes = this.pendingNotes.get(sessionKey);
-    if (!notes) {
-      try {
-        notes = this.sessions.getPendingNotes(sessionKey);
-      } catch (err) {
-        log.warn({ err, sessionKey }, "Could not load durable pending notes");
-        notes = [];
-      }
-    }
-    if (notes && notes.length > 0) {
-      drained.push(...notes);
-      try {
-        this.sessions.setPendingNotes(sessionKey, []);
-        this.pendingNotes.delete(sessionKey);
-      } catch (err) {
-        // Avoid replaying the same note repeatedly in this process. If the
-        // durable clear failed, a restart may replay it, which is safer than
-        // silently losing context.
-        this.pendingNotes.set(sessionKey, []);
-        log.warn({ err, sessionKey }, "Could not clear durable pending notes");
-      }
-    }
-
-    const errorNotes = this.pendingErrorNotes.get(sessionKey);
-    if (errorNotes && errorNotes.length > 0) {
-      this.pendingErrorNotes.delete(sessionKey);
-      drained.push([
-        "[System: Recent Tomo errors before this turn (newest last, capped):",
-        ...errorNotes.map((note) => `- ${note}`),
-        "Use this as operational context; do not repeat the raw error unless it helps the user.]",
-      ].join("\n"));
-    }
-
-    return drained.map((n) => `${n}\n\n`).join("");
+    return this.pendingNotesQueue.drain(sessionKey);
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */
@@ -1682,8 +1509,9 @@ export class Agent {
     let target: ReplyTarget | undefined;
 
     if (dmKey) {
+      const identityName = dmIdentityFromSessionKey(dmKey);
       target = this.router.getReplyTarget(dmKey)
-        ?? (dmKey.startsWith("dm:") ? this.router.deriveReplyTargetFromConfig(dmKey.slice(3)) : undefined)
+        ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
         ?? privateReplyTargetFromSessionKey(dmKey);
     }
 

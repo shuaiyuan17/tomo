@@ -1031,6 +1031,30 @@ describe("identity multi-channel routing", () => {
 // ===== Cron delivery =====
 
 describe("cron message delivery", () => {
+  it("reports the turn's outcome to the caller (CronScheduler.markRun)", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockResponseFn = () => "All done!";
+    await expect(agent.handleCronMessage("Task", "telegram:12345")).resolves.toBe(true);
+
+    mockResponseFn = () => "NO_REPLY";
+    await expect(agent.handleCronMessage("Quiet task", "telegram:12345")).resolves.toBe(true);
+
+    // An agent-level error response resolves false (never rejects) so the
+    // scheduler records lastStatus "error" instead of "ok".
+    mockResponseFn = () => "API Error: 529 overloaded";
+    await expect(agent.handleCronMessage("Failing task", "telegram:12345")).resolves.toBe(false);
+
+    await agent.stop();
+  });
+
   it("delivers cron response to channel: session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -2495,6 +2519,38 @@ describe("system prompt changes", () => {
     expect(queryCalls.length - queryCallsBefore).toBe(2);
 
     await agent.stop();
+  });
+
+  it("closes prompt-retired busy sessions on shutdown", async () => {
+    resetConfig();
+    const agent = new Agent();
+    const channel = new MockChannel("telegram");
+    agent.addChannel(channel);
+
+    let releaseTurn!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const invocations: string[] = [];
+    mockResponseFn = async (text) => {
+      invocations.push(text);
+      if (text.includes("slow request")) await gate;
+      return "done";
+    };
+
+    // Session A busy, then retired by a prompt-change sweep.
+    await channel.simulateMessage(makeMsg({ chatId: "111", text: "slow request" }));
+    await waitFor(() => expect(invocations).toHaveLength(1));
+    mockWorkspace.systemPrompt = "Updated system prompt";
+    await channel.simulateMessage(makeMsg({ chatId: "222", text: "quick request" }));
+    await waitFor(() => expect(channel.delivered.filter((d) => d.chatId === "222")).toHaveLength(1));
+
+    // Shutdown while A's turn is still in flight: stop() must close the
+    // retired session (killing the turn is correct at shutdown), not leave
+    // its SDK child running until the turn finishes or times out.
+    await agent.stop();
+    releaseTurn();
+    await drainQueue(agent);
+    await expectNoChangeFor(() =>
+      expect(channel.delivered.filter((d) => d.chatId === "111")).toHaveLength(0));
   });
 
   it("retires idle sessions on prompt change so their next turn gets the new prompt", async () => {

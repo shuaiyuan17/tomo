@@ -3,7 +3,7 @@ import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingO
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
-import type { ReplyTarget } from "./sessions/types.js";
+import type { ReplyTarget, SessionMessage } from "./sessions/types.js";
 import {
   isGroupSessionKey,
   isDmSessionKey,
@@ -1033,6 +1033,16 @@ export class Agent {
 
   listSessionCatalog(): SessionCatalog {
     return this.proactive.listSessionCatalog();
+  }
+
+  /** Transcript recall for the internal MCP server (recall_conversation).
+   *  Callers pass the session key the server instance was bound to — the
+   *  tool can only read its own session's history. */
+  searchSessionTranscript(
+    sessionKey: string,
+    opts: { query?: string; fromTime?: number; toTime?: number; limit?: number },
+  ): SessionMessage[] {
+    return this.sessions.searchTranscript(sessionKey, opts);
   }
 
   private recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {

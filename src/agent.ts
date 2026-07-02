@@ -93,6 +93,10 @@ export class Agent {
   private sessions: SessionStore;
   private router: IdentityRouter;
   private liveSessions = new Map<string, LiveSession>();
+  // Busy sessions retired by a prompt change: removed from liveSessions (so
+  // their key gets a fresh session) but still running an in-flight turn.
+  // Tracked so stop() can close them — they'd otherwise outlive shutdown.
+  private retiringSessions = new Set<LiveSession>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private messageQueues = new Map<string, Promise<void>>();
   private batcher = new InboundBatcher({
@@ -398,8 +402,23 @@ export class Agent {
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
       log.info("System prompt changed, creating new sessions");
       for (const [k, s] of this.liveSessions) {
-        s.close();
+        // Removing the session from the map is what retires it — the next
+        // message for its key creates a fresh session with the new prompt.
+        // Closing a busy session here would reject its in-flight turn, and
+        // runWithRetry's reset-and-retry branch would then re-run the whole
+        // turn, repeating side effects its first half already performed — so
+        // the actual close waits for the in-flight turn to finish.
         this.liveSessions.delete(k);
+        if (s.isBusy()) {
+          this.retiringSessions.add(s);
+          void s.waitForIdle().then(() => {
+            this.retiringSessions.delete(s);
+            s.close();
+            log.info({ key: k }, "Session closed after prompt change (deferred past in-flight turn)");
+          });
+        } else {
+          s.close();
+        }
       }
     }
     this.lastPromptHash = currentHash;
@@ -1188,18 +1207,23 @@ export class Agent {
     return `[${prefix}${weekday} ${date} ${time} ${tz}] ${text}`;
   }
 
-  /** Handle a cron-triggered message (queued per session key) */
-  async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<void> {
+  /** Handle a cron-triggered message (queued per session key). Resolves true
+   *  when the turn ran cleanly, false when it errored — errors are fully
+   *  handled here (logged, surfaced to the chat where appropriate), so the
+   *  boolean is a status report for callers like CronScheduler.markRun, not
+   *  something to retry on. Never rejects. */
+  async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<boolean> {
     return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey, options))
       .catch((err) => {
         log.error({ err, sessionKey }, "Cron message failed in queue");
+        return false;
       });
   }
 
-  private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<void> {
+  private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<boolean> {
     const key = sessionKey;
     const delivery = this.resolveDeliveryTargetForSession(sessionKey, "Cron");
-    if (!delivery) return;
+    if (!delivery) return false;
     const { channel: deliveryChannel, chatId: deliveryChatId } = delivery;
 
     const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
@@ -1227,23 +1251,23 @@ export class Agent {
         if (isGroupSessionKey(key) || options.suppressDelivery) {
           log.warn({ sessionKey: key }, "Cron error suppressed from chat delivery");
           await stopTyping({ clear: true });
-          return;
+          return false;
         }
         await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
         await stopTyping({ clear: true });
-        return;
+        return false;
       }
 
       if (options.suppressDelivery) {
         log.info({ sessionKey: key }, "Cron output suppressed from chat delivery");
         await stopTyping({ clear: true });
-        return;
+        return true;
       }
 
       if (silentCronResponse) {
         log.info("Cron completed silently (no reply sent)");
         await stopTyping({ clear: true });
-        return;
+        return true;
       }
 
       this.sessions.append(key, {
@@ -1255,6 +1279,7 @@ export class Agent {
 
       await this.deliverAssistantContent(deliveryChannel, deliveryChatId, response);
       await stopTyping({ clear: true });
+      return true;
     } catch (err) {
       log.error({ err }, "Cron message handling failed");
       const detail = err instanceof Error ? err.message : String(err);
@@ -1263,13 +1288,14 @@ export class Agent {
       if (isGroupSessionKey(key) || options.suppressDelivery) {
         log.warn({ sessionKey: key }, "Thrown cron error suppressed from chat delivery");
         await stopTyping({ clear: true });
-        return;
+        return false;
       }
       try {
         await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
       } finally {
         await stopTyping({ clear: true });
       }
+      return false;
     }
   }
 
@@ -1682,6 +1708,10 @@ export class Agent {
     this.commands.stop();
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
+    // Prompt-retired sessions waiting out an in-flight turn are not in the
+    // map; shutdown must not leave their SDK children running.
+    for (const s of this.retiringSessions) s.close();
+    this.retiringSessions.clear();
     await Promise.all(this.channels.map((ch) => ch.stop()));
   }
 }

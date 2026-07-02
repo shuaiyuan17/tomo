@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { CronStore, parseScheduleString } from "../src/cron/store.js";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -97,6 +97,49 @@ describe("CronStore", () => {
     expect(updated.lastStatus).toBe("ok");
     expect(updated.lastRunAt).toBeTruthy();
     expect(updated.nextRunAt).toBeGreaterThan(Date.now());
+  });
+
+  it("advances 'every' schedules from the scheduled due time, not run completion", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "tick",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+
+    // Simulate a run that fired 5s late (poll granularity + a slow agent
+    // turn). The next slot must be scheduled-time + interval, so the delay
+    // doesn't accumulate as drift run over run.
+    const scheduledAt = Date.now() - 5_000;
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = scheduledAt;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    store.markRun(job.id, "ok");
+    expect(store.get(job.id)!.nextRunAt).toBe(scheduledAt + 60_000);
+  });
+
+  it("restarts the 'every' cadence from now when the next slot is already past", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "tick",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+
+    // Daemon was down for several intervals: don't burst-fire missed runs.
+    const scheduledAt = Date.now() - 300_000;
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = scheduledAt;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const before = Date.now();
+    store.markRun(job.id, "ok");
+    const next = store.get(job.id)!.nextRunAt!;
+    expect(next).toBeGreaterThan(before);
+    expect(next).toBeLessThanOrEqual(Date.now() + 60_000);
   });
 
   it("disables one-shot jobs after run", () => {

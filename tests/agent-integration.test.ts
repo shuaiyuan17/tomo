@@ -233,7 +233,8 @@ function createMockQuery(prompt: AsyncGenerator) {
 // Module mocks — declared before imports
 // ---------------------------------------------------------------------------
 
-const { mockConfig } = vi.hoisted(() => ({
+const { mockConfig, mockWorkspace } = vi.hoisted(() => ({
+  mockWorkspace: { systemPrompt: "Test system prompt" },
   mockConfig: {
     auth: {
       method: "subscription" as "subscription" | "api-key",
@@ -288,7 +289,7 @@ vi.mock("../src/config.js", () => ({
 }));
 
 vi.mock("../src/workspace/index.js", () => ({
-  buildSystemPrompt: () => "Test system prompt",
+  buildSystemPrompt: () => mockWorkspace.systemPrompt,
   PRIVATE_MEMORY_SUBDIR: "private",
   PRIVATE_MEMORY_DIR: "/tmp/tomo-mock/workspace/memory/private",
   MEMORY_DIR: "/tmp/tomo-mock/workspace/memory",
@@ -493,6 +494,7 @@ beforeEach(() => {
   tmpDir = join(tmpdir(), `tomo-int-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
   mkdirSync(tmpDir, { recursive: true });
   resetConfig();
+  mockWorkspace.systemPrompt = "Test system prompt";
   mockResponseFn = () => "mock response";
   mockEmitStreamDeltas = true;
   mockSteerEcho = false;
@@ -1029,6 +1031,30 @@ describe("identity multi-channel routing", () => {
 // ===== Cron delivery =====
 
 describe("cron message delivery", () => {
+  it("reports the turn's outcome to the caller (CronScheduler.markRun)", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockResponseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockResponseFn = () => "All done!";
+    await expect(agent.handleCronMessage("Task", "telegram:12345")).resolves.toBe(true);
+
+    mockResponseFn = () => "NO_REPLY";
+    await expect(agent.handleCronMessage("Quiet task", "telegram:12345")).resolves.toBe(true);
+
+    // An agent-level error response resolves false (never rejects) so the
+    // scheduler records lastStatus "error" instead of "ok".
+    mockResponseFn = () => "API Error: 529 overloaded";
+    await expect(agent.handleCronMessage("Failing task", "telegram:12345")).resolves.toBe(false);
+
+    await agent.stop();
+  });
+
   it("delivers cron response to channel: session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -2452,6 +2478,112 @@ describe("chat commands", () => {
 });
 
 // ===== Message queueing =====
+
+describe("system prompt changes", () => {
+  it("defers closing a busy session until its in-flight turn finishes", async () => {
+    resetConfig();
+    const agent = new Agent();
+    const channel = new MockChannel("telegram");
+    agent.addChannel(channel);
+    // query() is a file-level mock; count only this test's calls.
+    const queryCallsBefore = (sdkMock.query as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+
+    let releaseTurn!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const invocations: string[] = [];
+    mockResponseFn = async (text) => {
+      invocations.push(text);
+      if (text.includes("slow request")) await gate;
+      return "done";
+    };
+
+    // Get session A's turn in flight, then hold it open.
+    await channel.simulateMessage(makeMsg({ chatId: "111", text: "slow request" }));
+    await waitFor(() => expect(invocations).toHaveLength(1));
+
+    // Prompt changes; session B's message triggers the retire-all sweep
+    // while A's turn is still running.
+    mockWorkspace.systemPrompt = "Updated system prompt";
+    await channel.simulateMessage(makeMsg({ chatId: "222", text: "quick request" }));
+    await waitFor(() => expect(channel.delivered.filter((d) => d.chatId === "222")).toHaveLength(1));
+
+    // A's turn survived the sweep: it completes and delivers exactly once.
+    releaseTurn();
+    await waitFor(() => expect(channel.delivered.filter((d) => d.chatId === "111")).toHaveLength(1));
+    await drainQueue(agent);
+
+    // No reset-and-retry double fire: the slow turn ran once, and only two
+    // SDK sessions were ever created (A original + B on the new prompt).
+    expect(invocations.filter((t) => t.includes("slow request"))).toHaveLength(1);
+    const queryCalls = (sdkMock.query as unknown as { mock: { calls: unknown[] } }).mock.calls;
+    expect(queryCalls.length - queryCallsBefore).toBe(2);
+
+    await agent.stop();
+  });
+
+  it("closes prompt-retired busy sessions on shutdown", async () => {
+    resetConfig();
+    const agent = new Agent();
+    const channel = new MockChannel("telegram");
+    agent.addChannel(channel);
+
+    let releaseTurn!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const invocations: string[] = [];
+    mockResponseFn = async (text) => {
+      invocations.push(text);
+      if (text.includes("slow request")) await gate;
+      return "done";
+    };
+
+    // Session A busy, then retired by a prompt-change sweep.
+    await channel.simulateMessage(makeMsg({ chatId: "111", text: "slow request" }));
+    await waitFor(() => expect(invocations).toHaveLength(1));
+    mockWorkspace.systemPrompt = "Updated system prompt";
+    await channel.simulateMessage(makeMsg({ chatId: "222", text: "quick request" }));
+    await waitFor(() => expect(channel.delivered.filter((d) => d.chatId === "222")).toHaveLength(1));
+
+    // Shutdown while A's turn is still in flight: stop() must close the
+    // retired session (killing the turn is correct at shutdown), not leave
+    // its SDK child running until the turn finishes or times out.
+    await agent.stop();
+    releaseTurn();
+    await drainQueue(agent);
+    await expectNoChangeFor(() =>
+      expect(channel.delivered.filter((d) => d.chatId === "111")).toHaveLength(0));
+  });
+
+  it("retires idle sessions on prompt change so their next turn gets the new prompt", async () => {
+    resetConfig();
+    const agent = new Agent();
+    const channel = new MockChannel("telegram");
+    agent.addChannel(channel);
+    // query() is a file-level mock; count only this test's calls.
+    const queryCallsBefore = (sdkMock.query as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+
+    await channel.simulateMessage(makeMsg({ chatId: "111", text: "first" }));
+    await drainQueue(agent);
+
+    // Session B's creation triggers the sweep; idle session A is retired.
+    mockWorkspace.systemPrompt = "Updated system prompt";
+    await channel.simulateMessage(makeMsg({ chatId: "222", text: "other chat" }));
+    await drainQueue(agent);
+
+    // A's next message can't reuse the retired session — a third SDK
+    // session is created, carrying the new prompt.
+    await channel.simulateMessage(makeMsg({ chatId: "111", text: "second" }));
+    await drainQueue(agent);
+
+    const queryCalls = (sdkMock.query as unknown as {
+      mock: { calls: Array<[{ options: { systemPrompt: string } }]> };
+    }).mock.calls;
+    expect(queryCalls.length - queryCallsBefore).toBe(3);
+    expect(queryCalls[queryCalls.length - 1][0].options.systemPrompt).toContain("Updated system prompt");
+    expect(channel.delivered.filter((d) => d.chatId === "111")).toHaveLength(2);
+
+    await agent.stop();
+  });
+});
 
 describe("message queueing", () => {
   it("settles split iMessage text and media fragments before starting a turn", async () => {

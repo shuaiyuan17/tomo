@@ -164,6 +164,28 @@ describe("SessionStore", () => {
     expect(all[0].unlinkedAt).toBeTruthy();
   });
 
+  it("picks up direct external rewrites of the registry file", () => {
+    // Regression guard for the mtime/size read cache: a rewrite by another
+    // process (not via a SessionStore instance) must still be observed.
+    const store = new SessionStore(TEST_DIR, 20);
+    store.setSdkSessionId("key1", "session-abc");
+    expect(store.getSdkSessionId("key1")).toBe("session-abc");
+
+    writeFileSync(join(TEST_DIR, "_sessions.json"), JSON.stringify({
+      version: 1,
+      sessions: [{
+        sdkSessionId: "session-external",
+        channelKey: "key1",
+        createdAt: 1,
+        lastActiveAt: 1,
+        unlinkedAt: null,
+        expiresAt: null,
+      }],
+    }));
+
+    expect(store.getSdkSessionId("key1")).toBe("session-external");
+  });
+
   it("mutators do not resurrect an externally cleared session", () => {
     const daemonStore = new SessionStore(TEST_DIR, 20);
     daemonStore.setSdkSessionId("telegram:1", "session-1");

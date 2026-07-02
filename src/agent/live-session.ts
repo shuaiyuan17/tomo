@@ -38,6 +38,7 @@ const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
 const QUERY_TIMEOUT_ERROR = `${QUERY_TIMEOUT_ERROR_PREFIX} 10 minutes`;
 
 export interface QueryResult {
+  /** Cost of this turn only (delta of the SDK's cumulative per-process total) */
   costUsd: number;
   inputTokens: number;
   outputTokens: number;
@@ -427,7 +428,7 @@ export class LiveSession {
 
       // Store result stats, get context usage, then resolve
       this.lastResult = {
-        costUsd: totalCost,
+        costUsd: turnCost,
         inputTokens: input,
         outputTokens: output,
         cacheReadTokens: cacheRead,

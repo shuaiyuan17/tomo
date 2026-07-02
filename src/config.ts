@@ -262,10 +262,10 @@ function buildConfig(): TomoConfig {
     (channels.imessage?.password as string | undefined) ??
     "";
 
-  const imessageWebhookPort = Number(
+  const imessageWebhookPort = parsePositiveInt(
     process.env.IMESSAGE_WEBHOOK_PORT ??
-    (channels.imessage?.webhookPort as string | undefined) ??
-    "3100",
+    (channels.imessage?.webhookPort as string | undefined),
+    3100,
   );
   const imessageInboundSettleMs = parseNonNegativeMs(
     process.env.IMESSAGE_INBOUND_SETTLE_MS ??
@@ -315,7 +315,7 @@ function buildConfig(): TomoConfig {
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
     sdkSessionsDir: paths.sdkSessionsDir,
-    historyLimit: Number(process.env.HISTORY_LIMIT ?? "20"),
+    historyLimit: parsePositiveInt(process.env.HISTORY_LIMIT, 20),
     logsDir: paths.logsDir,
     tomoHome: paths.tomoHome,
     continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
@@ -339,7 +339,7 @@ function buildConfig(): TomoConfig {
     groupSecret: (file.groupSecret as string) ?? null,
     summonExpiryMinutes: parseNonNegativeMs(process.env.TOMO_SUMMON_EXPIRY_MINUTES ?? file.summonExpiryMinutes ?? 60, 60),
     saveInboundImages: file.saveInboundImages !== false,
-    maxTurns: Number(process.env.TOMO_MAX_TURNS ?? file.maxTurns ?? "50"),
+    maxTurns: parsePositiveInt(process.env.TOMO_MAX_TURNS ?? file.maxTurns, 50),
     steering: parseBoolean(process.env.TOMO_STEERING, parseBoolean(file.steering, true)),
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,

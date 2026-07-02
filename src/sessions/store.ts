@@ -48,7 +48,6 @@ export class SessionStore {
   // full read+parse when the file hasn't changed since we last touched it.
   private registryStat: { mtimeMs: number; size: number } | null = null;
   private dir: string;
-  private historyLimit: number;
   private sdkSessionsDir: string;
   private tailLimit: number;
   private rotateBytes: number;
@@ -66,7 +65,6 @@ export class SessionStore {
       throw new Error("SessionStore requires an explicit SDK sessions directory");
     }
     this.dir = dir;
-    this.historyLimit = historyLimit;
     this.sdkSessionsDir = sdkSessionsDir;
     this.tailLimit = opts?.tailMessages ?? Math.max(TRANSCRIPT_TAIL_MIN, historyLimit * 10);
     this.rotateBytes = opts?.rotateBytes ?? TRANSCRIPT_ROTATE_BYTES;
@@ -243,26 +241,6 @@ export class SessionStore {
       }
     }
     return 0;
-  }
-
-  /** Get the last N turns of conversation for LLM context */
-  getHistory(key: string): SessionMessage[] {
-    const session = this.get(key);
-    const messages = session.messages;
-
-    if (this.historyLimit <= 0) return messages;
-
-    let userTurns = 0;
-    let cutoff = messages.length;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
-        userTurns++;
-        if (userTurns > this.historyLimit) break;
-      }
-      cutoff = i;
-    }
-
-    return messages.slice(cutoff);
   }
 
   /** Load prompt notes that must survive daemon restarts until the session's

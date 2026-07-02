@@ -67,16 +67,17 @@ describe("CronStore", () => {
       schedule: { kind: "every", everyMs: 1000 },
       message: "past",
     });
-    // Manually set nextRunAt to the past
-    const job = store.list()[0];
-    job.nextRunAt = Date.now() - 1000;
-
     store.add({
       name: "future",
       schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
       message: "later",
       sessionKey: "dm:alice",
     });
+
+    // Persist an overdue nextRunAt directly (getDueJobs reloads from disk)
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs.find((j: { name: string }) => j.name === "overdue").nextRunAt = Date.now() - 1000;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
 
     const due = store.getDueJobs();
     expect(due).toHaveLength(1);
@@ -209,6 +210,31 @@ describe("CronStore", () => {
       deleteAfterRun: true,
     });
     expect(job.deleteAfterRun).toBe(true);
+  });
+
+  it("add() does not resurrect jobs removed by another process", () => {
+    // Simulates the daemon's long-lived store vs a CLI process removing a
+    // job while the daemon holds a stale in-memory snapshot.
+    const daemonStore = new CronStore(TEST_PATH);
+    const stale = daemonStore.add({
+      name: "removed-externally",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+
+    const cliStore = new CronStore(TEST_PATH);
+    cliStore.remove(stale.id);
+
+    daemonStore.add({
+      name: "new-job",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "y",
+      sessionKey: "dm:alice",
+    });
+
+    const names = new CronStore(TEST_PATH).list().map((j) => j.name);
+    expect(names).toEqual(["new-job"]);
   });
 
   it("rewrites sessionKey in bulk", () => {

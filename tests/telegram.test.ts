@@ -3,7 +3,8 @@ import { describe, it, expect } from "vitest";
 // Test @mention cleaning (extracted from TelegramChannel.cleanMention)
 function cleanMention(text: string, botUsername: string | undefined): string {
   if (!botUsername) return text;
-  return text.replace(new RegExp(`@${botUsername}`, "gi"), "").trim();
+  const escaped = botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text.replace(new RegExp(`@${escaped}`, "gi"), "").trim();
 }
 
 describe("cleanMention", () => {
@@ -29,6 +30,13 @@ describe("cleanMention", () => {
 
   it("strips multiple mentions", () => {
     expect(cleanMention("@mybot hey @mybot", "mybot")).toBe("hey");
+  });
+
+  it("treats regex metacharacters in the username literally", () => {
+    // Telegram usernames are [A-Za-z0-9_], but the RegExp must not break or
+    // over-match if that ever changes.
+    expect(cleanMention("@my.bot hello", "my.bot")).toBe("hello");
+    expect(cleanMention("@myXbot hello", "my.bot")).toBe("@myXbot hello");
   });
 });
 

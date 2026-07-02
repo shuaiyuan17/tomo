@@ -34,8 +34,33 @@ export type UnownedTurnFactory = () => TurnRequest | undefined;
 export const STEER_MERGED = "";
 export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
 
-const TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
-const QUERY_TIMEOUT_ERROR = `${QUERY_TIMEOUT_ERROR_PREFIX} 10 minutes`;
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
+
+export interface LiveSessionSettings {
+  timeoutMs?: number;
+}
+
+function normalizeTimeoutMs(timeoutMs: number | undefined): number {
+  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.floor(timeoutMs)
+    : DEFAULT_TIMEOUT_MS;
+}
+
+function formatTimeout(timeoutMs: number): string {
+  if (timeoutMs % 60_000 === 0) {
+    const minutes = timeoutMs / 60_000;
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  if (timeoutMs % 1000 === 0) {
+    const seconds = timeoutMs / 1000;
+    return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  }
+  return `${timeoutMs}ms`;
+}
+
+function queryTimeoutError(timeoutMs: number): string {
+  return `${QUERY_TIMEOUT_ERROR_PREFIX} ${formatTimeout(timeoutMs)}`;
+}
 
 export interface QueryResult {
   /** Cost of this turn only (delta of the SDK's cumulative per-process total) */
@@ -164,6 +189,7 @@ export class LiveSession {
   private turnBudget: TurnBudget | undefined;
   private unownedTurnDropLogged = false;
   private unownedTurnFactory: UnownedTurnFactory | undefined;
+  private timeoutMs: number;
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -177,10 +203,12 @@ export class LiveSession {
     sessionKey?: string,
     turnBudget?: TurnBudget,
     unownedTurnFactory?: UnownedTurnFactory,
+    settings: LiveSessionSettings = {},
   ) {
     this.sessionKey = sessionKey;
     this.turnBudget = turnBudget;
     this.unownedTurnFactory = unownedTurnFactory;
+    this.timeoutMs = normalizeTimeoutMs(settings.timeoutMs);
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -262,9 +290,9 @@ export class LiveSession {
     this.activityTimer = setTimeout(() => {
       this.activityTimer = null;
       if (this.alive && this.isBusy()) {
-        this.timeoutTurn(new Error(QUERY_TIMEOUT_ERROR));
+        this.timeoutTurn(new Error(queryTimeoutError(this.timeoutMs)));
       }
-    }, TIMEOUT_MS);
+    }, this.timeoutMs);
   }
 
   /**

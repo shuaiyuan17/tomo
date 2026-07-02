@@ -279,6 +279,7 @@ const { mockConfig, mockWorkspace } = vi.hoisted(() => ({
     passiveGroups: {} as Record<string, string[]>,
     groupSecret: null as string | null,
     steering: true,
+    liveSessionTimeoutMs: 10 * 60 * 1000,
     litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
     lcm: {
       nudgeAtPct: 70,
@@ -468,10 +469,15 @@ function makeMsg(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
 
 /** Wait for the agent's internal message queues to drain */
 async function drainQueue(agent: InstanceType<typeof Agent>): Promise<void> {
-  const queues = (agent as unknown as { messageQueues: Map<string, Promise<void>> }).messageQueues;
-  for (const p of queues.values()) {
-    await p;
-  }
+  const queue = (agent as unknown as { sessionQueue: { drain(): Promise<void> } }).sessionQueue;
+  await queue.drain();
+}
+
+function peekPendingNotes(agent: InstanceType<typeof Agent>, sessionKey: string): string[] {
+  const queue = (agent as unknown as {
+    pendingNotesQueue: { peekNotes(key: string): string[] };
+  }).pendingNotesQueue;
+  return queue.peekNotes(sessionKey);
 }
 
 async function waitFor(assertion: () => void, timeoutMs = 250): Promise<void> {
@@ -569,7 +575,7 @@ describe("send_message direct mode", () => {
       content: `[proactive] ${text}`,
       channel: "telegram",
     });
-    expect((agent as unknown as { pendingNotes: Map<string, string[]> }).pendingNotes.get("telegram:12345")).toEqual([
+    expect(peekPendingNotes(agent, "telegram:12345")).toEqual([
       `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`,
     ]);
 
@@ -583,7 +589,6 @@ describe("send_message direct mode", () => {
     const internals = agent as unknown as {
       router: { summonGroup(ch: string, chatId: string, identity: string): void };
       sessions: { get(key: string): { messages: Array<{ content: string }> } };
-      pendingNotes: Map<string, string[]>;
     };
     internals.router.summonGroup("telegram", "-987", "Alice");
 
@@ -592,7 +597,7 @@ describe("send_message direct mode", () => {
     expect(result).toEqual({ ok: true });
     expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
       .toBe("[via dm:alice (summoned)] hello group");
-    expect(internals.pendingNotes.get("telegram:-987")).toEqual([
+    expect(peekPendingNotes(agent, "telegram:-987")).toEqual([
       `[System: Tomo from alice's main session (dm:alice), summoned into this group at the time, sent the following message here: "hello group"]`,
     ]);
 
@@ -606,7 +611,6 @@ describe("send_message direct mode", () => {
     const internals = agent as unknown as {
       router: { summonGroup(ch: string, chatId: string, identity: string): void };
       sessions: { get(key: string): { messages: Array<{ content: string }> } };
-      pendingNotes: Map<string, string[]>;
     };
     internals.router.summonGroup("telegram", "-987", "Alice");
 
@@ -616,7 +620,7 @@ describe("send_message direct mode", () => {
     expect(result).toEqual({ ok: true });
     expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
       .toBe("[proactive] hi from bob");
-    expect(internals.pendingNotes.get("telegram:-987")).toEqual([
+    expect(peekPendingNotes(agent, "telegram:-987")).toEqual([
       `[System: Tomo from another session sent the following message to this conversation earlier: "hi from bob"]`,
     ]);
 
@@ -627,15 +631,14 @@ describe("send_message direct mode", () => {
     const agent = new Agent();
     const internals = agent as unknown as {
       queuePendingNote(key: string, note: string): void;
-      pendingNotes: Map<string, string[]>;
     };
 
     for (let i = 0; i < 20; i++) internals.queuePendingNote("telegram:-987", `note-${i}`);
 
-    const notes = internals.pendingNotes.get("telegram:-987");
+    const notes = peekPendingNotes(agent, "telegram:-987");
     expect(notes).toHaveLength(15);
-    expect(notes?.[0]).toBe("note-5");
-    expect(notes?.at(-1)).toBe("note-19");
+    expect(notes[0]).toBe("note-5");
+    expect(notes.at(-1)).toBe("note-19");
 
     await agent.stop();
   });
@@ -1188,7 +1191,7 @@ describe("cron message delivery", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const internals = agent as unknown as {
-      runWithRetry: (...args: unknown[]) => Promise<string>;
+      runWithRetry: (req: unknown) => Promise<string>;
     };
     const originalRunWithRetry = internals.runWithRetry.bind(agent);
     internals.runWithRetry = vi.fn().mockRejectedValueOnce(
@@ -1325,7 +1328,7 @@ describe("cron message delivery", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const internals = agent as unknown as {
-      runWithRetry: (...args: unknown[]) => Promise<string>;
+      runWithRetry: (req: unknown) => Promise<string>;
     };
     internals.runWithRetry = vi.fn().mockRejectedValueOnce(
       new Error("Failed to authenticate. API Error: 401 Invalid authentication credentials"),
@@ -2869,12 +2872,8 @@ describe("message queueing", () => {
 
 /** Drain queues repeatedly — tasks may enqueue more work */
 async function drainAllSessions(agent: InstanceType<typeof Agent>): Promise<void> {
-  const queues = (agent as unknown as { messageQueues: Map<string, Promise<void>> }).messageQueues;
-  for (let i = 0; i < 5; i++) {
-    const all = Array.from(queues.values());
-    if (all.length === 0) break;
-    await Promise.all(all);
-  }
+  const queue = (agent as unknown as { sessionQueue: { drain(maxPasses?: number): Promise<void> } }).sessionQueue;
+  await queue.drain();
 }
 
 describe("ingress isolation", () => {

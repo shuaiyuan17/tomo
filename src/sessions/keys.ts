@@ -5,9 +5,21 @@ export interface ParsedSessionKey {
   chatId: string;
 }
 
+export function isDmSessionKey(key: string): boolean {
+  return key.startsWith("dm:");
+}
+
+export function dmIdentityFromSessionKey(key: string): string | undefined {
+  return isDmSessionKey(key) ? key.slice(3) : undefined;
+}
+
+export function dmSessionKeyForIdentity(identityName: string): string {
+  return `dm:${identityName.toLowerCase()}`;
+}
+
 /** Parse a raw "<channel>:<chatId>" session key. Returns undefined for dm: keys. */
 export function parseRawSessionKey(key: string): ParsedSessionKey | undefined {
-  if (key.startsWith("dm:")) return undefined;
+  if (isDmSessionKey(key)) return undefined;
   const colonIdx = key.indexOf(":");
   if (colonIdx < 0) return undefined;
   const channelName = key.slice(0, colonIdx);

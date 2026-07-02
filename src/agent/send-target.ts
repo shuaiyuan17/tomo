@@ -1,3 +1,5 @@
+import { dmSessionKeyForIdentity, isDmSessionKey } from "../sessions/keys.js";
+
 /**
  * Pure helpers for `send_message` target resolution. No I/O, no config, no
  * channel imports — safe to import from tests without triggering the rest of
@@ -26,12 +28,12 @@ export function normalizeSendTarget(
     );
     if (!identity) return null;
     return {
-      sessionKey: `dm:${identity.name.toLowerCase()}`,
+      sessionKey: dmSessionKeyForIdentity(identity.name),
       identityName: identity.name,
     };
   }
-  if (target.startsWith("dm:")) {
-    return { sessionKey: `dm:${target.slice(3).toLowerCase()}` };
+  if (isDmSessionKey(target)) {
+    return { sessionKey: dmSessionKeyForIdentity(target.slice(3)) };
   }
   return { sessionKey: target };
 }

@@ -7,6 +7,13 @@ async function loadContinuityIntervalMs(value: string): Promise<number> {
   return config.continuityIntervalMs;
 }
 
+async function loadLiveSessionTimeoutMs(value: string): Promise<number> {
+  vi.resetModules();
+  vi.stubEnv("TOMO_LIVE_SESSION_TIMEOUT_MS", value);
+  const { config } = await import("../src/config.js");
+  return config.liveSessionTimeoutMs;
+}
+
 async function loadWorkspacePaths(workspaceDir: string): Promise<{
   workspaceDir: string;
   sdkSessionsDir: string;
@@ -52,6 +59,14 @@ describe("config", () => {
 
   it("parses fractional continuity intervals above the minimum", async () => {
     await expect(loadContinuityIntervalMs("2.5")).resolves.toBe(150_000);
+  });
+
+  it("parses live session timeout from the environment", async () => {
+    await expect(loadLiveSessionTimeoutMs("2500")).resolves.toBe(2500);
+  });
+
+  it("falls back to the default live session timeout for invalid values", async () => {
+    await expect(loadLiveSessionTimeoutMs("0")).resolves.toBe(10 * 60 * 1000);
   });
 
   it("derives SDK session storage from TOMO_WORKSPACE", async () => {

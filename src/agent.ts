@@ -16,7 +16,7 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type TurnRequest } from "./agent/live-session.js";
+import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { deliverTextParts } from "./channels/delivery.js";
@@ -68,6 +68,9 @@ interface CronTurnOptions {
   suppressDelivery?: boolean;
 }
 
+// Context-usage percentage at which the nudge escalates from a daily rollup
+// (config.lcm.nudgeAtPct) to a full lcm compact.
+const COMPACT_NUDGE_PCT = 80;
 const MAX_PENDING_ERROR_NOTES = 3;
 const MAX_PENDING_ERROR_CHARS = 1200;
 const MAX_SINGLE_PENDING_ERROR_CHARS = 600;
@@ -111,9 +114,10 @@ export class Agent {
   private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
-  // Context-usage hysteresis: track whether we've nudged the agent to compact
-  // for the current over-threshold episode. Reset when usage drops below LOW.
-  private contextNudged = new Map<string, boolean>();
+  // Context-usage hysteresis: the highest nudge level already fired for the
+  // current over-threshold episode. Cleared when usage drops back below
+  // config.lcm.nudgeResetPct.
+  private contextNudged = new Map<string, "daily" | "compact">();
   // System notes queued by harness events and direct sends, drained and
   // prepended to the next user/cron/continuity turn.
   private pendingNotes = new Map<string, string[]>();
@@ -771,29 +775,66 @@ export class Agent {
   }
 
   /**
-   * If the live session's last turn pushed context past 80%, fire a compact
-   * nudge. Skips when SDK auto-compact owns this session. Shared by
-   * handleMessage and handleBatchedMessages.
+   * Single context-pressure nudge path, evaluated once per completed turn:
+   * runWithRetry covers owned turns (user, cron, continuity); unowned SDK
+   * background turns call it from their resolve handler. Skips when SDK
+   * auto-compact owns this session.
+   *
+   * Two escalation levels share one hysteresis latch, so a turn that lands
+   * at ≥ COMPACT_NUDGE_PCT queues exactly one housekeeping turn instead of
+   * two: at config.lcm.nudgeAtPct ask for a `tomo lcm daily` rollup; at
+   * COMPACT_NUDGE_PCT escalate to the lcm compact skill. The latch re-arms
+   * when usage drops back below nudgeResetPct (a successful compact knocks
+   * it well under).
    *
    * The nudge goes through handleCronMessage so it runs in the per-session
    * queue. Calling runWithRetry directly here would overlap with the next
    * user message's send() and stomp LiveSession's single currentRequest slot,
    * silently swallowing one of the two responses.
+   *
+   * Callers that hold the turn's session pass its lastResult explicitly —
+   * the compact-trigger reload may have already dropped the session from
+   * liveSessions, and the latch must still see the result to stay accurate.
    */
-  private maybeNudgeCompact(key: string): void {
-    const liveSession = this.liveSessions.get(key);
-    const ctx = liveSession?.lastResult;
-    if (!ctx || ctx.contextMax <= 0 || !usesLcmCompact(key)) return;
-    const pct = Math.round((ctx.contextUsed / ctx.contextMax) * 100);
-    if (pct < 80) return;
+  private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessions.get(key)?.lastResult ?? null): void {
+    if (!usesLcmCompact(key)) return;
+    if (!ctx || ctx.contextMax <= 0) return;
+
+    const usedFrac = ctx.contextUsed / ctx.contextMax;
+    const nudged = this.contextNudged.get(key);
+
+    if (usedFrac < config.lcm.nudgeResetPct / 100) {
+      if (nudged) this.contextNudged.delete(key);
+      return;
+    }
+
+    // The compact threshold never sits below the daily threshold, so a
+    // custom nudgeAtPct ≥ COMPACT_NUDGE_PCT escalates straight to compact.
+    const compactFrac = Math.max(COMPACT_NUDGE_PCT, config.lcm.nudgeAtPct) / 100;
+    const pct = Math.round(usedFrac * 100);
     const groupNote = isGroupSessionKey(key)
       ? " This is a group session — scope the rollup to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
       : "";
-    this.handleCronMessage(
-      `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
-      key,
-      { showTyping: false, suppressDelivery: isGroupSessionKey(key) },
-    ).catch((err) => {
+
+    let nudge: string;
+    if (usedFrac >= compactFrac && nudged !== "compact") {
+      this.contextNudged.set(key, "compact");
+      nudge = `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+      log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
+    } else if (usedFrac >= config.lcm.nudgeAtPct / 100 && !nudged) {
+      const sid = this.sessions.getSdkSessionId(key);
+      if (!sid) return;
+      this.contextNudged.set(key, "daily");
+      nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+      log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
+    } else {
+      return;
+    }
+
+    this.handleCronMessage(nudge, key, {
+      showTyping: false,
+      suppressDelivery: isGroupSessionKey(key),
+    }).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });
   }
@@ -821,8 +862,6 @@ export class Agent {
         await stream.cancel();
         return;
       }
-
-      this.maybeNudgeCompact(req.key);
 
       this.sessions.append(req.key, {
         role: "assistant",
@@ -1051,71 +1090,7 @@ export class Agent {
       // resolves; nothing to record for this caller.
       if (steer && response === STEER_MERGED) return response;
 
-      // Capture session ID if new
-      const sid = session.getSessionId();
-      if (sid && !this.sessions.getSdkSessionId(key)) {
-        this.sessions.setSdkSessionId(key, sid);
-        log.info({ sessionId: sid, key }, "Session ID captured");
-      }
-
-      // Save stats
-      if (session.lastResult) {
-        this.sessions.updateStats(key, session.lastResult);
-      }
-
-      // If compact happened during this turn, reload the session on next
-      // turn. With steering, a promoted steered turn may already be running
-      // on this session — closing now would kill it, so defer the reload
-      // until the session is truly idle.
-      if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
-        if (session.isBusy()) {
-          void session.waitForIdle().then(() => {
-            if (this.liveSessions.get(key) === session) {
-              this.closeLiveSession(key);
-              log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
-            }
-          });
-        } else {
-          this.closeLiveSession(key);
-          log.info({ key }, "Session reloaded after compact");
-        }
-      }
-
-      // Context-usage hysteresis: nudge agent to run `tomo lcm daily` when
-      // context usage crosses the high-water mark; reset when it drops back
-      // below the low-water mark (a successful compact knocks it well under).
-      // Skip when the session uses SDK auto-compact (only groups opted out via
-      // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
-      if (sid && usesLcmCompact(key)) {
-        const HIGH = config.lcm.nudgeAtPct / 100;
-        const LOW = config.lcm.nudgeResetPct / 100;
-        const ctxUsed = session.lastResult?.contextUsed ?? 0;
-        const ctxMax = session.lastResult?.contextMax ?? 0;
-        const usedFrac = ctxMax > 0 ? ctxUsed / ctxMax : 0;
-        const nudged = this.contextNudged.get(key) === true;
-
-        if (usedFrac < LOW && nudged) {
-          this.contextNudged.set(key, false);
-        }
-
-        if (usedFrac >= HIGH && !nudged) {
-          this.contextNudged.set(key, true);
-          const pct = Math.round(usedFrac * 100);
-          const groupNote = isGroupSessionKey(key)
-            ? " This is a group session — scope the summary to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
-            : "";
-          const nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
-          log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
-          // Fire-and-forget — don't block the current reply on the nudge
-          this.handleCronMessage(nudge, key, {
-            showTyping: false,
-            suppressDelivery: isGroupSessionKey(key),
-          }).catch((err) => {
-            log.warn({ err, key }, "Context nudge failed");
-          });
-        }
-      }
-
+      this.recordTurnCompletion(key, session);
       return response;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "";
@@ -1156,11 +1131,55 @@ export class Agent {
         }
 
         const session = await this.getOrCreateLiveSession(key);
-        return session.send(prompt, onText, images, onBlockComplete, documents);
+        const response = await session.send(prompt, onText, images, onBlockComplete, documents);
+        this.recordTurnCompletion(key, session);
+        return response;
       }
 
       throw err;
     }
+  }
+
+  /**
+   * Post-turn bookkeeping shared by runWithRetry's first attempt and its
+   * session-error retry: capture a new SDK session id, persist stats,
+   * reload after an external compact, and run the context-pressure check.
+   */
+  private recordTurnCompletion(key: string, session: LiveSession): void {
+    // Capture session ID if new
+    const sid = session.getSessionId();
+    if (sid && !this.sessions.getSdkSessionId(key)) {
+      this.sessions.setSdkSessionId(key, sid);
+      log.info({ sessionId: sid, key }, "Session ID captured");
+    }
+
+    // Save stats
+    if (session.lastResult) {
+      this.sessions.updateStats(key, session.lastResult);
+    }
+
+    // If compact happened during this turn, reload the session on next
+    // turn. With steering, a promoted steered turn may already be running
+    // on this session — closing now would kill it, so defer the reload
+    // until the session is truly idle.
+    if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
+      if (session.isBusy()) {
+        void session.waitForIdle().then(() => {
+          if (this.liveSessions.get(key) === session) {
+            this.closeLiveSession(key);
+            log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
+          }
+        });
+      } else {
+        this.closeLiveSession(key);
+        log.info({ key }, "Session reloaded after compact");
+      }
+    }
+
+    // Fire-and-forget context-pressure check — don't block the current
+    // reply on the nudge. Pass this turn's result explicitly: the reload
+    // above may have already removed the session from liveSessions.
+    this.maybeNudgeCompact(key, session.lastResult);
   }
 
   /**

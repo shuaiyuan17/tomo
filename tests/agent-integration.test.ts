@@ -34,6 +34,12 @@ let mockUserContents: Array<Array<{ type: string; text?: string }>> = [];
  *  the steered message is already pending before the turn unblocks; a
  *  timed-out race here would otherwise swallow a later message. */
 let mockSteerEcho = false;
+/** Context usage reported by the mock SDK's getContextUsage() after each turn. */
+let mockContextUsage = { totalTokens: 5000, maxTokens: 200000 };
+/** When set, the next query created fails its event stream with this error
+ *  message (one-shot) — simulates SDK session errors like "No conversation
+ *  found" that trip runWithRetry's reset-and-retry branch. */
+let mockFailNextQuery: string | null = null;
 
 /** Track in-flight mock queries so tests can assert no concurrency */
 const queryState = {
@@ -119,6 +125,11 @@ function enqueueAssistantTurnEvents(
 }
 
 function createMockQuery(prompt: AsyncGenerator) {
+  // One-shot failure injection: this query's event stream throws instead of
+  // producing events.
+  const failWith = mockFailNextQuery;
+  mockFailNextQuery = null;
+
   // Event queue + waiter for the consumer side
   const eventQueue: unknown[] = [];
   let waitResolve: (() => void) | null = null;
@@ -198,6 +209,7 @@ function createMockQuery(prompt: AsyncGenerator) {
     [Symbol.asyncIterator]() {
       return {
         async next(): Promise<IteratorResult<unknown>> {
+          if (failWith) throw new Error(failWith);
           while (eventQueue.length === 0 && !closed) {
             await new Promise<void>((r) => { waitResolve = r; });
           }
@@ -217,11 +229,12 @@ function createMockQuery(prompt: AsyncGenerator) {
       wakeConsumer();
     },
     async getContextUsage() {
+      const { totalTokens, maxTokens } = mockContextUsage;
       return {
-        totalTokens: 5000,
-        maxTokens: 200000,
-        percentage: 2.5,
-        categories: [{ name: "conversation", tokens: 5000 }],
+        totalTokens,
+        maxTokens,
+        percentage: (totalTokens / maxTokens) * 100,
+        categories: [{ name: "conversation", tokens: totalTokens }],
       };
     },
   };
@@ -498,6 +511,8 @@ beforeEach(() => {
   mockResponseFn = () => "mock response";
   mockEmitStreamDeltas = true;
   mockSteerEcho = false;
+  mockContextUsage = { totalTokens: 5000, maxTokens: 200000 };
+  mockFailNextQuery = null;
   mockUserContents = [];
   mockQueryControllers = [];
   queryState.reset();
@@ -3531,6 +3546,88 @@ describe("steering", () => {
     await drainAllSessions(agent);
 
     expect(order).toEqual(["first-start", "first-end", "second-run"]);
+    await agent.stop();
+  });
+});
+
+describe("compact nudges", () => {
+  /** Prompts of every housekeeping nudge turn the agent queued. */
+  const nudgePrompts = () =>
+    mockUserContents
+      .map((blocks) => blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join(""))
+      .filter((t) => t.includes("Context usage is at"));
+
+  it("queues exactly one housekeeping turn when a turn lands over the compact threshold", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockContextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("lcm compact skill");
+
+    // Still over threshold on the next turn — latched, no second nudge.
+    await tg.simulateMessage(makeMsg({ text: "Hi again" }));
+    await drainQueue(agent);
+    await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    await agent.stop();
+  });
+
+  it("runs the context-pressure check on a turn recovered by the session-error retry", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // First query fails its event stream — runWithRetry's "No conversation
+    // found" branch resets the session and retries on a fresh query, which
+    // must still get post-turn bookkeeping (including the nudge check).
+    mockContextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    mockFailNextQuery = "No conversation found";
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("lcm compact skill");
+
+    await agent.stop();
+  });
+
+  it("fires the daily rollup below the compact threshold, escalates once, and re-arms below reset", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // 72% — between nudgeAtPct (70) and the compact threshold (80).
+    mockContextUsage = { totalTokens: 144_000, maxTokens: 200_000 };
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("tomo lcm daily");
+
+    // Crossing 80% escalates to a compact nudge even though daily fired.
+    mockContextUsage = { totalTokens: 170_000, maxTokens: 200_000 };
+    await tg.simulateMessage(makeMsg({ text: "more" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(2));
+    expect(nudgePrompts()[1]).toContain("lcm compact skill");
+
+    // Dropping below nudgeResetPct (60) re-arms the latch...
+    mockContextUsage = { totalTokens: 100_000, maxTokens: 200_000 };
+    await tg.simulateMessage(makeMsg({ text: "compacted" }));
+    await drainQueue(agent);
+    await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(2));
+
+    // ...so the next crossing nudges again.
+    mockContextUsage = { totalTokens: 144_000, maxTokens: 200_000 };
+    await tg.simulateMessage(makeMsg({ text: "again" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(3));
+    expect(nudgePrompts()[2]).toContain("tomo lcm daily");
+
     await agent.stop();
   });
 });

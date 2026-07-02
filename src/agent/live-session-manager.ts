@@ -1,0 +1,303 @@
+import { createHash } from "node:crypto";
+import type {
+  ElicitationRequest,
+  ElicitationResult,
+  McpSdkServerConfigWithInstance,
+  McpServerConfig,
+} from "@anthropic-ai/claude-agent-sdk";
+import { config } from "../config.js";
+import { log } from "../logger.js";
+import { checkAndClearCompactTrigger } from "../lcm/index.js";
+import { repairSdkSessionForResume } from "../sessions/repair.js";
+import type { SessionMessage } from "../sessions/types.js";
+import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
+import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
+import type { RunWithRetryRequest } from "./turn-runner.js";
+
+/**
+ * The narrow surface the session lifecycle needs from the Agent: the durable
+ * SDK-session registry, per-session option assembly (MCP wiring, group
+ * context), and the post-turn context-pressure hook.
+ */
+export interface LiveSessionManagerDeps {
+  /** Current system prompt — hashed to detect workspace changes. */
+  buildSystemPrompt(): string;
+  getSdkSessionId(key: string): string | undefined;
+  setSdkSessionId(key: string, sessionId: string): void;
+  clearSdkSessionId(key: string): void;
+  retireSdkSessionId(key: string): void;
+  updateStats(key: string, result: QueryResult): void;
+  /** Transcript messages for pre-resume repair. */
+  getSessionMessages(key: string): SessionMessage[];
+  /** Per-session model override, if any. */
+  getModelOverride(key: string): string | undefined;
+  /** Per-session internal MCP server bound to the caller's session key. */
+  createInternalMcpServer(key: string): McpSdkServerConfigWithInstance;
+  /** External MCP servers with OAuth, authorize-URL forwarding bound to the key. */
+  buildExternalMcpServers(key: string): Promise<Record<string, McpServerConfig>>;
+  /** Group metadata snapshot for the system prompt — undefined for non-groups. */
+  buildGroupContext(key: string): SessionContext["group"];
+  handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
+  /** Delivery plumbing for SDK-initiated (unowned) turns. */
+  createUnownedTurnRequest(key: string): TurnRequest | undefined;
+  /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
+  maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
+}
+
+/**
+ * Owns the LiveSession lifecycle: creation (with SDK-session resume and
+ * pre-resume repair), the system-prompt-hash sweep that retires stale
+ * sessions, the send/steer retry policy, and shutdown. This is the
+ * concurrency-sensitive core moved verbatim out of Agent.
+ */
+export class LiveSessionManager {
+  private liveSessions = new Map<string, LiveSession>();
+  // Busy sessions retired by a prompt change: removed from liveSessions (so
+  // their key gets a fresh session) but still running an in-flight turn.
+  // Tracked so stop() can close them — they'd otherwise outlive shutdown.
+  private retiringSessions = new Set<LiveSession>();
+  private liveSessionCreates = new Map<string, Promise<LiveSession>>();
+  private lastPromptHash: string = "";
+  private stopping = false;
+
+  constructor(private readonly deps: LiveSessionManagerDeps) {}
+
+  /** Is a live turn currently in flight on this session? (steering target check) */
+  isBusy(key: string): boolean {
+    const live = this.liveSessions.get(key);
+    return !!live?.isAlive() && live.isBusy();
+  }
+
+  isAlive(key: string): boolean {
+    return this.liveSessions.get(key)?.isAlive() ?? false;
+  }
+
+  /** Last turn result for a session still in the map (context-nudge default). */
+  lastResult(key: string): QueryResult | null {
+    return this.liveSessions.get(key)?.lastResult ?? null;
+  }
+
+  async getOrCreateLiveSession(key: string): Promise<LiveSession> {
+    const session = this.liveSessions.get(key);
+    if (session?.isAlive()) return session;
+
+    const creating = this.liveSessionCreates.get(key);
+    if (creating) return creating;
+
+    const create = this.createLiveSession(key);
+    this.liveSessionCreates.set(key, create);
+    try {
+      return await create;
+    } finally {
+      if (this.liveSessionCreates.get(key) === create) {
+        this.liveSessionCreates.delete(key);
+      }
+    }
+  }
+
+  private async createLiveSession(key: string): Promise<LiveSession> {
+    let session = this.liveSessions.get(key);
+    if (session?.isAlive()) return session;
+
+    // Check prompt changes
+    const currentHash = this.hashString(this.deps.buildSystemPrompt());
+    if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
+      log.info("System prompt changed, creating new sessions");
+      for (const [k, s] of this.liveSessions) {
+        // Removing the session from the map is what retires it — the next
+        // message for its key creates a fresh session with the new prompt.
+        // Closing a busy session here would reject its in-flight turn, and
+        // runWithRetry's reset-and-retry branch would then re-run the whole
+        // turn, repeating side effects its first half already performed — so
+        // the actual close waits for the in-flight turn to finish.
+        this.liveSessions.delete(k);
+        if (s.isBusy()) {
+          this.retiringSessions.add(s);
+          void s.waitForIdle().then(() => {
+            this.retiringSessions.delete(s);
+            s.close();
+            log.info({ key: k }, "Session closed after prompt change (deferred past in-flight turn)");
+          });
+        } else {
+          s.close();
+        }
+      }
+    }
+    this.lastPromptHash = currentHash;
+
+    const resumeId = this.deps.getSdkSessionId(key);
+    if (resumeId) {
+      const repair = repairSdkSessionForResume(
+        resumeId,
+        this.deps.getSessionMessages(key),
+        config.sdkSessionsDir,
+      );
+      if (repair.error) {
+        log.warn({ key, sessionId: resumeId, error: repair.error }, "Could not repair SDK session before resume");
+      }
+    }
+    const model = this.deps.getModelOverride(key);
+    const turnBudget = makeTurnBudget();
+    const externalMcpServers = await this.deps.buildExternalMcpServers(key);
+    // Per-session server instance: binds the caller's session key so tool
+    // handlers (e.g. send_message) can attribute cross-session sends.
+    const opts = sdkOptions(this.deps.createInternalMcpServer(key), resumeId ?? undefined, model, {
+      sessionKey: key,
+      sdkSessionId: resumeId ?? undefined,
+      group: this.deps.buildGroupContext(key),
+      onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
+    }, turnBudget, externalMcpServers);
+
+    session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {
+      timeoutMs: config.liveSessionTimeoutMs,
+    });
+    this.liveSessions.set(key, session);
+    log.info(
+      {
+        key,
+        resume: !!resumeId,
+        model: opts.model,
+        gateway: opts.env?.ANTHROPIC_BASE_URL ? "litellm" : "native",
+      },
+      "Live session created",
+    );
+    return session;
+  }
+
+  closeLiveSession(key: string): void {
+    const session = this.liveSessions.get(key);
+    if (session) {
+      session.close();
+      this.liveSessions.delete(key);
+    }
+  }
+
+  private hashString(s: string): string {
+    return createHash("sha256").update(s).digest("hex");
+  }
+
+  async runWithRetry(req: RunWithRetryRequest): Promise<string> {
+    const {
+      key,
+      prompt,
+      onText,
+      images,
+      onBlockComplete,
+      documents,
+      steer = false,
+    } = req;
+
+    try {
+      const session = await this.getOrCreateLiveSession(key);
+      const response = steer
+        ? await session.steer(prompt, onText, images, onBlockComplete, documents)
+        : await session.send(prompt, onText, images, onBlockComplete, documents);
+
+      // Merged into another request's in-flight turn — that turn's owner
+      // does the per-turn bookkeeping (stats, compact triggers) when it
+      // resolves; nothing to record for this caller.
+      if (steer && response === STEER_MERGED) return response;
+
+      this.recordTurnCompletion(key, session);
+      return response;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "";
+
+      if (this.stopping && errMsg.includes("closed")) {
+        log.info({ key }, "Session closed during shutdown; preserving SDK session link");
+        return "NO_REPLY";
+      }
+
+      if (errMsg.includes("maximum number of turns")) {
+        log.warn("Hit max turns, returning partial response");
+        return "I ran out of steps trying to complete that. Can you try a simpler request?";
+      }
+
+      if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
+        log.warn({ err, key }, "Query timed out; retiring SDK session to avoid resuming stale in-flight work");
+        this.closeLiveSession(key);
+        this.deps.retireSdkSessionId(key);
+        throw err;
+      }
+
+      // Session error — reset and retry once
+      if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
+        // Shutdown closes live sessions while turns may still be in flight
+        // (e.g. the agent restarting itself via Bash). That "Session is
+        // closed" is not corruption — resetting here is what used to unlink
+        // the resume id and silently start the user over on a blank session.
+        if (this.stopping) throw err;
+
+        log.warn({ err }, "Session error, resetting and retrying");
+        this.closeLiveSession(key);
+        // Only a true resume failure invalidates the persisted SDK session
+        // id. "Session is closed"-style errors just mean the child process
+        // went away; the JSONL history is intact and MUST be kept so the
+        // retry resumes it instead of discarding the conversation.
+        if (errMsg.includes("No conversation found")) {
+          this.deps.clearSdkSessionId(key);
+        }
+
+        const session = await this.getOrCreateLiveSession(key);
+        const response = await session.send(prompt, onText, images, onBlockComplete, documents);
+        this.recordTurnCompletion(key, session);
+        return response;
+      }
+
+      throw err;
+    }
+  }
+
+  /**
+   * Post-turn bookkeeping shared by runWithRetry's first attempt and its
+   * session-error retry: capture a new SDK session id, persist stats,
+   * reload after an external compact, and run the context-pressure check.
+   */
+  private recordTurnCompletion(key: string, session: LiveSession): void {
+    // Capture session ID if new
+    const sid = session.getSessionId();
+    if (sid && !this.deps.getSdkSessionId(key)) {
+      this.deps.setSdkSessionId(key, sid);
+      log.info({ sessionId: sid, key }, "Session ID captured");
+    }
+
+    // Save stats
+    if (session.lastResult) {
+      this.deps.updateStats(key, session.lastResult);
+    }
+
+    // If compact happened during this turn, reload the session on next
+    // turn. With steering, a promoted steered turn may already be running
+    // on this session — closing now would kill it, so defer the reload
+    // until the session is truly idle.
+    if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
+      if (session.isBusy()) {
+        void session.waitForIdle().then(() => {
+          if (this.liveSessions.get(key) === session) {
+            this.closeLiveSession(key);
+            log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
+          }
+        });
+      } else {
+        this.closeLiveSession(key);
+        log.info({ key }, "Session reloaded after compact");
+      }
+    }
+
+    // Fire-and-forget context-pressure check — don't block the current
+    // reply on the nudge. Pass this turn's result explicitly: the reload
+    // above may have already removed the session from liveSessions.
+    this.deps.maybeNudgeCompact(key, session.lastResult);
+  }
+
+  /** Close every live session for shutdown; retries are disabled from here on. */
+  stop(): void {
+    this.stopping = true;
+    for (const [, s] of this.liveSessions) s.close();
+    this.liveSessions.clear();
+    // Prompt-retired sessions waiting out an in-flight turn are not in the
+    // map; shutdown must not leave their SDK children running.
+    for (const s of this.retiringSessions) s.close();
+    this.retiringSessions.clear();
+  }
+}

@@ -4,7 +4,6 @@ import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget } from "./sessions/types.js";
-import { checkAndClearCompactTrigger } from "./lcm/index.js";
 import {
   isGroupSessionKey,
   isDmSessionKey,
@@ -18,10 +17,9 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./agent/live-session.js";
-import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
-import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
-import { normalizeSendTarget } from "./agent/send-target.js";
+import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
+import { usesLcmCompact } from "./agent/sdk-options.js";
+import { isSilentReply, ATTACHMENT_TAG_RE } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
@@ -29,18 +27,13 @@ import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
 import { TurnRunner, embeddedSilentMatcher, type RunWithRetryRequest } from "./agent/turn-runner.js";
-import { repairSdkSessionForResume } from "./sessions/repair.js";
+import { LiveSessionManager } from "./agent/live-session-manager.js";
+import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 
-export type SendResult = { ok: true } | { ok: false; error: string };
-
-export interface SessionCatalog {
-  identities: Array<{ name: string }>;
-  groups: Array<{ key: string; title?: string; participants?: string[] }>;
-}
+export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
 
 interface UserTurnRequest {
   key: string;
@@ -77,24 +70,14 @@ export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
   private router: IdentityRouter;
-  private liveSessions = new Map<string, LiveSession>();
-  // Busy sessions retired by a prompt change: removed from liveSessions (so
-  // their key gets a fresh session) but still running an in-flight turn.
-  // Tracked so stop() can close them — they'd otherwise outlive shutdown.
-  private retiringSessions = new Set<LiveSession>();
-  private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private sessionQueue = new SessionQueue();
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
-    hasBusyLiveSession: (key) => {
-      const live = this.liveSessions.get(key);
-      return !!live?.isAlive() && live.isBusy();
-    },
+    hasBusyLiveSession: (key) => this.liveSessionManager.isBusy(key),
   });
   private commands: ChatCommandHandler;
   private modelOverrides = new Map<string, string>();
-  private lastPromptHash: string = "";
   // Context-usage hysteresis: the highest nudge level already fired for the
   // current over-threshold episode. Cleared when usage drops back below
   // config.lcm.nudgeResetPct.
@@ -102,12 +85,12 @@ export class Agent {
   private pendingNotesQueue: PendingNotesQueue;
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
-  private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
+  private liveSessionManager: LiveSessionManager;
+  private proactive: ProactiveSendService;
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
-  private stopping = false;
   private readonly mcpOAuthManager: McpOAuthManager;
 
   constructor() {
@@ -144,13 +127,50 @@ export class Agent {
       router: this.router,
       sessions: this.sessions,
       modelOverrides: this.modelOverrides,
-      closeLiveSession: (key) => this.closeLiveSession(key),
-      isSessionLive: (key) => this.liveSessions.get(key)?.isAlive() ?? false,
+      closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
+      isSessionLive: (key) => this.liveSessionManager.isAlive(key),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
     });
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
       onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
+    });
+    this.liveSessionManager = new LiveSessionManager({
+      buildSystemPrompt: () => buildSystemPrompt(),
+      getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
+      setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
+      clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
+      retireSdkSessionId: (key) => { this.sessions.retireSdkSessionId(key); },
+      updateStats: (key, result) => this.sessions.updateStats(key, result),
+      getSessionMessages: (key) => this.sessions.get(key).messages,
+      getModelOverride: (key) => this.modelOverrides.get(key),
+      createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
+      buildExternalMcpServers: (key) => this.mcpOAuthManager.buildServersWithAuth(
+        config.mcpServers ?? {},
+        (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
+      ),
+      buildGroupContext: (key) => this.buildGroupContext(key),
+      handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
+      createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
+      maybeNudgeCompact: (key, ctx) => this.maybeNudgeCompact(key, ctx),
+    });
+    this.proactive = new ProactiveSendService({
+      getChannel: (name) => this.getChannel(name),
+      getSummonedIdentity: (channelName, chatId) => this.router.getSummonedIdentity(channelName, chatId),
+      getReplyTarget: (sessionKey) => this.router.getReplyTarget(sessionKey),
+      deriveReplyTargetFromConfig: (identityName) => this.router.deriveReplyTargetFromConfig(identityName),
+      appendAssistantTranscript: (sessionKey, content, channelName) => {
+        this.sessions.append(sessionKey, {
+          role: "assistant",
+          content,
+          channel: channelName,
+          timestamp: Date.now(),
+        });
+      },
+      setChatTitle: (sessionKey, title) => this.sessions.setChatTitle(sessionKey, title),
+      listActiveEntries: () => this.sessions.listActiveEntries(),
+      queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
+      runDelegateTurn: (systemMsg, sessionKey) => this.handleCronMessage(systemMsg, sessionKey),
     });
 
     // Load persistent per-session model overrides
@@ -371,96 +391,6 @@ export class Agent {
     const title = this.sessions.getEntry(audience)?.chatTitle;
     return title ? `the group "${title}" (${audience})` : `the group ${audience}`;
   }
-  private async getOrCreateLiveSession(key: string): Promise<LiveSession> {
-    const session = this.liveSessions.get(key);
-    if (session?.isAlive()) return session;
-
-    const creating = this.liveSessionCreates.get(key);
-    if (creating) return creating;
-
-    const create = this.createLiveSession(key);
-    this.liveSessionCreates.set(key, create);
-    try {
-      return await create;
-    } finally {
-      if (this.liveSessionCreates.get(key) === create) {
-        this.liveSessionCreates.delete(key);
-      }
-    }
-  }
-
-  private async createLiveSession(key: string): Promise<LiveSession> {
-    let session = this.liveSessions.get(key);
-    if (session?.isAlive()) return session;
-
-    // Check prompt changes
-    const currentHash = this.hashString(buildSystemPrompt());
-    if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
-      log.info("System prompt changed, creating new sessions");
-      for (const [k, s] of this.liveSessions) {
-        // Removing the session from the map is what retires it — the next
-        // message for its key creates a fresh session with the new prompt.
-        // Closing a busy session here would reject its in-flight turn, and
-        // runWithRetry's reset-and-retry branch would then re-run the whole
-        // turn, repeating side effects its first half already performed — so
-        // the actual close waits for the in-flight turn to finish.
-        this.liveSessions.delete(k);
-        if (s.isBusy()) {
-          this.retiringSessions.add(s);
-          void s.waitForIdle().then(() => {
-            this.retiringSessions.delete(s);
-            s.close();
-            log.info({ key: k }, "Session closed after prompt change (deferred past in-flight turn)");
-          });
-        } else {
-          s.close();
-        }
-      }
-    }
-    this.lastPromptHash = currentHash;
-
-    const resumeId = this.sessions.getSdkSessionId(key);
-    if (resumeId) {
-      const repair = repairSdkSessionForResume(
-        resumeId,
-        this.sessions.get(key).messages,
-        config.sdkSessionsDir,
-      );
-      if (repair.error) {
-        log.warn({ key, sessionId: resumeId, error: repair.error }, "Could not repair SDK session before resume");
-      }
-    }
-    const model = this.modelOverrides.get(key);
-    const turnBudget = makeTurnBudget();
-    const externalMcpServers = await this.mcpOAuthManager.buildServersWithAuth(
-      config.mcpServers ?? {},
-      (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
-    );
-    // Per-session server instance: binds the caller's session key so tool
-    // handlers (e.g. send_message) can attribute cross-session sends.
-    const opts = sdkOptions(createTomoInternalMcpServer(this, key), resumeId ?? undefined, model, {
-      sessionKey: key,
-      sdkSessionId: resumeId ?? undefined,
-      group: this.buildGroupContext(key),
-      onMcpElicitation: (request) => this.handleMcpElicitation(key, request),
-    }, turnBudget, externalMcpServers);
-
-    session = new LiveSession(opts, key, turnBudget, () => this.createUnownedTurnRequest(key), {
-      timeoutMs: config.liveSessionTimeoutMs,
-    });
-    this.liveSessions.set(key, session);
-    log.info(
-      {
-        key,
-        resume: !!resumeId,
-        model: opts.model,
-        gateway: opts.env?.ANTHROPIC_BASE_URL ? "litellm" : "native",
-      },
-      "Live session created",
-    );
-    return session;
-  }
-
   private async forwardMcpAuthorizeUrl(key: string, serverName: string, url: string): Promise<void> {
     const target = this.resolvePrivateReplyTarget(key);
     if (!target) throw new Error(`No private reply target is available for MCP OAuth login (${serverName})`);
@@ -650,18 +580,6 @@ export class Agent {
     return undefined;
   }
 
-  private closeLiveSession(key: string): void {
-    const session = this.liveSessions.get(key);
-    if (session) {
-      session.close();
-      this.liveSessions.delete(key);
-    }
-  }
-
-  private hashString(s: string): string {
-    return createHash("sha256").update(s).digest("hex");
-  }
-
   /**
    * Single context-pressure nudge path, evaluated once per completed turn:
    * runWithRetry covers owned turns (user, cron, continuity); unowned SDK
@@ -684,7 +602,7 @@ export class Agent {
    * the compact-trigger reload may have already dropped the session from
    * liveSessions, and the latch must still see the result to stay accurate.
    */
-  private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessions.get(key)?.lastResult ?? null): void {
+  private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessionManager.lastResult(key)): void {
     if (!usesLcmCompact(key)) return;
     if (!ctx || ctx.contextMax <= 0) return;
 
@@ -931,118 +849,10 @@ export class Agent {
     });
   }
 
-  private async runWithRetry(req: RunWithRetryRequest): Promise<string> {
-    const {
-      key,
-      prompt,
-      onText,
-      images,
-      onBlockComplete,
-      documents,
-      steer = false,
-    } = req;
-
-    try {
-      const session = await this.getOrCreateLiveSession(key);
-      const response = steer
-        ? await session.steer(prompt, onText, images, onBlockComplete, documents)
-        : await session.send(prompt, onText, images, onBlockComplete, documents);
-
-      // Merged into another request's in-flight turn — that turn's owner
-      // does the per-turn bookkeeping (stats, compact triggers) when it
-      // resolves; nothing to record for this caller.
-      if (steer && response === STEER_MERGED) return response;
-
-      this.recordTurnCompletion(key, session);
-      return response;
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "";
-
-      if (this.stopping && errMsg.includes("closed")) {
-        log.info({ key }, "Session closed during shutdown; preserving SDK session link");
-        return "NO_REPLY";
-      }
-
-      if (errMsg.includes("maximum number of turns")) {
-        log.warn("Hit max turns, returning partial response");
-        return "I ran out of steps trying to complete that. Can you try a simpler request?";
-      }
-
-      if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
-        log.warn({ err, key }, "Query timed out; retiring SDK session to avoid resuming stale in-flight work");
-        this.closeLiveSession(key);
-        this.sessions.retireSdkSessionId(key);
-        throw err;
-      }
-
-      // Session error — reset and retry once
-      if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
-        // Shutdown closes live sessions while turns may still be in flight
-        // (e.g. the agent restarting itself via Bash). That "Session is
-        // closed" is not corruption — resetting here is what used to unlink
-        // the resume id and silently start the user over on a blank session.
-        if (this.stopping) throw err;
-
-        log.warn({ err }, "Session error, resetting and retrying");
-        this.closeLiveSession(key);
-        // Only a true resume failure invalidates the persisted SDK session
-        // id. "Session is closed"-style errors just mean the child process
-        // went away; the JSONL history is intact and MUST be kept so the
-        // retry resumes it instead of discarding the conversation.
-        if (errMsg.includes("No conversation found")) {
-          this.sessions.clearSdkSessionId(key);
-        }
-
-        const session = await this.getOrCreateLiveSession(key);
-        const response = await session.send(prompt, onText, images, onBlockComplete, documents);
-        this.recordTurnCompletion(key, session);
-        return response;
-      }
-
-      throw err;
-    }
-  }
-
-  /**
-   * Post-turn bookkeeping shared by runWithRetry's first attempt and its
-   * session-error retry: capture a new SDK session id, persist stats,
-   * reload after an external compact, and run the context-pressure check.
-   */
-  private recordTurnCompletion(key: string, session: LiveSession): void {
-    // Capture session ID if new
-    const sid = session.getSessionId();
-    if (sid && !this.sessions.getSdkSessionId(key)) {
-      this.sessions.setSdkSessionId(key, sid);
-      log.info({ sessionId: sid, key }, "Session ID captured");
-    }
-
-    // Save stats
-    if (session.lastResult) {
-      this.sessions.updateStats(key, session.lastResult);
-    }
-
-    // If compact happened during this turn, reload the session on next
-    // turn. With steering, a promoted steered turn may already be running
-    // on this session — closing now would kill it, so defer the reload
-    // until the session is truly idle.
-    if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
-      if (session.isBusy()) {
-        void session.waitForIdle().then(() => {
-          if (this.liveSessions.get(key) === session) {
-            this.closeLiveSession(key);
-            log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
-          }
-        });
-      } else {
-        this.closeLiveSession(key);
-        log.info({ key }, "Session reloaded after compact");
-      }
-    }
-
-    // Fire-and-forget context-pressure check — don't block the current
-    // reply on the nudge. Pass this turn's result explicitly: the reload
-    // above may have already removed the session from liveSessions.
-    this.maybeNudgeCompact(key, session.lastResult);
+  /** Thin delegate kept on Agent so TurnRunner's late-bound dep (and tests
+   *  that stub it on the instance) dispatch through `this`. */
+  private runWithRetry(req: RunWithRetryRequest): Promise<string> {
+    return this.liveSessionManager.runWithRetry(req);
   }
 
   /**
@@ -1189,230 +999,32 @@ export class Agent {
     return undefined;
   }
 
-  /**
-   * Direct mode: post a verbatim message to a target session via Channel.send().
-   * No Claude query is invoked for the recipient — the message arrives as-is.
-   * A pending note is queued so the recipient's next Claude turn has context.
-   */
+  // Proactive messaging (send_message, list_sessions, rename_group_chat,
+  // react_to_message MCP tools) — thin delegates so the MCP server wiring
+  // keeps calling Agent's public surface. See agent/proactive-send.ts.
+
   async sendToSession(target: string, text: string, callerSessionKey?: string): Promise<SendResult> {
-    const resolved = this.resolveSendTarget(target);
-    if (!resolved) {
-      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
-    }
-    const { sessionKey, replyTarget } = resolved;
-
-    const channel = this.getChannel(replyTarget.channelName);
-    if (!channel) {
-      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
-    }
-
-    const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
-    if (mediaPaths.length > 0 || stickerIds.length > 0) {
-      // Send text first (matches assistant response ordering)
-      if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
-      }
-      const validPaths = mediaPaths.filter((p) => existsSync(p));
-      for (const path of validPaths) {
-        await channel.send({
-          chatId: replyTarget.chatId,
-          photo: path,
-          text: "",
-        });
-      }
-      for (const stickerId of stickerIds) {
-        await channel.send({
-          chatId: replyTarget.chatId,
-          sticker: stickerId,
-          text: "",
-        });
-      }
-    } else {
-      // No attachments: preserve verbatim text (direct-mode contract)
-      await channel.send({ chatId: replyTarget.chatId, text });
-    }
-
-    // Attribute the send in the target session's record. Only claim it came
-    // from the summoning identity's main session when the caller actually IS
-    // that session — any session can direct-send into a summoned group.
-    const summoned = this.router.getSummonedIdentity(replyTarget.channelName, replyTarget.chatId);
-    const fromSummoner = summoned !== undefined && callerSessionKey === `dm:${summoned}`;
-
-    try {
-      this.sessions.append(sessionKey, {
-        role: "assistant",
-        content: fromSummoner ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
-        channel: replyTarget.channelName,
-        timestamp: Date.now(),
-      });
-    } catch (err) {
-      // The channel send already succeeded. Reporting a tool failure here
-      // invites the caller to retry and duplicate the user-visible message.
-      log.warn({ err, sessionKey }, "Message delivered but transcript persistence failed");
-    }
-
-    this.queuePendingNote(sessionKey, fromSummoner
-      ? `[System: Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"]`
-      : callerSessionKey === sessionKey
-        ? `[System: You sent the following message to this conversation earlier as a direct send: "${text}"]`
-        : `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`);
-
-    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Message sent (direct)");
-    return { ok: true };
+    return this.proactive.sendToSession(target, text, callerSessionKey);
   }
 
-  /**
-   * Delegate mode: queue a system request for the target session's Claude to
-   * compose and send a message in its own voice/context. Fire-and-forget — the
-   * caller's tool result returns as soon as the request is dispatched, not when
-   * the recipient's Claude finishes. The user observes the actual outcome in
-   * the recipient channel directly (since they're a participant).
-   *
-   * Note: delegate-to-self isn't blocked here. If it happens, the system
-   * request is just queued behind the current turn via enqueueForSession —
-   * one extra Claude turn fires, no infinite loop. For mid-loop self-progress
-   * updates, prefer direct mode (no extra turn).
-   */
   async delegateToSession(target: string, request: string): Promise<SendResult> {
-    const resolved = this.resolveSendTarget(target);
-    if (!resolved) {
-      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
-    }
-    const { sessionKey, replyTarget } = resolved;
-
-    if (!this.getChannel(replyTarget.channelName)) {
-      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
-    }
-
-    const systemMsg = `[System: From your other conversation, you were asked to: ${request}. Use this conversation's context, tone, and participants to respond appropriately. Reply NO_REPLY if you judge it shouldn't be sent.]`;
-
-    // Fire-and-forget — handleCronMessage enqueues per session and runs through
-    // a normal Claude turn. The user verifies the outcome in the channel.
-    this.handleCronMessage(systemMsg, sessionKey).catch((err) => {
-      log.error({ err, sessionKey }, "Delegated send failed");
-    });
-
-    log.info({ sessionKey, channel: replyTarget.channelName, chars: request.length }, "Proactive message dispatched (delegate)");
-    return { ok: true };
+    return this.proactive.delegateToSession(target, request);
   }
 
-  /** Rename a group chat via its channel API and persist the local title immediately. */
   async renameGroupChat(target: string, title: string): Promise<SendResult> {
-    const trimmedTitle = title.trim();
-    if (!trimmedTitle) {
-      return { ok: false, error: "Group title cannot be empty" };
-    }
-
-    const resolved = this.resolveSendTarget(target);
-    if (!resolved) {
-      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid group keys.` };
-    }
-    const { sessionKey, replyTarget } = resolved;
-    const rawKey = `${replyTarget.channelName}:${replyTarget.chatId}`;
-
-    if (!isGroupSessionKey(rawKey)) {
-      return { ok: false, error: `Target "${target}" is not a group chat session` };
-    }
-
-    const channel = this.getChannel(replyTarget.channelName);
-    if (!channel) {
-      return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
-    }
-    if (!channel.setChatTitle) {
-      return { ok: false, error: `Channel "${replyTarget.channelName}" does not support renaming group chats` };
-    }
-
-    try {
-      await channel.setChatTitle(replyTarget.chatId, trimmedTitle);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: detail };
-    }
-
-    this.sessions.setChatTitle(sessionKey, trimmedTitle);
-    log.info({ sessionKey, channel: replyTarget.channelName }, "Group chat title renamed");
-    return { ok: true };
+    return this.proactive.renameGroupChat(target, title);
   }
 
-  /** React/tapback to the latest inbound provider message seen in a session. */
   async reactToLatestMessage(target: string, reaction: MessageReaction, remove = false): Promise<SendResult> {
-    const resolved = this.resolveSendTarget(target);
-    if (!resolved) {
-      return { ok: false, error: `Unknown target "${target}". Use the current session key or call list_sessions.` };
-    }
-
-    const latest = this.latestInboundMessages.get(resolved.sessionKey);
-    if (!latest) {
-      return { ok: false, error: `No latest inbound message is known for "${resolved.sessionKey}" since Tomo started` };
-    }
-
-    const channel = this.getChannel(latest.channelName);
-    if (!channel) {
-      return { ok: false, error: `Channel "${latest.channelName}" is not connected` };
-    }
-    if (!channel.reactToMessage) {
-      return { ok: false, error: `Channel "${latest.channelName}" does not support message reactions` };
-    }
-
-    try {
-      await channel.reactToMessage(latest.chatId, latest.messageId, reaction, remove);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: detail };
-    }
-
-    log.info({ sessionKey: resolved.sessionKey, channel: latest.channelName, reaction, remove }, "Reacted to latest message");
-    return { ok: true };
+    return this.proactive.reactToLatestMessage(target, reaction, remove);
   }
 
-  /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
-  private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
-    const normalized = normalizeSendTarget(target, config.identities);
-    if (!normalized) return undefined;
-    const { sessionKey, identityName } = normalized;
-
-    const dmIdentityName = dmIdentityFromSessionKey(sessionKey);
-    if (dmIdentityName !== undefined) {
-      const replyTarget = this.router.getReplyTarget(sessionKey)
-        ?? this.router.deriveReplyTargetFromConfig(identityName ?? dmIdentityName);
-      return replyTarget ? { sessionKey, replyTarget } : undefined;
-    }
-
-    // Non-dm session key (channel:<chatId> form, possibly a group). The caller
-    // explicitly named a target, so honor group chats too.
-    const replyTarget = this.router.getReplyTarget(sessionKey)
-      ?? replyTargetFromRawSessionKey(sessionKey);
-    return replyTarget ? { sessionKey, replyTarget } : undefined;
-  }
-
-  /** Catalog of valid send_message targets, with friendly metadata for groups. Backs the `list_sessions` tool.
-   *  Uses active entries (not just linked SDK sessions) so groups known only
-   *  through metadata — e.g. summoned before ever running their own turn —
-   *  are still listed as send targets. */
   listSessionCatalog(): SessionCatalog {
-    const identities = config.identities.map((i) => ({ name: i.name }));
-    const groups: SessionCatalog["groups"] = [];
-    for (const entry of this.sessions.listActiveEntries()) {
-      const key = entry.channelKey;
-      if (!isGroupSessionKey(key)) continue;
-      groups.push({
-        key,
-        ...(entry.chatTitle ? { title: entry.chatTitle } : {}),
-        ...(entry.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
-      });
-    }
-    return { identities, groups };
+    return this.proactive.listSessionCatalog();
   }
 
   private recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {
-    // Incoming channels are expected to provide provider message ids; keep the
-    // guard defensive so synthetic/test messages cannot poison reaction state.
-    if (!message.id) return;
-    this.latestInboundMessages.set(sessionKey, {
-      channelName: channel.name,
-      chatId: message.chatId,
-      messageId: message.id,
-    });
+    this.proactive.recordLatestInboundMessage(sessionKey, channel, message);
   }
 
   private queuePendingNote(sessionKey: string, note: string): void {
@@ -1475,15 +1087,9 @@ export class Agent {
   }
 
   async stop(): Promise<void> {
-    this.stopping = true;
     log.info("Shutting down");
     this.commands.stop();
-    for (const [, s] of this.liveSessions) s.close();
-    this.liveSessions.clear();
-    // Prompt-retired sessions waiting out an in-flight turn are not in the
-    // map; shutdown must not leave their SDK children running.
-    for (const s of this.retiringSessions) s.close();
-    this.retiringSessions.clear();
+    this.liveSessionManager.stop();
     await Promise.all(this.channels.map((ch) => ch.stop()));
   }
 }

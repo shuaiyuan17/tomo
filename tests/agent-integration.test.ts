@@ -3376,7 +3376,9 @@ type SteerableSession = {
 };
 
 function getLiveSession(agent: InstanceType<typeof Agent>, key: string): SteerableSession {
-  const sessions = (agent as unknown as { liveSessions: Map<string, SteerableSession> }).liveSessions;
+  const sessions = (agent as unknown as {
+    liveSessionManager: { liveSessions: Map<string, SteerableSession> };
+  }).liveSessionManager.liveSessions;
   return sessions.get(key)!;
 }
 
@@ -3385,7 +3387,7 @@ describe("steering", () => {
     resetConfig({ steering: true });
     const agent = new Agent();
     const internals = agent as unknown as {
-      getOrCreateLiveSession: (key: string) => Promise<unknown>;
+      liveSessionManager: { getOrCreateLiveSession: (key: string) => Promise<unknown> };
       mcpOAuthManager: {
         buildServersWithAuth: (...args: unknown[]) => Promise<unknown>;
       };
@@ -3401,11 +3403,11 @@ describe("steering", () => {
       return originalBuild(...args);
     });
 
-    const p1 = internals.getOrCreateLiveSession("telegram:12345");
+    const p1 = internals.liveSessionManager.getOrCreateLiveSession("telegram:12345");
     await waitFor(() => expect(buildCalls).toBe(1));
 
-    const p2 = internals.getOrCreateLiveSession("telegram:12345");
-    const p3 = internals.getOrCreateLiveSession("telegram:12345");
+    const p2 = internals.liveSessionManager.getOrCreateLiveSession("telegram:12345");
+    const p3 = internals.liveSessionManager.getOrCreateLiveSession("telegram:12345");
     await expectNoChangeFor(() => expect(buildCalls).toBe(1));
 
     releaseBuild!();

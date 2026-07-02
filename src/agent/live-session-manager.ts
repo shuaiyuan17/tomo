@@ -15,6 +15,20 @@ import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.j
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
 /**
+ * Session-lifecycle failures that a reset-and-retry can genuinely fix:
+ * a broken resume chain ("No conversation found") or the SDK child going
+ * away ("Session is closed", process exit). Matched narrowly on purpose —
+ * a retry re-runs the WHOLE turn, so a broad match (any error merely
+ * mentioning "session", e.g. from an MCP tool or the API) would duplicate
+ * side effects the turn's first attempt already performed.
+ */
+function isRecoverableSessionError(errMsg: string): boolean {
+  return errMsg.includes("No conversation found")
+    || /session (?:is )?closed/i.test(errMsg)
+    || /process exited/i.test(errMsg);
+}
+
+/**
  * The narrow surface the session lifecycle needs from the Agent: the durable
  * SDK-session registry, per-session option assembly (MCP wiring, group
  * context), and the post-turn context-pressure hook.
@@ -221,7 +235,7 @@ export class LiveSessionManager {
       }
 
       // Session error — reset and retry once
-      if (errMsg.includes("No conversation found") || errMsg.includes("session") || errMsg.includes("closed")) {
+      if (isRecoverableSessionError(errMsg)) {
         // Shutdown closes live sessions while turns may still be in flight
         // (e.g. the agent restarting itself via Bash). That "Session is
         // closed" is not corruption — resetting here is what used to unlink

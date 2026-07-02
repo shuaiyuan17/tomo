@@ -138,9 +138,15 @@ describe("continuity delivery", () => {
     await drainQueue(agent);
     tg.clearDelivered();
 
+    // No private session exists — the heartbeat must skip entirely, not run
+    // the turn on the group session (that would leak the continuity prompt
+    // into the group's context).
+    const continuityTurn = vi.fn(() => "Should not arrive");
+    mockSdk.responseFn = continuityTurn;
+
     await agent.handleContinuity("System: Free time.");
 
-    // No DM session → nothing delivered
+    expect(continuityTurn).not.toHaveBeenCalled();
     expect(tg.sent).toHaveLength(0);
 
     await agent.stop();

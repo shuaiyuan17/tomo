@@ -243,6 +243,15 @@ export class Agent {
   /** Activate a group chat by adding it to the channel's allowlist */
   private async activateGroup(channel: Channel, chatId: string): Promise<void> {
     try {
+      // An open channel (no allowlist) already allows this group. Persisting a
+      // one-entry allowlist here would flip the whole channel to enforced and
+      // lock out every other chat — including the owner's own DM — until
+      // restart. Acknowledge and leave the config alone.
+      if (!this.router.hasAllowlist(channel.name)) {
+        log.info({ channel: channel.name, chatId }, "Group secret received; channel has no allowlist, group is already active");
+        await channel.send({ chatId, text: "Tomo is already active in this group." });
+        return;
+      }
       const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
       const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
       if (!channels[channel.name]) channels[channel.name] = {};
@@ -992,9 +1001,12 @@ export class Agent {
   }
 
   private findLastChatId(channelName: string): string | undefined {
+    // Private targets only: a continuity heartbeat must never run on a group
+    // session (its prompt would pollute the group's context, and the model
+    // could post into the group via send_message).
     for (const [key] of this.sessions.listSdkSessionIds()) {
-      const parsed = parseRawSessionKey(key);
-      if (parsed?.channelName === channelName) return parsed.chatId;
+      const target = privateReplyTargetFromSessionKey(key);
+      if (target?.channelName === channelName) return target.chatId;
     }
     return undefined;
   }

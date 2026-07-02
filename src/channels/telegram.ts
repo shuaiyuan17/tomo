@@ -15,6 +15,24 @@ import { LITERAL_NEWLINE_TOKEN, splitOutboundMessageText, splitText } from "./te
 
 /** Telegram rejects sendMessage/editMessageText beyond 4096 chars. */
 const TELEGRAM_TEXT_LIMIT = 4096;
+/** Telegram rejects sendPhoto captions beyond 1024 chars. */
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+/**
+ * Word-boundary–anchored regex for `@botUsername`. Telegram usernames are
+ * `[A-Za-z0-9_]`, so the trailing `\b` stops `@mybot` from matching inside a
+ * longer username like `@mybot_backup`.
+ */
+export function mentionRegex(botUsername: string, flags: string): RegExp {
+  const escaped = botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`@${escaped}\\b`, flags);
+}
+
+/** Strip `@botUsername` mentions from message text. */
+export function cleanMention(text: string, botUsername: string | undefined): string {
+  if (!botUsername) return text;
+  return text.replace(mentionRegex(botUsername, "gi"), "").trim();
+}
 
 export interface TelegramChannelOptions {
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
@@ -188,9 +206,10 @@ export class TelegramChannel implements Channel {
     // Replied to the bot
     if (msg.reply_to_message?.from?.id === this.bot.botInfo.id) return true;
 
-    // @mentioned in text
+    // @mentioned in text (word-boundary match so "@mybot" doesn't match
+    // inside a longer username like "@mybot_backup")
     const text = ("text" in msg ? msg.text : msg.caption) ?? "";
-    if (text.toLowerCase().includes(`@${this.botUsername.toLowerCase()}`)) return true;
+    if (mentionRegex(this.botUsername, "i").test(text)) return true;
 
     // Mentioned via entities
     const entities = ("entities" in msg ? msg.entities : msg.caption_entities) ?? [];
@@ -206,9 +225,7 @@ export class TelegramChannel implements Channel {
 
   /** Strip @botname from the message text */
   private cleanMention(text: string): string {
-    if (!this.botUsername) return text;
-    const escaped = this.botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return text.replace(new RegExp(`@${escaped}`, "gi"), "").trim();
+    return cleanMention(text, this.botUsername);
   }
 
   /** Error detail safe to log — file-download URLs embed the bot token. */
@@ -545,10 +562,18 @@ export class TelegramChannel implements Channel {
     // Send photo if provided
     if (message.photo) {
       const { InputFile } = await import("grammy");
+      const caption = message.text || undefined;
+      // Telegram rejects captions over 1024 chars outright, which would lose
+      // the photo AND the text. Ship the photo captionless and follow up with
+      // the text as its own (chunked) message instead.
+      const fitsCaption = !caption || caption.length <= TELEGRAM_CAPTION_LIMIT;
       await this.bot.api.sendPhoto(message.chatId, new InputFile(message.photo), {
         ...replyParams,
-        caption: message.text || undefined,
+        caption: fitsCaption ? caption : undefined,
       });
+      if (!fitsCaption) {
+        await this.send({ chatId: message.chatId, text: message.text });
+      }
       return;
     }
 

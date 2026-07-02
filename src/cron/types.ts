@@ -18,6 +18,8 @@ export interface CronJob {
   nextRunAt: number | null;
   lastRunAt: number | null;
   lastStatus: "ok" | "error" | null;
+  /** Failed runs of a one-shot ("at") job so far — bounds the retry loop. */
+  retryCount?: number;
 }
 
 export type CronJobCreate = Pick<CronJob, "name" | "message" | "sessionKey"> & {

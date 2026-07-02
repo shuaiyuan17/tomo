@@ -18,6 +18,29 @@ const TELEGRAM_TEXT_LIMIT = 4096;
 /** Telegram rejects sendPhoto captions beyond 1024 chars. */
 const TELEGRAM_CAPTION_LIMIT = 1024;
 
+/** First restart delay after polling exits. */
+export const POLLING_RESTART_MIN_MS = 3000;
+/** Backoff ceiling for repeated rapid polling failures. */
+export const POLLING_RESTART_MAX_MS = 5 * 60 * 1000;
+/** A polling run that stayed up at least this long counts as healthy. */
+export const POLLING_HEALTHY_RUN_MS = 60 * 1000;
+
+/**
+ * Restart delay after a polling run exits. A healthy run (it stayed up past
+ * the threshold) restarts promptly and re-arms the backoff; a rapid failure
+ * (revoked token, network down) doubles the previous delay up to the cap —
+ * without this, a permanent failure hot-loops a restart every 3 seconds
+ * forever. `delayMs` is the wait before this restart; `nextDelayMs` is what a
+ * subsequent rapid failure should use.
+ */
+export function nextPollingBackoff(
+  prevDelayMs: number,
+  uptimeMs: number,
+): { delayMs: number; nextDelayMs: number } {
+  const delayMs = uptimeMs >= POLLING_HEALTHY_RUN_MS ? POLLING_RESTART_MIN_MS : prevDelayMs;
+  return { delayMs, nextDelayMs: Math.min(delayMs * 2, POLLING_RESTART_MAX_MS) };
+}
+
 /**
  * Word-boundary–anchored regex for `@botUsername`. Telegram usernames are
  * `[A-Za-z0-9_]`, so the trailing `\b` stops `@mybot` from matching inside a
@@ -47,6 +70,8 @@ export class TelegramChannel implements Channel {
   private botUsername: string | undefined;
   private stopping = false;
   private imageStoreBaseDir: string | undefined;
+  private pollingRestartDelayMs = POLLING_RESTART_MIN_MS;
+  private pollingRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(token: string, options: TelegramChannelOptions = {}) {
     this.bot = new Bot(token);
@@ -649,22 +674,33 @@ export class TelegramChannel implements Channel {
 
   private startPolling(): void {
     if (this.stopping) return;
-    this.bot.start().then(() => {
-      if (!this.stopping) {
-        log.warn("Telegram polling ended unexpectedly, restarting in 3s");
-        setTimeout(() => this.startPolling(), 3000);
+    const startedAt = Date.now();
+
+    const scheduleRestart = (err?: unknown) => {
+      if (this.stopping) return;
+      const { delayMs, nextDelayMs } = nextPollingBackoff(this.pollingRestartDelayMs, Date.now() - startedAt);
+      this.pollingRestartDelayMs = nextDelayMs;
+      if (err) {
+        log.error({ err, delayMs }, "Telegram polling failed, restarting in %ds", Math.round(delayMs / 1000));
+      } else {
+        log.warn({ delayMs }, "Telegram polling ended unexpectedly, restarting in %ds", Math.round(delayMs / 1000));
       }
-    }).catch((err) => {
-      if (!this.stopping) {
-        log.error({ err }, "Telegram polling failed, restarting in 3s");
-        setTimeout(() => this.startPolling(), 3000);
-      }
-    });
+      this.pollingRestartTimer = setTimeout(() => {
+        this.pollingRestartTimer = null;
+        this.startPolling();
+      }, delayMs);
+    };
+
+    this.bot.start().then(() => scheduleRestart(), (err) => scheduleRestart(err));
   }
 
   async stop(): Promise<void> {
     log.info("Telegram bot stopping");
     this.stopping = true;
+    if (this.pollingRestartTimer) {
+      clearTimeout(this.pollingRestartTimer);
+      this.pollingRestartTimer = null;
+    }
     await this.bot.stop();
   }
 }

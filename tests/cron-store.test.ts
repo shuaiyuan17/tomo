@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { CronStore, parseScheduleString } from "../src/cron/store.js";
+import {
+  CronStore,
+  ONE_SHOT_MAX_RETRIES,
+  ONE_SHOT_RETRY_DELAY_MS,
+  parseScheduleString,
+} from "../src/cron/store.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -155,6 +160,80 @@ describe("CronStore", () => {
     store.markRun(job.id, "ok");
     // deleteAfterRun defaults to true for "at" jobs
     expect(store.get(job.id)).toBeUndefined();
+  });
+
+  it("schedules a delayed retry when a one-shot job fails", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "reminder",
+      schedule: { kind: "at", at: new Date(Date.now() - 1000).toISOString() },
+      message: "important reminder",
+      sessionKey: "dm:alice",
+    });
+
+    const before = Date.now();
+    store.markRun(job.id, "error");
+
+    const updated = store.get(job.id)!;
+    expect(updated.enabled).toBe(true);
+    expect(updated.lastStatus).toBe("error");
+    expect(updated.retryCount).toBe(1);
+    expect(updated.nextRunAt).toBeGreaterThanOrEqual(before + ONE_SHOT_RETRY_DELAY_MS);
+  });
+
+  it("disables a one-shot job only after exhausting its retries", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "reminder",
+      schedule: { kind: "at", at: new Date(Date.now() - 1000).toISOString() },
+      message: "important reminder",
+      sessionKey: "dm:alice",
+    });
+
+    for (let i = 0; i < ONE_SHOT_MAX_RETRIES; i++) {
+      store.markRun(job.id, "error");
+      expect(store.get(job.id)!.enabled).toBe(true);
+    }
+
+    // Final failure: retries exhausted, job is disabled (kept for inspection).
+    store.markRun(job.id, "error");
+    const final = store.get(job.id)!;
+    expect(final.enabled).toBe(false);
+    expect(final.nextRunAt).toBeNull();
+    expect(final.retryCount).toBe(ONE_SHOT_MAX_RETRIES);
+  });
+
+  it("still deletes a one-shot job when a retry succeeds", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "reminder",
+      schedule: { kind: "at", at: new Date(Date.now() - 1000).toISOString() },
+      message: "important reminder",
+      sessionKey: "dm:alice",
+    });
+
+    store.markRun(job.id, "error");
+    expect(store.get(job.id)!.enabled).toBe(true);
+
+    store.markRun(job.id, "ok");
+    expect(store.get(job.id)).toBeUndefined();
+  });
+
+  it("does not add retry state to failed recurring jobs", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "tick",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+
+    store.markRun(job.id, "error");
+    const updated = store.get(job.id)!;
+    // The next scheduled run IS the retry for recurring jobs.
+    expect(updated.enabled).toBe(true);
+    expect(updated.retryCount).toBeUndefined();
+    expect(updated.nextRunAt).toBeGreaterThan(Date.now());
   });
 
   it("defaults deleteAfterRun=true for 'at' schedules when not specified", () => {

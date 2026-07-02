@@ -48,8 +48,9 @@ async function startForeground(): Promise<void> {
 
   // Validate config before loading the heavy daemon modules so a fresh
   // install fails with a clear message instead of a module-load crash.
-  const { config, assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
+  const { config, assertConfigValid, assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
   try {
+    assertConfigValid();
     assertAuthConfigured();
     assertChannelsConfigured();
   } catch (err) {
@@ -185,8 +186,9 @@ async function startDaemon(): Promise<void> {
 
   // Validate config before spawning: the detached child would die instantly
   // with this error buried in tomo.err while we print "started in background".
-  const { assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
+  const { assertConfigValid, assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
   try {
+    assertConfigValid();
     assertAuthConfigured();
     assertChannelsConfigured();
   } catch (err) {

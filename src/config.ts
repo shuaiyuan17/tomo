@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { z } from "zod";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
 import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
 import {
@@ -117,63 +118,143 @@ export interface TomoConfig {
   lcm: LcmConfig;
 }
 
-function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
-  const r = (raw ?? {}) as Record<string, unknown>;
-  const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? r.baseUrl ?? "").trim();
-  if (!baseUrl) return null;
+// ---------------------------------------------------------------------------
+// Validation plumbing
+//
+// Every config value is checked by a zod schema. Invalid values still fall
+// back to their defaults — CLI repair commands (`tomo init`, `tomo config`)
+// must keep working on a broken file — but each fallback is recorded in
+// `configIssues` and `assertConfigValid()` (called at daemon startup, next to
+// assertAuthConfigured) refuses to start with the full list. Nothing falls
+// back silently anymore.
+// ---------------------------------------------------------------------------
 
-  return {
-    mode: inferLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? r.mode, defaultModel),
-    baseUrl,
-    apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? r.apiKey ?? "").trim(),
-  };
+const issues: string[] = [];
+
+/** Validation problems found while building `config`. Empty for a valid setup. */
+export const configIssues: readonly string[] = issues;
+
+interface Validator<T> {
+  safeParse(value: unknown): { success: true; data: T } | { success: false; error: z.ZodError };
 }
 
-function parseNonNegativeMs(raw: unknown, fallback: number): number {
-  const ms = Number(raw);
-  return Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : fallback;
+function describeValue(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
 }
 
-function parseLcmConfig(raw: unknown): LcmConfig {
-  const r = (raw ?? {}) as Record<string, unknown>;
-  const nudgeAt = Number(r.nudgeAtPct ?? 70);
-  const nudgeReset = Number(r.nudgeResetPct ?? 60);
-  const style = r.groupCompactStyle === "sdk" ? "sdk" : "lcm";
-  const tail = Number(r.dailyFreshTail ?? 32);
-
-  // Fall back to defaults on nonsense input (out of [1,100], or LOW >= HIGH).
-  const validHigh = Number.isFinite(nudgeAt) && nudgeAt > 0 && nudgeAt <= 100;
-  const validLow = Number.isFinite(nudgeReset) && nudgeReset >= 0 && nudgeReset < nudgeAt;
-  const validTail = Number.isInteger(tail) && tail >= 0;
-  return {
-    nudgeAtPct: validHigh ? nudgeAt : 70,
-    nudgeResetPct: validHigh && validLow ? nudgeReset : (validHigh ? Math.max(0, nudgeAt - 10) : 60),
-    groupCompactStyle: style,
-    dailyFreshTail: validTail ? tail : 32,
-    globalFreshTail: r.globalFreshTail === true,
-  };
+/** Validate one value. Absent (undefined/null) → default, no issue. Invalid →
+ *  default, with a descriptive entry in `configIssues`. */
+function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallback: T): T {
+  if (raw === undefined || raw === null) return fallback;
+  const result = schema.safeParse(raw);
+  if (result.success) return result.data;
+  const detail = result.error.issues
+    .map((issue) => (issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message))
+    .join("; ");
+  const fallbackNote = typeof fallback === "object" && fallback !== null
+    ? "using defaults"
+    : `using ${describeValue(fallback)}`;
+  issues.push(`${label}: ${detail} (got ${describeValue(raw)}; ${fallbackNote})`);
+  return fallback;
 }
 
-function parsePositiveInt(raw: unknown, fallback: number): number {
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+/** Env var for a numeric/boolean setting; empty string counts as unset. */
+function envVar(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value.trim() === "" ? undefined : value;
 }
 
-function parsePositiveMinutesAsMs(raw: unknown, fallbackMinutes: number): number {
-  const minutes = Number(raw);
-  if (!Number.isFinite(minutes) || minutes <= 0) return fallbackMinutes * 60_000;
-  const ms = Math.round(Math.max(minutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000);
-  return ms > 0 ? ms : fallbackMinutes * 60_000;
-}
-
-function parseBoolean(raw: unknown, fallback: boolean): boolean {
-  if (typeof raw === "boolean") return raw;
-  if (typeof raw === "string") {
-    const normalized = raw.trim().toLowerCase();
+// Coercing schemas: config.json values arrive typed, env overrides arrive as
+// strings — z.coerce keeps the Number()-compatible semantics of the old
+// hand-rolled parsers.
+const positiveInt = z.coerce.number().positive("expected a positive number").transform(Math.floor);
+const nonNegativeInt = z.coerce.number().min(0, "expected a non-negative number").transform(Math.floor);
+const positiveNumber = z.coerce.number().positive("expected a positive number");
+const boolLike = z.unknown().transform((value, ctx) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
     if (["true", "1", "yes", "on"].includes(normalized)) return true;
     if (["false", "0", "no", "off"].includes(normalized)) return false;
   }
-  return fallback;
+  ctx.addIssue({ code: "custom", message: "expected a boolean (true/false, or yes/no/on/off/1/0)" });
+  return z.NEVER;
+});
+/** Chat ids may be written as JSON numbers (Telegram); normalize to strings. */
+const chatId = z.union([z.string(), z.number()]).transform(String);
+
+const channelEntrySchema = z.looseObject({
+  token: z.string().optional(),
+  url: z.string().optional(),
+  password: z.string().optional(),
+  webhookPort: positiveInt.optional(),
+  inboundSettleMs: nonNegativeInt.optional(),
+  inboundMaxSettleMs: nonNegativeInt.optional(),
+  typingStartDelayMs: nonNegativeInt.optional(),
+  passiveTypingStartDelayMs: nonNegativeInt.optional(),
+  allowlist: z.array(chatId).optional(),
+  passiveGroups: z.array(chatId).optional(),
+});
+type ChannelEntry = z.output<typeof channelEntrySchema>;
+
+const identitySchema = z.object({
+  name: z.string().min(1, "expected a non-empty name"),
+  channels: z.record(z.string(), chatId),
+  replyPolicy: z.string().default("last-active"),
+});
+
+const DEFAULT_LCM: LcmConfig = {
+  nudgeAtPct: 70,
+  nudgeResetPct: 60,
+  groupCompactStyle: "lcm",
+  dailyFreshTail: 32,
+  globalFreshTail: false,
+};
+
+const lcmSchema = z.object({
+  nudgeAtPct: z.coerce.number().positive().max(100, "expected a percentage in (0, 100]").default(DEFAULT_LCM.nudgeAtPct),
+  nudgeResetPct: z.coerce.number().min(0).optional(),
+  groupCompactStyle: z.enum(["sdk", "lcm"]).default(DEFAULT_LCM.groupCompactStyle),
+  dailyFreshTail: z.coerce.number().int().min(0, "expected a non-negative integer").default(DEFAULT_LCM.dailyFreshTail),
+  globalFreshTail: boolLike.default(DEFAULT_LCM.globalFreshTail),
+}).transform((lcm, ctx) => {
+  // An omitted reset derives from the (possibly custom) nudge threshold: the
+  // stock 60 when that sits below it, else 10 points under the threshold.
+  // Only an EXPLICIT reset can conflict, and that is a real error.
+  const nudgeResetPct = lcm.nudgeResetPct
+    ?? (DEFAULT_LCM.nudgeResetPct < lcm.nudgeAtPct ? DEFAULT_LCM.nudgeResetPct : Math.max(0, lcm.nudgeAtPct - 10));
+  if (nudgeResetPct >= lcm.nudgeAtPct) {
+    ctx.addIssue({ code: "custom", path: ["nudgeResetPct"], message: "nudgeResetPct must be below nudgeAtPct" });
+    return z.NEVER;
+  }
+  return { ...lcm, nudgeResetPct };
+});
+
+const continuityScriptEntrySchema = z.union([
+  z.string().transform((path) => ({ path }) as { path?: string; timeoutMs?: unknown; maxOutputChars?: unknown }),
+  z.looseObject({ path: z.string().optional(), timeoutMs: z.unknown().optional(), maxOutputChars: z.unknown().optional() }),
+]);
+
+const litellmEntrySchema = z.looseObject({
+  mode: z.unknown().optional(),
+  baseUrl: z.string().optional(),
+  apiKey: z.string().optional(),
+});
+
+function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
+  const entry = validated("litellm", litellmEntrySchema, raw, {});
+  const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? entry.baseUrl ?? "").trim();
+  if (!baseUrl) return null;
+
+  return {
+    mode: inferLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? entry.mode, defaultModel),
+    baseUrl,
+    apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? entry.apiKey ?? "").trim(),
+  };
 }
 
 function expandConfigPath(rawPath: string): string {
@@ -188,23 +269,23 @@ function expandConfigPath(rawPath: string): string {
 }
 
 function parseContinuityScriptConfig(raw: unknown): ContinuityScriptConfig | null {
-  const r = (raw ?? {}) as Record<string, unknown>;
-  const rawPath = String(
-    process.env.TOMO_CONTINUITY_SCRIPT
-    ?? (typeof raw === "string" ? raw : r.path)
-    ?? "",
-  ).trim();
+  const entry = validated("continuityScript", continuityScriptEntrySchema, raw, {});
+  const rawPath = String(process.env.TOMO_CONTINUITY_SCRIPT ?? entry.path ?? "").trim();
 
   if (!rawPath) return null;
 
   return {
     path: expandConfigPath(rawPath),
-    timeoutMs: parsePositiveInt(
-      process.env.TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS ?? r.timeoutMs,
+    timeoutMs: validated(
+      "continuityScript.timeoutMs (TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS)",
+      positiveInt,
+      envVar("TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS") ?? entry.timeoutMs,
       DEFAULT_CONTINUITY_SCRIPT_TIMEOUT_MS,
     ),
-    maxOutputChars: parsePositiveInt(
-      process.env.TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS ?? r.maxOutputChars,
+    maxOutputChars: validated(
+      "continuityScript.maxOutputChars (TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS)",
+      positiveInt,
+      envVar("TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS") ?? entry.maxOutputChars,
       DEFAULT_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS,
     ),
   };
@@ -212,146 +293,147 @@ function parseContinuityScriptConfig(raw: unknown): ContinuityScriptConfig | nul
 
 function loadConfigFile(): Record<string, unknown> {
   if (!existsSync(CONFIG_PATH)) return {};
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-  } catch {
+    parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+  } catch (err) {
+    issues.push(`${CONFIG_PATH} is not valid JSON: ${err instanceof Error ? err.message : String(err)} (ignoring the file)`);
     return {};
   }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    issues.push(`${CONFIG_PATH} must contain a JSON object (got ${Array.isArray(parsed) ? "an array" : typeof parsed}; ignoring the file)`);
+    return {};
+  }
+  return parsed as Record<string, unknown>;
 }
 
-function parseAllowlists(channels: Record<string, Record<string, unknown>>): Record<string, string[]> {
-  const result: Record<string, string[]> = {};
-  for (const [name, ch] of Object.entries(channels)) {
-    if (Array.isArray(ch.allowlist)) {
-      result[name] = ch.allowlist.map(String);
-    }
+function parseChannels(raw: unknown): Record<string, ChannelEntry> {
+  const record = validated("channels", z.record(z.string(), z.unknown()), raw, {});
+  const result: Record<string, ChannelEntry> = {};
+  for (const [name, entry] of Object.entries(record)) {
+    result[name] = validated(`channels.${name}`, channelEntrySchema, entry, {});
   }
   return result;
 }
 
-function parsePassiveGroups(channels: Record<string, Record<string, unknown>>): Record<string, string[]> {
-  const result: Record<string, string[]> = {};
-  for (const [name, ch] of Object.entries(channels)) {
-    if (Array.isArray(ch.passiveGroups)) {
-      result[name] = ch.passiveGroups.map(String);
+function parseIdentities(raw: unknown): IdentityConfig[] {
+  const entries = validated("identities", z.array(z.unknown()), raw, []);
+  const identities: IdentityConfig[] = [];
+  for (const [index, entry] of entries.entries()) {
+    const parsed = identitySchema.safeParse(entry);
+    if (parsed.success) {
+      identities.push(parsed.data);
+    } else {
+      const detail = parsed.error.issues
+        .map((issue) => (issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message))
+        .join("; ");
+      issues.push(`identities[${index}]: ${detail} (got ${describeValue(entry)}; dropping the entry)`);
     }
   }
-  return result;
+  return identities;
 }
 
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
   const paths = defaultRuntimePaths;
-  const channels = (file.channels ?? {}) as Record<string, Record<string, unknown>>;
+  const channels = parseChannels(file.channels);
   const mcp = (file.mcp ?? {}) as Record<string, unknown>;
   const mcpServers = parseExternalMcpServers(file.mcpServers ?? mcp.servers);
-  const rawMcpAllowedTools = file.mcpAllowedTools ?? mcp.allowedTools;
-  const mcpAllowedTools = Array.isArray(rawMcpAllowedTools)
-    ? rawMcpAllowedTools.map(String)
-    : Object.keys(mcpServers).map((serverName) => `mcp__${serverName}__*`);
-
-  const telegramToken =
-    process.env.TELEGRAM_BOT_TOKEN ??
-    (channels.telegram?.token as string | undefined) ??
-    "";
-
-  const imessageUrl =
-    process.env.IMESSAGE_URL ??
-    (channels.imessage?.url as string | undefined) ??
-    "";
-
-  const imessagePassword =
-    process.env.IMESSAGE_PASSWORD ??
-    (channels.imessage?.password as string | undefined) ??
-    "";
-
-  const imessageWebhookPort = parsePositiveInt(
-    process.env.IMESSAGE_WEBHOOK_PORT ??
-    (channels.imessage?.webhookPort as string | undefined),
-    3100,
-  );
-  const imessageInboundSettleMs = parseNonNegativeMs(
-    process.env.IMESSAGE_INBOUND_SETTLE_MS ??
-    (channels.imessage?.inboundSettleMs as string | number | undefined) ??
-    DEFAULT_IMESSAGE_INBOUND_SETTLE_MS,
-    DEFAULT_IMESSAGE_INBOUND_SETTLE_MS,
-  );
-  const imessageInboundMaxSettleMs = parseNonNegativeMs(
-    process.env.IMESSAGE_INBOUND_MAX_SETTLE_MS ??
-    (channels.imessage?.inboundMaxSettleMs as string | number | undefined) ??
-    DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
-    DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
-  );
-  const imessageTypingStartDelayMs = parseNonNegativeMs(
-    process.env.IMESSAGE_TYPING_START_DELAY_MS ??
-    (channels.imessage?.typingStartDelayMs as string | number | undefined) ??
-    DEFAULT_IMESSAGE_TYPING_START_DELAY_MS,
-    DEFAULT_IMESSAGE_TYPING_START_DELAY_MS,
-  );
-  const imessagePassiveTypingStartDelayMs = parseNonNegativeMs(
-    process.env.IMESSAGE_PASSIVE_TYPING_START_DELAY_MS ??
-    (channels.imessage?.passiveTypingStartDelayMs as string | number | undefined) ??
-    DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
-    DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
+  const mcpAllowedTools = validated(
+    "mcpAllowedTools",
+    z.array(z.string()),
+    file.mcpAllowedTools ?? mcp.allowedTools,
+    Object.keys(mcpServers).map((serverName) => `mcp__${serverName}__*`),
   );
 
-  // Parse identities
-  const rawIdentities = (file.identities ?? []) as Array<{
-    name?: string;
-    channels?: Record<string, string>;
-    replyPolicy?: string;
-  }>;
-  const identities: IdentityConfig[] = rawIdentities
-    .filter((id) => id.name && id.channels)
-    .map((id) => ({
-      name: id.name!,
-      channels: id.channels!,
-      replyPolicy: id.replyPolicy ?? "last-active",
-    }));
+  const model = validated(
+    "model (CLAUDE_MODEL)",
+    z.string().min(1, "expected a non-empty model name"),
+    process.env.CLAUDE_MODEL ?? file.model,
+    DEFAULT_MODEL,
+  );
 
-  const model = (process.env.CLAUDE_MODEL ?? file.model ?? DEFAULT_MODEL) as string;
+  const continuityIntervalMinutes = validated(
+    "continuityIntervalMinutes (TOMO_CONTINUITY_INTERVAL_MINUTES)",
+    positiveNumber,
+    envVar("TOMO_CONTINUITY_INTERVAL_MINUTES") ?? file.continuityIntervalMinutes,
+    DEFAULT_CONTINUITY_INTERVAL_MINUTES,
+  );
 
   return {
     auth: parseAnthropicAuthConfig(file.auth),
-    telegramToken,
+    telegramToken: process.env.TELEGRAM_BOT_TOKEN ?? channels.telegram?.token ?? "",
     model,
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
     sdkSessionsDir: paths.sdkSessionsDir,
-    historyLimit: parsePositiveInt(process.env.HISTORY_LIMIT, 20),
+    historyLimit: validated("HISTORY_LIMIT", positiveInt, envVar("HISTORY_LIMIT"), 20),
     logsDir: paths.logsDir,
     tomoHome: paths.tomoHome,
-    continuity: (process.env.TOMO_CONTINUITY ?? file.continuity ?? false) === true || process.env.TOMO_CONTINUITY === "true",
-    continuityIntervalMs: parsePositiveMinutesAsMs(
-      process.env.TOMO_CONTINUITY_INTERVAL_MINUTES ?? file.continuityIntervalMinutes,
-      DEFAULT_CONTINUITY_INTERVAL_MINUTES,
-    ),
+    continuity: validated("continuity (TOMO_CONTINUITY)", boolLike, envVar("TOMO_CONTINUITY") ?? file.continuity, false),
+    continuityIntervalMs: Math.round(Math.max(continuityIntervalMinutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
-    city: (process.env.TOMO_CITY ?? file.city ?? null) as string | null,
-    identities,
-    imessageUrl,
-    imessagePassword,
-    imessageWebhookPort,
-    imessageInboundSettleMs,
-    imessageInboundMaxSettleMs,
-    imessageTypingStartDelayMs,
-    imessagePassiveTypingStartDelayMs,
-    sessionModelOverrides: (file.sessionModelOverrides ?? {}) as Record<string, string>,
-    channelAllowlists: parseAllowlists(channels),
-    passiveGroups: parsePassiveGroups(channels),
-    groupSecret: (file.groupSecret as string) ?? null,
-    summonExpiryMinutes: parseNonNegativeMs(process.env.TOMO_SUMMON_EXPIRY_MINUTES ?? file.summonExpiryMinutes ?? 60, 60),
-    saveInboundImages: file.saveInboundImages !== false,
-    maxTurns: parsePositiveInt(process.env.TOMO_MAX_TURNS ?? file.maxTurns, 50),
-    steering: parseBoolean(process.env.TOMO_STEERING, parseBoolean(file.steering, true)),
-    liveSessionTimeoutMs: parsePositiveInt(
-      process.env.TOMO_LIVE_SESSION_TIMEOUT_MS ?? file.liveSessionTimeoutMs,
+    city: validated("city (TOMO_CITY)", z.string().nullable(), process.env.TOMO_CITY ?? file.city, null),
+    identities: parseIdentities(file.identities),
+    imessageUrl: process.env.IMESSAGE_URL ?? channels.imessage?.url ?? "",
+    imessagePassword: process.env.IMESSAGE_PASSWORD ?? channels.imessage?.password ?? "",
+    imessageWebhookPort: validated(
+      "channels.imessage.webhookPort (IMESSAGE_WEBHOOK_PORT)",
+      positiveInt,
+      envVar("IMESSAGE_WEBHOOK_PORT") ?? channels.imessage?.webhookPort,
+      3100,
+    ),
+    imessageInboundSettleMs: validated(
+      "channels.imessage.inboundSettleMs (IMESSAGE_INBOUND_SETTLE_MS)",
+      nonNegativeInt,
+      envVar("IMESSAGE_INBOUND_SETTLE_MS") ?? channels.imessage?.inboundSettleMs,
+      DEFAULT_IMESSAGE_INBOUND_SETTLE_MS,
+    ),
+    imessageInboundMaxSettleMs: validated(
+      "channels.imessage.inboundMaxSettleMs (IMESSAGE_INBOUND_MAX_SETTLE_MS)",
+      nonNegativeInt,
+      envVar("IMESSAGE_INBOUND_MAX_SETTLE_MS") ?? channels.imessage?.inboundMaxSettleMs,
+      DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS,
+    ),
+    imessageTypingStartDelayMs: validated(
+      "channels.imessage.typingStartDelayMs (IMESSAGE_TYPING_START_DELAY_MS)",
+      nonNegativeInt,
+      envVar("IMESSAGE_TYPING_START_DELAY_MS") ?? channels.imessage?.typingStartDelayMs,
+      DEFAULT_IMESSAGE_TYPING_START_DELAY_MS,
+    ),
+    imessagePassiveTypingStartDelayMs: validated(
+      "channels.imessage.passiveTypingStartDelayMs (IMESSAGE_PASSIVE_TYPING_START_DELAY_MS)",
+      nonNegativeInt,
+      envVar("IMESSAGE_PASSIVE_TYPING_START_DELAY_MS") ?? channels.imessage?.passiveTypingStartDelayMs,
+      DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
+    ),
+    sessionModelOverrides: validated("sessionModelOverrides", z.record(z.string(), z.string()), file.sessionModelOverrides, {}),
+    channelAllowlists: Object.fromEntries(
+      Object.entries(channels).flatMap(([name, ch]) => (ch.allowlist ? [[name, ch.allowlist]] : [])),
+    ),
+    passiveGroups: Object.fromEntries(
+      Object.entries(channels).flatMap(([name, ch]) => (ch.passiveGroups ? [[name, ch.passiveGroups]] : [])),
+    ),
+    groupSecret: validated("groupSecret", z.string().min(1, "expected a non-empty string"), file.groupSecret, null),
+    summonExpiryMinutes: validated(
+      "summonExpiryMinutes (TOMO_SUMMON_EXPIRY_MINUTES)",
+      nonNegativeInt,
+      envVar("TOMO_SUMMON_EXPIRY_MINUTES") ?? file.summonExpiryMinutes,
+      60,
+    ),
+    saveInboundImages: validated("saveInboundImages", boolLike, file.saveInboundImages, true),
+    maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
+    steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
+    liveSessionTimeoutMs: validated(
+      "liveSessionTimeoutMs (TOMO_LIVE_SESSION_TIMEOUT_MS)",
+      positiveInt,
+      envVar("TOMO_LIVE_SESSION_TIMEOUT_MS") ?? file.liveSessionTimeoutMs,
       DEFAULT_LIVE_SESSION_TIMEOUT_MS,
     ),
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,
-    lcm: parseLcmConfig(file.lcm),
+    lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
   };
 }
 
@@ -360,6 +442,21 @@ export const config = buildConfig();
 /** Validate Anthropic auth at daemon startup without blocking config repair commands. */
 export function assertAuthConfigured(cfg: Pick<TomoConfig, "auth"> = config): void {
   if (cfg.auth.error) throw new Error(cfg.auth.error);
+}
+
+/**
+ * Refuse daemon startup while the config has validation problems. Called at
+ * startup — NOT during config build, so `tomo init`, `tomo config`, and other
+ * repair commands still work against a broken file (they see the defaults
+ * plus `configIssues`).
+ */
+export function assertConfigValid(issueList: readonly string[] = configIssues): void {
+  if (issueList.length === 0) return;
+  throw new Error([
+    `Invalid Tomo configuration (${CONFIG_PATH} / environment):`,
+    ...issueList.map((issue) => `  - ${issue}`),
+    "Fix the value(s), or remove them to use the defaults.",
+  ].join("\n"));
 }
 
 /**

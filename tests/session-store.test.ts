@@ -1,14 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { SessionStore as SessionStoreImpl } from "../src/sessions/store.js";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { SessionMessage } from "../src/sessions/types.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-sessions");
 
 class SessionStore extends SessionStoreImpl {
-  constructor(dir: string, historyLimit: number, sdkSessionsDir = join(dir, "sdk-sessions")) {
-    super(dir, historyLimit, sdkSessionsDir);
+  constructor(
+    dir: string,
+    historyLimit: number,
+    sdkSessionsDir = join(dir, "sdk-sessions"),
+    opts?: { tailMessages?: number; rotateBytes?: number },
+  ) {
+    super(dir, historyLimit, sdkSessionsDir, opts);
   }
 }
 
@@ -246,6 +252,125 @@ describe("SessionStore", () => {
     const after = store.listAllSessions()[0].lastActiveAt;
 
     expect(after).toBeGreaterThanOrEqual(before);
+  });
+
+  describe("transcript tail-loading and rotation", () => {
+    const msg = (overrides: Partial<SessionMessage> = {}) => ({
+      role: "user" as const,
+      content: "hello",
+      channel: "telegram",
+      timestamp: Date.now(),
+      ...overrides,
+    });
+
+    function writeTranscript(key: string, messages: unknown[]): void {
+      const safe = key.replace(/[^a-zA-Z0-9_-]/g, "_");
+      writeFileSync(join(TEST_DIR, `${safe}.jsonl`), messages.map((m) => JSON.stringify(m)).join("\n") + "\n");
+    }
+
+    it("loads only the transcript tail into memory and keeps seq continuity", () => {
+      writeTranscript("test", Array.from({ length: 30 }, (_, i) => msg({ content: `msg ${i + 1}`, seq: i + 1 })));
+
+      const store = new SessionStore(TEST_DIR, 20, undefined, { tailMessages: 10 });
+      const session = store.get("test");
+      expect(session.messages).toHaveLength(10);
+      expect(session.messages[0].content).toBe("msg 21");
+
+      // seq continues from the true transcript tail, not from 0
+      store.append("test", msg({ content: "new" }));
+      expect(session.messages[session.messages.length - 1].seq).toBe(31);
+    });
+
+    it("bounds the in-memory cache as messages are appended", () => {
+      const store = new SessionStore(TEST_DIR, 20, undefined, { tailMessages: 10 });
+      for (let i = 0; i < 25; i++) {
+        store.append("test", msg({ content: `msg ${i}` }));
+      }
+      const session = store.get("test");
+      expect(session.messages.length).toBeLessThanOrEqual(20);
+      // Everything is still on disk
+      expect(store.searchTranscript("test", { limit: 100 })).toHaveLength(25);
+    });
+
+    it("searchTranscript returns the most recent matches in chronological order", () => {
+      writeTranscript("test", Array.from({ length: 40 }, (_, i) =>
+        msg({ content: i % 2 === 0 ? `even ${i}` : `odd ${i}`, seq: i + 1, timestamp: 1000 + i })));
+
+      const store = new SessionStore(TEST_DIR, 20);
+      const results = store.searchTranscript("test", { query: "even", limit: 3 });
+      expect(results.map((r) => r.content)).toEqual(["even 34", "even 36", "even 38"]);
+
+      // Range filters still apply
+      const ranged = store.searchTranscript("test", { fromSeq: 5, toSeq: 8, limit: 10 });
+      expect(ranged.map((r) => r.seq)).toEqual([5, 6, 7, 8]);
+    });
+
+    it("rotates prior months into archive files and searches across them", () => {
+      const jan = Date.UTC(2020, 0, 15);
+      const feb = Date.UTC(2020, 1, 15);
+      writeTranscript("test", [
+        msg({ content: "jan one", seq: 1, timestamp: jan }),
+        msg({ content: "jan two", seq: 2, timestamp: jan + 1000 }),
+        msg({ content: "feb one", seq: 3, timestamp: feb }),
+        msg({ content: "now one", seq: 4 }),
+        msg({ content: "now two", seq: 5 }),
+      ]);
+
+      const store = new SessionStore(TEST_DIR, 20, undefined, { rotateBytes: 1 });
+      const session = store.get("test");
+
+      // Prior months rolled out of the active file...
+      expect(existsSync(join(TEST_DIR, "_archive_test_2020-01.jsonl"))).toBe(true);
+      expect(existsSync(join(TEST_DIR, "_archive_test_2020-02.jsonl"))).toBe(true);
+      expect(session.messages.map((m) => m.content)).toEqual(["now one", "now two"]);
+      expect(store.countRecentUserMessages("test")).toBe(2);
+
+      // ...but createdAt and search still span the whole history
+      expect(session.createdAt).toBe(jan);
+      const all = store.searchTranscript("test", { limit: 100 });
+      expect(all.map((m) => m.content)).toEqual(["jan one", "jan two", "feb one", "now one", "now two"]);
+      expect(store.searchTranscript("test", { query: "jan", limit: 10 })).toHaveLength(2);
+    });
+
+    it("re-running rotation does not duplicate archived messages", () => {
+      const jan = Date.UTC(2020, 0, 15);
+      const oldMessages = [
+        msg({ content: "jan one", seq: 1, timestamp: jan }),
+        msg({ content: "jan two", seq: 2, timestamp: jan + 1000 }),
+      ];
+      const current = msg({ content: "now", seq: 3 });
+      writeTranscript("test", [...oldMessages, current]);
+
+      new SessionStore(TEST_DIR, 20, undefined, { rotateBytes: 1 }).get("test");
+
+      // Simulate a crash between archive-append and active-file rewrite: the
+      // active file still contains the already-archived messages.
+      writeTranscript("test", [...oldMessages, current]);
+      const store = new SessionStore(TEST_DIR, 20, undefined, { rotateBytes: 1 });
+      store.get("test");
+
+      const archived = readFileSync(join(TEST_DIR, "_archive_test_2020-01.jsonl"), "utf-8")
+        .trim().split("\n");
+      expect(archived).toHaveLength(2);
+      expect(store.searchTranscript("test", { limit: 100 })).toHaveLength(3);
+    });
+
+    it("migrates rotation archives with the session key", () => {
+      const jan = Date.UTC(2020, 0, 15);
+      writeTranscript("telegram:111", [
+        msg({ content: "old", seq: 1, timestamp: jan }),
+        msg({ content: "new", seq: 2 }),
+      ]);
+      const store = new SessionStore(TEST_DIR, 20, undefined, { rotateBytes: 1 });
+      store.setSdkSessionId("telegram:111", "session-old");
+      store.get("telegram:111");
+
+      store.migrateSessionKey("telegram:111", "dm:alice");
+
+      expect(existsSync(join(TEST_DIR, "_archive_dm_alice_2020-01.jsonl"))).toBe(true);
+      const results = store.searchTranscript("dm:alice", { limit: 10 });
+      expect(results.map((m) => m.content)).toEqual(["old", "new"]);
+    });
   });
 
   describe("metadata-only stubs", () => {

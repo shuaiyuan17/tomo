@@ -17,4 +17,6 @@ tomo lcm search --channel-key CHANNEL_KEY --session-id SESSION_ID --query "blog"
 
 Always include `--session-id` to search the archive — without it, only the current transcript is searched.
 
+Transcript results are the MOST RECENT matches (up to `--limit`), listed oldest→newest, and include rotated monthly transcript archives automatically.
+
 Add `--json` for machine-readable output.

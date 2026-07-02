@@ -195,7 +195,9 @@ export class ChatCommandHandler {
       }
       lines.push(`Live: ${this.deps.isSessionLive(key) ? "yes" : "no"}`);
 
-      const msgCount = session.messages.filter((m) => m.role === "user").length;
+      // Count from the transcript file, not session.messages — the in-memory
+      // session holds only the recent tail.
+      const msgCount = this.deps.sessions.countRecentUserMessages(key);
       lines.push(`Messages: ${msgCount} user turns`);
 
       if (session.createdAt) {

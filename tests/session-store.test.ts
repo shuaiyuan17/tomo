@@ -203,6 +203,24 @@ describe("SessionStore", () => {
     expect(daemonStore.listSdkSessionIds()).toEqual([]);
   });
 
+  it("accumulates per-turn cost across updateStats calls", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.setSdkSessionId("telegram:1", "session-1");
+
+    const turn = {
+      inputTokens: 10, outputTokens: 5,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      contextUsed: 10, contextMax: 100,
+    };
+    store.updateStats("telegram:1", { ...turn, costUsd: 0.5 });
+    store.updateStats("telegram:1", { ...turn, costUsd: 0.25 });
+
+    const entry = store.getEntry("telegram:1");
+    expect(entry?.stats.totalCostUsd).toBeCloseTo(0.75);
+    expect(entry?.stats.totalQueries).toBe(2);
+    expect(entry?.stats.totalInputTokens).toBe(20);
+  });
+
   it("retires a poisoned SDK session while preserving active metadata", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setChatTitle("telegram:-987", "Ski Trip");

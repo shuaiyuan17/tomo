@@ -1,11 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.8.7 (2026-07-01)
 
 ### Features
 
-- **Sonnet 5 default and flexible model IDs.** `sonnet` now resolves to `claude-sonnet-5`, the fallback/default model and `sonnet-1m` resolve to `claude-sonnet-5[1m]`, and `/model` accepts future direct model IDs without requiring a code update while keeping LiteLLM `provider/model` names behind the gateway guard.
-- **Chat cost command.** `/cost` reports the current session's 1d, 7d, and 1mo cost totals from daemon usage logs.
+- **Sonnet 5 default and flexible model IDs** (#186). `sonnet` now resolves to `claude-sonnet-5`, the fallback/default model and `sonnet-1m` resolve to `claude-sonnet-5[1m]`, and `/model` accepts future direct model IDs without requiring a code update while keeping LiteLLM `provider/model` names behind the gateway guard.
+- **Chat cost command** (#186). `/cost` reports the current session's 1d, 7d, and 1mo cost totals from daemon usage logs.
+- **Transcript tail-loading, monthly rotation, and recent-first search** (#190). Session transcripts are no longer loaded whole into memory and kept forever — `get()` reads only the last N messages (backwards, in chunks) and the in-memory cache trims back to the tail as it grows. Active transcripts over 2MB rotate prior-month messages into monthly archive files with a crash-safe, seq-based idempotence guard, and sequence numbers continue from the archives even when rotation empties the active file. `searchTranscript()` now streams newest-first with early exit and returns the most *recent* matches when the limit truncates (it previously returned the oldest), continuing into archives as needed. `/status` turn counts and session `createdAt` survive rotation.
+- **Config validation with zod** (#196). The hand-rolled config coercion was replaced with zod schemas. Invalid values still fall back to their defaults so `tomo init`/`tomo config` can repair a broken file, but every fallback is now reported with the field, offending value, and default used — and `tomo start` refuses to launch the daemon with the aggregated list instead of running on silently-wrong settings. Malformed `config.json`, invalid identity entries, and boolean-like strings (`"true"`/`"1"`/`"yes"`) are all handled consistently; an omitted `lcm.nudgeResetPct` is derived from `nudgeAtPct` as before.
+
+### Bug fixes
+
+- **Session cost totals survive restarts** (#188). `totalCostUsd` was assigned the SDK's cumulative per-process cost instead of accumulating the per-turn delta, so it silently reset to the current process's spend on every daemon restart or session reload.
+- **Single compact-nudge path with hysteresis** (#189). Two overlapping nudge paths both evaluated the same turn's context stats — at ≥80% usage both fired, queueing two token-costing housekeeping turns back-to-back. There is now one nudge check per completed turn with two escalation levels (daily rollup at `nudgeAtPct`, compact skill at 80%) behind a shared hysteresis latch that re-arms below `nudgeResetPct`. The check also now covers the session-error retry path and unowned SDK background turns, which previously skipped post-turn bookkeeping entirely.
+- **Cron scheduler correctness** (#187). A per-job in-flight guard replaces the whole-tick lock, so one long-running job no longer delays every other due job; due jobs dispatch concurrently and `every` schedules advance from the scheduled due time instead of run completion (no more cadence drift, no burst-firing after downtime). Cron run status now reflects reality — turns that complete with agent-level errors are recorded as `error` instead of always `ok`.
+- **Performance and robustness fixes from a codebase review** (#187). The session registry is no longer re-read and re-parsed from disk on nearly every store operation (~16x faster via an mtime+size check), and a system-prompt change no longer closes busy sessions mid-turn — they retire from the map immediately but close only once idle, instead of tripping a reset-and-retry that repeated the turn's side effects. Prompt-retired busy sessions are also now closed on daemon shutdown.
+- **Cleanup batch: small correctness fixes** (#191). Prompt-change detection hashes with SHA-256 instead of a collision-prone 32-bit rolling hash; Telegram mention-stripping escapes the bot username before building a RegExp and download-failure logs redact the bot token; numeric env vars fall back to defaults on garbage input instead of propagating `NaN`; `CronStore.add()` reloads from disk before mutating so a stale in-memory snapshot can't resurrect jobs removed by another process.
+
+### Other
+
+- Internal refactor: the monolithic `Agent` class was split into focused subsystems — inbound queues and delivery primitives (#192), a spec-driven `TurnRunner` unifying the user/cron/continuity turn pipelines (#193), and `LiveSessionManager` + `ProactiveSendService` owning session lifecycle and proactive sends (#194).
+- Split the 3,634-line agent integration test suite into nine feature-scoped suites with a shared harness (#195).
 
 ## 0.8.6 (2026-06-30)
 

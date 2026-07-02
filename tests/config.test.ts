@@ -165,6 +165,28 @@ describe("config file validation", () => {
     expect(() => assertConfigValid()).toThrow(/Invalid Tomo configuration/);
   });
 
+  it("derives the lcm reset threshold when only nudgeAtPct is customized", async () => {
+    // nudgeAtPct below the stock reset (60): reset derives to nudgeAtPct - 10.
+    const low = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 50 } }));
+    expect(low.configIssues).toEqual([]);
+    expect(low.config.lcm).toMatchObject({ nudgeAtPct: 50, nudgeResetPct: 40 });
+
+    // nudgeAtPct above the stock reset: the stock reset still applies.
+    rmSync(home, { recursive: true, force: true });
+    const high = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 85 } }));
+    expect(high.configIssues).toEqual([]);
+    expect(high.config.lcm).toMatchObject({ nudgeAtPct: 85, nudgeResetPct: 60 });
+  });
+
+  it("rejects an explicitly conflicting lcm reset threshold", async () => {
+    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
+      lcm: { nudgeAtPct: 50, nudgeResetPct: 60 },
+    }));
+
+    expect(config.lcm).toMatchObject({ nudgeAtPct: 70, nudgeResetPct: 60 });
+    expect(configIssues.join("\n")).toContain("nudgeResetPct must be below nudgeAtPct");
+  });
+
   it("drops only the invalid identity entries and reports each one", async () => {
     const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
       identities: [

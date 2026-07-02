@@ -217,13 +217,21 @@ const DEFAULT_LCM: LcmConfig = {
 
 const lcmSchema = z.object({
   nudgeAtPct: z.coerce.number().positive().max(100, "expected a percentage in (0, 100]").default(DEFAULT_LCM.nudgeAtPct),
-  nudgeResetPct: z.coerce.number().min(0).default(DEFAULT_LCM.nudgeResetPct),
+  nudgeResetPct: z.coerce.number().min(0).optional(),
   groupCompactStyle: z.enum(["sdk", "lcm"]).default(DEFAULT_LCM.groupCompactStyle),
   dailyFreshTail: z.coerce.number().int().min(0, "expected a non-negative integer").default(DEFAULT_LCM.dailyFreshTail),
   globalFreshTail: boolLike.default(DEFAULT_LCM.globalFreshTail),
-}).refine((lcm) => lcm.nudgeResetPct < lcm.nudgeAtPct, {
-  message: "nudgeResetPct must be below nudgeAtPct",
-  path: ["nudgeResetPct"],
+}).transform((lcm, ctx) => {
+  // An omitted reset derives from the (possibly custom) nudge threshold: the
+  // stock 60 when that sits below it, else 10 points under the threshold.
+  // Only an EXPLICIT reset can conflict, and that is a real error.
+  const nudgeResetPct = lcm.nudgeResetPct
+    ?? (DEFAULT_LCM.nudgeResetPct < lcm.nudgeAtPct ? DEFAULT_LCM.nudgeResetPct : Math.max(0, lcm.nudgeAtPct - 10));
+  if (nudgeResetPct >= lcm.nudgeAtPct) {
+    ctx.addIssue({ code: "custom", path: ["nudgeResetPct"], message: "nudgeResetPct must be below nudgeAtPct" });
+    return z.NEVER;
+  }
+  return { ...lcm, nudgeResetPct };
 });
 
 const continuityScriptEntrySchema = z.union([

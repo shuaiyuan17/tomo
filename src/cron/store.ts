@@ -8,6 +8,11 @@ import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
 
+/** Failed one-shot ("at") jobs retry this many times before being disabled. */
+export const ONE_SHOT_MAX_RETRIES = 2;
+/** Delay before a failed one-shot job's retry. */
+export const ONE_SHOT_RETRY_DELAY_MS = 5 * 60_000;
+
 export class CronStore {
   private jobs: CronJob[] = [];
   private path: string;
@@ -109,6 +114,13 @@ export class CronStore {
       job.nextRunAt = next > now ? next : computeNextRun(job.schedule, now);
     } else if (job.schedule.kind !== "at") {
       job.nextRunAt = computeNextRun(job.schedule, now);
+    } else if (status === "error" && (job.retryCount ?? 0) < ONE_SHOT_MAX_RETRIES) {
+      // A one-shot job IS the deliverable (a reminder, usually) — a failed
+      // run gets a bounded number of delayed retries instead of being
+      // silently disabled. Recurring jobs need none of this: their next
+      // scheduled run is the retry.
+      job.retryCount = (job.retryCount ?? 0) + 1;
+      job.nextRunAt = now + ONE_SHOT_RETRY_DELAY_MS;
     } else {
       job.enabled = false;
       job.nextRunAt = null;

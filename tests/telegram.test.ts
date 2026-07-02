@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { TelegramChannel, cleanMention, mentionRegex } from "../src/channels/telegram.js";
+import {
+  POLLING_HEALTHY_RUN_MS,
+  POLLING_RESTART_MAX_MS,
+  POLLING_RESTART_MIN_MS,
+  TelegramChannel,
+  cleanMention,
+  mentionRegex,
+  nextPollingBackoff,
+} from "../src/channels/telegram.js";
 
 describe("cleanMention", () => {
   it("strips bot mention from text", () => {
@@ -313,5 +321,38 @@ describe("TelegramChannel.send photo captions", () => {
     await channel.send({ chatId: "1", text: longText, photo: "/tmp/pic.png" });
     expect(photos).toEqual([{ chatId: "1", caption: undefined }]);
     expect(messages.map((m) => m.text).join("")).toBe(longText);
+  });
+});
+
+// Polling restart backoff: a permanently failing bot.start() (revoked token,
+// network down) must not hot-loop a restart every 3s forever.
+describe("nextPollingBackoff", () => {
+  it("doubles the delay on rapid failures up to the cap", () => {
+    let delay = POLLING_RESTART_MIN_MS;
+    const seen: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      const { delayMs, nextDelayMs } = nextPollingBackoff(delay, 100);
+      seen.push(delayMs);
+      delay = nextDelayMs;
+    }
+    expect(seen[0]).toBe(POLLING_RESTART_MIN_MS);
+    expect(seen[1]).toBe(POLLING_RESTART_MIN_MS * 2);
+    expect(seen[seen.length - 1]).toBe(POLLING_RESTART_MAX_MS);
+    // Monotonically non-decreasing while failures stay rapid
+    for (let i = 1; i < seen.length; i++) {
+      expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1]);
+    }
+  });
+
+  it("resets to the minimum after a healthy run", () => {
+    // Backed off to the cap, then polling stayed up past the health threshold.
+    const { delayMs, nextDelayMs } = nextPollingBackoff(POLLING_RESTART_MAX_MS, POLLING_HEALTHY_RUN_MS);
+    expect(delayMs).toBe(POLLING_RESTART_MIN_MS);
+    expect(nextDelayMs).toBe(POLLING_RESTART_MIN_MS * 2);
+  });
+
+  it("keeps backing off when the run died just under the health threshold", () => {
+    const { delayMs } = nextPollingBackoff(12_000, POLLING_HEALTHY_RUN_MS - 1);
+    expect(delayMs).toBe(12_000);
   });
 });

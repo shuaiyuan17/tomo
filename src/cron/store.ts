@@ -32,6 +32,10 @@ export class CronStore {
     sessionKey: string;
     deleteAfterRun?: boolean;
   }): CronJob {
+    // Reload before mutating (like markRun/remove): jobs added/removed by
+    // separate CLI processes while this instance holds a stale snapshot
+    // would otherwise be reverted by the save below.
+    this.load();
     const now = Date.now();
     const job: CronJob = {
       id: randomUUID().slice(0, 8),

@@ -207,7 +207,14 @@ export class TelegramChannel implements Channel {
   /** Strip @botname from the message text */
   private cleanMention(text: string): string {
     if (!this.botUsername) return text;
-    return text.replace(new RegExp(`@${this.botUsername}`, "gi"), "").trim();
+    const escaped = this.botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return text.replace(new RegExp(`@${escaped}`, "gi"), "").trim();
+  }
+
+  /** Error detail safe to log — file-download URLs embed the bot token. */
+  private redactToken(err: unknown): string {
+    const detail = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
+    return this.bot.token ? detail.replaceAll(this.bot.token, "<bot-token>") : detail;
   }
 
   private describeSticker(sticker: {
@@ -265,7 +272,7 @@ export class TelegramChannel implements Channel {
         this.imageStoreBaseDir,
       );
     } catch (err) {
-      log.error({ err }, "Failed to download document");
+      log.error({ err: this.redactToken(err), fileId }, "Failed to download document");
       return undefined;
     }
   }
@@ -293,7 +300,7 @@ export class TelegramChannel implements Channel {
         this.imageStoreBaseDir,
       );
     } catch (err) {
-      log.error({ err }, "Failed to download photo");
+      log.error({ err: this.redactToken(err), fileId }, "Failed to download photo");
       return undefined;
     }
   }

@@ -31,6 +31,7 @@ import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipelin
 import { repairSdkSessionForResume } from "./sessions/repair.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
@@ -101,7 +102,6 @@ export class Agent {
     },
   });
   private commands: ChatCommandHandler;
-  private groupParticipants = new Map<string, Set<string>>();
   private modelOverrides = new Map<string, string>();
   private lastPromptHash: string = "";
   // Context-usage hysteresis: the highest nudge level already fired for the
@@ -650,11 +650,7 @@ export class Agent {
   }
 
   private hashString(s: string): string {
-    let hash = 0;
-    for (let i = 0; i < s.length; i++) {
-      hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0;
-    }
-    return String(hash);
+    return createHash("sha256").update(s).digest("hex");
   }
 
   /**
@@ -1086,15 +1082,8 @@ export class Agent {
   /** Track participants and chat title for a group session. The actual rules
    *  (passive listen, NO_REPLY guidance, participant snapshot) are now part of
    *  the system prompt — see SessionContext.group in sdkOptions — so they
-   *  survive compaction. This stays as pure persistence + in-memory tracking;
-   *  no LLM injection. */
+   *  survive compaction. This stays as pure persistence; no LLM injection. */
   private updateGroupContext(key: string, senderName: string, chatTitle?: string): void {
-    let participants = this.groupParticipants.get(key);
-    if (!participants) {
-      participants = new Set();
-      this.groupParticipants.set(key, participants);
-    }
-    participants.add(senderName);
     this.sessions.addParticipant(key, senderName);
     if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
   }

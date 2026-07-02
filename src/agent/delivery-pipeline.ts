@@ -25,7 +25,9 @@ export class DeliveryPipeline {
   /**
    * Finalize the streaming message after a turn completes. Per-block delivery
    * happens during the run, so by the time this runs the stream's only
-   * remaining job is flushing any trailing buffer state.
+   * remaining job is flushing any trailing buffer state. Callers with a
+   * different silent-reply policy (see TurnRunner's silent matchers) pass
+   * their own `isSilent`.
    */
   async deliverResponse(
     sessionKey: string,
@@ -33,10 +35,11 @@ export class DeliveryPipeline {
     replyChatId: string,
     response: string,
     stream: StreamingMessage,
+    isSilent: (response: string) => boolean = isSilentReply,
   ): Promise<void> {
     log.info({ channel: replyChannel.name, session: sessionKey }, "Tomo: %s", response);
 
-    if (isSilentReply(response)) {
+    if (isSilent(response)) {
       log.info("Silent reply (no message sent)");
       await stream.cancel();
       return;

@@ -28,6 +28,7 @@ import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
+import { TurnRunner, embeddedSilentMatcher, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { repairSdkSessionForResume } from "./sessions/repair.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
@@ -57,16 +58,6 @@ interface UserTurnRequest {
   steer?: boolean;
   /** True for turns where most inputs are expected to resolve to NO_REPLY. */
   passiveListen?: boolean;
-}
-
-interface RunWithRetryRequest {
-  key: string;
-  prompt: string;
-  onText?: (text: string) => void;
-  images?: Array<{ data: string; mediaType: string }>;
-  onBlockComplete?: (text: string) => void | Promise<void>;
-  documents?: Array<{ data: string; mediaType: string; filename?: string }>;
-  steer?: boolean;
 }
 
 interface CronTurnOptions {
@@ -110,6 +101,7 @@ export class Agent {
   private contextNudged = new Map<string, "daily" | "compact">();
   private pendingNotesQueue: PendingNotesQueue;
   private delivery: DeliveryPipeline;
+  private turnRunner: TurnRunner;
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
@@ -123,6 +115,23 @@ export class Agent {
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
     this.delivery = new DeliveryPipeline({
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
+    });
+    // Late-bound closures: runWithRetry must dispatch through `this` at call
+    // time (tests replace it on the instance).
+    this.turnRunner = new TurnRunner({
+      drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
+      runWithRetry: (req) => this.runWithRetry(req),
+      appendAssistantTranscript: (sessionKey, content, channelName) => {
+        this.sessions.append(sessionKey, {
+          role: "assistant",
+          content,
+          channel: channelName,
+          timestamp: Date.now(),
+        });
+      },
+      queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
+      startTurnTyping: (channel, chatId, passiveListen) => this.startTurnTyping(channel, chatId, passiveListen),
+      delivery: this.delivery,
     });
     const summons = new SummonStore(
       join(config.tomoHome, "data", "summons.json"),
@@ -719,58 +728,31 @@ export class Agent {
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
-    const stopTyping = this.startTurnTyping(req.replyChannel, req.replyChatId, req.passiveListen);
-
-    try {
-      const stampedText = this.drainPendingNotes(req.key) + this.injectTimestamp(req.promptText, req.sourceChannelName);
-      const stream = req.replyChannel.createStreamingMessage(req.replyChatId, req.replyToMessageId);
-      const response = await this.runWithRetry({
-        key: req.key,
-        prompt: stampedText,
-        onText: (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
+    await this.turnRunner.runTurn({
+      key: req.key,
+      prompt: req.promptText,
+      stampChannelName: req.sourceChannelName,
+      typing: { channel: req.replyChannel, chatId: req.replyChatId, passiveListen: req.passiveListen },
+      delivery: {
+        kind: "stream",
+        channel: req.replyChannel,
+        chatId: req.replyChatId,
+        replyToMessageId: req.replyToMessageId,
         images: req.images,
-        onBlockComplete: this.delivery.makeBlockHandler(req.replyChannel, req.replyChatId, stream),
         documents: req.documents,
         steer: req.steer,
-      });
-
-      if (req.steer && response === STEER_MERGED) {
-        // Steered message merged into the in-flight turn — that turn's owner
-        // streams and records the combined reply; nothing to deliver here.
-        await stopTyping({ clear: true });
-        await stream.cancel();
-        return;
-      }
-
-      this.sessions.append(req.key, {
-        role: "assistant",
-        content: response,
-        channel: req.replyChannel.name,
-        timestamp: Date.now(),
-      });
-
-      await this.delivery.deliverResponse(req.key, req.replyChannel, req.replyChatId, response, stream);
-      await stopTyping({ clear: true });
-    } catch (err) {
-      log.error({ err }, req.errorLogMessage);
-
-      if (req.suppressErrors) {
-        await stopTyping({ clear: true });
-        return;
-      }
-
-      const detail = err instanceof Error ? err.message : String(err);
-      const visibleError = `[error] ${detail}`;
-      this.queuePendingErrorNote(req.key, visibleError);
-      try {
-        await req.replyChannel.send({
-          chatId: req.replyChatId,
-          text: visibleError,
-        });
-      } finally {
-        await stopTyping({ clear: true });
-      }
-    }
+      },
+      silentMatcher: isSilentReply,
+      transcript: "always",
+      errors: {
+        visiblePrefix: "[error] ",
+        // Agent-error responses stream back like any text and are handled by
+        // DeliveryPipeline.deliverResponse; this only covers thrown errors.
+        response: "deliver",
+        thrown: req.suppressErrors ? "ignore" : "deliver",
+        thrownLogMessage: req.errorLogMessage,
+      },
+    });
   }
 
   private async handleMessage(
@@ -1088,18 +1070,6 @@ export class Agent {
     if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
   }
 
-  private injectTimestamp(text: string, channelName?: string): string {
-    const now = new Date();
-    const weekday = now.toLocaleDateString("en-US", { weekday: "short" });
-    const mm = String(now.getMonth() + 1).padStart(2, "0");
-    const dd = String(now.getDate()).padStart(2, "0");
-    const date = `${mm}/${dd}`;
-    const time = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
-    const tz = now.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
-    const prefix = channelName ? `${channelName} · ` : "";
-    return `[${prefix}${weekday} ${date} ${time} ${tz}] ${text}`;
-  }
-
   /** Handle a cron-triggered message (queued per session key). Resolves true
    *  when the turn ran cleanly, false when it errored — errors are fully
    *  handled here (logged, surfaced to the chat where appropriate), so the
@@ -1119,77 +1089,43 @@ export class Agent {
     if (!delivery) return false;
     const { channel: deliveryChannel, chatId: deliveryChatId } = delivery;
 
-    const stampedMessage = this.drainPendingNotes(key) + this.injectTimestamp(message, deliveryChannel.name);
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
-    const stopTyping = options.showTyping === false
-      ? async () => {}
-      : this.startTurnTyping(
-          deliveryChannel,
-          deliveryChatId,
-          this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
-        );
+    // Scheduled infrastructure failures must never be posted into a group.
+    // Silent housekeeping turns suppress them in DMs as well when requested.
+    const suppressErrorDelivery = isGroupSessionKey(key) || options.suppressDelivery === true;
 
-    try {
-      const response = await this.runWithRetry({ key, prompt: stampedMessage });
-      const silentCronResponse = isSilentReply(response) || response.includes("NO_REPLY");
-
-      log.info({ channel: deliveryChannel.name }, "Tomo: %s", response);
-
-      if (isAgentErrorResponse(response)) {
-        const visibleError = `[error] cron failed: ${response}`;
-        this.queuePendingErrorNote(key, visibleError);
-        // Scheduled infrastructure failures must never be posted into a group.
-        // Silent housekeeping turns suppress them in DMs as well when requested.
-        if (isGroupSessionKey(key) || options.suppressDelivery) {
-          log.warn({ sessionKey: key }, "Cron error suppressed from chat delivery");
-          await stopTyping({ clear: true });
-          return false;
-        }
-        await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
-        await stopTyping({ clear: true });
-        return false;
-      }
-
-      if (options.suppressDelivery) {
-        log.info({ sessionKey: key }, "Cron output suppressed from chat delivery");
-        await stopTyping({ clear: true });
-        return true;
-      }
-
-      if (silentCronResponse) {
-        log.info("Cron completed silently (no reply sent)");
-        await stopTyping({ clear: true });
-        return true;
-      }
-
-      this.sessions.append(key, {
-        role: "assistant",
-        content: response,
-        channel: deliveryChannel.name,
-        timestamp: Date.now(),
-      });
-
-      await this.delivery.deliverAssistantContent(deliveryChannel, deliveryChatId, response);
-      await stopTyping({ clear: true });
-      return true;
-    } catch (err) {
-      log.error({ err }, "Cron message handling failed");
-      const detail = err instanceof Error ? err.message : String(err);
-      const visibleError = `[error] cron failed: ${detail}`;
-      this.queuePendingErrorNote(key, visibleError);
-      if (isGroupSessionKey(key) || options.suppressDelivery) {
-        log.warn({ sessionKey: key }, "Thrown cron error suppressed from chat delivery");
-        await stopTyping({ clear: true });
-        return false;
-      }
-      try {
-        await deliveryChannel.send({ chatId: deliveryChatId, text: visibleError });
-      } finally {
-        await stopTyping({ clear: true });
-      }
-      return false;
-    }
+    return this.turnRunner.runTurn({
+      key,
+      prompt: message,
+      stampChannelName: deliveryChannel.name,
+      ...(options.showTyping === false ? {} : {
+        typing: {
+          channel: deliveryChannel,
+          chatId: deliveryChatId,
+          passiveListen: this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
+        },
+      }),
+      delivery: {
+        kind: "send",
+        channel: deliveryChannel,
+        chatId: deliveryChatId,
+        suppressDelivery: options.suppressDelivery,
+        suppressedLog: "Cron output suppressed from chat delivery",
+      },
+      silentMatcher: embeddedSilentMatcher,
+      silentLog: "Cron completed silently (no reply sent)",
+      transcript: "on-delivery",
+      logResponse: (response) => log.info({ channel: deliveryChannel.name }, "Tomo: %s", response),
+      errors: {
+        visiblePrefix: "[error] cron failed: ",
+        response: suppressErrorDelivery ? "note-only" : "deliver",
+        responseSuppressedLog: "Cron error suppressed from chat delivery",
+        thrown: suppressErrorDelivery ? "note-only" : "deliver",
+        thrownSuppressedLog: "Thrown cron error suppressed from chat delivery",
+        thrownLogMessage: "Cron message handling failed",
+      },
+    });
   }
 
   /** Handle a continuity heartbeat — runs on the first active DM session (queued) */
@@ -1215,34 +1151,34 @@ export class Agent {
   }
 
   private async processContinuity(prompt: string, key: string): Promise<void> {
-    try {
-      const response = await this.runWithRetry({ key, prompt: this.drainPendingNotes(key) + prompt });
-      log.info("Continuity response: %s", response.slice(0, 100));
-
-      if (isAgentErrorResponse(response)) {
-        this.queuePendingErrorNote(key, `[error] continuity failed: ${response}`);
-        log.warn({ sessionKey: key }, "Continuity returned an agent error response");
-        return;
-      }
-
-      // Send non-silent responses to the user (check includes() for multi-turn responses
-      // where NO_REPLY may appear after earlier text output)
-      if (!isSilentReply(response) && !response.includes("NO_REPLY")) {
-        const identityName = dmIdentityFromSessionKey(key);
-        const replyTarget = this.router.getReplyTarget(key)
-          ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
-          ?? privateReplyTargetFromSessionKey(key);
-
-        if (replyTarget) {
+    await this.turnRunner.runTurn({
+      key,
+      prompt,
+      // No timestamp stamp, no typing indicator, no transcript — continuity
+      // turns are invisible unless the model chooses to speak.
+      delivery: {
+        kind: "deferred-send",
+        resolveTarget: () => {
+          const identityName = dmIdentityFromSessionKey(key);
+          const replyTarget = this.router.getReplyTarget(key)
+            ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
+            ?? privateReplyTargetFromSessionKey(key);
+          if (!replyTarget) return undefined;
           const channel = this.getChannel(replyTarget.channelName);
-          if (channel) {
-            await this.delivery.deliverAssistantContent(channel, replyTarget.chatId, response);
-          }
-        }
-      }
-    } catch (err) {
-      log.error({ err }, "Continuity heartbeat failed");
-    }
+          return channel ? { channel, chatId: replyTarget.chatId } : undefined;
+        },
+      },
+      silentMatcher: embeddedSilentMatcher,
+      transcript: "never",
+      logResponse: (response) => log.info("Continuity response: %s", response.slice(0, 100)),
+      errors: {
+        visiblePrefix: "[error] continuity failed: ",
+        response: "note-only",
+        responseSuppressedLog: "Continuity returned an agent error response",
+        thrown: "ignore",
+        thrownLogMessage: "Continuity heartbeat failed",
+      },
+    });
   }
 
   private findLastChatId(channelName: string): string | undefined {

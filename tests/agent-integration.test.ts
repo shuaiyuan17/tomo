@@ -36,6 +36,10 @@ let mockUserContents: Array<Array<{ type: string; text?: string }>> = [];
 let mockSteerEcho = false;
 /** Context usage reported by the mock SDK's getContextUsage() after each turn. */
 let mockContextUsage = { totalTokens: 5000, maxTokens: 200000 };
+/** When set, the next query created fails its event stream with this error
+ *  message (one-shot) — simulates SDK session errors like "No conversation
+ *  found" that trip runWithRetry's reset-and-retry branch. */
+let mockFailNextQuery: string | null = null;
 
 /** Track in-flight mock queries so tests can assert no concurrency */
 const queryState = {
@@ -121,6 +125,11 @@ function enqueueAssistantTurnEvents(
 }
 
 function createMockQuery(prompt: AsyncGenerator) {
+  // One-shot failure injection: this query's event stream throws instead of
+  // producing events.
+  const failWith = mockFailNextQuery;
+  mockFailNextQuery = null;
+
   // Event queue + waiter for the consumer side
   const eventQueue: unknown[] = [];
   let waitResolve: (() => void) | null = null;
@@ -200,6 +209,7 @@ function createMockQuery(prompt: AsyncGenerator) {
     [Symbol.asyncIterator]() {
       return {
         async next(): Promise<IteratorResult<unknown>> {
+          if (failWith) throw new Error(failWith);
           while (eventQueue.length === 0 && !closed) {
             await new Promise<void>((r) => { waitResolve = r; });
           }
@@ -502,6 +512,7 @@ beforeEach(() => {
   mockEmitStreamDeltas = true;
   mockSteerEcho = false;
   mockContextUsage = { totalTokens: 5000, maxTokens: 200000 };
+  mockFailNextQuery = null;
   mockUserContents = [];
   mockQueryControllers = [];
   queryState.reset();
@@ -3562,6 +3573,25 @@ describe("compact nudges", () => {
     await tg.simulateMessage(makeMsg({ text: "Hi again" }));
     await drainQueue(agent);
     await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    await agent.stop();
+  });
+
+  it("runs the context-pressure check on a turn recovered by the session-error retry", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // First query fails its event stream — runWithRetry's "No conversation
+    // found" branch resets the session and retries on a fresh query, which
+    // must still get post-turn bookkeeping (including the nudge check).
+    mockContextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    mockFailNextQuery = "No conversation found";
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("lcm compact skill");
 
     await agent.stop();
   });

@@ -16,7 +16,7 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
-import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type TurnRequest } from "./agent/live-session.js";
+import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact } from "./agent/sdk-options.js";
 import { isSilentReply, ATTACHMENT_TAG_RE, extractAttachments } from "./agent/text-utils.js";
 import { deliverTextParts } from "./channels/delivery.js";
@@ -791,10 +791,13 @@ export class Agent {
    * queue. Calling runWithRetry directly here would overlap with the next
    * user message's send() and stomp LiveSession's single currentRequest slot,
    * silently swallowing one of the two responses.
+   *
+   * Callers that hold the turn's session pass its lastResult explicitly —
+   * the compact-trigger reload may have already dropped the session from
+   * liveSessions, and the latch must still see the result to stay accurate.
    */
-  private maybeNudgeCompact(key: string): void {
+  private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessions.get(key)?.lastResult ?? null): void {
     if (!usesLcmCompact(key)) return;
-    const ctx = this.liveSessions.get(key)?.lastResult;
     if (!ctx || ctx.contextMax <= 0) return;
 
     const usedFrac = ctx.contextUsed / ctx.contextMax;
@@ -1087,40 +1090,7 @@ export class Agent {
       // resolves; nothing to record for this caller.
       if (steer && response === STEER_MERGED) return response;
 
-      // Capture session ID if new
-      const sid = session.getSessionId();
-      if (sid && !this.sessions.getSdkSessionId(key)) {
-        this.sessions.setSdkSessionId(key, sid);
-        log.info({ sessionId: sid, key }, "Session ID captured");
-      }
-
-      // Save stats
-      if (session.lastResult) {
-        this.sessions.updateStats(key, session.lastResult);
-      }
-
-      // If compact happened during this turn, reload the session on next
-      // turn. With steering, a promoted steered turn may already be running
-      // on this session — closing now would kill it, so defer the reload
-      // until the session is truly idle.
-      if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
-        if (session.isBusy()) {
-          void session.waitForIdle().then(() => {
-            if (this.liveSessions.get(key) === session) {
-              this.closeLiveSession(key);
-              log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
-            }
-          });
-        } else {
-          this.closeLiveSession(key);
-          log.info({ key }, "Session reloaded after compact");
-        }
-      }
-
-      // Fire-and-forget context-pressure check — don't block the current
-      // reply on the nudge. See maybeNudgeCompact for thresholds/hysteresis.
-      this.maybeNudgeCompact(key);
-
+      this.recordTurnCompletion(key, session);
       return response;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "";
@@ -1161,11 +1131,55 @@ export class Agent {
         }
 
         const session = await this.getOrCreateLiveSession(key);
-        return session.send(prompt, onText, images, onBlockComplete, documents);
+        const response = await session.send(prompt, onText, images, onBlockComplete, documents);
+        this.recordTurnCompletion(key, session);
+        return response;
       }
 
       throw err;
     }
+  }
+
+  /**
+   * Post-turn bookkeeping shared by runWithRetry's first attempt and its
+   * session-error retry: capture a new SDK session id, persist stats,
+   * reload after an external compact, and run the context-pressure check.
+   */
+  private recordTurnCompletion(key: string, session: LiveSession): void {
+    // Capture session ID if new
+    const sid = session.getSessionId();
+    if (sid && !this.sessions.getSdkSessionId(key)) {
+      this.sessions.setSdkSessionId(key, sid);
+      log.info({ sessionId: sid, key }, "Session ID captured");
+    }
+
+    // Save stats
+    if (session.lastResult) {
+      this.sessions.updateStats(key, session.lastResult);
+    }
+
+    // If compact happened during this turn, reload the session on next
+    // turn. With steering, a promoted steered turn may already be running
+    // on this session — closing now would kill it, so defer the reload
+    // until the session is truly idle.
+    if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
+      if (session.isBusy()) {
+        void session.waitForIdle().then(() => {
+          if (this.liveSessions.get(key) === session) {
+            this.closeLiveSession(key);
+            log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
+          }
+        });
+      } else {
+        this.closeLiveSession(key);
+        log.info({ key }, "Session reloaded after compact");
+      }
+    }
+
+    // Fire-and-forget context-pressure check — don't block the current
+    // reply on the nudge. Pass this turn's result explicitly: the reload
+    // above may have already removed the session from liveSessions.
+    this.maybeNudgeCompact(key, session.lastResult);
   }
 
   /**

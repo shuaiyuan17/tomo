@@ -143,6 +143,21 @@ describe("recall_conversation MCP tool", () => {
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain("good record");
   });
+
+  it("skips transcript records without string content when browsing without a query", async () => {
+    seedMessage(store, { content: "good record", timestamp: 1000 });
+    // Simulate a corrupt/legacy line written directly to the transcript file.
+    appendFileSync(
+      join(TEST_DIR, "dm_alice.jsonl"),
+      JSON.stringify({ role: "user", channel: "telegram", timestamp: 2000 }) + "\n",
+    );
+    const freshStore = new SessionStore(TEST_DIR, 20, join(TEST_DIR, "sdk-sessions"));
+
+    const result = await makeTool(freshStore).handler({ limit: 20 }, {});
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain("good record");
+  });
 });
 
 describe("formatRecallResults", () => {

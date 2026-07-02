@@ -167,7 +167,8 @@ export class SessionStore {
         if (opts.toTime != null && msg.timestamp > opts.toTime) continue;
         // Legacy/hand-edited records may lack a string content — skip rather
         // than throw out of the whole search (this backs an agent tool call).
-        if (queryLower && !(typeof msg.content === "string" && msg.content.toLowerCase().includes(queryLower))) continue;
+        if (typeof msg.content !== "string") continue;
+        if (queryLower && !msg.content.toLowerCase().includes(queryLower)) continue;
 
         results.push(msg);
         if (results.length >= limit) break outer;

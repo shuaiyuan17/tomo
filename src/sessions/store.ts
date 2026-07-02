@@ -1,11 +1,30 @@
-import { mkdirSync, appendFileSync, readFileSync, existsSync, unlinkSync, renameSync, statSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { log } from "../logger.js";
-import { readJsonlFileSync } from "../jsonl.js";
+import { readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// Floor for the in-memory transcript tail: enough to cover historyLimit user
+// turns with generous margin (a turn is typically 2-3 messages) while keeping
+// months of history out of daemon memory.
+const TRANSCRIPT_TAIL_MIN = 200;
+// Rotate the active transcript once it outgrows this; prior months move to
+// _archive_<key>_<YYYY-MM>.jsonl siblings.
+const TRANSCRIPT_ROTATE_BYTES = 2 * 1024 * 1024;
+
+function monthOf(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 7);
+}
+
+/** Ordering guard for rotation crash recovery: prefer the monotonic seq,
+ *  fall back to timestamps for legacy messages without one. */
+function isAfterMessage(msg: SessionMessage, last: SessionMessage): boolean {
+  if (msg.seq != null && last.seq != null) return msg.seq > last.seq;
+  return msg.timestamp > last.timestamp;
+}
 
 interface PendingNotesFile {
   version: 1;
@@ -31,11 +50,17 @@ export class SessionStore {
   private dir: string;
   private historyLimit: number;
   private sdkSessionsDir: string;
+  private tailLimit: number;
+  private rotateBytes: number;
+  // Month for which rotation already ran and found nothing to roll — skip
+  // re-reading an all-current-month file until the month turns over.
+  private rotateSkipMonth = new Map<string, string>();
 
   constructor(
     dir: string,
     historyLimit: number,
     sdkSessionsDir: string,
+    opts?: { tailMessages?: number; rotateBytes?: number },
   ) {
     if (!sdkSessionsDir) {
       throw new Error("SessionStore requires an explicit SDK sessions directory");
@@ -43,21 +68,25 @@ export class SessionStore {
     this.dir = dir;
     this.historyLimit = historyLimit;
     this.sdkSessionsDir = sdkSessionsDir;
+    this.tailLimit = opts?.tailMessages ?? Math.max(TRANSCRIPT_TAIL_MIN, historyLimit * 10);
+    this.rotateBytes = opts?.rotateBytes ?? TRANSCRIPT_ROTATE_BYTES;
     mkdirSync(dir, { recursive: true });
     this.loadRegistry();
     this.cleanupExpired();
   }
 
-  /** Get or create a session, loading from disk on first access */
+  /** Get or create a session, loading only the transcript tail from disk on
+   *  first access. Older messages stay on disk (see searchTranscript). */
   get(key: string): Session {
     let session = this.sessions.get(key);
     if (session) return session;
 
+    this.maybeRotateTranscript(key);
     const messages = this.loadTranscript(key);
     session = {
       key,
       messages,
-      createdAt: messages.length > 0 ? messages[0].timestamp : Date.now(),
+      createdAt: this.transcriptCreatedAt(key) ?? (messages.length > 0 ? messages[0].timestamp : Date.now()),
       updatedAt: messages.length > 0 ? messages[messages.length - 1].timestamp : Date.now(),
     };
     this.sessions.set(key, session);
@@ -79,6 +108,13 @@ export class SessionStore {
 
     const file = this.transcriptPath(key);
     appendFileSync(file, JSON.stringify(message) + "\n");
+
+    // Long-running daemon: keep the in-memory cache bounded to the tail and
+    // take the (amortized) chance to roll old months out of the active file.
+    if (session.messages.length > this.tailLimit * 2) {
+      session.messages.splice(0, session.messages.length - this.tailLimit);
+      this.maybeRotateTranscript(key);
+    }
   }
 
   /** Append a tool summary entry for a completed tool chain */
@@ -100,7 +136,16 @@ export class SessionStore {
     });
   }
 
-  /** Search transcript by text query, optionally filtered by time range */
+  /**
+   * Search the transcript by text query, optionally filtered by seq/time
+   * range. Returns the most recent `limit` matches in chronological order —
+   * an assistant recalling things almost always wants the latest mentions,
+   * not the oldest.
+   *
+   * Streams newest-first from disk with early exit, so the full transcript
+   * is never materialized; continues into monthly rotation archives when the
+   * active file doesn't fill the limit.
+   */
   searchTranscript(key: string, opts: {
     query?: string;
     fromSeq?: number;
@@ -109,24 +154,27 @@ export class SessionStore {
     toTime?: number;
     limit?: number;
   }): SessionMessage[] {
-    const session = this.get(key);
     const limit = opts.limit ?? 50;
     const results: SessionMessage[] = [];
-
     const queryLower = opts.query?.toLowerCase();
+    const files = [this.transcriptPath(key), ...this.listTranscriptArchives(key)];
 
-    for (const msg of session.messages) {
-      if (opts.fromSeq != null && (msg.seq ?? 0) < opts.fromSeq) continue;
-      if (opts.toSeq != null && (msg.seq ?? 0) > opts.toSeq) continue;
-      if (opts.fromTime != null && msg.timestamp < opts.fromTime) continue;
-      if (opts.toTime != null && msg.timestamp > opts.toTime) continue;
-      if (queryLower && !msg.content.toLowerCase().includes(queryLower)) continue;
+    outer: for (const file of files) {
+      for (const msg of iterateJsonlBackwardsSync<SessionMessage>(file)) {
+        // Scanning newest→oldest: once past the window's lower bound,
+        // nothing older can match.
+        if (opts.fromSeq != null && (msg.seq ?? 0) < opts.fromSeq) break outer;
+        if (opts.fromTime != null && msg.timestamp < opts.fromTime) break outer;
+        if (opts.toSeq != null && (msg.seq ?? 0) > opts.toSeq) continue;
+        if (opts.toTime != null && msg.timestamp > opts.toTime) continue;
+        if (queryLower && !msg.content.toLowerCase().includes(queryLower)) continue;
 
-      results.push(msg);
-      if (results.length >= limit) break;
+        results.push(msg);
+        if (results.length >= limit) break outer;
+      }
     }
 
-    return results;
+    return results.reverse();
   }
 
   /** Search archive files (compacted SDK events) for a given session ID */
@@ -184,6 +232,15 @@ export class SessionStore {
   private getLastSeq(session: Session): number {
     for (let i = session.messages.length - 1; i >= 0; i--) {
       if (session.messages[i].seq != null) return session.messages[i].seq!;
+    }
+    // No seq in the tail — rotation may have moved every active message into
+    // monthly archives (e.g. a session idle across a month boundary).
+    // Continue the sequence from the newest archived record so seq stays
+    // monotonic across the whole transcript history.
+    for (const file of this.listTranscriptArchives(session.key)) {
+      for (const record of iterateJsonlBackwardsSync<SessionMessage>(file)) {
+        if (record.seq != null) return record.seq;
+      }
     }
     return 0;
   }
@@ -575,6 +632,15 @@ export class SessionStore {
       renameSync(oldPath, newPath);
     }
 
+    // Bring monthly rotation archives along so search and createdAt keep
+    // covering the pre-migration history.
+    for (const archive of this.listTranscriptArchives(oldKey)) {
+      const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
+      if (!month) continue;
+      const target = this.transcriptArchivePath(newKey, month);
+      if (!existsSync(target)) renameSync(archive, target);
+    }
+
     const pendingNotes = this.loadPendingNotes();
     const oldNotes = pendingNotes[oldKey];
     if (oldNotes) {
@@ -696,15 +762,120 @@ export class SessionStore {
 
   // --- Transcripts ---
 
-  private transcriptPath(key: string): string {
-    const safe = key.replace(/[^a-zA-Z0-9_-]/g, "_");
-    return join(this.dir, `${safe}.jsonl`);
+  private safeKey(key: string): string {
+    return key.replace(/[^a-zA-Z0-9_-]/g, "_");
   }
 
+  private transcriptPath(key: string): string {
+    return join(this.dir, `${this.safeKey(key)}.jsonl`);
+  }
+
+  private transcriptArchivePath(key: string, month: string): string {
+    return join(this.dir, `_archive_${this.safeKey(key)}_${month}.jsonl`);
+  }
+
+  /** Monthly rotation archives for a key, newest month first. */
+  private listTranscriptArchives(key: string): string[] {
+    const prefix = `_archive_${this.safeKey(key)}_`;
+    let names: string[];
+    try {
+      names = readdirSync(this.dir);
+    } catch {
+      return [];
+    }
+    return names
+      .filter((n) => n.startsWith(prefix) && /^\d{4}-\d{2}\.jsonl$/.test(n.slice(prefix.length)))
+      .sort()
+      .reverse()
+      .map((n) => join(this.dir, n));
+  }
+
+  /** Load only the last tailLimit messages of the active transcript. */
   private loadTranscript(key: string): SessionMessage[] {
     const file = this.transcriptPath(key);
     if (!existsSync(file)) return [];
 
-    return readJsonlFileSync<SessionMessage>(file);
+    return readJsonlTailSync<SessionMessage>(file, this.tailLimit);
+  }
+
+  /** Timestamp of the oldest surviving message across archives + active file. */
+  private transcriptCreatedAt(key: string): number | undefined {
+    const archives = this.listTranscriptArchives(key);
+    const oldestFile = archives.length > 0 ? archives[archives.length - 1] : this.transcriptPath(key);
+    return readFirstJsonlRecordSync<SessionMessage>(oldestFile)?.timestamp;
+  }
+
+  /** Count user messages in the active transcript without retaining them.
+   *  Bounded by rotation; archived months are not counted. */
+  countRecentUserMessages(key: string): number {
+    let count = 0;
+    for (const msg of iterateJsonlBackwardsSync<SessionMessage>(this.transcriptPath(key))) {
+      if (msg.role === "user") count++;
+    }
+    return count;
+  }
+
+  /**
+   * Roll messages from prior months out of the active transcript into
+   * _archive_<key>_<YYYY-MM>.jsonl siblings once the active file outgrows
+   * rotateBytes. Keeps the active file — and everything priced by its size:
+   * first-access load, search of recent history, /status counts — bounded
+   * for a daemon that runs for months.
+   *
+   * Crash safety: archives are appended before the active file is rewritten
+   * (atomically, via rename). If we die in between, the next rotation skips
+   * already-archived messages via isAfterMessage instead of duplicating them.
+   */
+  private maybeRotateTranscript(key: string): void {
+    const file = this.transcriptPath(key);
+    let size: number;
+    try {
+      size = statSync(file).size;
+    } catch {
+      return;
+    }
+    if (size < this.rotateBytes) return;
+
+    const currentMonth = monthOf(Date.now());
+    if (this.rotateSkipMonth.get(key) === currentMonth) return;
+
+    const all = readJsonlFileSync<SessionMessage>(file);
+    const keep: SessionMessage[] = [];
+    const byMonth = new Map<string, SessionMessage[]>();
+    for (const msg of all) {
+      const month = monthOf(msg.timestamp);
+      if (month >= currentMonth) {
+        keep.push(msg);
+        continue;
+      }
+      let bucket = byMonth.get(month);
+      if (!bucket) byMonth.set(month, bucket = []);
+      bucket.push(msg);
+    }
+    if (byMonth.size === 0) {
+      // Everything is current-month; nothing can roll until the month turns.
+      this.rotateSkipMonth.set(key, currentMonth);
+      return;
+    }
+
+    for (const [month, msgs] of byMonth) {
+      const archivePath = this.transcriptArchivePath(key, month);
+      let lastArchived: SessionMessage | undefined;
+      for (const record of iterateJsonlBackwardsSync<SessionMessage>(archivePath)) {
+        lastArchived = record;
+        break;
+      }
+      const fresh = lastArchived ? msgs.filter((m) => isAfterMessage(m, lastArchived)) : msgs;
+      if (fresh.length === 0) continue;
+      appendFileSync(archivePath, fresh.map((m) => JSON.stringify(m)).join("\n") + "\n");
+    }
+
+    const tmp = `${file}.rotate-tmp`;
+    writeFileSync(tmp, keep.length > 0 ? keep.map((m) => JSON.stringify(m)).join("\n") + "\n" : "");
+    renameSync(tmp, file);
+    log.info(
+      { key, months: [...byMonth.keys()].sort(), archived: all.length - keep.length, kept: keep.length },
+      "Transcript rotated: prior months moved to archive files",
+    );
   }
 }

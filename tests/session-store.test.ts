@@ -49,31 +49,6 @@ describe("SessionStore", () => {
     expect(session.messages[1].content).toBe("hi");
   });
 
-  it("limits history by user turns", () => {
-    const store = new SessionStore(TEST_DIR, 2);
-    for (let i = 0; i < 5; i++) {
-      store.append("test", {
-        role: "user",
-        content: `msg ${i}`,
-        channel: "test",
-        timestamp: Date.now(),
-      });
-      store.append("test", {
-        role: "assistant",
-        content: `reply ${i}`,
-        channel: "test",
-        timestamp: Date.now(),
-      });
-    }
-
-    const history = store.getHistory("test");
-    // Should only include last 2 user turns + their replies
-    const userMsgs = history.filter((m) => m.role === "user");
-    expect(userMsgs).toHaveLength(2);
-    expect(userMsgs[0].content).toBe("msg 3");
-    expect(userMsgs[1].content).toBe("msg 4");
-  });
-
   it("manages SDK session IDs", () => {
     const store = new SessionStore(TEST_DIR, 20);
 

@@ -26,6 +26,26 @@ describe("config", () => {
     vi.resetModules();
   });
 
+  it("falls back to defaults on non-numeric numeric env vars", async () => {
+    vi.resetModules();
+    vi.stubEnv("HISTORY_LIMIT", "abc");
+    vi.stubEnv("TOMO_MAX_TURNS", "not-a-number");
+    vi.stubEnv("IMESSAGE_WEBHOOK_PORT", "");
+    const { config } = await import("../src/config.js");
+    expect(config.historyLimit).toBe(20);
+    expect(config.maxTurns).toBe(50);
+    expect(config.imessageWebhookPort).toBe(3100);
+  });
+
+  it("parses valid numeric env vars", async () => {
+    vi.resetModules();
+    vi.stubEnv("HISTORY_LIMIT", "5");
+    vi.stubEnv("TOMO_MAX_TURNS", "75");
+    const { config } = await import("../src/config.js");
+    expect(config.historyLimit).toBe(5);
+    expect(config.maxTurns).toBe(75);
+  });
+
   it("clamps continuity intervals to at least one minute", async () => {
     await expect(loadContinuityIntervalMs("0.001")).resolves.toBe(60_000);
   });

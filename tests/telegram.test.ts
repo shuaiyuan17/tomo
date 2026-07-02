@@ -1,11 +1,5 @@
 import { describe, it, expect } from "vitest";
-
-// Test @mention cleaning (extracted from TelegramChannel.cleanMention)
-function cleanMention(text: string, botUsername: string | undefined): string {
-  if (!botUsername) return text;
-  const escaped = botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text.replace(new RegExp(`@${escaped}`, "gi"), "").trim();
-}
+import { TelegramChannel, cleanMention, mentionRegex } from "../src/channels/telegram.js";
 
 describe("cleanMention", () => {
   it("strips bot mention from text", () => {
@@ -37,6 +31,24 @@ describe("cleanMention", () => {
     // over-match if that ever changes.
     expect(cleanMention("@my.bot hello", "my.bot")).toBe("hello");
     expect(cleanMention("@myXbot hello", "my.bot")).toBe("@myXbot hello");
+  });
+
+  it("does not strip a longer username that starts with the bot's name", () => {
+    expect(cleanMention("@mybot_backup hello", "mybot")).toBe("@mybot_backup hello");
+    expect(cleanMention("@mybot2 hello", "mybot")).toBe("@mybot2 hello");
+  });
+});
+
+describe("mentionRegex", () => {
+  it("matches the username at word boundaries only", () => {
+    expect(mentionRegex("mybot", "i").test("hey @mybot!")).toBe(true);
+    expect(mentionRegex("mybot", "i").test("hey @MyBot, hello")).toBe(true);
+    expect(mentionRegex("mybot", "i").test("@mybot")).toBe(true);
+  });
+
+  it("does not match longer usernames sharing the bot's prefix", () => {
+    expect(mentionRegex("mybot", "i").test("hey @mybot_backup")).toBe(false);
+    expect(mentionRegex("mybot", "i").test("hey @mybot2")).toBe(false);
   });
 });
 
@@ -264,5 +276,42 @@ describe("streaming message NO_REPLY prefix suppression", () => {
 
     expect(calls).toEqual(["send:NO_REPLY just kidding, here's the answer"]);
     expect(messageId).toBe(1);
+  });
+});
+
+// Photo caption handling: Telegram rejects captions over 1024 chars, which
+// would lose both the photo and the text. Long captions must be sent as a
+// separate chunked message instead.
+describe("TelegramChannel.send photo captions", () => {
+  function makeChannel() {
+    const channel = new TelegramChannel("000000:test-token");
+    const photos: Array<{ chatId: string; caption?: string }> = [];
+    const messages: Array<{ chatId: string; text: string }> = [];
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendPhoto: async (chatId: string | number, _file: unknown, opts?: { caption?: string }) => {
+        photos.push({ chatId: String(chatId), caption: opts?.caption });
+        return {};
+      },
+      sendMessage: async (chatId: string | number, text: string) => {
+        messages.push({ chatId: String(chatId), text });
+        return { message_id: 1 };
+      },
+    };
+    return { channel, photos, messages };
+  }
+
+  it("keeps short captions on the photo", async () => {
+    const { channel, photos, messages } = makeChannel();
+    await channel.send({ chatId: "1", text: "short caption", photo: "/tmp/pic.png" });
+    expect(photos).toEqual([{ chatId: "1", caption: "short caption" }]);
+    expect(messages).toHaveLength(0);
+  });
+
+  it("ships over-limit captions as a separate text message", async () => {
+    const { channel, photos, messages } = makeChannel();
+    const longText = "x".repeat(2000);
+    await channel.send({ chatId: "1", text: longText, photo: "/tmp/pic.png" });
+    expect(photos).toEqual([{ chatId: "1", caption: undefined }]);
+    expect(messages.map((m) => m.text).join("")).toBe(longText);
   });
 });

@@ -265,6 +265,22 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances).toHaveLength(2);
   });
 
+  it("rethrows without retrying when an error merely mentions a session", async () => {
+    // Retrying re-runs the whole turn (duplicating its side effects), so only
+    // genuine session-lifecycle failures may trip the reset-and-retry branch —
+    // not any MCP/tool/API error whose message happens to contain "session".
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => { throw new Error("MCP tool failed: invalid session parameter"); };
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" }))
+      .rejects.toThrow("MCP tool failed");
+
+    expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+  });
+
   it("retires the SDK session id and rethrows on query timeouts", async () => {
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);

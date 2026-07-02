@@ -46,6 +46,11 @@ export class IdentityRouter {
     }
   }
 
+  /** True when this channel enforces an allowlist (absent = open channel). */
+  hasAllowlist(channelName: string): boolean {
+    return this.allowlists[channelName] !== undefined;
+  }
+
   /** Check if a chatId is allowed on a channel. Returns true if no allowlist is configured (open). */
   isAllowed(channelName: string, chatId: string): boolean {
     const allowlist = this.allowlists[channelName];
@@ -61,8 +66,19 @@ export class IdentityRouter {
 
   /** Add a chatId to a channel's in-memory allowlist (after persisting to config) */
   addToAllowlist(channelName: string, chatId: string): void {
-    if (!this.allowlists[channelName]) this.allowlists[channelName] = new Set();
-    this.allowlists[channelName].add(chatId);
+    let allowlist = this.allowlists[channelName];
+    if (!allowlist) {
+      // Creating a channel's first allowlist flips it from open to enforced.
+      // Seed it with identity-bound chatIds — the same merge the constructor
+      // does — so the owner's own DM isn't locked out by the new list.
+      allowlist = new Set();
+      for (const id of this.identities) {
+        const bound = id.channels[channelName];
+        if (bound) allowlist.add(bound);
+      }
+      this.allowlists[channelName] = allowlist;
+    }
+    allowlist.add(chatId);
   }
 
   /** Mark a group as summoned: its messages route to the identity's dm: session until dismissed. */

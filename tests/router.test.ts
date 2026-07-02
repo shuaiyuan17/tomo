@@ -74,6 +74,29 @@ describe("IdentityRouter", () => {
       expect(router.isAllowed("discord", "abc")).toBe(true);
       expect(router.isAllowed("discord", "xyz")).toBe(false);
     });
+
+    it("seeds a newly created allowlist with identity-bound chatIds", () => {
+      const router = new IdentityRouter(
+        [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      // Channel starts open; the first add flips it to enforced but must not
+      // lock out the identity's own DM.
+      expect(router.isAllowed("telegram", "999")).toBe(true);
+      router.addToAllowlist("telegram", "-100group");
+      expect(router.isAllowed("telegram", "-100group")).toBe(true);
+      expect(router.isAllowed("telegram", "111")).toBe(true);
+      expect(router.isAllowed("telegram", "999")).toBe(false);
+    });
+  });
+
+  describe("hasAllowlist", () => {
+    it("reports whether a channel enforces an allowlist", () => {
+      const router = new IdentityRouter([], sessions, { telegram: ["123"] });
+      expect(router.hasAllowlist("telegram")).toBe(true);
+      expect(router.hasAllowlist("imessage")).toBe(false);
+    });
   });
 
   describe("resolve", () => {

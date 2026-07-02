@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -261,6 +261,46 @@ describe("group chat handling", () => {
     const activation = tg.sent.find(m => m.text?.includes("activated"));
     expect(activation).toBeDefined();
     expect(activation!.chatId).toBe("-100group");
+
+    await agent.stop();
+  });
+
+  it("does not create an allowlist when the secret arrives on an open channel", async () => {
+    // The channel has no allowlist — everything (including this group) is
+    // already allowed. Activation must not flip the channel to enforced,
+    // which would lock out every other chat until restart.
+    const configPath = join(agentEnv.tmpDir, "config.json");
+    writeFileSync(configPath, JSON.stringify({
+      channels: { telegram: { token: "test" } },
+    }));
+
+    resetConfig({
+      channelAllowlists: {},
+      groupSecret: "tomo-secret-123",
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100group",
+      text: "tomo-secret-123",
+      isGroup: true,
+      isMentioned: false,
+      senderName: "Alice",
+    }));
+    await drainQueue(agent);
+
+    // Acknowledged, but the config gained no allowlist.
+    expect(tg.sent.find(m => m.text?.includes("already active"))).toBeDefined();
+    const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(cfg.channels.telegram.allowlist).toBeUndefined();
+
+    // Other chats (e.g. the owner's DM) still get through.
+    mockSdk.responseFn = () => "Hi there!";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
+    await drainQueue(agent);
+    expect(tg.delivered.some(m => m.chatId === "12345")).toBe(true);
 
     await agent.stop();
   });

@@ -233,6 +233,15 @@ export class SessionStore {
     for (let i = session.messages.length - 1; i >= 0; i--) {
       if (session.messages[i].seq != null) return session.messages[i].seq!;
     }
+    // No seq in the tail — rotation may have moved every active message into
+    // monthly archives (e.g. a session idle across a month boundary).
+    // Continue the sequence from the newest archived record so seq stays
+    // monotonic across the whole transcript history.
+    for (const file of this.listTranscriptArchives(session.key)) {
+      for (const record of iterateJsonlBackwardsSync<SessionMessage>(file)) {
+        if (record.seq != null) return record.seq;
+      }
+    }
     return 0;
   }
 

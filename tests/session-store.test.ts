@@ -332,6 +332,24 @@ describe("SessionStore", () => {
       expect(store.searchTranscript("test", { query: "jan", limit: 10 })).toHaveLength(2);
     });
 
+    it("continues seq from the newest archive when rotation empties the active file", () => {
+      // A session idle across a month boundary: every message is prior-month,
+      // so rotation leaves the active transcript empty.
+      const jan = Date.UTC(2020, 0, 15);
+      writeTranscript("test", [
+        msg({ content: "one", seq: 1, timestamp: jan }),
+        msg({ content: "two", seq: 2, timestamp: jan + 1000 }),
+      ]);
+
+      const store = new SessionStore(TEST_DIR, 20, undefined, { rotateBytes: 1 });
+      store.append("test", msg({ content: "three" }));
+
+      const session = store.get("test");
+      expect(session.messages.map((m) => m.seq)).toEqual([3]);
+      const all = store.searchTranscript("test", { limit: 10 });
+      expect(all.map((m) => [m.content, m.seq])).toEqual([["one", 1], ["two", 2], ["three", 3]]);
+    });
+
     it("re-running rotation does not duplicate archived messages", () => {
       const jan = Date.UTC(2020, 0, 15);
       const oldMessages = [

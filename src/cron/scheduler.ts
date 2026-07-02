@@ -10,8 +10,8 @@ export class CronScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
 
-  constructor(agent: Agent) {
-    this.store = new CronStore();
+  constructor(agent: Agent, store: CronStore = new CronStore()) {
+    this.store = store;
     this.agent = agent;
   }
 
@@ -38,9 +38,12 @@ export class CronScheduler {
     this.ticking = true;
     try {
       const dueJobs = this.store.getDueJobs();
-      for (const job of dueJobs) {
-        await this.execute(job.id);
-      }
+      // Dispatch due jobs concurrently: a job's agent turn can take minutes,
+      // and running them serially would delay every other due job by that
+      // much. Jobs on the same session still serialize through the agent's
+      // per-session queue; markRun stays safe because it's fully synchronous
+      // (no interleaving within a single load-mutate-save).
+      await Promise.allSettled(dueJobs.map((job) => this.execute(job.id)));
     } catch (err) {
       // markRun can throw on disk errors; don't let it become an unhandled
       // rejection that kills the daemon.

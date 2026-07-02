@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, readFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, existsSync, unlinkSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { log } from "../logger.js";
@@ -23,6 +23,11 @@ export function getSdkSessionPath(
 export class SessionStore {
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
+  // Stat of the registry file as of the last read/write. loadRegistry() is
+  // called on nearly every store operation to pick up external changes
+  // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
+  // full read+parse when the file hasn't changed since we last touched it.
+  private registryStat: { mtimeMs: number; size: number } | null = null;
   private dir: string;
   private historyLimit: number;
   private sdkSessionsDir: string;
@@ -616,22 +621,45 @@ export class SessionStore {
 
   private loadRegistry(): void {
     const file = this.registryPath;
-    if (!existsSync(file)) {
+    const stat = this.statRegistry();
+    if (!stat) {
+      this.registryStat = null;
       // Migrate from old _sdk_sessions.json if it exists
       this.migrateOldFormat();
+      return;
+    }
+    if (this.registryStat
+      && this.registryStat.mtimeMs === stat.mtimeMs
+      && this.registryStat.size === stat.size) {
       return;
     }
     try {
       const data: SessionRegistry = JSON.parse(readFileSync(file, "utf-8"));
       this.registry = data.sessions ?? [];
+      this.registryStat = stat;
     } catch {
       this.registry = [];
+      this.registryStat = null;
     }
   }
 
   private saveRegistry(): void {
     const data: SessionRegistry = { version: 1, sessions: this.registry };
     writeJsonAtomicSync(this.registryPath, data);
+    // Record our own write's stat so the next loadRegistry() doesn't re-read
+    // what we just wrote. An external writer landing in the stat window would
+    // be missed until its next write — the same read-modify-write race the
+    // uncached path had, so no new hazard.
+    this.registryStat = this.statRegistry();
+  }
+
+  private statRegistry(): { mtimeMs: number; size: number } | null {
+    try {
+      const s = statSync(this.registryPath);
+      return { mtimeMs: s.mtimeMs, size: s.size };
+    } catch {
+      return null;
+    }
   }
 
   /** Migrate from the old simple key→value format */

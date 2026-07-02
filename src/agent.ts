@@ -398,8 +398,21 @@ export class Agent {
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
       log.info("System prompt changed, creating new sessions");
       for (const [k, s] of this.liveSessions) {
-        s.close();
+        // Removing the session from the map is what retires it — the next
+        // message for its key creates a fresh session with the new prompt.
+        // Closing a busy session here would reject its in-flight turn, and
+        // runWithRetry's reset-and-retry branch would then re-run the whole
+        // turn, repeating side effects its first half already performed — so
+        // the actual close waits for the in-flight turn to finish.
         this.liveSessions.delete(k);
+        if (s.isBusy()) {
+          void s.waitForIdle().then(() => {
+            s.close();
+            log.info({ key: k }, "Session closed after prompt change (deferred past in-flight turn)");
+          });
+        } else {
+          s.close();
+        }
       }
     }
     this.lastPromptHash = currentHash;

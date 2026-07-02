@@ -94,7 +94,16 @@ export class CronStore {
     }
 
     // Compute next run for recurring jobs
-    if (job.schedule.kind !== "at") {
+    if (job.schedule.kind === "every") {
+      // Advance from the scheduled due time, not from run completion —
+      // otherwise every run's duration (an agent turn can take minutes)
+      // accumulates as drift. If the daemon was down long enough that the
+      // next slot is already in the past, restart the cadence from now
+      // instead of burst-firing missed runs.
+      const scheduled = job.nextRunAt ?? now;
+      const next = scheduled + job.schedule.everyMs;
+      job.nextRunAt = next > now ? next : computeNextRun(job.schedule, now);
+    } else if (job.schedule.kind !== "at") {
       job.nextRunAt = computeNextRun(job.schedule, now);
     } else {
       job.enabled = false;

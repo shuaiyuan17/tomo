@@ -7,7 +7,7 @@ import type { SessionEntry } from "../src/sessions/types.js";
 
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
-    identities: [] as Array<{ name: string }>,
+    identities: [] as Array<{ name: string; channels?: Record<string, string> }>,
   },
 }));
 
@@ -130,6 +130,27 @@ describe("ProactiveSendService.sendToSession", () => {
     expect(h.notes[0].note).toContain("You sent the following message to this conversation earlier");
   });
 
+  it("records a raw target bound to an identity DM under the dm session key (#203)", async () => {
+    mockConfig.identities = [{ name: "Shuai", channels: { telegram: "12345" } }];
+    try {
+      const h = makeHarness();
+      const result = await h.service.sendToSession("telegram:12345", "marker text", "dm:shuai");
+
+      expect(result).toEqual({ ok: true });
+      // Delivery stays pinned to the channel the caller named…
+      expect(h.channel.sent).toEqual([{ chatId: "12345", text: "marker text" }]);
+      // …but the record and note land on the dm session, where the chat's
+      // inbound history (and recall_conversation) live.
+      expect(h.transcript).toEqual([
+        { sessionKey: "dm:shuai", content: "[proactive] marker text", channelName: "telegram" },
+      ]);
+      expect(h.notes[0].sessionKey).toBe("dm:shuai");
+      expect(h.notes[0].note).toContain("You sent the following message to this conversation earlier");
+    } finally {
+      mockConfig.identities = [];
+    }
+  });
+
   it("splits attachments into ordered text/photo/sticker sends", async () => {
     const dir = join(tmpdir(), `tomo-proactive-${Date.now()}`);
     mkdirSync(dir, { recursive: true });
@@ -185,6 +206,21 @@ describe("ProactiveSendService.delegateToSession", () => {
 
     expect(result.ok).toBe(false);
     expect(h.delegated).toHaveLength(0);
+  });
+
+  it("delegates a raw target bound to an identity DM on the unified dm session (#203)", async () => {
+    mockConfig.identities = [{ name: "Shuai", channels: { telegram: "12345" } }];
+    try {
+      const h = makeHarness();
+      const result = await h.service.delegateToSession("telegram:12345", "send the brief");
+
+      expect(result).toEqual({ ok: true });
+      // Running under the raw key would spawn a shadow session parallel to
+      // dm:shuai for the same chat.
+      expect(h.delegated[0].sessionKey).toBe("dm:shuai");
+    } finally {
+      mockConfig.identities = [];
+    }
   });
 });
 

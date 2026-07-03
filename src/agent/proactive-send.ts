@@ -231,7 +231,11 @@ export class ProactiveSendService {
 
     const dmIdentityName = dmIdentityFromSessionKey(sessionKey);
     if (dmIdentityName !== undefined) {
-      const replyTarget = this.deps.getReplyTarget(sessionKey)
+      // A raw channel:chatId target canonicalized to this dm key keeps its
+      // named channel for delivery; router policy only picks the channel
+      // when the caller didn't name one.
+      const replyTarget = normalized.rawReplyTarget
+        ?? this.deps.getReplyTarget(sessionKey)
         ?? this.deps.deriveReplyTargetFromConfig(identityName ?? dmIdentityName);
       return replyTarget ? { sessionKey, replyTarget } : undefined;
     }

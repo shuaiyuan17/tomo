@@ -75,6 +75,30 @@ describe("send_message direct mode", () => {
     await agent.stop();
   });
 
+  it("records a raw bound-chat target under the dm session so recall sees it (#203)", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const result = await agent.sendToSession("telegram:12345", "distinctive marker", "dm:shuai");
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "distinctive marker", photo: undefined, sticker: undefined },
+    ]);
+    // The send is recorded on dm:shuai — the session recall_conversation is
+    // bound to — not a parallel telegram:12345 transcript.
+    const recorded = agent.searchSessionTranscript("dm:shuai", { query: "distinctive marker" });
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].content).toBe("[proactive] distinctive marker");
+    expect(agent.searchSessionTranscript("telegram:12345", { query: "distinctive marker" })).toHaveLength(0);
+
+    await agent.stop();
+  });
+
   it("attributes a summoned-group send to the summoning dm session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

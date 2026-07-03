@@ -38,19 +38,6 @@ function loadEvents(sdkSessionId: string, sdkSessionsDir: string): SdkEvent[] {
   return readJsonlFileSync<SdkEvent>(path);
 }
 
-/** Return 0-based conv-index for every user/assistant event. */
-function convIndices(events: SdkEvent[]): number[] {
-  const out: number[] = [];
-  let conv = 0;
-  for (const e of events) {
-    if (e.type === "user" || e.type === "assistant") {
-      out.push(conv);
-      conv++;
-    }
-  }
-  return out;
-}
-
 /** ISO week tag for a Date (YYYY-Www). Matches Python's isocalendar. */
 export function isoWeekTag(d: Date): string {
   // https://en.wikipedia.org/wiki/ISO_week_date#Algorithms
@@ -212,7 +199,6 @@ export function resolveBlockRange(
 ): ResolvedRange | null {
   const events = loadEvents(sdkSessionId, sdkSessionsDir);
   if (events.length === 0) return null;
-  const convIdx = convIndices(events);
   const convIdxOf = (globalIdx: number): number | null => {
     // Map global index → conversation index (null if not a u/a event)
     let conv = 0;
@@ -315,7 +301,6 @@ export function resolveBlockRange(
     ? `update ${tag}: ${count} events (existing block will be replaced)${tailSuffix}`
     : `create ${tag}: ${count} events${tailSuffix}`;
 
-  void convIdx;
   return { blockTag: tag, fromIdx: fromConv, toIdx: toConv, description };
 }
 
@@ -540,32 +525,4 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
   // Oldest-first so the agent works chronologically
   due.sort((a, b) => a.period.localeCompare(b.period));
   return due;
-}
-
-/**
- * Count raw (non-summary) user/assistant events since the most recent
- * `daily <today>` block. Used to trigger the hot-tail cap nudge.
- */
-export function countRawTailToday(sdkSessionId: string, sdkSessionsDir: string): number {
-  const events = loadEvents(sdkSessionId, sdkSessionsDir);
-  if (events.length === 0) return 0;
-  const today = localDateTag(new Date());
-
-  // Find last `daily <today>` block index
-  let lastDailyTodayIdx = -1;
-  for (let i = 0; i < events.length; i++) {
-    const e = events[i];
-    if (e.isCompactSummary && e.blockTag === `daily ${today}`) {
-      lastDailyTodayIdx = i;
-    }
-  }
-
-  let raw = 0;
-  for (let i = lastDailyTodayIdx + 1; i < events.length; i++) {
-    const e = events[i];
-    if (e.type !== "user" && e.type !== "assistant") continue;
-    if (e.isCompactSummary) continue;
-    raw++;
-  }
-  return raw;
 }

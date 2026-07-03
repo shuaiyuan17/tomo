@@ -16,11 +16,16 @@ export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: stri
 /** Check if a compact happened and clear the trigger */
 export function checkAndClearCompactTrigger(sdkSessionId: string, sdkSessionsDir: string): boolean {
   const triggerPath = getCompactTriggerPath(sdkSessionId, sdkSessionsDir);
-  if (existsSync(triggerPath)) {
+  // Unlink directly and treat ENOENT as "no trigger": an existsSync pre-check
+  // races with a concurrent caller clearing the same trigger, and the loser's
+  // unlinkSync would throw out of post-turn bookkeeping.
+  try {
     unlinkSync(triggerPath);
     return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
   }
-  return false;
 }
 
 export interface CompactRequest {
@@ -142,12 +147,6 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // Find events to remove: all events between removeStartGlobal and removeEndGlobal (inclusive),
   // including any metadata events (queue-operation, last-prompt, attachment) that sit between them
   const removeSet = new Set<number>();
-  for (let i = removeStartGlobal; i <= removeEndGlobal; i++) {
-    removeSet.add(i);
-  }
-
-  // Also remove any non-conversation events that sit entirely within the range
-  // (queue-operations, last-prompts, attachments between the conversation events)
   for (let i = removeStartGlobal; i <= removeEndGlobal; i++) {
     removeSet.add(i);
   }

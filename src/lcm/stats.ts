@@ -10,6 +10,26 @@ interface SdkEvent {
   };
 }
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Parse an agent-provided timestamp as LOCAL time.
+ *
+ * Datetime strings without a timezone ("2026-03-28T16:29") already parse as
+ * local per the ECMAScript spec, but date-only strings ("2026-03-28") parse
+ * as UTC midnight — shifted by the local UTC offset. Normalize those to the
+ * local day: start-of-day for a range start, end-of-day for a range end (so
+ * `--to-time 2026-03-28` includes that whole day rather than excluding it).
+ */
+function parseLocalTimeBoundary(value: string, edge: "start" | "end"): number {
+  const trimmed = value.trim();
+  if (DATE_ONLY_RE.test(trimmed)) {
+    const suffix = edge === "start" ? "T00:00:00.000" : "T23:59:59.999";
+    return new Date(trimmed + suffix).getTime();
+  }
+  return new Date(trimmed).getTime();
+}
+
 /**
  * Resolve a time range to conversation event indices in the SDK JSONL.
  * Returns the first and last user/assistant event indices within the range.
@@ -23,10 +43,8 @@ export function resolveTimeRange(
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;
 
-  // Parse inputs as Date. If no timezone is specified, JS treats them as
-  // local time — which is what we want for agent-provided timestamps.
-  const fromMs = new Date(fromTime).getTime();
-  const toMs = new Date(toTime).getTime();
+  const fromMs = parseLocalTimeBoundary(fromTime, "start");
+  const toMs = parseLocalTimeBoundary(toTime, "end");
   if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) return null;
 
   const events = readJsonlFileSync<SdkEvent>(path);

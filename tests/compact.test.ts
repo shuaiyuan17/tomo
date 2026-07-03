@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { compactSession, readSinceOffset, readWholeFile } from "../src/lcm/compact.js";
+import {
+  compactSession, readSinceOffset, readWholeFile,
+  checkAndClearCompactTrigger, getCompactTriggerPath,
+} from "../src/lcm/compact.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import {
   writeFileSync, mkdirSync, unlinkSync, existsSync, appendFileSync, readFileSync, statSync,
@@ -30,6 +33,36 @@ function mkAssistantEvent(parentUuid: string | null, ts: string, text: string) {
     message: { role: "assistant", content: [{ type: "text", text }] },
   };
 }
+
+describe("checkAndClearCompactTrigger", () => {
+  let sdkSessionsDir: string;
+  let sessionId: string;
+
+  beforeEach(() => {
+    sessionId = `test-trigger-${randomUUID()}`;
+    sdkSessionsDir = join(tmpdir(), `tomo-test-trigger-${randomUUID()}`);
+    mkdirSync(sdkSessionsDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(sdkSessionsDir, { recursive: true, force: true });
+  });
+
+  it("clears an existing trigger and returns true", () => {
+    const triggerPath = getCompactTriggerPath(sessionId, sdkSessionsDir);
+    writeFileSync(triggerPath, new Date().toISOString());
+
+    expect(checkAndClearCompactTrigger(sessionId, sdkSessionsDir)).toBe(true);
+    expect(existsSync(triggerPath)).toBe(false);
+  });
+
+  it("returns false without throwing when no trigger exists", () => {
+    // Also covers the TOCTOU race: a concurrent caller clearing the trigger
+    // between check and unlink must look like "no trigger", not an error.
+    expect(checkAndClearCompactTrigger(sessionId, sdkSessionsDir)).toBe(false);
+    expect(checkAndClearCompactTrigger(sessionId, sdkSessionsDir)).toBe(false);
+  });
+});
 
 describe("readWholeFile", () => {
   let path: string;

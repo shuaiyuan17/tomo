@@ -16,6 +16,7 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockConfig,
+  mockSdk,
   peekPendingNotes,
   resetConfig,
 } from "./helpers/agent-harness.js";
@@ -71,6 +72,62 @@ describe("send_message direct mode", () => {
     expect(peekPendingNotes(agent, "telegram:12345")).toEqual([
       `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`,
     ]);
+
+    await agent.stop();
+  });
+
+  it("records a raw bound-chat target under the dm session so recall sees it (#203)", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const result = await agent.sendToSession("telegram:12345", "distinctive marker", "dm:shuai");
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "distinctive marker", photo: undefined, sticker: undefined },
+    ]);
+    // The send is recorded on dm:shuai — the session recall_conversation is
+    // bound to — not a parallel telegram:12345 transcript.
+    const recorded = agent.searchSessionTranscript("dm:shuai", { query: "distinctive marker" });
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].content).toBe("[proactive] distinctive marker");
+    expect(agent.searchSessionTranscript("telegram:12345", { query: "distinctive marker" })).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("delegate to a raw bound-chat target delivers on the named channel, not the reply policy's (#203)", async () => {
+    resetConfig({
+      identities: [{
+        name: "shuai",
+        channels: { telegram: "12345", imessage: "+15551234567" },
+        replyPolicy: "last-active",
+      }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+
+    // Make iMessage the dm session's last-active reply target.
+    mockSdk.responseFn = () => "NO_REPLY";
+    await im.simulateMessage(makeMsg({ chatId: "+15551234567", text: "hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+    im.clearDelivered();
+
+    mockSdk.responseFn = () => "the brief";
+    const result = await agent.delegateToSession("telegram:12345", "send the brief");
+    await drainQueue(agent);
+
+    expect(result).toEqual({ ok: true });
+    expect(im.sent).toHaveLength(0);
+    expect(tg.sent.map((m) => m.text)).toEqual(["the brief"]);
 
     await agent.stop();
   });

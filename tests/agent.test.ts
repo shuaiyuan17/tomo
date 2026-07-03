@@ -348,4 +348,47 @@ describe("normalizeSendTarget", () => {
       sessionKey: "telegram:-1001234567",
     });
   });
+
+  it("canonicalizes a raw channel key bound to an identity's DM chat (#203)", () => {
+    const bound = [
+      { name: "Shuai", channels: { telegram: "12345", imessage: "+15551234567" } },
+      { name: "Alice", channels: { telegram: "67890" } },
+    ];
+
+    // The chat's inbound traffic lives on the dm session; recording a send
+    // under the raw key would hide it from that session's recall history.
+    expect(normalizeSendTarget("telegram:12345", bound)).toEqual({
+      sessionKey: "dm:shuai",
+      identityName: "Shuai",
+      rawReplyTarget: { channelName: "telegram", chatId: "12345" },
+    });
+    expect(normalizeSendTarget("imessage:+15551234567", bound)).toEqual({
+      sessionKey: "dm:shuai",
+      identityName: "Shuai",
+      rawReplyTarget: { channelName: "imessage", chatId: "+15551234567" },
+    });
+    expect(normalizeSendTarget("telegram:67890", bound)?.sessionKey).toBe("dm:alice");
+  });
+
+  it("canonicalizes iMessage chat-GUID keys by extracted identifier, like the router's inbound match", () => {
+    const bound = [{ name: "Shuai", channels: { imessage: "+15551234567" } }];
+
+    expect(normalizeSendTarget("imessage:iMessage;-;+15551234567", bound)).toEqual({
+      sessionKey: "dm:shuai",
+      identityName: "Shuai",
+      rawReplyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" },
+    });
+    // Group GUIDs (";+;") never canonicalize, even if the identifier collided.
+    expect(normalizeSendTarget("imessage:iMessage;+;+15551234567", bound)).toEqual({
+      sessionKey: "imessage:iMessage;+;+15551234567",
+    });
+  });
+
+  it("leaves unbound and group channel keys raw even when identities have bindings", () => {
+    const bound = [{ name: "Shuai", channels: { telegram: "12345" } }];
+
+    expect(normalizeSendTarget("telegram:99999", bound)).toEqual({ sessionKey: "telegram:99999" });
+    expect(normalizeSendTarget("imessage:12345", bound)).toEqual({ sessionKey: "imessage:12345" });
+    expect(normalizeSendTarget("telegram:-1001234567", bound)).toEqual({ sessionKey: "telegram:-1001234567" });
+  });
 });

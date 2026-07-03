@@ -1,10 +1,24 @@
-import { dmSessionKeyForIdentity, isDmSessionKey } from "../sessions/keys.js";
+import {
+  dmSessionKeyForIdentity,
+  extractImessageIdentifier,
+  isDmSessionKey,
+  isGroupSessionKey,
+} from "../sessions/keys.js";
 
 /**
  * Pure helpers for `send_message` target resolution. No I/O, no config, no
  * channel imports — safe to import from tests without triggering the rest of
  * the agent's startup graph.
  */
+
+export interface NormalizedSendTarget {
+  sessionKey: string;
+  identityName?: string;
+  /** Set when a raw `<channel>:<chatId>` target was canonicalized to a dm:
+   *  key — the caller named a specific channel, so delivery should stay
+   *  pinned there even though the record belongs to the dm session. */
+  rawReplyTarget?: { channelName: string; chatId: string };
+}
 
 /**
  * Canonicalize a `send_message` target to its session key form.
@@ -16,12 +30,17 @@ import { dmSessionKeyForIdentity, isDmSessionKey } from "../sessions/keys.js";
  * - **`dm:<name>` key**: lowercases the name part. Caller passing
  *   `dm:Shuai` lands on the same `dm:shuai` session as the inbound path,
  *   preventing a duplicate-cased shadow session from being created.
- * - **`<channel>:<chatId>` key**: returned unchanged.
+ * - **`<channel>:<chatId>` key**: if the chat is an identity's bound DM chat,
+ *   canonicalized to that identity's `dm:` key — inbound traffic for the chat
+ *   lives on the dm session, so recording or delegating under the raw key
+ *   would split the conversation's history across two transcripts and hide
+ *   the sent message from `recall_conversation` (#203). Other raw keys
+ *   (groups, unbound chats) are returned unchanged.
  */
 export function normalizeSendTarget(
   target: string,
-  identities: ReadonlyArray<{ name: string }>,
-): { sessionKey: string; identityName?: string } | null {
+  identities: ReadonlyArray<{ name: string; channels?: Record<string, string> }>,
+): NormalizedSendTarget | null {
   if (!target.includes(":")) {
     const identity = identities.find(
       (i) => i.name.toLowerCase() === target.toLowerCase(),
@@ -35,5 +54,34 @@ export function normalizeSendTarget(
   if (isDmSessionKey(target)) {
     return { sessionKey: dmSessionKeyForIdentity(target.slice(3)) };
   }
+
+  const sep = target.indexOf(":");
+  const channelName = target.slice(0, sep);
+  const chatId = target.slice(sep + 1);
+  if (!isGroupSessionKey(target)) {
+    const identity = identities.find((i) => matchesDmBinding(channelName, chatId, i.channels?.[channelName]));
+    if (identity) {
+      return {
+        sessionKey: dmSessionKeyForIdentity(identity.name),
+        identityName: identity.name,
+        rawReplyTarget: { channelName, chatId },
+      };
+    }
+  }
+
   return { sessionKey: target };
+}
+
+/** Match a raw chatId against an identity's channel binding, mirroring the
+ *  router's inbound matching: exact, plus iMessage chat GUIDs matched by
+ *  their extracted identifier (config binds "+15551234567", providers send
+ *  "iMessage;-;+15551234567"). */
+function matchesDmBinding(channelName: string, chatId: string, bound: string | undefined): boolean {
+  if (bound === undefined) return false;
+  if (bound === chatId) return true;
+  if (channelName === "imessage") {
+    const identifier = extractImessageIdentifier(chatId);
+    if (identifier !== null && identifier === bound) return true;
+  }
+  return false;
 }

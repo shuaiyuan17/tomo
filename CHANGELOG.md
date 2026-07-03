@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.8 (2026-07-03)
+
+### Features
+
+- **Conversation recall** (#200). New tomo-internal `recall_conversation` MCP tool gives the agent case-insensitive substring search over its own transcript — including messages compacted out of the SDK context window or moved into monthly rotation archives — with optional ISO 8601 time bounds and a paging hint when results hit the limit. Search is scoped to the calling session's key, so a group session can only recall that group's history (never DMs); results are oldest-first with timestamps, roles, sender names, and seq numbers, and per-message excerpts are capped at 400 chars. The harness prompt now tells the agent to search history before claiming it doesn't remember. `SessionStore.searchTranscript` also skips records without string content instead of aborting the whole search.
+
+### Bug fixes
+
+- **Lazy retirement of prompt-stale sessions** (#201). A system-prompt hash change used to retire every live session at once — idle sessions closed and busy ones yanked from the map, so the next message for a busy key spawned a parallel fresh session (losing the steering target) while every key paid an MCP reconnect and full prompt-cache rewrite simultaneously; frequent workspace memory-file writes made this a recurring mass-churn event. A hash change now only *marks* sessions prompt-stale: a stale session keeps serving its in-flight (and queued/steered) work and retires at its next idle boundary, so conversations are never interrupted and reconnects stagger with each key's natural traffic. The hash is checked on every `getOrCreateLiveSession` call, so even a lone long-lived session notices workspace changes by its next idle turn.
+- **1h prompt-cache TTL under api-key/gateway auth** (#201). Sets `ENABLE_PROMPT_CACHING_1H=1` in the SDK child env unless the user already sets it. Without the flag, api-key and LiteLLM-gateway sessions silently fell back to the 5-minute cache TTL and re-paid full cache writes on their large system-prompt prefixes; it is a no-op on subscription auth.
+- **Telegram polling backoff and cron one-shot retries** (#199). Telegram polling restarts now back off exponentially (3s doubling to a 5-minute cap) instead of hot-looping every 3s on a permanent failure like a revoked token; a run that stays up past 60s counts as healthy and re-arms the backoff, and the pending restart timer is cleared on `stop()`. Failed one-shot (`at`) cron jobs now get two delayed retries (5 minutes apart) before being disabled instead of being silently disabled on the first error — the reminder is the deliverable. Recurring jobs are unchanged.
+- **Codebase-review bug fixes** (#198). Group activation via secret no longer creates an allowlist on an open channel (which locked out every other chat, including the owner's DM), and a newly created in-memory allowlist is seeded with identity-bound chatIds. The continuity heartbeat fallback resolves private targets only, so a heartbeat can never run on a group session and leak its prompt there. `LiveSessionManager`'s reset-and-retry matches session-lifecycle errors narrowly instead of any error mentioning "session", preventing full-turn re-runs (and duplicated side effects) on unrelated failures. Telegram mention detection uses word-boundary matching so `@mybot` no longer matches inside `@mybot_backup`. Telegram photo sends with captions over the 1024-char limit ship the photo captionless and deliver the text as its own chunked message instead of failing the whole send.
+
 ## 0.8.7 (2026-07-01)
 
 ### Features

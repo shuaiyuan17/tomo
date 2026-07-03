@@ -149,6 +149,62 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(replacement).not.toBe(first);
   });
 
+  it("notices a prompt change even when the session would just be reused", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+
+    const first = await manager.getOrCreateLiveSession("telegram:1");
+
+    prompt = "v2";
+    const second = await manager.getOrCreateLiveSession("telegram:1");
+
+    expect(first.isAlive()).toBe(false);
+    expect(second).not.toBe(first);
+  });
+
+  it("keeps a busy session serving its in-flight conversation across a prompt change", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+
+    await manager.getOrCreateLiveSession("telegram:1");
+    const busySession = mockState.instances[0];
+    busySession.busy = true;
+
+    prompt = "v2";
+    await manager.getOrCreateLiveSession("telegram:2");
+
+    // Not retired mid-turn: still alive, still the target for its key so
+    // mid-turn messages steer into the running conversation instead of
+    // spawning a parallel fresh session.
+    expect(busySession.closed).toBe(false);
+    expect(manager.isAlive("telegram:1")).toBe(true);
+    expect(await manager.getOrCreateLiveSession("telegram:1")).toBe(busySession);
+
+    // Retired at its idle boundary; the next message gets a fresh session.
+    busySession.busy = false;
+    busySession.releaseIdle();
+    await flushMicrotasks();
+    expect(busySession.closed).toBe(true);
+    const replacement = await manager.getOrCreateLiveSession("telegram:1");
+    expect(replacement).not.toBe(busySession);
+    expect(replacement.isAlive()).toBe(true);
+  });
+
+  it("does not retire sessions created after the change — they already have the fresh prompt", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+
+    await manager.getOrCreateLiveSession("telegram:1");
+    prompt = "v2";
+    // Old session was idle → retired at this boundary; rebuilt with v2.
+    const fresh = await manager.getOrCreateLiveSession("telegram:1");
+
+    // Subsequent traffic with an unchanged prompt never touches it.
+    await manager.getOrCreateLiveSession("telegram:2");
+    expect(fresh.isAlive()).toBe(true);
+    expect(await manager.getOrCreateLiveSession("telegram:1")).toBe(fresh);
+  });
+
   it("defers closing a busy retired session until it goes idle", async () => {
     let prompt = "v1";
     const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));

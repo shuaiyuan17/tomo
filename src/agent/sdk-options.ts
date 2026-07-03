@@ -230,6 +230,14 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   if (args.disableAutoCompact) {
     env.DISABLE_AUTO_COMPACT = "1";
   }
+  // Preserve the 1-hour prompt-cache TTL under api-key/gateway auth — without
+  // this flag it silently drops to the 5-minute default, so idle-but-alive
+  // sessions re-pay full cache writes on their large system-prompt prefixes.
+  // No-op on subscription auth. Respect an explicit user override.
+  // See https://code.claude.com/docs/en/agent-sdk/cost-tracking
+  if (env.ENABLE_PROMPT_CACHING_1H === undefined) {
+    env.ENABLE_PROMPT_CACHING_1H = "1";
+  }
   return env;
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { resolveTimeRange } from "../src/lcm/stats.js";
+import { estimateTokens, resolveTimeRange } from "../src/lcm/stats.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -14,6 +14,34 @@ function mkEvent(type: "user" | "assistant", localDate: Date, text: string) {
     message: { role: type, content: [{ type: "text", text }] },
   };
 }
+
+describe("estimateTokens", () => {
+  it("estimates pure ASCII at roughly four chars per token", () => {
+    expect(estimateTokens("a".repeat(400))).toBe(100);
+  });
+
+  it("estimates pure Chinese much higher than chars over four", () => {
+    const text = "\u6c49".repeat(400);
+    const tokens = estimateTokens(text);
+    const oldEstimate = Math.ceil(text.length / 4);
+
+    expect(tokens).toBeGreaterThanOrEqual(250);
+    expect(tokens).toBeGreaterThan(oldEstimate * 3);
+  });
+
+  it("estimates mixed text between pure ASCII and pure Chinese", () => {
+    const ascii = estimateTokens("a".repeat(400));
+    const chinese = estimateTokens("\u6c49".repeat(400));
+    const mixed = estimateTokens("a".repeat(200) + "\u6c49".repeat(200));
+
+    expect(mixed).toBeGreaterThan(ascii);
+    expect(mixed).toBeLessThan(chinese);
+  });
+
+  it("returns zero for empty text", () => {
+    expect(estimateTokens("")).toBe(0);
+  });
+});
 
 describe("resolveTimeRange", () => {
   let sessionId: string;

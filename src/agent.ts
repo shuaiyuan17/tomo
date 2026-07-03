@@ -19,6 +19,7 @@ import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
 import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
+import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
 import { isSilentReply, ATTACHMENT_TAG_RE } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
@@ -29,6 +30,7 @@ import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipelin
 import { TurnRunner, embeddedSilentMatcher, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
+import { resolveBlockRange } from "./lcm/blocks.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -86,7 +88,7 @@ export class Agent {
   // Context-usage hysteresis: the highest nudge level already fired for the
   // current over-threshold episode. Cleared when usage drops back below
   // config.lcm.nudgeResetPct.
-  private contextNudged = new Map<string, "daily" | "compact">();
+  private contextNudged = new Map<string, ContextNudgeLatch>();
   private pendingNotesQueue: PendingNotesQueue;
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
@@ -631,29 +633,60 @@ export class Agent {
 
     const usedFrac = ctx.contextUsed / ctx.contextMax;
     const nudged = this.contextNudged.get(key);
+    const thresholds = {
+      nudgeAtPct: config.lcm.nudgeAtPct,
+      nudgeResetPct: config.lcm.nudgeResetPct,
+      compactNudgePct: COMPACT_NUDGE_PCT,
+    };
+    const compactFrac = Math.max(COMPACT_NUDGE_PCT, config.lcm.nudgeAtPct) / 100;
+    const shouldPrecheckDaily = usedFrac >= config.lcm.nudgeAtPct / 100 &&
+      usedFrac < compactFrac &&
+      !nudged;
+    let sid: string | undefined;
+    let dailyRangeAvailable = true;
 
-    if (usedFrac < config.lcm.nudgeResetPct / 100) {
-      if (nudged) this.contextNudged.delete(key);
+    if (shouldPrecheckDaily) {
+      sid = this.sessions.getSdkSessionId(key);
+      if (!sid) return;
+      dailyRangeAvailable = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir) !== null;
+    }
+
+    const decision = decideContextNudge({
+      usedFrac,
+      latchState: nudged,
+      dailyRangeAvailable,
+      thresholds,
+    });
+
+    if (decision.kind === "none") {
+      if (decision.newLatch === null && nudged) {
+        this.contextNudged.delete(key);
+      }
       return;
     }
 
-    // The compact threshold never sits below the daily threshold, so a
-    // custom nudgeAtPct ≥ COMPACT_NUDGE_PCT escalates straight to compact.
-    const compactFrac = Math.max(COMPACT_NUDGE_PCT, config.lcm.nudgeAtPct) / 100;
+    if (decision.newLatch) {
+      this.contextNudged.set(key, decision.newLatch);
+    }
+
     const pct = Math.round(usedFrac * 100);
     const groupNote = isGroupSessionKey(key)
       ? " This is a group session — scope the rollup to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
       : "";
+    const compactNudgeText = () =>
+      `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
 
     let nudge: string;
-    if (usedFrac >= compactFrac && nudged !== "compact") {
-      this.contextNudged.set(key, "compact");
-      nudge = `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
-      log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
-    } else if (usedFrac >= config.lcm.nudgeAtPct / 100 && !nudged) {
-      const sid = this.sessions.getSdkSessionId(key);
+    if (decision.kind === "compact") {
+      nudge = compactNudgeText();
+      if (decision.reason === "daily-empty") {
+        log.info({ key, usedPct: `${pct}%` }, "Context nudge (daily rollup empty; escalating to lcm compact)");
+      } else {
+        log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
+      }
+    } else if (decision.kind === "daily") {
+      sid ??= this.sessions.getSdkSessionId(key);
       if (!sid) return;
-      this.contextNudged.set(key, "daily");
       nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
       log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
     } else {

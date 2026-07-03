@@ -309,6 +309,8 @@ export const mockConfig = {
     nudgeAtPct: 70,
     nudgeResetPct: 60,
     groupCompactStyle: "lcm" as "sdk" | "lcm",
+    dailyFreshTail: 32,
+    globalFreshTail: false,
   },
 };
 

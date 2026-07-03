@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { getSdkSessionPath } from "../src/sessions/index.js";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -378,6 +379,19 @@ describe("compact nudges", () => {
       .map((blocks) => blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join(""))
       .filter((t) => t.includes("Context usage is at"));
 
+  function seedDailyRollupSourceEvents(count = 40) {
+    const path = getSdkSessionPath("mock-sdk-session-123", join(agentEnv.tmpDir, "sdk-sessions"));
+    mkdirSync(dirname(path), { recursive: true });
+    const todayNoon = new Date();
+    todayNoon.setHours(12, 0, 0, 0);
+    const events = Array.from({ length: count }, (_, i) => ({
+      type: "user",
+      timestamp: new Date(todayNoon.getTime() + i * 1000).toISOString(),
+      message: { role: "user", content: [{ type: "text", text: `event ${i}` }] },
+    }));
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  }
+
   it("queues exactly one housekeeping turn when a turn lands over the compact threshold", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -421,6 +435,7 @@ describe("compact nudges", () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
+    seedDailyRollupSourceEvents();
 
     // 72% — between nudgeAtPct (70) and the compact threshold (80).
     mockSdk.contextUsage = { totalTokens: 144_000, maxTokens: 200_000 };

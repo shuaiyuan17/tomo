@@ -11,6 +11,23 @@ interface SdkEvent {
 }
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const CJK_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3000-\u303F\uFF00-\uFFEF]/u;
+const CJK_TOKEN_WEIGHT = 0.76;
+
+/**
+ * Estimate tokens for mixed-script text. Latin/ASCII is roughly 4 chars/token;
+ * CJK (Han/Hiragana/Katakana/Hangul plus CJK punctuation/fullwidth forms) is
+ * roughly 1 token per 1.3 chars. chars/4 alone underestimates Chinese by ~3x.
+ */
+export function estimateTokens(text: string): number {
+  let cjk = 0;
+  let other = 0;
+  for (const ch of text) {
+    if (CJK_RE.test(ch)) cjk++;
+    else other++;
+  }
+  return Math.ceil(cjk * CJK_TOKEN_WEIGHT + other / 4);
+}
 
 /**
  * Parse an agent-provided timestamp as LOCAL time.
@@ -135,15 +152,15 @@ export function computeContextStats(
       const hasText = content.some((c: any) => c?.type === "text" && c.text?.trim());
 
       // Estimate tokens from content
-      let chars = 0;
+      let tokens = 0;
       const toolNames: string[] = [];
       for (const c of content) {
-        if (c?.type === "text") chars += (c.text?.length || 0);
+        if (c?.type === "text") tokens += estimateTokens(c.text ?? "");
         else if (c?.type === "tool_use") {
-          chars += JSON.stringify(c.input || {}).length;
+          tokens += estimateTokens(JSON.stringify(c.input || {}));
           toolNames.push(c.name || "unknown");
         }
-        else if (c?.type === "thinking") chars += (c.thinking?.length || 0);
+        else if (c?.type === "thinking") tokens += estimateTokens(c.thinking ?? "");
       }
 
       if (hasToolUse) {
@@ -152,7 +169,7 @@ export function computeContextStats(
             type: "assistant",
             timestamp,
             activity: "tool",
-            tokens: Math.ceil(chars / 4),
+            tokens,
             toolName: name,
           });
         }
@@ -161,7 +178,7 @@ export function computeContextStats(
           type: "assistant",
           timestamp,
           activity: "conversation",
-          tokens: Math.ceil(chars / 4),
+          tokens,
         });
       }
     } else if (type === "user") {
@@ -169,13 +186,13 @@ export function computeContextStats(
       if (Array.isArray(content)) {
         const hasToolResult = content.some((c: any) => c?.type === "tool_result");
         if (hasToolResult) {
-          let chars = 0;
+          let tokens = 0;
           for (const c of content) {
             const tc = c?.content;
-            if (typeof tc === "string") chars += tc.length;
+            if (typeof tc === "string") tokens += estimateTokens(tc);
             else if (Array.isArray(tc)) {
               for (const inner of tc) {
-                if (inner?.type === "text") chars += (inner.text?.length || 0);
+                if (inner?.type === "text") tokens += estimateTokens(inner.text ?? "");
               }
             }
           }
@@ -183,18 +200,18 @@ export function computeContextStats(
             type: "user",
             timestamp,
             activity: "tool",
-            tokens: Math.ceil(chars / 4),
+            tokens,
           });
         } else {
-          let chars = 0;
+          let tokens = 0;
           for (const c of content) {
-            if (c?.type === "text") chars += (c.text?.length || 0);
+            if (c?.type === "text") tokens += estimateTokens(c.text ?? "");
           }
           events.push({
             type: "user",
             timestamp,
             activity: "conversation",
-            tokens: Math.ceil(chars / 4),
+            tokens,
           });
         }
       } else if (typeof content === "string") {
@@ -202,7 +219,7 @@ export function computeContextStats(
           type: "user",
           timestamp,
           activity: "conversation",
-          tokens: Math.ceil(content.length / 4),
+          tokens: estimateTokens(content),
         });
       }
     }

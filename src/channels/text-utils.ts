@@ -13,6 +13,22 @@ export function restoreLiteralNewlines(text: string): string {
   return text.replace(LITERAL_NEWLINE_TOKEN_RE, "\n");
 }
 
+/**
+ * Marker prepended to inbound satellite (Apple emergency low-bandwidth relay)
+ * messages so the model knows the sender is off-grid: keep replies short,
+ * text-only, and don't expect or request photos.
+ */
+export const SATELLITE_MARKER = "[via satellite — sender off-grid, text-only, keep it short]";
+
+/**
+ * BlueBubbles reports satellite messages with the "iMessageLite" service rather
+ * than "iMessage". Match defensively on any service containing "lite" so a
+ * future variant spelling still gets flagged.
+ */
+export function isSatelliteService(service: unknown): boolean {
+  return typeof service === "string" && service.toLowerCase().includes("lite");
+}
+
 export function splitOutboundMessageText(text: string): string[] {
   if (!text) return [];
   const protectedText = text.replace(LITERAL_NEWLINE_TOKEN_RE, LITERAL_NEWLINE_SENTINEL);

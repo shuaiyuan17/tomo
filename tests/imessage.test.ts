@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { BlueBubblesChannel } from "../src/channels/imessage.js";
+import { isSatelliteService } from "../src/channels/text-utils.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -479,5 +480,27 @@ describe("BlueBubbles typing indicator", () => {
       { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
       { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
     ]);
+  });
+});
+
+describe("isSatelliteService", () => {
+  it("flags iMessageLite as satellite", () => {
+    expect(isSatelliteService("iMessageLite")).toBe(true);
+  });
+
+  it("is case-insensitive and matches variant spellings containing 'lite'", () => {
+    expect(isSatelliteService("imessagelite")).toBe(true);
+    expect(isSatelliteService("SMS-Lite")).toBe(true);
+  });
+
+  it("does not flag standard services", () => {
+    expect(isSatelliteService("iMessage")).toBe(false);
+    expect(isSatelliteService("SMS")).toBe(false);
+  });
+
+  it("handles missing/non-string service", () => {
+    expect(isSatelliteService(undefined)).toBe(false);
+    expect(isSatelliteService(null)).toBe(false);
+    expect(isSatelliteService(42)).toBe(false);
   });
 });

@@ -152,6 +152,32 @@ describe("continuity delivery", () => {
     await agent.stop();
   });
 
+  it("records delivered continuity messages in the session transcript (#203)", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => "Heads up: your flight check-in opens in an hour.";
+
+    await agent.handleContinuity("System: Free time.");
+
+    expect(tg.sent.length).toBeGreaterThanOrEqual(1);
+    const recorded = agent.searchSessionTranscript("dm:shuai", { query: "flight check-in" });
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].role).toBe("assistant");
+    expect(recorded[0].channel).toBe("telegram");
+
+    await agent.stop();
+  });
+
   it("suppresses NO_REPLY in continuity", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],

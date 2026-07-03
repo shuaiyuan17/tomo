@@ -318,7 +318,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
       prompt: "System: Free time.",
       delivery: { kind: "deferred-send", resolveTarget },
       silentMatcher: embeddedSilentMatcher,
-      transcript: "never",
+      transcript: "on-delivery",
       errors: {
         visiblePrefix: "[error] continuity failed: ",
         response: "note-only",
@@ -328,7 +328,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
     };
   }
 
-  it("resolves the target only after a non-silent response and never appends the transcript", async () => {
+  it("resolves the target only after a non-silent response and records the delivery in the transcript", async () => {
     const h = makeHarness(async () => "Good morning!");
     const resolveTarget = vi.fn(() => ({ channel: h.channel as Channel, chatId: "123" }));
     const result = await h.runner.runTurn(continuitySpec(h, resolveTarget));
@@ -336,7 +336,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
     expect(result).toBe(true);
     expect(resolveTarget).toHaveBeenCalledOnce();
     expect(h.channel.sent).toEqual([{ chatId: "123", text: "Good morning!" }]);
-    expect(h.transcript).toHaveLength(0);
+    expect(h.transcript).toEqual([{ sessionKey: "dm:shuai", content: "Good morning!", channelName: "telegram" }]);
     expect(h.typingStarts).toHaveLength(0);
   });
 
@@ -347,6 +347,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
 
     expect(resolveTarget).not.toHaveBeenCalled();
     expect(h.channel.sent).toHaveLength(0);
+    expect(h.transcript).toHaveLength(0);
   });
 
   it("skips delivery when no target resolves", async () => {
@@ -355,6 +356,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
 
     expect(result).toBe(true);
     expect(h.channel.sent).toHaveLength(0);
+    expect(h.transcript).toHaveLength(0);
   });
 
   it("only queues a note for agent-error responses and only logs thrown errors", async () => {

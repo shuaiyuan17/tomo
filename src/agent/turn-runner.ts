@@ -97,8 +97,10 @@ export interface TurnSpec {
   silentLog?: string;
   /** Transcript policy: "always" appends any response, even silent or error
    *  text (user turns); "on-delivery" appends only responses actually sent to
-   *  the chat (cron turns); "never" skips the transcript (continuity turns). */
-  transcript: "always" | "on-delivery" | "never";
+   *  the chat (cron and continuity turns). Every delivered message must be
+   *  recorded — an unrecorded delivery is invisible to recall_conversation
+   *  (#203). */
+  transcript: "always" | "on-delivery";
   /** Response logging for non-streaming turns (stream turns log inside
    *  DeliveryPipeline.deliverResponse). */
   logResponse?: (response: string) => void;
@@ -251,9 +253,7 @@ export class TurnRunner {
 
     const target = this.resolveSendTarget(delivery);
     if (target) {
-      if (spec.transcript !== "never") {
-        this.deps.appendAssistantTranscript(spec.key, response, target.channel.name);
-      }
+      this.deps.appendAssistantTranscript(spec.key, response, target.channel.name);
       await this.deps.delivery.deliverAssistantContent(target.channel, target.chatId, response);
     }
     await stopTyping({ clear: true });

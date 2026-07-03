@@ -973,8 +973,11 @@ export class Agent {
     await this.turnRunner.runTurn({
       key,
       prompt,
-      // No timestamp stamp, no typing indicator, no transcript — continuity
-      // turns are invisible unless the model chooses to speak.
+      // No timestamp stamp, no typing indicator — continuity turns are
+      // invisible unless the model chooses to speak. When it does speak, the
+      // delivered message must reach the transcript like any other assistant
+      // message (#203: heartbeat/restart deliveries were silently missing
+      // from recall history).
       delivery: {
         kind: "deferred-send",
         resolveTarget: () => {
@@ -988,7 +991,7 @@ export class Agent {
         },
       },
       silentMatcher: embeddedSilentMatcher,
-      transcript: "never",
+      transcript: "on-delivery",
       logResponse: (response) => log.info("Continuity response: %s", response.slice(0, 100)),
       errors: {
         visiblePrefix: "[error] continuity failed: ",

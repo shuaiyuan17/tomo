@@ -1,7 +1,7 @@
 import type { IdentityConfig } from "./config.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
-import { isDmSessionKey } from "./sessions/keys.js";
+import { extractImessageIdentifier, isDmSessionKey } from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
 
@@ -288,11 +288,4 @@ export class IdentityRouter {
       "Multiple existing sessions found for identity; refusing to auto-migrate. Run `tomo config` → Identities to choose which session to keep.",
     );
   }
-}
-
-/** Extract the identifier from an iMessage chat GUID (e.g. "any;-;+15551234567" → "+15551234567") */
-function extractImessageIdentifier(chatGuid: string): string | null {
-  const parts = chatGuid.split(";");
-  if (parts.length >= 3) return parts.slice(2).join(";");
-  return null;
 }

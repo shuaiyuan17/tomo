@@ -45,6 +45,13 @@ export function privateReplyTargetFromSessionKey(key: string): ReplyTarget | und
   return { channelName: parsed.channelName, chatId: parsed.chatId };
 }
 
+/** Extract the identifier from an iMessage chat GUID (e.g. "any;-;+15551234567" → "+15551234567") */
+export function extractImessageIdentifier(chatGuid: string): string | null {
+  const parts = chatGuid.split(";");
+  if (parts.length >= 3) return parts.slice(2).join(";");
+  return null;
+}
+
 /**
  * Identifies provider group session keys. Groups use raw channel keys rather
  * than dm:<identity> keys so their context stays isolated.

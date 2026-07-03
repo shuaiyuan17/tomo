@@ -370,6 +370,20 @@ describe("normalizeSendTarget", () => {
     expect(normalizeSendTarget("telegram:67890", bound)?.sessionKey).toBe("dm:alice");
   });
 
+  it("canonicalizes iMessage chat-GUID keys by extracted identifier, like the router's inbound match", () => {
+    const bound = [{ name: "Shuai", channels: { imessage: "+15551234567" } }];
+
+    expect(normalizeSendTarget("imessage:iMessage;-;+15551234567", bound)).toEqual({
+      sessionKey: "dm:shuai",
+      identityName: "Shuai",
+      rawReplyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" },
+    });
+    // Group GUIDs (";+;") never canonicalize, even if the identifier collided.
+    expect(normalizeSendTarget("imessage:iMessage;+;+15551234567", bound)).toEqual({
+      sessionKey: "imessage:iMessage;+;+15551234567",
+    });
+  });
+
   it("leaves unbound and group channel keys raw even when identities have bindings", () => {
     const bound = [{ name: "Shuai", channels: { telegram: "12345" } }];
 

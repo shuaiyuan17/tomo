@@ -1,4 +1,9 @@
-import { dmSessionKeyForIdentity, isDmSessionKey } from "../sessions/keys.js";
+import {
+  dmSessionKeyForIdentity,
+  extractImessageIdentifier,
+  isDmSessionKey,
+  isGroupSessionKey,
+} from "../sessions/keys.js";
 
 /**
  * Pure helpers for `send_message` target resolution. No I/O, no config, no
@@ -53,14 +58,30 @@ export function normalizeSendTarget(
   const sep = target.indexOf(":");
   const channelName = target.slice(0, sep);
   const chatId = target.slice(sep + 1);
-  const identity = identities.find((i) => i.channels?.[channelName] === chatId);
-  if (identity) {
-    return {
-      sessionKey: dmSessionKeyForIdentity(identity.name),
-      identityName: identity.name,
-      rawReplyTarget: { channelName, chatId },
-    };
+  if (!isGroupSessionKey(target)) {
+    const identity = identities.find((i) => matchesDmBinding(channelName, chatId, i.channels?.[channelName]));
+    if (identity) {
+      return {
+        sessionKey: dmSessionKeyForIdentity(identity.name),
+        identityName: identity.name,
+        rawReplyTarget: { channelName, chatId },
+      };
+    }
   }
 
   return { sessionKey: target };
+}
+
+/** Match a raw chatId against an identity's channel binding, mirroring the
+ *  router's inbound matching: exact, plus iMessage chat GUIDs matched by
+ *  their extracted identifier (config binds "+15551234567", providers send
+ *  "iMessage;-;+15551234567"). */
+function matchesDmBinding(channelName: string, chatId: string, bound: string | undefined): boolean {
+  if (bound === undefined) return false;
+  if (bound === chatId) return true;
+  if (channelName === "imessage") {
+    const identifier = extractImessageIdentifier(chatId);
+    if (identifier !== null && identifier === bound) return true;
+  }
+  return false;
 }

@@ -60,6 +60,11 @@ interface CronTurnOptions {
    *  so housekeeping tools can complete; failures remain in logs/pending
    *  operational context. */
   suppressDelivery?: boolean;
+  /** Deliver to this exact channel/chat instead of resolving from the
+   *  session's reply target. Set when the caller named a specific chat
+   *  (delegate sends to a raw channel:chatId target canonicalized to a dm
+   *  session key). */
+  deliveryTarget?: ReplyTarget;
 }
 
 // Context-usage percentage at which the nudge escalates from a daily rollup
@@ -170,7 +175,8 @@ export class Agent {
       setChatTitle: (sessionKey, title) => this.sessions.setChatTitle(sessionKey, title),
       listActiveEntries: () => this.sessions.listActiveEntries(),
       queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
-      runDelegateTurn: (systemMsg, sessionKey) => this.handleCronMessage(systemMsg, sessionKey),
+      runDelegateTurn: (systemMsg, sessionKey, deliveryTarget) =>
+        this.handleCronMessage(systemMsg, sessionKey, deliveryTarget ? { deliveryTarget } : {}),
     });
 
     // Load persistent per-session model overrides
@@ -490,6 +496,14 @@ export class Agent {
       }
     }
 
+    return this.channelDeliveryTarget(target, sessionKey, source);
+  }
+
+  private channelDeliveryTarget(
+    target: ReplyTarget,
+    sessionKey: string,
+    source: string,
+  ): { channel: Channel; chatId: string } | undefined {
     const channel = this.getChannel(target.channelName);
     if (!channel) {
       log.warn({ sessionKey, channelName: target.channelName }, "%s: channel not loaded", source);
@@ -904,7 +918,9 @@ export class Agent {
 
   private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<boolean> {
     const key = sessionKey;
-    const delivery = this.resolveDeliveryTargetForSession(sessionKey, "Cron");
+    const delivery = options.deliveryTarget
+      ? this.channelDeliveryTarget(options.deliveryTarget, sessionKey, "Cron")
+      : this.resolveDeliveryTargetForSession(sessionKey, "Cron");
     if (!delivery) return false;
     const { channel: deliveryChannel, chatId: deliveryChatId } = delivery;
 

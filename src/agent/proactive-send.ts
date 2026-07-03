@@ -33,8 +33,10 @@ export interface ProactiveSendDeps {
   listActiveEntries(): SessionEntry[];
   queuePendingNote(sessionKey: string, note: string): void;
   /** Queue a delegate request as a system turn on the target session
-   *  (Agent.handleCronMessage — per-session queue, never rejects). */
-  runDelegateTurn(systemMsg: string, sessionKey: string): Promise<boolean>;
+   *  (Agent.handleCronMessage — per-session queue, never rejects).
+   *  `deliveryTarget` pins the turn's delivery to a specific channel/chat
+   *  instead of the session's reply-target resolution. */
+  runDelegateTurn(systemMsg: string, sessionKey: string, deliveryTarget?: ReplyTarget): Promise<boolean>;
 }
 
 /**
@@ -146,7 +148,10 @@ export class ProactiveSendService {
 
     // Fire-and-forget — handleCronMessage enqueues per session and runs through
     // a normal Claude turn. The user verifies the outcome in the channel.
-    this.deps.runDelegateTurn(systemMsg, sessionKey).catch((err) => {
+    // A raw channel:chatId target canonicalized to a dm key pins delivery to
+    // the named channel, like direct mode; otherwise the turn resolves its
+    // own delivery target from the session's reply policy.
+    this.deps.runDelegateTurn(systemMsg, sessionKey, resolved.rawReplyTarget).catch((err) => {
       log.error({ err, sessionKey }, "Delegated send failed");
     });
 
@@ -224,20 +229,22 @@ export class ProactiveSendService {
   }
 
   /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */
-  private resolveSendTarget(target: string): { sessionKey: string; replyTarget: ReplyTarget } | undefined {
+  private resolveSendTarget(
+    target: string,
+  ): { sessionKey: string; replyTarget: ReplyTarget; rawReplyTarget?: ReplyTarget } | undefined {
     const normalized = normalizeSendTarget(target, config.identities);
     if (!normalized) return undefined;
-    const { sessionKey, identityName } = normalized;
+    const { sessionKey, identityName, rawReplyTarget } = normalized;
 
     const dmIdentityName = dmIdentityFromSessionKey(sessionKey);
     if (dmIdentityName !== undefined) {
       // A raw channel:chatId target canonicalized to this dm key keeps its
       // named channel for delivery; router policy only picks the channel
       // when the caller didn't name one.
-      const replyTarget = normalized.rawReplyTarget
+      const replyTarget = rawReplyTarget
         ?? this.deps.getReplyTarget(sessionKey)
         ?? this.deps.deriveReplyTargetFromConfig(identityName ?? dmIdentityName);
-      return replyTarget ? { sessionKey, replyTarget } : undefined;
+      return replyTarget ? { sessionKey, replyTarget, rawReplyTarget } : undefined;
     }
 
     // Non-dm session key (channel:<chatId> form, possibly a group). The caller

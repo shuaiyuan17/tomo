@@ -66,10 +66,11 @@ export interface LiveSessionManagerDeps {
  */
 export class LiveSessionManager {
   private liveSessions = new Map<string, LiveSession>();
-  // Busy sessions retired by a prompt change: removed from liveSessions (so
-  // their key gets a fresh session) but still running an in-flight turn.
-  // Tracked so stop() can close them — they'd otherwise outlive shutdown.
-  private retiringSessions = new Set<LiveSession>();
+  // Sessions whose system prompt is out of date (workspace changed since they
+  // were built). They STAY in liveSessions so in-flight conversations keep
+  // their steering target; each is retired at its next idle boundary instead
+  // of all at once — see sweepPromptChanges().
+  private promptStale = new Set<LiveSession>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private lastPromptHash: string = "";
   private stopping = false;
@@ -92,6 +93,11 @@ export class LiveSessionManager {
   }
 
   async getOrCreateLiveSession(key: string): Promise<LiveSession> {
+    // Checked on every message (not just on creation): a lone session that is
+    // only ever reused would otherwise never notice a workspace change and
+    // serve a stale prompt indefinitely.
+    this.sweepPromptChanges();
+
     const session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
 
@@ -109,35 +115,58 @@ export class LiveSessionManager {
     }
   }
 
-  private async createLiveSession(key: string): Promise<LiveSession> {
-    let session = this.liveSessions.get(key);
-    if (session?.isAlive()) return session;
-
-    // Check prompt changes
+  /**
+   * Detect system-prompt changes and mark every current session prompt-stale
+   * instead of retiring them all on the spot. Retiring en masse dropped every
+   * MCP connection and prompt-cache prefix at once, and yanking a busy session
+   * out of the map orphaned its in-flight turn as a steering target — the next
+   * message for its key spawned a parallel fresh session while the old turn
+   * was still running. Each stale session is retired at its own next idle
+   * boundary (no turn in flight, no queued/steered work) by retireWhenIdle, so
+   * active conversations finish undisturbed and reconnects stagger with each
+   * key's natural traffic. New sessions are always built from the current
+   * workspace, so a changed prompt reaches every key by its next idle turn.
+   */
+  private sweepPromptChanges(): void {
     const currentHash = this.hashString(this.deps.buildSystemPrompt());
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
-      log.info("System prompt changed, creating new sessions");
-      for (const [k, s] of this.liveSessions) {
-        // Removing the session from the map is what retires it — the next
-        // message for its key creates a fresh session with the new prompt.
-        // Closing a busy session here would reject its in-flight turn, and
-        // runWithRetry's reset-and-retry branch would then re-run the whole
-        // turn, repeating side effects its first half already performed — so
-        // the actual close waits for the in-flight turn to finish.
-        this.liveSessions.delete(k);
-        if (s.isBusy()) {
-          this.retiringSessions.add(s);
-          void s.waitForIdle().then(() => {
-            this.retiringSessions.delete(s);
-            s.close();
-            log.info({ key: k }, "Session closed after prompt change (deferred past in-flight turn)");
-          });
-        } else {
-          s.close();
-        }
+      log.info("System prompt changed; retiring live sessions at their next idle boundary");
+      for (const [key, session] of this.liveSessions) {
+        if (this.promptStale.has(session)) continue;
+        this.promptStale.add(session);
+        void this.retireWhenIdle(key, session);
       }
     }
     this.lastPromptHash = currentHash;
+  }
+
+  /**
+   * Close a prompt-stale session once it is truly idle — the next message for
+   * its key then creates a fresh session with the new prompt. An already-idle
+   * session closes synchronously (its idle boundary is now). Closing a busy
+   * session instead would reject its in-flight turn, and runWithRetry's
+   * reset-and-retry branch would re-run the whole turn, repeating side effects
+   * its first half already performed — so the close waits for true idleness.
+   */
+  private async retireWhenIdle(key: string, session: LiveSession): Promise<void> {
+    // waitForIdle resolves when no turn is in flight, but a queued send()
+    // woken by the same turn-completion can start a new turn before this
+    // continuation runs — re-check so a live conversation is never cut.
+    while (session.isAlive() && session.isBusy()) {
+      await session.waitForIdle();
+    }
+    this.promptStale.delete(session);
+    // Replaced or closed by another path (error reset, compact reload,
+    // shutdown) while we waited — nothing left to retire.
+    if (this.liveSessions.get(key) !== session) return;
+    this.liveSessions.delete(key);
+    session.close();
+    log.info({ key }, "Prompt-stale session retired at idle boundary");
+  }
+
+  private async createLiveSession(key: string): Promise<LiveSession> {
+    let session = this.liveSessions.get(key);
+    if (session?.isAlive()) return session;
 
     const resumeId = this.deps.getSdkSessionId(key);
     if (resumeId) {
@@ -181,6 +210,7 @@ export class LiveSessionManager {
   closeLiveSession(key: string): void {
     const session = this.liveSessions.get(key);
     if (session) {
+      this.promptStale.delete(session);
       session.close();
       this.liveSessions.delete(key);
     }
@@ -307,11 +337,10 @@ export class LiveSessionManager {
   /** Close every live session for shutdown; retries are disabled from here on. */
   stop(): void {
     this.stopping = true;
+    // Prompt-stale sessions stay in the map until their idle-boundary
+    // retirement, so this loop covers them too.
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
-    // Prompt-retired sessions waiting out an in-flight turn are not in the
-    // map; shutdown must not leave their SDK children running.
-    for (const s of this.retiringSessions) s.close();
-    this.retiringSessions.clear();
+    this.promptStale.clear();
   }
 }

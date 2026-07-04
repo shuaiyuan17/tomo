@@ -95,6 +95,8 @@ describe("resolveBlockRange — daily fresh-tail behavior", () => {
     const result = resolveBlockRange(sessionId, "daily", pastDay);
     expect(result).not.toBeNull();
     expect(result!.blockTag).toBe(`daily ${pastDay}`);
+    expect(result!.firstUuid).toBe(events[0].uuid);
+    expect(result!.lastUuid).toBe(events[9].uuid);
     expect(result!.description).toContain("10 events");
     // No "kept raw" suffix for past-day rollups.
     expect(result!.description).not.toContain("kept raw");

@@ -19,6 +19,9 @@ export interface ResolvedRange {
   /** Inclusive range in conversation (user/assistant) index space */
   fromIdx: number;
   toIdx: number;
+  /** UUIDs of the first/last events of the resolved range, for drift detection. */
+  firstUuid?: string;
+  lastUuid?: string;
   /** Human-readable explanation of what gets compacted */
   description: string;
 }
@@ -301,7 +304,14 @@ export function resolveBlockRange(
     ? `update ${tag}: ${count} events (existing block will be replaced)${tailSuffix}`
     : `create ${tag}: ${count} events${tailSuffix}`;
 
-  return { blockTag: tag, fromIdx: fromConv, toIdx: toConv, description };
+  return {
+    blockTag: tag,
+    fromIdx: fromConv,
+    toIdx: toConv,
+    firstUuid: events[firstIdx].uuid,
+    lastUuid: events[lastIdx].uuid,
+    description,
+  };
 }
 
 function defaultPeriod(level: BlockLevel): string {

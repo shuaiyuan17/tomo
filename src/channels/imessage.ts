@@ -440,14 +440,16 @@ export class BlueBubblesChannel implements Channel {
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
 
     // Satellite messages arrive over Apple's low-bandwidth emergency relay and
-    // carry the "iMessageLite" service instead of "iMessage". Surface this to
-    // the model so it keeps replies short + text-only and doesn't expect (or
-    // ask for) photos the sender physically cannot send. Any non-standard
-    // service that still contains "Lite" is treated as satellite defensively.
+    // carry the "iMessageLite" service instead of "iMessage". BlueBubbles does
+    // not always expose the message service in serialized webhooks, but the
+    // sender handle service survives serialization. Surface either signal to the
+    // model so it keeps replies short + text-only and doesn't expect photos.
     // Only tag when there's real text — avoids turning an empty satellite ghost
     // row into a non-empty prompt that would bypass the empty-message guard below.
+    const isSatelliteMessage =
+      isSatelliteService(data.service) || isSatelliteService(handle?.service);
     const satelliteMarker =
-      isSatelliteService(data.service) && text.trim() ? SATELLITE_MARKER : "";
+      isSatelliteMessage && text.trim() ? SATELLITE_MARKER : "";
 
     const markers = [satelliteMarker, imageMarker, docMarker].filter(Boolean).join(" ");
     const composedText = text

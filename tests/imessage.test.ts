@@ -506,7 +506,7 @@ describe("isSatelliteService", () => {
 });
 
 describe("BlueBubbles satellite message tagging", () => {
-  const payload = (guid: string, text: string, service?: string) => ({
+  const payload = (guid: string, text: string, service?: string, handleService?: string) => ({
     type: "new-message",
     data: {
       guid,
@@ -514,7 +514,10 @@ describe("BlueBubbles satellite message tagging", () => {
       ...(service !== undefined ? { service } : {}),
       isFromMe: false,
       dateCreated: 1_000,
-      handle: { address: "+15551234567" },
+      handle: {
+        address: "+15551234567",
+        ...(handleService !== undefined ? { service: handleService } : {}),
+      },
       chats: [{ guid: "iMessage;-;+15551234567" }],
       attachments: [],
     },
@@ -542,6 +545,20 @@ describe("BlueBubbles satellite message tagging", () => {
     expect(handler).toHaveBeenCalledTimes(1);
     const message = handler.mock.calls[0][0] as { text: string };
     expect(message.text).toBe(`${SATELLITE_MARKER} we are off-grid`);
+  });
+
+  it("prefixes satellite text when BlueBubbles only exposes handle service", async () => {
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(
+      channel,
+      payload("guid-sat-handle", "can you see this", undefined, "iMessageLite"),
+    );
+    expect(handler).toHaveBeenCalledTimes(1);
+    const message = handler.mock.calls[0][0] as { text: string };
+    expect(message.text).toBe(`${SATELLITE_MARKER} can you see this`);
   });
 
   it("does not tag standard iMessage text", async () => {

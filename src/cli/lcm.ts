@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
 import { pruneTools } from "../lcm/prune-tools.js";
-import { resolveBlockRange, type BlockLevel } from "../lcm/blocks.js";
+import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
 import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
 
@@ -120,12 +120,19 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
       });
 
       if (result.success) {
+        const budget = summaryBudgetCheck(level, opts.summary);
         console.log(JSON.stringify({
           status: "ok",
           blockTag: resolved.blockTag,
           description: resolved.description,
           eventsRemoved: result.eventsRemoved,
           eventsAfter: result.eventsAfter,
+          summaryTokens: budget.tokens,
+          summaryBudget: budget.budget,
+          ...(budget.overBudget ? {
+            warning: `summary is ~${budget.tokens} tokens (budget ${budget.budget} for ${level}); ` +
+              "if the period genuinely has irreducible texture this is fine, otherwise compress harder next time",
+          } : {}),
         }));
       } else {
         console.error(JSON.stringify({ status: "error", error: result.error }));

@@ -1,4 +1,5 @@
 import { log } from "../logger.js";
+import { formatTomoEvent } from "../tomo-event.js";
 
 export interface DurablePendingNotesStore {
   getPendingNotes(key: string): string[];
@@ -88,11 +89,11 @@ export class PendingNotesQueue {
     const errorNotes = this.errorNotes.get(sessionKey);
     if (errorNotes && errorNotes.length > 0) {
       this.errorNotes.delete(sessionKey);
-      drained.push([
-        "[System: Recent Tomo errors before this turn (newest last, capped):",
+      drained.push(formatTomoEvent("errors", [
+        "Recent Tomo errors before this turn (newest last, capped):",
         ...errorNotes.map((note) => `- ${note}`),
-        "Use this as operational context; do not repeat the raw error unless it helps the user.]",
-      ].join("\n"));
+        "Use this as operational context; do not repeat the raw error unless it helps the user.",
+      ].join("\n")));
     }
 
     return drained.map((n) => `${n}\n\n`).join("");

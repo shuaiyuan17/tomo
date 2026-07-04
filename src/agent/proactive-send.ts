@@ -10,6 +10,7 @@ import {
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
 import { normalizeSendTarget } from "./send-target.js";
+import { formatTomoEvent } from "../tomo-event.js";
 
 export type SendResult = { ok: true } | { ok: false; error: string };
 
@@ -111,11 +112,11 @@ export class ProactiveSendService {
       log.warn({ err, sessionKey }, "Message delivered but transcript persistence failed");
     }
 
-    this.deps.queuePendingNote(sessionKey, fromSummoner
-      ? `[System: Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"]`
+    this.deps.queuePendingNote(sessionKey, formatTomoEvent("direct-send", fromSummoner
+      ? `Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"`
       : callerSessionKey === sessionKey
-        ? `[System: You sent the following message to this conversation earlier as a direct send: "${text}"]`
-        : `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`);
+        ? `You sent the following message to this conversation earlier as a direct send: "${text}"`
+        : `Tomo from another session sent the following message to this conversation earlier: "${text}"`));
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Message sent (direct)");
     return { ok: true };
@@ -144,7 +145,10 @@ export class ProactiveSendService {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
-    const systemMsg = `[System: From your other conversation, you were asked to: ${request}. Use this conversation's context, tone, and participants to respond appropriately. Reply NO_REPLY if you judge it shouldn't be sent.]`;
+    const systemMsg = formatTomoEvent(
+      "delegate",
+      `From your other conversation, you were asked to: ${request}. Use this conversation's context, tone, and participants to respond appropriately. Reply NO_REPLY if you judge it shouldn't be sent.`,
+    );
 
     // Fire-and-forget — handleCronMessage enqueues per session and runs through
     // a normal Claude turn. The user verifies the outcome in the channel.

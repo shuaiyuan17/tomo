@@ -103,10 +103,12 @@ describe("ProactiveSendService.sendToSession", () => {
     expect(h.transcript).toEqual([
       { sessionKey: "telegram:12345", content: `[proactive] ${text}`, channelName: "telegram" },
     ]);
-    expect(h.notes).toEqual([{
-      sessionKey: "telegram:12345",
-      note: `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`,
-    }]);
+    expect(h.notes).toHaveLength(1);
+    expect(h.notes[0].sessionKey).toBe("telegram:12345");
+    expect(h.notes[0].note).toMatch(/^<tomo-event type="direct-send" ts="[^"]+">/);
+    expect(h.notes[0].note).toContain(
+      `Tomo from another session sent the following message to this conversation earlier: "${text}"`,
+    );
   });
 
   it("attributes summoned-group sends to the summoning dm session only", async () => {

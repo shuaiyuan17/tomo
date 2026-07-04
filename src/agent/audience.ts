@@ -1,3 +1,5 @@
+import { formatTomoEvent } from "../tomo-event.js";
+
 /** Audience identifier for an inbound message on a unified dm: session —
  *  "dm" for private messages, the raw "<channel>:<chatId>" key for (summoned)
  *  group messages. */
@@ -23,8 +25,16 @@ export function audienceSwitchNote(
   if (audiences.length === 0) return "";
   const distinct = [...new Set(audiences)];
   if (distinct.length > 1) {
-    return `[System: audience check — the messages below span ${distinct.map(label).join(" and ")}. Mind each message's tag when replying; group replies only via send_message.]`;
+    return formatTomoEvent(
+      "audience",
+      `Audience check — the messages below span ${distinct.map(label).join(" and ")}. Mind each message's tag when replying; group replies only via send_message.`,
+      { name: "check" },
+    );
   }
   if (prev === undefined || distinct[0] === prev) return "";
-  return `[System: audience switched — the previous message in this session was from ${label(prev)}; this one is from ${label(distinct[0])}. Re-anchor tone and privacy to the new audience.]`;
+  return formatTomoEvent(
+    "audience",
+    `Audience switched — the previous message in this session was from ${label(prev)}; this one is from ${label(distinct[0])}. Re-anchor tone and privacy to the new audience.`,
+    { name: "switch" },
+  );
 }

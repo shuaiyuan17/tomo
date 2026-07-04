@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { log } from "./logger.js";
 import type { Agent } from "./agent.js";
 import { runContinuityScript, type ContinuityScriptConfig } from "./continuity-script.js";
+import { formatTomoEvent } from "./tomo-event.js";
 import { DEFAULT_CONTINUITY_INTERVAL_MS } from "./continuity-defaults.js";
 
 const DEFAULT_TRIGGER_DIR = join(homedir(), ".tomo");
@@ -117,7 +118,11 @@ export class ContinuityRunner {
       scriptLine = `\n\n${await runContinuityScript(this.script)}`;
     }
 
-    const prompt = `System: It is ${timestamp}.${weatherLine} Read CONTINUITY.md. This is free time — reflect, research, or prepare something useful.${scriptLine}`;
+    const prompt = formatTomoEvent(
+      "heartbeat",
+      `It is ${timestamp}.${weatherLine} Read CONTINUITY.md. This is free time — reflect, research, or prepare something useful.${scriptLine}`,
+      { ts: now },
+    );
 
     log.info({
       city: this.city,

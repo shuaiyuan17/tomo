@@ -69,9 +69,12 @@ describe("send_message direct mode", () => {
       content: `[proactive] ${text}`,
       channel: "telegram",
     });
-    expect(peekPendingNotes(agent, "telegram:12345")).toEqual([
-      `[System: Tomo from another session sent the following message to this conversation earlier: "${text}"]`,
-    ]);
+    const pendingNotes = peekPendingNotes(agent, "telegram:12345");
+    expect(pendingNotes).toHaveLength(1);
+    expect(pendingNotes[0]).toMatch(/^<tomo-event type="direct-send" ts="[^"]+">/);
+    expect(pendingNotes[0]).toContain(
+      `Tomo from another session sent the following message to this conversation earlier: "${text}"`,
+    );
 
     await agent.stop();
   });
@@ -147,9 +150,12 @@ describe("send_message direct mode", () => {
     expect(result).toEqual({ ok: true });
     expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
       .toBe("[via dm:alice (summoned)] hello group");
-    expect(peekPendingNotes(agent, "telegram:-987")).toEqual([
-      `[System: Tomo from alice's main session (dm:alice), summoned into this group at the time, sent the following message here: "hello group"]`,
-    ]);
+    const summonNotes = peekPendingNotes(agent, "telegram:-987");
+    expect(summonNotes).toHaveLength(1);
+    expect(summonNotes[0]).toMatch(/^<tomo-event type="direct-send" ts="[^"]+">/);
+    expect(summonNotes[0]).toContain(
+      `Tomo from alice's main session (dm:alice), summoned into this group at the time, sent the following message here: "hello group"`,
+    );
 
     await agent.stop();
   });
@@ -170,9 +176,12 @@ describe("send_message direct mode", () => {
     expect(result).toEqual({ ok: true });
     expect(internals.sessions.get("telegram:-987").messages.at(-1)?.content)
       .toBe("[proactive] hi from bob");
-    expect(peekPendingNotes(agent, "telegram:-987")).toEqual([
-      `[System: Tomo from another session sent the following message to this conversation earlier: "hi from bob"]`,
-    ]);
+    const neutralNotes = peekPendingNotes(agent, "telegram:-987");
+    expect(neutralNotes).toHaveLength(1);
+    expect(neutralNotes[0]).toMatch(/^<tomo-event type="direct-send" ts="[^"]+">/);
+    expect(neutralNotes[0]).toContain(
+      `Tomo from another session sent the following message to this conversation earlier: "hi from bob"`,
+    );
 
     await agent.stop();
   });

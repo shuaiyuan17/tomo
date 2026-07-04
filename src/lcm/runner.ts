@@ -4,6 +4,7 @@ import { isGroupSessionKey } from "../sessions/keys.js";
 import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, type DuePromotion } from "./blocks.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
+import { formatTomoEvent } from "../tomo-event.js";
 
 /**
  * Periodic rollup promotion checker.
@@ -45,7 +46,7 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
     BLOCK_SUMMARY_TOKEN_BUDGETS.yearly,
   );
   const lines = [
-    `System: An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
+    `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
     "The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:",
     `  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`,
@@ -67,7 +68,7 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
     );
   }
   void commandFor; // keep reference for potential future use
-  return lines.join("\n");
+  return formatTomoEvent("lcm-rollup", lines.join("\n"), { name: `${p.level} ${p.period}` });
 }
 
 export class RollupRunner {

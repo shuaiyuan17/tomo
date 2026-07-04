@@ -4,6 +4,7 @@ import type { Channel, StreamingMessage } from "../channels/types.js";
 import { deliverTextParts } from "../channels/delivery.js";
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
 import { extractAttachments, isSilentReply } from "./text-utils.js";
+import { filterScaffoldLeak } from "./scaffold-filter.js";
 
 interface DeliveryPipelineDeps {
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
@@ -95,12 +96,15 @@ export class DeliveryPipeline {
     chatId: string,
     stream: StreamingMessage,
   ): (text: string) => Promise<void> {
-    return async (blockText: string) => {
+    return async (rawBlockText: string) => {
       try {
-        if (isAgentErrorResponse(blockText)) {
+        if (isAgentErrorResponse(rawBlockText)) {
           await stream.cancel();
           return;
         }
+        const scaffold = filterScaffoldLeak(rawBlockText);
+        if (scaffold.filtered) log.warn({ channel: channel.name }, "model scaffold leak filtered");
+        const blockText = scaffold.text;
         const attachments = extractAttachments(blockText);
         if (attachments.mediaPaths.length > 0 || attachments.stickerIds.length > 0) {
           await stream.discardBlock();

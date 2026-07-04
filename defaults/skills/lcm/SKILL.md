@@ -45,7 +45,7 @@ tomo lcm yearly  --session-id SESSION_ID --summary "<yearly summary>"   # last c
 
 These consume block summaries already in your context — no tool calls needed to fetch source data. You just read the child blocks and synthesize.
 
-The harness will nudge you via a `System:` message when rollups are due (idempotent — catches missed Mondays etc.).
+The harness will nudge you via a `<tomo-event type="lcm-rollup" ...>` message when rollups are due (idempotent — catches missed Mondays etc.).
 
 ## Other commands
 

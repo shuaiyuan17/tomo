@@ -25,16 +25,18 @@ describe("audienceSwitchNote", () => {
     expect(audienceSwitchNote("telegram:-987", ["telegram:-987"], label)).toBe("");
   });
 
-  it("notes a switch from DM to a group", () => {
+  it("notes a switch from DM to a group as an audience tomo-event", () => {
     const note = audienceSwitchNote("dm", ["telegram:-987"], label);
-    expect(note).toContain("audience switched");
+    expect(note).toMatch(/^<tomo-event type="audience" name="switch" ts="[^"]+">/);
+    expect(note).toContain("Audience switched");
     expect(note).toContain("the private DM");
     expect(note).toContain("the group telegram:-987");
+    expect(note.trimEnd()).toMatch(/<\/tomo-event>$/);
   });
 
   it("notes a switch from a group back to the DM", () => {
     const note = audienceSwitchNote("telegram:-987", ["dm"], label);
-    expect(note).toContain("audience switched");
+    expect(note).toContain("Audience switched");
     expect(note).toContain("this one is from the private DM");
   });
 
@@ -46,7 +48,8 @@ describe("audienceSwitchNote", () => {
 
   it("flags mixed-audience batches even without a prior audience", () => {
     const note = audienceSwitchNote(undefined, ["dm", "telegram:-987", "dm"], label);
-    expect(note).toContain("audience check");
+    expect(note).toMatch(/^<tomo-event type="audience" name="check" ts="[^"]+">/);
+    expect(note).toContain("Audience check");
     expect(note).toContain("the private DM");
     expect(note).toContain("the group telegram:-987");
   });

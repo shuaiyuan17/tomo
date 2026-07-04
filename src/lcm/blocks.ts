@@ -3,6 +3,7 @@ import { getSdkSessionPath } from "../sessions/index.js";
 import { config } from "../config.js";
 import { readJsonlFileSync } from "../jsonl.js";
 import { estimateTokens } from "./stats.js";
+import { stripLeadingTomoEvents } from "../tomo-event.js";
 
 /**
  * Hierarchical rollup block tags live on compact summary events. Each level
@@ -124,8 +125,10 @@ function extractText(e: SdkEvent): string {
  * Classification (verified against real SDK session shapes 2026-06-05):
  *   - real user msg:   "[imessage · Fri 06/05 22:18 PDT] 🧱做好了"            → candidate
  *   - coalesced msgs:  "[imessage · …] [User sent 2 messages in quick succ…]" → candidate (real text)
- *   - cron:            "[imessage · …] System: Scheduled task …"             → NOT (System: after prefix)
- *   - continuity beat: "System: It is Fri … Weather …"                       → NOT (raw System:)
+ *   - cron:            "[imessage · …] <tomo-event type=\"cron\" …>…"          → NOT (harness event)
+ *   - continuity beat: "<tomo-event type=\"heartbeat\" …>It is Fri …"          → NOT (harness event)
+ *   - legacy cron:     "[imessage · …] System: Scheduled task …"             → NOT (System: after prefix)
+ *   - legacy beat:     "System: It is Fri … Weather …"                       → NOT (raw System:)
  *   - tool_result turn: user event with no text block                        → NOT (machinery)
  *   - tool_use-only assistant turn: no text                                  → NOT (machinery)
  */
@@ -143,20 +146,45 @@ export function isWarmTailCandidate(e: SdkEvent): boolean {
   }
   // user event
   if (!text) return false; // tool_result-only turn = machinery
-  // Strip ALL leading bracketed prefixes (+ whitespace), then a System: prefix
-  // means heartbeat/cron (both injected, not conversation). Looping matters:
-  // a cron turn with a pending note prepended looks like
-  //   "[System: <note>]\n\n[imessage · …] System: Scheduled task …"
-  // so stripping just one bracket would leave "[imessage · …] System:" and
-  // misclassify the cron as conversational. Coalesced real msgs
+  // Strip ALL leading bracketed prefixes and <tomo-event> envelopes (+
+  // whitespace); what's left is the conversational payload. Harness events
+  // arrive as <tomo-event> envelopes (new) or System:-prefixed text (legacy
+  // transcripts — never migrated, so both must be recognized). Looping
+  // matters: a cron turn with a pending note prepended looks like
+  //   "<tomo-event …>…</tomo-event>\n\n[imessage · …] <tomo-event type=\"cron\" …>…"
+  // (or the legacy "[System: <note>]\n\n[imessage · …] System: Scheduled task …")
+  // so stripping just one prefix would misclassify the cron as
+  // conversational. Coalesced real msgs
   //   "[imessage · …] [User sent 2 messages …] real text"
   // strip down to "real text" → still correctly a candidate.
   let stripped = text;
+  // Whether the LAST thing stripped was specifically a harness event
+  // (<tomo-event> envelope or legacy [System: ...] note) as opposed to a
+  // generic bracketed prefix (channel stamp, "[User sent N messages …]",
+  // or a real message that just looks like "[ok]").
+  let lastStrippedWasHarness = false;
   for (let prev = ""; stripped !== prev; ) {
     prev = stripped;
-    stripped = stripped.replace(/^\[[^\]]*\]\s*/, "");
+    const isLegacyNote = stripped.startsWith("[System:");
+    const afterBracket = stripped.replace(/^\[[^\]]*\]\s*/, "");
+    if (afterBracket !== stripped) {
+      stripped = afterBracket;
+      lastStrippedWasHarness = isLegacyNote;
+      continue;
+    }
+    const afterEnvelope = stripLeadingTomoEvents(stripped);
+    if (afterEnvelope !== stripped) {
+      stripped = afterEnvelope;
+      lastStrippedWasHarness = true;
+    }
   }
   if (stripped.startsWith("System:")) return false;
+  // Empty after stripping: the turn is pure harness injection ONLY when the
+  // final stripped element was a harness event (e.g. "[stamp] <tomo-event
+  // type=cron …>…" or a bare heartbeat envelope). A real message that strips
+  // to empty via generic brackets alone — "[ok]", "[stamp] [ok]" — is still
+  // conversation and must stay a candidate.
+  if (stripped.trim().length === 0) return !lastStrippedWasHarness;
   return true;
 }
 

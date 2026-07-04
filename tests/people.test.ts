@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   annotateSenderName,
   autoBindHandle,
+  findPersonByDisplayName,
   findPersonByHandle,
   findPersonByName,
   loadPeople,
@@ -119,6 +120,42 @@ describe("people store", () => {
     expect(findPersonByName(people, "alice")).toBeUndefined();
   });
 
+  describe("findPersonByDisplayName (decoration-tolerant fallback)", () => {
+    it("matches decorated wire names against plain aliases", () => {
+      writePerson(dirs.publicDir, "kevin.md", KEVIN);
+      const people = loadPeople({ includePrivate: false, dirs });
+      expect(findPersonByDisplayName(people, "kw 🚀")?.name).toBe("Kevin Wang");
+      expect(findPersonByDisplayName(people, "阿丽✨")).toBeUndefined();
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Chen\naliases: 阿丽\n---\n`);
+      const reloaded = loadPeople({ includePrivate: false, dirs });
+      expect(findPersonByDisplayName(reloaded, "阿丽✨")?.name).toBe("Alice Chen");
+    });
+
+    it("prefers an exact match over the stripped fallback", () => {
+      writePerson(dirs.publicDir, "a.md", `---\nname: Rocket Kw\naliases: "kw 🚀"\n---\n`);
+      writePerson(dirs.publicDir, "b.md", `---\nname: Kevin Wang\naliases: kw\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      // Exact alias "kw 🚀" wins even though stripped matching would be ambiguous.
+      expect(findPersonByDisplayName(people, "kw 🚀")?.name).toBe("Rocket Kw");
+    });
+
+    it("does not fall through to stripped matching when the exact stage is ambiguous", () => {
+      writePerson(dirs.publicDir, "a1.md", `---\nname: Alice Smith\naliases: alice\n---\n`);
+      writePerson(dirs.publicDir, "a2.md", `---\nname: Alice Jones\naliases: alice\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      expect(findPersonByDisplayName(people, "alice")).toBeUndefined();
+    });
+
+    it("requires a unique stripped match and a non-trivial stripped form", () => {
+      writePerson(dirs.publicDir, "a.md", `---\nname: Kevin Wang\naliases: kw\n---\n`);
+      writePerson(dirs.publicDir, "b.md", `---\nname: Kelly West\naliases: "KW!"\n---\n`);
+      writePerson(dirs.publicDir, "c.md", `---\nname: Kay\naliases: k\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      expect(findPersonByDisplayName(people, "kw 🚀")).toBeUndefined(); // two stripped "kw" candidates
+      expect(findPersonByDisplayName(people, "k ⭐")).toBeUndefined(); // stripped form too short
+    });
+  });
+
   describe("upsertPerson", () => {
     it("creates a new record with a slug filename", () => {
       const { record, created } = upsertPerson(
@@ -205,6 +242,30 @@ describe("people store", () => {
       writePerson(dirs.publicDir, "kevin.md", KEVIN);
       expect(autoBindHandle("telegram", "12345678", "Someone Else", dirs)).toBeUndefined();
     });
+
+    it("binds decorated display names via the stripped fallback", () => {
+      writePerson(dirs.publicDir, "kevin.md", `---\nname: Kevin Wang\naliases: kw\n---\n`);
+      const bound = autoBindHandle("telegram", "99", "kw 🚀", dirs);
+      expect(bound?.name).toBe("Kevin Wang");
+      const reloaded = loadPeople({ includePrivate: false, dirs });
+      expect(findPersonByHandle(reloaded, "telegram", "99")?.name).toBe("Kevin Wang");
+    });
+
+    it("never binds a private record from group traffic, even on a name collision", () => {
+      writePerson(dirs.privateDir, "secret.md", `---\nname: Secret Friend\naliases: sf\n---\n`);
+      expect(autoBindHandle("telegram", "42", "Secret Friend", dirs)).toBeUndefined();
+      expect(autoBindHandle("telegram", "42", "sf 🚀", dirs)).toBeUndefined();
+      const [secret] = loadPeople({ includePrivate: true, dirs });
+      expect(secret.handles).toEqual({});
+    });
+
+    it("does not double-bind an id already owned by a private record onto a same-named public one", () => {
+      writePerson(dirs.privateDir, "secret.md", `---\nname: Secret Friend\ntelegram: 42\n---\n`);
+      writePerson(dirs.publicDir, "impostor.md", `---\nname: Secret Friend\n---\n`);
+      expect(autoBindHandle("telegram", "42", "Secret Friend", dirs)).toBeUndefined();
+      const publicOnly = loadPeople({ includePrivate: false, dirs });
+      expect(publicOnly[0].handles).toEqual({});
+    });
   });
 
   describe("prompt rendering", () => {
@@ -253,6 +314,23 @@ describe("people store", () => {
       expect(annotateSenderName(people, "telegram", "嘉伟")).toBe("嘉伟 (Kevin Wang)");
       expect(annotateSenderName(people, "telegram", "Kevin Wang", "12345678")).toBe("Kevin Wang");
       expect(annotateSenderName(people, "telegram", "Stranger", "555")).toBe("Stranger");
+    });
+
+    it("annotates decorated names before any handle is bound", () => {
+      writePerson(dirs.publicDir, "kevin.md", `---\nname: Kevin Wang\naliases: kw\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      expect(annotateSenderName(people, "telegram", "kw 🚀", "999")).toBe("kw 🚀 (Kevin Wang)");
+    });
+
+    it("resolves decorated participant names without a sender id", () => {
+      writePerson(dirs.publicDir, "kevin.md", `---\nname: Kevin Wang\naliases: kw\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      const labels = renderParticipantLabels({
+        channelName: "telegram",
+        participants: ["kw ✨"],
+        people,
+      });
+      expect(labels).toEqual(['Kevin Wang (aka: kw; appears as "kw ✨")']);
     });
 
     it("renders the roster with aliases only", () => {

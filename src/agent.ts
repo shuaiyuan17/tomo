@@ -974,9 +974,11 @@ export class Agent {
   private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
     if (!message.isGroup) return message.text;
     // Resolve the sender against the people registry so every group line
-    // carries the identity join inline: `kw 🚀 (Kevin Wang): ...`. Private
-    // records only participate when the receiving session is a DM (summon).
-    const people = loadPeople({ includePrivate: isDmSessionKey(sessionKey) });
+    // carries the identity join inline: `kw 🚀 (Kevin Wang): ...`. Public
+    // records only, even when a summon routes this line into a dm: session —
+    // the reply audience is still the group, and a harness-stitched private
+    // canonical name would sit right next to the content being answered.
+    const people = loadPeople({ includePrivate: false });
     const sender = annotateSenderName(people, channel.name, message.senderName, message.senderId);
     const prefixed = `${sender}: ${message.text}`;
     if (!isDmSessionKey(sessionKey)) return prefixed;

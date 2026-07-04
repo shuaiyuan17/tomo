@@ -162,7 +162,7 @@ imessage: +14155551234
 Freeform notes about Kevin below the frontmatter.
 \`\`\`
 
-The harness resolves group-chat senders against this registry automatically: sender prefixes and the participant list show canonical names, and stable channel ids (\`telegram\`/\`imessage\`) are bound automatically the first time a matching sender appears — name + aliases is enough, nobody needs to look up ids by hand.
+The harness resolves group-chat senders against this registry automatically: sender prefixes and the participant list show canonical names, and stable channel ids (\`telegram\`/\`imessage\`) are bound automatically the first time a matching sender appears — name + aliases is enough, nobody needs to look up ids by hand. Matching tolerates decorated profile names ("kw 🚀" matches alias \`kw\`) but requires an unambiguous match. Auto-binding only considers public records; a private record's ids must be set explicitly via \`upsert_person\` from a DM.
 
 Maintain the registry with the \`upsert_person\` tool (preferred — it keeps the frontmatter well-formed; \`list_people\` shows current records with their handles and notes) or by editing the files directly. When you learn a new nickname ("kw is Kevin") or a fact about a person, update their record — don't create a parallel memory topic file for them. ${privacyNote}
 

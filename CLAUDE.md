@@ -94,10 +94,10 @@ Person records live at `~/.tomo/workspace/memory/people/*.md` (DM-only records u
 
 - Channels attach a stable `senderId` to every `IncomingMessage`; the session registry tracks display names per id (`participantIds`), so profile renames stay one person.
 - Group transcript lines are annotated inline (`kw 🚀 (Kevin Wang): ...`) and the group system prompt lists participants resolved to canonical names + aliases.
-- Handles are auto-bound the first time a sender's display name unambiguously matches an unbound record (`autoBindHandle`) — users only ever write names/nicknames.
+- Handles are auto-bound the first time a sender's display name unambiguously matches an unbound record (`autoBindHandle`) — users only ever write names/nicknames. Matching is exact-first with a decoration-stripped fallback ("kw 🚀" matches alias `kw`); auto-binding considers public records only.
 - The agent maintains records via `list_people` / `upsert_person` MCP tools; a roster (names + aliases only) is injected into every system prompt.
 
-Private people records never enter group flows: excluded from group prompts, invisible to group-session tools, and file reads are blocked by the existing private-memory guard hook.
+Private people records never enter group flows: excluded from group prompts, invisible to group-session tools, and file reads are blocked by the existing private-memory guard hook. Group-originated transcript lines are annotated from public records only — even when a summon routes them into a `dm:` session, since the reply audience is still the group.
 
 ### System Prompt
 

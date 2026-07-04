@@ -199,6 +199,36 @@ export function findPersonByName(people: PersonRecord[], name: string): PersonRe
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+/** Collapse a display name to its letters/numbers (any script) so decorated
+ *  profile names ("kw 🚀", "阿丽✨") can match a plain alias. */
+function strippedName(name: string): string {
+  return name.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/g, " ");
+}
+
+/** Refuse to fuzzy-match on a single character — "K." matching alias "k"
+ *  is far more likely to be a different person than a decoration. */
+const MIN_STRIPPED_MATCH_CHARS = 2;
+
+/**
+ * Display-name resolution for wire names: exact name/alias match first; when
+ * nothing matches exactly, fall back to comparing with decorations (emoji,
+ * symbols, punctuation) stripped from BOTH sides. Each stage requires a
+ * unique match — an exact-stage ambiguity does not fall through to the
+ * looser stage. Deliberately NOT used by upsertPerson, whose `match` must
+ * stay exact so the tool never fuzzy-edits the wrong record.
+ */
+export function findPersonByDisplayName(people: PersonRecord[], name: string): PersonRecord | undefined {
+  const exact = findPeopleByName(people, name);
+  if (exact.length > 0) return exact.length === 1 ? exact[0] : undefined;
+
+  const target = strippedName(name);
+  if (target.length < MIN_STRIPPED_MATCH_CHARS) return undefined;
+  const stripped = people.filter(
+    (p) => strippedName(p.name) === target || p.aliases.some((a) => strippedName(a) === target),
+  );
+  return stripped.length === 1 ? stripped[0] : undefined;
+}
+
 /** Resolve a sender to a person: stable handle first, then unambiguous name/alias. */
 export function resolveSender(
   people: PersonRecord[],
@@ -210,7 +240,7 @@ export function resolveSender(
     const byHandle = findPersonByHandle(people, channel, senderId);
     if (byHandle) return byHandle;
   }
-  return findPersonByName(people, senderName);
+  return findPersonByDisplayName(people, senderName);
 }
 
 /**
@@ -346,6 +376,13 @@ export function upsertPerson(
  * their friends' Telegram user ids offhand. A person that already has a
  * different handle bound keeps it (guards against a second person adopting
  * an existing friend's display name).
+ *
+ * Binding fires on group traffic, so candidates are PUBLIC records only — a
+ * group display-name collision must never mutate a private (DM-only) record.
+ * The "already bound?" pre-check still scans private records, so an id owned
+ * by a private person can't get double-bound onto a same-named public one.
+ * Consequence: private records never auto-bind; their handles are set
+ * explicitly via upsert_person from a DM.
  */
 export function autoBindHandle(
   channel: string,
@@ -354,13 +391,11 @@ export function autoBindHandle(
   dirs?: PeopleDirs,
 ): PersonRecord | undefined {
   try {
-    const people = loadPeople({ includePrivate: true, dirs });
-    if (findPersonByHandle(people, channel, senderId)) return undefined;
     if (!(HANDLE_CHANNELS as readonly string[]).includes(channel)) return undefined;
-    const matches = findPeopleByName(people, senderName);
-    if (matches.length !== 1) return undefined;
-    const person = matches[0];
-    if (person.handles[channel]) return undefined;
+    const all = loadPeople({ includePrivate: true, dirs });
+    if (findPersonByHandle(all, channel, senderId)) return undefined;
+    const person = findPersonByDisplayName(all.filter((p) => !p.isPrivate), senderName);
+    if (!person || person.handles[channel]) return undefined;
     person.handles[channel] = normalizeHandle(channel, senderId);
     savePersonRecord(person);
     log.info({ person: person.name, channel, senderId }, "Auto-bound sender handle to person record");
@@ -407,7 +442,7 @@ export function renderParticipantLabels(opts: {
     for (const n of names) covered.add(n);
     const person =
       findPersonByHandle(people, channelName, senderId) ??
-      names.map((n) => findPersonByName(people, n)).find(Boolean);
+      names.map((n) => findPersonByDisplayName(people, n)).find(Boolean);
     if (person) {
       if (labeledPeople.has(person)) continue;
       labeledPeople.add(person);
@@ -417,7 +452,7 @@ export function renderParticipantLabels(opts: {
 
   for (const name of participants) {
     if (covered.has(name)) continue;
-    const person = findPersonByName(people, name);
+    const person = findPersonByDisplayName(people, name);
     if (person) {
       if (labeledPeople.has(person)) continue;
       labeledPeople.add(person);

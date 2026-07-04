@@ -58,7 +58,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
         "",
         "Use whenever you learn identity facts: a new nickname (\"kw is Kevin\"), a person's real name, or notes worth keeping about them. Aliases are merged into the existing list unless `replace_aliases` is set; `notes` replaces the record's freeform body when provided.",
         "",
-        "Channel handles (telegram user id, imessage address) are bound automatically by the harness when a matching sender appears in a chat — only pass `telegram`/`imessage` to correct a wrong binding.",
+        "Channel handles (telegram user id, imessage address) are bound automatically by the harness when a matching sender appears in a group chat — but only for public records. Pass `telegram`/`imessage` to correct a wrong binding or to bind a private record's handles (auto-binding never touches private records).",
       ].join("\n"),
       {
         name: z.string().min(1).max(200).describe(

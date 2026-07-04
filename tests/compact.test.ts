@@ -34,6 +34,14 @@ function mkAssistantEvent(parentUuid: string | null, ts: string, text: string) {
   };
 }
 
+function mkSummaryEvent(parentUuid: string | null, ts: string, text: string, blockTag?: string) {
+  return {
+    ...mkUserEvent(parentUuid, ts, text),
+    isCompactSummary: true,
+    ...(blockTag ? { blockTag } : {}),
+  };
+}
+
 describe("checkAndClearCompactTrigger", () => {
   let sdkSessionsDir: string;
   let sessionId: string;
@@ -238,6 +246,8 @@ describe("compactSession", () => {
       sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
+      expectedFirstUuid: events[1].uuid,
+      expectedLastUuid: events[3].uuid,
       summary: "compacted middle",
       transcriptPath: archivePath,
     });
@@ -251,6 +261,149 @@ describe("compactSession", () => {
     expect(out[1].isCompactSummary).toBe(true);
     // Chain still walks: event 4's parent should now be the summary
     expect(out[2].parentUuid).toBe(out[1].uuid);
+  });
+
+  it("aborts cleanly when the first range anchor is stale", () => {
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0
+        ? mkUserEvent(parent, ts, `msg ${i}`)
+        : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    const initialContent = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, initialContent);
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      expectedFirstUuid: randomUUID(),
+      expectedLastUuid: events[3].uuid,
+      summary: "should not be applied",
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Range anchors moved (file rewritten since range resolution); re-resolve the range and retry");
+    expect(readFileSync(path, "utf-8")).toBe(initialContent);
+    expect(existsSync(archivePath)).toBe(false);
+  });
+
+  it("verifies the last range anchor when it is the only anchor provided", () => {
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0
+        ? mkUserEvent(parent, ts, `msg ${i}`)
+        : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    const initialContent = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, initialContent);
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      expectedLastUuid: randomUUID(),
+      summary: "should not be applied",
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Range anchors moved (file rewritten since range resolution); re-resolve the range and retry");
+    expect(readFileSync(path, "utf-8")).toBe(initialContent);
+    expect(existsSync(archivePath)).toBe(false);
+  });
+
+  it("aborts cleanly when blockTag expansion would swallow another summary block", () => {
+    const oldMonthly = mkSummaryEvent(null, "2026-04-30T00:00:00.000Z", "old April", "monthly 2026-04");
+    const dailyMay = mkSummaryEvent(oldMonthly.uuid, "2026-05-01T00:00:00.000Z", "May day", "daily 2026-05-01");
+    const raw1 = mkUserEvent(dailyMay.uuid, "2026-05-02T00:00:00.000Z", "raw 1");
+    const raw2 = mkAssistantEvent(raw1.uuid, "2026-05-02T00:01:00.000Z", "raw 2");
+    const events = [oldMonthly, dailyMay, raw1, raw2];
+    mkdirSync(dirname(path), { recursive: true });
+    const initialContent = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, initialContent);
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 2,
+      toIdx: 3,
+      summary: "should not be applied",
+      transcriptPath: archivePath,
+      blockTag: "monthly 2026-04",
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('unrelated summary block "daily 2026-05-01"');
+    expect(readFileSync(path, "utf-8")).toBe(initialContent);
+    expect(existsSync(archivePath)).toBe(false);
+  });
+
+  it("still expands across a blockTag gap that contains only raw events", () => {
+    const oldMonthly = mkSummaryEvent(null, "2026-04-30T00:00:00.000Z", "old April", "monthly 2026-04");
+    const gap1 = mkUserEvent(oldMonthly.uuid, "2026-05-01T00:00:00.000Z", "raw gap 1");
+    const gap2 = mkAssistantEvent(gap1.uuid, "2026-05-01T00:01:00.000Z", "raw gap 2");
+    const raw1 = mkUserEvent(gap2.uuid, "2026-05-02T00:00:00.000Z", "raw 1");
+    const raw2 = mkAssistantEvent(raw1.uuid, "2026-05-02T00:01:00.000Z", "raw 2");
+    const events = [oldMonthly, gap1, gap2, raw1, raw2];
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 3,
+      toIdx: 4,
+      summary: "rebuilt April",
+      transcriptPath: archivePath,
+      blockTag: "monthly 2026-04",
+    });
+
+    expect(result.success).toBe(true);
+    const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(out).toHaveLength(1);
+    expect(out[0].isCompactSummary).toBe(true);
+    expect(out[0].blockTag).toBe("monthly 2026-04");
+    expect(out[0].message.content).toContain("[monthly 2026-04");
+  });
+
+  it("allows differently tagged summary blocks inside the requested range", () => {
+    const daily1 = mkSummaryEvent(null, "2026-05-04T00:00:00.000Z", "Mon", "daily 2026-05-04");
+    const daily2 = mkSummaryEvent(daily1.uuid, "2026-05-05T00:00:00.000Z", "Tue", "daily 2026-05-05");
+    const rawAfter = mkUserEvent(daily2.uuid, "2026-05-06T00:00:00.000Z", "after");
+    const events = [daily1, daily2, rawAfter];
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 0,
+      toIdx: 1,
+      summary: "weekly rollup",
+      transcriptPath: archivePath,
+      blockTag: "weekly 2026-W19",
+    });
+
+    expect(result.success).toBe(true);
+    const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(out).toHaveLength(2);
+    expect(out[0].isCompactSummary).toBe(true);
+    expect(out[0].blockTag).toBe("weekly 2026-W19");
+    expect(out[1].uuid).toBe(rawAfter.uuid);
   });
 
   it("aborts (does not rename) when the file ends in a partial SDK write", () => {

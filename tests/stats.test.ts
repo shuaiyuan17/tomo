@@ -77,7 +77,12 @@ describe("resolveTimeRange", () => {
     writeEvents(events);
 
     const r = resolveTimeRange(sessionId, "2026-04-30", "2026-04-30", sdkSessionsDir);
-    expect(r).toEqual({ fromIdx: 1, toIdx: 2 });
+    expect(r).toEqual({
+      fromIdx: 1,
+      toIdx: 2,
+      firstUuid: events[1].uuid,
+      lastUuid: events[2].uuid,
+    });
   });
 
   it("still parses timezone-less datetimes as local time", () => {
@@ -89,7 +94,12 @@ describe("resolveTimeRange", () => {
     writeEvents(events);
 
     const r = resolveTimeRange(sessionId, "2026-04-30T09:00", "2026-04-30T11:00", sdkSessionsDir);
-    expect(r).toEqual({ fromIdx: 1, toIdx: 1 });
+    expect(r).toEqual({
+      fromIdx: 1,
+      toIdx: 1,
+      firstUuid: events[1].uuid,
+      lastUuid: events[1].uuid,
+    });
   });
 
   it("returns null for unparseable boundaries", () => {

@@ -49,6 +49,15 @@ export interface CompactRequest {
    * refresh, re-running a weekly rollup, etc).
    */
   blockTag?: string;
+  /**
+   * Expected UUIDs of the events at fromIdx/toIdx, captured at range-resolution
+   * time. If the file was rewritten between resolution and this call (e.g. two
+   * compacts chained in one turn), conversation indices shift; a mismatch here
+   * aborts instead of compacting the wrong events. Undefined anchors skip the
+   * check (back-compat / anchor event had no uuid).
+   */
+  expectedFirstUuid?: string;
+  expectedLastUuid?: string;
   /** @internal Test hook for simulating SDK appends in the final pre-rename window. */
   beforeRenameForTest?: () => void;
   /** @internal Test hook for simulating SDK writes through a pre-rename fd. */
@@ -133,6 +142,30 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   let removeStartGlobal = convIndices[req.fromIdx];
   let removeEndGlobal = convIndices[req.toIdx];
 
+  if (
+    (req.expectedFirstUuid && allEvents[removeStartGlobal].uuid !== req.expectedFirstUuid) ||
+    (req.expectedLastUuid && allEvents[removeEndGlobal].uuid !== req.expectedLastUuid)
+  ) {
+    log.warn({
+      sessionId: req.sdkSessionId,
+      fromIdx: req.fromIdx,
+      toIdx: req.toIdx,
+      expectedFirstUuid: req.expectedFirstUuid,
+      actualFirstUuid: allEvents[removeStartGlobal].uuid,
+      expectedLastUuid: req.expectedLastUuid,
+      actualLastUuid: allEvents[removeEndGlobal].uuid,
+    }, "Compact aborted: range anchors moved");
+    return {
+      success: false,
+      eventsRemoved: 0,
+      eventsAfter: allEvents.length,
+      error: "Range anchors moved (file rewritten since range resolution); re-resolve the range and retry",
+    };
+  }
+
+  const origStartGlobal = removeStartGlobal;
+  const origEndGlobal = removeEndGlobal;
+
   // Rebuild semantics: if blockTag matches an existing summary event, expand
   // the range to include it so the new summary replaces the old in place.
   if (req.blockTag) {
@@ -141,6 +174,34 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
         if (i < removeStartGlobal) removeStartGlobal = i;
         if (i > removeEndGlobal) removeEndGlobal = i;
       }
+    }
+
+    const gapConflict = findUnrelatedSummaryInExpansionGap(
+      allEvents,
+      req.blockTag,
+      removeStartGlobal,
+      removeEndGlobal,
+      origStartGlobal,
+      origEndGlobal,
+    );
+    if (gapConflict) {
+      log.warn({
+        sessionId: req.sdkSessionId,
+        blockTag: req.blockTag,
+        conflictTag: gapConflict.tag,
+        conflictIndex: gapConflict.index,
+        leftGapStart: removeStartGlobal,
+        leftGapEnd: origStartGlobal - 1,
+        rightGapStart: origEndGlobal + 1,
+        rightGapEnd: removeEndGlobal,
+      }, "Compact aborted: blockTag expansion would swallow unrelated summary block");
+      return {
+        success: false,
+        eventsRemoved: 0,
+        eventsAfter: allEvents.length,
+        error: `blockTag expansion would swallow unrelated summary block "${gapConflict.tag}" at index ${gapConflict.index}; ` +
+          "adjust the time range to include it explicitly or drop --block-tag",
+      };
     }
   }
 
@@ -330,6 +391,35 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     eventsRemoved,
     eventsAfter,
   };
+}
+
+function findUnrelatedSummaryInExpansionGap(
+  events: SdkEvent[],
+  blockTag: string,
+  removeStartGlobal: number,
+  removeEndGlobal: number,
+  origStartGlobal: number,
+  origEndGlobal: number,
+): { index: number; tag: string } | null {
+  for (let i = removeStartGlobal; i < origStartGlobal; i++) {
+    const conflict = unrelatedSummaryConflict(events[i], blockTag, i);
+    if (conflict) return conflict;
+  }
+  for (let i = origEndGlobal + 1; i <= removeEndGlobal; i++) {
+    const conflict = unrelatedSummaryConflict(events[i], blockTag, i);
+    if (conflict) return conflict;
+  }
+  return null;
+}
+
+function unrelatedSummaryConflict(
+  event: SdkEvent,
+  blockTag: string,
+  index: number,
+): { index: number; tag: string } | null {
+  if (!event.isCompactSummary) return null;
+  if (event.blockTag === blockTag) return null;
+  return { index, tag: event.blockTag ?? "legacy" };
 }
 
 /**

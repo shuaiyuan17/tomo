@@ -4,10 +4,18 @@ import { readJsonlFileSync } from "../jsonl.js";
 
 interface SdkEvent {
   type?: string;
+  uuid?: string;
   timestamp?: string;
   message?: {
     content?: unknown;
   };
+}
+
+export interface ResolvedTimeRange {
+  fromIdx: number;
+  toIdx: number;
+  firstUuid?: string;
+  lastUuid?: string;
 }
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -56,7 +64,7 @@ export function resolveTimeRange(
   fromTime: string,
   toTime: string,
   sdkSessionsDir: string,
-): { fromIdx: number; toIdx: number } | null {
+): ResolvedTimeRange | null {
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;
 
@@ -68,20 +76,26 @@ export function resolveTimeRange(
   let convIdx = 0;
   let firstIdx = -1;
   let lastIdx = -1;
+  let firstUuid: string | undefined;
+  let lastUuid: string | undefined;
 
   for (const e of events) {
     if (e.type !== "user" && e.type !== "assistant") continue;
 
     const tsMs = e.timestamp ? new Date(e.timestamp).getTime() : NaN;
     if (Number.isFinite(tsMs) && tsMs >= fromMs && tsMs <= toMs) {
-      if (firstIdx === -1) firstIdx = convIdx;
+      if (firstIdx === -1) {
+        firstIdx = convIdx;
+        firstUuid = e.uuid;
+      }
       lastIdx = convIdx;
+      lastUuid = e.uuid;
     }
     convIdx++;
   }
 
   if (firstIdx === -1) return null;
-  return { fromIdx: firstIdx, toIdx: lastIdx };
+  return { fromIdx: firstIdx, toIdx: lastIdx, firstUuid, lastUuid };
 }
 
 export interface ContextSection {

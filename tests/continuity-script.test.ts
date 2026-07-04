@@ -87,6 +87,8 @@ describe("ContinuityRunner", () => {
 
     expect(handleContinuity).toHaveBeenCalledTimes(1);
     const prompt = handleContinuity.mock.calls[0][0] as string;
+    expect(prompt).toMatch(/^<tomo-event type="heartbeat" ts="[^"]+">/);
+    expect(prompt.trimEnd()).toMatch(/<\/tomo-event>$/);
     expect(prompt).toContain("Read CONTINUITY.md");
     expect(prompt).toContain("Continuity script result:");
     expect(prompt).toContain("runner-output");

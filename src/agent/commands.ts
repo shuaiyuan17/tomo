@@ -16,6 +16,7 @@ import {
   liteLlmModeLabel,
 } from "../litellm.js";
 import { log } from "../logger.js";
+import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
 import { ClaudeLoginManager } from "./claude-login.js";
 
@@ -258,7 +259,11 @@ export class ChatCommandHandler {
       this.deps.router.dismissGroup(channel.name, chatId);
       this.deps.queuePendingNote(
         `dm:${summoned}`,
-        `[System: You have been dismissed from the group "${groupLabel}" — its messages no longer reach this session, and the group's own Tomo session has taken back over.]`,
+        formatTomoEvent(
+          "dismiss",
+          `You have been dismissed from the group "${groupLabel}" — its messages no longer reach this session, and the group's own Tomo session has taken back over.`,
+          { name: rawKey },
+        ),
       );
       await channel.send({ chatId, text: "Handed back to this group's own Tomo session." });
       return;
@@ -283,7 +288,11 @@ export class ChatCommandHandler {
       : "";
     this.deps.queuePendingNote(
       `dm:${identity.name.toLowerCase()}`,
-      `[System: ${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed${expiryNote}, messages from that group arrive in this session tagged [group ...] with the sender's name. To reply in the group, call send_message with mode "direct" and target "${rawKey}" — compose the reply yourself, with your context. Plain text you output goes to ${identity.name}'s private DM, not the group. Everyone in the group can read what you send it — keep private memory and DM context out of group-facing messages.]`,
+      formatTomoEvent(
+        "summon",
+        `${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed${expiryNote}, messages from that group arrive in this session tagged [group ...] with the sender's name. To reply in the group, call send_message with mode "direct" and target "${rawKey}" — compose the reply yourself, with your context. Plain text you output goes to ${identity.name}'s private DM, not the group. Everyone in the group can read what you send it — keep private memory and DM context out of group-facing messages.`,
+        { name: rawKey },
+      ),
     );
     log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
     await channel.send({

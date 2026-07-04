@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { CronScheduler } from "../src/cron/scheduler.js";
 import { CronStore } from "../src/cron/store.js";
+import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -183,5 +184,31 @@ describe("CronScheduler", () => {
     // A failed run still reschedules — transient agent errors shouldn't
     // silently kill a recurring job.
     expect(jobs.find((j) => j.name === "job-fail")?.nextRunAt).toBeGreaterThan(Date.now());
+  });
+
+  it("delivers the trigger as a cron tomo-event envelope (round-trip)", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "daily-backup",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "Run the backup.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const fakeAgent = {
+      handleCronMessage: vi.fn(() => Promise.resolve(true)),
+    } as unknown as Agent;
+
+    const scheduler = new CronScheduler(fakeAgent, store);
+    await tick(scheduler);
+
+    const [msg] = (fakeAgent.handleCronMessage as ReturnType<typeof vi.fn>).mock.calls[0] as [string];
+    const parsed = parseTomoEvent(msg);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe("cron");
+    expect(parsed!.name).toBe("daily-backup");
+    expect(parsed!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
+    expect(parsed!.body).toBe('Scheduled task "daily-backup" triggered. Run the backup.');
   });
 });

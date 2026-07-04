@@ -31,6 +31,7 @@ import { TurnRunner, embeddedSilentMatcher, type RunWithRetryRequest } from "./a
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
+import { formatTomoEvent } from "./tomo-event.js";
 import { pruneTools } from "./lcm/index.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
@@ -380,7 +381,11 @@ export class Agent {
     const groupLabel = this.sessions.getEntry(rawKey)?.chatTitle ?? rawKey;
     this.queuePendingNote(
       `dm:${identity}`,
-      `[System: Your summon into the group "${groupLabel}" expired after inactivity — its messages no longer reach this session; the group's own Tomo session has taken back over.]`,
+      formatTomoEvent(
+        "summon-expired",
+        `Your summon into the group "${groupLabel}" expired after inactivity — its messages no longer reach this session; the group's own Tomo session has taken back over.`,
+        { name: rawKey },
+      ),
     );
     if (!notifyGroup) return;
     const channel = this.getChannel(channelName);
@@ -397,7 +402,10 @@ export class Agent {
    */
   private summonReminder(targets: string[]): string {
     const list = targets.map((t) => `"${t}"`).join(", ");
-    return `[System: summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them.]`;
+    return formatTomoEvent(
+      "summon-reminder",
+      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them.`,
+    );
   }
 
   /** Audience-switch prefix for a dm session turn (see agent/audience.ts).
@@ -689,8 +697,11 @@ export class Agent {
     const groupNote = isGroupSessionKey(key)
       ? " This is a group session — scope the rollup to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
       : "";
-    const compactNudgeText = () =>
-      `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+    const compactNudgeText = () => formatTomoEvent(
+      "context-nudge",
+      `Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+      { name: "compact" },
+    );
 
     let nudge: string;
     if (decision.kind === "compact") {
@@ -701,10 +712,18 @@ export class Agent {
         log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
       }
     } else if (decision.kind === "daily") {
-      nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+      nudge = formatTomoEvent(
+        "context-nudge",
+        `Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+        { name: "daily" },
+      );
       log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
     } else if (decision.kind === "prune") {
-      nudge = `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Bulky tool results are holding roughly ${prunableTokens} reclaimable tokens. Run \`tomo lcm prune-tools --session-id ${sid}\` to stub them out — this is cheaper than a rollup and loses nothing conversational.${groupNote} After it finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+      nudge = formatTomoEvent(
+        "context-nudge",
+        `Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Bulky tool results are holding roughly ${prunableTokens} reclaimable tokens. Run \`tomo lcm prune-tools --session-id ${sid}\` to stub them out — this is cheaper than a rollup and loses nothing conversational.${groupNote} After it finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+        { name: "prune" },
+      );
       log.info({ key, usedPct: `${pct}%`, prunableTokens }, "Context nudge (agent should run lcm prune-tools)");
     } else {
       return;
@@ -1170,7 +1189,7 @@ export class Agent {
       try { unlinkSync(RESTART_REASON_FILE); } catch { /* ignore */ }
       if (reason) {
         log.info({ reason }, "Restart reason found, notifying agent");
-        this.handleContinuity(`System: Restarted. Reason: ${reason}`).catch((err) =>
+        this.handleContinuity(formatTomoEvent("restart", `Restarted. Reason: ${reason}`)).catch((err) =>
           log.error({ err }, "Failed to send restart reason")
         );
       }

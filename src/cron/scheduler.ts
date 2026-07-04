@@ -2,6 +2,7 @@ import { CronStore } from "./store.js";
 import type { CronJob } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
+import { formatTomoEvent } from "../tomo-event.js";
 
 const POLL_INTERVAL_MS = 30_000; // Check every 30s
 
@@ -65,7 +66,11 @@ export class CronScheduler {
     log.info({ jobId: job.id, name: job.name }, "Cron triggered: %s", job.message);
 
     try {
-      const cronMessage = `System: Scheduled task "${job.name}" triggered. ${job.message}`;
+      const cronMessage = formatTomoEvent(
+        "cron",
+        `Scheduled task "${job.name}" triggered. ${job.message}`,
+        { name: job.name },
+      );
       // handleCronMessage never rejects — it reports the turn's outcome so
       // real agent failures land in lastStatus instead of reading as "ok".
       const ok = await this.agent.handleCronMessage(cronMessage, job.sessionKey);

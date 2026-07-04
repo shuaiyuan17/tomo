@@ -22,8 +22,9 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("suppresses delivery");
   });
 
-  it("includes System: prefix instruction in harness", () => {
+  it("includes harness-event envelope instruction in harness", () => {
     const prompt = buildSystemPrompt();
+    expect(prompt).toContain("<tomo-event");
     expect(prompt).toContain("System:");
     expect(prompt).toContain("harness, not a human");
   });

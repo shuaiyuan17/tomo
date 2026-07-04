@@ -3,6 +3,7 @@ import { log } from "../logger.js";
 import { STEER_MERGED } from "./live-session.js";
 import { ATTACHMENT_TAG_RE, isSilentReply } from "./text-utils.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
+import { filterScaffoldLeak } from "./scaffold-filter.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -179,17 +180,21 @@ export class TurnRunner {
     stopTyping: StopTyping,
   ): Promise<boolean> {
     const stream = delivery.channel.createStreamingMessage(delivery.chatId, delivery.replyToMessageId);
-    const response = await this.deps.runWithRetry({
+    const rawResponse = await this.deps.runWithRetry({
       key: spec.key,
       prompt,
-      onText: (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
+      // Filter scaffold leaks from streamed updates too — `text` is the
+      // block's cumulative text, so once a marker appears every subsequent
+      // draft edit stays truncated (logging happens once, on the response).
+      onText: (text) => stream.update(filterScaffoldLeak(text).text.replace(ATTACHMENT_TAG_RE, "").trim()),
       images: delivery.images,
       onBlockComplete: this.deps.delivery.makeBlockHandler(delivery.channel, delivery.chatId, stream),
       documents: delivery.documents,
       steer: delivery.steer,
     });
+    const response = this.applyScaffoldFilter(spec.key, rawResponse);
 
-    if (delivery.steer && response === STEER_MERGED) {
+    if (delivery.steer && rawResponse === STEER_MERGED) {
       // Steered message merged into the in-flight turn — that turn's owner
       // streams and records the combined reply; nothing to deliver here.
       await stopTyping({ clear: true });
@@ -219,7 +224,10 @@ export class TurnRunner {
     prompt: string,
     stopTyping: StopTyping,
   ): Promise<boolean> {
-    const response = await this.deps.runWithRetry({ key: spec.key, prompt });
+    const response = this.applyScaffoldFilter(
+      spec.key,
+      await this.deps.runWithRetry({ key: spec.key, prompt }),
+    );
     const silent = spec.silentMatcher(response);
     spec.logResponse?.(response);
 
@@ -291,5 +299,12 @@ export class TurnRunner {
 
   private resolveSendTarget(delivery: TurnDelivery): { channel: Channel; chatId: string } | undefined {
     return delivery.kind === "deferred-send" ? delivery.resolveTarget() : delivery;
+  }
+
+  /** Strip training-scaffold leaks from an outbound response (see scaffold-filter.ts). */
+  private applyScaffoldFilter(sessionKey: string, response: string): string {
+    const { text, filtered } = filterScaffoldLeak(response);
+    if (filtered) log.warn({ sessionKey }, "model scaffold leak filtered");
+    return text;
   }
 }

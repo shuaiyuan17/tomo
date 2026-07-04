@@ -91,7 +91,7 @@ Reply with exactly `NO_REPLY` to suppress delivery to the channel. Use for backg
 Every message includes a timestamp prefix like `[Mon 04/07 14:30 PDT]` so you always know the current time.
 
 ### System messages
-Messages prefixed with `System:` are from the harness (cron triggers, group context), not from a human.
+Harness-composed messages (cron triggers, heartbeats, group context) arrive wrapped in a `<tomo-event type="..." ts="...">` envelope. Legacy transcripts show them prefixed with `System:` or `[System: ...]` instead. Either way they are from the harness, not from a human.
 
 ### Group chats
 Two listen modes per group:

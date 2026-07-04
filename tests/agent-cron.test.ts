@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getSdkSessionPath } from "../src/sessions/index.js";
+import { getCompactTriggerPath } from "../src/lcm/compact.js";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -385,19 +386,22 @@ describe("compact nudges", () => {
     writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
   }
 
-  function seedDailyRollupSourceEvents(count = 40) {
+  function dailyRollupSourceEvents(count = 40) {
     const todayNoon = new Date();
     todayNoon.setHours(12, 0, 0, 0);
-    const events = Array.from({ length: count }, (_, i) => ({
+    return Array.from({ length: count }, (_, i) => ({
       type: "user",
       timestamp: new Date(todayNoon.getTime() + i * 1000).toISOString(),
       message: { role: "user", content: [{ type: "text", text: `event ${i}` }] },
     }));
-    writeSdkSessionEvents(events);
   }
 
-  function seedBulkyToolResult() {
-    writeSdkSessionEvents([
+  function seedDailyRollupSourceEvents(count = 40) {
+    writeSdkSessionEvents(dailyRollupSourceEvents(count));
+  }
+
+  function bulkyToolResultEvents() {
+    return [
       {
         type: "assistant",
         message: {
@@ -412,7 +416,16 @@ describe("compact nudges", () => {
           content: [{ type: "tool_result", tool_use_id: "tu1", content: "x".repeat(100_000) }],
         },
       },
-    ]);
+    ];
+  }
+
+  /** Simulate what `tomo lcm prune-tools` / `tomo lcm daily` do on disk:
+   *  write the compact trigger so the harness reloads the session. */
+  function writeCompactTrigger() {
+    writeFileSync(
+      getCompactTriggerPath("mock-sdk-session-123", join(agentEnv.tmpDir, "sdk-sessions")),
+      new Date().toISOString(),
+    );
   }
 
   it("queues exactly one housekeeping turn when a turn lands over the compact threshold", async () => {
@@ -458,10 +471,15 @@ describe("compact nudges", () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    seedBulkyToolResult();
+    writeSdkSessionEvents([...bulkyToolResultEvents(), ...dailyRollupSourceEvents()]);
+    // The prune housekeeping turn writes the compact trigger (as the real CLI
+    // does) but its own QueryResult still reports the PRE-prune usage — the
+    // in-memory session ran with the old context. Usage stays at 72% here on
+    // purpose: the harness must NOT decide the next rung on that stale
+    // reading, so no daily nudge may chain off the prune turn's completion.
     mockSdk.responseFn = (text) => {
       if (text.includes("prune-tools")) {
-        mockSdk.contextUsage = { totalTokens: 100_000, maxTokens: 200_000 };
+        writeCompactTrigger();
         return "NO_REPLY";
       }
       return "mock response";
@@ -473,7 +491,16 @@ describe("compact nudges", () => {
 
     await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
     expect(nudgePrompts()[0]).toContain("prune-tools");
-    expect(nudgePrompts()[0]).not.toContain("tomo lcm daily");
+    await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    // Next turn runs on the reloaded session and gives a FRESH reading. Still
+    // over the threshold → the prune latch escalates one rung to daily.
+    await tg.simulateMessage(makeMsg({ text: "Hi again" }));
+    await drainQueue(agent);
+
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(2));
+    expect(nudgePrompts()[1]).toContain("tomo lcm daily");
+    expect(nudgePrompts()[1]).not.toContain("prune-tools");
 
     await agent.stop();
   });

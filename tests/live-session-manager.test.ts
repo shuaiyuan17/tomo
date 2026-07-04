@@ -405,4 +405,19 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances[0].closed).toBe(true);
     expect(manager.isAlive("telegram:1")).toBe(false);
   });
+
+  it("skips the context-pressure check on the turn that compacted", async () => {
+    // The compact/prune rewrote the file mid-turn, but this turn's context
+    // reading was measured against the old in-memory session — it's stale-high.
+    // Nudging on it would falsely escalate the ladder (e.g. queue a daily
+    // rollup right after a prune that already freed enough space).
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.compactTriggered = true;
+    mockState.sendImpl = async () => "done";
+
+    await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+
+    expect(deps.maybeNudgeCompact).not.toHaveBeenCalled();
+  });
 });

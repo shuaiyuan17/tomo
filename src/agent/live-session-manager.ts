@@ -314,7 +314,8 @@ export class LiveSessionManager {
     // turn. With steering, a promoted steered turn may already be running
     // on this session — closing now would kill it, so defer the reload
     // until the session is truly idle.
-    if (sid && checkAndClearCompactTrigger(sid, config.sdkSessionsDir)) {
+    const compactedThisTurn = sid ? checkAndClearCompactTrigger(sid, config.sdkSessionsDir) : false;
+    if (compactedThisTurn) {
       if (session.isBusy()) {
         void session.waitForIdle().then(() => {
           if (this.liveSessions.get(key) === session) {
@@ -326,11 +327,19 @@ export class LiveSessionManager {
         this.closeLiveSession(key);
         log.info({ key }, "Session reloaded after compact");
       }
+      // Skip the context-pressure check for this turn: the compact/prune
+      // rewrote the file mid-turn, but this turn's QueryResult was measured
+      // against the OLD in-memory context, so its usage reading is stale-high.
+      // Deciding on it would falsely escalate the nudge ladder (e.g. queue a
+      // daily rollup right after a prune that already freed enough space).
+      // Staleness only ever reads high, so skipping can't miss a legitimate
+      // latch reset either — the next turn runs on the reloaded session and
+      // provides a fresh reading for both escalation and reset.
+      return;
     }
 
     // Fire-and-forget context-pressure check — don't block the current
-    // reply on the nudge. Pass this turn's result explicitly: the reload
-    // above may have already removed the session from liveSessions.
+    // reply on the nudge. Pass this turn's result explicitly.
     this.deps.maybeNudgeCompact(key, session.lastResult);
   }
 

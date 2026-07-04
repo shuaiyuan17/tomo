@@ -158,15 +158,33 @@ export function isWarmTailCandidate(e: SdkEvent): boolean {
   //   "[imessage · …] [User sent 2 messages …] real text"
   // strip down to "real text" → still correctly a candidate.
   let stripped = text;
+  // Whether the LAST thing stripped was specifically a harness event
+  // (<tomo-event> envelope or legacy [System: ...] note) as opposed to a
+  // generic bracketed prefix (channel stamp, "[User sent N messages …]",
+  // or a real message that just looks like "[ok]").
+  let lastStrippedWasHarness = false;
   for (let prev = ""; stripped !== prev; ) {
     prev = stripped;
-    stripped = stripped.replace(/^\[[^\]]*\]\s*/, "");
-    stripped = stripLeadingTomoEvents(stripped);
+    const isLegacyNote = stripped.startsWith("[System:");
+    const afterBracket = stripped.replace(/^\[[^\]]*\]\s*/, "");
+    if (afterBracket !== stripped) {
+      stripped = afterBracket;
+      lastStrippedWasHarness = isLegacyNote;
+      continue;
+    }
+    const afterEnvelope = stripLeadingTomoEvents(stripped);
+    if (afterEnvelope !== stripped) {
+      stripped = afterEnvelope;
+      lastStrippedWasHarness = true;
+    }
   }
   if (stripped.startsWith("System:")) return false;
-  // Nothing left after stripping harness envelopes/prefixes → the turn was
-  // pure harness injection (heartbeat/cron/notes), not conversation.
-  if (stripped.trim().length === 0) return false;
+  // Empty after stripping: the turn is pure harness injection ONLY when the
+  // final stripped element was a harness event (e.g. "[stamp] <tomo-event
+  // type=cron …>…" or a bare heartbeat envelope). A real message that strips
+  // to empty via generic brackets alone — "[ok]", "[stamp] [ok]" — is still
+  // conversation and must stay a candidate.
+  if (stripped.trim().length === 0) return !lastStrippedWasHarness;
   return true;
 }
 

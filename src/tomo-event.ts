@@ -54,6 +54,35 @@ function unescapeAttr(value: string): string {
     .replace(/&amp;/g, "&");
 }
 
+/**
+ * Body escaping: parts of the body are user-controlled (cron messages,
+ * direct-send echoes, delegate requests), and parsing/stripping resolves the
+ * envelope at the FIRST closing tag — so body text must never be able to
+ * close the envelope early. Only the closing-tag sequence is neutralized;
+ * everything else stays byte-identical so prompt readability is unaffected.
+ *
+ * The scheme is injective (round-trips exactly):
+ *   1. every `&` that heads a chain resolving to the escaped closer
+ *      (`&(amp;)*lt;/tomo-event>`) gains one more `&amp;` level, then
+ *   2. every literal `</tomo-event>` becomes `&lt;/tomo-event>`.
+ * After encoding, `&lt;/tomo-event>` can only mean an escaped closer, and the
+ * encoded body never contains a literal closer. A fake OPENING tag in the
+ * body is harmless: parseTomoEvent reads attributes from the envelope's own
+ * opening tag (anchored at the start) and the fake open tag simply rides
+ * along inside the body.
+ */
+function escapeBody(body: string): string {
+  return body
+    .replace(/&(?=(?:amp;)*lt;\/tomo-event>)/g, "&amp;")
+    .replace(/<\/tomo-event>/g, "&lt;/tomo-event>");
+}
+
+function unescapeBody(body: string): string {
+  return body
+    .replace(/&lt;\/tomo-event>/g, "</tomo-event>")
+    .replace(/&amp;(?=(?:amp;)*lt;\/tomo-event>)/g, "&");
+}
+
 /** ISO 8601 with the local UTC offset, e.g. "2026-07-04T09:15:02-07:00". */
 export function isoTimestampWithOffset(d: Date = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -69,11 +98,15 @@ export function isoTimestampWithOffset(d: Date = new Date()): string {
  * Format a harness event envelope. The single composer for ALL
  * harness-injected user-turn messages — producers must not hand-roll
  * `System:` / `[System: ...]` strings or `<tomo-event>` tags.
+ *
+ * Any literal `</tomo-event>` in the body is escaped (see escapeBody) so
+ * user-controlled body text can never close the envelope early;
+ * parseTomoEvent restores it exactly.
  */
 export function formatTomoEvent(type: TomoEventType, body: string, opts: TomoEventOptions = {}): string {
   const name = opts.name !== undefined ? ` name="${escapeAttr(opts.name)}"` : "";
   const ts = isoTimestampWithOffset(opts.ts);
-  return `<tomo-event type="${type}"${name} ts="${ts}">\n${body}\n</tomo-event>`;
+  return `<tomo-event type="${type}"${name} ts="${ts}">\n${escapeBody(body)}\n</tomo-event>`;
 }
 
 export interface ParsedTomoEvent {
@@ -83,8 +116,9 @@ export interface ParsedTomoEvent {
   body: string;
 }
 
-// One full envelope at the start of the text (body spans lines; envelopes
-// never nest, so non-greedy up to the first closing tag is correct).
+// One full envelope at the start of the text. Body spans lines; escapeBody
+// guarantees an encoded body never contains a literal closing tag, so
+// non-greedy up to the FIRST closing tag is always the envelope's own closer.
 const LEADING_ENVELOPE_RE = /^<tomo-event\b([^>]*)>\n?([\s\S]*?)\n?<\/tomo-event>/;
 
 function parseAttrs(raw: string): Map<string, string> {
@@ -111,7 +145,7 @@ export function parseTomoEvent(text: string): ParsedTomoEvent | null {
     type,
     ...(attrs.has("name") ? { name: attrs.get("name") } : {}),
     ...(attrs.has("ts") ? { ts: attrs.get("ts") } : {}),
-    body: m[2],
+    body: unescapeBody(m[2]),
   };
 }
 

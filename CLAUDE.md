@@ -23,6 +23,7 @@ src/
   cli/                # Subcommands: start, stop, config, init, etc.
   agent.ts            # Core Agent class — message routing, live sessions, channel management
   router.ts           # IdentityRouter — session key resolution, DM vs group, allowlists
+  people.ts           # People registry — person records, alias/handle resolution, auto-binding
   config.ts           # Config loading from ~/.tomo/config.json + env vars
   channels/           # Channel implementations (Telegram, iMessage/BlueBubbles)
     types.ts          # Channel interface: onMessage, send, startTyping, etc.
@@ -86,6 +87,17 @@ With config `steering` (default on), user messages that arrive while a turn is i
 3. Uses `parseChannelKey()` to skip groups
 
 Use this for system-level notifications (version updates, errors) that don't need AI processing.
+
+### People Registry (Group Sender Recognition)
+
+Person records live at `~/.tomo/workspace/memory/people/*.md` (DM-only records under `memory/private/people/`) — frontmatter holds `name`, `aliases`, and per-channel handles (`telegram` user id, `imessage` address); freeform notes below. Resolution is harness-side and deterministic (`src/people.ts`):
+
+- Channels attach a stable `senderId` to every `IncomingMessage`; the session registry tracks display names per id (`participantIds`), so profile renames stay one person.
+- Group transcript lines are annotated inline (`kw 🚀 (Kevin Wang): ...`) and the group system prompt lists participants resolved to canonical names + aliases.
+- Handles are auto-bound the first time a sender's display name unambiguously matches an unbound record (`autoBindHandle`) — users only ever write names/nicknames. Matching is exact-first with a decoration-stripped fallback ("kw 🚀" matches alias `kw`); auto-binding considers public records only.
+- The agent maintains records via `list_people` / `upsert_person` MCP tools; a roster (names + aliases only) is injected into every system prompt.
+
+Private people records never enter group flows: excluded from group prompts, invisible to group-session tools, and file reads are blocked by the existing private-memory guard hook. Group-originated transcript lines are annotated from public records only — even when a summon routes them into a `dm:` session, since the reply audience is still the group.
 
 ### System Prompt
 

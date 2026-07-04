@@ -105,6 +105,7 @@ export class TelegramChannel implements Channel {
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
+        senderId: this.getSenderId(ctx),
         text: this.cleanMention(ctx.message.text),
         timestamp: ctx.message.date * 1000,
         isGroup,
@@ -130,6 +131,7 @@ export class TelegramChannel implements Channel {
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
+        senderId: this.getSenderId(ctx),
         text,
         images: image ? [image] : undefined,
         timestamp: ctx.message.date * 1000,
@@ -157,6 +159,7 @@ export class TelegramChannel implements Channel {
           id: String(ctx.message.message_id),
           chatId: String(ctx.chat.id),
           senderName: this.getSenderName(ctx),
+          senderId: this.getSenderId(ctx),
           text: caption ? `${note} ${caption}` : note,
           timestamp: ctx.message.date * 1000,
           isGroup,
@@ -183,6 +186,7 @@ export class TelegramChannel implements Channel {
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
+        senderId: this.getSenderId(ctx),
         text,
         documents: document ? [document] : undefined,
         timestamp: ctx.message.date * 1000,
@@ -203,6 +207,7 @@ export class TelegramChannel implements Channel {
         id: String(ctx.message.message_id),
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
+        senderId: this.getSenderId(ctx),
         text: this.describeSticker({
           fileId: sticker.file_id,
           emoji: sticker.emoji,
@@ -222,6 +227,10 @@ export class TelegramChannel implements Channel {
   private getSenderName(ctx: Context): string {
     const from = ctx.from!;
     return from.first_name + (from.last_name ? ` ${from.last_name}` : "");
+  }
+
+  private getSenderId(ctx: Context): string | undefined {
+    return ctx.from ? String(ctx.from.id) : undefined;
   }
 
   private checkMentioned(ctx: Context): boolean {

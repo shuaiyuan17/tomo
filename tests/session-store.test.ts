@@ -224,6 +224,29 @@ describe("SessionStore", () => {
     expect(unlinked?.expiresAt).toBeTruthy();
   });
 
+  it("tracks display names per stable sender id", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.addParticipant("telegram:-987", "kw 🚀", "12345678");
+    store.addParticipant("telegram:-987", "kw 🚀", "12345678"); // duplicate — no-op
+    store.addParticipant("telegram:-987", "Kevin Wang", "12345678"); // profile rename
+    store.addParticipant("telegram:-987", "No Id Person");
+
+    const entry = store.getEntry("telegram:-987");
+    expect(entry?.participants).toEqual(["kw 🚀", "Kevin Wang", "No Id Person"]);
+    expect(entry?.participantIds).toEqual({ "12345678": ["kw 🚀", "Kevin Wang"] });
+  });
+
+  it("preserves participantIds when retiring a poisoned SDK session", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.addParticipant("telegram:-987", "Alice", "42");
+    store.setSdkSessionId("telegram:-987", "session-poisoned");
+
+    store.retireSdkSessionId("telegram:-987");
+
+    const active = store.getEntry("telegram:-987");
+    expect(active?.participantIds).toEqual({ "42": ["Alice"] });
+  });
+
   it("migrates pending notes with a unified session key", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setSdkSessionId("telegram:111", "session-old");

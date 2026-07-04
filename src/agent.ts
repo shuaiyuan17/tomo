@@ -13,6 +13,7 @@ import {
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { IdentityRouter, type SessionResolution } from "./router.js";
+import { annotateSenderName, autoBindHandle, loadPeople, renderParticipantLabels } from "./people.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
@@ -249,9 +250,24 @@ export class Agent {
     if (!isGroupSessionKey(sessionKey)) return undefined;
     const parsed = parseRawSessionKey(sessionKey);
     const entry = this.sessions.getEntry(sessionKey);
+
+    // Resolve raw sender names against the people registry so the prompt
+    // shows canonical identities ("Kevin Wang (aka: kw; appears as ...)")
+    // instead of whatever display string each provider sent. Private people
+    // records are never loaded for group sessions.
+    let participants: string[] | undefined;
+    if (parsed && entry?.participants && entry.participants.length > 0) {
+      participants = renderParticipantLabels({
+        channelName: parsed.channelName,
+        participants: entry.participants,
+        participantIds: entry.participantIds,
+        people: loadPeople({ includePrivate: false }),
+      });
+    }
+
     return {
       ...(entry?.chatTitle ? { chatTitle: entry.chatTitle } : {}),
-      ...(entry?.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
+      ...(participants && participants.length > 0 ? { participants } : {}),
       isPassive: parsed ? this.isPassiveListenGroup(parsed.channelName, parsed.chatId) : false,
     };
   }
@@ -815,7 +831,7 @@ export class Agent {
     if (isGroup) {
       // Track group metadata under the raw group key even while summoned, so
       // the group's own session entry stays fresh for when it takes back over.
-      this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle);
+      this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId);
     }
     this.recordLatestInboundMessage(key, channel, message);
 
@@ -893,7 +909,7 @@ export class Agent {
     const replyChatId = resolution.replyTarget.chatId;
 
     for (const { channel, message } of items) {
-      if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle);
+      if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId);
       this.recordLatestInboundMessage(key, channel, message);
       const transcriptText = this.formatGroupText(channel, message, key);
       this.sessions.append(key, {
@@ -957,7 +973,14 @@ export class Agent {
    */
   private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
     if (!message.isGroup) return message.text;
-    const prefixed = `${message.senderName}: ${message.text}`;
+    // Resolve the sender against the people registry so every group line
+    // carries the identity join inline: `kw 🚀 (Kevin Wang): ...`. Public
+    // records only, even when a summon routes this line into a dm: session —
+    // the reply audience is still the group, and a harness-stitched private
+    // canonical name would sit right next to the content being answered.
+    const people = loadPeople({ includePrivate: false });
+    const sender = annotateSenderName(people, channel.name, message.senderName, message.senderId);
+    const prefixed = `${sender}: ${message.text}`;
     if (!isDmSessionKey(sessionKey)) return prefixed;
     const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
     return `[group${label ? ` "${label}"` : ""}] ${prefixed}`;
@@ -967,9 +990,15 @@ export class Agent {
    *  (passive listen, NO_REPLY guidance, participant snapshot) are now part of
    *  the system prompt — see SessionContext.group in sdkOptions — so they
    *  survive compaction. This stays as pure persistence; no LLM injection. */
-  private updateGroupContext(key: string, senderName: string, chatTitle?: string): void {
-    this.sessions.addParticipant(key, senderName);
+  private updateGroupContext(key: string, senderName: string, chatTitle?: string, senderId?: string): void {
+    this.sessions.addParticipant(key, senderName, senderId);
     if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
+    // Learn stable-id bindings for the people registry as senders appear —
+    // no-op unless the display name unambiguously matches an unbound record.
+    if (senderId) {
+      const parsed = parseRawSessionKey(key);
+      if (parsed) autoBindHandle(parsed.channelName, senderId, senderName);
+    }
   }
 
   /** Handle a cron-triggered message (queued per session key). Resolves true

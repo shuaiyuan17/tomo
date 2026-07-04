@@ -5,6 +5,8 @@ import type { Agent } from "../agent.js";
 import { buildCronTools } from "./cron-tools.js";
 import { buildPetTools } from "./pet-tools.js";
 import { buildRecallTools } from "./recall-tools.js";
+import { buildPeopleTools } from "./people-tools.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 
@@ -176,6 +178,9 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ),
       ...buildCronTools(),
       ...buildPetTools(),
+      // Group sessions never see private people records through these tools —
+      // same boundary as the private memory subtree they live in.
+      ...buildPeopleTools({ includePrivate: !isGroupSessionKey(callerSessionKey) }),
       // Bound to the calling session's key: recall can only read the caller's
       // own transcript, so group sessions cannot search DM history.
       ...buildRecallTools({ search: (opts) => agent.searchSessionTranscript(callerSessionKey, opts) }),

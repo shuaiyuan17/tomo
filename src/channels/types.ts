@@ -25,6 +25,13 @@ export interface IncomingMessage {
   chatId: string;
   /** Display name of the sender */
   senderName: string;
+  /**
+   * Provider-verified stable sender identifier (Telegram user id, normalized
+   * iMessage handle address). Unlike `senderName` it survives profile renames
+   * and is safe to key identity resolution on. Absent when the provider did
+   * not expose a sender handle.
+   */
+  senderId?: string;
   /** Message text content */
   text: string;
   /** Optional image attachments */

@@ -84,9 +84,12 @@ export function sdkOptions(
       lines.push("## Group Chat Context");
       if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
       if (g.participants && g.participants.length > 0) {
-        lines.push(`- Known participants: ${g.participants.join(", ")} (more may join later — you'll see new senders prefixed in incoming messages)`);
+        lines.push("- Known participants (more may join later — you'll see new senders prefixed in incoming messages):");
+        for (const p of g.participants) {
+          lines.push(`  - ${p}`);
+        }
       }
-      lines.push("- Messages from each sender are prefixed with their name (e.g. `Alice: ...`).");
+      lines.push("- Messages from each sender are prefixed with their name (e.g. `Alice: ...`). When a sender is matched to a person in your PEOPLE registry, the canonical name is appended in parentheses (e.g. `kw 🚀 (Kevin Wang): ...`) — treat them as the same person.");
       if (g.isPassive) {
         lines.push("- **Listen mode: passive.** You see every message in this group; no @mention is required to address you. Reply only when you have something genuinely useful to add — reply `NO_REPLY` to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.");
       } else {
@@ -137,6 +140,8 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_list`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_remove`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__recall_conversation`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__list_people`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__upsert_person`,
       ...externalMcpAllowedTools,
     ],
     // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path

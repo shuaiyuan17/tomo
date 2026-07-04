@@ -467,6 +467,9 @@ export class BlueBubblesChannel implements Channel {
       id: guid,
       chatId: chatGuid,
       senderName,
+      // Normalized so the same person matches whether BlueBubbles reports
+      // "+1 (415) 555-1234" or "+14155551234" across restarts.
+      senderId: handle?.address ? this.normalizeAddress(senderAddress) : undefined,
       text: composedText,
       images: images.length > 0 ? images : undefined,
       documents: documents.length > 0 ? documents : undefined,

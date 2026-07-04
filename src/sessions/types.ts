@@ -73,6 +73,13 @@ export interface SessionEntry {
   chatTitle?: string;
   /** Known participants (sender names seen) — used to disambiguate groups. */
   participants?: string[];
+  /**
+   * Stable sender id → display names seen for that id (oldest first). Joins
+   * a renamed profile back to the same human and keys people-registry
+   * resolution. Names arriving without a sender id only appear in
+   * `participants`.
+   */
+  participantIds?: Record<string, string[]>;
 }
 
 export interface SessionRegistry {

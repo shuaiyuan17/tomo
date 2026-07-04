@@ -465,6 +465,7 @@ export class SessionStore {
       ...(entry.replyTarget ? { replyTarget: entry.replyTarget } : {}),
       ...(entry.chatTitle ? { chatTitle: entry.chatTitle } : {}),
       ...(entry.participants ? { participants: [...entry.participants] } : {}),
+      ...(entry.participantIds ? { participantIds: structuredClone(entry.participantIds) } : {}),
     });
 
     this.saveRegistry();
@@ -548,13 +549,28 @@ export class SessionStore {
     }
   }
 
-  /** Add a participant name to a session. No-op if already present. */
-  addParticipant(key: string, name: string): void {
+  /** Add a participant name (and, when known, its stable sender id) to a
+   *  session. No-op if nothing new was learned. */
+  addParticipant(key: string, name: string, senderId?: string): void {
     const entry = this.ensureActiveEntry(key);
+    let changed = false;
+
     const list = entry.participants ?? [];
-    if (list.includes(name)) return;
-    entry.participants = [...list, name];
-    this.saveRegistry();
+    if (!list.includes(name)) {
+      entry.participants = [...list, name];
+      changed = true;
+    }
+
+    if (senderId) {
+      const byId = entry.participantIds ?? {};
+      const names = byId[senderId] ?? [];
+      if (!names.includes(name)) {
+        entry.participantIds = { ...byId, [senderId]: [...names, name] };
+        changed = true;
+      }
+    }
+
+    if (changed) this.saveRegistry();
   }
 
   /** Active entry for a key, creating a metadata-only stub (empty sdkSessionId)

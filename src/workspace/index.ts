@@ -2,6 +2,7 @@ import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { defaultPeopleDirs, loadPeople, renderPeopleRoster } from "../people.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -58,6 +59,7 @@ ${privacySection}
 
 **user** — Who the user is. Role, preferences, habits, knowledge, relationships.
 - Save when: you learn anything about them — name, job, timezone, likes/dislikes, people they mention, how they communicate
+- For facts about a specific person (friends, family, coworkers), prefer their record in the PEOPLE registry (see the PEOPLE section) over a generic memory file
 - Example: user says "I'm heading to Tokyo next week" → save travel plans
 - Example: user says "my wife thinks..." → save that they have a wife
 
@@ -134,6 +136,41 @@ Signals to watch for:
   return `${instructions}\n\n## Current MEMORY.md\n\n${memoryContent}`;
 }
 
+function loadPeopleSection(isGroup: boolean): string {
+  const dirs = defaultPeopleDirs();
+  // Private people records never enter group prompts; in DMs the full
+  // registry (including private records) is listed.
+  const people = loadPeople({ includePrivate: !isGroup });
+  const roster = people.length > 0 ? renderPeopleRoster(people).join("\n") : "(no people records yet)";
+  const privacyNote = isGroup
+    ? `Records under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` are DM-only — they are not listed here and cannot be read from this group session.`
+    : `For people whose details shouldn't surface in group chats, keep their record under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` instead — group sessions never see those records.`;
+
+  return `
+# PEOPLE — Known People Registry
+
+Structured identity records for the people in the user's life live at ${dirs.publicDir}/ — one markdown file per person:
+
+\`\`\`markdown
+---
+name: Kevin Wang
+aliases: kw, 嘉伟
+telegram: 12345678
+imessage: +14155551234
+---
+
+Freeform notes about Kevin below the frontmatter.
+\`\`\`
+
+The harness resolves group-chat senders against this registry automatically: sender prefixes and the participant list show canonical names, and stable channel ids (\`telegram\`/\`imessage\`) are bound automatically the first time a matching sender appears — name + aliases is enough, nobody needs to look up ids by hand.
+
+Maintain the registry with the \`upsert_person\` tool (preferred — it keeps the frontmatter well-formed; \`list_people\` shows current records with their handles and notes) or by editing the files directly. When you learn a new nickname ("kw is Kevin") or a fact about a person, update their record — don't create a parallel memory topic file for them. ${privacyNote}
+
+## Current registry
+
+${roster}`.trim();
+}
+
 const HARNESS_INSTRUCTIONS = `
 # HARNESS — Internal Rules (not user-editable)
 
@@ -187,6 +224,6 @@ This is a messaging app, not a document. Keep responses chat-native:
 
 export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {
   const isGroup = !!opts.isGroup;
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), HARNESS_INSTRUCTIONS].filter(Boolean);
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), loadPeopleSection(isGroup), HARNESS_INSTRUCTIONS].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

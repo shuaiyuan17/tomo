@@ -10,7 +10,7 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { deliverTextParts } from "./delivery.js";
-import { splitText } from "./text-utils.js";
+import { splitText, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -438,7 +438,20 @@ export class BlueBubblesChannel implements Channel {
     const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
     const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
-    const markers = [imageMarker, docMarker].filter(Boolean).join(" ");
+
+    // Satellite messages arrive over Apple's low-bandwidth emergency relay and
+    // carry the "iMessageLite" service instead of "iMessage". BlueBubbles does
+    // not always expose the message service in serialized webhooks, but the
+    // sender handle service survives serialization. Surface either signal to the
+    // model so it keeps replies short + text-only and doesn't expect photos.
+    // Only tag when there's real text — avoids turning an empty satellite ghost
+    // row into a non-empty prompt that would bypass the empty-message guard below.
+    const isSatelliteMessage =
+      isSatelliteService(data.service) || isSatelliteService(handle?.service);
+    const satelliteMarker =
+      isSatelliteMessage && text.trim() ? SATELLITE_MARKER : "";
+
+    const markers = [satelliteMarker, imageMarker, docMarker].filter(Boolean).join(" ");
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;

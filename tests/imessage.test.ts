@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { BlueBubblesChannel } from "../src/channels/imessage.js";
+import { isSatelliteService, SATELLITE_MARKER } from "../src/channels/text-utils.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -479,5 +480,114 @@ describe("BlueBubbles typing indicator", () => {
       { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
       { method: "DELETE", path: "/api/v1/chat/iMessage%3B%2B%3Bgroup123/typing" },
     ]);
+  });
+});
+
+describe("isSatelliteService", () => {
+  it("flags iMessageLite as satellite", () => {
+    expect(isSatelliteService("iMessageLite")).toBe(true);
+  });
+
+  it("is case-insensitive and matches variant spellings containing 'lite'", () => {
+    expect(isSatelliteService("imessagelite")).toBe(true);
+    expect(isSatelliteService("SMS-Lite")).toBe(true);
+  });
+
+  it("does not flag standard services", () => {
+    expect(isSatelliteService("iMessage")).toBe(false);
+    expect(isSatelliteService("SMS")).toBe(false);
+  });
+
+  it("handles missing/non-string service", () => {
+    expect(isSatelliteService(undefined)).toBe(false);
+    expect(isSatelliteService(null)).toBe(false);
+    expect(isSatelliteService(42)).toBe(false);
+  });
+});
+
+describe("BlueBubbles satellite message tagging", () => {
+  const payload = (guid: string, text: string, service?: string, handleService?: string) => ({
+    type: "new-message",
+    data: {
+      guid,
+      text,
+      ...(service !== undefined ? { service } : {}),
+      isFromMe: false,
+      dateCreated: 1_000,
+      handle: {
+        address: "+15551234567",
+        ...(handleService !== undefined ? { service: handleService } : {}),
+      },
+      chats: [{ guid: "iMessage;-;+15551234567" }],
+      attachments: [],
+    },
+  });
+
+  const dispatch = (channel: BlueBubblesChannel, event: ReturnType<typeof payload>) =>
+    (channel as unknown as { handleWebhookEvent(payload: Record<string, unknown>): Promise<void> })
+      .handleWebhookEvent(event);
+
+  const makeChannel = () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    return new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+  };
+
+  it("prefixes satellite (iMessageLite) text with the satellite marker", async () => {
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(channel, payload("guid-sat-1", "we are off-grid", "iMessageLite"));
+    expect(handler).toHaveBeenCalledTimes(1);
+    const message = handler.mock.calls[0][0] as { text: string };
+    expect(message.text).toBe(`${SATELLITE_MARKER} we are off-grid`);
+  });
+
+  it("prefixes satellite text when BlueBubbles only exposes handle service", async () => {
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(
+      channel,
+      payload("guid-sat-handle", "can you see this", undefined, "iMessageLite"),
+    );
+    expect(handler).toHaveBeenCalledTimes(1);
+    const message = handler.mock.calls[0][0] as { text: string };
+    expect(message.text).toBe(`${SATELLITE_MARKER} can you see this`);
+  });
+
+  it("does not tag standard iMessage text", async () => {
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(channel, payload("guid-sat-2", "normal message", "iMessage"));
+    const message = handler.mock.calls[0][0] as { text: string };
+    expect(message.text).toBe("normal message");
+  });
+
+  it("does not tag when service is absent", async () => {
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(channel, payload("guid-sat-3", "no service field"));
+    const message = handler.mock.calls[0][0] as { text: string };
+    expect(message.text).toBe("no service field");
+  });
+
+  it("still drops an empty satellite ghost row", async () => {
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(channel, payload("guid-sat-4", "", "iMessageLite"));
+    await dispatch(channel, payload("guid-sat-5", "   ", "iMessageLite"));
+    expect(handler).not.toHaveBeenCalled();
   });
 });

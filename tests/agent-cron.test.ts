@@ -379,9 +379,13 @@ describe("compact nudges", () => {
       .map((blocks) => blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join(""))
       .filter((t) => t.includes("Context usage is at"));
 
-  function seedDailyRollupSourceEvents(count = 40) {
+  function writeSdkSessionEvents(events: object[]) {
     const path = getSdkSessionPath("mock-sdk-session-123", join(agentEnv.tmpDir, "sdk-sessions"));
     mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  }
+
+  function seedDailyRollupSourceEvents(count = 40) {
     const todayNoon = new Date();
     todayNoon.setHours(12, 0, 0, 0);
     const events = Array.from({ length: count }, (_, i) => ({
@@ -389,7 +393,26 @@ describe("compact nudges", () => {
       timestamp: new Date(todayNoon.getTime() + i * 1000).toISOString(),
       message: { role: "user", content: [{ type: "text", text: `event ${i}` }] },
     }));
-    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    writeSdkSessionEvents(events);
+  }
+
+  function seedBulkyToolResult() {
+    writeSdkSessionEvents([
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu1", name: "Read", input: {} }],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu1", content: "x".repeat(100_000) }],
+        },
+      },
+    ]);
   }
 
   it("queues exactly one housekeeping turn when a turn lands over the compact threshold", async () => {
@@ -427,6 +450,47 @@ describe("compact nudges", () => {
 
     await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
     expect(nudgePrompts()[0]).toContain("lcm compact skill");
+
+    await agent.stop();
+  });
+
+  it("fires the prune nudge below the compact threshold when bulky tool results are reclaimable", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    seedBulkyToolResult();
+    mockSdk.responseFn = (text) => {
+      if (text.includes("prune-tools")) {
+        mockSdk.contextUsage = { totalTokens: 100_000, maxTokens: 200_000 };
+        return "NO_REPLY";
+      }
+      return "mock response";
+    };
+
+    mockSdk.contextUsage = { totalTokens: 144_000, maxTokens: 200_000 };
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("prune-tools");
+    expect(nudgePrompts()[0]).not.toContain("tomo lcm daily");
+
+    await agent.stop();
+  });
+
+  it("falls through to daily below the compact threshold when nothing is prunable", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    seedDailyRollupSourceEvents();
+
+    mockSdk.contextUsage = { totalTokens: 144_000, maxTokens: 200_000 };
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("tomo lcm daily");
+    expect(nudgePrompts()[0]).not.toContain("prune-tools");
 
     await agent.stop();
   });

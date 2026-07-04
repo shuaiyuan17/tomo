@@ -31,6 +31,7 @@ import { TurnRunner, embeddedSilentMatcher, type RunWithRetryRequest } from "./a
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
+import { pruneTools } from "./lcm/index.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -72,6 +73,12 @@ interface CronTurnOptions {
 // Context-usage percentage at which the nudge escalates from a daily rollup
 // (config.lcm.nudgeAtPct) to a full lcm compact.
 const COMPACT_NUDGE_PCT = 80;
+
+// Prune-first only when the dry run shows enough reclaimable volume to
+// plausibly drop usage below the reset threshold; otherwise skip straight to
+// the daily rollup rung. chars/4 is fine here because tool output is mostly
+// ASCII (JSON, logs, file contents).
+const PRUNE_NUDGE_MIN_FRAC = 0.10;
 
 export class Agent {
   private channels: Channel[] = [];
@@ -611,12 +618,11 @@ export class Agent {
    * background turns call it from their resolve handler. Skips when SDK
    * auto-compact owns this session.
    *
-   * Two escalation levels share one hysteresis latch, so a turn that lands
-   * at ≥ COMPACT_NUDGE_PCT queues exactly one housekeeping turn instead of
-   * two: at config.lcm.nudgeAtPct ask for a `tomo lcm daily` rollup; at
-   * COMPACT_NUDGE_PCT escalate to the lcm compact skill. The latch re-arms
-   * when usage drops back below nudgeResetPct (a successful compact knocks
-   * it well under).
+   * The prune → daily → compact ladder shares one hysteresis latch, so a turn
+   * queues exactly one housekeeping turn: first try deterministic
+   * `tomo lcm prune-tools` when enough bulky tool output is reclaimable, then
+   * `tomo lcm daily`, then the lcm compact skill at COMPACT_NUDGE_PCT. The
+   * latch re-arms when usage drops back below nudgeResetPct.
    *
    * The nudge goes through handleCronMessage so it runs in the per-session
    * queue. Calling runWithRetry directly here would overlap with the next
@@ -639,21 +645,31 @@ export class Agent {
       compactNudgePct: COMPACT_NUDGE_PCT,
     };
     const compactFrac = Math.max(COMPACT_NUDGE_PCT, config.lcm.nudgeAtPct) / 100;
-    const shouldPrecheckDaily = usedFrac >= config.lcm.nudgeAtPct / 100 &&
+    const shouldPrecheckContextNudge = usedFrac >= config.lcm.nudgeAtPct / 100 &&
       usedFrac < compactFrac &&
-      !nudged;
+      (!nudged || nudged === "prune");
     let sid: string | undefined;
+    let prunableTokens = 0;
+    let prunableSufficient = false;
     let dailyRangeAvailable = true;
 
-    if (shouldPrecheckDaily) {
+    if (shouldPrecheckContextNudge) {
       sid = this.sessions.getSdkSessionId(key);
       if (!sid) return;
-      dailyRangeAvailable = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir) !== null;
+      if (!nudged) {
+        const dry = pruneTools({ sdkSessionId: sid, sdkSessionsDir: config.sdkSessionsDir, dryRun: true });
+        prunableTokens = dry.success ? Math.ceil(dry.totalCharsRemoved / 4) : 0;
+        prunableSufficient = prunableTokens >= PRUNE_NUDGE_MIN_FRAC * ctx.contextMax;
+      }
+      if (nudged === "prune" || !prunableSufficient) {
+        dailyRangeAvailable = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir) !== null;
+      }
     }
 
     const decision = decideContextNudge({
       usedFrac,
       latchState: nudged,
+      prunableSufficient,
       dailyRangeAvailable,
       thresholds,
     });
@@ -687,6 +703,9 @@ export class Agent {
     } else if (decision.kind === "daily") {
       nudge = `System: Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
       log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
+    } else if (decision.kind === "prune") {
+      nudge = `System: Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Bulky tool results are holding roughly ${prunableTokens} reclaimable tokens. Run \`tomo lcm prune-tools --session-id ${sid}\` to stub them out — this is cheaper than a rollup and loses nothing conversational.${groupNote} After it finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`;
+      log.info({ key, usedPct: `${pct}%`, prunableTokens }, "Context nudge (agent should run lcm prune-tools)");
     } else {
       return;
     }

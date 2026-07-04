@@ -1,9 +1,13 @@
-export type ContextNudgeLatch = "daily" | "compact";
+export type ContextNudgeLatch = "prune" | "daily" | "compact";
 
 export type ContextNudgeDecision =
   | {
       kind: "none";
       newLatch: ContextNudgeLatch | null;
+    }
+  | {
+      kind: "prune";
+      newLatch: "prune";
     }
   | {
       kind: "daily";
@@ -18,6 +22,7 @@ export type ContextNudgeDecision =
 interface DecideContextNudgeInput {
   usedFrac: number;
   latchState: ContextNudgeLatch | undefined;
+  prunableSufficient: boolean;
   dailyRangeAvailable: boolean;
   thresholds: {
     nudgeAtPct: number;
@@ -27,7 +32,7 @@ interface DecideContextNudgeInput {
 }
 
 export function decideContextNudge(input: DecideContextNudgeInput): ContextNudgeDecision {
-  const { usedFrac, latchState, dailyRangeAvailable, thresholds } = input;
+  const { usedFrac, latchState, prunableSufficient, dailyRangeAvailable, thresholds } = input;
 
   if (usedFrac < thresholds.nudgeResetPct / 100) {
     return { kind: "none", newLatch: null };
@@ -41,11 +46,21 @@ export function decideContextNudge(input: DecideContextNudgeInput): ContextNudge
     return { kind: "none", newLatch: latchState };
   }
 
-  if (usedFrac >= thresholds.nudgeAtPct / 100 && !latchState) {
-    if (dailyRangeAvailable) {
-      return { kind: "daily", newLatch: "daily" };
+  if (usedFrac >= thresholds.nudgeAtPct / 100) {
+    if (!latchState && prunableSufficient) {
+      return { kind: "prune", newLatch: "prune" };
     }
-    return { kind: "compact", newLatch: "compact", reason: "daily-empty" };
+
+    if (!latchState || latchState === "prune") {
+      if (dailyRangeAvailable) {
+        return { kind: "daily", newLatch: "daily" };
+      }
+      return { kind: "compact", newLatch: "compact", reason: "daily-empty" };
+    }
+
+    if (latchState === "daily" || latchState === "compact") {
+      return { kind: "none", newLatch: latchState };
+    }
   }
 
   return { kind: "none", newLatch: latchState ?? null };

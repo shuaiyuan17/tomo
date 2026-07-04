@@ -12,6 +12,7 @@ import {
   findDuePromotions as findDuePromotionsImpl,
   isWarmTailCandidate,
   globalFreshTailStartIdx,
+  summaryBudgetCheck,
   type BlockLevel,
 } from "../src/lcm/blocks.js";
 import { config as mockedConfig } from "../src/config.js";
@@ -56,6 +57,12 @@ function mkTextEvent(day: string, hour: number, role: "user" | "assistant", text
     message: { role, content: text },
     ...extra,
   };
+}
+
+function mkToolResultEvent(day: string, hour: number, toolUseId: string) {
+  return mkEvent(day, hour, "user", {
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: "..." }] },
+  });
 }
 
 function writeArchive(sessionId: string, events: any[]): string {
@@ -180,7 +187,7 @@ describe("findDuePromotions — past-day nudging", () => {
     const pastDay = "2026-04-15";
     const events: any[] = [];
     for (let i = 0; i < 10; i++) {
-      events.push(mkEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant"));
+      events.push(mkTextEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] msg ${i}`));
     }
     archivePath = writeArchive(sessionId, events);
 
@@ -188,6 +195,53 @@ describe("findDuePromotions — past-day nudging", () => {
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(10);
+  });
+
+  it("does NOT flag a heartbeat-only past day with no daily block", () => {
+    const pastDay = "2026-04-16";
+    archivePath = writeArchive(sessionId, [
+      mkTextEvent(pastDay, 2, "user", "System: It is Fri, Apr 16, 02:00 PDT. Weather outside ..."),
+    ]);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "daily" && d.period === pastDay)).toBeUndefined();
+  });
+
+  it("does NOT flag a small tool-machinery-only past day with no daily block", () => {
+    const pastDay = "2026-04-17";
+    archivePath = writeArchive(sessionId, [
+      mkToolResultEvent(pastDay, 2, "tool-1"),
+      mkToolResultEvent(pastDay, 3, "tool-2"),
+    ]);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "daily" && d.period === pastDay)).toBeUndefined();
+  });
+
+  it("flags a past day with one real message and no daily block", () => {
+    const pastDay = "2026-04-18";
+    archivePath = writeArchive(sessionId, [
+      mkTextEvent(pastDay, 9, "user", "[imessage · x] real message"),
+    ]);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
+    expect(dailyDue).toBeDefined();
+    expect(dailyDue!.childCount).toBe(1);
+  });
+
+  it("flags a large machinery-only past day with no daily block", () => {
+    const pastDay = "2026-04-20";
+    const events: any[] = [];
+    for (let i = 0; i < 12; i++) {
+      events.push(mkToolResultEvent(pastDay, 1 + i, `tool-${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
+    expect(dailyDue).toBeDefined();
+    expect(dailyDue!.childCount).toBe(12);
   });
 
   it("flags a past day with a daily block AND leftover raw events", () => {
@@ -208,7 +262,7 @@ describe("findDuePromotions — past-day nudging", () => {
       message: { role: "user", content: "[daily 2026-04-22 — 50 events summarized]\n\nearly 4/22 rollup" },
     });
     // Leftover raw events for the same day
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 8; i++) {
       events.push(mkEvent(pastDay, 14, i % 2 === 0 ? "user" : "assistant"));
     }
     archivePath = writeArchive(sessionId, events);
@@ -216,10 +270,10 @@ describe("findDuePromotions — past-day nudging", () => {
     const due = findDuePromotions(sessionId);
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeDefined();
-    expect(dailyDue!.childCount).toBe(20);
+    expect(dailyDue!.childCount).toBe(8);
   });
 
-  it("does NOT flag a past day with a block and only a few (<8) leftover raw events", () => {
+  it("does NOT flag a past day with a block and 7 leftover raw events", () => {
     // Don't spam nudges for trivial residual events (attachments, a stray
     // heartbeat). The floor kicks in when both a block exists AND leftover
     // is below FLOOR_WITH_BLOCK = 8.
@@ -233,7 +287,7 @@ describe("findDuePromotions — past-day nudging", () => {
       blockTag: `daily ${pastDay}`,
       message: { role: "user", content: "[daily 2026-04-19 — 100 events summarized]\n\n..." },
     });
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 7; i++) {
       events.push(mkEvent(pastDay, 23, i % 2 === 0 ? "user" : "assistant"));
     }
     archivePath = writeArchive(sessionId, events);
@@ -306,6 +360,35 @@ describe("globalFreshTailStartIdx", () => {
     ] as any[];
     // N=2 → 2nd-newest candidate is idx 2
     expect(globalFreshTailStartIdx(evs, 2)).toBe(2);
+  });
+});
+
+describe("summaryBudgetCheck", () => {
+  it("reports under-budget English summaries", () => {
+    const result = summaryBudgetCheck("daily", "a".repeat(1000));
+    expect(result).toEqual({
+      tokens: 250,
+      budget: 1500,
+      overBudget: false,
+    });
+  });
+
+  it("reports over-budget English summaries", () => {
+    const result = summaryBudgetCheck("daily", "a".repeat(8000));
+    expect(result).toEqual({
+      tokens: 2000,
+      budget: 1500,
+      overBudget: true,
+    });
+  });
+
+  it("uses mixed-script token estimation for CJK summaries", () => {
+    const result = summaryBudgetCheck("weekly", "汉".repeat(1600));
+    expect(result).toEqual({
+      tokens: 1216,
+      budget: 1000,
+      overBudget: true,
+    });
   });
 });
 

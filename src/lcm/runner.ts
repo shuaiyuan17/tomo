@@ -1,7 +1,7 @@
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
-import { findDuePromotions, type DuePromotion } from "./blocks.js";
+import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, type DuePromotion } from "./blocks.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
 
@@ -39,6 +39,11 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
                p.level === "weekly" ? "--week" :
                p.level === "monthly" ? "--month" : "--year";
   const childLabel = p.level === "daily" ? "raw events" : "child blocks";
+  const higherLevelBudget = Math.max(
+    BLOCK_SUMMARY_TOKEN_BUDGETS.weekly,
+    BLOCK_SUMMARY_TOKEN_BUDGETS.monthly,
+    BLOCK_SUMMARY_TOKEN_BUDGETS.yearly,
+  );
   const lines = [
     `System: An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
@@ -47,8 +52,8 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
     "",
     "Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.",
     "Token budget per block:",
-    "  - daily: ≤ 1500 tokens (texture-curate, not texture-collect — pick 1-2 texture pieces worth keeping; let the rest stay in raw events)",
-    "  - weekly / monthly / yearly: ~500-1000 tokens (compress harder at each level)",
+    `  - daily: ≤ ${BLOCK_SUMMARY_TOKEN_BUDGETS.daily} tokens (texture-curate, not texture-collect — pick 1-2 texture pieces worth keeping; let the rest stay in raw events)`,
+    `  - weekly / monthly / yearly: ~500-${higherLevelBudget} tokens (compress harder at each level)`,
     "If a period genuinely has more irreducible texture than fits, exceed the budget and flag it in the summary.",
     "",
     "Note: this is the only rollup nudge for this tick. If other periods are also due, the next heartbeat (~1h) will pick up the next one. Don't chain multiple compacts in a single turn — running two `tomo lcm` calls back-to-back can race the SDK's in-memory state and orphan the chain.",

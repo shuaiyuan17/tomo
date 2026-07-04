@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { config } from "../config.js";
 import { readJsonlFileSync } from "../jsonl.js";
+import { estimateTokens } from "./stats.js";
 
 /**
  * Hierarchical rollup block tags live on compact summary events. Each level
@@ -12,6 +13,28 @@ import { readJsonlFileSync } from "../jsonl.js";
  *   yearly YYYY        ← monthly blocks for that year
  */
 export type BlockLevel = "daily" | "weekly" | "monthly" | "yearly";
+
+/** Soft token budgets per rollup level (matches the guidance in runner.ts nudge text). */
+export const BLOCK_SUMMARY_TOKEN_BUDGETS: Record<BlockLevel, number> = {
+  daily: 1500,
+  weekly: 1000,
+  monthly: 1000,
+  yearly: 1000,
+};
+
+export function summaryBudgetCheck(level: BlockLevel, summary: string): {
+  tokens: number;
+  budget: number;
+  overBudget: boolean;
+} {
+  const tokens = estimateTokens(summary);
+  const budget = BLOCK_SUMMARY_TOKEN_BUDGETS[level];
+  return {
+    tokens,
+    budget,
+    overBudget: tokens > budget,
+  };
+}
 
 export interface ResolvedRange {
   /** The block tag that will be written (e.g. "daily 2026-04-17") */
@@ -503,8 +526,9 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
   //      these cleanly when the agent re-runs `tomo lcm daily --date <day>`.
   // Small raw-tail floors avoid spamming nudges for one or two orphaned
   // metadata/attachment residuals.
-  const FLOOR_WITH_BLOCK = 8;   // block exists — only nudge if meaningful leftover
-  const FLOOR_WITHOUT_BLOCK = 1; // no block — any raw event is a reason to nudge
+  const FLOOR_WITH_BLOCK = 8;              // block exists — nudge only for meaningful leftover total
+  const CONV_FLOOR_WITHOUT_BLOCK = 1;      // no block — any real conversational turn is due
+  const MACHINERY_ONLY_FLOOR = 12;         // no block — large machinery-only days still get absorbed
 
   // With the global fresh tail on, raw events inside the warm-tail suffix are
   // intentionally kept un-promoted — they must NOT trigger a daily nudge (else
@@ -512,7 +536,7 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
   // them, they fall outside the suffix and DO get counted → the rollup rebuild
   // absorbs them. So the `i >= tailStart` check (tailStart computed above) is
   // both the no-nudge guard and the GC trigger.
-  const rawDays = new Map<string, number>();
+  const rawDays = new Map<string, { total: number; conversational: number }>();
   for (let i = 0; i < events.length; i++) {
     const e = events[i];
     if (e.type !== "user" && e.type !== "assistant") continue;
@@ -521,14 +545,19 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
     if (i >= tailStart) continue; // inside the global warm tail → not due
     const day = localDateTag(new Date(e.timestamp));
     if (day !== currentDay) {
-      rawDays.set(day, (rawDays.get(day) ?? 0) + 1);
+      const counts = rawDays.get(day) ?? { total: 0, conversational: 0 };
+      counts.total += 1;
+      if (isWarmTailCandidate(e)) counts.conversational += 1;
+      rawDays.set(day, counts);
     }
   }
-  for (const [day, count] of rawDays) {
+  for (const [day, counts] of rawDays) {
     const hasBlock = haveTags.has(`daily ${day}`);
-    const floor = hasBlock ? FLOOR_WITH_BLOCK : FLOOR_WITHOUT_BLOCK;
-    if (count >= floor) {
-      due.push({ level: "daily", period: day, childCount: count });
+    const isDue = hasBlock
+      ? counts.total >= FLOOR_WITH_BLOCK
+      : counts.conversational >= CONV_FLOOR_WITHOUT_BLOCK || counts.total >= MACHINERY_ONLY_FLOOR;
+    if (isDue) {
+      due.push({ level: "daily", period: day, childCount: counts.total });
     }
   }
 

@@ -72,7 +72,7 @@ describe("DM message routing", () => {
     await tg.simulateMessage(makeMsg({ id: "42", chatId: "12345", text: "Second" }));
     await drainQueue(agent);
 
-    const result = await agent.reactToLatestMessage("telegram:12345", "like");
+    const result = await agent.reactToMessage("telegram:12345", "like");
 
     expect(result.ok).toBe(true);
     expect(tg.reacted).toEqual([{ chatId: "12345", messageId: "42", reaction: "like", remove: false }]);
@@ -99,7 +99,7 @@ describe("DM message routing", () => {
     await im.simulateMessage(makeMsg({ id: "im-22", chatId: "+15551234567", text: "From iMessage" }));
     await drainQueue(agent);
 
-    const result = await agent.reactToLatestMessage("shuai", "love", true);
+    const result = await agent.reactToMessage("shuai", "love", true);
 
     expect(result.ok).toBe(true);
     expect(tg.reacted).toHaveLength(0);
@@ -113,7 +113,7 @@ describe("DM message routing", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    const result = await agent.reactToLatestMessage("telegram:12345", "like");
+    const result = await agent.reactToMessage("telegram:12345", "like");
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/unknown target|no latest inbound message/i);

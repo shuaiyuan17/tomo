@@ -80,10 +80,19 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           mode: z.enum(["delegate", "direct"]).default("delegate").describe(
             "`delegate` (default): recipient's Claude composes the message. `direct`: send verbatim, recipient is not triggered.",
           ),
+          reply_to: z.string().optional().describe(
+            "Direct mode only: send as a threaded reply. Case-insensitive substring of the target message's text, matched over the chat's recent messages (newest first). Errors without sending if nothing matches. Currently iMessage only.",
+          ),
         },
-        async ({ target, message, mode }) => {
+        async ({ target, message, mode, reply_to }) => {
+          if (reply_to !== undefined && mode !== "direct") {
+            return {
+              content: [{ type: "text" as const, text: "send_message failed: reply_to requires mode \"direct\"" }],
+              isError: true,
+            };
+          }
           const result = mode === "direct"
-            ? await agent.sendToSession(target, message, callerSessionKey)
+            ? await agent.sendToSession(target, message, callerSessionKey, reply_to !== undefined ? { replyTo: reply_to } : undefined)
             : await agent.delegateToSession(target, message);
 
           if (result.ok) {
@@ -138,13 +147,15 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         },
       ),
       tool(
-        "react_to_latest_message",
+        "react_to_message",
         [
-          "React/tapback to the latest inbound message Tomo has seen in a session.",
+          "React/tapback to a message in a session — the latest inbound message by default, or a specific one via `match`.",
           "",
-          "Use for lightweight acknowledgements like liking, loving, laughing at, emphasizing, questioning, or removing a reaction from the latest message.",
+          "Use for lightweight acknowledgements like liking, loving, laughing at, emphasizing, questioning, or removing a reaction from a message.",
           "",
-          "The target is normally the current Session key from the system prompt. For another conversation, pass an identity name or session key. The tool reacts to the latest inbound provider message recorded for that session since Tomo started.",
+          "The target is normally the current Session key from the system prompt. For another conversation, pass an identity name or session key. Without `match`, the tool reacts to the latest inbound provider message recorded for that session since Tomo started.",
+          "",
+          "`match` is a case-insensitive substring of the target message's text, searched over the chat's recent messages (newest first). If nothing matches, the tool errors and nothing is sent. Currently iMessage only.",
           "",
           "Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`. Telegram maps these to close emoji reactions; iMessage/BlueBubbles sends native tapbacks and requires the Private API/helper.",
         ].join("\n"),
@@ -153,14 +164,17 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
             "Current session key, identity name, or session key to react in. Usually use the current Session key.",
           ),
           reaction: z.enum(["love", "like", "dislike", "laugh", "emphasize", "question"]).describe(
-            "Cross-channel reaction/tapback to apply to the latest inbound message.",
+            "Cross-channel reaction/tapback to apply.",
+          ),
+          match: z.string().optional().describe(
+            "Case-insensitive substring of the target message's text. Omit to react to the latest inbound message.",
           ),
           remove: z.boolean().default(false).describe(
-            "Set true to remove Tomo's existing reaction/tapback of this type from the latest message.",
+            "Set true to remove Tomo's existing reaction/tapback of this type from the message.",
           ),
         },
-        async ({ target, reaction, remove }) => {
-          const result = await agent.reactToLatestMessage(target, reaction, remove);
+        async ({ target, reaction, match, remove }) => {
+          const result = await agent.reactToMessage(target, reaction, remove, match);
 
           if (result.ok) {
             return {
@@ -168,12 +182,12 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
             };
           }
           return {
-            content: [{ type: "text" as const, text: `react_to_latest_message failed: ${result.error}` }],
+            content: [{ type: "text" as const, text: `react_to_message failed: ${result.error}` }],
             isError: true,
           };
         },
         {
-          searchHint: "react reaction tapback latest message telegram imessage bluebubbles like love laugh",
+          searchHint: "react reaction tapback latest message match telegram imessage bluebubbles like love laugh",
         },
       ),
       ...buildCronTools(),

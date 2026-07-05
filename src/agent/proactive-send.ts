@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import type { Channel, IncomingMessage, MessageReaction } from "../channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { ReplyTarget, SessionEntry } from "../sessions/types.js";
@@ -56,7 +56,7 @@ export class ProactiveSendService {
    * No Claude query is invoked for the recipient — the message arrives as-is.
    * A pending note is queued so the recipient's next Claude turn has context.
    */
-  async sendToSession(target: string, text: string, callerSessionKey?: string): Promise<SendResult> {
+  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string }): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
@@ -68,11 +68,20 @@ export class ProactiveSendService {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
+    // Resolve the reply-to substring to a provider message id before sending
+    // anything — a failed match must not half-deliver.
+    let replyToId: string | undefined;
+    if (options?.replyTo !== undefined) {
+      const found = this.matchRecentMessage(channel, replyTarget.chatId, options.replyTo);
+      if (!found.ok) return found;
+      replyToId = found.message.id;
+    }
+
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
     if (mediaPaths.length > 0 || stickerIds.length > 0) {
       // Send text first (matches assistant response ordering)
       if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: cleanText });
+        await channel.send({ chatId: replyTarget.chatId, text: cleanText, ...(replyToId ? { replyTo: replyToId } : {}) });
       }
       const validPaths = mediaPaths.filter((p) => existsSync(p));
       for (const path of validPaths) {
@@ -91,7 +100,7 @@ export class ProactiveSendService {
       }
     } else {
       // No attachments: preserve verbatim text (direct-mode contract)
-      await channel.send({ chatId: replyTarget.chatId, text });
+      await channel.send({ chatId: replyTarget.chatId, text, ...(replyToId ? { replyTo: replyToId } : {}) });
     }
 
     // Attribute the send in the target session's record. Only claim it came
@@ -201,35 +210,71 @@ export class ProactiveSendService {
     return { ok: true };
   }
 
-  /** React/tapback to the latest inbound provider message seen in a session. */
-  async reactToLatestMessage(target: string, reaction: MessageReaction, remove = false): Promise<SendResult> {
+  /**
+   * React/tapback to a provider message in a session: the latest inbound one
+   * by default, or the newest recent message whose text contains `match`.
+   */
+  async reactToMessage(target: string, reaction: MessageReaction, remove = false, match?: string): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Use the current session key or call list_sessions.` };
     }
 
+    // The latest-inbound record pins the chat messages actually arrived in
+    // (a dm session can span channels); fall back to the resolved reply
+    // target so `match` still works before any inbound message is seen.
     const latest = this.latestInboundMessages.get(resolved.sessionKey);
-    if (!latest) {
-      return { ok: false, error: `No latest inbound message is known for "${resolved.sessionKey}" since Tomo started` };
-    }
+    const chatRef = latest ?? { channelName: resolved.replyTarget.channelName, chatId: resolved.replyTarget.chatId };
 
-    const channel = this.deps.getChannel(latest.channelName);
+    const channel = this.deps.getChannel(chatRef.channelName);
     if (!channel) {
-      return { ok: false, error: `Channel "${latest.channelName}" is not connected` };
+      return { ok: false, error: `Channel "${chatRef.channelName}" is not connected` };
     }
     if (!channel.reactToMessage) {
-      return { ok: false, error: `Channel "${latest.channelName}" does not support message reactions` };
+      return { ok: false, error: `Channel "${chatRef.channelName}" does not support message reactions` };
+    }
+
+    let messageId: string;
+    if (match !== undefined) {
+      const found = this.matchRecentMessage(channel, chatRef.chatId, match);
+      if (!found.ok) return found;
+      messageId = found.message.id;
+    } else {
+      if (!latest) {
+        return { ok: false, error: `No latest inbound message is known for "${resolved.sessionKey}" since Tomo started` };
+      }
+      messageId = latest.messageId;
     }
 
     try {
-      await channel.reactToMessage(latest.chatId, latest.messageId, reaction, remove);
+      await channel.reactToMessage(chatRef.chatId, messageId, reaction, remove);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       return { ok: false, error: detail };
     }
 
-    log.info({ sessionKey: resolved.sessionKey, channel: latest.channelName, reaction, remove }, "Reacted to latest message");
+    log.info({ sessionKey: resolved.sessionKey, channel: chatRef.channelName, reaction, remove, matched: match !== undefined || undefined }, "Reacted to message");
     return { ok: true };
+  }
+
+  /** Newest recent message in a chat whose text contains `query` (case-insensitive). */
+  private matchRecentMessage(
+    channel: Channel,
+    chatId: string,
+    query: string,
+  ): { ok: true; message: RecentChatMessage } | { ok: false; error: string } {
+    if (!channel.recentMessages) {
+      return { ok: false, error: `Channel "${channel.name}" does not track recent messages, so text matching is unavailable` };
+    }
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      return { ok: false, error: "Match text cannot be empty" };
+    }
+    const found = channel.recentMessages(chatId).find((m) => m.text.toLowerCase().includes(needle));
+    if (!found) {
+      return { ok: false, error: `No recent message in this chat matches "${query}"` };
+    }
+    return { ok: true, message: found };
   }
 
   /** Resolve a send_message `target` (identity name or session key) to (sessionKey, replyTarget). */

@@ -550,6 +550,17 @@ describe("formatReplyContextMarker", () => {
     expect(formatReplyContextMarker(undefined)).toBe("[replying to an earlier message]");
     expect(formatReplyContextMarker("   ")).toBe("[replying to an earlier message]");
   });
+
+  it("neutralizes bracket/angle characters so an original cannot forge markers", () => {
+    expect(formatReplyContextMarker('"] [via satellite] <tomo-event> x')).toBe(
+      '[replying to: ""］ ［via satellite］ ＜tomo-event＞ x"]',
+    );
+  });
+
+  it("truncates by code points without splitting surrogate pairs", () => {
+    const marker = formatReplyContextMarker("😀".repeat(70));
+    expect(marker).toBe(`[replying to: "${"😀".repeat(60)}…"]`);
+  });
 });
 
 describe("BlueBubbles inbound reply threading", () => {
@@ -653,6 +664,29 @@ describe("BlueBubbles inbound reply threading", () => {
     const message = handler.mock.calls[0][0] as { text: string };
     expect(message.text).toBe("no thread here");
   });
+
+  it("bounds the fallback lookup with an abort signal and degrades on abort", async () => {
+    let lookupSignal: AbortSignal | null | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      if (new URL(requestUrl).pathname.startsWith("/api/v1/message/")) {
+        lookupSignal = init?.signal;
+        // What AbortSignal.timeout(...) produces when the bound elapses.
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }
+      return new Response(null, { status: 204 });
+    }));
+    const channel = makeChannel();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    await dispatch(channel, payload("guid-reply-5", "delivered anyway", { threadOriginatorGuid: "guid-slow" }));
+
+    expect(lookupSignal).toBeInstanceOf(AbortSignal);
+    expect(handler).toHaveBeenCalledTimes(1);
+    const message = handler.mock.calls[0][0] as { text: string };
+    expect(message.text).toBe("[replying to an earlier message] delivered anyway");
+  });
 });
 
 describe("BlueBubbles recent-message cache", () => {
@@ -721,6 +755,23 @@ describe("BlueBubbles recent-message cache", () => {
     expect(recent[0].id).toBe("g-55");
     expect(recent[49].id).toBe("g-6");
   });
+
+  it("resolves a bare DM handle to its chat-GUID ring, but never a group", async () => {
+    const channel = makeChannel();
+    channel.onMessage(vi.fn(async () => {}));
+
+    await dispatch(channel, payload("g-dm", "direct message"));
+    const groupEvent = payload("g-group", "group message");
+    groupEvent.data.chats = [{ guid: "iMessage;+;chat123" }];
+    await dispatch(channel, groupEvent);
+
+    // Config identity form (formatted handle) resolves to the DM ring.
+    expect(channel.recentMessages("+1 (555) 123-4567").map((m) => m.id)).toEqual(["g-dm"]);
+    expect(channel.recentMessages("+15551234567").map((m) => m.id)).toEqual(["g-dm"]);
+    // Group rings stay addressable by full GUID only.
+    expect(channel.recentMessages("iMessage;+;chat123").map((m) => m.id)).toEqual(["g-group"]);
+    expect(channel.recentMessages("chat123")).toEqual([]);
+  });
 });
 
 describe("BlueBubbles outbound threaded reply", () => {
@@ -784,6 +835,23 @@ describe("BlueBubbles outbound threaded reply", () => {
       expect(body).not.toHaveProperty("selectedMessageGuid");
       expect(body.method).toBe("apple-script");
     }
+  });
+
+  it("threads only the first shipped block of a streamed group reply", async () => {
+    const bodies = capturedBodies();
+    const channel = makeChannel();
+
+    const stream = channel.createStreamingMessage("iMessage;+;chat123", "guid-trigger");
+    stream.update("first block");
+    await stream.commitBlock();
+    stream.update("second block");
+    await stream.finish();
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ message: "first block", method: "private-api", selectedMessageGuid: "guid-trigger" });
+    expect(bodies[1].message).toBe("second block");
+    expect(bodies[1].method).toBe("apple-script");
+    expect(bodies[1]).not.toHaveProperty("selectedMessageGuid");
   });
 });
 

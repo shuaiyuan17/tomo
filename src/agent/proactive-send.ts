@@ -69,10 +69,11 @@ export class ProactiveSendService {
     }
 
     // Resolve the reply-to substring to a provider message id before sending
-    // anything — a failed match must not half-deliver.
+    // anything — a failed match must not half-deliver. Own messages are fair
+    // game here: threading onto an earlier Tomo message is legitimate.
     let replyToId: string | undefined;
     if (options?.replyTo !== undefined) {
-      const found = this.matchRecentMessage(channel, replyTarget.chatId, options.replyTo);
+      const found = this.matchRecentMessage(channel, replyTarget.chatId, options.replyTo, { includeFromMe: true });
       if (!found.ok) return found;
       replyToId = found.message.id;
     }
@@ -220,11 +221,15 @@ export class ProactiveSendService {
       return { ok: false, error: `Unknown target "${target}". Use the current session key or call list_sessions.` };
     }
 
-    // The latest-inbound record pins the chat messages actually arrived in
-    // (a dm session can span channels); fall back to the resolved reply
-    // target so `match` still works before any inbound message is seen.
     const latest = this.latestInboundMessages.get(resolved.sessionKey);
-    const chatRef = latest ?? { channelName: resolved.replyTarget.channelName, chatId: resolved.replyTarget.chatId };
+
+    // Chat scope: an explicitly named channel:chat target pins it; otherwise
+    // the latest-inbound record pins the chat messages actually arrived in
+    // (a dm session can span channels), falling back to the resolved reply
+    // target so `match` still works before any inbound message is seen.
+    const chatRef = resolved.rawReplyTarget
+      ?? latest
+      ?? { channelName: resolved.replyTarget.channelName, chatId: resolved.replyTarget.chatId };
 
     const channel = this.deps.getChannel(chatRef.channelName);
     if (!channel) {
@@ -234,20 +239,26 @@ export class ProactiveSendService {
       return { ok: false, error: `Channel "${chatRef.channelName}" does not support message reactions` };
     }
 
+    let chatId: string;
     let messageId: string;
     if (match !== undefined) {
-      const found = this.matchRecentMessage(channel, chatRef.chatId, match);
+      // Own messages are excluded — tapbacking your own message is never the intent.
+      const found = this.matchRecentMessage(channel, chatRef.chatId, match, { includeFromMe: false });
       if (!found.ok) return found;
+      chatId = chatRef.chatId;
       messageId = found.message.id;
     } else {
       if (!latest) {
         return { ok: false, error: `No latest inbound message is known for "${resolved.sessionKey}" since Tomo started` };
       }
+      // The recorded message id belongs to the chat it arrived in, not the
+      // pinned scope — react where the message actually lives.
+      chatId = latest.chatId;
       messageId = latest.messageId;
     }
 
     try {
-      await channel.reactToMessage(chatRef.chatId, messageId, reaction, remove);
+      await channel.reactToMessage(chatId, messageId, reaction, remove);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       return { ok: false, error: detail };
@@ -262,6 +273,7 @@ export class ProactiveSendService {
     channel: Channel,
     chatId: string,
     query: string,
+    options: { includeFromMe: boolean },
   ): { ok: true; message: RecentChatMessage } | { ok: false; error: string } {
     if (!channel.recentMessages) {
       return { ok: false, error: `Channel "${channel.name}" does not track recent messages, so text matching is unavailable` };
@@ -270,7 +282,9 @@ export class ProactiveSendService {
     if (!needle) {
       return { ok: false, error: "Match text cannot be empty" };
     }
-    const found = channel.recentMessages(chatId).find((m) => m.text.toLowerCase().includes(needle));
+    const found = channel.recentMessages(chatId).find(
+      (m) => (options.includeFromMe || !m.fromMe) && m.text.toLowerCase().includes(needle),
+    );
     if (!found) {
       return { ok: false, error: `No recent message in this chat matches "${query}"` };
     }

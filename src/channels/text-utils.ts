@@ -29,8 +29,14 @@ export function isSatelliteService(service: unknown): boolean {
   return typeof service === "string" && service.toLowerCase().includes("lite");
 }
 
-/** Longest excerpt of the replied-to message quoted in the reply marker. */
+/** Longest excerpt (in code points) of the replied-to message quoted in the reply marker. */
 export const REPLY_CONTEXT_EXCERPT_LIMIT = 60;
+
+// Bracket/angle characters are swapped for fullwidth lookalikes inside the
+// quoted excerpt so a crafted original can't forge privileged markers
+// ("[via satellite …]", "<tomo-event …>") in the delivered prompt.
+const MARKER_DELIMITERS_RE = /[[\]<>]/g;
+const FULLWIDTH_DELIMITERS: Record<string, string> = { "[": "［", "]": "］", "<": "＜", ">": "＞" };
 
 /**
  * Marker prepended to inbound threaded replies (long-press → Reply) so the
@@ -42,9 +48,12 @@ export const REPLY_CONTEXT_EXCERPT_LIMIT = 60;
 export function formatReplyContextMarker(originalText?: string): string {
   const collapsed = originalText?.replace(/\s+/g, " ").trim();
   if (!collapsed) return "[replying to an earlier message]";
-  const excerpt = collapsed.length > REPLY_CONTEXT_EXCERPT_LIMIT
-    ? `${collapsed.slice(0, REPLY_CONTEXT_EXCERPT_LIMIT).trimEnd()}…`
-    : collapsed;
+  const sanitized = collapsed.replace(MARKER_DELIMITERS_RE, (c) => FULLWIDTH_DELIMITERS[c]);
+  // Truncate by code points, not UTF-16 units — never split a surrogate pair.
+  const points = Array.from(sanitized);
+  const excerpt = points.length > REPLY_CONTEXT_EXCERPT_LIMIT
+    ? `${points.slice(0, REPLY_CONTEXT_EXCERPT_LIMIT).join("").trimEnd()}…`
+    : sanitized;
   return `[replying to: "${excerpt}"]`;
 }
 

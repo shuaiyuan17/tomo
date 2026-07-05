@@ -15,6 +15,9 @@ import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const RECENT_MESSAGES_PER_CHAT = 50;
+// Reply-context lookups run before inbound dispatch — bound them so a slow
+// BlueBubbles server can only delay delivery, never stall it.
+const MESSAGE_LOOKUP_TIMEOUT_MS = 3000;
 
 interface BlueBubblesConfig {
   url: string;
@@ -138,7 +141,19 @@ export class BlueBubblesChannel implements Channel {
   }
 
   recentMessages(chatId: string): RecentChatMessage[] {
-    return [...(this.recentByChat.get(chatId) ?? [])];
+    const exact = this.recentByChat.get(chatId);
+    if (exact) return [...exact];
+    if (chatId.includes(";")) return [];
+    // Callers may address a DM by bare handle (the config identity form,
+    // e.g. "+15551234567") while the ring is keyed by BlueBubbles chat GUID
+    // ("iMessage;-;+15551234567") — match on the GUID's identifier part.
+    const want = this.normalizeAddress(chatId);
+    for (const [key, ring] of this.recentByChat) {
+      const parts = key.split(";");
+      if (parts.length < 3 || parts[1] === "+") continue; // groups are GUID-addressed
+      if (this.normalizeAddress(parts.slice(2).join(";")) === want) return [...ring];
+    }
+    return [];
   }
 
   async setChatTitle(chatId: string, title: string): Promise<void> {
@@ -156,12 +171,15 @@ export class BlueBubblesChannel implements Channel {
     });
   }
 
-  createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
+  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
     // iMessage can't edit sent messages — buffer per block, ship at boundary
     // (commitBlock between text blocks, finish at end of turn). NO_REPLY-only
     // blocks are dropped silently to mirror Telegram's prefix-suppression.
     let buffer = "";
     let canceled = false;
+    // Group replies carry the triggering message's GUID (mirrors Telegram);
+    // thread only the first shipped block — one reply, not one per block.
+    let pendingReplyTo = replyTo;
 
     const NO_REPLY_RE = /^\s*NO_REPLY\s*$/i;
 
@@ -170,7 +188,9 @@ export class BlueBubblesChannel implements Channel {
       if (NO_REPLY_RE.test(buffer)) { buffer = ""; return; }
       const text = buffer;
       buffer = "";
-      await deliverTextParts(this, chatId, text);
+      const threadTarget = pendingReplyTo;
+      pendingReplyTo = undefined;
+      await deliverTextParts(this, chatId, text, { replyTo: threadTarget });
     };
 
     return {
@@ -550,7 +570,7 @@ export class BlueBubblesChannel implements Channel {
     if (cached) return cached.text;
 
     try {
-      const result = await this.api("GET", `/message/${encodeURIComponent(guid)}`);
+      const result = await this.api("GET", `/message/${encodeURIComponent(guid)}`, undefined, { timeoutMs: MESSAGE_LOOKUP_TIMEOUT_MS });
       const original = result?.data as Record<string, unknown> | undefined;
       return typeof original?.text === "string" ? original.text : undefined;
     } catch (err) {
@@ -675,7 +695,7 @@ export class BlueBubblesChannel implements Channel {
 
   // --- BlueBubbles API ---
 
-  private async api(method: string, path: string, body?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async api(method: string, path: string, body?: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>> {
     const separator = path.includes("?") ? "&" : "?";
     const url = `${this.apiUrl}/api/v1${path}${separator}password=${encodeURIComponent(this.password)}`;
 
@@ -683,6 +703,7 @@ export class BlueBubblesChannel implements Channel {
       method,
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
+      ...(options?.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}),
     });
 
     if (!res.ok) {

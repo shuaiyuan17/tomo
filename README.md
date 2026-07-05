@@ -46,11 +46,19 @@ tomo start             # Start in background (daemon)
 tomo start -f          # Start in foreground (for dev)
 tomo stop              # Stop the daemon
 tomo restart           # Restart the daemon
+tomo restart --reason "..."  # Restart and tell the agent why afterward
 tomo status            # Show PID and uptime
 tomo logs              # View logs (pretty-printed)
 tomo logs -f           # Follow logs live
 tomo sessions list     # Show active sessions
-tomo sessions clear    # Reset all sessions
+tomo sessions clear [key]  # Unlink one session (or all sessions)
+tomo cron              # Manage scheduled tasks (add / list / remove / run <id>)
+tomo continuity        # Manually trigger a continuity heartbeat
+tomo lcm               # Context tools (stats / blocks / compact / search / prune-tools / rollups)
+tomo backup            # Back up all Tomo data (create / list / restore <date>)
+tomo migrate           # Import conversation history from other platforms (openclaw <file>)
+tomo update            # Update Tomo to the latest version and restart
+tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 ```
 
 ## Chat Commands
@@ -60,10 +68,14 @@ tomo sessions clear    # Reset all sessions
 | `/new` | Start a new conversation (resets session) |
 | `/model` | Switch model (Claude aliases, direct model IDs, or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
-| `/login` | Refresh Claude login from a configured owner's private DM |
+| `/login` | Refresh Claude login from a configured owner's private DM (`/login cancel` aborts a pending login) |
 | `/status` | Show session info (model, channel, message count) |
 | `/cost` | Show current-session cost for 1d / 7d / 1mo |
 | `/pet` | Check Tomo's pet's mood, growth stage, and stats |
+| `/summon` | (groups) Pull your main DM session into this group temporarily |
+| `/dismiss` | (groups) Hand the group back to its own Tomo session |
+
+**Summon** — `/summon` in a group routes that group's messages into your main `dm:` session, so Tomo answers with your full personal context. Group-facing replies go through an explicit `send_message` direct call; plain output stays in your private DM. `/dismiss` hands back, and the summon auto-expires after `summonExpiryMinutes` (default 60) of group inactivity.
 
 ## Features
 
@@ -82,6 +94,12 @@ During `tomo init`, you choose a name, your preferred name, and a tone (chill / 
 ### Memory
 
 File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` index is injected into every conversation. Tomo reads and writes memory files autonomously — it remembers who you are, your preferences, and past context across sessions.
+
+Beyond memory files, the `recall_conversation` tool lets Tomo search a session's full message history — including everything compacted out of its context window or archived to monthly transcript files.
+
+### People Registry
+
+Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonical name, aliases/nicknames, and per-channel handles in frontmatter, freeform notes below. Group messages are annotated with the sender's resolved name, and handles auto-bind the first time a sender's display name matches a record — you only ever refer to people by name. Records meant for your eyes only live under `memory/private/people/` and never enter group chats. Tomo maintains the registry itself via the `list_people` / `upsert_person` tools.
 
 ### Channels
 
@@ -119,8 +137,19 @@ Tomo has access to Claude's built-in tools:
 | Skill | Specialized workflows |
 | TodoWrite | Task tracking within a turn |
 | NotebookEdit | Edit Jupyter notebooks |
-| `send_message` (MCP) | Proactively send a message to another session/identity |
-| `list_sessions` (MCP) | List active identities and group sessions |
+
+Plus a built-in `tomo-internal` MCP server:
+
+| Group | Tool | Capability |
+|-------|------|-----------|
+| Messaging | `send_message` | Message another session — `delegate` mode (recipient's Claude composes) or `direct` mode (verbatim text) |
+| | `list_sessions` | List identities and active group chats (titles, participants) |
+| | `rename_group_chat` | Rename a real Telegram/iMessage group chat |
+| | `react_to_latest_message` | React/tapback to the latest inbound message in a session |
+| Scheduling | `schedule_create` / `schedule_list` / `schedule_remove` | Manage scheduled tasks (one-shot, interval, or cron) |
+| People | `list_people` / `upsert_person` | Read and maintain the people registry |
+| History | `recall_conversation` | Search the session's full history, including compacted and archived messages |
+| Pet | `pet_status` / `pet_hatch` / `pet_feed` / `pet_play` / `pet_sleep` | Care for Tomo's virtual pet |
 
 ### External MCP Servers
 
@@ -166,12 +195,20 @@ If browser login is needed, Tomo forwards the authorize URL to your private chat
 
 Tomo can create scheduled tasks on its own — just ask "remind me in 30 minutes to stretch" or "check the weather every morning at 9am." Supports one-shot reminders, recurring intervals, and cron expressions.
 
+### Pet
+
+Tomo can hatch and raise a virtual pet — Tamagotchi-style, with hunger, mood, energy, and growth stages, persisted in `~/.tomo/data/pet.json`. Tomo cares for it with its pet tools; check in with `/pet`.
+
 ### Sessions
 
 - Multi-turn conversations via Claude Agent SDK session resume
 - Persistent across restarts
 - `/new` in Telegram to start fresh
 - Unlinked sessions kept for 30 days before cleanup
+
+### Context Management (LCM)
+
+Instead of lossy auto-compaction, long conversations are rolled up into hierarchical summary blocks (daily → weekly → monthly → yearly), so old context degrades gracefully rather than disappearing. The `lcm` config block controls the housekeeping nudges: at `nudgeAtPct` context usage (default 70%) Tomo is prompted to prune bulky tool results or run a rollup, re-arming once usage drops below `nudgeResetPct`; `groupCompactStyle` chooses hierarchical rollups (`"lcm"`, default) or SDK auto-compact (`"sdk"`) for group chats.
 
 ### Logging
 
@@ -190,11 +227,16 @@ Structured logs via [pino](https://github.com/pinojs/pino):
     SOUL.md                   # Your personality config
     AGENT.md                  # Your operating rules
     IDENTITY.md               # Your identity config
+    CONTINUITY.md             # Standing instructions for continuity heartbeats
     memory/                   # Persistent memory files
+      people/                 # People registry records (private ones under memory/private/people/)
+    secrets/                  # Harness-managed credentials (e.g. MCP OAuth tokens, mode 0600)
     .claude/skills/           # Agent skills
   data/
     cron/jobs.json            # Scheduled tasks
     sessions/                 # Transcript logs and session registry
+    pet.json                  # Virtual pet state
+    summons.json              # Active group summons
   logs/
     tomo.log                  # Daemon logs
 ```
@@ -240,6 +282,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     "maxOutputChars": 8000
   },
   "groupSecret": "tomo-xxxxxxxx",
+  "summonExpiryMinutes": 60,
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,

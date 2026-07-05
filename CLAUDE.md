@@ -9,10 +9,11 @@ Published to npm as `tomo-ai`. Installed globally via `npm install -g tomo-ai`.
 ## Commands
 
 ```bash
-npm run build    # tsc — compile src/ → dist/
-npm run dev      # tsx watch, foreground with hot reload
-npm run lint     # eslint
-npm test         # vitest
+npm run build                  # tsc — compile src/ → dist/
+npm run dev                    # tsx watch, foreground with hot reload
+npm run lint                   # eslint (src/ + tests/)
+npm test                       # vitest — full suite
+npx vitest run tests/<file>    # single test file (shared fixtures in tests/helpers/)
 ```
 
 ## Architecture Overview
@@ -20,23 +21,35 @@ npm test         # vitest
 ```
 src/
   cli.ts              # Entry point — commander CLI
-  cli/                # Subcommands: start, stop, config, init, etc.
-  agent.ts            # Core Agent class — message routing, live sessions, channel management
-  router.ts           # IdentityRouter — session key resolution, DM vs group, allowlists
+  cli/                # Subcommands: start, config, backup, lcm, cron, sessions, etc.
+  agent.ts            # Agent orchestrator — ingress, turn dispatch, notifications, context nudges
+  agent/              # Turn execution internals:
+    turn-runner.ts          # Runs a turn with retry + NO_REPLY silent-reply policy
+    live-session-manager.ts # Owns LiveSession lifecycle — create/resume, reset-and-retry
+    live-session.ts         # Wraps SDK query() streaming; steering merge/promotion
+    delivery-pipeline.ts    # Streams + finalizes outbound messages to channels
+    commands.ts             # Chat slash commands (/new, /model, /summon, /login, ...)
+    scaffold-filter.ts      # Strips training-scaffold leaks from outbound text
+    context-nudge.ts        # Pure decision logic for context-usage nudges
+    sdk-options.ts          # Builds SDK query options (model, MCP servers, auto-compact policy)
+    audience.ts             # DM-session audience tracking (private DM vs summoned group)
+    inbound-batcher.ts      # Coalesces messages that pile up behind an in-flight turn
+    proactive-send.ts       # send_message service (direct + delegate modes)
+    #  plus: session-queue, pending-notes-queue, send-target, permissions, text-utils, claude-login
+  router.ts           # IdentityRouter — session key resolution, allowlists, summons
   people.ts           # People registry — person records, alias/handle resolution, auto-binding
-  config.ts           # Config loading from ~/.tomo/config.json + env vars
+  config.ts           # Config from ~/.tomo/config.json + env vars (zod-validated)
+  tomo-event.ts       # <tomo-event> envelope for harness-composed messages
+  auth.ts             # Anthropic auth resolution (env key > config; subscription or API key)
   channels/           # Channel implementations (Telegram, iMessage/BlueBubbles)
-    types.ts          # Channel interface: onMessage, send, startTyping, etc.
-    telegram.ts
-    imessage.ts
-  sessions/           # Session persistence
-    store.ts          # SessionStore — transcript files, SDK session registry, stats
-    types.ts          # SessionMessage, SessionEntry, ReplyTarget, etc.
-  cron/               # Scheduled tasks (user-created reminders, recurring jobs)
-    scheduler.ts      # Polls every 30s, fires due jobs via agent.handleCronMessage()
-    store.ts          # CRUD for cron jobs (persisted in ~/.tomo/data/cron/jobs.json)
-  lcm/                # Lifecycle management — context compaction, stats, tool pruning
+  sessions/           # Persistence (store.ts), key helpers (keys.ts), summon-store.ts
+  mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
+                      #   (cron-, people-, recall-, pet-tools); external-config.ts, oauth.ts
+  cron/               # Scheduler (30s poll → agent.handleCronMessage) + store (data/cron/jobs.json)
+  lcm/                # Context mgmt — compact, stats, prune-tools, blocks (rollups), runner
   continuity.ts       # ContinuityRunner — periodic heartbeats for autonomous behavior
+  costs.ts, models.ts, litellm.ts        # /cost reports; model aliases; LiteLLM gateway modes
+  jsonl.ts, fs-utils.ts, runtime-paths.ts # JSONL readers; atomic writes; SDK session file paths
   version.ts          # VersionChecker — weekly npm registry check, daytime-only notification
   workspace/          # System prompt builder (SOUL.md + AGENT.md + IDENTITY.md + memory)
   logger.ts           # Pino structured logging
@@ -57,9 +70,10 @@ The `IdentityRouter` resolves (channel, chatId, isGroup) → sessionKey + replyT
 
 ### DM vs Group Detection
 
-- Telegram groups: chatId is negative (starts with `-`)
-- iMessage groups: chatId GUID contains `;+;`
-- `parseChannelKey()` in Agent uses this to filter — reuse it when you need DM-only logic
+Use the helpers in `src/sessions/keys.ts` — don't re-parse keys by hand:
+- `isDmSessionKey(key)` — true for `dm:` keys
+- `parseRawSessionKey(key)` — `<channel>:<chatId>` → `{ channelName, chatId }` (undefined for `dm:` keys)
+- `isGroupSessionKey(key)` — Telegram chatId starts with `-`; iMessage GUID contains `;+;`
 
 ### Live Sessions (SDK Integration)
 
@@ -70,7 +84,7 @@ The `IdentityRouter` resolves (channel, chatId, isGroup) → sessionKey + replyT
 
 SDK session IDs are persisted in the session registry so conversations survive daemon restarts.
 
-With config `steering` (default on), user messages that arrive while a turn is in flight bypass the per-session queue via `session.steer(text)` — the SDK injects them at the next tool-call boundary. Two outcomes: the message merges into the in-flight turn (detected via the CLI's `isReplay` echo, enabled by passing `--replay-user-messages` through `extraArgs` when steering is on; the steered caller resolves with `STEER_MERGED` and the turn's owner delivers the combined response), or it misses the turn and runs as its own follow-up turn (promoted at `result` time). `send()` waits for true session idleness, so queued system turns (cron, continuity) never overlap a promoted steered turn. Set `steering: false` or `TOMO_STEERING=false` to keep mid-turn user messages queued.
+With config `steering` (default on), user messages that arrive mid-turn bypass the per-session queue via `session.steer(text)` — they either merge into the in-flight turn or are promoted to their own follow-up turn. Details (STEER_MERGED sentinel, replay detection, idle-wait) live in `src/agent/turn-runner.ts` and `src/agent/live-session.ts`; set `steering: false` or `TOMO_STEERING=false` to keep mid-turn messages queued.
 
 ### Message Flow
 
@@ -79,25 +93,22 @@ With config `steering` (default on), user messages that arrive while a turn is i
 3. `runWithRetry()` → `LiveSession.send()` → SDK query → streamed response
 4. Response sent back through channel (with streaming updates via `createStreamingMessage`)
 
+### Harness Message Envelope
+
+All harness-composed messages (cron, heartbeats, nudges, summons, delegate requests) are wrapped in a `<tomo-event type=... name=... ts=...>` envelope by `formatTomoEvent()` (`src/tomo-event.ts`) — the single composer; never hand-roll `System:` strings. Bodies are injection-escaped so user-controlled text can't close the envelope early. Consumers must tolerate BOTH the envelope and the legacy `System:` / `[System: ...]` formats — old transcripts are never migrated. Outbound, `src/agent/scaffold-filter.ts` strips training-scaffold leaks before text reaches a channel.
+
 ### Sending Notifications (No Agent Query)
 
 `agent.sendNotification(text)` sends a direct channel message without invoking Claude:
 1. Tries `dm:` session via IdentityRouter
 2. Falls back to first non-group session key from the registry
-3. Uses `parseChannelKey()` to skip groups
+3. Uses `privateReplyTargetFromSessionKey()` (`src/sessions/keys.ts`) which excludes groups
 
 Use this for system-level notifications (version updates, errors) that don't need AI processing.
 
 ### People Registry (Group Sender Recognition)
 
-Person records live at `~/.tomo/workspace/memory/people/*.md` (DM-only records under `memory/private/people/`) — frontmatter holds `name`, `aliases`, and per-channel handles (`telegram` user id, `imessage` address); freeform notes below. Resolution is harness-side and deterministic (`src/people.ts`):
-
-- Channels attach a stable `senderId` to every `IncomingMessage`; the session registry tracks display names per id (`participantIds`), so profile renames stay one person.
-- Group transcript lines are annotated inline (`kw 🚀 (Kevin Wang): ...`) and the group system prompt lists participants resolved to canonical names + aliases.
-- Handles are auto-bound the first time a sender's display name unambiguously matches an unbound record (`autoBindHandle`) — users only ever write names/nicknames. Matching is exact-first with a decoration-stripped fallback ("kw 🚀" matches alias `kw`); auto-binding considers public records only.
-- The agent maintains records via `list_people` / `upsert_person` MCP tools; a roster (names + aliases only) is injected into every system prompt.
-
-Private people records never enter group flows: excluded from group prompts, invisible to group-session tools, and file reads are blocked by the existing private-memory guard hook. Group-originated transcript lines are annotated from public records only — even when a summon routes them into a `dm:` session, since the reply audience is still the group.
+Person records live at `~/.tomo/workspace/memory/people/*.md` (DM-only records under `memory/private/people/`) — frontmatter holds `name`, `aliases`, per-channel handles; freeform notes below. Resolution is harness-side and deterministic (`src/people.ts`): channels attach a stable `senderId` to every message, group transcript lines are annotated inline (`kw 🚀 (Kevin Wang): ...`), and handles auto-bind the first time a sender's display name unambiguously matches an unbound public record. The agent maintains records via `list_people` / `upsert_person` MCP tools; a roster (names + aliases) is injected into every system prompt. Private records never enter group flows — excluded from group prompts, group-session tools, and file reads (private-memory guard hook), even when a summon routes group messages into a `dm:` session.
 
 ### System Prompt
 
@@ -122,16 +133,15 @@ Changes to workspace files take effect on next message (no restart needed) — t
 
 ### Cron System
 
-Users ask Tomo to schedule things via chat. The agent uses a skill to CRUD jobs in `~/.tomo/data/cron/jobs.json`. The `CronScheduler` polls every 30s and fires due jobs via `agent.handleCronMessage()`, which delivers the response through the appropriate channel.
+Users ask Tomo to schedule things via chat. The agent CRUDs jobs with the `schedule_create` / `schedule_list` / `schedule_remove` MCP tools (`src/mcp/cron-tools.ts`), backed by `~/.tomo/data/cron/jobs.json` (the `tomo cron` CLI is a parallel surface on the same store). The `CronScheduler` polls every 30s and fires due jobs via `agent.handleCronMessage()`, which delivers the response through the appropriate channel.
 
 ### LCM (Lifecycle Management)
 
-Custom context compaction that operates on the SDK's JSONL session files directly:
-- `compact.ts` — replaces a range of conversation events with a summary
-- `stats.ts` — computes context usage breakdown
-- `prune-tools.ts` — removes tool results to free context space
+Custom context management that operates on the SDK's JSONL session files directly (`src/lcm/`):
+- `compact.ts` / `stats.ts` / `prune-tools.ts` — range summarization, usage breakdown, tool-result pruning
+- `blocks.ts` + `runner.ts` — hierarchical rollups (daily → weekly → monthly → yearly summary blocks); the runner nudges the agent when a completed period is due for promotion
 
-Compaction is triggered by the agent itself (via skill) when context usage exceeds 80%.
+The harness emits context nudges at `lcm.nudgeAtPct` usage (default 70%, `src/config.ts`), escalating prune → daily rollup → full compact at 80% (decision logic in `src/agent/context-nudge.ts`).
 
 ## Code Conventions
 
@@ -139,5 +149,5 @@ Compaction is triggered by the agent itself (via skill) when context usage excee
 - TypeScript strict mode
 - Imports use `.js` extensions (Node16 module resolution)
 - Logging via `log` from `./logger.ts` (pino) — use `log.info`, `log.warn`, `log.error`, `log.debug`
-- Tests in `tests/` using vitest — run with `npm test`
 - No default exports — always named exports
+- Config values are zod-validated: invalid entries collect into `configIssues` and `assertConfigValid()` refuses daemon startup (repair commands like `tomo config` still run)

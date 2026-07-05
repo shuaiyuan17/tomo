@@ -412,8 +412,12 @@ export class BlueBubblesChannel implements Channel {
       const command = parts[0];
       const args = parts.slice(1).join(" ");
       if (command === "new" || command === "model" || command === "restore" || command === "login" || command === "status" || command === "cost" || command === "pet" || command === "summon" || command === "dismiss") {
+        // Normalized exactly like the message path's senderId below, so owner
+        // checks (identityForSender) match however BlueBubbles formats the
+        // address.
+        const senderId = handle?.address ? this.normalizeAddress(senderAddress) : undefined;
         for (const handler of this.commandHandlers) {
-          await handler(command, chatGuid, senderAddress, args, senderAddress);
+          await handler(command, chatGuid, senderAddress, args, senderId);
         }
         return;
       }

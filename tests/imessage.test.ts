@@ -306,6 +306,33 @@ describe("BlueBubbles inbound replay handling", () => {
     await dispatch(channel, payload("guid-empty", ""));
     expect(handler).not.toHaveBeenCalled();
   });
+
+  it("dispatches slash commands with a normalized senderId, matching the message path", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    const channel = new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+    const commandHandler = vi.fn(async () => {});
+    channel.onCommand(commandHandler);
+
+    // BlueBubbles may report the owner's number formatted; owner checks
+    // compare senderId against configured identity ids, so the command path
+    // must normalize like the message path does.
+    const event = payload("guid-cmd-1", "/model sonnet");
+    event.data.handle.address = "+1 (555) 123-4567";
+    await dispatch(channel, event);
+
+    expect(commandHandler).toHaveBeenCalledTimes(1);
+    expect(commandHandler).toHaveBeenCalledWith(
+      "model",
+      "iMessage;-;+15551234567",
+      "+1 (555) 123-4567",
+      "sonnet",
+      "+15551234567",
+    );
+  });
 });
 
 describe("BlueBubbles typing indicator", () => {

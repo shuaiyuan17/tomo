@@ -62,6 +62,23 @@ export interface OutgoingMessage {
 }
 
 export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
+
+/**
+ * A recently seen message in a chat, tracked by channels that support
+ * targeted reactions and threaded replies (see Channel.recentMessages).
+ */
+export interface RecentChatMessage {
+  /** Provider message id/GUID. */
+  id: string;
+  /** Plain text content. */
+  text: string;
+  /** Display name of the sender (absent for our own messages). */
+  senderName?: string;
+  /** Unix timestamp in milliseconds. */
+  timestamp: number;
+  /** Whether the message was sent by us. */
+  fromMe: boolean;
+}
 export interface StopTypingOptions {
   /** Clear the remote typing indicator immediately when the channel supports it. */
   clear?: boolean;
@@ -123,6 +140,13 @@ export interface Channel {
 
   /** React/tapback to a specific provider message, if supported by the channel. */
   reactToMessage?(chatId: string, messageId: string, reaction: MessageReaction, remove?: boolean): Promise<void>;
+
+  /**
+   * Recently seen messages in a chat, newest first (bounded window), if the
+   * channel tracks them. Backs substring targeting for reactions
+   * (react_to_message `match`) and threaded replies (send_message `reply_to`).
+   */
+  recentMessages?(chatId: string): RecentChatMessage[];
 
   /** Create a streaming message that can be updated incrementally */
   createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage;

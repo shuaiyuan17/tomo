@@ -29,6 +29,25 @@ export function isSatelliteService(service: unknown): boolean {
   return typeof service === "string" && service.toLowerCase().includes("lite");
 }
 
+/** Longest excerpt of the replied-to message quoted in the reply marker. */
+export const REPLY_CONTEXT_EXCERPT_LIMIT = 60;
+
+/**
+ * Marker prepended to inbound threaded replies (long-press → Reply) so the
+ * model sees which earlier message the sender is responding to. Same visual
+ * family as SATELLITE_MARKER. When the original text is unavailable the
+ * marker degrades to a quote-less form — reply context is best-effort and
+ * must never block delivery.
+ */
+export function formatReplyContextMarker(originalText?: string): string {
+  const collapsed = originalText?.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "[replying to an earlier message]";
+  const excerpt = collapsed.length > REPLY_CONTEXT_EXCERPT_LIMIT
+    ? `${collapsed.slice(0, REPLY_CONTEXT_EXCERPT_LIMIT).trimEnd()}…`
+    : collapsed;
+  return `[replying to: "${excerpt}"]`;
+}
+
 export function splitOutboundMessageText(text: string): string[] {
   if (!text) return [];
   const protectedText = text.replace(LITERAL_NEWLINE_TOKEN_RE, LITERAL_NEWLINE_SENTINEL);

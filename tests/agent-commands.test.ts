@@ -766,6 +766,135 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("ignores commands from chats outside the channel allowlist", async () => {
+    resetConfig({
+      channelAllowlists: { telegram: ["12345"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
+
+    await tg.simulateCommand("status", "99999", "Stranger", undefined, "99999");
+    await tg.simulateCommand("restore", "99999", "Stranger", undefined, "99999");
+    await tg.simulateCommand("model", "99999", "Stranger", "opus-1m", "99999");
+
+    // Silent drop, exactly like disallowed inbound messages — no reply at all.
+    expect(tg.sent).toHaveLength(0);
+    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
+      model?: string;
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.model).toBe("claude-haiku-4-5");
+    expect(cfg.sessionModelOverrides).toBeUndefined();
+
+    await agent.stop();
+  });
+
+  it("still serves commands from allowlisted chats when an allowlist is configured", async () => {
+    resetConfig({
+      channelAllowlists: { telegram: ["12345"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("status", "12345", "TestUser", undefined, "12345");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("Session:");
+
+    await agent.stop();
+  });
+
+  it("/restore refuses an allowlisted sender who is not a configured owner", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345", "-100777"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
+
+    await tg.simulateCommand("restore", "-100777", "GroupMember", undefined, "99999");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("configured owner");
+    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as { model?: string };
+    expect(cfg.model).toBe("claude-haiku-4-5");
+
+    await agent.stop();
+  });
+
+  it("/restore works for a configured owner", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
+    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
+
+    await tg.simulateCommand("restore", "12345", "Shuai", undefined, "12345");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("Restored config.json");
+    const restored = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as { model?: string };
+    expect(restored.model).toBe("claude-sonnet-4-6");
+
+    await agent.stop();
+  });
+
+  it("/model refuses a sender who is not a configured owner", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345", "-100777"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+
+    await tg.simulateCommand("model", "-100777", "GroupMember", "opus-1m", "99999");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("configured owner");
+    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
+      sessionModelOverrides?: Record<string, string>;
+    };
+    expect(cfg.sessionModelOverrides).toBeUndefined();
+    expect(mockConfig.sessionModelOverrides["telegram:-100777"]).toBeUndefined();
+
+    await agent.stop();
+  });
+
+  it("/model reports an error instead of crashing when config.json is malformed", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    writeFileSync(agentEnv.configFilePath, "{ this is not json\n");
+
+    await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("[error]");
+    expect(tg.sent[0].text).toContain("model unchanged");
+    // Neither the in-memory override nor the broken file was touched.
+    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBeUndefined();
+    expect(readFileSync(agentEnv.configFilePath, "utf-8")).toBe("{ this is not json\n");
+
+    await agent.stop();
+  });
+
   it("/restore reports when no config backup exists", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

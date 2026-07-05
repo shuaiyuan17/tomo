@@ -57,6 +57,15 @@ export class ChatCommandHandler {
   }
 
   async handle(channel: Channel, command: string, chatId: string, senderName: string, args?: string, senderId?: string): Promise<void> {
+    // Commands obey the same channel allowlist as inbound messages
+    // (Agent.enqueueMessage): check channel+chatId BEFORE resolving, so a
+    // disallowed chat can't touch routing state, and drop silently — the
+    // message path never replies to chats outside the allowlist.
+    if (!this.deps.router.isAllowed(channel.name, chatId)) {
+      log.debug({ channel: channel.name, chatId, command }, "Command blocked at receipt (not in allowlist)");
+      return;
+    }
+
     if (this.restoringConfig) {
       await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
       return;
@@ -85,6 +94,11 @@ export class ChatCommandHandler {
     }
 
     if (command === "model") {
+      if (!this.isIdentityOwner(channel, senderId)) {
+        log.info({ channel: channel.name, chatId, sender: senderName }, "/model refused (sender is not a configured identity)");
+        await channel.send({ chatId, text: "Only a configured owner can change the model." });
+        return;
+      }
       const arg = args?.trim();
       if (!arg) {
         const current = this.deps.modelOverrides.get(key) ?? config.model;
@@ -124,8 +138,14 @@ export class ChatCommandHandler {
           return;
         }
       }
+      if (!this.persistModelOverride(key, resolved)) {
+        await channel.send({
+          chatId,
+          text: "[error] Could not save the model override to ~/.tomo/config.json — model unchanged. Check the file (or /restore) and try again.",
+        });
+        return;
+      }
       this.deps.modelOverrides.set(key, resolved);
-      this.persistModelOverride(key, resolved);
       // Model changes require a fresh SDK child process, but keep the SDK
       // session ID so continuity survives switching between Claude and LiteLLM.
       // getOrCreateLiveSession repairs provider-specific JSONL quirks before
@@ -137,6 +157,11 @@ export class ChatCommandHandler {
     }
 
     if (command === "restore") {
+      if (!this.isIdentityOwner(channel, senderId)) {
+        log.info({ channel: channel.name, chatId, sender: senderName }, "/restore refused (sender is not a configured identity)");
+        await channel.send({ chatId, text: "Only a configured owner can restore config." });
+        return;
+      }
       await this.restoreConfigAndRestart(channel, chatId);
       return;
     }
@@ -301,19 +326,36 @@ export class ChatCommandHandler {
     });
   }
 
-  private persistModelOverride(key: string, model: string): void {
-    config.sessionModelOverrides[key] = model;
+  /** Gate for config-mutating commands (/model, /restore): the sender must own
+   *  a configured identity on this channel — the same identityForSender check
+   *  /login uses. With no identities configured there are no owners to
+   *  restrict to, so these commands stay available to allowed chats. */
+  private isIdentityOwner(channel: Channel, senderId?: string): boolean {
+    if (config.identities.length === 0) return true;
+    if (!senderId) return false;
+    return this.deps.router.identityForSender(channel.name, senderId) !== undefined;
+  }
 
-    const cfg = existsSync(CONFIG_PATH)
-      ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
-      : {};
-    const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-    overrides[key] = model;
-    cfg.sessionModelOverrides = overrides;
+  /** Persist a /model override into config.json. Returns false (after logging,
+   *  leaving in-memory state untouched) if the file can't be read or written. */
+  private persistModelOverride(key: string, model: string): boolean {
+    try {
+      const cfg = existsSync(CONFIG_PATH)
+        ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
+        : {};
+      const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
+      overrides[key] = model;
+      cfg.sessionModelOverrides = overrides;
 
-    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-    backupConfigFile();
-    writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+      mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+      backupConfigFile();
+      writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+      config.sessionModelOverrides[key] = model;
+      return true;
+    } catch (err) {
+      log.error({ err, key }, "Failed to persist model override");
+      return false;
+    }
   }
 
   private async handleClaudeLogin(

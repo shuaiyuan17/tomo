@@ -29,6 +29,34 @@ export function isSatelliteService(service: unknown): boolean {
   return typeof service === "string" && service.toLowerCase().includes("lite");
 }
 
+/** Longest excerpt (in code points) of the replied-to message quoted in the reply marker. */
+export const REPLY_CONTEXT_EXCERPT_LIMIT = 60;
+
+// Bracket/angle characters are swapped for fullwidth lookalikes inside the
+// quoted excerpt so a crafted original can't forge privileged markers
+// ("[via satellite …]", "<tomo-event …>") in the delivered prompt.
+const MARKER_DELIMITERS_RE = /[[\]<>]/g;
+const FULLWIDTH_DELIMITERS: Record<string, string> = { "[": "［", "]": "］", "<": "＜", ">": "＞" };
+
+/**
+ * Marker prepended to inbound threaded replies (long-press → Reply) so the
+ * model sees which earlier message the sender is responding to. Same visual
+ * family as SATELLITE_MARKER. When the original text is unavailable the
+ * marker degrades to a quote-less form — reply context is best-effort and
+ * must never block delivery.
+ */
+export function formatReplyContextMarker(originalText?: string): string {
+  const collapsed = originalText?.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "[replying to an earlier message]";
+  const sanitized = collapsed.replace(MARKER_DELIMITERS_RE, (c) => FULLWIDTH_DELIMITERS[c]);
+  // Truncate by code points, not UTF-16 units — never split a surrogate pair.
+  const points = Array.from(sanitized);
+  const excerpt = points.length > REPLY_CONTEXT_EXCERPT_LIMIT
+    ? `${points.slice(0, REPLY_CONTEXT_EXCERPT_LIMIT).join("").trimEnd()}…`
+    : sanitized;
+  return `[replying to: "${excerpt}"]`;
+}
+
 export function splitOutboundMessageText(text: string): string[] {
   if (!text) return [];
   const protectedText = text.replace(LITERAL_NEWLINE_TOKEN_RE, LITERAL_NEWLINE_SENTINEL);

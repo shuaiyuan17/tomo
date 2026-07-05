@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage } from "../src/channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, RecentChatMessage } from "../src/channels/types.js";
 import type { SessionEntry } from "../src/sessions/types.js";
 
 const { mockConfig } = vi.hoisted(() => ({
@@ -25,10 +25,13 @@ class FakeChannel implements Channel {
   sent: OutgoingMessage[] = [];
   renamed: Array<{ chatId: string; title: string }> = [];
   reacted: Array<{ chatId: string; messageId: string; reaction: MessageReaction; remove?: boolean }> = [];
+  /** Newest-first recent-message window; set per test. Undefined = channel does not track. */
+  recent: RecentChatMessage[] | undefined;
   constructor(name = "telegram") { this.name = name; }
   onMessage(): void {}
   onCommand(): void {}
   async send(message: OutgoingMessage): Promise<void> { this.sent.push(message); }
+  recentMessages? = (_chatId: string): RecentChatMessage[] => this.recent ?? [];
   async setChatTitle(chatId: string, title: string): Promise<void> {
     this.renamed.push({ chatId, title });
   }
@@ -176,6 +179,44 @@ describe("ProactiveSendService.sendToSession", () => {
     }
   });
 
+  it("threads a direct send onto the matched recent message via replyTo", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      { id: "g-2", text: "how about Friday?", timestamp: 2, fromMe: false },
+      { id: "g-1", text: "dinner plans?", timestamp: 1, fromMe: false },
+    ];
+
+    const result = await h.service.sendToSession("telegram:12345", "Friday works", undefined, { replyTo: "dinner" });
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.sent).toEqual([{ chatId: "12345", text: "Friday works", replyTo: "g-1" }]);
+  });
+
+  it("allows reply_to to thread onto Tomo's own earlier message", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      { id: "mine", text: "I'll check and get back to you", timestamp: 2, fromMe: true },
+      { id: "theirs", text: "any update?", timestamp: 1, fromMe: false },
+    ];
+
+    const result = await h.service.sendToSession("telegram:12345", "Update: done", undefined, { replyTo: "get back to you" });
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.sent).toEqual([{ chatId: "12345", text: "Update: done", replyTo: "mine" }]);
+  });
+
+  it("does not send anything when the reply_to match fails", async () => {
+    const h = makeHarness();
+    h.channel.recent = [{ id: "g-1", text: "hello", timestamp: 1, fromMe: false }];
+
+    const result = await h.service.sendToSession("telegram:12345", "hi", undefined, { replyTo: "nonexistent" });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/no recent message/i);
+    expect(h.channel.sent).toHaveLength(0);
+    expect(h.transcript).toHaveLength(0);
+  });
+
   it("still reports success when transcript persistence fails after delivery", async () => {
     const h = makeHarness({
       appendAssistantTranscript: () => { throw new Error("disk full"); },
@@ -278,7 +319,7 @@ describe("ProactiveSendService.renameGroupChat", () => {
   });
 });
 
-describe("ProactiveSendService.reactToLatestMessage", () => {
+describe("ProactiveSendService.reactToMessage", () => {
   function inbound(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
     return {
       id: "msg-1",
@@ -290,12 +331,16 @@ describe("ProactiveSendService.reactToLatestMessage", () => {
     };
   }
 
-  it("reacts to the recorded latest inbound message", async () => {
+  function recent(id: string, text: string, timestamp = 1): RecentChatMessage {
+    return { id, text, timestamp, fromMe: false };
+  }
+
+  it("reacts to the recorded latest inbound message when match is omitted", async () => {
     const h = makeHarness();
     h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "old" }));
     h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "latest" }));
 
-    const result = await h.service.reactToLatestMessage("telegram:12345", "like");
+    const result = await h.service.reactToMessage("telegram:12345", "like");
 
     expect(result).toEqual({ ok: true });
     expect(h.channel.reacted).toEqual([
@@ -307,10 +352,96 @@ describe("ProactiveSendService.reactToLatestMessage", () => {
     const h = makeHarness();
     h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "" }));
 
-    const result = await h.service.reactToLatestMessage("telegram:12345", "like");
+    const result = await h.service.reactToMessage("telegram:12345", "like");
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/no latest inbound message/i);
+  });
+
+  it("reacts to the newest recent message matching the substring, case-insensitively", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      recent("newest", "unrelated"),
+      recent("dinner-2", "Dinner Friday works!"),
+      recent("dinner-1", "what about dinner sometime"),
+    ];
+    h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "newest" }));
+
+    const result = await h.service.reactToMessage("telegram:12345", "love", false, "dinner friday");
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.reacted).toEqual([
+      { chatId: "12345", messageId: "dinner-2", reaction: "love", remove: false },
+    ]);
+  });
+
+  it("errors without reacting when no recent message matches", async () => {
+    const h = makeHarness();
+    h.channel.recent = [recent("a", "hello there")];
+    h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "a" }));
+
+    const result = await h.service.reactToMessage("telegram:12345", "like", false, "nonexistent");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/no recent message/i);
+    expect(h.channel.reacted).toHaveLength(0);
+  });
+
+  it("errors when the channel does not track recent messages", async () => {
+    const h = makeHarness();
+    h.channel.recentMessages = undefined;
+    h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "a" }));
+
+    const result = await h.service.reactToMessage("telegram:12345", "like", false, "hello");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/does not track recent messages/i);
+    expect(h.channel.reacted).toHaveLength(0);
+  });
+
+  it("never matches Tomo's own outbound messages", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      { id: "mine", text: "dinner friday works for me", timestamp: 2, fromMe: true },
+      { id: "theirs", text: "dinner friday?", timestamp: 1, fromMe: false },
+    ];
+    h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "theirs" }));
+
+    const result = await h.service.reactToMessage("telegram:12345", "love", false, "dinner friday");
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.reacted).toEqual([
+      { chatId: "12345", messageId: "theirs", reaction: "love", remove: false },
+    ]);
+
+    const onlyMine = await h.service.reactToMessage("telegram:12345", "love", false, "works for me");
+    expect(onlyMine.ok).toBe(false);
+    if (!onlyMine.ok) expect(onlyMine.error).toMatch(/no recent message/i);
+  });
+
+  it("scopes match to the chat of an explicitly named raw target, not the latest-inbound chat", async () => {
+    mockConfig.identities = [{ name: "Shuai", channels: { telegram: "12345", imessage: "+15551234567" } }];
+    try {
+      const tg = new FakeChannel("telegram");
+      const im = new FakeChannel("imessage");
+      im.recent = [{ id: "im-1", text: "check the imessage thread", timestamp: 1, fromMe: false }];
+      const h = makeHarness({
+        getChannel: (name) => (name === "telegram" ? tg : name === "imessage" ? im : undefined),
+      }, tg);
+      // Latest inbound for dm:shuai arrived on Telegram…
+      h.service.recordLatestInboundMessage("dm:shuai", tg, inbound({ id: "tg-9", chatId: "12345" }));
+
+      // …but the caller explicitly targeted the iMessage chat.
+      const result = await h.service.reactToMessage("imessage:+15551234567", "like", false, "imessage thread");
+
+      expect(result).toEqual({ ok: true });
+      expect(tg.reacted).toHaveLength(0);
+      expect(im.reacted).toEqual([
+        { chatId: "+15551234567", messageId: "im-1", reaction: "like", remove: false },
+      ]);
+    } finally {
+      mockConfig.identities = [];
+    }
   });
 });
 

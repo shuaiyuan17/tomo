@@ -1,5 +1,5 @@
 import { createServer, type Server, type IncomingMessage as HttpRequest, type ServerResponse } from "node:http";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
 import {
@@ -10,10 +10,14 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { deliverTextParts } from "./delivery.js";
-import { splitText, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
+import { splitText, isSatelliteService, formatReplyContextMarker, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
+const RECENT_MESSAGES_PER_CHAT = 50;
+// Reply-context lookups run before inbound dispatch — bound them so a slow
+// BlueBubbles server can only delay delivery, never stall it.
+const MESSAGE_LOOKUP_TIMEOUT_MS = 3000;
 
 interface BlueBubblesConfig {
   url: string;
@@ -37,6 +41,11 @@ export class BlueBubblesChannel implements Channel {
   private imageStoreBaseDir: string | undefined;
   private contactCache = new Map<string, string>(); // address → display name
   private messageGuidDedupe: MessageGuidDedupeStore;
+  // Bounded per-chat window of message GUIDs + text, newest first. Populated
+  // from the webhook for inbound AND our own outbound rows (BlueBubbles fires
+  // new-message for isFromMe too), so both reply-context lookups and
+  // substring-targeted reactions/replies resolve without extra HTTP calls.
+  private recentByChat = new Map<string, RecentChatMessage[]>();
 
   constructor(config: BlueBubblesConfig) {
     this.apiUrl = config.url.replace(/\/+$/, "");
@@ -115,14 +124,36 @@ export class BlueBubblesChannel implements Channel {
 
     // Split long messages
     const chunks = splitText(text, TEXT_CHUNK_LIMIT);
-    for (const chunk of chunks) {
+    for (const [i, chunk] of chunks.entries()) {
+      // Threaded replies require the Private API helper (like tapbacks);
+      // plain sends stay on apple-script. Only the first chunk threads —
+      // continuation chunks read as one message, not repeated replies.
+      const threaded = i === 0 && message.replyTo;
       await this.api("POST", "/message/text", {
         chatGuid: message.chatId,
         tempGuid: `tomo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         message: chunk,
-        method: "apple-script",
+        ...(threaded
+          ? { method: "private-api", selectedMessageGuid: message.replyTo, partIndex: 0 }
+          : { method: "apple-script" }),
       });
     }
+  }
+
+  recentMessages(chatId: string): RecentChatMessage[] {
+    const exact = this.recentByChat.get(chatId);
+    if (exact) return [...exact];
+    if (chatId.includes(";")) return [];
+    // Callers may address a DM by bare handle (the config identity form,
+    // e.g. "+15551234567") while the ring is keyed by BlueBubbles chat GUID
+    // ("iMessage;-;+15551234567") — match on the GUID's identifier part.
+    const want = this.normalizeAddress(chatId);
+    for (const [key, ring] of this.recentByChat) {
+      const parts = key.split(";");
+      if (parts.length < 3 || parts[1] === "+") continue; // groups are GUID-addressed
+      if (this.normalizeAddress(parts.slice(2).join(";")) === want) return [...ring];
+    }
+    return [];
   }
 
   async setChatTitle(chatId: string, title: string): Promise<void> {
@@ -140,12 +171,15 @@ export class BlueBubblesChannel implements Channel {
     });
   }
 
-  createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
+  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
     // iMessage can't edit sent messages — buffer per block, ship at boundary
     // (commitBlock between text blocks, finish at end of turn). NO_REPLY-only
     // blocks are dropped silently to mirror Telegram's prefix-suppression.
     let buffer = "";
     let canceled = false;
+    // Group replies carry the triggering message's GUID (mirrors Telegram);
+    // thread only the first shipped block — one reply, not one per block.
+    let pendingReplyTo = replyTo;
 
     const NO_REPLY_RE = /^\s*NO_REPLY\s*$/i;
 
@@ -154,7 +188,9 @@ export class BlueBubblesChannel implements Channel {
       if (NO_REPLY_RE.test(buffer)) { buffer = ""; return; }
       const text = buffer;
       buffer = "";
-      await deliverTextParts(this, chatId, text);
+      const threadTarget = pendingReplyTo;
+      pendingReplyTo = undefined;
+      await deliverTextParts(this, chatId, text, { replyTo: threadTarget });
     };
 
     return {
@@ -372,11 +408,12 @@ export class BlueBubblesChannel implements Channel {
     const data = payload.data as Record<string, unknown>;
     if (!data) return;
 
-    // Skip messages from self (prevent echo loop)
-    if (data.isFromMe) return;
-
     const text = (data.text as string) ?? "";
     const guid = data.guid as string;
+
+    // Get sender info
+    const handle = data.handle as Record<string, unknown> | undefined;
+    const senderAddress = (handle?.address as string) ?? "Unknown";
 
     // Resolve chat info
     const chats = data.chats as Array<Record<string, unknown>> | undefined;
@@ -385,6 +422,23 @@ export class BlueBubblesChannel implements Channel {
 
     const chatGuid = chat.guid as string;
     if (!chatGuid) return;
+
+    // Track every real message row — inbound AND our own outbound (BlueBubbles
+    // fires new-message for isFromMe rows too) — so reply-context lookups and
+    // substring-targeted reactions/replies can resolve text to a GUID later.
+    // Insertion is GUID-deduped, so webhook replays don't double-record.
+    if (guid && text.trim()) {
+      this.recordRecentMessage(chatGuid, {
+        id: guid,
+        text,
+        ...(data.isFromMe ? {} : { senderName: this.resolveContactName(senderAddress) }),
+        timestamp: typeof data.dateCreated === "number" ? data.dateCreated : Date.now(),
+        fromMe: Boolean(data.isFromMe),
+      });
+    }
+
+    // Skip messages from self (prevent echo loop)
+    if (data.isFromMe) return;
 
     // BlueBubbles' poller can replay a message row from its lookback window
     // after a restart or reconnection. Persist the GUID before dispatch so the
@@ -397,10 +451,6 @@ export class BlueBubblesChannel implements Channel {
 
     // Determine if group chat (iMessage;+; = group, iMessage;-; or SMS;-; = DM)
     const isGroup = chatGuid.includes(";+;");
-
-    // Get sender info
-    const handle = data.handle as Record<string, unknown> | undefined;
-    const senderAddress = (handle?.address as string) ?? "Unknown";
 
     // iMessage has no @mention system — treat all group messages as mentioned
     // (the agent gets a one-time system prompt to stay silent unless it has something to say)
@@ -455,7 +505,18 @@ export class BlueBubblesChannel implements Channel {
     const satelliteMarker =
       isSatelliteMessage && text.trim() ? SATELLITE_MARKER : "";
 
-    const markers = [satelliteMarker, imageMarker, docMarker].filter(Boolean).join(" ");
+    // Threaded replies (long-press → Reply) carry the replied-to message's
+    // GUID. Surface the original as inline context in the same visual family
+    // as the satellite marker; when the original can't be found the marker
+    // degrades to its quote-less form. Best-effort — never blocks delivery.
+    // Only tag rows with real content so a ghost row can't become a prompt.
+    const threadOriginatorGuid = data.threadOriginatorGuid as string | undefined;
+    const hasContent = Boolean(text.trim()) || images.length > 0 || documents.length > 0;
+    const replyMarker = threadOriginatorGuid && hasContent
+      ? formatReplyContextMarker(await this.lookupMessageText(chatGuid, threadOriginatorGuid))
+      : "";
+
+    const markers = [satelliteMarker, replyMarker, imageMarker, docMarker].filter(Boolean).join(" ");
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;
@@ -488,6 +549,33 @@ export class BlueBubblesChannel implements Channel {
     // coalescing.
     for (const handler of this.handlers) {
       handler(message).catch((err) => log.error({ err }, "iMessage handler failed"));
+    }
+  }
+
+  private recordRecentMessage(chatGuid: string, message: RecentChatMessage): void {
+    const ring = this.recentByChat.get(chatGuid) ?? [];
+    if (ring.some((m) => m.id === message.id)) return;
+    ring.unshift(message); // newest first
+    if (ring.length > RECENT_MESSAGES_PER_CHAT) ring.pop();
+    this.recentByChat.set(chatGuid, ring);
+  }
+
+  /**
+   * Text of a message by GUID: recent-message cache first (free), then the
+   * BlueBubbles server (covers messages older than the cache window).
+   * Best-effort — returns undefined rather than throwing.
+   */
+  private async lookupMessageText(chatGuid: string, guid: string): Promise<string | undefined> {
+    const cached = this.recentByChat.get(chatGuid)?.find((m) => m.id === guid);
+    if (cached) return cached.text;
+
+    try {
+      const result = await this.api("GET", `/message/${encodeURIComponent(guid)}`, undefined, { timeoutMs: MESSAGE_LOOKUP_TIMEOUT_MS });
+      const original = result?.data as Record<string, unknown> | undefined;
+      return typeof original?.text === "string" ? original.text : undefined;
+    } catch (err) {
+      log.debug({ err, guid }, "Failed to look up replied-to message");
+      return undefined;
     }
   }
 
@@ -607,7 +695,7 @@ export class BlueBubblesChannel implements Channel {
 
   // --- BlueBubbles API ---
 
-  private async api(method: string, path: string, body?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async api(method: string, path: string, body?: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>> {
     const separator = path.includes("?") ? "&" : "?";
     const url = `${this.apiUrl}/api/v1${path}${separator}password=${encodeURIComponent(this.password)}`;
 
@@ -615,6 +703,7 @@ export class BlueBubblesChannel implements Channel {
       method,
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
+      ...(options?.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}),
     });
 
     if (!res.ok) {

@@ -1132,8 +1132,8 @@ export class Agent {
   // react_to_message MCP tools) — thin delegates so the MCP server wiring
   // keeps calling Agent's public surface. See agent/proactive-send.ts.
 
-  async sendToSession(target: string, text: string, callerSessionKey?: string): Promise<SendResult> {
-    return this.proactive.sendToSession(target, text, callerSessionKey);
+  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string }): Promise<SendResult> {
+    return this.proactive.sendToSession(target, text, callerSessionKey, options);
   }
 
   async delegateToSession(target: string, request: string): Promise<SendResult> {
@@ -1144,8 +1144,8 @@ export class Agent {
     return this.proactive.renameGroupChat(target, title);
   }
 
-  async reactToLatestMessage(target: string, reaction: MessageReaction, remove = false): Promise<SendResult> {
-    return this.proactive.reactToLatestMessage(target, reaction, remove);
+  async reactToMessage(target: string, reaction: MessageReaction, remove = false, match?: string): Promise<SendResult> {
+    return this.proactive.reactToMessage(target, reaction, remove, match);
   }
 
   listSessionCatalog(): SessionCatalog {

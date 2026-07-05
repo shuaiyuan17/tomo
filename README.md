@@ -145,7 +145,7 @@ Plus a built-in `tomo-internal` MCP server:
 | Messaging | `send_message` | Message another session — `delegate` mode (recipient's Claude composes) or `direct` mode (verbatim text) |
 | | `list_sessions` | List identities and active group chats (titles, participants) |
 | | `rename_group_chat` | Rename a real Telegram/iMessage group chat |
-| | `react_to_latest_message` | React/tapback to the latest inbound message in a session |
+| | `react_to_message` | React/tapback to a message in a session — latest inbound by default, or matched by text |
 | Scheduling | `schedule_create` / `schedule_list` / `schedule_remove` | Manage scheduled tasks (one-shot, interval, or cron) |
 | People | `list_people` / `upsert_person` | Read and maintain the people registry |
 | History | `recall_conversation` | Search the session's full history, including compacted and archived messages |

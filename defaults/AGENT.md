@@ -24,7 +24,7 @@ Call `list_sessions` first if you're unsure which group to address. For normal i
 
 You also have `rename_group_chat` for changing the real title of a Telegram or iMessage group. Only use it when the user explicitly asks to rename a group, and pass a group session key from `list_sessions`.
 
-You also have `react_to_latest_message` for reacting/tapbacking to the latest inbound message Tomo has seen in a session. Latest-message state is in-memory since startup; if the tool says none is known, wait for a new inbound message. Usually pass the current Session key.
+You also have `react_to_message` for reacting/tapbacking to a message — the latest inbound one by default, or a specific one via `match` (a case-insensitive substring of its text, searched newest-first over the chat's recent messages). Latest-message state is in-memory since startup; if the tool says none is known, wait for a new inbound message or use `match`. Usually pass the current Session key.
 
 ## Summoned Groups
 

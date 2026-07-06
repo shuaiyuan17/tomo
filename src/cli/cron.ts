@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { CronStore, parseScheduleString } from "../cron/store.js";
+import { formatSchedule, formatRelative } from "../cron/format.js";
 
 const store = new CronStore();
 
@@ -45,7 +46,9 @@ cronCommand
     for (const job of jobs) {
       const status = job.enabled ? "enabled" : "disabled";
       const lifecycle = job.deleteAfterRun ? "once" : "recurring";
-      const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—";
+      const next = job.nextRunAt
+        ? `${new Date(job.nextRunAt).toLocaleString()} (${formatRelative(job.nextRunAt)})`
+        : "—";
       const last = job.lastRunAt
         ? `${new Date(job.lastRunAt).toLocaleString()} (${job.lastStatus})`
         : "never";
@@ -72,6 +75,31 @@ cronCommand
   });
 
 cronCommand
+  .command("enable <id>")
+  .description("Re-enable a disabled task (recomputes next run)")
+  .action((id) => {
+    const job = store.setEnabled(id, true);
+    if (!job) {
+      console.error(`Job ${id} not found`);
+      process.exit(1);
+    }
+    const next = job.nextRunAt ? formatRelative(job.nextRunAt) : "never";
+    console.log(`Enabled job ${job.id}: "${job.name}" — next run ${next}`);
+  });
+
+cronCommand
+  .command("disable <id>")
+  .description("Disable a task without deleting it")
+  .action((id) => {
+    const job = store.setEnabled(id, false);
+    if (!job) {
+      console.error(`Job ${id} not found`);
+      process.exit(1);
+    }
+    console.log(`Disabled job ${job.id}: "${job.name}"`);
+  });
+
+cronCommand
   .command("run <id>")
   .description("Trigger a job immediately (for testing)")
   .action((id) => {
@@ -85,12 +113,3 @@ cronCommand
     console.log(`  Message: ${job.message}`);
     console.log("(Use 'tomo start' to run jobs — this just previews)");
   });
-
-function formatSchedule(s: { kind: string; at?: string; everyMs?: number; expr?: string; tz?: string }): string {
-  switch (s.kind) {
-    case "at": return `once at ${s.at}`;
-    case "every": return `every ${(s.everyMs! / 60_000).toFixed(0)}m`;
-    case "cron": return `${s.expr}${s.tz ? ` (${s.tz})` : ""}`;
-    default: return JSON.stringify(s);
-  }
-}

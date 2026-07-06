@@ -3,6 +3,9 @@ import { existsSync } from "node:fs";
 import * as p from "@clack/prompts";
 import { printBanner } from "../banner.js";
 import { isAutostartEnabled, isMacOS } from "../service.js";
+import { getDaemonStatus } from "../status-info.js";
+import { formatDuration } from "../../cron/format.js";
+import { configIssues } from "../../config.js";
 import { CONFIG_PATH } from "./shared.js";
 import { configModel } from "./model.js";
 import { configAutostart } from "./autostart.js";
@@ -10,6 +13,7 @@ import { configChannels } from "./channels.js";
 import { configIdentities } from "./identities.js";
 import { configGroups } from "./groups.js";
 import { configSessions } from "./sessions.js";
+import { configCron } from "./cron.js";
 import { configCostAnalysis } from "./costs.js";
 import { configLiteLlm } from "./litellm.js";
 import { configAnthropicAuth } from "./auth.js";
@@ -26,6 +30,21 @@ export const configCommand = new Command("config")
       return;
     }
 
+    const daemon = getDaemonStatus();
+    if (daemon.pid) {
+      const uptime = daemon.uptimeMs !== null ? `, up ${formatDuration(daemon.uptimeMs)}` : "";
+      p.log.info(`Daemon: running (PID ${daemon.pid}${uptime})`);
+    } else {
+      p.log.warn("Daemon: not running — start it with `tomo start`.");
+    }
+
+    if (configIssues.length > 0) {
+      p.log.warn(
+        `Config has ${configIssues.length} issue${configIssues.length === 1 ? "" : "s"} — the daemon will refuse to start:\n` +
+        configIssues.map((issue) => `  ✗ ${issue}`).join("\n"),
+      );
+    }
+
     for (;;) {
       const options: Array<{ value: string; label: string; hint?: string }> = [
         { value: "auth", label: "Anthropic authentication", hint: "Claude subscription or API key" },
@@ -35,6 +54,7 @@ export const configCommand = new Command("config")
         { value: "identities", label: "Identities", hint: "bind DMs across channels" },
         { value: "groups", label: "Group chats", hint: "activation secret" },
         { value: "sessions", label: "Sessions", hint: "view and configure sessions" },
+        { value: "cron", label: "Scheduled tasks", hint: "cron job status" },
         { value: "costs", label: "Cost analysis", hint: "usage and spending breakdown" },
       ];
       if (isMacOS()) {
@@ -60,6 +80,7 @@ export const configCommand = new Command("config")
       if (choice === "identities") await configIdentities();
       if (choice === "groups") await configGroups();
       if (choice === "sessions") await configSessions();
+      if (choice === "cron") await configCron();
       if (choice === "costs") await configCostAnalysis();
       if (choice === "autostart") await configAutostart();
     }

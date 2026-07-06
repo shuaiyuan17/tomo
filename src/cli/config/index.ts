@@ -3,6 +3,9 @@ import { existsSync } from "node:fs";
 import * as p from "@clack/prompts";
 import { printBanner } from "../banner.js";
 import { isAutostartEnabled, isMacOS } from "../service.js";
+import { getDaemonStatus } from "../status-info.js";
+import { formatDuration } from "../../cron/format.js";
+import { configIssues } from "../../config.js";
 import { CONFIG_PATH } from "./shared.js";
 import { configModel } from "./model.js";
 import { configAutostart } from "./autostart.js";
@@ -25,6 +28,21 @@ export const configCommand = new Command("config")
       p.log.error("No config found. Run `tomo init` first.");
       p.outro("");
       return;
+    }
+
+    const daemon = getDaemonStatus();
+    if (daemon.pid) {
+      const uptime = daemon.uptimeMs !== null ? `, up ${formatDuration(daemon.uptimeMs)}` : "";
+      p.log.info(`Daemon: running (PID ${daemon.pid}${uptime})`);
+    } else {
+      p.log.warn("Daemon: not running — start it with `tomo start`.");
+    }
+
+    if (configIssues.length > 0) {
+      p.log.warn(
+        `Config has ${configIssues.length} issue${configIssues.length === 1 ? "" : "s"} — the daemon will refuse to start:\n` +
+        configIssues.map((issue) => `  ✗ ${issue}`).join("\n"),
+      );
     }
 
     for (;;) {

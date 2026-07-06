@@ -1,33 +1,14 @@
 import { Command } from "commander";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync, mkdirSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { RESTART_REASON_FILE } from "../config.js";
 import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { isRunning, getRunningPid } from "./status-info.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
-const PID_FILE = defaultRuntimePaths.pidFile;
 const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
-
-function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getRunningPid(): number | null {
-  if (!existsSync(PID_FILE)) return null;
-  const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-  if (isNaN(pid) || !isRunning(pid)) {
-    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
-    return null;
-  }
-  return pid;
-}
 
 export const stopCommand = new Command("stop")
   .description("Stop Tomo daemon")
@@ -86,33 +67,6 @@ export const restartCommand = new Command("restart")
       stdio: "inherit",
     });
     child.on("exit", (code) => process.exit(code ?? 0));
-  });
-
-export const statusCommand = new Command("status")
-  .description("Show Tomo status")
-  .action(() => {
-    const autostart = isAutostartEnabled();
-    const pid = getRunningPid();
-
-    if (!pid) {
-      console.log("Tomo is not running.");
-      if (autostart) {
-        console.log("Autostart is enabled — it will start at next login.");
-      }
-      return;
-    }
-
-    let uptime = "";
-    if (existsSync(PID_FILE)) {
-      const started = statSync(PID_FILE).mtimeMs;
-      const ms = Date.now() - started;
-      const hours = Math.floor(ms / 3_600_000);
-      const mins = Math.floor((ms % 3_600_000) / 60_000);
-      uptime = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
-    }
-
-    const mode = autostart ? " [autostart]" : "";
-    console.log(`Tomo is running (PID ${pid}, uptime: ${uptime})${mode}`);
   });
 
 export const continuityCommand = new Command("continuity")

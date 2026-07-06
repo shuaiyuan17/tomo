@@ -90,6 +90,10 @@ export class CronStore {
       const next = computeNextRun(job.schedule, now);
       job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
       if (job.schedule.kind === "at") delete job.retryCount;
+    } else {
+      // Clear rather than leave a stale timestamp that list/detail views
+      // would show as a "next run" that will never fire.
+      job.nextRunAt = null;
     }
     this.save();
     return job;

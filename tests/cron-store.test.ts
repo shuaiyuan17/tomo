@@ -327,6 +327,8 @@ describe("CronStore", () => {
 
     const disabled = store.setEnabled(job.id, false)!;
     expect(disabled.enabled).toBe(false);
+    // No stale "next run" on a job that will not fire
+    expect(disabled.nextRunAt).toBeNull();
     // Persisted, not just in-memory
     expect(new CronStore(TEST_PATH).get(job.id)!.enabled).toBe(false);
 

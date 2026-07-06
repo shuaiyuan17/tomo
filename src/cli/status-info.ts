@@ -34,7 +34,9 @@ export function getDaemonStatus(pidFile = PID_FILE): DaemonStatus {
   if (!pid) return { pid: null, uptimeMs: null };
   let uptimeMs: number | null = null;
   try {
-    uptimeMs = Date.now() - statSync(pidFile).mtimeMs;
+    // Clamp: mtime can be a fraction ahead of Date.now() right after the
+    // pid file is written (filesystem timestamp granularity).
+    uptimeMs = Math.max(0, Date.now() - statSync(pidFile).mtimeMs);
   } catch { /* pid file raced away; report running without uptime */ }
   return { pid, uptimeMs };
 }

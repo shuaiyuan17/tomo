@@ -26,6 +26,8 @@ describe("status-info", () => {
     writeFileSync(PID_FILE, String(process.pid));
     expect(getRunningPid(PID_FILE)).toBe(process.pid);
 
+    // uptimeMs must never go negative, even when the freshly written pid
+    // file's mtime is a fraction ahead of Date.now().
     const status = getDaemonStatus(PID_FILE);
     expect(status.pid).toBe(process.pid);
     expect(status.uptimeMs).toBeGreaterThanOrEqual(0);

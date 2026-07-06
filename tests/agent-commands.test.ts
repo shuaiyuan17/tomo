@@ -956,6 +956,35 @@ describe("/pause and /resume", () => {
     await agent.stop();
   });
 
+  it("drops a group message queued behind an in-flight turn when /pause lands while it waits", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // Block the first turn so the second message queues behind it.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    mockSdk.responseFn = async (text) => {
+      if (text.includes("first message")) await gate;
+      return "mock response";
+    };
+
+    await tg.simulateMessage(groupMsg("first message"));
+    // Accepted before the pause, but waiting in the session queue.
+    await tg.simulateMessage(groupMsg("second message, queued"));
+    await tg.simulateCommand("pause", GROUP, "GroupMember");
+    release();
+    await drainQueue(agent);
+
+    // Turn 1 completed; the queued message was dropped at processing time.
+    const allTexts = mockSdk.userContents.flat().map((b) => b.text ?? "").join("\n");
+    expect(allTexts).toContain("first message");
+    expect(allTexts).not.toContain("second message, queued");
+    expect(tg.delivered.filter((d) => d.text === "mock response")).toHaveLength(1);
+
+    await agent.stop();
+  });
+
   it("any group member can pause and resume, even with identities configured", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],

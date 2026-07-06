@@ -376,7 +376,10 @@ export class Agent {
     const canCoalesce = !isGroup || isPassiveGroup;
 
     if (!canCoalesce) {
-      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message, false, resolution))
+      // Through processInboundItems (not handleMessage directly) so the
+      // allowlist and /pause state are re-checked at processing time — this
+      // task can wait behind an in-flight turn, and both can change meanwhile.
+      this.enqueueForSession(sessionKey, () => this.processInboundItems([{ channel, message, resolution }]))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
       return;
     }

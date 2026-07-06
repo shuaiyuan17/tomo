@@ -370,6 +370,78 @@ describe("background task notification delivery", () => {
 
     await agent.stop();
   });
+
+  // #222: a "background task/agent" notifying another session (e.g. via the
+  // delegate send_message tool, or a scheduled cron job) runs through
+  // handleCronMessage -> TurnRunner.runSendTurn, which has no per-block
+  // delivery (unlike stream turns) — it collects the whole multi-block
+  // response into one string and only then decides whether to deliver it.
+  it("#222: delivers mid-turn text from a send-turn ending in a trailing NO_REPLY block", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    // Mirrors the reported repro shape: text -> tool_use -> tool_use -> NO_REPLY.
+    mockSdk.responseFn = () => [
+      "mid-turn user-facing text",
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/b" } },
+      "NO_REPLY",
+    ];
+    await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0]).toMatchObject({ chatId: "12345", text: "mid-turn user-facing text" });
+
+    await agent.stop();
+  });
+
+  it("#222: a send-turn whose ONLY content is NO_REPLY (even after tool calls) stays silent", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => [
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/b" } },
+      "NO_REPLY",
+    ];
+    await expect(agent.handleCronMessage("System: housekeeping task", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered).toHaveLength(0);
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("#222: a bare NO_REPLY send-turn (no tool calls) still stays silent (no regression)", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => "NO_REPLY";
+    await expect(agent.handleCronMessage("System: housekeeping task", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered).toHaveLength(0);
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
 });
 
 

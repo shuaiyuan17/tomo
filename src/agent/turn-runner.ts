@@ -1,7 +1,7 @@
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
 import { STEER_MERGED } from "./live-session.js";
-import { ATTACHMENT_TAG_RE, isSilentReply } from "./text-utils.js";
+import { ATTACHMENT_TAG_RE, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
 import { filterScaffoldLeak } from "./scaffold-filter.js";
 
@@ -228,7 +228,19 @@ export class TurnRunner {
       spec.key,
       await this.deps.runWithRetry({ key: spec.key, prompt }),
     );
-    const silent = spec.silentMatcher(response);
+
+    // Send turns have no per-block delivery (unlike stream turns' onBlockComplete
+    // — see makeBlockHandler): the whole multi-block response arrives joined
+    // into one string, so a trailing NO_REPLY block must be peeled off here
+    // instead of matched with a blanket substring check. Otherwise
+    // silentMatcher's `.includes("NO_REPLY")` (embeddedSilentMatcher) silences
+    // the ENTIRE response, dropping any earlier substantive text the model
+    // emitted before ending the turn with NO_REPLY (#222). `response` (unstripped)
+    // still drives the error/log checks below so they see the model's literal
+    // output; `deliverText` is what actually ships.
+    const { visible, hadTrailingNoReply } = stripTrailingNoReply(response);
+    const silent = hadTrailingNoReply ? visible.length === 0 : spec.silentMatcher(response);
+    const deliverText = hadTrailingNoReply ? visible : response;
     spec.logResponse?.(response);
 
     if (isAgentErrorResponse(response)) {
@@ -261,8 +273,8 @@ export class TurnRunner {
 
     const target = this.resolveSendTarget(delivery);
     if (target) {
-      this.deps.appendAssistantTranscript(spec.key, response, target.channel.name);
-      await this.deps.delivery.deliverAssistantContent(target.channel, target.chatId, response);
+      this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+      await this.deps.delivery.deliverAssistantContent(target.channel, target.chatId, deliverText);
     }
     await stopTyping({ clear: true });
     return true;

@@ -324,6 +324,186 @@ describe("TelegramChannel.send photo captions", () => {
   });
 });
 
+// Recent-message tracking + edit/unsend of own messages. Outbound sends must
+// record their provider message ids (Telegram has no webhook echo for bot
+// messages) so edit_message/unsend_message can target them later.
+describe("TelegramChannel recent messages and edit/unsend", () => {
+  function makeChannel() {
+    const channel = new TelegramChannel("000000:test-token");
+    const sent: Array<{ chatId: string; text: string }> = [];
+    const edited: Array<{ chatId: string; messageId: number; text: string; parseMode?: string }> = [];
+    const deleted: Array<{ chatId: string; messageId: number }> = [];
+    let nextId = 100;
+    const api = {
+      sendMessage: async (chatId: string | number, text: string) => {
+        sent.push({ chatId: String(chatId), text });
+        return { message_id: nextId++ };
+      },
+      editMessageText: async (chatId: string | number, messageId: number, text: string, opts?: { parse_mode?: string }) => {
+        edited.push({ chatId: String(chatId), messageId, text, parseMode: opts?.parse_mode });
+        return {};
+      },
+      deleteMessage: async (chatId: string | number, messageId: number) => {
+        deleted.push({ chatId: String(chatId), messageId });
+        return true;
+      },
+    };
+    (channel as unknown as { bot: { api: unknown } }).bot.api = api;
+    return { channel, api, sent, edited, deleted };
+  }
+
+  it("records outbound sends as own messages, newest first", async () => {
+    const { channel } = makeChannel();
+
+    await channel.send({ chatId: "1", text: "first" });
+    await channel.send({ chatId: "1", text: "second" });
+
+    const recent = channel.recentMessages("1");
+    expect(recent.map((m) => ({ id: m.id, text: m.text, fromMe: m.fromMe }))).toEqual([
+      { id: "101", text: "second", fromMe: true },
+      { id: "100", text: "first", fromMe: true },
+    ]);
+  });
+
+  it("records each chunk of a long outbound send under its own message id", async () => {
+    const { channel } = makeChannel();
+
+    const longText = `${"x".repeat(4090)} ${"y".repeat(100)}`;
+    await channel.send({ chatId: "1", text: longText });
+
+    const recent = channel.recentMessages("1");
+    expect(recent).toHaveLength(2);
+    expect(recent.every((m) => m.fromMe)).toBe(true);
+    expect(recent.map((m) => m.id)).toEqual(["101", "100"]);
+  });
+
+  it("records inbound dispatches as messages from others", async () => {
+    const { channel } = makeChannel();
+
+    (channel as unknown as { dispatch(msg: unknown): void }).dispatch({
+      id: "555",
+      chatId: "1",
+      senderName: "Alice",
+      text: "hi tomo",
+      timestamp: 1,
+    });
+
+    const recent = channel.recentMessages("1");
+    expect(recent).toEqual([
+      { id: "555", text: "hi tomo", senderName: "Alice", timestamp: 1, fromMe: false },
+    ]);
+  });
+
+  it("caps the per-chat window at 50 messages", async () => {
+    const { channel } = makeChannel();
+
+    for (let i = 0; i < 55; i++) {
+      await channel.send({ chatId: "1", text: `message ${i}` });
+    }
+
+    const recent = channel.recentMessages("1");
+    expect(recent).toHaveLength(50);
+    expect(recent[0].text).toBe("message 54");
+    expect(recent[49].text).toBe("message 5");
+  });
+
+  it("edits via editMessageText (Markdown first) and updates the recorded text", async () => {
+    const { channel, edited } = makeChannel();
+    await channel.send({ chatId: "1", text: "helo world" });
+
+    await channel.editMessage("1", "100", "hello world");
+
+    expect(edited).toEqual([
+      { chatId: "1", messageId: 100, text: "hello world", parseMode: "Markdown" },
+    ]);
+    expect(channel.recentMessages("1")[0].text).toBe("hello world");
+  });
+
+  it("falls back to a plain-text edit when Markdown parsing fails", async () => {
+    const { channel, api, edited } = makeChannel();
+    await channel.send({ chatId: "1", text: "original" });
+
+    let calls = 0;
+    api.editMessageText = async (chatId: string | number, messageId: number, text: string, opts?: { parse_mode?: string }) => {
+      calls++;
+      if (opts?.parse_mode === "Markdown") throw new Error("Bad Request: can't parse entities");
+      edited.push({ chatId: String(chatId), messageId, text, parseMode: opts?.parse_mode });
+      return {};
+    };
+
+    await channel.editMessage("1", "100", "broken _markdown");
+
+    expect(calls).toBe(2);
+    expect(edited).toEqual([
+      { chatId: "1", messageId: 100, text: "broken _markdown", parseMode: undefined },
+    ]);
+    expect(channel.recentMessages("1")[0].text).toBe("broken _markdown");
+  });
+
+  it("treats 'message is not modified' as success", async () => {
+    const { channel, api } = makeChannel();
+    await channel.send({ chatId: "1", text: "same text" });
+    api.editMessageText = async () => {
+      throw new Error("Bad Request: message is not modified");
+    };
+
+    await expect(channel.editMessage("1", "100", "same text")).resolves.toBeUndefined();
+  });
+
+  it("rejects empty and over-limit edits without calling the API", async () => {
+    const { channel, edited } = makeChannel();
+
+    await expect(channel.editMessage("1", "100", "   ")).rejects.toThrow(/cannot be empty/i);
+    await expect(channel.editMessage("1", "100", "x".repeat(4097))).rejects.toThrow(/4096/);
+    expect(edited).toHaveLength(0);
+  });
+
+  it("maps Telegram's edit refusal to a friendly window error", async () => {
+    const { channel, api } = makeChannel();
+    api.editMessageText = async () => {
+      throw new Error("Bad Request: message can't be edited");
+    };
+
+    await expect(channel.editMessage("1", "100", "new text")).rejects.toThrow(/48 hours/);
+  });
+
+  it("unsends via deleteMessage and drops the recorded row", async () => {
+    const { channel, deleted } = makeChannel();
+    await channel.send({ chatId: "1", text: "oops" });
+    expect(channel.recentMessages("1")).toHaveLength(1);
+
+    await channel.unsendMessage("1", "100");
+
+    expect(deleted).toEqual([{ chatId: "1", messageId: 100 }]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("maps Telegram's delete refusal to a friendly window error", async () => {
+    const { channel, api } = makeChannel();
+    api.deleteMessage = async () => {
+      throw new Error("Bad Request: message can't be deleted for everyone");
+    };
+
+    await expect(channel.unsendMessage("1", "100")).rejects.toThrow(/48 hours/);
+  });
+
+  it("records streamed blocks once sealed so they are targetable", async () => {
+    const { channel } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("first block");
+    await stream.commitBlock();
+    stream.update("second block");
+    await stream.finish();
+
+    const recent = channel.recentMessages("1");
+    expect(recent.map((m) => ({ text: m.text, fromMe: m.fromMe }))).toEqual([
+      { text: "second block", fromMe: true },
+      { text: "first block", fromMe: true },
+    ]);
+  });
+});
+
 // Polling restart backoff: a permanently failing bot.start() (revoked token,
 // network down) must not hot-loop a restart every 3s forever.
 describe("nextPollingBackoff", () => {

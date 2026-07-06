@@ -171,6 +171,46 @@ export class BlueBubblesChannel implements Channel {
     });
   }
 
+  async editMessage(_chatId: string, messageId: string, text: string): Promise<void> {
+    if (!text.trim()) throw new Error("Edited message text cannot be empty");
+    // Requires the BlueBubbles Private API on macOS Ventura+. Apple only
+    // allows edits within 15 minutes of sending (max 5 edits per message);
+    // outside that window the server rejects the request.
+    await this.api("POST", `/message/${encodeURIComponent(messageId)}/edit`, {
+      editedMessage: text,
+      // Shown as a follow-up bubble on recipients too old to render edits
+      // (pre-iOS 16 / pre-Ventura).
+      backwardsCompatibilityMessage: `Edited to: ${text}`,
+      partIndex: 0,
+    });
+    // Keep substring targeting working against what's actually on screen.
+    // Message GUIDs are globally unique, so scanning rings needs no chat key
+    // (chatId may be a bare handle while rings are keyed by chat GUID).
+    for (const ring of this.recentByChat.values()) {
+      const entry = ring.find((m) => m.id === messageId);
+      if (entry) {
+        entry.text = text;
+        return;
+      }
+    }
+  }
+
+  async unsendMessage(_chatId: string, messageId: string): Promise<void> {
+    // Requires the BlueBubbles Private API on macOS Ventura+. Apple only
+    // allows unsend within 2 minutes of sending; recipients see a
+    // "message was unsent" notice.
+    await this.api("POST", `/message/${encodeURIComponent(messageId)}/unsend`, {
+      partIndex: 0,
+    });
+    for (const ring of this.recentByChat.values()) {
+      const idx = ring.findIndex((m) => m.id === messageId);
+      if (idx !== -1) {
+        ring.splice(idx, 1);
+        return;
+      }
+    }
+  }
+
   createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
     // iMessage can't edit sent messages — buffer per block, ship at boundary
     // (commitBlock between text blocks, finish at end of turn). NO_REPLY-only

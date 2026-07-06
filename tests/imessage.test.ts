@@ -855,6 +855,106 @@ describe("BlueBubbles outbound threaded reply", () => {
   });
 });
 
+describe("BlueBubbles edit and unsend", () => {
+  const ownMessagePayload = (guid: string, text: string) => ({
+    type: "new-message",
+    data: {
+      guid,
+      text,
+      isFromMe: true,
+      dateCreated: 1_000,
+      handle: { address: "+15551234567" },
+      chats: [{ guid: "iMessage;-;+15551234567" }],
+      attachments: [],
+    },
+  });
+
+  const dispatch = (channel: BlueBubblesChannel, event: ReturnType<typeof ownMessagePayload>) =>
+    (channel as unknown as { handleWebhookEvent(payload: Record<string, unknown>): Promise<void> })
+      .handleWebhookEvent(event);
+
+  const captureApi = () => {
+    const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      calls.push({
+        method: init?.method ?? "GET",
+        path: new URL(requestUrl).pathname,
+        body: init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined,
+      });
+      return new Response("{}", { status: 200 });
+    }));
+    return calls;
+  };
+
+  const makeChannel = () =>
+    new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+
+  it("edits via the Private API edit endpoint and updates the cached text", async () => {
+    const calls = captureApi();
+    const channel = makeChannel();
+    await dispatch(channel, ownMessagePayload("guid-mine", "helo world"));
+
+    await channel.editMessage("iMessage;-;+15551234567", "guid-mine", "hello world");
+
+    const edit = calls.find((c) => c.path === "/api/v1/message/guid-mine/edit");
+    expect(edit).toBeDefined();
+    expect(edit!.method).toBe("POST");
+    expect(edit!.body).toEqual({
+      editedMessage: "hello world",
+      backwardsCompatibilityMessage: "Edited to: hello world",
+      partIndex: 0,
+    });
+    expect(channel.recentMessages("iMessage;-;+15551234567")[0].text).toBe("hello world");
+  });
+
+  it("updates the cached text even when addressed by bare handle", async () => {
+    captureApi();
+    const channel = makeChannel();
+    await dispatch(channel, ownMessagePayload("guid-mine", "before"));
+
+    // Callers may address a DM by the config identity form; rings are keyed
+    // by chat GUID. GUIDs are globally unique, so the update still lands.
+    await channel.editMessage("+15551234567", "guid-mine", "after");
+
+    expect(channel.recentMessages("iMessage;-;+15551234567")[0].text).toBe("after");
+  });
+
+  it("unsends via the Private API unsend endpoint and drops the cached row", async () => {
+    const calls = captureApi();
+    const channel = makeChannel();
+    await dispatch(channel, ownMessagePayload("guid-mine", "oops wrong chat"));
+    expect(channel.recentMessages("iMessage;-;+15551234567")).toHaveLength(1);
+
+    await channel.unsendMessage("iMessage;-;+15551234567", "guid-mine");
+
+    const unsend = calls.find((c) => c.path === "/api/v1/message/guid-mine/unsend");
+    expect(unsend).toBeDefined();
+    expect(unsend!.method).toBe("POST");
+    expect(unsend!.body).toEqual({ partIndex: 0 });
+    expect(channel.recentMessages("iMessage;-;+15551234567")).toHaveLength(0);
+  });
+
+  it("rejects empty edited text without calling the API", async () => {
+    const calls = captureApi();
+    const channel = makeChannel();
+
+    await expect(channel.editMessage("iMessage;-;+15551234567", "guid-mine", "  ")).rejects.toThrow(/cannot be empty/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("surfaces server rejections (edit window elapsed, Private API off)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("edit window elapsed", { status: 400 })));
+    const channel = makeChannel();
+
+    await expect(channel.editMessage("iMessage;-;+15551234567", "guid-old", "too late")).rejects.toThrow(/400/);
+  });
+});
+
 describe("BlueBubbles satellite message tagging", () => {
   const payload = (guid: string, text: string, service?: string, handleService?: string) => ({
     type: "new-message",

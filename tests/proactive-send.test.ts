@@ -25,6 +25,8 @@ class FakeChannel implements Channel {
   sent: OutgoingMessage[] = [];
   renamed: Array<{ chatId: string; title: string }> = [];
   reacted: Array<{ chatId: string; messageId: string; reaction: MessageReaction; remove?: boolean }> = [];
+  edited: Array<{ chatId: string; messageId: string; text: string }> = [];
+  unsent: Array<{ chatId: string; messageId: string }> = [];
   /** Newest-first recent-message window; set per test. Undefined = channel does not track. */
   recent: RecentChatMessage[] | undefined;
   constructor(name = "telegram") { this.name = name; }
@@ -38,6 +40,12 @@ class FakeChannel implements Channel {
   async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove?: boolean): Promise<void> {
     this.reacted.push({ chatId, messageId, reaction, remove });
   }
+  editMessage? = async (chatId: string, messageId: string, text: string): Promise<void> => {
+    this.edited.push({ chatId, messageId, text });
+  };
+  unsendMessage? = async (chatId: string, messageId: string): Promise<void> => {
+    this.unsent.push({ chatId, messageId });
+  };
   createStreamingMessage(): never { throw new Error("not used"); }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
@@ -442,6 +450,124 @@ describe("ProactiveSendService.reactToMessage", () => {
     } finally {
       mockConfig.identities = [];
     }
+  });
+});
+
+describe("ProactiveSendService edit/unsend of own messages", () => {
+  function own(id: string, text: string, timestamp = 1): RecentChatMessage {
+    return { id, text, timestamp, fromMe: true };
+  }
+  function theirs(id: string, text: string, timestamp = 1): RecentChatMessage {
+    return { id, text, timestamp, fromMe: false, senderName: "TestUser" };
+  }
+
+  it("edits the most recent own message when match is omitted", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      theirs("in-2", "what did you mean?"),
+      own("mine-2", "dinner is at 7pm"),
+      own("mine-1", "hello!"),
+    ];
+
+    const result = await h.service.editSentMessage("telegram:12345", "dinner is at 8pm");
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.edited).toEqual([
+      { chatId: "12345", messageId: "mine-2", text: "dinner is at 8pm" },
+    ]);
+  });
+
+  it("unsends the most recent own message when match is omitted", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      theirs("in-2", "who is this for?"),
+      own("mine-2", "wrong chat, sorry"),
+    ];
+
+    const result = await h.service.unsendMessage("telegram:12345");
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.unsent).toEqual([{ chatId: "12345", messageId: "mine-2" }]);
+  });
+
+  it("matches only Tomo's own messages, never inbound ones", async () => {
+    const h = makeHarness();
+    h.channel.recent = [
+      theirs("in-1", "there is a typo in that"),
+      own("mine-1", "a message with a typo inside"),
+    ];
+
+    const result = await h.service.editSentMessage("telegram:12345", "fixed text", "typo");
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.edited).toEqual([
+      { chatId: "12345", messageId: "mine-1", text: "fixed text" },
+    ]);
+
+    const noOwnMatch = await h.service.unsendMessage("telegram:12345", "there is a typo");
+    expect(noOwnMatch.ok).toBe(false);
+    if (!noOwnMatch.ok) expect(noOwnMatch.error).toMatch(/no message sent by tomo/i);
+    expect(h.channel.unsent).toHaveLength(0);
+  });
+
+  it("errors when no own message is known in the chat", async () => {
+    const h = makeHarness();
+    h.channel.recent = [theirs("in-1", "hello")];
+
+    const result = await h.service.editSentMessage("telegram:12345", "new text");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/no message sent by tomo/i);
+    expect(h.channel.edited).toHaveLength(0);
+  });
+
+  it("errors when the channel does not support edit/unsend", async () => {
+    const h = makeHarness();
+    h.channel.recent = [own("mine-1", "hello")];
+    h.channel.editMessage = undefined;
+    h.channel.unsendMessage = undefined;
+
+    const edit = await h.service.editSentMessage("telegram:12345", "new text");
+    expect(edit.ok).toBe(false);
+    if (!edit.ok) expect(edit.error).toMatch(/does not support editing/i);
+
+    const unsend = await h.service.unsendMessage("telegram:12345");
+    expect(unsend.ok).toBe(false);
+    if (!unsend.ok) expect(unsend.error).toMatch(/does not support unsending/i);
+  });
+
+  it("rejects empty replacement text without touching the channel", async () => {
+    const h = makeHarness();
+    h.channel.recent = [own("mine-1", "hello")];
+
+    const result = await h.service.editSentMessage("telegram:12345", "   ");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/cannot be empty/i);
+    expect(h.channel.edited).toHaveLength(0);
+  });
+
+  it("surfaces channel errors (provider time windows) as tool failures", async () => {
+    const h = makeHarness();
+    h.channel.recent = [own("mine-1", "hello")];
+    h.channel.unsendMessage = async () => {
+      throw new Error("Telegram refused the delete — bots can only delete messages within ~48 hours of sending");
+    };
+
+    const result = await h.service.unsendMessage("telegram:12345");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/48 hours/);
+  });
+
+  it("errors on unknown targets", async () => {
+    const h = makeHarness();
+    mockConfig.identities = [];
+
+    const result = await h.service.unsendMessage("nobody");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/unknown target/i);
   });
 });
 

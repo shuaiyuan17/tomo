@@ -136,6 +136,8 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__list_sessions`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__rename_group_chat`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__react_to_message`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__edit_message`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__unsend_message`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_create`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_list`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__schedule_remove`,

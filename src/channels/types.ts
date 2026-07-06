@@ -142,6 +142,20 @@ export interface Channel {
   reactToMessage?(chatId: string, messageId: string, reaction: MessageReaction, remove?: boolean): Promise<void>;
 
   /**
+   * Edit the text of a message we previously sent, if supported by the
+   * channel. Providers enforce their own windows (Telegram ~48h for bot
+   * messages; iMessage 15 minutes, Private API + macOS Ventura+).
+   */
+  editMessage?(chatId: string, messageId: string, text: string): Promise<void>;
+
+  /**
+   * Unsend/delete a message we previously sent, if supported by the channel.
+   * Providers enforce their own windows (Telegram ~48h for bot messages;
+   * iMessage 2 minutes, Private API + macOS Ventura+).
+   */
+  unsendMessage?(chatId: string, messageId: string): Promise<void>;
+
+  /**
    * Recently seen messages in a chat, newest first (bounded window), if the
    * channel tracks them. Backs substring targeting for reactions
    * (react_to_message `match`) and threaded replies (send_message `reply_to`).

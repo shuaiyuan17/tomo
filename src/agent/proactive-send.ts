@@ -42,9 +42,10 @@ export interface ProactiveSendDeps {
 
 /**
  * Proactive messaging into other sessions: direct sends, delegate requests,
- * group renames, and reactions. Backs the tomo-internal MCP tools
- * (send_message, list_sessions, rename_group_chat, react_to_message) via the
- * Agent's public delegate methods.
+ * group renames, reactions, and edit/unsend of own messages. Backs the
+ * tomo-internal MCP tools (send_message, list_sessions, rename_group_chat,
+ * react_to_message, edit_message, unsend_message) via the Agent's public
+ * delegate methods.
  */
 export class ProactiveSendService {
   private latestInboundMessages = new Map<string, { channelName: string; chatId: string; messageId: string }>();
@@ -73,7 +74,7 @@ export class ProactiveSendService {
     // game here: threading onto an earlier Tomo message is legitimate.
     let replyToId: string | undefined;
     if (options?.replyTo !== undefined) {
-      const found = this.matchRecentMessage(channel, replyTarget.chatId, options.replyTo, { includeFromMe: true });
+      const found = this.matchRecentMessage(channel, replyTarget.chatId, options.replyTo, { from: "anyone" });
       if (!found.ok) return found;
       replyToId = found.message.id;
     }
@@ -243,7 +244,7 @@ export class ProactiveSendService {
     let messageId: string;
     if (match !== undefined) {
       // Own messages are excluded — tapbacking your own message is never the intent.
-      const found = this.matchRecentMessage(channel, chatRef.chatId, match, { includeFromMe: false });
+      const found = this.matchRecentMessage(channel, chatRef.chatId, match, { from: "others" });
       if (!found.ok) return found;
       chatId = chatRef.chatId;
       messageId = found.message.id;
@@ -268,12 +269,104 @@ export class ProactiveSendService {
     return { ok: true };
   }
 
+  /**
+   * Edit the text of a message Tomo previously sent in a session — the most
+   * recent own message by default, or the newest own message whose text
+   * contains `match`.
+   */
+  async editSentMessage(target: string, newText: string, match?: string): Promise<SendResult> {
+    if (!newText.trim()) {
+      return { ok: false, error: "Edited message text cannot be empty" };
+    }
+
+    const resolved = this.resolveOwnMessage(target, match, "editMessage");
+    if (!resolved.ok) return resolved;
+
+    try {
+      await resolved.channel.editMessage!(resolved.chatId, resolved.message.id, newText);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: detail };
+    }
+
+    log.info({ sessionKey: resolved.sessionKey, channel: resolved.channel.name, matched: match !== undefined || undefined }, "Edited sent message");
+    return { ok: true };
+  }
+
+  /**
+   * Unsend/delete a message Tomo previously sent in a session — the most
+   * recent own message by default, or the newest own message whose text
+   * contains `match`.
+   */
+  async unsendMessage(target: string, match?: string): Promise<SendResult> {
+    const resolved = this.resolveOwnMessage(target, match, "unsendMessage");
+    if (!resolved.ok) return resolved;
+
+    try {
+      await resolved.channel.unsendMessage!(resolved.chatId, resolved.message.id);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: detail };
+    }
+
+    log.info({ sessionKey: resolved.sessionKey, channel: resolved.channel.name, matched: match !== undefined || undefined }, "Unsent message");
+    return { ok: true };
+  }
+
+  /**
+   * Resolve a target + optional `match` to one of Tomo's own recent messages
+   * in the chat, checking that the channel supports `capability`. Shared by
+   * edit/unsend — both only ever operate on messages Tomo sent.
+   */
+  private resolveOwnMessage(
+    target: string,
+    match: string | undefined,
+    capability: "editMessage" | "unsendMessage",
+  ): { ok: true; channel: Channel; chatId: string; message: RecentChatMessage; sessionKey: string } | { ok: false; error: string } {
+    const resolved = this.resolveSendTarget(target);
+    if (!resolved) {
+      return { ok: false, error: `Unknown target "${target}". Use the current session key or call list_sessions.` };
+    }
+
+    // Chat scope mirrors reactToMessage: an explicitly named channel:chat
+    // target pins it; otherwise the latest-inbound record pins the chat the
+    // conversation actually lives in (a dm session can span channels).
+    const latest = this.latestInboundMessages.get(resolved.sessionKey);
+    const chatRef = resolved.rawReplyTarget
+      ?? latest
+      ?? { channelName: resolved.replyTarget.channelName, chatId: resolved.replyTarget.chatId };
+
+    const channel = this.deps.getChannel(chatRef.channelName);
+    if (!channel) {
+      return { ok: false, error: `Channel "${chatRef.channelName}" is not connected` };
+    }
+    if (!channel[capability]) {
+      const verb = capability === "editMessage" ? "editing sent messages" : "unsending messages";
+      return { ok: false, error: `Channel "${chatRef.channelName}" does not support ${verb}` };
+    }
+
+    if (match !== undefined) {
+      const found = this.matchRecentMessage(channel, chatRef.chatId, match, { from: "self" });
+      if (!found.ok) return found;
+      return { ok: true, channel, chatId: chatRef.chatId, message: found.message, sessionKey: resolved.sessionKey };
+    }
+
+    if (!channel.recentMessages) {
+      return { ok: false, error: `Channel "${chatRef.channelName}" does not track recent messages` };
+    }
+    const newestOwn = channel.recentMessages(chatRef.chatId).find((m) => m.fromMe);
+    if (!newestOwn) {
+      return { ok: false, error: `No message sent by Tomo is known in this chat since Tomo started` };
+    }
+    return { ok: true, channel, chatId: chatRef.chatId, message: newestOwn, sessionKey: resolved.sessionKey };
+  }
+
   /** Newest recent message in a chat whose text contains `query` (case-insensitive). */
   private matchRecentMessage(
     channel: Channel,
     chatId: string,
     query: string,
-    options: { includeFromMe: boolean },
+    options: { from: "others" | "self" | "anyone" },
   ): { ok: true; message: RecentChatMessage } | { ok: false; error: string } {
     if (!channel.recentMessages) {
       return { ok: false, error: `Channel "${channel.name}" does not track recent messages, so text matching is unavailable` };
@@ -282,11 +375,14 @@ export class ProactiveSendService {
     if (!needle) {
       return { ok: false, error: "Match text cannot be empty" };
     }
+    const fromOk = (m: RecentChatMessage) =>
+      options.from === "anyone" || (options.from === "self") === m.fromMe;
     const found = channel.recentMessages(chatId).find(
-      (m) => (options.includeFromMe || !m.fromMe) && m.text.toLowerCase().includes(needle),
+      (m) => fromOk(m) && m.text.toLowerCase().includes(needle),
     );
     if (!found) {
-      return { ok: false, error: `No recent message in this chat matches "${query}"` };
+      const scope = options.from === "self" ? "message sent by Tomo" : "recent message";
+      return { ok: false, error: `No ${scope} in this chat matches "${query}"` };
     }
     return { ok: true, message: found };
   }

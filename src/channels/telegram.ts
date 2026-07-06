@@ -1,6 +1,6 @@
 import { Bot, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, StreamingMessage, MessageReaction, RecentChatMessage } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
 import {
@@ -17,6 +17,8 @@ import { LITERAL_NEWLINE_TOKEN, splitOutboundMessageText, splitText } from "./te
 const TELEGRAM_TEXT_LIMIT = 4096;
 /** Telegram rejects sendPhoto captions beyond 1024 chars. */
 const TELEGRAM_CAPTION_LIMIT = 1024;
+/** Per-chat window of recent messages kept for substring targeting. */
+const RECENT_MESSAGES_PER_CHAT = 50;
 
 /** First restart delay after polling exits. */
 export const POLLING_RESTART_MIN_MS = 3000;
@@ -72,6 +74,11 @@ export class TelegramChannel implements Channel {
   private imageStoreBaseDir: string | undefined;
   private pollingRestartDelayMs = POLLING_RESTART_MIN_MS;
   private pollingRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  // Bounded per-chat window of message ids + text, newest first. Populated
+  // from inbound dispatch AND our own outbound sends (Telegram has no webhook
+  // echo for bot messages, so send paths record explicitly), backing
+  // substring-targeted reactions, threaded replies, and edit/unsend.
+  private recentByChat = new Map<string, RecentChatMessage[]>();
 
   constructor(token: string, options: TelegramChannelOptions = {}) {
     this.bot = new Bot(token);
@@ -357,12 +364,44 @@ export class TelegramChannel implements Channel {
   }
 
   private dispatch(msg: IncomingMessage): void {
+    if (msg.id && msg.text.trim()) {
+      this.recordRecentMessage(msg.chatId, {
+        id: msg.id,
+        text: msg.text,
+        senderName: msg.senderName,
+        timestamp: msg.timestamp,
+        fromMe: false,
+      });
+    }
+
     // Fire-and-forget: the agent's per-session queue handles ordering.
     // Awaiting here would let grammy serialize updates against the SDK turn,
     // preventing rapid messages from piling up for the queue to coalesce.
     for (const handler of this.handlers) {
       handler(msg).catch((err) => log.error({ err }, "Telegram message handler failed"));
     }
+  }
+
+  private recordRecentMessage(chatId: string, message: RecentChatMessage): void {
+    const ring = this.recentByChat.get(chatId) ?? [];
+    if (ring.some((m) => m.id === message.id)) return;
+    ring.unshift(message); // newest first
+    if (ring.length > RECENT_MESSAGES_PER_CHAT) ring.pop();
+    this.recentByChat.set(chatId, ring);
+  }
+
+  private recordOwnMessage(chatId: string, messageId: number, text: string): void {
+    if (!text.trim()) return;
+    this.recordRecentMessage(chatId, {
+      id: String(messageId),
+      text,
+      timestamp: Date.now(),
+      fromMe: true,
+    });
+  }
+
+  recentMessages(chatId: string): RecentChatMessage[] {
+    return [...(this.recentByChat.get(chatId) ?? [])];
   }
 
   onMessage(handler: MessageHandler): void {
@@ -485,6 +524,7 @@ export class TelegramChannel implements Channel {
             // first chunk, then roll the remainder into a fresh message.
             const head = splitText(visiblePending, TELEGRAM_TEXT_LIMIT)[0];
             await sendOrEdit(head);
+            if (messageId !== null) this.recordOwnMessage(chatId, messageId, head);
             offset += head.length;
             messageId = null;
             lastSent = "";
@@ -556,6 +596,10 @@ export class TelegramChannel implements Channel {
         // starts a fresh sendMessage instead of editing the previous block.
         await stopAndDrain();
         await finalFlush();
+        // The block is sealed — its message is final, so it becomes
+        // targetable for edit/unsend. (Multi-part finals went through
+        // send(), which records each part itself.)
+        if (messageId !== null && lastSent) this.recordOwnMessage(chatId, messageId, lastSent);
         messageId = null;
         lastSent = "";
         buffer = "";
@@ -566,6 +610,7 @@ export class TelegramChannel implements Channel {
         finished = true;
         await stopAndDrain();
         await finalFlush();
+        if (messageId !== null && lastSent) this.recordOwnMessage(chatId, messageId, lastSent);
       },
       cancel: async () => {
         canceled = true;
@@ -601,10 +646,16 @@ export class TelegramChannel implements Channel {
       // the photo AND the text. Ship the photo captionless and follow up with
       // the text as its own (chunked) message instead.
       const fitsCaption = !caption || caption.length <= TELEGRAM_CAPTION_LIMIT;
-      await this.bot.api.sendPhoto(message.chatId, new InputFile(message.photo), {
+      const sent = await this.bot.api.sendPhoto(message.chatId, new InputFile(message.photo), {
         ...replyParams,
         caption: fitsCaption ? caption : undefined,
       });
+      if (fitsCaption && caption) {
+        // A captioned photo is the visible form of a text reply (the delivery
+        // pipeline ships assistant text as the first photo's caption) — it
+        // must be targetable by edit/unsend like any other own message.
+        this.recordOwnMessage(message.chatId, sent.message_id, caption);
+      }
       if (!fitsCaption) {
         await this.send({ chatId: message.chatId, text: message.text });
       }
@@ -622,15 +673,17 @@ export class TelegramChannel implements Channel {
     const chunks = splitText(message.text, TELEGRAM_TEXT_LIMIT);
     for (const [i, chunk] of chunks.entries()) {
       const params = i === 0 ? replyParams : {};
+      let sent;
       try {
-        await this.bot.api.sendMessage(message.chatId, chunk, {
+        sent = await this.bot.api.sendMessage(message.chatId, chunk, {
           ...params,
           parse_mode: "Markdown",
         });
       } catch {
         // Fallback to plain text if Markdown parsing fails
-        await this.bot.api.sendMessage(message.chatId, chunk, params);
+        sent = await this.bot.api.sendMessage(message.chatId, chunk, params);
       }
+      this.recordOwnMessage(message.chatId, sent.message_id, chunk);
     }
   }
 
@@ -657,6 +710,77 @@ export class TelegramChannel implements Channel {
       }
       throw err;
     }
+  }
+
+  async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
+    if (!text.trim()) throw new Error("Edited message text cannot be empty");
+    // editMessageText cannot split into multiple messages the way send() can —
+    // reject outright instead of losing the tail.
+    if (text.length > TELEGRAM_TEXT_LIMIT) {
+      throw new Error(`Edited text exceeds Telegram's ${TELEGRAM_TEXT_LIMIT}-character message limit`);
+    }
+    // Keep substring targeting working against what's actually on screen.
+    // "message is not modified" counts: the content already equals `text`.
+    const recordEditedText = () => {
+      const entry = this.recentByChat.get(chatId)?.find((m) => m.id === messageId);
+      if (entry) entry.text = text;
+    };
+    const isNotModified = (err: unknown) => err instanceof Error && /not modified/i.test(err.message);
+    // Media messages (captioned photos) carry their text as a caption —
+    // editMessageText rejects them with this error and editMessageCaption is
+    // the right surface.
+    const isMediaMessage = (err: unknown) => err instanceof Error && /no text in the message to edit/i.test(err.message);
+
+    // Try Markdown first then plain, mirroring send(). Returns "media" when
+    // Telegram says the target has no text to edit, so the caller can retry
+    // via the caption API.
+    const attempt = async (edit: (parseMode?: "Markdown") => Promise<unknown>): Promise<"ok" | "media"> => {
+      try {
+        await edit("Markdown");
+        return "ok";
+      } catch (err) {
+        if (isNotModified(err)) return "ok";
+        if (isMediaMessage(err)) return "media";
+        try {
+          await edit(undefined);
+          return "ok";
+        } catch (plainErr) {
+          if (isNotModified(plainErr)) return "ok";
+          if (isMediaMessage(plainErr)) return "media";
+          if (plainErr instanceof Error && /can't be edited|message to edit not found/i.test(plainErr.message)) {
+            throw new Error("Telegram refused the edit — bots can only edit their own messages, within ~48 hours of sending", { cause: plainErr });
+          }
+          throw plainErr;
+        }
+      }
+    };
+
+    const asText = await attempt((parseMode) =>
+      this.bot.api.editMessageText(chatId, Number(messageId), text, parseMode ? { parse_mode: parseMode } : undefined),
+    );
+    if (asText === "media") {
+      if (text.length > TELEGRAM_CAPTION_LIMIT) {
+        throw new Error(`This message is a captioned photo, and the edited text exceeds Telegram's ${TELEGRAM_CAPTION_LIMIT}-character caption limit`);
+      }
+      await attempt((parseMode) =>
+        this.bot.api.editMessageCaption(chatId, Number(messageId), { caption: text, ...(parseMode ? { parse_mode: parseMode } : {}) }),
+      );
+    }
+    recordEditedText();
+  }
+
+  async unsendMessage(chatId: string, messageId: string): Promise<void> {
+    try {
+      await this.bot.api.deleteMessage(chatId, Number(messageId));
+    } catch (err) {
+      if (err instanceof Error && /message can't be deleted|message to delete not found/i.test(err.message)) {
+        throw new Error("Telegram refused the delete — bots can only delete messages within ~48 hours of sending", { cause: err });
+      }
+      throw err;
+    }
+    const ring = this.recentByChat.get(chatId);
+    const idx = ring?.findIndex((m) => m.id === messageId) ?? -1;
+    if (ring && idx !== -1) ring.splice(idx, 1);
   }
 
   async start(): Promise<void> {

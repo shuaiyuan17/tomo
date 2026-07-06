@@ -81,7 +81,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
             "`delegate` (default): recipient's Claude composes the message. `direct`: send verbatim, recipient is not triggered.",
           ),
           reply_to: z.string().optional().describe(
-            "Direct mode only: send as a threaded reply. Case-insensitive substring of the target message's text, matched over the chat's recent messages (newest first). Errors without sending if nothing matches. Currently iMessage only.",
+            "Direct mode only: send as a threaded reply. Case-insensitive substring of the target message's text, matched over the chat's recent messages (newest first, seen since Tomo started). Errors without sending if nothing matches.",
           ),
         },
         async ({ target, message, mode, reply_to }) => {
@@ -155,7 +155,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           "",
           "The target is normally the current Session key from the system prompt. For another conversation, pass an identity name or session key. Without `match`, the tool reacts to the latest inbound provider message recorded for that session since Tomo started.",
           "",
-          "`match` is a case-insensitive substring of the target message's text, searched over the chat's recent messages (newest first). If nothing matches, the tool errors and nothing is sent. Currently iMessage only.",
+          "`match` is a case-insensitive substring of the target message's text, searched over the chat's recent messages (newest first, seen since Tomo started). If nothing matches, the tool errors and nothing is sent.",
           "",
           "Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`. Telegram maps these to close emoji reactions; iMessage/BlueBubbles sends native tapbacks and requires the Private API/helper.",
         ].join("\n"),
@@ -188,6 +188,81 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         },
         {
           searchHint: "react reaction tapback latest message match telegram imessage bluebubbles like love laugh",
+        },
+      ),
+      tool(
+        "edit_message",
+        [
+          "Edit the text of a message Tomo already sent — the most recent own message by default, or a specific one via `match`.",
+          "",
+          "Use when the user asks to fix or reword something Tomo just sent, or right after catching your own mistake (typo, wrong detail) in a delivered message.",
+          "",
+          "The target is normally the current Session key from the system prompt. `match` is a case-insensitive substring of the message's current text, searched over Tomo's own recent messages in the chat (newest first). Without `match`, the most recent message Tomo sent there is edited. Only messages sent since Tomo started are targetable. Long replies ship as multiple provider messages — each is edited separately, so use `match` to pick the right one.",
+          "",
+          "Platform limits: Telegram bots can edit their own messages for ~48 hours; the message shows an \"edited\" label. iMessage requires the BlueBubbles Private API on macOS Ventura+, Apple allows edits only within 15 minutes of sending (max 5 edits, recipients can view the edit history), and pre-iOS 16 recipients see the edit as a separate \"Edited to: ...\" message. Telegram edits are capped at 4096 characters.",
+        ].join("\n"),
+        {
+          target: z.string().describe(
+            "Current session key, identity name, or session key of the conversation the message was sent in. Usually use the current Session key.",
+          ),
+          new_text: z.string().min(1).max(4000).describe(
+            "Replacement text for the whole message (not a diff — the full new content).",
+          ),
+          match: z.string().optional().describe(
+            "Case-insensitive substring of the message's current text, matched over Tomo's own recent messages only. Omit to edit the most recent message Tomo sent in the chat.",
+          ),
+        },
+        async ({ target, new_text, match }) => {
+          const result = await agent.editSentMessage(target, new_text, match);
+
+          if (result.ok) {
+            return {
+              content: [{ type: "text" as const, text: "OK. Message edited." }],
+            };
+          }
+          return {
+            content: [{ type: "text" as const, text: `edit_message failed: ${result.error}` }],
+            isError: true,
+          };
+        },
+        {
+          searchHint: "edit sent message fix typo correct reword change text telegram imessage bluebubbles",
+        },
+      ),
+      tool(
+        "unsend_message",
+        [
+          "Unsend/delete a message Tomo already sent — the most recent own message by default, or a specific one via `match`.",
+          "",
+          "Use when the user asks to retract something Tomo sent, or right after an accidental or clearly wrong send. For fixing a typo or detail, prefer edit_message — unsending is more disruptive.",
+          "",
+          "Targeting works like edit_message: `match` is a case-insensitive substring searched over Tomo's own recent messages in the chat (newest first); without it, the most recent message Tomo sent there is unsent. Only messages sent since Tomo started are targetable, and long replies ship as multiple provider messages that must be unsent one by one.",
+          "",
+          "Platform limits: Telegram bots can delete their own messages for ~48 hours; deletion is silent (no placeholder). iMessage requires the BlueBubbles Private API on macOS Ventura+, Apple allows unsend only within 2 minutes of sending, recipients see a \"message was unsent\" notice, and pre-iOS 16 recipients keep the original text.",
+        ].join("\n"),
+        {
+          target: z.string().describe(
+            "Current session key, identity name, or session key of the conversation the message was sent in. Usually use the current Session key.",
+          ),
+          match: z.string().optional().describe(
+            "Case-insensitive substring of the message's text, matched over Tomo's own recent messages only. Omit to unsend the most recent message Tomo sent in the chat.",
+          ),
+        },
+        async ({ target, match }) => {
+          const result = await agent.unsendMessage(target, match);
+
+          if (result.ok) {
+            return {
+              content: [{ type: "text" as const, text: "OK. Message unsent." }],
+            };
+          }
+          return {
+            content: [{ type: "text" as const, text: `unsend_message failed: ${result.error}` }],
+            isError: true,
+          };
+        },
+        {
+          searchHint: "unsend delete retract undo sent message telegram imessage bluebubbles",
         },
       ),
       ...buildCronTools(),

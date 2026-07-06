@@ -116,7 +116,7 @@ function sendSpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
     stampChannelName: "telegram",
     typing: { channel: h.channel, chatId: "123", passiveListen: false },
     delivery: { kind: "send", channel: h.channel, chatId: "123" },
-    silentMatcher: embeddedSilentMatcher,
+    silentMatcher: isSilentReply,
     transcript: "on-delivery",
     errors: {
       visiblePrefix: "[error] cron failed: ",
@@ -237,8 +237,30 @@ describe("TurnRunner send turns", () => {
     expect(h.channel.sent).toEqual([{ chatId: "123", text: "cron says hi" }]);
   });
 
-  it("treats responses containing NO_REPLY as silent (no send, no transcript)", async () => {
+  it("delivers prose that merely mentions NO_REPLY inline", async () => {
     const h = makeHarness(async () => "did housekeeping. NO_REPLY");
+    const result = await h.runner.runTurn(sendSpec(h));
+
+    expect(result).toBe(true);
+    expect(h.channel.sent).toEqual([{ chatId: "123", text: "did housekeeping. NO_REPLY" }]);
+    expect(h.transcript).toEqual([
+      { sessionKey: "telegram:123", content: "did housekeeping. NO_REPLY", channelName: "telegram" },
+    ]);
+  });
+
+  it("strips repeated trailing NO_REPLY blocks before delivery", async () => {
+    const h = makeHarness(async () => "cron says hi\nNO_REPLY\nNO_REPLY");
+    const result = await h.runner.runTurn(sendSpec(h));
+
+    expect(result).toBe(true);
+    expect(h.channel.sent).toEqual([{ chatId: "123", text: "cron says hi" }]);
+    expect(h.transcript).toEqual([
+      { sessionKey: "telegram:123", content: "cron says hi", channelName: "telegram" },
+    ]);
+  });
+
+  it("keeps repeated trailing NO_REPLY-only send turns silent", async () => {
+    const h = makeHarness(async () => "NO_REPLY\nNO_REPLY");
     const result = await h.runner.runTurn(sendSpec(h));
 
     expect(result).toBe(true);
@@ -317,7 +339,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
       key: "dm:shuai",
       prompt: "System: Free time.",
       delivery: { kind: "deferred-send", resolveTarget },
-      silentMatcher: embeddedSilentMatcher,
+      silentMatcher: isSilentReply,
       transcript: "on-delivery",
       errors: {
         visiblePrefix: "[error] continuity failed: ",
@@ -341,7 +363,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
   });
 
   it("does not resolve the target for silent responses", async () => {
-    const h = makeHarness(async () => "nothing to say NO_REPLY");
+    const h = makeHarness(async () => "NO_REPLY");
     const resolveTarget = vi.fn(() => ({ channel: h.channel as Channel, chatId: "123" }));
     await h.runner.runTurn(continuitySpec(h, resolveTarget));
 

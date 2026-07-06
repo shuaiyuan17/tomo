@@ -17,11 +17,10 @@ export interface RunWithRetryRequest {
 }
 
 /**
- * The two silent-reply checks in use. User turns match the bare token only;
- * cron and continuity turns additionally treat any response CONTAINING
- * NO_REPLY as silent (multi-turn responses may emit NO_REPLY after earlier
- * text output). The mismatch is a known inconsistency preserved deliberately
- * — tightening the substring check to line-anchored is an owner decision.
+ * Silent-reply checks. User and production send/deferred-send turns match the
+ * bare token only; send/deferred-send turns strip trailing bare NO_REPLY blocks
+ * before applying their matcher. The embedded matcher is retained for callers
+ * that deliberately want legacy substring suppression.
  */
 export const bareSilentMatcher = isSilentReply;
 export function embeddedSilentMatcher(response: string): boolean {
@@ -231,16 +230,15 @@ export class TurnRunner {
 
     // Send turns have no per-block delivery (unlike stream turns' onBlockComplete
     // — see makeBlockHandler): the whole multi-block response arrives joined
-    // into one string, so a trailing NO_REPLY block must be peeled off here
+    // into one string, so trailing NO_REPLY blocks must be peeled off here
     // instead of matched with a blanket substring check. Otherwise
-    // silentMatcher's `.includes("NO_REPLY")` (embeddedSilentMatcher) silences
-    // the ENTIRE response, dropping any earlier substantive text the model
-    // emitted before ending the turn with NO_REPLY (#222). `response` (unstripped)
-    // still drives the error/log checks below so they see the model's literal
-    // output; `deliverText` is what actually ships.
-    const { visible, hadTrailingNoReply } = stripTrailingNoReply(response);
-    const silent = hadTrailingNoReply ? visible.length === 0 : spec.silentMatcher(response);
-    const deliverText = hadTrailingNoReply ? visible : response;
+    // embeddedSilentMatcher's `.includes("NO_REPLY")` can silence the ENTIRE
+    // response, dropping earlier substantive text or prose that merely mentions
+    // NO_REPLY inline (#222). `response` (unstripped) still drives the error/log
+    // checks below so they see the model's literal output; `deliverText` is what
+    // actually ships.
+    const { visible: deliverText } = stripTrailingNoReply(response);
+    const silent = deliverText.length === 0 || spec.silentMatcher(deliverText);
     spec.logResponse?.(response);
 
     if (isAgentErrorResponse(response)) {

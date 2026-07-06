@@ -401,6 +401,44 @@ describe("background task notification delivery", () => {
     await agent.stop();
   });
 
+  it("#222: delivers send-turn prose that merely mentions NO_REPLY inline", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => "The literal token is NO_REPLY.";
+    await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0]).toMatchObject({ chatId: "12345", text: "The literal token is NO_REPLY." });
+
+    await agent.stop();
+  });
+
+  it("#222: repeated trailing NO_REPLY blocks with no visible text stay silent", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => ["NO_REPLY", "NO_REPLY"];
+    await expect(agent.handleCronMessage("System: housekeeping task", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered).toHaveLength(0);
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
+
   it("#222: a send-turn whose ONLY content is NO_REPLY (even after tool calls) stays silent", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

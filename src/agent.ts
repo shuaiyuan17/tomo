@@ -28,7 +28,7 @@ import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
-import { TurnRunner, embeddedSilentMatcher, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
@@ -1046,7 +1046,7 @@ export class Agent {
         suppressDelivery: options.suppressDelivery,
         suppressedLog: "Cron output suppressed from chat delivery",
       },
-      silentMatcher: embeddedSilentMatcher,
+      silentMatcher: isSilentReply,
       silentLog: "Cron completed silently (no reply sent)",
       transcript: "on-delivery",
       logResponse: (response) => log.info({ channel: deliveryChannel.name }, "Tomo: %s", response),
@@ -1104,7 +1104,7 @@ export class Agent {
           return channel ? { channel, chatId: replyTarget.chatId } : undefined;
         },
       },
-      silentMatcher: embeddedSilentMatcher,
+      silentMatcher: isSilentReply,
       transcript: "on-delivery",
       logResponse: (response) => log.info("Continuity response: %s", response.slice(0, 100)),
       errors: {

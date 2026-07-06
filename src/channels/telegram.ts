@@ -646,10 +646,16 @@ export class TelegramChannel implements Channel {
       // the photo AND the text. Ship the photo captionless and follow up with
       // the text as its own (chunked) message instead.
       const fitsCaption = !caption || caption.length <= TELEGRAM_CAPTION_LIMIT;
-      await this.bot.api.sendPhoto(message.chatId, new InputFile(message.photo), {
+      const sent = await this.bot.api.sendPhoto(message.chatId, new InputFile(message.photo), {
         ...replyParams,
         caption: fitsCaption ? caption : undefined,
       });
+      if (fitsCaption && caption) {
+        // A captioned photo is the visible form of a text reply (the delivery
+        // pipeline ships assistant text as the first photo's caption) — it
+        // must be targetable by edit/unsend like any other own message.
+        this.recordOwnMessage(message.chatId, sent.message_id, caption);
+      }
       if (!fitsCaption) {
         await this.send({ chatId: message.chatId, text: message.text });
       }
@@ -720,27 +726,45 @@ export class TelegramChannel implements Channel {
       if (entry) entry.text = text;
     };
     const isNotModified = (err: unknown) => err instanceof Error && /not modified/i.test(err.message);
+    // Media messages (captioned photos) carry their text as a caption —
+    // editMessageText rejects them with this error and editMessageCaption is
+    // the right surface.
+    const isMediaMessage = (err: unknown) => err instanceof Error && /no text in the message to edit/i.test(err.message);
 
-    try {
-      await this.bot.api.editMessageText(chatId, Number(messageId), text, { parse_mode: "Markdown" });
-    } catch (err) {
-      if (isNotModified(err)) {
-        recordEditedText();
-        return;
-      }
-      // Fallback to plain text if Markdown parsing fails, mirroring send()
+    // Try Markdown first then plain, mirroring send(). Returns "media" when
+    // Telegram says the target has no text to edit, so the caller can retry
+    // via the caption API.
+    const attempt = async (edit: (parseMode?: "Markdown") => Promise<unknown>): Promise<"ok" | "media"> => {
       try {
-        await this.bot.api.editMessageText(chatId, Number(messageId), text);
-      } catch (plainErr) {
-        if (isNotModified(plainErr)) {
-          recordEditedText();
-          return;
+        await edit("Markdown");
+        return "ok";
+      } catch (err) {
+        if (isNotModified(err)) return "ok";
+        if (isMediaMessage(err)) return "media";
+        try {
+          await edit(undefined);
+          return "ok";
+        } catch (plainErr) {
+          if (isNotModified(plainErr)) return "ok";
+          if (isMediaMessage(plainErr)) return "media";
+          if (plainErr instanceof Error && /can't be edited|message to edit not found/i.test(plainErr.message)) {
+            throw new Error("Telegram refused the edit — bots can only edit their own messages, within ~48 hours of sending", { cause: plainErr });
+          }
+          throw plainErr;
         }
-        if (plainErr instanceof Error && /can't be edited|message to edit not found/i.test(plainErr.message)) {
-          throw new Error("Telegram refused the edit — bots can only edit their own messages, within ~48 hours of sending", { cause: plainErr });
-        }
-        throw plainErr;
       }
+    };
+
+    const asText = await attempt((parseMode) =>
+      this.bot.api.editMessageText(chatId, Number(messageId), text, parseMode ? { parse_mode: parseMode } : undefined),
+    );
+    if (asText === "media") {
+      if (text.length > TELEGRAM_CAPTION_LIMIT) {
+        throw new Error(`This message is a captioned photo, and the edited text exceeds Telegram's ${TELEGRAM_CAPTION_LIMIT}-character caption limit`);
+      }
+      await attempt((parseMode) =>
+        this.bot.api.editMessageCaption(chatId, Number(messageId), { caption: text, ...(parseMode ? { parse_mode: parseMode } : {}) }),
+      );
     }
     recordEditedText();
   }

@@ -295,14 +295,15 @@ describe("TelegramChannel.send photo captions", () => {
     const channel = new TelegramChannel("000000:test-token");
     const photos: Array<{ chatId: string; caption?: string }> = [];
     const messages: Array<{ chatId: string; text: string }> = [];
+    let nextId = 100;
     (channel as unknown as { bot: { api: unknown } }).bot.api = {
       sendPhoto: async (chatId: string | number, _file: unknown, opts?: { caption?: string }) => {
         photos.push({ chatId: String(chatId), caption: opts?.caption });
-        return {};
+        return { message_id: nextId++ };
       },
       sendMessage: async (chatId: string | number, text: string) => {
         messages.push({ chatId: String(chatId), text });
-        return { message_id: 1 };
+        return { message_id: nextId++ };
       },
     };
     return { channel, photos, messages };
@@ -322,6 +323,26 @@ describe("TelegramChannel.send photo captions", () => {
     expect(photos).toEqual([{ chatId: "1", caption: undefined }]);
     expect(messages.map((m) => m.text).join("")).toBe(longText);
   });
+
+  it("records a captioned photo as an own message so edit/unsend can target it", async () => {
+    const { channel } = makeChannel();
+    await channel.send({ chatId: "1", text: "earlier text" });
+    await channel.send({ chatId: "1", text: "look at this", photo: "/tmp/pic.png" });
+
+    // The captioned photo — not the earlier text — is the newest own message,
+    // so a no-match unsend targets what the user actually just saw.
+    const recent = channel.recentMessages("1");
+    expect(recent.map((m) => ({ text: m.text, fromMe: m.fromMe }))).toEqual([
+      { text: "look at this", fromMe: true },
+      { text: "earlier text", fromMe: true },
+    ]);
+  });
+
+  it("does not record captionless photos (no text to match on)", async () => {
+    const { channel } = makeChannel();
+    await channel.send({ chatId: "1", text: "", photo: "/tmp/pic.png" });
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
 });
 
 // Recent-message tracking + edit/unsend of own messages. Outbound sends must
@@ -334,13 +355,21 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     const edited: Array<{ chatId: string; messageId: number; text: string; parseMode?: string }> = [];
     const deleted: Array<{ chatId: string; messageId: number }> = [];
     let nextId = 100;
+    const editedCaptions: Array<{ chatId: string; messageId: number; caption?: string; parseMode?: string }> = [];
     const api = {
       sendMessage: async (chatId: string | number, text: string) => {
         sent.push({ chatId: String(chatId), text });
         return { message_id: nextId++ };
       },
+      sendPhoto: async (_chatId: string | number, _file: unknown, _opts?: { caption?: string }) => {
+        return { message_id: nextId++ };
+      },
       editMessageText: async (chatId: string | number, messageId: number, text: string, opts?: { parse_mode?: string }) => {
         edited.push({ chatId: String(chatId), messageId, text, parseMode: opts?.parse_mode });
+        return {};
+      },
+      editMessageCaption: async (chatId: string | number, messageId: number, opts?: { caption?: string; parse_mode?: string }) => {
+        editedCaptions.push({ chatId: String(chatId), messageId, caption: opts?.caption, parseMode: opts?.parse_mode });
         return {};
       },
       deleteMessage: async (chatId: string | number, messageId: number) => {
@@ -349,7 +378,7 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
       },
     };
     (channel as unknown as { bot: { api: unknown } }).bot.api = api;
-    return { channel, api, sent, edited, deleted };
+    return { channel, api, sent, edited, editedCaptions, deleted };
   }
 
   it("records outbound sends as own messages, newest first", async () => {
@@ -465,6 +494,32 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     };
 
     await expect(channel.editMessage("1", "100", "new text")).rejects.toThrow(/48 hours/);
+  });
+
+  it("falls back to editMessageCaption for captioned photos and updates the recorded text", async () => {
+    const { channel, api, editedCaptions } = makeChannel();
+    await channel.send({ chatId: "1", text: "old caption", photo: "/tmp/pic.png" });
+
+    api.editMessageText = async () => {
+      throw new Error("Bad Request: there is no text in the message to edit");
+    };
+
+    await channel.editMessage("1", "100", "new caption");
+
+    expect(editedCaptions).toEqual([
+      { chatId: "1", messageId: 100, caption: "new caption", parseMode: "Markdown" },
+    ]);
+    expect(channel.recentMessages("1")[0].text).toBe("new caption");
+  });
+
+  it("rejects caption edits over Telegram's 1024-char caption limit", async () => {
+    const { channel, api, editedCaptions } = makeChannel();
+    api.editMessageText = async () => {
+      throw new Error("Bad Request: there is no text in the message to edit");
+    };
+
+    await expect(channel.editMessage("1", "100", "x".repeat(2000))).rejects.toThrow(/1024/);
+    expect(editedCaptions).toHaveLength(0);
   });
 
   it("unsends via deleteMessage and drops the recorded row", async () => {

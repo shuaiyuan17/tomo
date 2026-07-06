@@ -82,7 +82,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "model", "restore", "login", "status", "cost", "pet", "summon", "dismiss"]) {
+    for (const cmd of ["new", "model", "restore", "login", "status", "cost", "pet", "summon", "dismiss", "pause", "resume"]) {
       this.bot.command(cmd, async (ctx) => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
@@ -676,6 +676,8 @@ export class TelegramChannel implements Channel {
       { command: "pet", description: "Check on Tomo's pet" },
       { command: "summon", description: "Pull your main Tomo session into this group" },
       { command: "dismiss", description: "Hand this group back to its own Tomo session" },
+      { command: "pause", description: "Pause Tomo in this group (messages ignored until /resume)" },
+      { command: "resume", description: "Resume Tomo in this group after /pause" },
     ]);
 
     this.startPolling();

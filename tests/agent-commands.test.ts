@@ -16,6 +16,7 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockConfig,
+  mockSdk,
   resetConfig,
   sdkMock,
 } from "./helpers/agent-harness.js";
@@ -906,5 +907,156 @@ describe("chat commands", () => {
     expect(tg.sent[0].text).toContain("No config backup found");
 
     await agent.stop();
+  });
+});
+
+// ===== /pause and /resume =====
+
+describe("/pause and /resume", () => {
+  const GROUP = "-100123";
+  const groupMsg = (text: string) => makeMsg({ chatId: GROUP, text, isGroup: true, isMentioned: true });
+
+  it("pauses a group (messages dropped without reaching the SDK) until /resume", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // Sanity: the group is handled before pausing.
+    await tg.simulateMessage(groupMsg("hello before pause"));
+    await drainQueue(agent);
+    expect(tg.delivered.some((d) => d.text === "mock response")).toBe(true);
+    tg.clearDelivered();
+
+    await tg.simulateCommand("pause", GROUP, "GroupMember", undefined, "99999");
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("paused");
+    tg.clearDelivered();
+    mockSdk.userContents = [];
+
+    await tg.simulateMessage(groupMsg("this should be ignored"));
+    await tg.simulateMessage(groupMsg("this too"));
+    await drainQueue(agent);
+
+    // Completely ignored: no reply, and nothing ever reached the model.
+    expect(tg.delivered).toHaveLength(0);
+    expect(mockSdk.userContents).toHaveLength(0);
+
+    await tg.simulateCommand("resume", GROUP, "OtherMember", undefined, "88888");
+    expect(tg.sent.at(-1)?.text).toContain("Tomo is back");
+    tg.clearDelivered();
+
+    await tg.simulateMessage(groupMsg("hello after resume"));
+    await drainQueue(agent);
+    expect(tg.delivered.some((d) => d.text === "mock response")).toBe(true);
+    // The paused-period messages never entered the context of the new turn.
+    const allTexts = mockSdk.userContents.flat().map((b) => b.text ?? "").join("\n");
+    expect(allTexts).not.toContain("this should be ignored");
+    expect(allTexts).not.toContain("this too");
+
+    await agent.stop();
+  });
+
+  it("any group member can pause and resume, even with identities configured", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // Sender 99999 is NOT a configured identity — /pause must still work.
+    await tg.simulateCommand("pause", GROUP, "RandomMember", undefined, "99999");
+    expect(tg.sent[0].text).toContain("paused");
+
+    await tg.simulateCommand("resume", GROUP, "AnotherMember", undefined, "77777");
+    expect(tg.sent[1].text).toContain("Tomo is back");
+
+    await agent.stop();
+  });
+
+  it("rejects /pause and /resume in DMs", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pause", "12345", "TestUser");
+    expect(tg.sent[0].text).toBe("/pause only works in group chats.");
+
+    await tg.simulateCommand("resume", "12345", "TestUser");
+    expect(tg.sent[1].text).toBe("/resume only works in group chats.");
+
+    // DM messages still flow normally.
+    tg.clearDelivered();
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    expect(tg.delivered.some((d) => d.text === "mock response")).toBe(true);
+
+    await agent.stop();
+  });
+
+  it("reports already-paused and not-paused states", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("resume", GROUP, "GroupMember");
+    expect(tg.sent[0].text).toContain("isn't paused");
+
+    await tg.simulateCommand("pause", GROUP, "GroupMember");
+    await tg.simulateCommand("pause", GROUP, "GroupMember");
+    expect(tg.sent[2].text).toContain("already paused");
+
+    await agent.stop();
+  });
+
+  it("only pauses the group it was sent in", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pause", GROUP, "GroupMember");
+    tg.clearDelivered();
+
+    await tg.simulateMessage(makeMsg({ chatId: "-100777", text: "other group", isGroup: true, isMentioned: true }));
+    await drainQueue(agent);
+    expect(tg.delivered.some((d) => d.text === "mock response")).toBe(true);
+
+    await agent.stop();
+  });
+
+  it("/status shows the paused state", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("pause", GROUP, "GroupMember");
+    tg.clearDelivered();
+
+    await tg.simulateCommand("status", GROUP, "GroupMember");
+    expect(tg.sent[0].text).toContain("Paused: yes");
+
+    await agent.stop();
+  });
+
+  it("pause state survives a daemon restart", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await tg.simulateCommand("pause", GROUP, "GroupMember");
+    await agent.stop();
+
+    // Fresh Agent, same tomoHome — pauses.json is reloaded.
+    const agent2 = new Agent();
+    const tg2 = new MockChannel("telegram");
+    agent2.addChannel(tg2);
+
+    await tg2.simulateMessage(groupMsg("still ignored"));
+    await drainQueue(agent2);
+    expect(tg2.delivered).toHaveLength(0);
+
+    await tg2.simulateCommand("resume", GROUP, "GroupMember");
+    expect(tg2.sent[0].text).toContain("Tomo is back");
+
+    await agent2.stop();
   });
 });

@@ -30,7 +30,13 @@ export type MockThinkingBlock = {
   /** Test hook: simulate a thinking block whose stream delta is text-shaped. */
   streamAsTextDelta?: boolean;
 };
-type MockResponseBlock = string | MockTextBlock | MockThinkingBlock;
+export type MockToolUseBlock = {
+  type: "tool_use";
+  id?: string;
+  name: string;
+  input?: Record<string, unknown>;
+};
+type MockResponseBlock = string | MockTextBlock | MockThinkingBlock | MockToolUseBlock;
 export type MockResponse = string | MockResponseBlock[];
 
 export interface MockQueryController {
@@ -92,13 +98,17 @@ function enqueueAssistantTurnEvents(
   // `assistant` event consolidates the just-completed block(s). Only one
   // `result` fires at the end of the whole turn.
   for (const block of blocks) {
-    const rawBlock: MockTextBlock | MockThinkingBlock =
+    const rawBlock: MockTextBlock | MockThinkingBlock | MockToolUseBlock =
       typeof block === "string" ? { type: "text", text: block } : block;
     const assistantBlock = rawBlock.type === "thinking"
       ? { type: rawBlock.type, thinking: rawBlock.thinking, signature: rawBlock.signature }
       : rawBlock;
 
-    if (mockSdk.emitStreamDeltas) {
+    // Tool-use blocks carry no text/thinking deltas to stream — the SDK
+    // reports them via partial_json input deltas we don't need to simulate
+    // here; the block just arrives whole in its `assistant` event, same as
+    // the real tool_use content our code only inspects post-hoc.
+    if (mockSdk.emitStreamDeltas && rawBlock.type !== "tool_use") {
       eventQueue.push({
         type: "stream_event",
         event: {

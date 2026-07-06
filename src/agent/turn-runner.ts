@@ -1,7 +1,7 @@
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
 import { STEER_MERGED } from "./live-session.js";
-import { ATTACHMENT_TAG_RE, isSilentReply } from "./text-utils.js";
+import { ATTACHMENT_TAG_RE, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
 import { filterScaffoldLeak } from "./scaffold-filter.js";
 
@@ -17,11 +17,10 @@ export interface RunWithRetryRequest {
 }
 
 /**
- * The two silent-reply checks in use. User turns match the bare token only;
- * cron and continuity turns additionally treat any response CONTAINING
- * NO_REPLY as silent (multi-turn responses may emit NO_REPLY after earlier
- * text output). The mismatch is a known inconsistency preserved deliberately
- * — tightening the substring check to line-anchored is an owner decision.
+ * Silent-reply checks. User and production send/deferred-send turns match the
+ * bare token only; send/deferred-send turns strip trailing bare NO_REPLY blocks
+ * before applying their matcher. The embedded matcher is retained for callers
+ * that deliberately want legacy substring suppression.
  */
 export const bareSilentMatcher = isSilentReply;
 export function embeddedSilentMatcher(response: string): boolean {
@@ -228,7 +227,18 @@ export class TurnRunner {
       spec.key,
       await this.deps.runWithRetry({ key: spec.key, prompt }),
     );
-    const silent = spec.silentMatcher(response);
+
+    // Send turns have no per-block delivery (unlike stream turns' onBlockComplete
+    // — see makeBlockHandler): the whole multi-block response arrives joined
+    // into one string, so trailing NO_REPLY blocks must be peeled off here
+    // instead of matched with a blanket substring check. Otherwise
+    // embeddedSilentMatcher's `.includes("NO_REPLY")` can silence the ENTIRE
+    // response, dropping earlier substantive text or prose that merely mentions
+    // NO_REPLY inline (#222). `response` (unstripped) still drives the error/log
+    // checks below so they see the model's literal output; `deliverText` is what
+    // actually ships.
+    const { visible: deliverText } = stripTrailingNoReply(response);
+    const silent = deliverText.length === 0 || spec.silentMatcher(deliverText);
     spec.logResponse?.(response);
 
     if (isAgentErrorResponse(response)) {
@@ -261,8 +271,8 @@ export class TurnRunner {
 
     const target = this.resolveSendTarget(delivery);
     if (target) {
-      this.deps.appendAssistantTranscript(spec.key, response, target.channel.name);
-      await this.deps.delivery.deliverAssistantContent(target.channel, target.chatId, response);
+      this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+      await this.deps.delivery.deliverAssistantContent(target.channel, target.chatId, deliverText);
     }
     await stopTyping({ clear: true });
     return true;

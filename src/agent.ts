@@ -15,6 +15,7 @@ import {
 import { IdentityRouter, type SessionResolution } from "./router.js";
 import { annotateSenderName, autoBindHandle, loadPeople, renderParticipantLabels } from "./people.js";
 import { SummonStore } from "./sessions/summon-store.js";
+import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager } from "./mcp/oauth.js";
 import { log } from "./logger.js";
@@ -93,6 +94,8 @@ export class Agent {
     hasBusyLiveSession: (key) => this.liveSessionManager.isBusy(key),
   });
   private commands: ChatCommandHandler;
+  // /pause state: raw group keys whose inbound messages are dropped at receipt.
+  private pauses: PauseStore;
   private modelOverrides = new Map<string, string>();
   // Context-usage hysteresis: the highest nudge level already fired for the
   // current over-threshold episode. Cleared when usage drops back below
@@ -139,9 +142,11 @@ export class Agent {
     this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons);
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
+    this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
+      pauses: this.pauses,
       modelOverrides: this.modelOverrides,
       closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
       isSessionLive: (key) => this.liveSessionManager.isAlive(key),
@@ -351,6 +356,15 @@ export class Agent {
       return;
     }
 
+    // /pause gate, BEFORE resolving: a paused group's messages are dropped
+    // entirely — they never reach a session, the batcher, or the transcript
+    // (and must not extend a summon's activity clock). /resume lifts it;
+    // slash commands bypass this path, which is how /resume gets through.
+    if (isGroup && this.pauses.isPaused(`${channel.name}:${message.chatId}`)) {
+      log.debug({ channel: channel.name, chatId: message.chatId }, "Message dropped (group is paused via /pause)");
+      return;
+    }
+
     // Resolve ONCE, at receipt — this decides both which queue the message
     // waits in and which session eventually processes it. Re-resolving at
     // processing time would let a /summon or /dismiss that lands while the
@@ -362,7 +376,10 @@ export class Agent {
     const canCoalesce = !isGroup || isPassiveGroup;
 
     if (!canCoalesce) {
-      this.enqueueForSession(sessionKey, () => this.handleMessage(channel, message, false, resolution))
+      // Through processInboundItems (not handleMessage directly) so the
+      // allowlist and /pause state are re-checked at processing time — this
+      // task can wait behind an in-flight turn, and both can change meanwhile.
+      this.enqueueForSession(sessionKey, () => this.processInboundItems([{ channel, message, resolution }]))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
       return;
     }
@@ -371,13 +388,16 @@ export class Agent {
   }
 
   private async processInboundItems(items: InboundItem[], steer = false): Promise<void> {
-    // Re-check the allowlist PER ITEM at processing time: it can change while
-    // a batch waits (settle window, in-flight turn), and dm: batches may mix
-    // items from several chats — a tail-only check would let a now-disallowed
-    // group's stale items ride along with an allowed DM message.
-    const allowed = items.filter((it) => this.router.isAllowed(it.channel.name, it.message.chatId));
+    // Re-check the allowlist and /pause state PER ITEM at processing time:
+    // both can change while a batch waits (settle window, in-flight turn), and
+    // dm: batches may mix items from several chats — a tail-only check would
+    // let a now-disallowed or now-paused group's stale items ride along with
+    // an allowed DM message.
+    const allowed = items.filter((it) =>
+      this.router.isAllowed(it.channel.name, it.message.chatId)
+      && !((it.message.isGroup ?? false) && this.pauses.isPaused(`${it.channel.name}:${it.message.chatId}`)));
     if (allowed.length < items.length) {
-      log.debug({ dropped: items.length - allowed.length }, "Batched items dropped (no longer in allowlist)");
+      log.debug({ dropped: items.length - allowed.length }, "Batched items dropped (no longer in allowlist, or group paused)");
     }
     if (allowed.length === 0) return;
     if (allowed.length === 1) {

@@ -6,6 +6,7 @@ import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "..
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { IdentityRouter } from "../router.js";
 import type { SessionStore } from "../sessions/index.js";
+import type { PauseStore } from "../sessions/pause-store.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
 import { DEFAULT_MODEL, MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "../models.js";
 import { buildSessionCostReport } from "../costs.js";
@@ -29,6 +30,8 @@ export function backupConfigFile(): void {
 export interface ChatCommandDeps {
   router: IdentityRouter;
   sessions: SessionStore;
+  /** Shared with the Agent — paused groups are dropped at message receipt. */
+  pauses: PauseStore;
   /** Shared with the Agent — per-session model overrides read at session create time. */
   modelOverrides: Map<string, string>;
   closeLiveSession(key: string): void;
@@ -38,7 +41,7 @@ export interface ChatCommandDeps {
 
 /**
  * Handles slash commands typed in chat (/new, /model, /status, /pet,
- * /cost, /restore, /login).
+ * /cost, /restore, /login, /pause, /resume).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -82,6 +85,11 @@ export class ChatCommandHandler {
 
     if (command === "summon" || command === "dismiss") {
       await this.handleSummonCommand(channel, command, chatId, senderName, senderId);
+      return;
+    }
+
+    if (command === "pause" || command === "resume") {
+      await this.handlePauseCommand(channel, command, chatId, senderName);
       return;
     }
 
@@ -215,6 +223,9 @@ export class ChatCommandHandler {
       lines.push(`Channel: ${channel.name}`);
       const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
       if (summoned) lines.push(`Summoned: messages route to dm:${summoned} (/dismiss to hand back)`);
+      if (this.deps.pauses.isPaused(`${channel.name}:${chatId}`)) {
+        lines.push("Paused: yes — group messages are being ignored (/resume to lift)");
+      }
       lines.push(`Model: ${model}`);
       if (config.litellm?.baseUrl) {
         lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
@@ -323,6 +334,50 @@ export class ChatCommandHandler {
     await channel.send({
       chatId,
       text: `${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
+    });
+  }
+
+  /**
+   * /pause drops ALL of a group's inbound messages at receipt — nothing
+   * reaches the agent, its context, or the transcript — until someone sends
+   * /resume. Group-only; ANY group member can pause or resume (no owner
+   * check). Slash commands keep flowing while paused — that is how /resume
+   * gets through.
+   */
+  private async handlePauseCommand(
+    channel: Channel,
+    command: "pause" | "resume",
+    chatId: string,
+    senderName: string,
+  ): Promise<void> {
+    const rawKey = `${channel.name}:${chatId}`;
+    if (!isGroupSessionKey(rawKey)) {
+      await channel.send({ chatId, text: `/${command} only works in group chats.` });
+      return;
+    }
+
+    if (command === "pause") {
+      if (this.deps.pauses.isPaused(rawKey)) {
+        await channel.send({ chatId, text: "Tomo is already paused here. Send /resume to bring it back." });
+        return;
+      }
+      this.deps.pauses.pause(rawKey, senderName);
+      log.info({ channel: channel.name, chatId, sender: senderName }, "Group paused via /pause");
+      await channel.send({
+        chatId,
+        text: "Tomo is paused in this group. Messages sent here will be completely ignored (not read, not remembered) until someone sends /resume.",
+      });
+      return;
+    }
+
+    if (!this.deps.pauses.resume(rawKey)) {
+      await channel.send({ chatId, text: "Tomo isn't paused in this group." });
+      return;
+    }
+    log.info({ channel: channel.name, chatId, sender: senderName }, "Group resumed via /resume");
+    await channel.send({
+      chatId,
+      text: "Tomo is back. Messages sent while paused were ignored; new messages will be handled normally.",
     });
   }
 

@@ -316,6 +316,63 @@ describe("CronStore", () => {
     expect(names).toEqual(["new-job"]);
   });
 
+  it("setEnabled disables and re-enables a recurring job", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "tick",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+
+    const disabled = store.setEnabled(job.id, false)!;
+    expect(disabled.enabled).toBe(false);
+    // Persisted, not just in-memory
+    expect(new CronStore(TEST_PATH).get(job.id)!.enabled).toBe(false);
+
+    const before = Date.now();
+    const enabled = store.setEnabled(job.id, true)!;
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.nextRunAt).toBeGreaterThanOrEqual(before + 60_000);
+  });
+
+  it("setEnabled re-arms an expired one-shot to fire on the next poll", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "reminder",
+      schedule: { kind: "at", at: new Date(Date.now() - 1000).toISOString() },
+      message: "important reminder",
+      sessionKey: "dm:alice",
+    });
+
+    // Exhaust retries so the job ends up disabled
+    for (let i = 0; i <= ONE_SHOT_MAX_RETRIES; i++) store.markRun(job.id, "error");
+    expect(store.get(job.id)!.enabled).toBe(false);
+
+    const before = Date.now();
+    const enabled = store.setEnabled(job.id, true)!;
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.retryCount).toBeUndefined();
+    expect(enabled.nextRunAt).toBeGreaterThanOrEqual(before);
+    expect(enabled.nextRunAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("setEnabled returns undefined for unknown ids and is a no-op when unchanged", () => {
+    const store = new CronStore(TEST_PATH);
+    expect(store.setEnabled("nope", true)).toBeUndefined();
+
+    const job = store.add({
+      name: "tick",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    const next = job.nextRunAt;
+    const same = store.setEnabled(job.id, true)!;
+    expect(same.enabled).toBe(true);
+    expect(same.nextRunAt).toBe(next);
+  });
+
   it("rewrites sessionKey in bulk", () => {
     const store = new CronStore(TEST_PATH);
     store.add({

@@ -74,6 +74,27 @@ export class CronStore {
     return count;
   }
 
+  /**
+   * Enable or disable a job. Enabling recomputes the next run; a one-shot
+   * ("at") job whose time already passed fires on the next poll, with its
+   * retry budget reset — re-enabling a failed reminder is a manual retry.
+   */
+  setEnabled(id: string, enabled: boolean): CronJob | undefined {
+    this.load();
+    const job = this.get(id);
+    if (!job) return undefined;
+    if (job.enabled === enabled) return job;
+    job.enabled = enabled;
+    if (enabled) {
+      const now = Date.now();
+      const next = computeNextRun(job.schedule, now);
+      job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
+      if (job.schedule.kind === "at") delete job.retryCount;
+    }
+    this.save();
+    return job;
+  }
+
   remove(id: string): boolean {
     this.load();
     const before = this.jobs.length;

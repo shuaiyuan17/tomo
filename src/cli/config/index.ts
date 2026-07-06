@@ -10,6 +10,7 @@ import { configChannels } from "./channels.js";
 import { configIdentities } from "./identities.js";
 import { configGroups } from "./groups.js";
 import { configSessions } from "./sessions.js";
+import { configCron } from "./cron.js";
 import { configCostAnalysis } from "./costs.js";
 import { configLiteLlm } from "./litellm.js";
 import { configAnthropicAuth } from "./auth.js";
@@ -35,6 +36,7 @@ export const configCommand = new Command("config")
         { value: "identities", label: "Identities", hint: "bind DMs across channels" },
         { value: "groups", label: "Group chats", hint: "activation secret" },
         { value: "sessions", label: "Sessions", hint: "view and configure sessions" },
+        { value: "cron", label: "Scheduled tasks", hint: "cron job status" },
         { value: "costs", label: "Cost analysis", hint: "usage and spending breakdown" },
       ];
       if (isMacOS()) {
@@ -60,6 +62,7 @@ export const configCommand = new Command("config")
       if (choice === "identities") await configIdentities();
       if (choice === "groups") await configGroups();
       if (choice === "sessions") await configSessions();
+      if (choice === "cron") await configCron();
       if (choice === "costs") await configCostAnalysis();
       if (choice === "autostart") await configAutostart();
     }

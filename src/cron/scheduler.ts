@@ -3,6 +3,7 @@ import type { CronJob } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
+import { watchBus } from "../watch/bus.js";
 
 const POLL_INTERVAL_MS = 30_000; // Check every 30s
 
@@ -64,6 +65,7 @@ export class CronScheduler {
 
     this.inFlight.add(jobId);
     log.info({ jobId: job.id, name: job.name }, "Cron triggered: %s", job.message);
+    watchBus.publish({ type: "cron.fired", jobId: job.id, name: job.name });
 
     try {
       const cronMessage = formatTomoEvent(
@@ -75,6 +77,7 @@ export class CronScheduler {
       // real agent failures land in lastStatus instead of reading as "ok".
       const ok = await this.agent.handleCronMessage(cronMessage, job.sessionKey);
       this.store.markRun(jobId, ok ? "ok" : "error");
+      watchBus.publish({ type: "cron.done", jobId: job.id, name: job.name, ok });
       if (ok) {
         log.info({ jobId: job.id }, "Cron completed successfully");
       } else {

@@ -15,6 +15,7 @@ import { configCommand } from "./cli/config/index.js";
 import { uninstallCommand } from "./cli/uninstall.js";
 import { backupCommand } from "./cli/backup.js";
 import { updateCommand } from "./cli/update.js";
+import { watchCommand } from "./cli/watch.js";
 
 // Read version at runtime from package.json (works in dev via tsx and after
 // build under dist/) so it can't drift from package.json on release bumps.
@@ -33,6 +34,7 @@ program.addCommand(startCommand);
 program.addCommand(stopCommand);
 program.addCommand(restartCommand);
 program.addCommand(statusCommand);
+program.addCommand(watchCommand);
 program.addCommand(logsCommand);
 program.addCommand(cronCommand);
 program.addCommand(continuityCommand);

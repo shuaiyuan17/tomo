@@ -4,6 +4,8 @@ import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarge
 import { log } from "../logger.js";
 import { readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
+import { watchBus } from "../watch/bus.js";
+import { clip, TRANSCRIPT_TEXT_LIMIT } from "../watch/protocol.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
@@ -106,6 +108,21 @@ export class SessionStore {
 
     const file = this.transcriptPath(key);
     appendFileSync(file, JSON.stringify(message) + "\n");
+
+    // Every transcript write — user inbound (any ingress path) and assistant
+    // outbound (turns, proactive sends) — funnels through here, making this
+    // the single observability choke point for the watch feed.
+    if (message.role === "user" || message.role === "assistant") {
+      watchBus.publish({
+        type: "transcript",
+        ts: message.timestamp,
+        sessionKey: key,
+        role: message.role,
+        channel: message.channel,
+        ...(message.senderName ? { sender: message.senderName } : {}),
+        text: clip(message.content, TRANSCRIPT_TEXT_LIMIT),
+      });
+    }
 
     // Long-running daemon: keep the in-memory cache bounded to the tail and
     // take the (amortized) chance to roll old months out of the active file.

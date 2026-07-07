@@ -35,6 +35,8 @@ import { ProactiveSendService, type SendResult, type SessionCatalog } from "./ag
 import { resolveBlockRange } from "./lcm/blocks.js";
 import { formatTomoEvent } from "./tomo-event.js";
 import { pruneTools } from "./lcm/index.js";
+import { watchBus } from "./watch/bus.js";
+import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -162,7 +164,16 @@ export class Agent {
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
       retireSdkSessionId: (key) => { this.sessions.retireSdkSessionId(key); },
-      updateStats: (key, result) => this.sessions.updateStats(key, result),
+      updateStats: (key, result) => {
+        this.sessions.updateStats(key, result);
+        watchBus.publish({
+          type: "turn.stats",
+          sessionKey: key,
+          costUsd: result.costUsd,
+          contextUsed: result.contextUsed,
+          contextMax: result.contextMax,
+        });
+      },
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
@@ -776,6 +787,7 @@ export class Agent {
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
     await this.turnRunner.runTurn({
       key: req.key,
+      source: "user",
       prompt: req.promptText,
       stampChannelName: req.sourceChannelName,
       typing: { channel: req.replyChannel, chatId: req.replyChatId, passiveListen: req.passiveListen },
@@ -1050,6 +1062,7 @@ export class Agent {
 
     return this.turnRunner.runTurn({
       key,
+      source: "cron",
       prompt: message,
       stampChannelName: deliveryChannel.name,
       ...(options.showTyping === false ? {} : {
@@ -1106,6 +1119,7 @@ export class Agent {
   private async processContinuity(prompt: string, key: string): Promise<void> {
     await this.turnRunner.runTurn({
       key,
+      source: "continuity",
       prompt,
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible unless the model chooses to speak. When it does speak, the
@@ -1206,6 +1220,62 @@ export class Agent {
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
     return this.pendingNotesQueue.drain(sessionKey);
+  }
+
+  /** Channel + per-session vitals snapshot for the watch server. */
+  watchOverview(): { channels: string[]; sessions: WatchSessionInfo[] } {
+    return {
+      channels: this.channels.map((ch) => ch.name),
+      sessions: this.sessions.listActiveEntries().map((e) => ({
+        key: e.channelKey,
+        ...(e.chatTitle ? { chatTitle: e.chatTitle } : {}),
+        lastActiveAt: e.lastActiveAt,
+        contextUsed: e.stats?.contextUsed ?? 0,
+        contextMax: e.stats?.contextMax ?? 0,
+        totalCostUsd: e.stats?.totalCostUsd ?? 0,
+        totalQueries: e.stats?.totalQueries ?? 0,
+      })),
+    };
+  }
+
+  /**
+   * Route a chat message typed in the `tomo watch` TUI into the owner's dm
+   * session. Resolves once the turn is queued — the reply reaches the TUI as
+   * a transcript event (and lands in the dm channel like any other reply),
+   * so callers don't wait out a multi-minute turn for an ack.
+   */
+  async handleWatchChat(text: string): Promise<void> {
+    const key = this.router.findFirstDmSession();
+    if (!key) throw new Error("No dm session yet — message Tomo from a connected channel first");
+    const delivery = this.resolveDeliveryTargetForSession(key, "Watch chat");
+    if (!delivery) throw new Error("No delivery target for the dm session");
+    const { channel, chatId } = delivery;
+
+    this.sessions.append(key, {
+      role: "user",
+      content: text,
+      channel: "terminal",
+      timestamp: Date.now(),
+    });
+
+    this.enqueueForSession(key, () => this.turnRunner.runTurn({
+      key,
+      source: "user",
+      prompt: text,
+      stampChannelName: "terminal",
+      delivery: { kind: "send", channel, chatId },
+      silentMatcher: isSilentReply,
+      silentLog: "Watch chat completed silently (no reply sent)",
+      transcript: "on-delivery",
+      errors: {
+        visiblePrefix: "[error] ",
+        response: "deliver",
+        thrown: "deliver",
+        thrownLogMessage: "Watch chat turn failed",
+      },
+    })).catch((err) => {
+      log.error({ err, sessionKey: key }, "Watch chat failed in queue");
+    });
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */

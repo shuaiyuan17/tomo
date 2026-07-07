@@ -5,6 +5,7 @@ import { log } from "./logger.js";
 import type { Agent } from "./agent.js";
 import { runContinuityScript, type ContinuityScriptConfig } from "./continuity-script.js";
 import { formatTomoEvent } from "./tomo-event.js";
+import { watchBus } from "./watch/bus.js";
 import { DEFAULT_CONTINUITY_INTERVAL_MS } from "./continuity-defaults.js";
 
 const DEFAULT_TRIGGER_DIR = join(homedir(), ".tomo");
@@ -47,6 +48,8 @@ export class ContinuityRunner {
   private intervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private watcher: FSWatcher | null = null;
+  /** Last scheduled-tick time; interval fires are lastTickAt + intervalMs. */
+  private lastTickAt: number | null = null;
 
   constructor(
     agent: Agent,
@@ -63,8 +66,18 @@ export class ContinuityRunner {
 
   start(): void {
     log.info({ intervalMs: this.intervalMs }, `Continuity runner started (every ${formatIntervalMs(this.intervalMs)})`);
-    this.timer = setInterval(() => this.fire(), this.intervalMs);
+    this.lastTickAt = Date.now();
+    this.timer = setInterval(() => {
+      this.lastTickAt = Date.now();
+      this.fire();
+    }, this.intervalMs);
     this.watchTrigger();
+  }
+
+  /** Approximate time of the next scheduled heartbeat (null when stopped). */
+  nextFireAt(): number | null {
+    if (!this.timer || this.lastTickAt === null) return null;
+    return this.lastTickAt + this.intervalMs;
   }
 
   stop(): void {
@@ -129,6 +142,7 @@ export class ContinuityRunner {
       weather: weatherLine || "(none)",
       script: this.script?.path ?? "(none)",
     }, "Continuity heartbeat fired");
+    watchBus.publish({ type: "heartbeat" });
 
     try {
       await this.agent.handleContinuity(prompt);

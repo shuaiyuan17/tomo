@@ -94,6 +94,26 @@ describe("watch TUI model", () => {
     expect(s.feed.find((i) => i.kind === "turn")?.meta).toContain("$0.0200");
   });
 
+  it("never annotates an older turn row while the current turn is in flight", () => {
+    const s = fold([
+      // Turn A fails without ever emitting stats — its row stays unannotated.
+      { type: "turn.start", ts: 1, sessionKey: "dm:shuai", source: "user" },
+      { type: "turn.end", ts: 2, sessionKey: "dm:shuai", source: "user", ok: false, durationMs: 500 },
+      // Turn B: stats fire mid-flight (normal runtime order), then it ends.
+      { type: "turn.start", ts: 3, sessionKey: "dm:shuai", source: "user" },
+      { type: "turn.stats", ts: 4, sessionKey: "dm:shuai", costUsd: 0.42, contextUsed: 42, contextMax: 100 },
+      { type: "turn.end", ts: 5, sessionKey: "dm:shuai", source: "user", ok: true, durationMs: 1000 },
+    ]);
+    const rows = s.feed.filter((i) => i.kind === "turn");
+    expect(rows).toHaveLength(2);
+    // Turn A's failed row must NOT carry turn B's stats…
+    expect(rows[0].status).toBe("error");
+    expect(rows[0].meta).not.toContain("$");
+    // …turn B's row must.
+    expect(rows[1].status).toBe("ok");
+    expect(rows[1].meta).toContain("$0.4200");
+  });
+
   it("does not leak a previous turn's stashed stats into the next turn", () => {
     const s = fold([
       // Turn 1: stats recorded, but the turn dies before turn.end fires.

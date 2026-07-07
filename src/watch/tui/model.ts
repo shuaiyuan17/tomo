@@ -213,15 +213,20 @@ export function applyEvent(state: WatchState, event: WatchEvent, backfill = fals
         contextMax: event.contextMax,
         costTodayUsd: backfill ? state.costTodayUsd : state.costTodayUsd + event.costUsd,
       };
-      // Stats normally precede this turn's turn.end — stash them for the
-      // feed row it will create. If a matching row already exists (replayed
-      // history with a different interleaving), annotate it directly.
-      for (let i = withVitals.feed.length - 1; i >= 0; i--) {
-        const item = withVitals.feed[i];
-        if (item.matchKey === `turn:${event.sessionKey}` && item.kind === "turn" && !item.meta?.includes("$")) {
-          const feed = [...withVitals.feed];
-          feed[i] = { ...item, meta: `${item.meta ?? ""}${statsMeta(event)}` };
-          return { ...withVitals, feed };
+      // Stats normally precede this turn's turn.end — while a turn is in
+      // flight for this session, ALWAYS stash for the row it will create.
+      // Scanning the feed here instead would annotate an older same-session
+      // row (e.g. a prior turn that failed before its stats fired). Only
+      // when nothing is in flight (replayed history with a different
+      // interleaving) is annotating an existing row safe.
+      if (!withVitals.inFlight[event.sessionKey]) {
+        for (let i = withVitals.feed.length - 1; i >= 0; i--) {
+          const item = withVitals.feed[i];
+          if (item.matchKey === `turn:${event.sessionKey}` && item.kind === "turn" && !item.meta?.includes("$")) {
+            const feed = [...withVitals.feed];
+            feed[i] = { ...item, meta: `${item.meta ?? ""}${statsMeta(event)}` };
+            return { ...withVitals, feed };
+          }
         }
       }
       return {

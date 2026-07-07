@@ -15,8 +15,9 @@ export interface WatchServerDeps {
  * Unix-domain-socket event server for `tomo watch`. Accepts local clients,
  * sends a snapshot frame on connect, then relays every WatchBus event as an
  * NDJSON `event` frame. The daemon never depends on clients: writes are
- * fire-and-forget, slow consumers get dropped frames (kernel buffer full),
- * and client errors only close that client's socket.
+ * fire-and-forget, a client that stops reading is disconnected once its
+ * write buffer passes MAX_BUFFERED_BYTES, and client errors only close that
+ * client's socket.
  */
 export class WatchServer {
   private server: Server | null = null;
@@ -135,13 +136,29 @@ export class WatchServer {
     if (this.clients.size === 0) return;
     const line = JSON.stringify(frame) + "\n";
     for (const socket of this.clients) {
-      if (!socket.writable) continue;
-      socket.write(line);
+      this.writeLine(socket, line);
     }
   }
 
   private write(socket: Socket, frame: ServerFrame): void {
+    this.writeLine(socket, JSON.stringify(frame) + "\n");
+  }
+
+  /**
+   * Backpressure guard: a client that stopped reading (suspended terminal,
+   * hung SSH) would otherwise make Node buffer frames in daemon memory
+   * without bound. Past the cap we destroy the socket — the TUI's reconnect
+   * loop brings it back with a fresh snapshot once it's responsive again.
+   */
+  private static readonly MAX_BUFFERED_BYTES = 1024 * 1024;
+
+  private writeLine(socket: Socket, line: string): void {
     if (!socket.writable) return;
-    socket.write(JSON.stringify(frame) + "\n");
+    if (socket.writableLength > WatchServer.MAX_BUFFERED_BYTES) {
+      log.warn({ buffered: socket.writableLength }, "Watch client too slow; disconnecting it");
+      socket.destroy();
+      return;
+    }
+    socket.write(line);
   }
 }

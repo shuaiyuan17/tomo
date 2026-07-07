@@ -62,25 +62,66 @@ describe("watch TUI model", () => {
     expect(s.feed.map((i) => i.isGroup)).toEqual([true, true, false]);
   });
 
-  it("tracks in-flight turns and resolves them with duration and stats", () => {
+  it("tracks in-flight turns and attaches stats that arrive before turn.end (runtime order)", () => {
     let s = fold([{ type: "turn.start", ts: 1, sessionKey: "dm:shuai", source: "user" }]);
-    expect(s.inFlight).toMatchObject({ sessionKey: "dm:shuai", source: "user" });
+    expect(s.inFlight["dm:shuai"]).toMatchObject({ sessionKey: "dm:shuai", source: "user" });
 
     s = applyEvent(s, { type: "tool.start", ts: 2, sessionKey: "dm:shuai", tool: "Read", detail: "Read /tmp/x" });
-    expect(s.inFlight?.activity).toBe("Read /tmp/x");
+    expect(s.inFlight["dm:shuai"]?.activity).toBe("Read /tmp/x");
 
-    s = applyEvent(s, { type: "turn.end", ts: 3, sessionKey: "dm:shuai", source: "user", ok: true, durationMs: 8200 });
-    expect(s.inFlight).toBeNull();
-    expect(s.turnsToday).toBe(1);
-    const turnItem = s.feed.find((i) => i.kind === "turn");
-    expect(turnItem).toMatchObject({ status: "ok", meta: "8.2s" });
-
-    s = applyEvent(s, { type: "turn.stats", ts: 4, sessionKey: "dm:shuai", costUsd: 0.04, contextUsed: 41_000, contextMax: 100_000 });
+    // Runtime order: stats are recorded when the SDK query resolves, BEFORE
+    // the turn (delivery included) ends.
+    s = applyEvent(s, { type: "turn.stats", ts: 3, sessionKey: "dm:shuai", costUsd: 0.04, contextUsed: 41_000, contextMax: 100_000 });
     expect(s.contextUsed).toBe(41_000);
     expect(s.costTodayUsd).toBeCloseTo(0.04);
-    const updated = s.feed.find((i) => i.kind === "turn");
-    expect(updated?.meta).toContain("$0.0400");
-    expect(updated?.meta).toContain("ctx 41%");
+
+    s = applyEvent(s, { type: "turn.end", ts: 4, sessionKey: "dm:shuai", source: "user", ok: true, durationMs: 8200 });
+    expect(s.inFlight["dm:shuai"]).toBeUndefined();
+    expect(s.turnsToday).toBe(1);
+    const turnItem = s.feed.find((i) => i.kind === "turn");
+    expect(turnItem?.status).toBe("ok");
+    expect(turnItem?.meta).toContain("8.2s");
+    expect(turnItem?.meta).toContain("$0.0400");
+    expect(turnItem?.meta).toContain("ctx 41%");
+    expect(s.pendingStats["dm:shuai"]).toBeUndefined();
+  });
+
+  it("still annotates an existing turn row when stats arrive after turn.end", () => {
+    const s = fold([
+      { type: "turn.end", ts: 1, sessionKey: "dm:shuai", source: "user", ok: true, durationMs: 1000 },
+      { type: "turn.stats", ts: 2, sessionKey: "dm:shuai", costUsd: 0.02, contextUsed: 10, contextMax: 100 },
+    ]);
+    expect(s.feed.find((i) => i.kind === "turn")?.meta).toContain("$0.0200");
+  });
+
+  it("does not leak a previous turn's stashed stats into the next turn", () => {
+    const s = fold([
+      // Turn 1: stats recorded, but the turn dies before turn.end fires.
+      { type: "turn.start", ts: 1, sessionKey: "dm:shuai", source: "user" },
+      { type: "turn.stats", ts: 2, sessionKey: "dm:shuai", costUsd: 0.9, contextUsed: 1, contextMax: 100 },
+      // Turn 2 starts fresh and ends without stats.
+      { type: "turn.start", ts: 3, sessionKey: "dm:shuai", source: "cron" },
+      { type: "turn.end", ts: 4, sessionKey: "dm:shuai", source: "cron", ok: false, durationMs: 100 },
+    ]);
+    expect(s.feed.find((i) => i.kind === "turn")?.meta).not.toContain("$0.9");
+  });
+
+  it("tracks concurrent in-flight turns on different sessions independently", () => {
+    let s = fold([
+      { type: "turn.start", ts: 1, sessionKey: "dm:shuai", source: "user" },
+      { type: "turn.start", ts: 2, sessionKey: "telegram:-100123", source: "cron" },
+    ]);
+    expect(Object.keys(s.inFlight)).toHaveLength(2);
+
+    // Activity updates land on the right session's indicator.
+    s = applyEvent(s, { type: "tool.start", ts: 3, sessionKey: "telegram:-100123", tool: "Bash", detail: "Bash: ls" });
+    expect(s.inFlight["telegram:-100123"]?.activity).toBe("Bash: ls");
+    expect(s.inFlight["dm:shuai"]?.activity).toBeUndefined();
+
+    // One session's turn.end must not clear the other's indicator.
+    s = applyEvent(s, { type: "turn.end", ts: 4, sessionKey: "telegram:-100123", source: "cron", ok: true, durationMs: 500 });
+    expect(s.inFlight["telegram:-100123"]).toBeUndefined();
+    expect(s.inFlight["dm:shuai"]).toMatchObject({ source: "user" });
   });
 
   it("resolves tool items on tool.end with duration", () => {
@@ -126,9 +167,13 @@ describe("watch TUI model", () => {
 
   it("clears a stale in-flight turn left dangling at the ring edge", () => {
     const s = applySnapshot(initialState(), snapshotWith({
-      recent: [{ type: "turn.start", ts: Date.now() - 60 * 60_000, sessionKey: "dm:shuai", source: "cron" }],
+      recent: [
+        { type: "turn.start", ts: Date.now() - 60 * 60_000, sessionKey: "dm:shuai", source: "cron" },
+        { type: "turn.start", ts: Date.now() - 10_000, sessionKey: "telegram:-1", source: "user" },
+      ],
     }));
-    expect(s.inFlight).toBeNull();
+    expect(s.inFlight["dm:shuai"]).toBeUndefined();
+    expect(s.inFlight["telegram:-1"]).toBeDefined();
   });
 
   it("caps the feed length", () => {

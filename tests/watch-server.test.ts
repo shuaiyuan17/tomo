@@ -158,6 +158,36 @@ describe("WatchServer", () => {
     expect(b[1]).toMatchObject({ kind: "event", event: { type: "heartbeat" } });
   });
 
+  it("disconnects a client that stops reading instead of buffering forever", async () => {
+    server = new WatchServer(socketPath, {
+      getSnapshot: () => fakeSnapshot(),
+      sendChat: async () => {},
+    });
+    server.start();
+
+    // Connect but never read: pause() stops consuming, so the kernel buffer
+    // fills and further frames pile up in the server's writableLength.
+    const socket = createConnection(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      socket.on("connect", () => resolve());
+      socket.on("error", reject);
+    });
+    socket.pause();
+
+    // Assert server-side (the paused client won't see 'close' while paused):
+    // the server must evict the stalled client from its set.
+    const clients = (server as unknown as { clients: Set<unknown> }).clients;
+    const bigMsg = "x".repeat(64 * 1024);
+    const deadline = Date.now() + 5000;
+    while (clients.size > 0 && Date.now() < deadline) {
+      watchBus.publish({ type: "issue", level: "warn", msg: bigMsg });
+      await new Promise((r) => setImmediate(r));
+    }
+
+    expect(clients.size).toBe(0);
+    socket.destroy();
+  }, 10_000);
+
   it("recovers from a stale socket file on start", async () => {
     // First server leaves a socket file behind (crash simulation: no stop()).
     const first = new WatchServer(socketPath, {

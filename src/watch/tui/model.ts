@@ -46,7 +46,12 @@ export interface WatchState {
   conn: WatchConnectionState;
   snapshot: WatchSnapshot | null;
   feed: FeedItem[];
-  inFlight: InFlightTurn | null;
+  /** In-flight turns by session key — sessions run turns concurrently. */
+  inFlight: Record<string, InFlightTurn>;
+  /** turn.stats arrives BEFORE turn.end (stats are recorded when the SDK
+   *  query resolves, the turn ends after delivery) — stash per session until
+   *  the turn.end feed row exists to attach them to. */
+  pendingStats: Record<string, { costUsd: number; contextUsed: number; contextMax: number }>;
   contextUsed: number;
   contextMax: number;
   costTodayUsd: number;
@@ -62,7 +67,8 @@ export function initialState(): WatchState {
     conn: "connecting",
     snapshot: null,
     feed: [],
-    inFlight: null,
+    inFlight: {},
+    pendingStats: {},
     contextUsed: 0,
     contextMax: 0,
     costTodayUsd: 0,
@@ -107,6 +113,12 @@ function resolveItem(
     }
   }
   return state;
+}
+
+/** ` · $0.0410 · ctx 42%` suffix for a turn row. */
+function statsMeta(stats: { costUsd: number; contextUsed: number; contextMax: number }): string {
+  const pct = stats.contextMax > 0 ? ` · ctx ${Math.round((stats.contextUsed / stats.contextMax) * 100)}%` : "";
+  return ` · $${stats.costUsd.toFixed(4)}${pct}`;
 }
 
 function fmtDuration(ms: number): string {
@@ -154,23 +166,38 @@ export function applyEvent(state: WatchState, event: WatchEvent, backfill = fals
       });
     }
 
-    case "turn.start":
+    case "turn.start": {
+      // A fresh turn on this session invalidates any stats stash left by a
+      // previous turn that ended without consuming it (thrown errors).
+      const pendingStats = { ...state.pendingStats };
+      delete pendingStats[event.sessionKey];
       return {
         ...state,
-        inFlight: { sessionKey: event.sessionKey, source: event.source, startedAt: event.ts },
+        pendingStats,
+        inFlight: {
+          ...state.inFlight,
+          [event.sessionKey]: { sessionKey: event.sessionKey, source: event.source, startedAt: event.ts },
+        },
       };
+    }
 
     case "turn.end": {
+      const inFlight = { ...state.inFlight };
+      delete inFlight[event.sessionKey];
+      const stats = state.pendingStats[event.sessionKey];
+      const pendingStats = { ...state.pendingStats };
+      delete pendingStats[event.sessionKey];
       let next: WatchState = {
         ...state,
-        inFlight: null,
+        inFlight,
+        pendingStats,
         turnsToday: backfill ? state.turnsToday : state.turnsToday + 1,
       };
       next = pushItem(next, {
         ts: event.ts,
         kind: "turn",
         text: `turn ${event.ok ? "done" : "failed"} (${event.source})`,
-        meta: fmtDuration(event.durationMs),
+        meta: fmtDuration(event.durationMs) + (stats ? statsMeta(stats) : ""),
         sessionKey: event.sessionKey,
         status: event.ok ? "ok" : "error",
         matchKey: `turn:${event.sessionKey}`,
@@ -186,34 +213,47 @@ export function applyEvent(state: WatchState, event: WatchEvent, backfill = fals
         contextMax: event.contextMax,
         costTodayUsd: backfill ? state.costTodayUsd : state.costTodayUsd + event.costUsd,
       };
-      // Attach cost/context to the newest turn line for this session.
+      // Stats normally precede this turn's turn.end — stash them for the
+      // feed row it will create. If a matching row already exists (replayed
+      // history with a different interleaving), annotate it directly.
       for (let i = withVitals.feed.length - 1; i >= 0; i--) {
         const item = withVitals.feed[i];
-        if (item.matchKey === `turn:${event.sessionKey}` && item.kind === "turn") {
-          const pct = event.contextMax > 0 ? ` · ctx ${Math.round((event.contextUsed / event.contextMax) * 100)}%` : "";
+        if (item.matchKey === `turn:${event.sessionKey}` && item.kind === "turn" && !item.meta?.includes("$")) {
           const feed = [...withVitals.feed];
-          feed[i] = { ...item, meta: `${item.meta ?? ""} · $${event.costUsd.toFixed(4)}${pct}` };
+          feed[i] = { ...item, meta: `${item.meta ?? ""}${statsMeta(event)}` };
           return { ...withVitals, feed };
         }
       }
-      return withVitals;
+      return {
+        ...withVitals,
+        pendingStats: {
+          ...withVitals.pendingStats,
+          [event.sessionKey]: { costUsd: event.costUsd, contextUsed: event.contextUsed, contextMax: event.contextMax },
+        },
+      };
     }
 
-    case "tool.start":
-      return pushItem(
-        state.inFlight
-          ? { ...state, inFlight: { ...state.inFlight, activity: `${event.agent ? `${event.agent} · ` : ""}${event.detail ?? event.tool}` } }
-          : state,
-        {
-          ts: event.ts,
-          kind: "tool",
-          text: `${event.agent ? `${event.agent} · ` : ""}${event.detail ?? event.tool}`,
-          sessionKey: event.sessionKey,
-          status: "pending",
-          matchKey: `tool:${event.sessionKey ?? ""}:${event.tool}`,
-          isGroup: isGroupKey(event.sessionKey),
-        },
-      );
+    case "tool.start": {
+      const current = event.sessionKey ? state.inFlight[event.sessionKey] : undefined;
+      const withActivity = current
+        ? {
+          ...state,
+          inFlight: {
+            ...state.inFlight,
+            [current.sessionKey]: { ...current, activity: `${event.agent ? `${event.agent} · ` : ""}${event.detail ?? event.tool}` },
+          },
+        }
+        : state;
+      return pushItem(withActivity, {
+        ts: event.ts,
+        kind: "tool",
+        text: `${event.agent ? `${event.agent} · ` : ""}${event.detail ?? event.tool}`,
+        sessionKey: event.sessionKey,
+        status: "pending",
+        matchKey: `tool:${event.sessionKey ?? ""}:${event.tool}`,
+        isGroup: isGroupKey(event.sessionKey),
+      });
+    }
 
     case "tool.end":
       return resolveItem(
@@ -290,8 +330,10 @@ export function applySnapshot(state: WatchState, snapshot: WatchSnapshot): Watch
 
   // A turn.start at the ring edge without its turn.end would pin a stale
   // "in flight" indicator forever; only trust recent ones.
-  if (next.inFlight && Date.now() - next.inFlight.startedAt > 15 * 60_000) {
-    next = { ...next, inFlight: null };
+  const fresh = Object.entries(next.inFlight)
+    .filter(([, turn]) => Date.now() - turn.startedAt <= 15 * 60_000);
+  if (fresh.length !== Object.keys(next.inFlight).length) {
+    next = { ...next, inFlight: Object.fromEntries(fresh) };
   }
 
   return next;

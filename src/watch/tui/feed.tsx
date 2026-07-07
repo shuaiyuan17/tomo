@@ -56,11 +56,12 @@ function FeedLine({ item, state }: { item: FeedItem; state: WatchState }): React
   );
 }
 
-function InFlightLine({ turn, now }: { turn: InFlightTurn; now: number }): React.JSX.Element {
+function InFlightLine({ turn, state, now }: { turn: InFlightTurn; state: WatchState; now: number }): React.JSX.Element {
+  const label = sessionLabel(state, turn.sessionKey);
   return (
     <Box>
       <Text color="yellow">
-        ✦ turn in flight ({turn.source}) · {elapsedSeconds(turn.startedAt, now)}
+        ✦ turn in flight ({turn.source}{label && !turn.sessionKey.startsWith("dm:") ? ` · ${label}` : ""}) · {elapsedSeconds(turn.startedAt, now)}
       </Text>
       {turn.activity ? (
         <Box flexGrow={1}>
@@ -82,7 +83,8 @@ export interface FeedProps {
 
 export function Feed({ state, height, scrollOffset, hideGroups, now }: FeedProps): React.JSX.Element {
   const items = hideGroups ? state.feed.filter((i) => !i.isGroup) : state.feed;
-  const pinned = state.inFlight && scrollOffset === 0 ? 1 : 0;
+  const inFlight = Object.values(state.inFlight).sort((a, b) => a.startedAt - b.startedAt);
+  const pinned = scrollOffset === 0 ? inFlight.length : 0;
   const visibleCount = Math.max(1, height - pinned);
   const end = Math.max(0, items.length - scrollOffset);
   const start = Math.max(0, end - visibleCount);
@@ -90,13 +92,15 @@ export function Feed({ state, height, scrollOffset, hideGroups, now }: FeedProps
 
   return (
     <Box flexDirection="column" flexGrow={1}>
-      {visible.length === 0 && !state.inFlight ? (
+      {visible.length === 0 && inFlight.length === 0 ? (
         <Text dimColor>  waiting for activity…</Text>
       ) : null}
       {visible.map((item) => (
         <FeedLine key={item.id} item={item} state={state} />
       ))}
-      {state.inFlight && scrollOffset === 0 ? <InFlightLine turn={state.inFlight} now={now} /> : null}
+      {scrollOffset === 0
+        ? inFlight.map((turn) => <InFlightLine key={turn.sessionKey} turn={turn} state={state} now={now} />)
+        : null}
       {scrollOffset > 0 ? (
         <Text dimColor>── scrolled ({scrollOffset} back) — [f] to follow ──</Text>
       ) : null}

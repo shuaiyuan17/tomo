@@ -66,7 +66,7 @@ export function App({ socketPath, logPath }: AppProps): React.JSX.Element {
 
   // Clock/elapsed tick: fast while a turn is in flight, slow when idle —
   // this TUI is designed to sit open 24/7 without burning CPU.
-  const busy = state.inFlight !== null;
+  const busy = Object.keys(state.inFlight).length > 0;
   useEffect(() => {
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), busy ? BUSY_TICK_MS : IDLE_TICK_MS);

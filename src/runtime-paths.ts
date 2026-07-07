@@ -8,6 +8,7 @@ export interface RuntimePaths {
   configBackupPath: string;
   restartReasonFile: string;
   pidFile: string;
+  watchSocketPath: string;
   workspaceDir: string;
   sessionsDir: string;
   logsDir: string;
@@ -52,6 +53,7 @@ export function createRuntimePaths(options: RuntimePathOptions = {}): RuntimePat
     configBackupPath: join(tomoHome, "config.json.bak"),
     restartReasonFile: join(tomoHome, "data", ".restart-reason"),
     pidFile: join(tomoHome, "tomo.pid"),
+    watchSocketPath: join(tomoHome, "watch.sock"),
     workspaceDir,
     sessionsDir,
     logsDir,

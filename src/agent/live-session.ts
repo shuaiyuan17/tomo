@@ -1,5 +1,7 @@
 import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
+import { watchBus } from "../watch/bus.js";
+import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
 
 export interface TurnRequest {
@@ -193,6 +195,8 @@ export class LiveSession {
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
+  /** tool_use_id → start time, for tool.end durations on the watch bus. */
+  private pendingToolStarts = new Map<string, number>();
   /** Agent tool_use id → subagent_type, so a subagent's tool logs can name which agent ran them. */
   private subagentTypeById = new Map<string, string>();
   private activeStreamBlockTypes = new Map<number, string>();
@@ -405,6 +409,7 @@ export class LiveSession {
             if (subType) this.subagentTypeById.set(block.id, subType);
           }
           log.info({ tool: block.name }, summarizeToolInput(block.name, block.input));
+          this.publishToolStart(block);
         }
       }
     }
@@ -423,6 +428,12 @@ export class LiveSession {
         { pre: compact.compact_metadata?.pre_tokens, post: compact.compact_metadata?.post_tokens },
         "Context compacted",
       );
+      watchBus.publish({
+        type: "compact",
+        ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
+        preTokens: compact.compact_metadata?.pre_tokens,
+        postTokens: compact.compact_metadata?.post_tokens,
+      });
     }
 
     if (event.type === "tool_use_summary") {
@@ -521,6 +532,7 @@ export class LiveSession {
             if (subType) this.subagentTypeById.set(block.id, subType);
           }
           log.info({ tool: block.name, agent: agentName }, summarizeToolInput(block.name, block.input));
+          this.publishToolStart(block, agentName);
         }
       }
     }
@@ -529,19 +541,43 @@ export class LiveSession {
     }
   }
 
+  private publishToolStart(
+    block: { id?: string; name: string; input?: Record<string, unknown> },
+    agent?: string,
+  ): void {
+    if (block.id) this.pendingToolStarts.set(block.id, Date.now());
+    watchBus.publish({
+      type: "tool.start",
+      ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
+      tool: block.name,
+      ...(agent ? { agent } : {}),
+      detail: clip(summarizeToolInput(block.name, block.input), TOOL_DETAIL_LIMIT),
+    });
+  }
+
   private logToolResults(content: unknown[], agent?: string): void {
     for (const block of content) {
       if (block && typeof block === "object" && "type" in block && block.type === "tool_result") {
         const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
         const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
+        const startedAt = tr.tool_use_id ? this.pendingToolStarts.get(tr.tool_use_id) : undefined;
         if (tr.tool_use_id) {
           this.pendingToolNames.delete(tr.tool_use_id);
+          this.pendingToolStarts.delete(tr.tool_use_id);
           this.subagentTypeById.delete(tr.tool_use_id);
         }
         log.info(
           { tool: name ?? "?", ...(tr.is_error ? { is_error: true } : {}), ...(agent ? { agent } : {}) },
           `${tr.is_error ? "[ERR] " : ""}${name ?? "?"} result: ${summarizeToolResult(tr.content)}`,
         );
+        watchBus.publish({
+          type: "tool.end",
+          ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
+          tool: name ?? "?",
+          ok: !tr.is_error,
+          ...(startedAt !== undefined ? { durationMs: Date.now() - startedAt } : {}),
+          ...(agent ? { agent } : {}),
+        });
       }
     }
   }

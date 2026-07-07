@@ -134,7 +134,9 @@ async function startForeground(): Promise<void> {
     }));
   }
 
-  const scheduler = new CronScheduler(agent);
+  const { CronStore } = await import("../cron/store.js");
+  const cronStore = new CronStore();
+  const scheduler = new CronScheduler(agent, cronStore);
   const petScheduler = new PetScheduler(agent);
 
   // Start continuity runner if enabled
@@ -156,10 +158,29 @@ async function startForeground(): Promise<void> {
   const rollupRunner = new RollupRunner(agent);
   rollupRunner.start();
 
+  // Watch server: event socket for the `tomo watch` TUI. The daemon never
+  // depends on clients — see src/watch/server.ts.
+  const { WatchServer } = await import("../watch/server.js");
+  const { buildWatchSnapshot } = await import("../watch/snapshot.js");
+  const { getCurrentVersion } = await import("../version.js");
+  const daemonStartedAt = Date.now();
+  const watchServer = new WatchServer(defaultRuntimePaths.watchSocketPath, {
+    getSnapshot: () => buildWatchSnapshot({
+      startedAt: daemonStartedAt,
+      version: getCurrentVersion(),
+      model: config.model,
+      overview: () => agent.watchOverview(),
+      cronJobs: () => cronStore.list(),
+      nextHeartbeatAt: () => continuity.nextFireAt(),
+    }),
+    sendChat: (text) => agent.handleWatchChat(text),
+  });
+
   // Write PID so `tomo stop` can find us
   writeFileSync(PID_FILE, String(process.pid));
 
   const shutdown = async () => {
+    watchServer.stop();
     versionChecker.stop();
     rollupRunner.stop();
     continuity.stop();
@@ -175,6 +196,7 @@ async function startForeground(): Promise<void> {
   await agent.start();
   scheduler.start();
   petScheduler.start();
+  watchServer.start();
 }
 
 async function startDaemon(): Promise<void> {

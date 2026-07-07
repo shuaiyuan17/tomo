@@ -1,5 +1,7 @@
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
+import { watchBus } from "../watch/bus.js";
+import type { TurnSource } from "../watch/protocol.js";
 import { STEER_MERGED } from "./live-session.js";
 import { ATTACHMENT_TAG_RE, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
@@ -83,6 +85,8 @@ export interface TurnErrorPolicy {
 
 export interface TurnSpec {
   key: string;
+  /** Ingress path label for observability (watch feed turn events). */
+  source: TurnSource;
   /** Prompt body; pending notes are always drained in front of it. */
   prompt: string;
   /** Channel label for the timestamp stamp. When undefined the prompt is sent
@@ -157,6 +161,9 @@ export class TurnRunner {
       ? this.deps.startTurnTyping(spec.typing.channel, spec.typing.chatId, spec.typing.passiveListen ?? false)
       : async () => {};
 
+    const startedAt = Date.now();
+    watchBus.publish({ type: "turn.start", sessionKey: spec.key, source: spec.source });
+    let ok = false;
     try {
       const prompt = this.deps.drainPendingNotes(spec.key)
         + (spec.stampChannelName !== undefined
@@ -164,11 +171,22 @@ export class TurnRunner {
           : spec.prompt);
 
       if (spec.delivery.kind === "stream") {
-        return await this.runStreamTurn(spec, spec.delivery, prompt, stopTyping);
+        ok = await this.runStreamTurn(spec, spec.delivery, prompt, stopTyping);
+      } else {
+        ok = await this.runSendTurn(spec, spec.delivery, prompt, stopTyping);
       }
-      return await this.runSendTurn(spec, spec.delivery, prompt, stopTyping);
+      return ok;
     } catch (err) {
-      return this.handleThrownError(spec, err, stopTyping);
+      ok = await this.handleThrownError(spec, err, stopTyping);
+      return ok;
+    } finally {
+      watchBus.publish({
+        type: "turn.end",
+        sessionKey: spec.key,
+        source: spec.source,
+        ok,
+        durationMs: Date.now() - startedAt,
+      });
     }
   }
 

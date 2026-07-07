@@ -155,8 +155,14 @@ export class WatchServer {
   private writeLine(socket: Socket, line: string): void {
     if (!socket.writable) return;
     if (socket.writableLength > WatchServer.MAX_BUFFERED_BYTES) {
-      log.warn({ buffered: socket.writableLength }, "Watch client too slow; disconnecting it");
+      // Destroy BEFORE logging: log.warn feeds a watch-bus issue event back
+      // into this server's broadcast, which re-enters writeLine on this very
+      // socket — it must already be dead (writable=false) by then or the
+      // over-buffer branch recurses until the stack blows.
+      const buffered = socket.writableLength;
+      this.clients.delete(socket);
       socket.destroy();
+      log.warn({ buffered }, "Watch client too slow; disconnected it");
       return;
     }
     socket.write(line);

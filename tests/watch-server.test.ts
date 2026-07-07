@@ -188,6 +188,48 @@ describe("WatchServer", () => {
     socket.destroy();
   }, 10_000);
 
+  it("does not recurse when the slow-client warning itself hits the watch bus", async () => {
+    // The real logger publishes warn/error back onto the watch bus — the
+    // module mock severs that edge, so restore it here: this is exactly the
+    // feedback loop that made the eviction path re-enter writeLine.
+    const { log } = await import("../src/logger.js");
+    const warn = log.warn as ReturnType<typeof vi.fn>;
+    warn.mockClear(); // shared module mock — drop calls recorded by earlier tests
+    warn.mockImplementation(() => {
+      watchBus.publish({ type: "issue", level: "warn", msg: "Watch client too slow; disconnected it" });
+    });
+
+    try {
+      server = new WatchServer(socketPath, {
+        getSnapshot: () => fakeSnapshot(),
+        sendChat: async () => {},
+      });
+      server.start();
+
+      const socket = createConnection(socketPath);
+      await new Promise<void>((resolve, reject) => {
+        socket.on("connect", () => resolve());
+        socket.on("error", reject);
+      });
+      socket.pause();
+
+      const clients = (server as unknown as { clients: Set<unknown> }).clients;
+      const bigMsg = "x".repeat(64 * 1024);
+      const deadline = Date.now() + 5000;
+      while (clients.size > 0 && Date.now() < deadline) {
+        watchBus.publish({ type: "issue", level: "warn", msg: bigMsg });
+        await new Promise((r) => setImmediate(r));
+      }
+
+      expect(clients.size).toBe(0);
+      // One eviction, one warning — not thousands from re-entry.
+      expect(warn).toHaveBeenCalledTimes(1);
+      socket.destroy();
+    } finally {
+      warn.mockReset();
+    }
+  }, 10_000);
+
   it("recovers from a stale socket file on start", async () => {
     // First server leaves a socket file behind (crash simulation: no stop()).
     const first = new WatchServer(socketPath, {

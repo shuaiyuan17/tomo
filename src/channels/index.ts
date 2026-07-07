@@ -7,3 +7,4 @@ export type {
 } from "./types.js";
 export { TelegramChannel } from "./telegram.js";
 export { BlueBubblesChannel } from "./imessage.js";
+export { ImsgChannel } from "./imessage-imsg.js";

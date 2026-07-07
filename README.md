@@ -108,11 +108,12 @@ Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonica
   - Image/photo support (sends to Claude as vision input)
   - Group chat: defaults to mention-required (only responds when @mentioned or replied to); per-group passive listen mode opt-in via `channels.telegram.passiveGroups`
   - Markdown rendering with plain-text fallback
-- **iMessage** — via [BlueBubbles](https://bluebubbles.app)
+- **iMessage** — via [BlueBubbles](https://bluebubbles.app) (default) or the [imsg CLI](https://github.com/openclaw/imsg) (`channels.imessage.provider: "imsg"`)
   - DM and group chat support
   - Image attachment support
   - Contact name resolution from Mac contacts
   - Group chat: observes all messages, only responds when relevant (replies `NO_REPLY` to stay silent)
+  - imsg provider: no external server — Tomo spawns one `imsg rpc` child (needs Full Disk Access); adds inbound tapbacks and built-in reply context, and gates message editing on a live macOS selector probe
 
 ### Multi-Channel Sessions
 
@@ -291,6 +292,16 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
 }
 ```
 
+To run iMessage through the local [imsg CLI](https://github.com/openclaw/imsg) instead of a BlueBubbles server (the Tomo process needs Full Disk Access; advanced features additionally need `imsg launch`):
+
+```json
+{
+  "channels": {
+    "imessage": { "provider": "imsg", "cliPath": "/opt/homebrew/bin/imsg", "allowlist": ["+15551234567"] }
+  }
+}
+```
+
 Environment variables override config file values:
 
 | Variable | Description |
@@ -298,6 +309,9 @@ Environment variables override config file values:
 | `ANTHROPIC_API_KEY` | Use Anthropic API-key authentication; overrides the authentication stored in `config.json` |
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
 | `IMESSAGE_URL` | Override BlueBubbles URL |
+| `IMESSAGE_PROVIDER` | iMessage backend: `bluebubbles` (default) or `imsg` |
+| `IMSG_CLI_PATH` | Path to the `imsg` binary (default: `imsg` on PATH) |
+| `IMSG_DB_PATH` | Override chat.db path passed to `imsg rpc --db` |
 | `IMESSAGE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for ordinary turns (default: `1200`) |
 | `IMESSAGE_PASSIVE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for passive iMessage group turns (default: `4000`) |
 | `CLAUDE_MODEL` | Override model |

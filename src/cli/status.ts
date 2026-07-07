@@ -31,7 +31,7 @@ export async function gatherStatus(): Promise<StatusReport> {
   const pkg = JSON.parse(
     readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json"), "utf-8"),
   ) as { version: string };
-  const { config, configIssues } = await import("../config.js");
+  const { config, configIssues, imessageConfigured } = await import("../config.js");
 
   const daemon = getDaemonStatus();
 
@@ -61,7 +61,7 @@ export async function gatherStatus(): Promise<StatusReport> {
     configIssues,
     channels: [
       { name: "telegram", configured: Boolean(config.telegramToken) },
-      { name: "imessage", configured: Boolean(config.imessageUrl) },
+      { name: "imessage", configured: imessageConfigured(config) },
     ],
     sessions,
     cron: {

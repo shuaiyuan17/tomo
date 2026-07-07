@@ -17,11 +17,13 @@ export async function configChannels(): Promise<void> {
     });
 
     const imUrl = channels.imessage?.url as string | undefined;
+    const imProvider = (channels.imessage?.provider as string | undefined) ?? "bluebubbles";
+    const imConfigured = imProvider === "imsg" || Boolean(imUrl);
     const imAllow = (channels.imessage?.allowlist ?? []) as string[];
     options.push({
       value: "imessage",
-      label: "iMessage (BlueBubbles)",
-      hint: imUrl ? `configured | ${imAllow.length} allowed` : "not configured",
+      label: "iMessage",
+      hint: imConfigured ? `${imProvider} | ${imAllow.length} allowed` : "not configured",
     });
 
     options.push({ value: "back", label: "Back" });
@@ -61,14 +63,49 @@ export async function configChannels(): Promise<void> {
 
     if (choice === "imessage") {
       const action = await p.select({
-        message: "iMessage (BlueBubbles)",
+        message: "iMessage",
         options: [
-          { value: "connection", label: "Connection settings", hint: imUrl ?? "not set" },
+          { value: "provider", label: "Provider", hint: imProvider },
+          { value: "connection", label: "BlueBubbles connection settings", hint: imUrl ?? "not set" },
+          { value: "imsg", label: "imsg CLI settings", hint: (channels.imessage?.cliPath as string) ?? "imsg (PATH)" },
           { value: "allowlist", label: "Allowlist", hint: `${imAllow.length} user(s)` },
           { value: "back", label: "Back" },
         ],
       });
       if (p.isCancel(action) || action === "back") continue;
+
+      if (action === "provider") {
+        const provider = await p.select({
+          message: "iMessage backend",
+          options: [
+            { value: "bluebubbles", label: "BlueBubbles", hint: "external server + webhook" },
+            { value: "imsg", label: "imsg CLI", hint: "local imsg rpc child (needs Full Disk Access)" },
+          ],
+          initialValue: imProvider,
+        });
+        if (p.isCancel(provider)) continue;
+        if (!channels.imessage) channels.imessage = {};
+        channels.imessage.provider = provider as string;
+        cfg.channels = channels;
+        saveConfig(cfg);
+        p.log.success(`iMessage provider set to ${provider as string}`);
+      }
+
+      if (action === "imsg") {
+        const cliPath = await p.text({
+          message: "imsg binary path (empty = resolve \"imsg\" from PATH)",
+          placeholder: "/opt/homebrew/bin/imsg",
+          initialValue: (channels.imessage?.cliPath as string) ?? "",
+        });
+        if (p.isCancel(cliPath)) continue;
+        if (!channels.imessage) channels.imessage = {};
+        const trimmed = (cliPath as string).trim();
+        if (trimmed) channels.imessage.cliPath = trimmed;
+        else delete channels.imessage.cliPath;
+        cfg.channels = channels;
+        saveConfig(cfg);
+        p.log.success("imsg CLI settings saved");
+      }
 
       if (action === "connection") {
         const url = await p.text({

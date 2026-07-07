@@ -13,7 +13,7 @@ export async function configIdentities(): Promise<void> {
   const channels = (cfg.channels ?? {}) as Record<string, Record<string, string>>;
   const configuredChannels = Object.keys(channels).filter((ch) => {
     if (ch === "telegram") return !!channels.telegram?.token;
-    if (ch === "imessage") return !!channels.imessage?.url;
+    if (ch === "imessage") return !!channels.imessage?.url || channels.imessage?.provider === "imsg";
     return true;
   });
 

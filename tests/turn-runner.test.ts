@@ -248,15 +248,22 @@ describe("TurnRunner send turns", () => {
     ]);
   });
 
-  it("strips repeated trailing NO_REPLY blocks before delivery", async () => {
+  it("suppresses the whole turn when narration ends with a trailing NO_REPLY line", async () => {
+    const h = makeHarness(async () => "archived the logs, nothing urgent\nNO_REPLY");
+    const result = await h.runner.runTurn(sendSpec(h));
+
+    expect(result).toBe(true);
+    expect(h.channel.sent).toHaveLength(0);
+    expect(h.transcript).toHaveLength(0);
+  });
+
+  it("suppresses the whole turn on repeated trailing NO_REPLY blocks", async () => {
     const h = makeHarness(async () => "cron says hi\nNO_REPLY\nNO_REPLY");
     const result = await h.runner.runTurn(sendSpec(h));
 
     expect(result).toBe(true);
-    expect(h.channel.sent).toEqual([{ chatId: "123", text: "cron says hi" }]);
-    expect(h.transcript).toEqual([
-      { sessionKey: "telegram:123", content: "cron says hi", channelName: "telegram" },
-    ]);
+    expect(h.channel.sent).toHaveLength(0);
+    expect(h.transcript).toHaveLength(0);
   });
 
   it("keeps repeated trailing NO_REPLY-only send turns silent", async () => {

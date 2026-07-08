@@ -557,6 +557,155 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
       { text: "first block", fromMe: true },
     ]);
   });
+
+  // Trailing bare-NO_REPLY line(s) suppress the whole streamed block (owner
+  // decision 2026-07-08). Telegram streams progressively, so narration may
+  // already be on screen when the trailing token arrives in the final delta —
+  // finalFlush retracts it via deleteMessage (flicker-then-retraction is
+  // accepted; matches unsend semantics).
+  it("retracts an already-streamed block when the final delta ends in NO_REPLY (multi-part path)", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("archived the logs");
+    // Let the first-frame flush land so the narration is actually on screen.
+    await new Promise((r) => setTimeout(r, 0));
+    stream.update("archived the logs\nfound two stale sessions\nNO_REPLY");
+    await stream.finish();
+
+    expect(sent).toEqual([{ chatId: "1", text: "archived the logs" }]);
+    expect(deleted).toEqual([{ chatId: "1", messageId: 100 }]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("delivers nothing for a bare NO_REPLY block (single-part path)", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("NO_REPLY");
+    await stream.finish();
+
+    expect(sent).toHaveLength(0);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("suppresses a multi-line NO_REPLY-terminated block even when nothing streamed yet", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Single delta straight to the final content — the flush guard skips the
+    // mid-stream send, and finalFlush must suppress BEFORE the multi-part
+    // deliverTextParts path ships "did housekeeping" as its own message.
+    stream.update("did housekeeping\nNO_REPLY");
+    await stream.finish();
+
+    expect(sent).toHaveLength(0);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("still delivers real multi-line blocks through the multi-part path", async () => {
+    const { channel, sent } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("line one\nline two");
+    await stream.finish();
+
+    expect(sent.map((s) => s.text)).toContain("line one");
+    expect(sent.map((s) => s.text)).toContain("line two");
+  });
+
+  it("retracts finalized rollover heads too when the block ends in trailing NO_REPLY", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Over Telegram's 4096 limit: flush finalizes a head chunk (recorded, no
+    // longer the "current" message) and rolls the tail into a fresh message.
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(2); // head (100, finalized) + tail (101) on screen
+
+    // Final delta reveals the block is housekeeping narration — suppression
+    // must retract the WHOLE block, finalized heads included.
+    stream.update(`${"x".repeat(5000)}\nNO_REPLY`);
+    await stream.finish();
+
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("delivers the sliced tail of a real over-limit reply ending in NO_REPLY (no stall)", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // A single-line real reply that happens to END with the token inline. The
+    // rollover hard-cuts at 4096, so the post-rollover slice is exactly
+    // "NO_REPLY" — the suppression guard must judge the FULL block buffer
+    // (inline mention → deliver), not the slice, or this tail stalls forever
+    // and finalFlush drops it.
+    stream.update(`${"x".repeat(4096)}NO_REPLY`);
+    await stream.finish();
+
+    expect(sent.map((s) => s.text)).toEqual(["x".repeat(4096), "NO_REPLY"]);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1")).toHaveLength(2);
+  });
+
+  it("discardBlock retracts finalized rollover heads so attachment re-delivery isn't duplicated", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Over-limit block: flush finalizes a head (100) and rolls into a tail (101).
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(2);
+
+    // The delivery pipeline's attachment path discards the streamed block and
+    // re-delivers the full content via deliverAssistantContent -> channel.send.
+    // Both streamed messages must be retracted and un-recorded, or the head
+    // content would sit on screen next to the re-delivery.
+    await stream.discardBlock();
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+
+    await channel.send({ chatId: "1", text: "full content with attachment" });
+    const recent = channel.recentMessages("1");
+    expect(recent).toHaveLength(1);
+    expect(recent[0].text).toBe("full content with attachment");
+  });
+
+  it("cancel retracts finalized rollover heads along with the current message", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(2);
+
+    await stream.cancel();
+
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("multi-part final delivery after rollover retracts heads so content ships exactly once", async () => {
+    const { channel, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Rollover finalizes a head (100) and a tail (101)...
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    // ...then the block turns multi-line, so finalFlush re-delivers the FULL
+    // buffer via deliverTextParts. The streamed head/tail must be retracted
+    // or their content would appear on screen twice.
+    stream.update(`${"x".repeat(5000)}\nsecond line`);
+    await stream.finish();
+
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    const recent = channel.recentMessages("1");
+    expect(recent.map((m) => m.text)).toEqual(["second line", "x".repeat(904), "x".repeat(4096)]);
+  });
 });
 
 // Polling restart backoff: a permanently failing bot.start() (revoked token,

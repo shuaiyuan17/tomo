@@ -198,6 +198,15 @@ export class ImsgChannel implements Channel {
         readReceipts: this.capabilities.readReceipts,
         editSupported: this.isEditSupported(),
       }, "imsg capabilities probed");
+      // Hard operational prerequisite: without `imsg launch` (bridge injected),
+      // the IMCore-backed outbound RPCs — send.rich, tapback, message.unsend,
+      // group.rename, typing — have no live path and BLOCK until their request
+      // timeouts (30s / 5s) fire. Inbound watch and plain AppleScript `send`
+      // still work, but outbound is effectively dead. Warn loudly so a cutover
+      // that skipped `imsg launch` is obvious in the logs.
+      if (!this.capabilities.advancedFeatures) {
+        log.warn("imsg bridge NOT injected (advanced_features=false): run `imsg launch`. Until then, outbound tapback/typing/unsend/rename/threaded-reply RPCs will hang until timeout; only inbound watch and plain sends work.");
+      }
     } catch (err) {
       this.capabilities = NO_CAPABILITIES;
       log.warn({ err }, "imsg status probe failed; assuming basic features only");
@@ -293,12 +302,16 @@ export class ImsgChannel implements Channel {
   }
 
   async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove = false): Promise<void> {
-    // Targeted tapback via the IMCore bridge — reaction names map 1:1 to
-    // imsg's normalized kinds (love/like/dislike/laugh/emphasize/question).
+    // Targeted tapback via the IMCore bridge. The param name is `kind` — the
+    // canonical `imsg tapback --kind love|like|dislike|laugh|emphasize|question`
+    // flag. (The v0.12.3 RPC source also accepts a `reaction` alias, but the
+    // shipped binary honors only `kind`: sending `reaction` was silently
+    // ignored and defaulted every tapback to 👍 — confirmed on-device.) Our
+    // MessageReaction enum values map 1:1 to imsg's --kind values.
     await this.request("tapback", {
       chat_guid: chatId,
       message_guid: messageId,
-      reaction,
+      kind: reaction,
       remove,
       part_index: 0,
     });

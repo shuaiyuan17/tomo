@@ -676,20 +676,24 @@ describe("imsg outbound send", () => {
 // --- Tapback / unsend / edit -----------------------------------------------------
 
 describe("imsg tapback, unsend, and edit", () => {
-  it("sends a targeted tapback over RPC", async () => {
+  it("sends a targeted tapback over RPC with the `kind` param (NOT `reaction`)", async () => {
     const { channel, requests } = makeChannel();
     await channel.start();
 
     await channel.reactToMessage(DM_GUID, "target-guid", "love");
 
     const tapback = requests().find((r) => r.method === "tapback");
+    // imsg's shipped tapback RPC honors `kind` (the CLI --kind flag); a
+    // `reaction` field is silently ignored → defaults to 👍. Assert the exact
+    // param name so a rename back to `reaction` regresses loudly.
     expect(tapback?.params).toEqual({
       chat_guid: DM_GUID,
       message_guid: "target-guid",
-      reaction: "love",
+      kind: "love",
       remove: false,
       part_index: 0,
     });
+    expect(tapback?.params).not.toHaveProperty("reaction");
     await channel.stop();
   });
 
@@ -699,7 +703,7 @@ describe("imsg tapback, unsend, and edit", () => {
 
     await channel.reactToMessage(DM_GUID, "target-guid", "like", true);
 
-    expect(requests().find((r) => r.method === "tapback")?.params).toMatchObject({ reaction: "like", remove: true });
+    expect(requests().find((r) => r.method === "tapback")?.params).toMatchObject({ kind: "like", remove: true });
     await channel.stop();
   });
 
@@ -834,6 +838,114 @@ describe("imsg mark-as-read", () => {
     await settle();
 
     expect(requests().map((r) => r.method)).not.toContain("read");
+    await channel.stop();
+  });
+});
+
+// --- RPC param-name contract (guards against field-name drift vs the imsg CLI) ---
+// Unit-test mocks don't know imsg's real field names, so a rename (e.g. the
+// tapback `reaction`→`kind` dogfood bug) can pass tests while silently
+// misbehaving on-device. These assert the EXACT param key set of every outbound
+// RPC against the verified v0.12.3 imsg handler contract, so drift fails loudly.
+
+describe("imsg outbound RPC param-name contract", () => {
+  const editSelectorCaps: ImsgCapabilities = {
+    ...CAPS_FULL,
+    rpcMethods: new Set([...CAPS_FULL.rpcMethods, "message.edit"]),
+    selectors: { ...CAPS_FULL.selectors, editMessageItem: true },
+  };
+  const keysOf = (requests: () => RpcRequest[], method: string) =>
+    Object.keys(requests().find((r) => r.method === method)?.params ?? {}).sort();
+
+  it("send (plain text) → chat_guid, text", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+    await channel.send({ chatId: DM_GUID, text: "hi" });
+    expect(keysOf(requests, "send")).toEqual(["chat_guid", "text"]);
+    await channel.stop();
+  });
+
+  it("send (attachment) → chat_guid, file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-contract-"));
+    const photoPath = join(dir, "pic.png");
+    writeFileSync(photoPath, "x");
+    try {
+      const { channel, requests } = makeChannel();
+      await channel.start();
+      await channel.send({ chatId: DM_GUID, photo: photoPath });
+      expect(keysOf(requests, "send")).toEqual(["chat_guid", "file"]);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("send.rich (threaded reply) → chat_guid, part_index, reply_to, text", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    await channel.send({ chatId: DM_GUID, text: "hi", replyTo: "guid-target" });
+    expect(keysOf(requests, "send.rich")).toEqual(["chat_guid", "part_index", "reply_to", "text"]);
+    await channel.stop();
+  });
+
+  it("tapback → chat_guid, kind, message_guid, part_index, remove", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+    await channel.reactToMessage(DM_GUID, "m-1", "love");
+    expect(keysOf(requests, "tapback")).toEqual(["chat_guid", "kind", "message_guid", "part_index", "remove"]);
+    await channel.stop();
+  });
+
+  it("typing → chat_guid, typing", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+    const stop = channel.startTyping(DM_GUID);
+    await settle();
+    await stop();
+    expect(keysOf(requests, "typing")).toEqual(["chat_guid", "typing"]);
+    await channel.stop();
+  });
+
+  it("read → chat_guid", async () => {
+    const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    channel.onMessage(vi.fn(async () => {}));
+    children[0].notifyMessage(inboundMessage());
+    await vi.waitFor(() => expect(requests().some((r) => r.method === "read")).toBe(true));
+    expect(keysOf(requests, "read")).toEqual(["chat_guid"]);
+    await channel.stop();
+  });
+
+  it("message.unsend → chat_guid, message_guid, part_index", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+    await channel.unsendMessage(DM_GUID, "m-1");
+    expect(keysOf(requests, "message.unsend")).toEqual(["chat_guid", "message_guid", "part_index"]);
+    await channel.stop();
+  });
+
+  it("message.edit → backwards_compatibility_message, chat_guid, message_guid, part_index, text", async () => {
+    const { channel, requests } = makeChannel({ caps: editSelectorCaps });
+    await channel.start();
+    await channel.editMessage(DM_GUID, "m-1", "fixed");
+    expect(keysOf(requests, "message.edit")).toEqual([
+      "backwards_compatibility_message", "chat_guid", "message_guid", "part_index", "text",
+    ]);
+    await channel.stop();
+  });
+
+  it("group.rename → chat_guid, name", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+    await channel.setChatTitle(GROUP_GUID, "New Title");
+    expect(keysOf(requests, "group.rename")).toEqual(["chat_guid", "name"]);
+    await channel.stop();
+  });
+
+  it("watch.subscribe → attachments, convert_attachments, include_reactions (+ since_rowid when resuming)", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+    expect(keysOf(requests, "watch.subscribe")).toEqual(["attachments", "convert_attachments", "include_reactions"]);
     await channel.stop();
   });
 });

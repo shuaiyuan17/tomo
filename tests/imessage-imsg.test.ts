@@ -1172,6 +1172,25 @@ describe("imsg rpc child lifecycle", () => {
     expect(spawnFn).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects in-flight requests on stop() instead of leaving them hanging", async () => {
+    const { channel } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "send") return; // never answered — must settle on stop
+        child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
+      },
+    });
+    await channel.start();
+
+    // killChild() nulls this.child before kill(), so the exit event is a stale
+    // no-op in handleChildDown — stop() itself must reject what's in flight,
+    // else this send never settles (its timeout timer is unref'd).
+    const inFlight = channel.send({ chatId: DM_GUID, text: "in flight at shutdown" }).catch((e: Error) => e);
+    await settle();
+    await channel.stop();
+    expect(await inFlight).toBeInstanceOf(Error);
+    expect(((await inFlight) as Error).message).toMatch(/stopped while awaiting send/);
+  });
+
   it("restarts the child when the watch stream errors server-side", async () => {
     vi.useFakeTimers();
     const { channel, children, spawnFn } = makeChannel({ config: { restartDelaysMs: [1_000] } });
@@ -1465,6 +1484,31 @@ describe("imsg at-least-once persist ordering", () => {
     }
   });
 
+  it("does not wedge the cursor floor when a row WITHOUT a rowid fails to dispatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-norowid-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath } });
+      await channel.start();
+      channel.onMessage(async (m) => { if (m.id === "no-rowid") throw new Error("boom"); });
+
+      // A malformed row with no numeric rowid (parses to 0) whose dispatch
+      // throws can't be replayed by since_rowid. Flooring at 0 would block
+      // every future cursor commit forever — instead the failure is logged,
+      // the child stays up, and a later good row still commits.
+      children[0].notifyMessage(inboundMessage({ id: undefined, guid: "no-rowid", text: "will throw" }));
+      children[0].notifyMessage(inboundMessage({ id: 700, guid: "good-after-norowid", text: "ok" }));
+      await vi.waitFor(() => {
+        expect(existsSync(cursorStorePath)).toBe(true);
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(700);
+      });
+      expect(children[0].killed).toBe(false);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("advanceCursor refuses to skip a known-failed lower rowid, then clears on replay", () => {
     const { channel } = makeChannel();
     const internals = channel as unknown as {
@@ -1668,7 +1712,15 @@ describe("imsg watch FIFO serialization", () => {
 
 describe("imsg stdin backpressure", () => {
   it("holds the next write until 'drain' when a write signals a full pipe", async () => {
-    const { channel, children } = makeChannel();
+    // Hold send responses: an immediate response would (correctly) release the
+    // parked write via the response path, hiding the drain gate under test.
+    const heldSends: Array<{ id: number }> = [];
+    const { channel, children } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "send") { heldSends.push({ id: req.id }); return; }
+        child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
+      },
+    });
     await channel.start();
     const child = children[0];
     const sentTexts = () => child.stdin.lines
@@ -1679,7 +1731,8 @@ describe("imsg stdin backpressure", () => {
     // The first send's write returns false (full pipe); its chain link then
     // waits for 'drain' before the next write is allowed through.
     child.stdin.backpressureWrites = 1;
-    await channel.send({ chatId: DM_GUID, text: "first" });
+    const p1 = channel.send({ chatId: DM_GUID, text: "first" });
+    await settle();
     expect(sentTexts()).toEqual(["first"]);
 
     // The second send is queued behind the un-drained first write — its bytes
@@ -1691,8 +1744,12 @@ describe("imsg stdin backpressure", () => {
 
     // Drain releases the backlog; the held write now goes out, in order.
     child.stdin.emit("drain");
-    await p2;
+    await settle();
     expect(sentTexts()).toEqual(["first", "second"]);
+
+    // Answer the held sends so both calls resolve.
+    for (const { id } of heldSends.splice(0)) child.respond(id, { ok: true });
+    await Promise.all([p1, p2]);
     await channel.stop();
   });
 
@@ -1714,7 +1771,14 @@ describe("imsg stdin backpressure", () => {
 
   it("skips a queued write whose request already timed out (no late duplicate send) (round-2 #3)", async () => {
     vi.useFakeTimers();
-    const { channel, children } = makeChannel();
+    // Sends stay unanswered: a response to the first send would settle its
+    // parked link and release the queued second write before the timeout.
+    const { channel, children } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "send") return;
+        child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
+      },
+    });
     await channel.start();
     const child = children[0];
     const sentTexts = () => child.stdin.lines
@@ -1782,6 +1846,27 @@ describe("imsg stdin backpressure", () => {
     await settle();
     expect(sentTexts()).toEqual(["first", "second"]);
     void p2;
+    await channel.stop();
+  });
+
+  it("releases a parked write when its response arrives, without waiting for 'drain'", async () => {
+    // defaultResponder answers every request — the response itself (proof the
+    // child consumed the line) must settle the parked link, so the next write
+    // goes out even though 'drain' never fires.
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const child = children[0];
+    const sentTexts = () => child.stdin.lines
+      .map((l) => JSON.parse(l) as RpcRequest)
+      .filter((r) => r.method === "send")
+      .map((r) => r.params.text);
+
+    child.stdin.backpressureWrites = 1; // first send parks on a full pipe
+    const p1 = channel.send({ chatId: DM_GUID, text: "first" });
+    const p2 = channel.send({ chatId: DM_GUID, text: "second" });
+    await settle(12);
+    expect(sentTexts()).toEqual(["first", "second"]);
+    await Promise.all([p1, p2]);
     await channel.stop();
   });
 

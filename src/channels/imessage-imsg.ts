@@ -625,6 +625,11 @@ export class ImsgChannel implements Channel {
     const child = this.child;
     this.child = null;
     this.subscriptionId = null;
+    // Nulling this.child above makes the kill's exit event a stale no-op in
+    // handleChildDown, so settle in-flight requests here — otherwise a send
+    // awaited during shutdown would never resolve (its timeout timer is
+    // unref'd, so it may never fire before the process exits).
+    this.rejectAllPending("stopped");
     child.kill();
   }
 
@@ -781,6 +786,11 @@ export class ImsgChannel implements Channel {
       if (!req) return;
       this.pending.delete(id);
       clearTimeout(req.timer);
+      // A response proves the child consumed the request line, so a write
+      // link still parked on 'drain' for it can settle now instead of waiting
+      // out the drain backstop (which would needlessly restart a healthy,
+      // answering child).
+      this.writeWaiters.get(id)?.();
       if (payload.error) {
         const error = payload.error as { code?: number; message?: string; data?: string };
         const detail = error.data ? `: ${error.data}` : "";
@@ -1080,6 +1090,14 @@ export class ImsgChannel implements Channel {
    * the failure so they don't reach the agent out of order.
    */
   private recoverFromGap(rowId: number, err: unknown): void {
+    // A row without a numeric rowid (parsed as 0) can't be replayed by
+    // since_rowid. Flooring at 0 would block every future cursor commit (all
+    // real rowids are > 0) and the floor could never clear — the cursor file
+    // would silently freeze forever. Log and move on instead.
+    if (rowId <= 0) {
+      log.error({ err }, "imsg dispatch failed for a row with no rowid; cannot replay — skipping");
+      return;
+    }
     if (this.failedRowId === null || rowId < this.failedRowId) this.failedRowId = rowId;
     log.error({ err, rowId, sinceRowId: this.lastRowId }, "imsg dispatch failed; resubscribing to replay the gap");
     const child = this.child;

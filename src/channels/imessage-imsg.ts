@@ -104,7 +104,9 @@ interface PendingRequest {
  *
  * - inbound: `watch.subscribe` notifications (method "message"), which carry
  *   attachments with local file paths and built-in reply context
- *   (reply_to_guid/reply_to_text/reply_to_sender)
+ *   (thread_originator_guid marks genuine threaded replies; reply_to_text
+ *   quotes the originator — reply_to_guid alone is NOT a reply signal, it is
+ *   set on nearly every chat.db row)
  * - outbound: `send` (AppleScript transport), `send.rich` for threaded
  *   replies, `tapback`, `typing`, `read`, `message.unsend` (IMCore bridge)
  *
@@ -993,15 +995,27 @@ export class ImsgChannel implements Channel {
       && isSatelliteService(this.serviceLookup.serviceForGuid(guid));
     const satelliteMarker = isSatelliteMessage ? SATELLITE_MARKER : "";
 
-    // Threaded replies carry the original inline: reply_to_guid plus
-    // reply_to_text/reply_to_sender resolved by imsg from chat.db — no
-    // lookup round-trip like the BlueBubbles channel needed. Only tag rows
-    // with real content so a ghost row can't become a prompt.
-    const replyToGuid = (typeof data.thread_originator_guid === "string" && data.thread_originator_guid)
-      || (typeof data.reply_to_guid === "string" && data.reply_to_guid) || "";
+    // Reply context gates on thread_originator_guid ONLY — chat.db sets that
+    // column solely on genuine long-press → Reply messages, matching what the
+    // BlueBubbles channel keyed on (threadOriginatorGuid). imsg also emits
+    // reply_to_guid, but that mirrors chat.db's message.reply_to_guid column,
+    // which is populated on virtually EVERY message (it points at the message
+    // that preceded it in the conversation — usually our own last outbound),
+    // so falling back to it tagged every plain inbound send as a reply
+    // quoting our latest message (100% reply rate after the BB → imsg
+    // cutover). For genuine threaded replies imsg resolves reply_to_text from
+    // the originator (thread_originator_guid takes precedence over
+    // reply_to_guid in its lookup), so the quoted excerpt is the right
+    // message; when imsg couldn't resolve it, fall back to the recent-message
+    // ring before degrading to the quote-less marker. Only tag rows with real
+    // content so a ghost row can't become a prompt.
+    const threadOriginatorGuid = typeof data.thread_originator_guid === "string" ? data.thread_originator_guid : "";
     const hasContent = Boolean(text.trim()) || images.length > 0 || documents.length > 0;
-    const replyMarker = replyToGuid && hasContent
-      ? formatReplyContextMarker(typeof data.reply_to_text === "string" ? data.reply_to_text : undefined)
+    const replyMarker = threadOriginatorGuid && hasContent
+      ? formatReplyContextMarker(
+        (typeof data.reply_to_text === "string" && data.reply_to_text)
+          || this.recentByChat.get(chatGuid)?.find((m) => m.id === threadOriginatorGuid)?.text,
+      )
       : "";
 
     const markers = [satelliteMarker, replyMarker, imageMarker, docMarker].filter(Boolean).join(" ");

@@ -370,6 +370,153 @@ describe("imsg inbound message mapping", () => {
     }
   });
 
+  it("converts an inbound HEIC attachment (by mime/extension) to JPEG on the group path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const heicPath = join(dir, "photo.heic");
+    // Minimal HEIC: ftyp box with the `heic` major brand.
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => {
+        const out = join(dir, "converted.jpg");
+        writeFileSync(out, Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"));
+        return out;
+      });
+      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-1",
+        chat_guid: GROUP_GUID,
+        is_group: true,
+        text: "",
+        attachments: [{
+          filename: "photo.heic",
+          mime_type: "image/heic",
+          original_path: heicPath,
+          missing: false,
+        }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(convertHeic).toHaveBeenCalledWith(heicPath);
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images).toHaveLength(1);
+      expect(msg.images![0].mediaType).toBe("image/jpeg");
+      expect(msg.images![0].savedPath).toMatch(/\.jpg$/);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("converts a HEIC attachment detected only by magic bytes (mislabeled mime, no .heic extension)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const srcPath = join(dir, "IMG_0001.jpg"); // wrong extension
+    writeFileSync(srcPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => {
+        const out = join(dir, "converted.jpg");
+        writeFileSync(out, Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"));
+        return out;
+      });
+      // Mime lies ("image/jpeg") and the extension is .jpg; only the ftyp magic
+      // bytes reveal it's really HEIC.
+      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-2",
+        chat_guid: GROUP_GUID,
+        is_group: true,
+        text: "",
+        attachments: [{ mime_type: "image/jpeg", original_path: srcPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(convertHeic).toHaveBeenCalledWith(srcPath);
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images).toHaveLength(1);
+      expect(msg.images![0].mediaType).toBe("image/jpeg");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the original HEIC bytes when conversion fails, without throwing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const heicPath = join(dir, "photo.heic");
+    const heicBytes = Buffer.from("000000246674797068656963000000006d696631", "hex");
+    writeFileSync(heicPath, heicBytes);
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => null); // conversion failed
+      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-3",
+        chat_guid: DM_GUID,
+        text: "",
+        attachments: [{
+          filename: "photo.heic",
+          mime_type: "image/heic",
+          original_path: heicPath,
+          missing: false,
+        }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(convertHeic).toHaveBeenCalledWith(heicPath);
+      const msg = handler.mock.calls[0][0];
+      // Attachment is NOT dropped — original HEIC bytes/mime are kept.
+      expect(msg.images).toHaveLength(1);
+      expect(msg.images![0].mediaType).toBe("image/heic");
+      expect(Buffer.from(msg.images![0].data, "base64").equals(heicBytes)).toBe(true);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("passes non-HEIC images through untouched (no conversion attempted)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const pngPath = join(dir, "photo.png");
+    writeFileSync(pngPath, Buffer.from("89504e470d0a1a0a", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => null);
+      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "png-guid-1",
+        text: "",
+        attachments: [{ filename: "photo.png", mime_type: "image/png", original_path: pngPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(convertHeic).not.toHaveBeenCalled();
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images).toHaveLength(1);
+      expect(msg.images![0].mediaType).toBe("image/png");
+      expect(Buffer.from(msg.images![0].data, "base64").toString("hex")).toBe("89504e470d0a1a0a");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("skips attachments marked missing and still delivers the text", async () => {
     const { channel, children } = makeChannel();
     await channel.start();

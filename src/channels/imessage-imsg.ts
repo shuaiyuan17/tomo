@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
@@ -12,6 +12,7 @@ import { deliverTextParts } from "./delivery.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
+import { convertHeicToJpeg, looksLikeHeic } from "./heic.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -80,6 +81,12 @@ export interface ImsgChannelConfig {
    * standard `~/Library/Messages/chat.db`).
    */
   serviceLookup?: ServiceLookup;
+  /**
+   * Test seam: HEIC/HEIF → JPEG converter. Given a source path, returns the
+   * path to a temp JPEG (the channel reads then unlinks it) or `null` on
+   * failure. Defaults to a macOS `sips`-backed implementation.
+   */
+  convertHeic?: (srcPath: string) => Promise<string | null>;
 }
 
 interface PendingRequest {
@@ -123,6 +130,7 @@ export class ImsgChannel implements Channel {
   private readonly drainWaitTimeoutMs: number;
   private messageGuidDedupe: MessageGuidDedupeStore;
   private readonly serviceLookup: ServiceLookup;
+  private readonly convertHeicFn: (srcPath: string) => Promise<string | null>;
   // Settles a request's parked-on-'drain' write link, keyed by request id, so a
   // request timeout/cancel can release its own stuck write (else future writes
   // queue behind a forever-pending drain-wait).
@@ -173,6 +181,7 @@ export class ImsgChannel implements Channel {
     this.drainWaitTimeoutMs = config.drainWaitTimeoutMs ?? DEFAULT_DRAIN_WAIT_TIMEOUT_MS;
     this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
     this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
+    this.convertHeicFn = config.convertHeic ?? convertHeicToJpeg;
     this.loadCursor();
   }
 
@@ -1221,7 +1230,15 @@ export class ImsgChannel implements Channel {
         };
 
         if (isImage) {
-          images.push(await buildImageAttachment(buffer, mimeType, meta, this.imageStoreBaseDir));
+          // imsg's convert_attachments is unreliable — it hands us a converted
+          // JPEG for some rows but raw HEIC for others (raw HEIC observed on
+          // group photos, converted JPEG on a DM photo, 2026-07-07). The
+          // harness image reader can't display HEIC, so normalize here as a
+          // channel-side fallback: any HEIC (by mime, extension, OR ftyp magic
+          // bytes) is converted to JPEG via sips before it's stored/encoded.
+          // Failure keeps the original bytes — never drop the attachment.
+          const { buffer: imageBuffer, mimeType: imageMime } = await this.normalizeHeicImage(buffer, mimeType, filePath);
+          images.push(await buildImageAttachment(imageBuffer, imageMime, meta, this.imageStoreBaseDir));
         } else {
           const filename = (typeof att.transfer_name === "string" && att.transfer_name) || basename(filePath);
           documents.push(await buildDocumentAttachment(buffer, mimeType, { ...meta, filename }, this.imageStoreBaseDir));
@@ -1232,6 +1249,39 @@ export class ImsgChannel implements Channel {
     }
 
     return { images, documents };
+  }
+
+  /**
+   * Channel-side HEIC/HEIF → JPEG fallback. Returns the JPEG buffer + mime when
+   * the attachment is HEIC and the conversion succeeds; otherwise returns the
+   * inputs unchanged so a non-HEIC image passes through untouched and a failed
+   * conversion keeps the original bytes (never drops the attachment). Never
+   * throws. `filePath` is only used for extension sniffing — the convert reads
+   * the same on-disk file imsg pointed us at, and writes to a temp JPEG that we
+   * read then unlink; chat.db and Messages are never touched.
+   */
+  private async normalizeHeicImage(
+    buffer: Buffer,
+    mimeType: string,
+    filePath: string,
+  ): Promise<{ buffer: Buffer; mimeType: string }> {
+    if (!looksLikeHeic(mimeType, filePath, buffer)) return { buffer, mimeType };
+
+    const jpegPath = await this.convertHeicFn(filePath).catch((err) => {
+      log.error({ err, path: filePath }, "HEIC->JPEG conversion threw; keeping original attachment");
+      return null;
+    });
+    if (!jpegPath) return { buffer, mimeType };
+
+    try {
+      const jpegBuffer = await readFile(jpegPath);
+      return { buffer: jpegBuffer, mimeType: "image/jpeg" };
+    } catch (err) {
+      log.error({ err, path: filePath, jpegPath }, "Failed to read converted JPEG; keeping original attachment");
+      return { buffer, mimeType };
+    } finally {
+      await unlink(jpegPath).catch(() => undefined);
+    }
   }
 
   // --- Outbound attachments ---

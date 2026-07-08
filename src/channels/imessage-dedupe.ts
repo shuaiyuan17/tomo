@@ -52,6 +52,25 @@ export class MessageGuidDedupeStore {
     return false;
   }
 
+  /**
+   * Read-only membership check (no side effects beyond TTL pruning). Split out
+   * from `checkAndRecord` so an at-least-once consumer can CHECK before
+   * dispatch and only `record()` AFTER a successful hand-off — recording up
+   * front then crashing mid-dispatch would drop the message on replay.
+   */
+  has(guid: string, now = Date.now()): boolean {
+    this.prune(now);
+    return this.entries.has(guid);
+  }
+
+  /** Record a GUID as seen. Idempotent. */
+  record(guid: string, now = Date.now()): void {
+    if (this.entries.has(guid)) return;
+    this.entries.set(guid, now);
+    this.prune(now);
+    this.persist();
+  }
+
   private prune(now: number): void {
     const cutoff = now - this.ttlMs;
     for (const [guid, seenAt] of this.entries) {

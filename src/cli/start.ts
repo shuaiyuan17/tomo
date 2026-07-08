@@ -123,7 +123,19 @@ async function startForeground(): Promise<void> {
     agent.addChannel(new TelegramChannel(config.telegramToken, { imageStoreBaseDir }));
   }
 
-  if (config.imessageUrl) {
+  if (config.imessageProvider === "imsg") {
+    const { ImsgChannel } = await import("../channels/index.js");
+    agent.addChannel(new ImsgChannel({
+      cliPath: config.imsgCliPath,
+      dbPath: config.imsgDbPath ?? undefined,
+      imageStoreBaseDir,
+      // Same GUID store as the BlueBubbles channel on purpose: chat.db message
+      // GUIDs are identical across both backends, so messages BlueBubbles
+      // already dispatched are not re-dispatched after a provider cutover.
+      dedupeStorePath: join(config.tomoHome, "data", "imessage", "seen-message-guids.json"),
+      cursorStorePath: join(config.tomoHome, "data", "imessage", "imsg-watch-cursor.json"),
+    }));
+  } else if (config.imessageUrl) {
     const { BlueBubblesChannel } = await import("../channels/index.js");
     agent.addChannel(new BlueBubblesChannel({
       url: config.imessageUrl,

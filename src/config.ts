@@ -77,9 +77,15 @@ export interface TomoConfig {
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
   identities: IdentityConfig[];
+  /** iMessage backend: BlueBubbles server (default) or the imsg CLI. */
+  imessageProvider: "bluebubbles" | "imsg";
   imessageUrl: string;
   imessagePassword: string;
   imessageWebhookPort: number;
+  /** Path to the imsg binary (provider "imsg"). Defaults to "imsg" on PATH. */
+  imsgCliPath: string;
+  /** Optional chat.db path forwarded to `imsg rpc --db` (provider "imsg"). */
+  imsgDbPath: string | null;
   /** Delay before processing inbound iMessage bursts, so split text/link/media fragments coalesce. */
   imessageInboundSettleMs: number;
   /** Maximum total delay for one continuously extended iMessage inbound burst. */
@@ -191,6 +197,9 @@ const channelEntrySchema = z.looseObject({
   token: z.string().optional(),
   url: z.string().optional(),
   password: z.string().optional(),
+  provider: z.enum(["bluebubbles", "imsg"]).optional(),
+  cliPath: z.string().optional(),
+  dbPath: z.string().optional(),
   webhookPort: positiveInt.optional(),
   inboundSettleMs: nonNegativeInt.optional(),
   inboundMaxSettleMs: nonNegativeInt.optional(),
@@ -375,8 +384,26 @@ function buildConfig(): TomoConfig {
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
     city: validated("city (TOMO_CITY)", z.string().nullable(), process.env.TOMO_CITY ?? file.city, null),
     identities: parseIdentities(file.identities),
+    imessageProvider: validated(
+      "channels.imessage.provider (IMESSAGE_PROVIDER)",
+      z.enum(["bluebubbles", "imsg"]),
+      envVar("IMESSAGE_PROVIDER") ?? channels.imessage?.provider,
+      "bluebubbles",
+    ),
     imessageUrl: process.env.IMESSAGE_URL ?? channels.imessage?.url ?? "",
     imessagePassword: process.env.IMESSAGE_PASSWORD ?? channels.imessage?.password ?? "",
+    imsgCliPath: validated(
+      "channels.imessage.cliPath (IMSG_CLI_PATH)",
+      z.string().min(1, "expected a non-empty path"),
+      envVar("IMSG_CLI_PATH") ?? channels.imessage?.cliPath,
+      "imsg",
+    ),
+    imsgDbPath: validated(
+      "channels.imessage.dbPath (IMSG_DB_PATH)",
+      z.string().min(1, "expected a non-empty path").nullable(),
+      envVar("IMSG_DB_PATH") ?? channels.imessage?.dbPath,
+      null,
+    ),
     imessageWebhookPort: validated(
       "channels.imessage.webhookPort (IMESSAGE_WEBHOOK_PORT)",
       positiveInt,
@@ -465,9 +492,19 @@ export function assertConfigValid(issueList: readonly string[] = configIssues): 
  * commands work on a fresh install with no config at all.
  */
 export function assertChannelsConfigured(cfg: TomoConfig = config): void {
-  if (!cfg.telegramToken && !cfg.imessageUrl) {
+  if (!cfg.telegramToken && !imessageConfigured(cfg)) {
     throw new Error(
       "No channels configured. Run 'tomo init' or set TELEGRAM_BOT_TOKEN / IMESSAGE_URL.",
     );
   }
+}
+
+/**
+ * Whether an iMessage backend is configured: BlueBubbles needs a server URL,
+ * while the imsg provider only needs to be selected (the CLI path defaults to
+ * "imsg" on PATH).
+ */
+export function imessageConfigured(cfg: Pick<TomoConfig, "imessageProvider" | "imessageUrl"> = config): boolean {
+  if (cfg.imessageProvider === "imsg") return true;
+  return Boolean(cfg.imessageUrl);
 }

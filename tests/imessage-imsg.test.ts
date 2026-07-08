@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
+import { NULL_SERVICE_LOOKUP, type ServiceLookup } from "../src/channels/imsg-satellite.js";
+import { SATELLITE_MARKER } from "../src/channels/text-utils.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -14,10 +16,14 @@ afterEach(() => {
 
 type RpcRequest = { jsonrpc: string; id: number; method: string; params: Record<string, unknown> };
 
-class FakeStdin {
+class FakeStdin extends EventEmitter {
   writable = true;
   lines: string[] = [];
   onLine: ((req: RpcRequest) => void) | null = null;
+  /** When >0, the next N write() calls return false (full pipe). The test must
+   *  emit 'drain' manually to release the writer — so the paused state is
+   *  observable instead of racing away in the same microtask flush. */
+  backpressureWrites = 0;
 
   write(line: string, cb?: (err?: Error | null) => void): boolean {
     this.lines.push(line);
@@ -25,6 +31,10 @@ class FakeStdin {
     // Deliver asynchronously like a real pipe.
     queueMicrotask(() => this.onLine?.(req));
     cb?.(null);
+    if (this.backpressureWrites > 0) {
+      this.backpressureWrites--;
+      return false;
+    }
     return true;
   }
 }
@@ -105,6 +115,9 @@ function makeChannel(options: {
     cliPath: "imsg",
     spawnFn: spawnFn as never,
     probeCapabilities: async () => options.caps ?? CAPS_FULL,
+    // Never touch the real chat.db from tests: default to a no-op service
+    // lookup so satellite detection is off unless a test injects its own.
+    serviceLookup: NULL_SERVICE_LOOKUP,
     ...options.config,
   });
   return { channel, children, spawnFn, requests: () => children.flatMap((c) => c.stdin.lines.map((l) => JSON.parse(l) as RpcRequest)) };
@@ -936,12 +949,332 @@ describe("imsg recent-message cache addressing", () => {
     children[0].notifyMessage(inboundMessage({
       guid: "g-group", text: "group message", chat_guid: GROUP_GUID, is_group: true,
     }));
-    await settle();
+    // Rows process through a FIFO chain, so wait for the second to land.
+    await vi.waitFor(() => expect(channel.recentMessages(GROUP_GUID)).toHaveLength(1));
 
     expect(channel.recentMessages("+1 (555) 123-4567").map((m) => m.id)).toEqual(["g-dm"]);
     expect(channel.recentMessages("+15551234567").map((m) => m.id)).toEqual(["g-dm"]);
     expect(channel.recentMessages(GROUP_GUID).map((m) => m.id)).toEqual(["g-group"]);
     expect(channel.recentMessages("a70f2f5b3ea847759d38c0b8e3cba57d")).toEqual([]);
+    await channel.stop();
+  });
+});
+
+// --- Session-key passthrough (Codex adjudication: no normalization) --------------
+
+describe("imsg session-key passthrough", () => {
+  it("emits chat_guid verbatim so keys match the on-disk any-format sessions", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    // DMs on macOS 26 are stored as any;-;+E164; groups as any;+;<hex>.
+    // These map to ~/.tomo/data/sessions/imessage_any_-__<E164>.jsonl and
+    // imessage_any___<hex>.jsonl — BlueBubbles reported the identical GUIDs,
+    // so passthrough (no normalization) keeps existing session keys valid.
+    children[0].notifyMessage(inboundMessage({ guid: "dm-1", text: "hi", chat_guid: "any;-;+15551234567" }));
+    children[0].notifyMessage(inboundMessage({ guid: "grp-1", text: "yo", chat_guid: "any;+;a70f2f5b3ea847759d38c0b8e3cba57d", is_group: true }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+
+    const byId = Object.fromEntries(handler.mock.calls.map((c) => [c[0].id, c[0]]));
+    expect(byId["dm-1"].chatId).toBe("any;-;+15551234567");
+    expect(byId["dm-1"].isGroup).toBe(false);
+    expect(byId["grp-1"].chatId).toBe("any;+;a70f2f5b3ea847759d38c0b8e3cba57d");
+    expect(byId["grp-1"].isGroup).toBe(true);
+    await channel.stop();
+  });
+});
+
+// --- Satellite (iMessageLite) detection via chat.db service lookup ---------------
+
+describe("imsg satellite detection", () => {
+  const makeLookup = (services: Record<string, string>): { lookup: ServiceLookup; spy: ReturnType<typeof vi.fn> } => {
+    const spy = vi.fn((guid: string) => services[guid]);
+    return { lookup: { serviceForGuid: spy, close: () => {} }, spy };
+  };
+
+  it("prefixes the satellite marker when message.service is iMessageLite", async () => {
+    const { lookup } = makeLookup({ "sat-1": "iMessageLite" });
+    const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
+    await channel.start();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    children[0].notifyMessage(inboundMessage({ guid: "sat-1", text: "we are off-grid" }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+    expect(handler.mock.calls[0][0].text).toBe(`${SATELLITE_MARKER} we are off-grid`);
+    await channel.stop();
+  });
+
+  it("does not tag standard iMessage rows", async () => {
+    const { lookup } = makeLookup({ "plain-1": "iMessage" });
+    const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
+    await channel.start();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    children[0].notifyMessage(inboundMessage({ guid: "plain-1", text: "normal message" }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+    expect(handler.mock.calls[0][0].text).toBe("normal message");
+    await channel.stop();
+  });
+
+  it("skips the sqlite lookup entirely for attachment-only rows (no text)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sat-"));
+    const imgPath = join(dir, "photo.png");
+    writeFileSync(imgPath, Buffer.from("89504e470d0a1a0a", "hex"));
+    try {
+      const { lookup, spy } = makeLookup({});
+      const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "att-only-1",
+        text: "",
+        attachments: [{ mime_type: "image/png", original_path: imgPath, total_bytes: 8, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(spy).not.toHaveBeenCalled();
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- At-least-once cursor / GUID ordering (Codex HIGH #1) ------------------------
+
+describe("imsg at-least-once persist ordering", () => {
+  it("advances the cursor and records the GUID only AFTER a successful dispatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-atleastonce-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({ id: 900, guid: "ok-1", text: "delivered" }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      // A replay of the same GUID is now dropped (recorded after dispatch).
+      children[0].notifyMessage(inboundMessage({ id: 900, guid: "ok-1", text: "delivered" }));
+      await settle();
+      expect(handler).toHaveBeenCalledTimes(1);
+
+      await vi.waitFor(() => {
+        expect(existsSync(cursorStorePath)).toBe(true);
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(900);
+      });
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT advance the cursor when dispatch throws, so the row replays", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-replay-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath } });
+      await channel.start();
+      // Succeeds for row 400, throws for row 500.
+      channel.onMessage(async (m) => { if (m.id === "throws-1") throw new Error("boom"); });
+
+      children[0].notifyMessage(inboundMessage({ id: 400, guid: "good-1", text: "ok" }));
+      children[0].notifyMessage(inboundMessage({ id: 500, guid: "throws-1", text: "will throw" }));
+      // Cursor commits to 400 (the last successful row) and never advances to 500.
+      await vi.waitFor(() => {
+        expect(existsSync(cursorStorePath)).toBe(true);
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
+      });
+      await settle();
+      expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
+
+      // A restart therefore resubscribes from 400 — the throwing row replays.
+      await channel.stop();
+      const second = makeChannel({ config: { cursorStorePath } });
+      await second.channel.start();
+      const resubscribe = second.requests().find((r) => r.method === "watch.subscribe");
+      expect(resubscribe?.params.since_rowid).toBe(400);
+      await second.channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- FIFO watch serialization (Codex MED #3) ------------------------------------
+
+describe("imsg watch FIFO serialization", () => {
+  it("processes watch rows strictly in order even when an earlier row blocks", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    channel.onMessage(async (m) => {
+      order.push(`start:${m.id}`);
+      if (m.id === "first") await firstGate;
+      order.push(`end:${m.id}`);
+    });
+
+    children[0].notifyMessage(inboundMessage({ id: 1, guid: "first", text: "one" }));
+    children[0].notifyMessage(inboundMessage({ id: 2, guid: "second", text: "two" }));
+    await vi.waitFor(() => expect(order).toContain("start:first"));
+
+    // The second row must not have started while the first is blocked.
+    expect(order).toEqual(["start:first"]);
+
+    releaseFirst();
+    await vi.waitFor(() => expect(order).toContain("end:second"));
+    expect(order).toEqual(["start:first", "end:first", "start:second", "end:second"]);
+    await channel.stop();
+  });
+});
+
+// --- stdin backpressure (Codex MED #4) ------------------------------------------
+
+describe("imsg stdin backpressure", () => {
+  it("holds the next write until 'drain' when a write signals a full pipe", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const child = children[0];
+    const sentTexts = () => child.stdin.lines
+      .map((l) => JSON.parse(l) as RpcRequest)
+      .filter((r) => r.method === "send")
+      .map((r) => r.params.text);
+
+    // The first send's write returns false (full pipe); its chain link then
+    // waits for 'drain' before the next write is allowed through.
+    child.stdin.backpressureWrites = 1;
+    await channel.send({ chatId: DM_GUID, text: "first" });
+    expect(sentTexts()).toEqual(["first"]);
+
+    // The second send is queued behind the un-drained first write — its bytes
+    // must not hit stdin yet.
+    const p2 = channel.send({ chatId: DM_GUID, text: "second" });
+    await settle();
+    expect(sentTexts()).toEqual(["first"]);
+    expect(child.stdin.listenerCount("drain")).toBeGreaterThan(0);
+
+    // Drain releases the backlog; the held write now goes out, in order.
+    child.stdin.emit("drain");
+    await p2;
+    expect(sentTexts()).toEqual(["first", "second"]);
+    await channel.stop();
+  });
+
+  it("fails a request cleanly once the pending queue is saturated", async () => {
+    // Answer only watch.subscribe, so every send stays pending forever.
+    const { channel } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") child.respond(req.id, { subscription: 1 });
+      },
+    });
+    await channel.start();
+
+    const request = (channel as unknown as { request(method: string, params: Record<string, unknown>): Promise<unknown> }).request.bind(channel);
+    for (let i = 0; i < 256; i++) void (request("send", { chat_guid: DM_GUID, text: `x${i}` }) as Promise<unknown>).catch(() => {});
+
+    await expect(request("send", { chat_guid: DM_GUID, text: "overflow" })).rejects.toThrow(/pending queue full/);
+    await channel.stop();
+  });
+});
+
+// --- Child leak on failed subscribe (Codex HIGH #2) -----------------------------
+
+describe("imsg failed-subscribe child cleanup", () => {
+  it("kills the spawned child when the initial watch.subscribe fails", async () => {
+    const { channel, children } = makeChannel({
+      responder: (req, child) => child.respondError(req.id, -32603, "Internal error", "Full Disk Access required"),
+    });
+    await expect(channel.start()).rejects.toThrow(/Full Disk Access/);
+    expect(children).toHaveLength(1);
+    expect(children[0].killed).toBe(true);
+    await channel.stop();
+  });
+
+  it("kills each failed child across restart backoff (no process leak)", async () => {
+    vi.useFakeTimers();
+    let subscribeOk = true;
+    const { channel, children } = makeChannel({
+      config: { restartDelaysMs: [1_000] },
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") {
+          return subscribeOk ? child.respond(req.id, { subscription: 1 }) : child.respondError(req.id, -32603, "err", "nope");
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+    expect(children[0].killed).toBe(false);
+
+    // Crash the healthy child; the restart's subscribe now fails.
+    subscribeOk = false;
+    children[0].emit("exit", 1, null);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(2);
+    expect(children[1].killed).toBe(true); // failed subscribe → killed, not leaked
+
+    // Backoff retries; still failing → that child is killed too.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(3);
+    expect(children[2].killed).toBe(true);
+
+    // Recovery: subscribe succeeds and the child survives.
+    subscribeOk = true;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(4);
+    expect(children[3].killed).toBe(false);
+    await channel.stop();
+  });
+});
+
+// --- Edit gating (Codex LOW #5) -------------------------------------------------
+
+describe("imsg edit gating requires the full capability set", () => {
+  const editParams = ["any;-;+15551234567", "mine-1", "fixed text"] as const;
+
+  it("refuses when the bridge is down even if a selector is set", async () => {
+    const caps: ImsgCapabilities = { ...CAPS_FULL, advancedFeatures: false, selectors: { editMessageItem: true } };
+    const { channel, requests } = makeChannel({ caps });
+    await channel.start();
+    await expect(channel.editMessage(...editParams)).rejects.toThrow(/unsupported on this macOS/i);
+    expect(requests().map((r) => r.method)).not.toContain("message.edit");
+    await channel.stop();
+  });
+
+  it("refuses when imsg does not advertise message.edit", async () => {
+    const caps: ImsgCapabilities = {
+      ...CAPS_FULL,
+      rpcMethods: new Set(["send", "watch.subscribe"]),
+      selectors: { editMessageItem: true },
+    };
+    const { channel, requests } = makeChannel({ caps });
+    await channel.start();
+    await expect(channel.editMessage(...editParams)).rejects.toThrow(/unsupported on this macOS/i);
+    expect(requests().map((r) => r.method)).not.toContain("message.edit");
+    await channel.stop();
+  });
+
+  it("allows edit only with bridge + message.edit + a live selector", async () => {
+    const caps: ImsgCapabilities = {
+      ...CAPS_FULL,
+      advancedFeatures: true,
+      rpcMethods: new Set([...CAPS_FULL.rpcMethods, "message.edit"]),
+      selectors: { editMessageItem: true },
+    };
+    const { channel, requests } = makeChannel({ caps });
+    await channel.start();
+    await channel.editMessage(...editParams);
+    expect(requests().find((r) => r.method === "message.edit")).toBeDefined();
     await channel.stop();
   });
 });

@@ -1,21 +1,27 @@
 import { spawn as nodeSpawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
 import { log } from "../logger.js";
 import { deliverTextParts } from "./delivery.js";
-import { splitText, formatReplyContextMarker } from "./text-utils.js";
+import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
+import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const RECENT_MESSAGES_PER_CHAT = 50;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const STATUS_PROBE_TIMEOUT_MS = 15_000;
+// Cap on in-flight RPC requests. Past this the pending map is treated as a
+// symptom of a stuck child; new requests fail fast instead of piling up.
+const MAX_PENDING_REQUESTS = 256;
+const DEFAULT_CHAT_DB_PATH = join(homedir(), "Library", "Messages", "chat.db");
 // Backoff schedule for restarting a crashed `imsg rpc` child. The last entry
 // repeats forever; the index resets once a child stays up for STABLE_CHILD_MS.
 const DEFAULT_RESTART_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000];
@@ -60,6 +66,12 @@ export interface ImsgChannelConfig {
   probeCapabilities?: () => Promise<ImsgCapabilities>;
   /** Test seam: restart backoff schedule. */
   restartDelaysMs?: number[];
+  /**
+   * Test seam: message-service lookup for satellite (iMessageLite) detection.
+   * Defaults to a read-only chat.db-backed lookup over `dbPath` (or the
+   * standard `~/Library/Messages/chat.db`).
+   */
+  serviceLookup?: ServiceLookup;
 }
 
 interface PendingRequest {
@@ -101,6 +113,7 @@ export class ImsgChannel implements Channel {
   private readonly probeCapabilitiesFn: () => Promise<ImsgCapabilities>;
   private readonly restartDelaysMs: number[];
   private messageGuidDedupe: MessageGuidDedupeStore;
+  private readonly serviceLookup: ServiceLookup;
 
   private child: ChildProcessWithoutNullStreams | null = null;
   private childSpawnedAt = 0;
@@ -114,6 +127,13 @@ export class ImsgChannel implements Channel {
   private capabilities: ImsgCapabilities = NO_CAPABILITIES;
   /** Exclusive chat.db rowid cursor; watch resubscribes after this row. */
   private lastRowId = 0;
+  // Serializes watch-notification processing. Rows arrive in rowid order on the
+  // stream, but each row's handler awaits attachment IO — without this chain a
+  // later row could overtake an earlier one and reach the agent out of order.
+  private watchChain: Promise<void> = Promise.resolve();
+  // Serializes stdin writes so we can honor backpressure (await 'drain' when
+  // write() returns false) instead of unboundedly buffering in the pipe.
+  private writeChain: Promise<void> = Promise.resolve();
 
   // Bounded per-chat window of message GUIDs + text, newest first. Populated
   // from the watch stream for inbound AND our own outbound rows (imsg emits
@@ -130,6 +150,7 @@ export class ImsgChannel implements Channel {
     this.probeCapabilitiesFn = config.probeCapabilities ?? (() => this.probeStatus());
     this.restartDelaysMs = config.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS;
     this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
+    this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
     this.loadCursor();
   }
 
@@ -183,6 +204,7 @@ export class ImsgChannel implements Channel {
       }
     }
     this.killChild();
+    this.serviceLookup.close();
   }
 
   async send(message: OutgoingMessage): Promise<void> {
@@ -260,10 +282,17 @@ export class ImsgChannel implements Channel {
     });
   }
 
-  /** True when the bridge selector probe confirmed an edit path exists. */
+  /**
+   * True only when the whole edit path is live: the IMCore bridge is injected,
+   * the installed imsg advertises `message.edit`, AND the bridge selector probe
+   * confirmed an edit selector exists. Gated the same way as typing/read so a
+   * partial capability set can never reach `message.edit` (see #227).
+   */
   isEditSupported(): boolean {
-    return this.capabilities.selectors.editMessageItem === true
-      || this.capabilities.selectors.editMessage === true;
+    return this.capabilities.advancedFeatures
+      && this.capabilities.rpcMethods.has("message.edit")
+      && (this.capabilities.selectors.editMessageItem === true
+        || this.capabilities.selectors.editMessage === true);
   }
 
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
@@ -455,15 +484,27 @@ export class ImsgChannel implements Channel {
     // Subscribe to the all-chat watch stream. `since_rowid` resumes from the
     // persisted cursor so messages that arrived while we were down replay
     // (the GUID dedupe store drops any we already dispatched).
-    const result = await this.request("watch.subscribe", {
-      attachments: true,
-      convert_attachments: true,
-      include_reactions: true,
-      ...(this.lastRowId > 0 ? { since_rowid: this.lastRowId } : {}),
-    });
-    const subscription = result.subscription;
-    this.subscriptionId = typeof subscription === "number" ? subscription : null;
-    log.info({ subscription: this.subscriptionId, sinceRowId: this.lastRowId || undefined }, "imsg watch subscribed");
+    try {
+      const result = await this.request("watch.subscribe", {
+        attachments: true,
+        convert_attachments: true,
+        include_reactions: true,
+        ...(this.lastRowId > 0 ? { since_rowid: this.lastRowId } : {}),
+      });
+      const subscription = result.subscription;
+      this.subscriptionId = typeof subscription === "number" ? subscription : null;
+      log.info({ subscription: this.subscriptionId, sinceRowId: this.lastRowId || undefined }, "imsg watch subscribed");
+    } catch (err) {
+      // The child spawned but the subscribe failed (FDA missing, startup
+      // error, ...). Kill the child we just started before propagating —
+      // otherwise it leaks as a live `imsg rpc` process with dangling pipes.
+      if (this.child === child) {
+        this.child = null;
+        this.subscriptionId = null;
+      }
+      child.kill();
+      throw err;
+    }
   }
 
   private handleChildDown(child: ChildProcessWithoutNullStreams, reason: string): void {
@@ -478,7 +519,12 @@ export class ImsgChannel implements Channel {
       req.reject(new Error(`imsg rpc child ${reason} while awaiting ${req.method}`));
     }
 
-    if (this.stopping) return;
+    this.scheduleRestart(reason);
+  }
+
+  /** Schedule a backoff restart of the rpc child (no-op once stopping). */
+  private scheduleRestart(reason: string): void {
+    if (this.stopping || this.restartTimer) return;
 
     // A child that survived a while earns a fresh backoff schedule.
     if (Date.now() - this.childSpawnedAt >= STABLE_CHILD_MS) {
@@ -492,8 +538,10 @@ export class ImsgChannel implements Channel {
       this.restartTimer = null;
       if (this.stopping) return;
       this.spawnChildAndSubscribe().catch((err) => {
+        // spawnChildAndSubscribe already killed the failed child; just queue
+        // another attempt (its own exit event is ignored as stale).
         log.error({ err }, "imsg rpc child restart failed");
-        this.handleChildDown(this.child ?? child, "restart failed");
+        this.scheduleRestart("restart failed");
       });
     }, delay);
     // Don't hold the process open just for a pending restart.
@@ -515,6 +563,11 @@ export class ImsgChannel implements Channel {
     if (!child || !child.stdin.writable) {
       return Promise.reject(new Error(`imsg rpc child is not running (${method})`));
     }
+    // Bound the in-flight set. A pending map this large means the child has
+    // stopped answering (or draining); fail fast rather than buffer unboundedly.
+    if (this.pending.size >= MAX_PENDING_REQUESTS) {
+      return Promise.reject(new Error(`imsg rpc pending queue full (${MAX_PENDING_REQUESTS}); dropping ${method}`));
+    }
     const id = this.nextRequestId++;
     const line = `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
 
@@ -525,17 +578,52 @@ export class ImsgChannel implements Channel {
       }, timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer, method });
-      child.stdin.write(line, (err) => {
-        if (err) {
-          const req = this.pending.get(id);
-          if (req) {
-            this.pending.delete(id);
-            clearTimeout(req.timer);
-            reject(new Error(`imsg rpc write failed for ${method}: ${err.message}`));
-          }
+      // Route the write through the backpressure-aware, serialized writer.
+      // A write failure rejects the request (the response will never come).
+      this.enqueueWrite(child, line).catch((err: Error) => {
+        const req = this.pending.get(id);
+        if (req) {
+          this.pending.delete(id);
+          clearTimeout(req.timer);
+          reject(new Error(`imsg rpc write failed for ${method}: ${err.message}`));
         }
       });
     });
+  }
+
+  /**
+   * Serialized, backpressure-aware stdin writer. When `write()` returns false
+   * the pipe buffer is full — await the 'drain' event before the next write so
+   * we never let Node buffer an unbounded backlog in memory.
+   */
+  private enqueueWrite(child: ChildProcessWithoutNullStreams, line: string): Promise<void> {
+    this.writeChain = this.writeChain.then(() => new Promise<void>((resolve, reject) => {
+      if (!child.stdin.writable) {
+        reject(new Error("stdin is not writable"));
+        return;
+      }
+      let settled = false;
+      const finishOk = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const ok = child.stdin.write(line, (err) => {
+        if (err && !settled) {
+          settled = true;
+          reject(err);
+        }
+      });
+      // write() true → the chunk was flushed/queued below the highWaterMark, so
+      // proceed immediately. false → wait for 'drain' before the next write.
+      if (ok) finishOk();
+      else child.stdin.once("drain", finishOk);
+    }));
+    // Keep the chain from rejecting (which would poison every later write);
+    // per-write failures are surfaced through the returned promise instead.
+    const result = this.writeChain;
+    this.writeChain = this.writeChain.catch(() => {});
+    return result;
   }
 
   private handleStdout(chunk: string): void {
@@ -580,9 +668,15 @@ export class ImsgChannel implements Channel {
       const params = payload.params as Record<string, unknown> | undefined;
       const message = params?.message as Record<string, unknown> | undefined;
       if (!message) return;
-      this.handleWatchMessage(message).catch((err) => {
-        log.error({ err }, "Error processing imsg watch message");
-      });
+      // Serialize through a FIFO chain: rows arrive in rowid order, but each
+      // handler awaits attachment IO, so without this a later row could reach
+      // the agent before an earlier one. One row's failure must not break the
+      // chain, so swallow (and log) per-row errors.
+      this.watchChain = this.watchChain.then(() =>
+        this.handleWatchMessage(message).catch((err) => {
+          log.error({ err }, "Error processing imsg watch message");
+        }),
+      );
       return;
     }
 
@@ -603,16 +697,20 @@ export class ImsgChannel implements Channel {
   // --- Inbound watch messages ---
 
   private async handleWatchMessage(data: Record<string, unknown>): Promise<void> {
-    // Advance the watch cursor first: even rows we drop (echo, dedupe, ghost)
-    // must not replay after a child restart.
+    // At-least-once ordering: the rowid cursor and the GUID dedupe entry are
+    // advanced ONLY after a row is fully handled (dispatched OR deliberately
+    // dropped) — never before. Advancing up front and then crashing mid-
+    // dispatch would silently DROP the message on the resubscribe (the
+    // unacceptable failure); advancing after means a crash replays the row,
+    // and the persistent GUID dedupe makes that replay a harmless duplicate.
     const rowId = typeof data.id === "number" ? data.id : 0;
-    if (rowId > this.lastRowId) {
-      this.lastRowId = rowId;
-      this.persistCursor();
-    }
 
     const chatGuid = typeof data.chat_guid === "string" ? data.chat_guid : "";
-    if (!chatGuid) return;
+    if (!chatGuid) {
+      // Malformed/unjoined row: nothing to dispatch, deterministic on replay.
+      this.advanceCursor(rowId);
+      return;
+    }
 
     const guid = typeof data.guid === "string" ? data.guid : "";
     const text = typeof data.text === "string" ? data.text : "";
@@ -624,15 +722,18 @@ export class ImsgChannel implements Channel {
 
     // Inbound tapbacks surface as reaction events (include_reactions: true) —
     // BlueBubbles dropped these entirely. Handled before ring recording so a
-    // reaction row never pollutes substring targeting.
+    // reaction row never pollutes substring targeting. Tapbacks are ambient;
+    // dispatch is best-effort and the cursor always advances past them.
     if (data.is_reaction === true) {
-      this.handleInboundReaction(chatGuid, data, { guid, isFromMe, sender, senderName, timestampMs });
+      await this.handleInboundReaction(chatGuid, data, { guid, isFromMe, sender, senderName, timestampMs });
+      this.advanceCursor(rowId);
       return;
     }
 
     // Track every real message row — inbound AND our own outbound — so
     // reply-context lookups and substring-targeted reactions/replies can
-    // resolve text to a GUID later. Insertion is GUID-deduped.
+    // resolve text to a GUID later. Insertion is GUID-deduped. (In-memory
+    // only; safe to do before dispatch.)
     if (guid && text.trim()) {
       this.recordRecentMessage(chatGuid, {
         id: guid,
@@ -645,14 +746,19 @@ export class ImsgChannel implements Channel {
 
     // Skip our own rows (outbound echo — imsg emits is_from_me rows on the
     // watch stream, debounced 500ms server-side so send follow-ups settle).
-    if (isFromMe) return;
+    if (isFromMe) {
+      this.advanceCursor(rowId);
+      return;
+    }
 
     // The rowid cursor makes exact replays unlikely, but keep the persistent
     // GUID dedupe as a second layer: it also spans the BlueBubbles → imsg
     // cutover (same chat.db message GUIDs), so messages the BlueBubbles
-    // channel already dispatched are not dispatched again by this one.
-    if (guid && this.messageGuidDedupe.checkAndRecord(guid)) {
+    // channel already dispatched are not dispatched again by this one. CHECK
+    // only here — the GUID is recorded after dispatch, below.
+    if (guid && this.messageGuidDedupe.has(guid)) {
       log.debug({ guid }, "Dropping replayed imsg message (guid already seen)");
+      this.advanceCursor(rowId);
       return;
     }
 
@@ -671,6 +777,10 @@ export class ImsgChannel implements Channel {
         for (const handler of this.commandHandlers) {
           await handler(command, chatGuid, senderName, args, senderId);
         }
+        // Only advance past the command once every handler ran (a throw above
+        // skips this, so the command replays rather than being lost).
+        if (guid) this.messageGuidDedupe.record(guid);
+        this.advanceCursor(rowId);
         return;
       }
     }
@@ -691,6 +801,15 @@ export class ImsgChannel implements Channel {
     const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
 
+    // Satellite (iMessageLite) detection. imsg's JSON exposes no message
+    // service, so read `message.service` straight from chat.db (see
+    // imsg-satellite.ts) and reuse the exact BlueBubbles indicator (#208).
+    // Only when there's real text — mirrors the BlueBubbles guard and avoids
+    // a sqlite hit on every attachment-only/ghost row.
+    const isSatelliteMessage = Boolean(text.trim())
+      && isSatelliteService(this.serviceLookup.serviceForGuid(guid));
+    const satelliteMarker = isSatelliteMessage ? SATELLITE_MARKER : "";
+
     // Threaded replies carry the original inline: reply_to_guid plus
     // reply_to_text/reply_to_sender resolved by imsg from chat.db — no
     // lookup round-trip like the BlueBubbles channel needed. Only tag rows
@@ -702,7 +821,7 @@ export class ImsgChannel implements Channel {
       ? formatReplyContextMarker(typeof data.reply_to_text === "string" ? data.reply_to_text : undefined)
       : "";
 
-    const markers = [replyMarker, imageMarker, docMarker].filter(Boolean).join(" ");
+    const markers = [satelliteMarker, replyMarker, imageMarker, docMarker].filter(Boolean).join(" ");
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;
@@ -711,11 +830,18 @@ export class ImsgChannel implements Channel {
     // attachment. Do not turn them into blank agent prompts.
     if (!composedText.trim() && images.length === 0 && documents.length === 0) {
       log.debug({ guid }, "Ignoring empty imsg message (no text or attachments)");
+      this.advanceCursor(rowId);
       return;
     }
 
     const message: IncomingMessage = {
       id: guid,
+      // chat_guid is passed through VERBATIM as the session's chatId — no
+      // normalization. On macOS 26 chat.db stores GUIDs as `any;-;+E164`
+      // (DMs) and `any;+;<hex>` (groups), and BlueBubbles reported those same
+      // strings; keeping them identical is what lets existing session keys
+      // (imessage_any_-__… / imessage_any___<hex>) survive the BB → imsg
+      // cutover unchanged.
       chatId: chatGuid,
       senderName,
       // Normalized so the same person matches whether the handle is reported
@@ -730,19 +856,45 @@ export class ImsgChannel implements Channel {
       chatTitle: (typeof data.chat_name === "string" && data.chat_name) || undefined,
     };
 
-    // Fire-and-forget: the agent's per-session queue handles ordering.
-    for (const handler of this.handlers) {
-      handler(message).catch((err) => log.error({ err }, "iMessage handler failed"));
+    // Hand off to the agent (its per-session queue handles turn ordering) and
+    // AWAIT the enqueue so "dispatched" is real before we commit the cursor.
+    // A handler that throws leaves the cursor un-advanced → the row replays.
+    await this.dispatch(message);
+
+    // Success: only now record the GUID and advance the cursor.
+    if (guid) this.messageGuidDedupe.record(guid);
+    this.advanceCursor(rowId);
+  }
+
+  /** Persist the exclusive rowid cursor once a row is fully handled. */
+  private advanceCursor(rowId: number): void {
+    if (rowId > this.lastRowId) {
+      this.lastRowId = rowId;
+      this.persistCursor();
     }
   }
 
-  private handleInboundReaction(
+  /**
+   * Hand a message to every registered handler and await the hand-off. The
+   * handler promise resolves once the agent has queued/batched the message
+   * (not when the turn completes), which is the right commit point for the
+   * at-least-once cursor. A rejection propagates so the caller skips the
+   * cursor advance and the row replays.
+   */
+  private async dispatch(message: IncomingMessage): Promise<void> {
+    await Promise.all(this.handlers.map((handler) => handler(message)));
+  }
+
+  private async handleInboundReaction(
     chatGuid: string,
     data: Record<string, unknown>,
     meta: { guid: string; isFromMe: boolean; sender: string; senderName: string; timestampMs: number },
-  ): void {
+  ): Promise<void> {
     // Only surface tapbacks other people ADD; removals and our own reactions
     // are noise. Dedupe by reaction-row GUID so watch replays don't re-fire.
+    // Reactions are ambient, so checkAndRecord (record-before-dispatch) is
+    // fine: a dropped tapback on a mid-dispatch crash is acceptable, unlike a
+    // dropped message.
     if (meta.isFromMe) return;
     if (data.is_reaction_add !== true) return;
     if (meta.guid && this.messageGuidDedupe.checkAndRecord(meta.guid)) return;
@@ -774,9 +926,8 @@ export class ImsgChannel implements Channel {
       chatTitle: (typeof data.chat_name === "string" && data.chat_name) || undefined,
     };
 
-    for (const handler of this.handlers) {
-      handler(message).catch((err) => log.error({ err }, "iMessage tapback handler failed"));
-    }
+    await Promise.all(this.handlers.map((handler) =>
+      handler(message).catch((err) => log.error({ err }, "iMessage tapback handler failed"))));
   }
 
   private recordRecentMessage(chatGuid: string, message: RecentChatMessage): void {

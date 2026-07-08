@@ -1107,6 +1107,65 @@ describe("imsg at-least-once persist ordering", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("does NOT let a LATER row commit the cursor past a failed row (round-2 #1)", async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-gap-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      // Long backoff so the gap-recovery restart doesn't fire during the test.
+      const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [60_000] } });
+      await channel.start();
+      const seen: string[] = [];
+      channel.onMessage(async (m) => {
+        if (m.id === "throws-1") throw new Error("boom");
+        seen.push(m.id);
+      });
+
+      children[0].notifyMessage(inboundMessage({ id: 400, guid: "good-1", text: "ok" }));
+      children[0].notifyMessage(inboundMessage({ id: 500, guid: "throws-1", text: "will throw" }));
+      // A later row queued behind the failure — it must not commit past 500.
+      children[0].notifyMessage(inboundMessage({ id: 600, guid: "later-1", text: "after the gap" }));
+      await vi.waitFor(() => {
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
+      });
+      await settle();
+
+      // Cursor stays at 400 (never 500, never 600) and the later row is not
+      // delivered out of order (the chain was halted for gap recovery).
+      expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
+      expect(seen).toEqual(["good-1"]);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("advanceCursor refuses to skip a known-failed lower rowid, then clears on replay", () => {
+    const { channel } = makeChannel();
+    const internals = channel as unknown as {
+      lastRowId: number;
+      failedRowId: number | null;
+      advanceCursor(rowId: number): void;
+    };
+    internals.lastRowId = 100;
+    internals.failedRowId = 200;
+
+    internals.advanceCursor(300); // past the gap → refused
+    expect(internals.lastRowId).toBe(100);
+    expect(internals.failedRowId).toBe(200);
+
+    internals.advanceCursor(150); // before the gap → allowed
+    expect(internals.lastRowId).toBe(150);
+    expect(internals.failedRowId).toBe(200);
+
+    internals.advanceCursor(200); // reaching the failed row (successful replay) → clears + advances
+    expect(internals.lastRowId).toBe(200);
+    expect(internals.failedRowId).toBeNull();
+
+    internals.advanceCursor(300); // gap closed → normal advance resumes
+    expect(internals.lastRowId).toBe(300);
+  });
 });
 
 // --- FIFO watch serialization (Codex MED #3) ------------------------------------
@@ -1186,6 +1245,41 @@ describe("imsg stdin backpressure", () => {
     await expect(request("send", { chat_guid: DM_GUID, text: "overflow" })).rejects.toThrow(/pending queue full/);
     await channel.stop();
   });
+
+  it("skips a queued write whose request already timed out (no late duplicate send) (round-2 #3)", async () => {
+    vi.useFakeTimers();
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const child = children[0];
+    const sentTexts = () => child.stdin.lines
+      .map((l) => JSON.parse(l) as RpcRequest)
+      .filter((r) => r.method === "send")
+      .map((r) => r.params.text);
+
+    const request = (channel as unknown as {
+      request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+    }).request.bind(channel);
+
+    // The first send backpressures (write returns false), so the second send's
+    // write stays QUEUED behind the un-drained first.
+    child.stdin.backpressureWrites = 1;
+    void (request("send", { chat_guid: DM_GUID, text: "first" }, 60_000) as Promise<unknown>).catch(() => {});
+    const p2 = (request("send", { chat_guid: DM_GUID, text: "second" }, 1_000) as Promise<unknown>).catch((e: Error) => e);
+    await settle();
+    expect(sentTexts()).toEqual(["first"]); // second not written — still queued
+
+    // The queued second request times out before drain releases it.
+    await vi.advanceTimersByTimeAsync(1_000);
+    const err = await p2;
+    expect((err as Error).message).toMatch(/timed out/);
+
+    // Drain dequeues the write, but the request is gone → the write is SKIPPED,
+    // so no late/duplicate "second" send hits stdin.
+    child.stdin.emit("drain");
+    await settle();
+    expect(sentTexts()).toEqual(["first"]);
+    await channel.stop();
+  });
 });
 
 // --- Child leak on failed subscribe (Codex HIGH #2) -----------------------------
@@ -1233,6 +1327,47 @@ describe("imsg failed-subscribe child cleanup", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(children).toHaveLength(4);
     expect(children[3].killed).toBe(false);
+    await channel.stop();
+  });
+
+  it("rejects in-flight requests when a RESTART's subscribe fails (no hang) (round-2 #2)", async () => {
+    vi.useFakeTimers();
+    let failSubscribe = false;
+    let releaseSubscribe: (() => void) | null = null;
+    const { channel, children } = makeChannel({
+      config: { restartDelaysMs: [1_000] },
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") {
+          if (!failSubscribe) return child.respond(req.id, { subscription: 1 });
+          // Hold the (doomed) subscribe so a send can be issued mid-restart.
+          releaseSubscribe = () => child.respondError(req.id, -32603, "err", "nope");
+          return;
+        }
+        // sends are never answered
+      },
+    });
+    await channel.start();
+
+    // Crash the healthy child; the restart's subscribe will hang, then fail.
+    failSubscribe = true;
+    children[0].emit("exit", 1, null);
+    await vi.advanceTimersByTimeAsync(1_000); // spawn child 1, subscribe held
+    expect(children).toHaveLength(2);
+
+    // A request issued to the new child while subscribe is still in flight.
+    const sendP = channel.send({ chatId: DM_GUID, text: "during restart" });
+    let settled = false;
+    void sendP.then(() => { settled = true; }, () => { settled = true; });
+    await settle();
+    expect(settled).toBe(false); // pending while subscribe is in flight
+
+    // The subscribe now fails → the failed-subscribe path must reject the
+    // in-flight send rather than leaving it to hang until timeout.
+    releaseSubscribe!();
+    await settle();
+    expect(settled).toBe(true);
+    await expect(sendP).rejects.toThrow(/subscribe failed/);
+    expect(children[1].killed).toBe(true);
     await channel.stop();
   });
 });

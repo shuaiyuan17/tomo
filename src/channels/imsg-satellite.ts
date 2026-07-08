@@ -69,12 +69,21 @@ export class ChatDbServiceLookup implements ServiceLookup {
 
   private ensureOpen(): void {
     if (this.db || this.failed) return;
+    let db: SqliteDatabase | null = null;
     try {
       const { DatabaseSync } = this.loadSqlite();
-      this.db = new DatabaseSync(this.dbPath, { readOnly: true });
-      this.stmt = this.db.prepare("SELECT service FROM message WHERE guid = ? LIMIT 1");
+      db = new DatabaseSync(this.dbPath, { readOnly: true });
+      // prepare() before publishing the handle: if it throws, close the db we
+      // just opened so the file handle never leaks.
+      this.stmt = db.prepare("SELECT service FROM message WHERE guid = ? LIMIT 1");
+      this.db = db;
     } catch (err) {
       this.failed = true;
+      this.stmt = null;
+      this.db = null;
+      if (db) {
+        try { db.close(); } catch { /* ignore */ }
+      }
       log.warn({ err, dbPath: this.dbPath }, "imsg satellite service lookup unavailable (chat.db not readable)");
     }
   }

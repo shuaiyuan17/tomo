@@ -127,10 +127,18 @@ export class ImsgChannel implements Channel {
   private capabilities: ImsgCapabilities = NO_CAPABILITIES;
   /** Exclusive chat.db rowid cursor; watch resubscribes after this row. */
   private lastRowId = 0;
+  // Lowest rowid whose dispatch failed and hasn't been re-handled yet. While
+  // set, the cursor refuses to advance PAST it (never skip a failed real
+  // message) and a resubscribe from the committed cursor replays the gap.
+  private failedRowId: number | null = null;
   // Serializes watch-notification processing. Rows arrive in rowid order on the
   // stream, but each row's handler awaits attachment IO — without this chain a
   // later row could overtake an earlier one and reach the agent out of order.
   private watchChain: Promise<void> = Promise.resolve();
+  // Bumped whenever the current subscription is torn down (crash, gap
+  // recovery). Chain links captured under an older generation short-circuit,
+  // so stale rows from a dead subscription never dispatch out of order.
+  private watchGeneration = 0;
   // Serializes stdin writes so we can honor backpressure (await 'drain' when
   // write() returns false) instead of unboundedly buffering in the pipe.
   private writeChain: Promise<void> = Promise.resolve();
@@ -498,12 +506,26 @@ export class ImsgChannel implements Channel {
       // The child spawned but the subscribe failed (FDA missing, startup
       // error, ...). Kill the child we just started before propagating —
       // otherwise it leaks as a live `imsg rpc` process with dangling pipes.
+      // Also reject any OTHER in-flight requests (e.g. sends issued during a
+      // restart): once we null this.child, the child's exit event is stale and
+      // handleChildDown() would skip them, hanging them until timeout.
       if (this.child === child) {
         this.child = null;
         this.subscriptionId = null;
       }
+      this.rejectAllPending("subscribe failed");
       child.kill();
       throw err;
+    }
+  }
+
+  /** Reject every in-flight request (the child can no longer answer them). */
+  private rejectAllPending(reason: string): void {
+    const pending = [...this.pending.values()];
+    this.pending.clear();
+    for (const req of pending) {
+      clearTimeout(req.timer);
+      req.reject(new Error(`imsg rpc child ${reason} while awaiting ${req.method}`));
     }
   }
 
@@ -511,14 +533,12 @@ export class ImsgChannel implements Channel {
     if (this.child !== child) return; // stale event from an already-replaced child
     this.child = null;
     this.subscriptionId = null;
+    // Abandon the current watch chain: queued rows belong to the dead
+    // subscription and will replay in order after resubscribe.
+    this.watchGeneration++;
+    this.watchChain = Promise.resolve();
 
-    const pending = [...this.pending.values()];
-    this.pending.clear();
-    for (const req of pending) {
-      clearTimeout(req.timer);
-      req.reject(new Error(`imsg rpc child ${reason} while awaiting ${req.method}`));
-    }
-
+    this.rejectAllPending(reason);
     this.scheduleRestart(reason);
   }
 
@@ -580,7 +600,7 @@ export class ImsgChannel implements Channel {
       this.pending.set(id, { resolve, reject, timer, method });
       // Route the write through the backpressure-aware, serialized writer.
       // A write failure rejects the request (the response will never come).
-      this.enqueueWrite(child, line).catch((err: Error) => {
+      this.enqueueWrite(child, line, id).catch((err: Error) => {
         const req = this.pending.get(id);
         if (req) {
           this.pending.delete(id);
@@ -595,9 +615,19 @@ export class ImsgChannel implements Channel {
    * Serialized, backpressure-aware stdin writer. When `write()` returns false
    * the pipe buffer is full — await the 'drain' event before the next write so
    * we never let Node buffer an unbounded backlog in memory.
+   *
+   * `id` is the owning request: if it is no longer pending by the time this
+   * write dequeues (the request already timed out or was rejected), the write
+   * is SKIPPED. Otherwise a queued send could fire late — after the caller saw
+   * a timeout and possibly retried — producing a duplicate side-effecting send.
    */
-  private enqueueWrite(child: ChildProcessWithoutNullStreams, line: string): Promise<void> {
+  private enqueueWrite(child: ChildProcessWithoutNullStreams, line: string, id: number): Promise<void> {
     this.writeChain = this.writeChain.then(() => new Promise<void>((resolve, reject) => {
+      if (!this.pending.has(id)) {
+        // Request already settled (timeout/reject); do not execute its write.
+        resolve();
+        return;
+      }
       if (!child.stdin.writable) {
         reject(new Error("stdin is not writable"));
         return;
@@ -670,13 +700,16 @@ export class ImsgChannel implements Channel {
       if (!message) return;
       // Serialize through a FIFO chain: rows arrive in rowid order, but each
       // handler awaits attachment IO, so without this a later row could reach
-      // the agent before an earlier one. One row's failure must not break the
-      // chain, so swallow (and log) per-row errors.
-      this.watchChain = this.watchChain.then(() =>
-        this.handleWatchMessage(message).catch((err) => {
+      // the agent before an earlier one. Capture the generation so that if the
+      // subscription is torn down (crash / gap recovery) while rows are queued,
+      // those stale rows short-circuit instead of dispatching out of order.
+      const generation = this.watchGeneration;
+      this.watchChain = this.watchChain.then(() => {
+        if (generation !== this.watchGeneration) return;
+        return this.handleWatchMessage(message).catch((err) => {
           log.error({ err }, "Error processing imsg watch message");
-        }),
-      );
+        });
+      });
       return;
     }
 
@@ -858,19 +891,57 @@ export class ImsgChannel implements Channel {
 
     // Hand off to the agent (its per-session queue handles turn ordering) and
     // AWAIT the enqueue so "dispatched" is real before we commit the cursor.
-    // A handler that throws leaves the cursor un-advanced → the row replays.
-    await this.dispatch(message);
+    try {
+      await this.dispatch(message);
+    } catch (err) {
+      // Dispatch of a REAL message failed. Do NOT advance the cursor past this
+      // row — that would permanently skip it on resubscribe (the drop the FIFO
+      // chain's blanket .catch used to cause). Record the failed floor and
+      // resubscribe from the committed cursor so this row + everything after
+      // replays in order.
+      this.recoverFromGap(rowId, err);
+      return;
+    }
 
     // Success: only now record the GUID and advance the cursor.
     if (guid) this.messageGuidDedupe.record(guid);
     this.advanceCursor(rowId);
   }
 
-  /** Persist the exclusive rowid cursor once a row is fully handled. */
+  /**
+   * Persist the exclusive rowid cursor once a row is fully handled. Refuses to
+   * advance PAST an unresolved failed row (that would skip it); reaching the
+   * failed row again (successful replay) clears the floor.
+   */
   private advanceCursor(rowId: number): void {
+    if (this.failedRowId !== null) {
+      if (rowId > this.failedRowId) return; // never commit past the gap
+      if (rowId >= this.failedRowId) this.failedRowId = null; // gap re-handled
+    }
     if (rowId > this.lastRowId) {
       this.lastRowId = rowId;
       this.persistCursor();
+    }
+  }
+
+  /**
+   * A real message failed to dispatch. Mark its rowid as the failed floor and
+   * tear down the subscription so it resubscribes from the last committed
+   * cursor — replaying the failed row and everything after it, in order. The
+   * generation bump in handleChildDown abandons any rows already queued behind
+   * the failure so they don't reach the agent out of order.
+   */
+  private recoverFromGap(rowId: number, err: unknown): void {
+    if (this.failedRowId === null || rowId < this.failedRowId) this.failedRowId = rowId;
+    log.error({ err, rowId, sinceRowId: this.lastRowId }, "imsg dispatch failed; resubscribing to replay the gap");
+    const child = this.child;
+    if (child) {
+      child.kill();
+      this.handleChildDown(child, "dispatch gap recovery");
+    } else {
+      // No live child (a restart is already in flight) — it will resubscribe
+      // from the (un-advanced) committed cursor and replay the failed row.
+      this.scheduleRestart("dispatch gap recovery");
     }
   }
 

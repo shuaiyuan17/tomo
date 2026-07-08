@@ -12,6 +12,7 @@ import {
 import { log } from "../logger.js";
 import { deliverTextParts } from "./delivery.js";
 import { LITERAL_NEWLINE_TOKEN, splitOutboundMessageText, splitText } from "./text-utils.js";
+import { endsWithTrailingNoReply } from "../agent/text-utils.js";
 
 /** Telegram rejects sendMessage/editMessageText beyond 4096 chars. */
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -509,6 +510,10 @@ export class TelegramChannel implements Channel {
             // the agent uses NO_REPLY to suppress delivery, and Telegram's
             // first-frame send would race ahead and surface it before suppression.
             if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
+            // Likewise skip while the buffer currently ends in a bare NO_REPLY
+            // line — finalFlush suppresses the whole block anyway; not sending
+            // here just reduces mid-stream flicker.
+            if (endsWithTrailingNoReply(pending)) return;
             const messageParts = splitOutboundMessageText(pending);
             if (messageParts.length !== 1 || pending.includes(LITERAL_NEWLINE_TOKEN)) {
               await deleteCurrentMessage();
@@ -556,6 +561,20 @@ export class TelegramChannel implements Channel {
      * with backoff, and log loudly if the tail content is truly lost.
      */
     const finalFlush = async () => {
+      // A block whose trailing line(s) are bare NO_REPLY is suppressed WHOLE
+      // (owner decision 2026-07-08): narration ending in the token is not for
+      // the channel. Progressive streaming may already have put the narration
+      // on screen — retract it (mid-stream flicker then deletion is accepted;
+      // matches unsend semantics). This must run BEFORE the multi-part path
+      // below, which would otherwise ship the narration via deliverTextParts.
+      if (endsWithTrailingNoReply(buffer)) {
+        await deleteCurrentMessage();
+        buffer = "";
+        offset = 0;
+        lastSent = "";
+        return;
+      }
+
       const parts = splitOutboundMessageText(buffer);
       if (parts.length !== 1 || buffer.includes(LITERAL_NEWLINE_TOKEN)) {
         await deleteCurrentMessage();

@@ -855,6 +855,66 @@ describe("BlueBubbles outbound threaded reply", () => {
   });
 });
 
+// Trailing bare-NO_REPLY line(s) suppress the whole streamed block (owner
+// decision 2026-07-08) — narration ending in the token is not for the channel.
+describe("BlueBubbles streaming NO_REPLY suppression", () => {
+  const capturedBodies = () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const requestUrl = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      if (new URL(requestUrl).pathname === "/api/v1/message/text") {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      }
+      return new Response("{}", { status: 200 });
+    }));
+    return bodies;
+  };
+
+  const makeChannel = () =>
+    new BlueBubblesChannel({
+      url: "http://bluebubbles.local",
+      password: "pw",
+      webhookPort: 3100,
+    });
+
+  it("drops a whole streamed block whose trailing line is a bare NO_REPLY", async () => {
+    const bodies = capturedBodies();
+    const channel = makeChannel();
+
+    const stream = channel.createStreamingMessage("iMessage;-;+15551234567");
+    stream.update("archived the logs, nothing urgent\nNO_REPLY");
+    await stream.finish();
+
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("ships a streamed block that merely mentions NO_REPLY inline", async () => {
+    const bodies = capturedBodies();
+    const channel = makeChannel();
+
+    const stream = channel.createStreamingMessage("iMessage;-;+15551234567");
+    stream.update("the literal token is NO_REPLY, for reference");
+    await stream.finish();
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].message).toBe("the literal token is NO_REPLY, for reference");
+  });
+
+  it("still ships earlier real blocks when a later block is NO_REPLY-only", async () => {
+    const bodies = capturedBodies();
+    const channel = makeChannel();
+
+    const stream = channel.createStreamingMessage("iMessage;-;+15551234567");
+    stream.update("real block");
+    await stream.commitBlock();
+    stream.update("NO_REPLY");
+    await stream.finish();
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].message).toBe("real block");
+  });
+});
+
 describe("BlueBubbles edit and unsend", () => {
   const ownMessagePayload = (guid: string, text: string) => ({
     type: "new-message",

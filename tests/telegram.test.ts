@@ -557,6 +557,64 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
       { text: "first block", fromMe: true },
     ]);
   });
+
+  // Trailing bare-NO_REPLY line(s) suppress the whole streamed block (owner
+  // decision 2026-07-08). Telegram streams progressively, so narration may
+  // already be on screen when the trailing token arrives in the final delta —
+  // finalFlush retracts it via deleteMessage (flicker-then-retraction is
+  // accepted; matches unsend semantics).
+  it("retracts an already-streamed block when the final delta ends in NO_REPLY (multi-part path)", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("archived the logs");
+    // Let the first-frame flush land so the narration is actually on screen.
+    await new Promise((r) => setTimeout(r, 0));
+    stream.update("archived the logs\nfound two stale sessions\nNO_REPLY");
+    await stream.finish();
+
+    expect(sent).toEqual([{ chatId: "1", text: "archived the logs" }]);
+    expect(deleted).toEqual([{ chatId: "1", messageId: 100 }]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("delivers nothing for a bare NO_REPLY block (single-part path)", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("NO_REPLY");
+    await stream.finish();
+
+    expect(sent).toHaveLength(0);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("suppresses a multi-line NO_REPLY-terminated block even when nothing streamed yet", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Single delta straight to the final content — the flush guard skips the
+    // mid-stream send, and finalFlush must suppress BEFORE the multi-part
+    // deliverTextParts path ships "did housekeeping" as its own message.
+    stream.update("did housekeeping\nNO_REPLY");
+    await stream.finish();
+
+    expect(sent).toHaveLength(0);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("still delivers real multi-line blocks through the multi-part path", async () => {
+    const { channel, sent } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("line one\nline two");
+    await stream.finish();
+
+    expect(sent.map((s) => s.text)).toContain("line one");
+    expect(sent.map((s) => s.text)).toContain("line two");
+  });
 });
 
 // Polling restart backoff: a permanently failing bot.start() (revoked token,

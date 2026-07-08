@@ -11,6 +11,7 @@ import {
 import { log } from "../logger.js";
 import { deliverTextParts } from "./delivery.js";
 import { splitText, isSatelliteService, formatReplyContextMarker, SATELLITE_MARKER } from "./text-utils.js";
+import { endsWithTrailingNoReply } from "../agent/text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -213,19 +214,21 @@ export class BlueBubblesChannel implements Channel {
 
   createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
     // iMessage can't edit sent messages — buffer per block, ship at boundary
-    // (commitBlock between text blocks, finish at end of turn). NO_REPLY-only
-    // blocks are dropped silently to mirror Telegram's prefix-suppression.
+    // (commitBlock between text blocks, finish at end of turn). Blocks whose
+    // trailing line(s) are bare NO_REPLY are dropped WHOLE — narration ending
+    // in the token is not for the channel (owner decision 2026-07-08). Inline
+    // mentions of NO_REPLY mid-text still ship; other blocks in the same turn
+    // are unaffected. Mirrors the imsg channel and Telegram's final-flush
+    // retraction.
     let buffer = "";
     let canceled = false;
     // Group replies carry the triggering message's GUID (mirrors Telegram);
     // thread only the first shipped block — one reply, not one per block.
     let pendingReplyTo = replyTo;
 
-    const NO_REPLY_RE = /^\s*NO_REPLY\s*$/i;
-
     const shipBuffer = async () => {
       if (canceled || !buffer) return;
-      if (NO_REPLY_RE.test(buffer)) { buffer = ""; return; }
+      if (endsWithTrailingNoReply(buffer)) { buffer = ""; return; }
       const text = buffer;
       buffer = "";
       const threadTarget = pendingReplyTo;

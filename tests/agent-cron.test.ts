@@ -371,12 +371,16 @@ describe("background task notification delivery", () => {
     await agent.stop();
   });
 
-  // #222: a "background task/agent" notifying another session (e.g. via the
+  // A "background task/agent" notifying another session (e.g. via the
   // delegate send_message tool, or a scheduled cron job) runs through
   // handleCronMessage -> TurnRunner.runSendTurn, which has no per-block
   // delivery (unlike stream turns) — it collects the whole multi-block
   // response into one string and only then decides whether to deliver it.
-  it("#222: delivers mid-turn text from a send-turn ending in a trailing NO_REPLY block", async () => {
+  // A trailing bare-NO_REPLY block silences the ENTIRE turn (owner decision
+  // 2026-07-08): the narration is housekeeping, not for the channel. This
+  // inverts the #222 delivery of mid-turn text; the #222 protection that
+  // remains is that inline mentions of NO_REPLY do not silence (next test).
+  it("suppresses the whole send-turn when it ends in a trailing NO_REPLY block", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -388,15 +392,15 @@ describe("background task notification delivery", () => {
 
     // Mirrors the reported repro shape: text -> tool_use -> tool_use -> NO_REPLY.
     mockSdk.responseFn = () => [
-      "mid-turn user-facing text",
+      "housekeeping narration not meant for the channel",
       { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
       { type: "tool_use", name: "Read", input: { file_path: "/tmp/b" } },
       "NO_REPLY",
     ];
     await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
 
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0]).toMatchObject({ chatId: "12345", text: "mid-turn user-facing text" });
+    expect(tg.delivered).toHaveLength(0);
+    expect(tg.sent).toHaveLength(0);
 
     await agent.stop();
   });

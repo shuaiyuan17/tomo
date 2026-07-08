@@ -248,15 +248,18 @@ export class TurnRunner {
 
     // Send turns have no per-block delivery (unlike stream turns' onBlockComplete
     // — see makeBlockHandler): the whole multi-block response arrives joined
-    // into one string, so trailing NO_REPLY blocks must be peeled off here
-    // instead of matched with a blanket substring check. Otherwise
-    // embeddedSilentMatcher's `.includes("NO_REPLY")` can silence the ENTIRE
-    // response, dropping earlier substantive text or prose that merely mentions
-    // NO_REPLY inline (#222). `response` (unstripped) still drives the error/log
-    // checks below so they see the model's literal output; `deliverText` is what
-    // actually ships.
-    const { visible: deliverText } = stripTrailingNoReply(response);
-    const silent = deliverText.length === 0 || spec.silentMatcher(deliverText);
+    // into one string. Trailing bare-NO_REPLY line(s) silence the ENTIRE turn
+    // by design (owner decision 2026-07-08): the agent narrates housekeeping
+    // turns and ends with NO_REPLY, and that narration is not for the channel —
+    // previously the narration plus the literal "NO_REPLY" text leaked. Only
+    // trailing lines are inspected, so prose that merely *mentions* NO_REPLY
+    // mid-line still delivers — that's all that remains of the #222 protection.
+    // The accepted tradeoff: a substantive reply that erroneously ends with a
+    // bare NO_REPLY line is eaten whole; the agent's contract is to never end
+    // a real reply with the token. `response` (unstripped) still drives the
+    // error/log checks below so they see the model's literal output.
+    const { visible: deliverText, hadTrailingNoReply } = stripTrailingNoReply(response);
+    const silent = hadTrailingNoReply || deliverText.length === 0 || spec.silentMatcher(deliverText);
     spec.logResponse?.(response);
 
     if (isAgentErrorResponse(response)) {

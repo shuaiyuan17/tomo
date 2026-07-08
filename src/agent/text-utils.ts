@@ -3,17 +3,15 @@ export function isSilentReply(text: string): boolean {
 }
 
 /**
- * Peel trailing bare-NO_REPLY blocks off a joined multi-block response.
+ * Peel trailing bare-NO_REPLY lines off a response and report whether any
+ * were present.
  *
- * Non-streaming turns (cron, continuity) collect every text block from the
- * whole turn into one string, blocks joined by "\n" (see LiveSession's
- * `result` handler) — they have no per-block delivery, unlike stream turns'
- * makeBlockHandler. Without this, a trailing NO_REPLY block combined with
- * embeddedSilentMatcher's `.includes("NO_REPLY")` check silences the ENTIRE
- * response, dropping any earlier substantive text along with it (#222).
- * Only trailing lines are inspected: blocks are pre-trimmed before joining, so
- * a NO_REPLY block never has interior newlines, and this can't false-positive
- * on earlier prose that merely mentions NO_REPLY inline.
+ * Only trailing lines are inspected, so prose that merely mentions NO_REPLY
+ * inline (mid-line or followed by more text) never trips the flag (#222).
+ * Consumers differ in what they do with the result: delivery paths treat
+ * `hadTrailingNoReply` as "suppress the whole thing" (trailing NO_REPLY marks
+ * the response as not-for-the-channel — owner decision 2026-07-08), while the
+ * watch TUI shows `visible` so housekeeping narration stays readable locally.
  */
 export function stripTrailingNoReply(response: string): { visible: string; hadTrailingNoReply: boolean } {
   const lines = response.split("\n");
@@ -30,6 +28,16 @@ export function stripTrailingNoReply(response: string): { visible: string; hadTr
     visible: hadTrailingNoReply ? lines.join("\n").trim() : response,
     hadTrailingNoReply,
   };
+}
+
+/**
+ * True iff the text's final non-empty line(s) are bare NO_REPLY — i.e. the
+ * response is marked as not-for-the-channel and should be suppressed whole.
+ * Inline mentions of NO_REPLY (mid-line, or followed by more prose) return
+ * false; so does an empty/whitespace-only string.
+ */
+export function endsWithTrailingNoReply(text: string): boolean {
+  return stripTrailingNoReply(text).hadTrailingNoReply;
 }
 
 export const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;

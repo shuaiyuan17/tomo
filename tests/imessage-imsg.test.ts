@@ -1260,6 +1260,63 @@ describe("imsg at-least-once persist ordering", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("ignores a STALE-generation row failure that rejects after replay advanced the cursor (round-4 #1)", async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-stalegen-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [1_000] } });
+      await channel.start();
+
+      const seen: string[] = [];
+      let gateReject: ((e: Error) => void) | null = null;
+      let allowReplay = false;
+      channel.onMessage(async (m) => {
+        if (m.id === "row-500" && !allowReplay) {
+          // The OLD-generation delivery hangs until we reject it later.
+          await new Promise<void>((_, rej) => { gateReject = rej; });
+          return;
+        }
+        seen.push(m.id);
+      });
+
+      // Old generation: row 500 arrives and hangs mid-dispatch.
+      children[0].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
+      await vi.waitFor(() => expect(gateReject).not.toBeNull());
+
+      // The child restarts (generation bump). The new child replays 500 + 600
+      // successfully, advancing the committed cursor to 600.
+      allowReplay = true;
+      children[0].emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(children).toHaveLength(2);
+      children[1].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
+      children[1].notifyMessage(inboundMessage({ id: 600, guid: "row-600", text: "row 600" }));
+      await vi.waitFor(() => {
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
+      });
+
+      // NOW the OLD row 500 finally rejects. Because its generation is stale, it
+      // must be a no-op: no floor, no kill, no cursor wedge.
+      const childCountBefore = children.length;
+      gateReject!(new Error("stale boom"));
+      await settle();
+
+      expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
+      expect((channel as unknown as { failedRowId: number | null }).failedRowId).toBeNull();
+      expect(children).toHaveLength(childCountBefore); // no extra restart from the stale failure
+
+      // The cursor keeps advancing — not wedged.
+      children[1].notifyMessage(inboundMessage({ id: 700, guid: "row-700", text: "row 700" }));
+      await vi.waitFor(() => {
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(700);
+      });
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // --- FIFO watch serialization (Codex MED #3) ------------------------------------
@@ -1372,6 +1429,80 @@ describe("imsg stdin backpressure", () => {
     child.stdin.emit("drain");
     await settle();
     expect(sentTexts()).toEqual(["first"]);
+    await channel.stop();
+  });
+
+  it("settles a parked write when its request times out so the chain proceeds (round-4 #2a)", async () => {
+    vi.useFakeTimers();
+    // Answer only watch.subscribe/unsubscribe; sends stay pending so responses
+    // can't resolve the parked link out from under the test.
+    const { channel, children } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "send") return;
+        child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
+      },
+    });
+    await channel.start();
+    const child = children[0];
+    const sentTexts = () => child.stdin.lines
+      .map((l) => JSON.parse(l) as RpcRequest)
+      .filter((r) => r.method === "send")
+      .map((r) => r.params.text);
+    const request = (channel as unknown as {
+      request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+    }).request.bind(channel);
+
+    // The first send parks on 'drain' (never fires; child stays alive). The
+    // second send is queued behind it.
+    child.stdin.backpressureWrites = 1;
+    const p1 = (request("send", { chat_guid: DM_GUID, text: "first" }, 1_000) as Promise<unknown>).catch((e: Error) => e);
+    const p2 = (request("send", { chat_guid: DM_GUID, text: "second" }, 60_000) as Promise<unknown>).catch(() => {});
+    await settle();
+    expect(sentTexts()).toEqual(["first"]); // second queued behind the parked first
+
+    // First request times out → its parked write link settles → the chain
+    // proceeds and the second write goes out (never wedged).
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect((await p1 as Error).message).toMatch(/timed out/);
+    await settle();
+    expect(sentTexts()).toEqual(["first", "second"]);
+    void p2;
+    await channel.stop();
+  });
+
+  it("restarts a live child that stops draining so the write chain recovers (round-4 #2b)", async () => {
+    vi.useFakeTimers();
+    let subCount = 0;
+    const { channel, children } = makeChannel({
+      config: { restartDelaysMs: [1_000], drainWaitTimeoutMs: 5_000 },
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") { subCount++; child.respond(req.id, { subscription: subCount }); return; }
+        if (req.method === "send") return; // never answer; the first backpressures
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+    const child0 = children[0];
+
+    // A send parks on 'drain', and the (alive) child never drains.
+    child0.stdin.backpressureWrites = 1;
+    const p = channel.send({ chatId: DM_GUID, text: "stuck" }).catch((e: Error) => e);
+    await settle();
+    expect(child0.stdin.listenerCount("drain")).toBeGreaterThan(0);
+    expect(child0.killed).toBe(false);
+
+    // The drain-wait backstop fires: settle the parked link + restart the child.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(child0.killed).toBe(true);
+    expect(await p).toBeInstanceOf(Error); // the stuck send is rejected on teardown
+
+    // Restart backoff → a fresh child subscribes; the write chain works again.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(2);
+    await vi.waitFor(() => {
+      const sub = children[1].stdin.lines.map((l) => JSON.parse(l) as RpcRequest).find((r) => r.method === "watch.subscribe");
+      expect(sub).toBeDefined();
+    });
     await channel.stop();
   });
 });

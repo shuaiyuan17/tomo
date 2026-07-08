@@ -21,6 +21,11 @@ const STATUS_PROBE_TIMEOUT_MS = 15_000;
 // Cap on in-flight RPC requests. Past this the pending map is treated as a
 // symptom of a stuck child; new requests fail fast instead of piling up.
 const MAX_PENDING_REQUESTS = 256;
+// Backstop for a write that parked on 'drain': if a still-alive child never
+// drains within this window, treat it as wedged, settle the parked write (so
+// the chain recovers) and restart the child (its watch replays from the
+// committed cursor, so delivery is preserved).
+const DEFAULT_DRAIN_WAIT_TIMEOUT_MS = 10_000;
 const DEFAULT_CHAT_DB_PATH = join(homedir(), "Library", "Messages", "chat.db");
 // Backoff schedule for restarting a crashed `imsg rpc` child. The last entry
 // repeats forever; the index resets once a child stays up for STABLE_CHILD_MS.
@@ -66,6 +71,9 @@ export interface ImsgChannelConfig {
   probeCapabilities?: () => Promise<ImsgCapabilities>;
   /** Test seam: restart backoff schedule. */
   restartDelaysMs?: number[];
+  /** Max time to wait for a `drain` on a parked write before treating the child
+   *  as wedged and restarting it. Default 10s. */
+  drainWaitTimeoutMs?: number;
   /**
    * Test seam: message-service lookup for satellite (iMessageLite) detection.
    * Defaults to a read-only chat.db-backed lookup over `dbPath` (or the
@@ -112,8 +120,13 @@ export class ImsgChannel implements Channel {
   private readonly spawnFn: typeof nodeSpawn;
   private readonly probeCapabilitiesFn: () => Promise<ImsgCapabilities>;
   private readonly restartDelaysMs: number[];
+  private readonly drainWaitTimeoutMs: number;
   private messageGuidDedupe: MessageGuidDedupeStore;
   private readonly serviceLookup: ServiceLookup;
+  // Settles a request's parked-on-'drain' write link, keyed by request id, so a
+  // request timeout/cancel can release its own stuck write (else future writes
+  // queue behind a forever-pending drain-wait).
+  private writeWaiters = new Map<number, () => void>();
 
   private child: ChildProcessWithoutNullStreams | null = null;
   private childSpawnedAt = 0;
@@ -157,6 +170,7 @@ export class ImsgChannel implements Channel {
     this.spawnFn = config.spawnFn ?? nodeSpawn;
     this.probeCapabilitiesFn = config.probeCapabilities ?? (() => this.probeStatus());
     this.restartDelaysMs = config.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS;
+    this.drainWaitTimeoutMs = config.drainWaitTimeoutMs ?? DEFAULT_DRAIN_WAIT_TIMEOUT_MS;
     this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
     this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
     this.loadCursor();
@@ -610,6 +624,10 @@ export class ImsgChannel implements Channel {
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // Settle this request's write link if it is still parked on 'drain':
+        // the request is gone, so leaving the link pending would queue every
+        // future write behind it forever.
+        this.writeWaiters.get(id)?.();
         reject(new Error(`imsg rpc ${method} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       timer.unref?.();
@@ -651,12 +669,15 @@ export class ImsgChannel implements Channel {
       let settled = false;
       let onDrain: (() => void) | null = null;
       let onExit: (() => void) | null = null;
+      let drainTimer: ReturnType<typeof setTimeout> | null = null;
       const cleanup = () => {
         if (onDrain) child.stdin.removeListener("drain", onDrain);
         if (onExit) {
           child.removeListener("exit", onExit);
           child.removeListener("close", onExit);
         }
+        if (drainTimer) clearTimeout(drainTimer);
+        this.writeWaiters.delete(id);
       };
       const finishOk = () => {
         if (settled) return;
@@ -674,10 +695,15 @@ export class ImsgChannel implements Channel {
         if (err) fail(err);
       });
       // write() true → the chunk was flushed/queued below the highWaterMark, so
-      // proceed immediately. false → wait for 'drain', but never past the
-      // child's death: if it exits/closes first, unblock the chain (the request
-      // is rejected separately by handleChildDown) so a dead 'drain' that never
-      // fires can't wedge the global write chain forever.
+      // proceed immediately. false → wait for 'drain', but never forever:
+      //  - the child exiting/closing unblocks the chain (request rejected via
+      //    handleChildDown), and
+      //  - the owning request timing out settles this link (via writeWaiters),
+      //    and
+      //  - a backstop timeout catches a still-ALIVE child that silently stops
+      //    draining: settle the link AND restart the child (its watch replays
+      //    from the committed cursor, so no delivery is lost) so one wedged
+      //    pipe can't stall every future write.
       if (ok) {
         finishOk();
       } else {
@@ -686,6 +712,17 @@ export class ImsgChannel implements Channel {
         child.stdin.once("drain", onDrain);
         child.once("exit", onExit);
         child.once("close", onExit);
+        this.writeWaiters.set(id, finishOk);
+        drainTimer = setTimeout(() => {
+          if (settled) return;
+          log.warn({ drainWaitTimeoutMs: this.drainWaitTimeoutMs }, "imsg stdin never drained; restarting the rpc child");
+          finishOk();
+          if (this.child === child) {
+            child.kill();
+            this.handleChildDown(child, "stdin drain timeout");
+          }
+        }, this.drainWaitTimeoutMs);
+        drainTimer.unref?.();
       }
     }));
     // Keep the chain from rejecting (which would poison every later write);
@@ -745,7 +782,7 @@ export class ImsgChannel implements Channel {
       const generation = this.watchGeneration;
       this.watchChain = this.watchChain.then(() => {
         if (generation !== this.watchGeneration) return;
-        return this.handleWatchMessage(message).catch((err) => {
+        return this.handleWatchMessage(message, generation).catch((err) => {
           log.error({ err }, "Error processing imsg watch message");
         });
       });
@@ -768,11 +805,22 @@ export class ImsgChannel implements Channel {
 
   // --- Inbound watch messages ---
 
-  private async handleWatchMessage(data: Record<string, unknown>): Promise<void> {
+  private async handleWatchMessage(data: Record<string, unknown>, generation: number): Promise<void> {
     const rowId = typeof data.id === "number" ? data.id : 0;
     try {
       await this.processWatchRow(data, rowId);
     } catch (err) {
+      // A row's handling can outlive its subscription: it starts under one
+      // generation, the child restarts (bumping the generation) and the new
+      // child REPLAYS this row and advances the cursor past it — and only THEN
+      // does the old in-flight handling reject. That late failure is stale: the
+      // row was already superseded by replay, so halting+flooring on it would
+      // resubscribe from a cursor ALREADY past the row (wedging it forever).
+      // Only the current generation's failures may halt+floor+resubscribe.
+      if (generation !== this.watchGeneration) {
+        log.debug({ err, rowId, generation, current: this.watchGeneration }, "imsg stale-generation row failure ignored");
+        return;
+      }
       // ANY failure while handling this row — a real-message dispatch, a slash
       // COMMAND handler, or an unexpected error — must halt + floor + resubscribe
       // rather than let a later row advance the cursor past it. Otherwise the

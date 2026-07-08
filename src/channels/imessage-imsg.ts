@@ -475,7 +475,14 @@ export class ImsgChannel implements Channel {
     this.stdoutBuffer = "";
 
     child.stdout.setEncoding("utf-8");
-    child.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
+    child.stdout.on("data", (chunk: string) => {
+      // Drop late/buffered stdout from a child that is no longer current: after
+      // a kill + gap-recovery generation bump, a straggler line from the dead
+      // child must not be parsed and dispatched under the new subscription
+      // (out of order, before the in-order replay).
+      if (this.child !== child) return;
+      this.handleStdout(chunk);
+    });
     child.stderr.setEncoding("utf-8");
     child.stderr.on("data", (chunk: string) => {
       const line = chunk.trim();
@@ -513,6 +520,9 @@ export class ImsgChannel implements Channel {
         this.child = null;
         this.subscriptionId = null;
       }
+      // Fresh write chain for the next attempt (a stalled drain-wait on this
+      // dead child must not block future writes) and reject in-flight requests.
+      this.writeChain = Promise.resolve();
       this.rejectAllPending("subscribe failed");
       child.kill();
       throw err;
@@ -537,6 +547,12 @@ export class ImsgChannel implements Channel {
     // subscription and will replay in order after resubscribe.
     this.watchGeneration++;
     this.watchChain = Promise.resolve();
+    // Give the restarted child a fresh write chain. A write that returned false
+    // and is still awaiting 'drain' on the dead child would otherwise keep the
+    // global chain pending forever, so every restarted watch.subscribe would
+    // queue behind it and time out — a permanent restart loop. (The stalled
+    // link itself settles via the drain/exit race in enqueueWrite.)
+    this.writeChain = Promise.resolve();
 
     this.rejectAllPending(reason);
     this.scheduleRestart(reason);
@@ -633,21 +649,44 @@ export class ImsgChannel implements Channel {
         return;
       }
       let settled = false;
+      let onDrain: (() => void) | null = null;
+      let onExit: (() => void) | null = null;
+      const cleanup = () => {
+        if (onDrain) child.stdin.removeListener("drain", onDrain);
+        if (onExit) {
+          child.removeListener("exit", onExit);
+          child.removeListener("close", onExit);
+        }
+      };
       const finishOk = () => {
         if (settled) return;
         settled = true;
+        cleanup();
         resolve();
       };
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
       const ok = child.stdin.write(line, (err) => {
-        if (err && !settled) {
-          settled = true;
-          reject(err);
-        }
+        if (err) fail(err);
       });
       // write() true → the chunk was flushed/queued below the highWaterMark, so
-      // proceed immediately. false → wait for 'drain' before the next write.
-      if (ok) finishOk();
-      else child.stdin.once("drain", finishOk);
+      // proceed immediately. false → wait for 'drain', but never past the
+      // child's death: if it exits/closes first, unblock the chain (the request
+      // is rejected separately by handleChildDown) so a dead 'drain' that never
+      // fires can't wedge the global write chain forever.
+      if (ok) {
+        finishOk();
+      } else {
+        onDrain = finishOk;
+        onExit = finishOk;
+        child.stdin.once("drain", onDrain);
+        child.once("exit", onExit);
+        child.once("close", onExit);
+      }
     }));
     // Keep the chain from rejecting (which would poison every later write);
     // per-write failures are surfaced through the returned promise instead.
@@ -730,14 +769,26 @@ export class ImsgChannel implements Channel {
   // --- Inbound watch messages ---
 
   private async handleWatchMessage(data: Record<string, unknown>): Promise<void> {
+    const rowId = typeof data.id === "number" ? data.id : 0;
+    try {
+      await this.processWatchRow(data, rowId);
+    } catch (err) {
+      // ANY failure while handling this row — a real-message dispatch, a slash
+      // COMMAND handler, or an unexpected error — must halt + floor + resubscribe
+      // rather than let a later row advance the cursor past it. Otherwise the
+      // failed row is skipped forever on resubscribe.
+      this.recoverFromGap(rowId, err);
+    }
+  }
+
+  private async processWatchRow(data: Record<string, unknown>, rowId: number): Promise<void> {
     // At-least-once ordering: the rowid cursor and the GUID dedupe entry are
     // advanced ONLY after a row is fully handled (dispatched OR deliberately
     // dropped) — never before. Advancing up front and then crashing mid-
     // dispatch would silently DROP the message on the resubscribe (the
     // unacceptable failure); advancing after means a crash replays the row,
     // and the persistent GUID dedupe makes that replay a harmless duplicate.
-    const rowId = typeof data.id === "number" ? data.id : 0;
-
+    // Any throw here propagates to handleWatchMessage → recoverFromGap.
     const chatGuid = typeof data.chat_guid === "string" ? data.chat_guid : "";
     if (!chatGuid) {
       // Malformed/unjoined row: nothing to dispatch, deterministic on replay.
@@ -808,10 +859,11 @@ export class ImsgChannel implements Channel {
       if (KNOWN_COMMANDS.has(command)) {
         const senderId = sender ? this.normalizeAddress(sender) : undefined;
         for (const handler of this.commandHandlers) {
+          // A throwing command handler propagates to handleWatchMessage →
+          // recoverFromGap (halt + floor + resubscribe), so the command row is
+          // replayed rather than skipped when a later row advances the cursor.
           await handler(command, chatGuid, senderName, args, senderId);
         }
-        // Only advance past the command once every handler ran (a throw above
-        // skips this, so the command replays rather than being lost).
         if (guid) this.messageGuidDedupe.record(guid);
         this.advanceCursor(rowId);
         return;
@@ -890,18 +942,10 @@ export class ImsgChannel implements Channel {
     };
 
     // Hand off to the agent (its per-session queue handles turn ordering) and
-    // AWAIT the enqueue so "dispatched" is real before we commit the cursor.
-    try {
-      await this.dispatch(message);
-    } catch (err) {
-      // Dispatch of a REAL message failed. Do NOT advance the cursor past this
-      // row — that would permanently skip it on resubscribe (the drop the FIFO
-      // chain's blanket .catch used to cause). Record the failed floor and
-      // resubscribe from the committed cursor so this row + everything after
-      // replays in order.
-      this.recoverFromGap(rowId, err);
-      return;
-    }
+    // AWAIT the enqueue so "dispatched" is real before we commit the cursor. A
+    // throw here propagates to handleWatchMessage → recoverFromGap, which
+    // leaves the cursor un-advanced so the row replays (never skipped).
+    await this.dispatch(message);
 
     // Success: only now record the GUID and advance the cursor.
     if (guid) this.messageGuidDedupe.record(guid);

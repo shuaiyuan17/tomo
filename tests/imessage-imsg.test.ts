@@ -935,6 +935,70 @@ describe("imsg rpc child lifecycle", () => {
     await expect(channel.start()).rejects.toThrow(/Full Disk Access/);
     await channel.stop();
   });
+
+  it("recovers the write chain when the child exits before 'drain' fires (round-3 #1)", async () => {
+    vi.useFakeTimers();
+    let subCount = 0;
+    const { channel, children } = makeChannel({
+      config: { restartDelaysMs: [1_000] },
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") { subCount++; child.respond(req.id, { subscription: subCount }); return; }
+        if (req.method === "send") return; // stay pending (and the first one backpressures)
+        child.respond(req.id, { ok: true }); // e.g. watch.unsubscribe on stop()
+      },
+    });
+    await channel.start();
+    const child0 = children[0];
+
+    // The next write (a send) backpressures — write() returns false and its
+    // chain link parks on 'drain' (which will never fire for this child).
+    child0.stdin.backpressureWrites = 1;
+    void channel.send({ chatId: DM_GUID, text: "stuck" }).catch(() => {});
+    await settle();
+    expect(child0.stdin.listenerCount("drain")).toBeGreaterThan(0);
+
+    // The child dies before draining. The parked write must not wedge the
+    // global write chain, or the restarted subscribe would queue behind it.
+    child0.emit("exit", 1, null);
+    await settle();
+    expect(child0.stdin.listenerCount("drain")).toBe(0); // parked wait released
+
+    // Restart: the new child's watch.subscribe actually goes out.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(2);
+    await vi.waitFor(() => {
+      const sub = children[1].stdin.lines.map((l) => JSON.parse(l) as RpcRequest).find((r) => r.method === "watch.subscribe");
+      expect(sub).toBeDefined();
+    });
+    await channel.stop();
+  });
+
+  it("ignores buffered stdout from an old killed child after restart (round-3 #3)", async () => {
+    vi.useFakeTimers();
+    const { channel, children } = makeChannel({ config: { restartDelaysMs: [1_000] } });
+    await channel.start();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+    const child0 = children[0];
+
+    // Crash + restart so a fresh child becomes current.
+    child0.emit("exit", 1, null);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(2);
+    const child1 = children[1];
+
+    // A late buffered notification from the DEAD child0 must be dropped — not
+    // parsed and dispatched under the new subscription's generation.
+    child0.notifyMessage(inboundMessage({ id: 999, guid: "stale-1", text: "from dead child" }));
+    await settle();
+    expect(handler).not.toHaveBeenCalled();
+
+    // The current child still delivers normally.
+    child1.notifyMessage(inboundMessage({ id: 1_000, guid: "live-1", text: "from live child" }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(handler.mock.calls[0][0].id).toBe("live-1");
+    await channel.stop();
+  });
 });
 
 // --- recentMessages addressing ---------------------------------------------------
@@ -1165,6 +1229,36 @@ describe("imsg at-least-once persist ordering", () => {
 
     internals.advanceCursor(300); // gap closed → normal advance resumes
     expect(internals.lastRowId).toBe(300);
+  });
+
+  it("halts on a failing COMMAND row so a later row can't advance past it (round-3 #2)", async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-cmdgap-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [60_000] } });
+      await channel.start();
+      const seen: string[] = [];
+      channel.onMessage(async (m) => { seen.push(m.id); });
+      // A slash-command handler that throws.
+      channel.onCommand(async (command) => { if (command === "model") throw new Error("cmd boom"); });
+
+      children[0].notifyMessage(inboundMessage({ id: 400, guid: "good-1", text: "hi" }));
+      children[0].notifyMessage(inboundMessage({ id: 500, guid: "cmd-1", text: "/model sonnet" }));
+      // A later real row queued behind the failing command.
+      children[0].notifyMessage(inboundMessage({ id: 600, guid: "later-1", text: "after cmd" }));
+      await vi.waitFor(() => {
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
+      });
+      await settle();
+
+      // The failing command row (500) never lets the cursor advance to 600.
+      expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
+      expect(seen).toEqual(["good-1"]); // "later-1" not delivered out of order
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

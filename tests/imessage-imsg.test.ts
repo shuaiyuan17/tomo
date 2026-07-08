@@ -283,7 +283,57 @@ describe("imsg inbound message mapping", () => {
     await channel.stop();
   });
 
-  it("degrades to a quote-less reply marker when reply_to_text is missing", async () => {
+  it("attaches NO reply context when thread_originator_guid is absent (reply_to_guid alone is not a reply)", async () => {
+    // chat.db populates message.reply_to_guid on virtually every row (it
+    // points at the preceding message — usually our own last outbound), and
+    // imsg resolves reply_to_text from it. Keying reply context on it tagged
+    // every plain inbound send as [replying to: "<our latest message>"].
+    // Only thread_originator_guid marks a genuine long-press → Reply.
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    children[0].notifyMessage(inboundMessage({
+      guid: "plain-guid-1",
+      text: "早啊",
+      reply_to_guid: "our-last-outbound-guid",
+      reply_to_text: "our latest outbound message",
+      reply_to_sender: "me",
+    }));
+    await settle();
+
+    expect(handler.mock.calls[0][0].text).toBe("早啊");
+    await channel.stop();
+  });
+
+  it("quotes the thread originator from the recent ring when imsg left reply_to_text unresolved", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const handler = vi.fn(async () => {});
+    channel.onMessage(handler);
+
+    // Seed the ring with the originator (an is_from_me watch row).
+    children[0].notifyMessage(inboundMessage({
+      id: 100,
+      guid: "orig-guid-ring",
+      text: "dinner friday?",
+      is_from_me: true,
+    }));
+    await settle();
+    children[0].notifyMessage(inboundMessage({
+      id: 101,
+      guid: "reply-guid-3",
+      text: "sounds good",
+      thread_originator_guid: "orig-guid-ring",
+    }));
+    await settle();
+
+    expect(handler.mock.calls[0][0].text).toBe('[replying to: "dinner friday?"] sounds good');
+    await channel.stop();
+  });
+
+  it("degrades to a quote-less reply marker when the originator text is unavailable", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
     const handler = vi.fn(async () => {});
@@ -292,7 +342,7 @@ describe("imsg inbound message mapping", () => {
     children[0].notifyMessage(inboundMessage({
       guid: "reply-guid-2",
       text: "still arrives",
-      reply_to_guid: "orig-gone",
+      thread_originator_guid: "orig-gone",
     }));
     await settle();
 

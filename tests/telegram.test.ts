@@ -651,6 +651,61 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     expect(deleted).toHaveLength(0);
     expect(channel.recentMessages("1")).toHaveLength(2);
   });
+
+  it("discardBlock retracts finalized rollover heads so attachment re-delivery isn't duplicated", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Over-limit block: flush finalizes a head (100) and rolls into a tail (101).
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(2);
+
+    // The delivery pipeline's attachment path discards the streamed block and
+    // re-delivers the full content via deliverAssistantContent -> channel.send.
+    // Both streamed messages must be retracted and un-recorded, or the head
+    // content would sit on screen next to the re-delivery.
+    await stream.discardBlock();
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+
+    await channel.send({ chatId: "1", text: "full content with attachment" });
+    const recent = channel.recentMessages("1");
+    expect(recent).toHaveLength(1);
+    expect(recent[0].text).toBe("full content with attachment");
+  });
+
+  it("cancel retracts finalized rollover heads along with the current message", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(2);
+
+    await stream.cancel();
+
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("multi-part final delivery after rollover retracts heads so content ships exactly once", async () => {
+    const { channel, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Rollover finalizes a head (100) and a tail (101)...
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    // ...then the block turns multi-line, so finalFlush re-delivers the FULL
+    // buffer via deliverTextParts. The streamed head/tail must be retracted
+    // or their content would appear on screen twice.
+    stream.update(`${"x".repeat(5000)}\nsecond line`);
+    await stream.finish();
+
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    const recent = channel.recentMessages("1");
+    expect(recent.map((m) => m.text)).toEqual(["second line", "x".repeat(904), "x".repeat(4096)]);
+  });
 });
 
 // Polling restart backoff: a permanently failing bot.start() (revoked token,

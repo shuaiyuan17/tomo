@@ -616,7 +616,11 @@ export class TelegramChannel implements Channel {
 
       const parts = splitOutboundMessageText(buffer);
       if (parts.length !== 1 || buffer.includes(LITERAL_NEWLINE_TOKEN)) {
+        // deliverTextParts re-sends the FULL buffer, including any content
+        // already finalized into rollover heads — retract those too or the
+        // head content ends up on screen twice.
         await deleteCurrentMessage();
+        await deleteFinalizedHeads();
         await deliverTextParts(this, chatId, buffer, { replyTo });
         buffer = "";
         offset = 0;
@@ -680,17 +684,23 @@ export class TelegramChannel implements Channel {
           editTimer = null;
         }
         // Wait for any in-flight flush so we know whether messageId got set.
+        // Abandoning the block retracts everything it streamed, including
+        // heads finalized by an over-limit rollover.
         await flushPending;
         await deleteCurrentMessage();
+        await deleteFinalizedHeads();
       },
       discardBlock: async () => {
         if (canceled || finished) return;
         await stopAndDrain();
+        // The block's content is being rerouted (e.g. attachment blocks are
+        // re-delivered whole via deliverAssistantContent) — retract rollover
+        // heads too, or they'd stay on screen and duplicate the re-delivery.
         await deleteCurrentMessage();
+        await deleteFinalizedHeads();
         buffer = "";
         offset = 0;
         lastSent = "";
-        finalizedHeadIds = [];
       },
     };
   }

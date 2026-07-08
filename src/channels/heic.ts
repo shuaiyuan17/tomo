@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { log } from "../logger.js";
@@ -81,6 +82,13 @@ export function convertHeicToJpeg(srcPath: string): Promise<string | null> {
       settled = true;
       resolve(result);
     };
+    // On any failure the caller only receives `null` and can't clean up, so a
+    // partial/corrupt tomo-heic-*.jpg left behind by a non-zero sips exit (or a
+    // spawn error) would leak. Unlink it here (best-effort; ENOENT is fine)
+    // before resolving null.
+    const failWithCleanup = () => {
+      unlink(outPath).catch(() => undefined).finally(() => done(null));
+    };
 
     const child = spawn("sips", ["-s", "format", "jpeg", srcPath, "--out", outPath], {
       stdio: ["ignore", "ignore", "pipe"],
@@ -88,7 +96,7 @@ export function convertHeicToJpeg(srcPath: string): Promise<string | null> {
     child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
     child.on("error", (err) => {
       log.error({ err, srcPath }, "sips HEIC->JPEG spawn failed; keeping original attachment");
-      done(null);
+      failWithCleanup();
     });
     child.on("exit", (code) => {
       if (code === 0) {
@@ -96,7 +104,7 @@ export function convertHeicToJpeg(srcPath: string): Promise<string | null> {
         done(outPath);
       } else {
         log.error({ srcPath, code, stderr: stderr.trim().slice(0, 200) }, "sips HEIC->JPEG failed; keeping original attachment");
-        done(null);
+        failWithCleanup();
       }
     });
   });

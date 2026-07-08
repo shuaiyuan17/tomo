@@ -1,5 +1,28 @@
-import { describe, it, expect } from "vitest";
-import { isHeicMimeType, hasHeicExtension, sniffHeic, looksLikeHeic } from "../src/channels/heic.js";
+import { EventEmitter } from "node:events";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { isHeicMimeType, hasHeicExtension, sniffHeic, looksLikeHeic, convertHeicToJpeg } from "../src/channels/heic.js";
+
+const spawnMock = vi.fn();
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: (...args: unknown[]) => spawnMock(...args) };
+});
+
+/** Minimal stand-in for a spawned `sips` child. */
+class FakeChild extends EventEmitter {
+  stderr = new EventEmitter();
+}
+
+/** Pull the `--out <path>` value the code chose out of the spawn args. */
+function outPathFromArgs(args: string[]): string {
+  const idx = args.indexOf("--out");
+  return idx >= 0 ? args[idx + 1] : "";
+}
+
+afterEach(() => {
+  spawnMock.mockReset();
+});
 
 // A real iPhone HEIC header: `....ftypheic....mif1MiHE...` (from a 2026-07-07
 // dogfood group photo). Only the leading ftyp box matters for detection.
@@ -56,5 +79,73 @@ describe("looksLikeHeic (any signal)", () => {
     expect(looksLikeHeic("image/jpeg", "x.heic", JPEG_HEADER)).toBe(true); // extension
     expect(looksLikeHeic("image/jpeg", "x.jpg", HEIC_HEADER)).toBe(true); // magic
     expect(looksLikeHeic("image/jpeg", "x.jpg", JPEG_HEADER)).toBe(false); // none
+  });
+});
+
+describe("convertHeicToJpeg temp-file cleanup", () => {
+  it("unlinks the partial temp output on non-zero sips exit and returns null (no leak)", async () => {
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      // sips wrote a partial/corrupt file before failing.
+      writeFileSync(capturedOut, Buffer.from("partial"));
+      const child = new FakeChild();
+      queueMicrotask(() => child.emit("exit", 1));
+      return child;
+    });
+
+    const result = await convertHeicToJpeg("/tmp/input.heic");
+
+    expect(result).toBeNull();
+    expect(capturedOut).not.toBe("");
+    expect(existsSync(capturedOut)).toBe(false);
+  });
+
+  it("unlinks the temp output on a spawn error and returns null", async () => {
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      writeFileSync(capturedOut, Buffer.from("partial"));
+      const child = new FakeChild();
+      queueMicrotask(() => child.emit("error", new Error("spawn sips ENOENT")));
+      return child;
+    });
+
+    const result = await convertHeicToJpeg("/tmp/input.heic");
+
+    expect(result).toBeNull();
+    expect(existsSync(capturedOut)).toBe(false);
+  });
+
+  it("returns null without throwing when no temp file was written (ENOENT tolerated)", async () => {
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      const child = new FakeChild(); // never wrote outPath
+      queueMicrotask(() => child.emit("exit", 1));
+      return child;
+    });
+
+    const result = await convertHeicToJpeg("/tmp/input.heic");
+
+    expect(result).toBeNull();
+    expect(existsSync(capturedOut)).toBe(false);
+  });
+
+  it("returns the output path on a successful (code 0) conversion", async () => {
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      writeFileSync(capturedOut, Buffer.from("ffd8ffe0", "hex"));
+      const child = new FakeChild();
+      queueMicrotask(() => child.emit("exit", 0));
+      return child;
+    });
+
+    const result = await convertHeicToJpeg("/tmp/input.heic");
+
+    expect(result).toBe(capturedOut);
+    expect(existsSync(capturedOut)).toBe(true);
+    unlinkSync(capturedOut);
   });
 });

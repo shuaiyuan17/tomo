@@ -401,6 +401,14 @@ export class TelegramChannel implements Channel {
     });
   }
 
+  /** Drop a previously recorded own message from the recent ring (retraction). */
+  private forgetOwnMessage(chatId: string, messageId: number): void {
+    const ring = this.recentByChat.get(chatId);
+    if (!ring) return;
+    const idx = ring.findIndex((m) => m.id === String(messageId));
+    if (idx !== -1) ring.splice(idx, 1);
+  }
+
   recentMessages(chatId: string): RecentChatMessage[] {
     return [...(this.recentByChat.get(chatId) ?? [])];
   }
@@ -467,6 +475,11 @@ export class TelegramChannel implements Channel {
     let finished = false;
     let canceled = false;
     let flushPending: Promise<void> = Promise.resolve();
+    // Message ids of head chunks already finalized when this block overflowed
+    // TELEGRAM_TEXT_LIMIT (see the rollover branch in flush). Tracked so a
+    // trailing-NO_REPLY suppression can retract the WHOLE block — not just the
+    // current message. Cleared at block seams.
+    let finalizedHeadIds: number[] = [];
 
     const deleteCurrentMessage = async (): Promise<void> => {
       if (messageId === null) return;
@@ -477,6 +490,22 @@ export class TelegramChannel implements Channel {
         await this.bot.api.deleteMessage(chatId, id);
       } catch {
         // Best-effort — message may already be gone or too old to delete.
+      }
+    };
+
+    // Retract head chunks finalized by over-limit rollover in this block:
+    // delete each (best-effort, like deleteCurrentMessage) and un-record it
+    // so a suppressed block leaves no trace in the recent ring either.
+    const deleteFinalizedHeads = async (): Promise<void> => {
+      const ids = finalizedHeadIds;
+      finalizedHeadIds = [];
+      for (const id of ids) {
+        this.forgetOwnMessage(chatId, id);
+        try {
+          await this.bot.api.deleteMessage(chatId, id);
+        } catch {
+          // Best-effort — message may already be gone or too old to delete.
+        }
       }
     };
 
@@ -510,10 +539,14 @@ export class TelegramChannel implements Channel {
             // the agent uses NO_REPLY to suppress delivery, and Telegram's
             // first-frame send would race ahead and surface it before suppression.
             if (offset === 0 && NO_REPLY_PREFIX_RE.test(pending)) return;
-            // Likewise skip while the buffer currently ends in a bare NO_REPLY
+            // Likewise skip while the BLOCK currently ends in a bare NO_REPLY
             // line — finalFlush suppresses the whole block anyway; not sending
-            // here just reduces mid-stream flicker.
-            if (endsWithTrailingNoReply(pending)) return;
+            // here just reduces mid-stream flicker. Checked against the full
+            // block buffer, never the post-rollover slice: an over-limit real
+            // reply ending "...NO_REPLY" can slice so `pending` alone looks
+            // like a bare token, and skipping on that would stall delivery of
+            // a legitimate tail (inline mentions must still deliver).
+            if (endsWithTrailingNoReply(buffer)) return;
             const messageParts = splitOutboundMessageText(pending);
             if (messageParts.length !== 1 || pending.includes(LITERAL_NEWLINE_TOKEN)) {
               await deleteCurrentMessage();
@@ -529,7 +562,10 @@ export class TelegramChannel implements Channel {
             // first chunk, then roll the remainder into a fresh message.
             const head = splitText(visiblePending, TELEGRAM_TEXT_LIMIT)[0];
             await sendOrEdit(head);
-            if (messageId !== null) this.recordOwnMessage(chatId, messageId, head);
+            if (messageId !== null) {
+              finalizedHeadIds.push(messageId);
+              this.recordOwnMessage(chatId, messageId, head);
+            }
             offset += head.length;
             messageId = null;
             lastSent = "";
@@ -565,10 +601,13 @@ export class TelegramChannel implements Channel {
       // (owner decision 2026-07-08): narration ending in the token is not for
       // the channel. Progressive streaming may already have put the narration
       // on screen — retract it (mid-stream flicker then deletion is accepted;
-      // matches unsend semantics). This must run BEFORE the multi-part path
-      // below, which would otherwise ship the narration via deliverTextParts.
+      // matches unsend semantics), including any head chunks finalized by an
+      // over-limit rollover. This must run BEFORE the multi-part path below,
+      // which would otherwise ship the narration via deliverTextParts. The
+      // decision is made on the full block buffer, matching flush()'s guard.
       if (endsWithTrailingNoReply(buffer)) {
         await deleteCurrentMessage();
+        await deleteFinalizedHeads();
         buffer = "";
         offset = 0;
         lastSent = "";
@@ -623,6 +662,9 @@ export class TelegramChannel implements Channel {
         lastSent = "";
         buffer = "";
         offset = 0;
+        // Delivered blocks keep their rollover heads (already recorded); the
+        // retraction list must not leak into the next block.
+        finalizedHeadIds = [];
       },
       finish: async () => {
         if (finished) return;
@@ -648,6 +690,7 @@ export class TelegramChannel implements Channel {
         buffer = "";
         offset = 0;
         lastSent = "";
+        finalizedHeadIds = [];
       },
     };
   }

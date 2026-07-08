@@ -3,7 +3,7 @@ import { log } from "../logger.js";
 import type { Channel, StreamingMessage } from "../channels/types.js";
 import { deliverTextParts } from "../channels/delivery.js";
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
-import { extractAttachments, isSilentReply } from "./text-utils.js";
+import { endsWithTrailingNoReply, extractAttachments, isSilentReply } from "./text-utils.js";
 import { filterScaffoldLeak } from "./scaffold-filter.js";
 
 interface DeliveryPipelineDeps {
@@ -108,6 +108,12 @@ export class DeliveryPipeline {
         const attachments = extractAttachments(blockText);
         if (attachments.mediaPaths.length > 0 || attachments.stickerIds.length > 0) {
           await stream.discardBlock();
+          // Attachment blocks bypass the StreamingMessage (and therefore the
+          // channels' trailing-NO_REPLY suppression), so enforce the semantics
+          // here: a block whose trailing line(s) are bare NO_REPLY ships
+          // NOTHING — no text, no media, no stickers (owner decision
+          // 2026-07-08). The stream buffer is already discarded above.
+          if (endsWithTrailingNoReply(blockText)) return;
           await this.deliverAssistantContent(channel, chatId, blockText, attachments);
           return;
         }

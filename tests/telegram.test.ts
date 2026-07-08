@@ -615,6 +615,42 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     expect(sent.map((s) => s.text)).toContain("line one");
     expect(sent.map((s) => s.text)).toContain("line two");
   });
+
+  it("retracts finalized rollover heads too when the block ends in trailing NO_REPLY", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // Over Telegram's 4096 limit: flush finalizes a head chunk (recorded, no
+    // longer the "current" message) and rolls the tail into a fresh message.
+    stream.update("x".repeat(5000));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(2); // head (100, finalized) + tail (101) on screen
+
+    // Final delta reveals the block is housekeeping narration — suppression
+    // must retract the WHOLE block, finalized heads included.
+    stream.update(`${"x".repeat(5000)}\nNO_REPLY`);
+    await stream.finish();
+
+    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
+    expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+
+  it("delivers the sliced tail of a real over-limit reply ending in NO_REPLY (no stall)", async () => {
+    const { channel, sent, deleted } = makeChannel();
+
+    const stream = channel.createStreamingMessage("1");
+    // A single-line real reply that happens to END with the token inline. The
+    // rollover hard-cuts at 4096, so the post-rollover slice is exactly
+    // "NO_REPLY" — the suppression guard must judge the FULL block buffer
+    // (inline mention → deliver), not the slice, or this tail stalls forever
+    // and finalFlush drops it.
+    stream.update(`${"x".repeat(4096)}NO_REPLY`);
+    await stream.finish();
+
+    expect(sent.map((s) => s.text)).toEqual(["x".repeat(4096), "NO_REPLY"]);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1")).toHaveLength(2);
+  });
 });
 
 // Polling restart backoff: a permanently failing bot.start() (revoked token,

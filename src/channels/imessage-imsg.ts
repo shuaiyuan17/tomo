@@ -808,7 +808,7 @@ export class ImsgChannel implements Channel {
   private async handleWatchMessage(data: Record<string, unknown>, generation: number): Promise<void> {
     const rowId = typeof data.id === "number" ? data.id : 0;
     try {
-      await this.processWatchRow(data, rowId);
+      await this.processWatchRow(data, rowId, generation);
     } catch (err) {
       // A row's handling can outlive its subscription: it starts under one
       // generation, the child restarts (bumping the generation) and the new
@@ -829,7 +829,7 @@ export class ImsgChannel implements Channel {
     }
   }
 
-  private async processWatchRow(data: Record<string, unknown>, rowId: number): Promise<void> {
+  private async processWatchRow(data: Record<string, unknown>, rowId: number, generation: number): Promise<void> {
     // At-least-once ordering: the rowid cursor and the GUID dedupe entry are
     // advanced ONLY after a row is fully handled (dispatched OR deliberately
     // dropped) — never before. Advancing up front and then crashing mid-
@@ -837,6 +837,14 @@ export class ImsgChannel implements Channel {
     // unacceptable failure); advancing after means a crash replays the row,
     // and the persistent GUID dedupe makes that replay a harmless duplicate.
     // Any throw here propagates to handleWatchMessage → recoverFromGap.
+    //
+    // Generation staleness: this row can BLOCK on an await (attachment load, a
+    // command handler, the dispatch hand-off) while the child restarts and the
+    // replacement generation REPLAYS this same row and moves on. When the stale
+    // row then resumes, the replay is authoritative — it must NOT dispatch,
+    // record the GUID, or advance the cursor (that would double-deliver, deliver
+    // out of order, or dedupe the authoritative replay away as "seen"). We
+    // re-check `generation` after every await point that precedes a side effect.
     const chatGuid = typeof data.chat_guid === "string" ? data.chat_guid : "";
     if (!chatGuid) {
       // Malformed/unjoined row: nothing to dispatch, deterministic on replay.
@@ -858,6 +866,7 @@ export class ImsgChannel implements Channel {
     // dispatch is best-effort and the cursor always advances past them.
     if (data.is_reaction === true) {
       await this.handleInboundReaction(chatGuid, data, { guid, isFromMe, sender, senderName, timestampMs });
+      if (this.isStaleGeneration(generation, rowId)) return;
       this.advanceCursor(rowId);
       return;
     }
@@ -912,6 +921,9 @@ export class ImsgChannel implements Channel {
           // replayed rather than skipped when a later row advances the cursor.
           await handler(command, chatGuid, senderName, args, senderId);
         }
+        // If the child restarted while a handler ran, the replay owns this row —
+        // don't record/advance (recording would dedupe the authoritative replay).
+        if (this.isStaleGeneration(generation, rowId)) return;
         if (guid) this.messageGuidDedupe.record(guid);
         this.advanceCursor(rowId);
         return;
@@ -923,6 +935,10 @@ export class ImsgChannel implements Channel {
     const intendedImageCount = rawAttachments.filter((a) => this.attachmentMime(a).startsWith("image/")).length;
     const intendedDocumentCount = rawAttachments.filter((a) => isSupportedDocumentMime(this.attachmentMime(a))).length;
     const { images, documents } = await this.loadAttachments(rawAttachments, chatGuid);
+
+    // Attachment loading may have blocked long enough for a restart + replay to
+    // supersede this row. Bail before any side effect (read, dispatch, cursor).
+    if (this.isStaleGeneration(generation, rowId)) return;
 
     // Mark chat as read (best-effort; needs the bridge's read-receipt path).
     if (this.capabilities.readReceipts) {
@@ -989,15 +1005,33 @@ export class ImsgChannel implements Channel {
       chatTitle: (typeof data.chat_name === "string" && data.chat_name) || undefined,
     };
 
+    // Final staleness gate immediately before the delivery side effect: if a
+    // restart replayed this row while we were building it, the replay is
+    // authoritative — do NOT dispatch (would double-deliver, out of order).
+    if (this.isStaleGeneration(generation, rowId)) return;
+
     // Hand off to the agent (its per-session queue handles turn ordering) and
     // AWAIT the enqueue so "dispatched" is real before we commit the cursor. A
     // throw here propagates to handleWatchMessage → recoverFromGap, which
     // leaves the cursor un-advanced so the row replays (never skipped).
     await this.dispatch(message);
 
-    // Success: only now record the GUID and advance the cursor.
+    // If a restart superseded us during the dispatch hand-off, we already
+    // delivered — but let the replay own the cursor and the dedupe record, so
+    // the authoritative replay isn't deduped away (safe-side: a duplicate, not
+    // a drop).
+    if (this.isStaleGeneration(generation, rowId)) return;
+
+    // Success under the current generation: record the GUID and advance.
     if (guid) this.messageGuidDedupe.record(guid);
     this.advanceCursor(rowId);
+  }
+
+  /** True (with a log) when a row's generation has been superseded by a replay. */
+  private isStaleGeneration(generation: number, rowId: number): boolean {
+    if (generation === this.watchGeneration) return false;
+    log.debug({ rowId, generation, current: this.watchGeneration }, "imsg abandoning stale-generation row (superseded by replay)");
+    return true;
   }
 
   /**

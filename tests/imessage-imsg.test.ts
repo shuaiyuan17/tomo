@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
@@ -1312,6 +1313,61 @@ describe("imsg at-least-once persist ordering", () => {
       await vi.waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(700);
       });
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT dispatch a stale-generation row that blocked in attachment load (round-5)", async () => {
+    // Real timers: the row blocks on a real readFile of a FIFO (no fake-timer
+    // control over that IO), and restart backoff is tiny.
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-r5-"));
+    const fifoPath = join(dir, "blocking.png");
+    execFileSync("mkfifo", [fifoPath]);
+    const normalPath = join(dir, "replay.png");
+    const pngBytes = Buffer.from("89504e470d0a1a0a", "hex");
+    writeFileSync(normalPath, pngBytes);
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [10] } });
+      await channel.start();
+      const seen: string[] = [];
+      channel.onMessage(async (m) => { seen.push(m.id); });
+
+      // Old generation: row 500 carries a FIFO attachment, so loadAttachments
+      // blocks on readFile BEFORE the dispatch side effect.
+      children[0].notifyMessage(inboundMessage({
+        id: 500, guid: "row-500", text: "with photo",
+        attachments: [{ mime_type: "image/png", original_path: fifoPath, total_bytes: 8, missing: false }],
+      }));
+      await new Promise((r) => setTimeout(r, 60));
+      expect(seen).toEqual([]); // still blocked in attachment load — not delivered
+
+      // The child restarts; the replacement generation replays 500 (with a
+      // NORMAL file) + 600 and delivers them exactly once, in order.
+      children[0].emit("exit", 1, null);
+      await vi.waitFor(() => expect(children).toHaveLength(2));
+      children[1].notifyMessage(inboundMessage({
+        id: 500, guid: "row-500", text: "with photo",
+        attachments: [{ mime_type: "image/png", original_path: normalPath, total_bytes: 8, missing: false }],
+      }));
+      children[1].notifyMessage(inboundMessage({ id: 600, guid: "row-600", text: "next" }));
+      await vi.waitFor(() => expect(seen).toEqual(["row-500", "row-600"]));
+      await vi.waitFor(() => {
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
+      });
+
+      // Unblock the OLD row's FIFO read → it resumes SUCCESSFULLY, but its
+      // generation is now stale, so it must abandon before dispatching.
+      const fd = openSync(fifoPath, "w");
+      writeSync(fd, pngBytes);
+      closeSync(fd);
+      await new Promise((r) => setTimeout(r, 80));
+
+      // No duplicate, no out-of-order re-delivery; cursor still at 600.
+      expect(seen).toEqual(["row-500", "row-600"]);
+      expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
       await channel.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });

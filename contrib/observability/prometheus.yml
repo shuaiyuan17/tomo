@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: tomo
+    static_configs:
+      # Tomo's metrics exporter on the Docker host (metrics.port, default 9464).
+      - targets: ["host.docker.internal:9464"]

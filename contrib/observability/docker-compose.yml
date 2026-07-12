@@ -1,0 +1,70 @@
+# Local observability stack for Tomo: Prometheus (metrics), Loki (activity
+# feed), Alloy (log shipper), Grafana (dashboard). See README.md.
+#
+# Grafana listens on the LAN (with login required); everything else binds to
+# 127.0.0.1 — Prometheus/Loki have no auth of their own, and Grafana reaches
+# them over the internal Docker network, so they never need outside exposure.
+services:
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=90d
+    extra_hosts:
+      # Docker Desktop for Mac provides host.docker.internal natively; this
+      # line makes the same name work if the stack ever runs on Linux.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.5.1
+    # No host port: Grafana and Alloy reach Loki over the internal Docker
+    # network, and host 3100 is BlueBubbles' default webhook port — publishing
+    # it would collide with a default iMessage setup. To poke Loki directly:
+    #   docker compose exec loki wget -qO- localhost:3100/ready
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.9.1
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+      # Tomo's activity log (metrics.activityLog). Adjust if TOMO_HOME moved.
+      - ~/.tomo/logs:/var/log/tomo:ro
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    ports:
+      # LAN-reachable so other machines can open the dashboard. Because the
+      # activity feed can contain message text, login stays REQUIRED — first
+      # sign-in is admin/admin and Grafana forces a password change. To lock
+      # it back down to this machine only, prefix with 127.0.0.1: again.
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  loki-data:
+  alloy-data:
+  grafana-data:

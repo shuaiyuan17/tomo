@@ -49,6 +49,18 @@ export interface LcmConfig {
   globalFreshTail: boolean;
 }
 
+export interface MetricsConfig {
+  /** Serve Prometheus metrics + write the activity log. Default false. */
+  enabled: boolean;
+  /** Port for http://127.0.0.1:<port>/metrics (loopback-only by design). */
+  port: number;
+  /** Also write ~/.tomo/logs/activity.ndjson for log shippers (Loki). */
+  activityLog: boolean;
+  /** Include transcript message text in the activity log. Disable if the log
+   *  is shipped off this machine. */
+  includeMessageText: boolean;
+}
+
 export interface LiteLlmConfig {
   /** Gateway mode. ChatGPT mode documents the subscription/OAuth LiteLLM setup; runtime env wiring is the same. */
   mode: LiteLlmMode;
@@ -122,6 +134,7 @@ export interface TomoConfig {
   /** MCP tool allowlist entries for external servers. Defaults to mcp__<server>__* for each server. */
   mcpAllowedTools: string[];
   lcm: LcmConfig;
+  metrics: MetricsConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +255,39 @@ const lcmSchema = z.object({
   }
   return { ...lcm, nudgeResetPct };
 });
+
+const DEFAULT_METRICS: MetricsConfig = {
+  enabled: false,
+  port: 9464,
+  activityLog: true,
+  includeMessageText: true,
+};
+
+const metricsSchema = z.object({
+  enabled: boolLike.default(DEFAULT_METRICS.enabled),
+  port: positiveInt.default(DEFAULT_METRICS.port),
+  activityLog: boolLike.default(DEFAULT_METRICS.activityLog),
+  includeMessageText: boolLike.default(DEFAULT_METRICS.includeMessageText),
+});
+
+function parseMetricsConfig(raw: unknown): MetricsConfig {
+  const entry = validated("metrics", metricsSchema, raw, DEFAULT_METRICS);
+  return {
+    ...entry,
+    enabled: validated(
+      "metrics.enabled (TOMO_METRICS)",
+      boolLike,
+      envVar("TOMO_METRICS") ?? entry.enabled,
+      DEFAULT_METRICS.enabled,
+    ),
+    port: validated(
+      "metrics.port (TOMO_METRICS_PORT)",
+      positiveInt,
+      envVar("TOMO_METRICS_PORT") ?? entry.port,
+      DEFAULT_METRICS.port,
+    ),
+  };
+}
 
 const continuityScriptEntrySchema = z.union([
   z.string().transform((path) => ({ path }) as { path?: string; timeoutMs?: unknown; maxOutputChars?: unknown }),
@@ -461,6 +507,7 @@ function buildConfig(): TomoConfig {
     mcpServers,
     mcpAllowedTools,
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
+    metrics: parseMetricsConfig(file.metrics),
   };
 }
 

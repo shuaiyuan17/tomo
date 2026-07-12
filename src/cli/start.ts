@@ -188,10 +188,37 @@ async function startForeground(): Promise<void> {
     sendChat: (text) => agent.handleWatchChat(text),
   });
 
+  // Metrics exporter + activity log: two more watch-bus subscribers, for
+  // Prometheus scrapes and Loki tailing. Off unless config.metrics.enabled.
+  const { MetricsExporter } = await import("../metrics/exporter.js");
+  const { ActivityLog } = await import("../metrics/activity-log.js");
+  let metricsExporter: InstanceType<typeof MetricsExporter> | null = null;
+  let activityLog: InstanceType<typeof ActivityLog> | null = null;
+  if (config.metrics.enabled) {
+    metricsExporter = new MetricsExporter({
+      version: getCurrentVersion(),
+      model: config.model,
+      collectors: {
+        cronJobs: () => cronStore.list(),
+        nextHeartbeatAt: () => continuity.nextFireAt(),
+      },
+    });
+    await metricsExporter.start(config.metrics.port);
+    if (config.metrics.activityLog) {
+      activityLog = new ActivityLog({
+        path: join(config.logsDir, "activity.ndjson"),
+        includeMessageText: config.metrics.includeMessageText,
+      });
+      activityLog.start();
+    }
+  }
+
   // Write PID so `tomo stop` can find us
   writeFileSync(PID_FILE, String(process.pid));
 
   const shutdown = async () => {
+    activityLog?.stop();
+    metricsExporter?.stop();
     watchServer.stop();
     versionChecker.stop();
     rollupRunner.stop();

@@ -1,0 +1,53 @@
+// Tail Tomo's NDJSON activity feed into Loki. The glob also matches rotated
+// files (activity.ndjson.1, …) so lines written just before a rotation are
+// still picked up if the shipper lags.
+
+local.file_match "tomo_activity" {
+	path_targets = [{ __path__ = "/var/log/tomo/activity.ndjson*" }]
+}
+
+loki.source.file "tomo_activity" {
+	targets    = local.file_match.tomo_activity.targets
+	forward_to = [loki.process.tomo.receiver]
+}
+
+loki.process "tomo" {
+	stage.json {
+		expressions = {
+			type    = "type",
+			session = "sessionKey",
+			level   = "level",
+			ts      = "ts",
+		}
+	}
+
+	// Low-cardinality labels only: event type, session key, issue level.
+	// Everything else stays in the JSON body and is queryable via `| json`.
+	stage.labels {
+		values = {
+			type    = "",
+			session = "",
+			level   = "",
+		}
+	}
+
+	stage.static_labels {
+		values = {
+			job = "tomo-activity",
+		}
+	}
+
+	// Use the event's own millisecond timestamp, not ingestion time.
+	stage.timestamp {
+		source = "ts"
+		format = "UnixMs"
+	}
+
+	forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

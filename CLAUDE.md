@@ -51,6 +51,9 @@ src/
   watch/              # `tomo watch` mission-control TUI: bus.ts (in-process event bus emitters
                       #   publish to), server.ts (NDJSON over ~/.tomo/watch.sock), snapshot.ts,
                       #   client.ts, tui/ (Ink app — feed, vitals sidebar, chat line, log tail)
+  metrics/            # Prometheus exporter (exporter.ts, /metrics on 127.0.0.1:9464) + NDJSON
+                      #   activity log (activity-log.ts) — both WatchBus subscribers, gated by
+                      #   config.metrics; Grafana stack in contrib/observability/
   costs.ts, models.ts, litellm.ts        # /cost reports; model aliases; LiteLLM gateway modes
   jsonl.ts, fs-utils.ts, runtime-paths.ts # JSONL readers; atomic writes; SDK session file paths
   version.ts          # VersionChecker — weekly npm registry check, daytime-only notification

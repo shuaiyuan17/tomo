@@ -9,7 +9,7 @@
 ### Dependencies
 
 - Bump `@anthropic-ai/claude-agent-sdk` 0.3.201 → 0.3.207 (#237).
-- Bump the dev-dependencies group with 5 updates, headlined by TypeScript ^6 → ^7 (#236).
+- Bump the dev-dependencies group (#236). The TypeScript ^6 → ^7 bump in that group was reverted — no `typescript-eslint` release yet supports TypeScript 7 (peer range caps at `<6.1.0`), so it broke `npm ci`.
 
 ## 0.8.11 (2026-07-09)
 

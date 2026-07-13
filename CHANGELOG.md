@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.12 (2026-07-12)
+
+### Features
+
+- **Prometheus metrics + activity log with Grafana stack** (#238). Two new `WatchBus` subscribers, gated by `config.metrics` (default off): a `prom-client` exporter on `127.0.0.1:9464` (turns, cost, per-session context, tool calls, cron, heartbeats, compactions) and an NDJSON activity log at `~/.tomo/logs/activity.ndjson` for Loki tailing (transcript text local-only, redactable via `metrics.includeMessageText=false`). `contrib/observability/` ships a docker-compose stack (Prometheus, Loki, Alloy, Grafana) with a provisioned Tomo dashboard.
+
+### Dependencies
+
+- Bump `@anthropic-ai/claude-agent-sdk` 0.3.201 → 0.3.207 (#237).
+- Bump the dev-dependencies group (#236). The TypeScript ^6 → ^7 bump in that group was reverted — no `typescript-eslint` release yet supports TypeScript 7 (peer range caps at `<6.1.0`), so it broke `npm ci`.
+
 ## 0.8.11 (2026-07-09)
 
 ### Features

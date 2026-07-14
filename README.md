@@ -192,6 +192,29 @@ Remote HTTP/SSE servers can also use harness-managed OAuth by adding an `oauth` 
 
 If browser login is needed, Tomo forwards the authorize URL to your private chat and waits for the localhost callback before starting the agent session.
 
+### Claude Code Plugins
+
+Tomo can load [Claude Code plugins](https://code.claude.com/docs/en/agent-sdk/plugins) — bundles of skills, agents, slash commands, hooks, and MCP servers — into every session. Add a top-level `plugins` array to `~/.tomo/config.json`:
+
+```json
+{
+  "plugins": [
+    "~/my-plugins/deploy-tools",
+    "code-reviewer@claude-plugins-official",
+    "linear",
+    { "path": "./relative/plugin", "skipMcpDiscovery": true }
+  ]
+}
+```
+
+Entries can be:
+
+- **Local paths** (`~/x`, `./x`, `/x`) — the plugin root directory (the parent of `skills/`, `agents/`, `.claude-plugin/`). Relative paths resolve against `~/.tomo`, not the daemon's working directory.
+- **Installed plugin refs** — plugins you already installed with `claude plugin marketplace add ...` + `claude plugin install ...`. Use the full `name@marketplace` id, or the bare name when it's unambiguous. Tomo resolves the current install path from `~/.claude/plugins/installed_plugins.json` at session start, so plugin updates are picked up automatically on the next session.
+- **Object form** — set `skipMcpDiscovery: true` when Tomo should own the plugin's MCP connections and ignore its bundled `.mcp.json`.
+
+Unresolvable entries are skipped with a warning in the logs — a bad plugin ref never blocks startup. Note that plugins whose functionality is defined entirely in their *marketplace entry* (rather than in the plugin directory, e.g. some LSP-only plugins) cannot be loaded this way; Tomo logs a warning when a plugin directory contains no recognizable components.
+
 ### Scheduled Tasks
 
 Tomo can create scheduled tasks on its own — just ask "remind me in 30 minutes to stretch" or "check the weather every morning at 9am." Supports one-shot reminders, recurring intervals, and cron expressions.

@@ -64,6 +64,11 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
     }
   },
+  "plugins": [
+    "~/my-plugins/deploy-tools",
+    "code-reviewer@claude-plugins-official",
+    { "path": "./relative/plugin", "skipMcpDiscovery": true }
+  ],
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,
@@ -101,6 +106,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `steering` | boolean | Optional. Default `true`. User messages that arrive while a turn is in flight bypass the per-session queue and are injected at the next tool-call boundary. If the current turn has no boundary left, the message runs as a follow-up turn. Cron, continuity, and other system-originated turns still queue normally. Set `false` or `TOMO_STEERING=false` to keep mid-turn messages queued behind the active turn. |
 | `mcpServers` | object | External MCP servers keyed by server name. Supports stdio (`command`, `args`, `env`), HTTP (`type: "http"`, `url`, `headers`), and SSE (`type: "sse"`, `url`, `headers`). Environment variables like `${HOME}` expand in `url`, `headers`, `env`, and `args`. |
 | `mcpServers.<name>.oauth` | object | Optional harness-managed OAuth for HTTP/SSE MCP servers. Supports `authorizationServer` (optional; omitted = discover from the MCP server), `clientId` (optional if dynamic registration is available), `scopes`, `tokenStoreKey`, `redirectUri`, and `clientName`. Tokens are stored outside agent context in `workspace/secrets/mcp-oauth.json` (`0600`). |
+| `plugins` | array | Claude Code plugins loaded into every session. Entries: local plugin-root paths (`~/x`, `./x` — relative resolves against `~/.tomo`), CLI-installed refs (`name` or `name@marketplace` from `claude plugin install`, resolved via `~/.claude/plugins/installed_plugins.json` at session spawn), or `{ "path"\|"name", "skipMcpDiscovery" }` objects. Shape errors refuse startup like any config field; resolution failures (uninstalled, deleted, ambiguous) log a warning and skip the entry. |
 | `mcpAllowedTools` | string[] | Auto-allowed external MCP tools. If omitted, Tomo defaults to `mcp__<server>__*` for every configured external server. Set this to narrow tool access, e.g. `["mcp__github__list_issues"]`. |
 | `lcm.nudgeAtPct` | number | Context-usage % at which the harness nudges the agent to run `tomo lcm daily`. Default `70`. Lower = compact earlier and more often. |
 | `lcm.nudgeResetPct` | number | Hysteresis reset threshold — the "already nudged" flag clears once usage drops below this %. Default `60`. Must be less than `nudgeAtPct`; invalid values fall back to defaults. |

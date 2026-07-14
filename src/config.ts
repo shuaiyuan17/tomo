@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
+import type { PluginSpec } from "./agent/plugins.js";
 import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
 import {
   DEFAULT_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS,
@@ -133,6 +134,10 @@ export interface TomoConfig {
   mcpServers: Record<string, ExternalMcpServerConfig>;
   /** MCP tool allowlist entries for external servers. Defaults to mcp__<server>__* for each server. */
   mcpAllowedTools: string[];
+  /** Claude Code plugins to load into every session. Entries are local paths
+   *  ("./x", "~/x", "/x") or CLI-installed plugin refs ("name" or
+   *  "name@marketplace" from `claude plugin install`). */
+  plugins: PluginSpec[];
   lcm: LcmConfig;
   metrics: MetricsConfig;
 }
@@ -388,6 +393,48 @@ function parseIdentities(raw: unknown): IdentityConfig[] {
   return identities;
 }
 
+const pluginEntrySchema = z.union([
+  z.string().min(1, "expected a non-empty plugin path or name"),
+  z
+    .object({
+      path: z.string().min(1).optional(),
+      name: z.string().min(1).optional(),
+      skipMcpDiscovery: z.boolean().optional(),
+    })
+    .refine((o) => Boolean(o.path) !== Boolean(o.name), {
+      message: "expected exactly one of `path` or `name`",
+    }),
+]);
+
+/** Parse the `plugins` config array into normalized PluginSpec entries.
+ *  Invalid entries are dropped with a configIssues record (same policy as
+ *  identities): one bad plugin must not take the daemon down. */
+function parsePlugins(raw: unknown): PluginSpec[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    issues.push(`plugins: expected an array (got ${describeValue(raw)}; ignoring)`);
+    return [];
+  }
+  const specs: PluginSpec[] = [];
+  for (const [index, entry] of raw.entries()) {
+    const parsed = pluginEntrySchema.safeParse(entry);
+    if (!parsed.success) {
+      const detail = parsed.error.issues.map((issue) => issue.message).join("; ");
+      issues.push(`plugins[${index}]: ${detail} (got ${describeValue(entry)}; dropping the entry)`);
+      continue;
+    }
+    const value = parsed.data;
+    if (typeof value === "string") {
+      specs.push({ ref: value });
+    } else if (value.path) {
+      specs.push({ ref: value.path, isPath: true, ...(value.skipMcpDiscovery ? { skipMcpDiscovery: true } : {}) });
+    } else {
+      specs.push({ ref: value.name!, isPath: false, ...(value.skipMcpDiscovery ? { skipMcpDiscovery: true } : {}) });
+    }
+  }
+  return specs;
+}
+
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
   const paths = defaultRuntimePaths;
@@ -506,6 +553,7 @@ function buildConfig(): TomoConfig {
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,
     mcpAllowedTools,
+    plugins: parsePlugins(file.plugins),
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),
   };

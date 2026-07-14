@@ -308,6 +308,7 @@ export const mockConfig = {
   imessageInboundMaxSettleMs: 0,
   imessageTypingStartDelayMs: 1200,
   imessagePassiveTypingStartDelayMs: 4000,
+  plugins: [] as Array<{ ref: string; isPath?: boolean; skipMcpDiscovery?: boolean }>,
   sessionModelOverrides: {} as Record<string, string>,
   channelAllowlists: {} as Record<string, string[]>,
   passiveGroups: {} as Record<string, string[]>,

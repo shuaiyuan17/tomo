@@ -126,7 +126,7 @@ export function sdkOptions(
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
   // so a long-running daemon must re-resolve rather than cache paths.
-  const plugins = resolvePlugins(config.plugins ?? []);
+  const plugins = resolvePlugins(config.plugins ?? [], undefined, config.tomoHome || undefined);
 
   return {
     model: effectiveModel,

@@ -112,4 +112,49 @@ describe("resolvePlugins", () => {
   it("handles a missing installed_plugins.json gracefully", () => {
     expect(resolvePlugins([{ ref: "tool" }], claudePluginsDir)).toEqual([]);
   });
+
+  it("resolves relative paths against the provided base, not process.cwd()", () => {
+    const dir = makePluginDir("base/rel-plugin");
+    const out = resolvePlugins([{ ref: "./rel-plugin" }], claudePluginsDir, join(tmp, "base"));
+    expect(out).toEqual([{ type: "local", path: dir }]);
+  });
+
+  it("skips a path that exists but is a regular file", () => {
+    const file = join(tmp, "not-a-dir");
+    writeFileSync(file, "hi");
+    expect(resolvePlugins([{ ref: file }], claudePluginsDir)).toEqual([]);
+  });
+
+  it("tolerates shape drift in installed_plugins.json without throwing", () => {
+    const dir = makePluginDir("cache/mkt/ok/1.0.0");
+    mkdirSync(claudePluginsDir, { recursive: true });
+    writeFileSync(
+      join(claudePluginsDir, "installed_plugins.json"),
+      JSON.stringify({
+        version: 3,
+        plugins: {
+          "null@mkt": null,
+          "bare-object@mkt": { installPath: dir },
+          "null-entry@mkt": [null],
+          "bad-path@mkt": [{ installPath: 42 }],
+          "ok@mkt": [{ scope: "user", installPath: dir }],
+        },
+      }),
+    );
+    const out = resolvePlugins(
+      [
+        { ref: "null@mkt" },
+        { ref: "bare-object@mkt" },
+        { ref: "null-entry@mkt" },
+        { ref: "bad-path@mkt" },
+        { ref: "ok@mkt" },
+      ],
+      claudePluginsDir,
+    );
+    // bare-object form still yields its path; null / bad entries are skipped.
+    expect(out).toEqual([
+      { type: "local", path: dir },
+      { type: "local", path: dir },
+    ]);
+  });
 });

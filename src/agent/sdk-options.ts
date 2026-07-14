@@ -7,6 +7,7 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
+import { resolvePlugins } from "./plugins.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -122,6 +123,11 @@ export function sdkOptions(
   const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact, model: effectiveModel });
   const thinking = omittedAdaptiveThinkingForModel(effectiveModel);
 
+  // Resolved at session spawn, not config load: CLI-installed plugin paths are
+  // version-pinned and change on `claude plugin update` (old dirs are GC'd),
+  // so a long-running daemon must re-resolve rather than cache paths.
+  const plugins = resolvePlugins(config.plugins ?? []);
+
   return {
     model: effectiveModel,
     cwd: config.workspaceDir,
@@ -152,6 +158,7 @@ export function sdkOptions(
     // `skills` is defined, so we set it to "all" to keep every discovered
     // skill invocable (same surface as the old `"Skill"` allowedTools entry).
     skills: "all" as const,
+    ...(plugins.length > 0 ? { plugins } : {}),
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: ["project"] as ("project")[],
     settings: {

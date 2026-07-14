@@ -63,7 +63,7 @@ The `tomo cron list / add / remove` CLI is still here for human debugging (audit
 
 ## Config file
 
-`~/.tomo/config.json` holds model, channels, identities, allowlists, LiteLLM gateway settings, session model overrides, and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, ChatGPT subscription LiteLLM config, and env-var overrides see [CONFIG.md](CONFIG.md). Manual edits require `tomo restart` to take effect; `/model <name>` persists and applies the current session override without a restart.
+`~/.tomo/config.json` holds model, channels, identities, allowlists, LiteLLM gateway settings, session model overrides, Claude Code plugins (`plugins` array — local paths or `claude plugin install` refs, loaded into every session), and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, ChatGPT subscription LiteLLM config, and env-var overrides see [CONFIG.md](CONFIG.md). Manual edits require `tomo restart` to take effect; `/model <name>` persists and applies the current session override without a restart.
 
 Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tomo/config.json.bak`, then write the updated config. If the new config breaks Tomo while the harness is still reachable, the user can send `/restore` to copy `config.json.bak` back to `config.json` and restart.
 

@@ -432,7 +432,7 @@ export class ChatCommandHandler {
       // never falls open when no identities exist — instead point the user at
       // the setup path.
       const text = config.identities.length === 0
-        ? "No owner identity is configured, so /login is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID (re-running `tomo init` also sets this up), then try /login again."
+        ? "No owner identity is configured, so /login is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /login again."
         : "Only a configured owner can refresh Claude login.";
       await channel.send({ chatId, text });
       return;

@@ -152,6 +152,31 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/login with no identities configured points at identity setup instead of a bare refusal", async () => {
+    resetConfig({ identities: [] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const fakeLogin = {
+      start: vi.fn(),
+      complete: vi.fn(),
+      cancel: vi.fn(),
+      stop: vi.fn(),
+    };
+    const internals = agent as unknown as {
+      commands: { claudeLogin: typeof fakeLogin };
+    };
+    internals.commands.claudeLogin = fakeLogin;
+
+    await tg.simulateCommand("login", "12345", "Shuai", undefined, "12345");
+
+    expect(fakeLogin.start).not.toHaveBeenCalled();
+    expect(tg.sent[0].text).toContain("No owner identity is configured");
+    expect(tg.sent[0].text).toContain("tomo config");
+
+    await agent.stop();
+  });
+
   it("/new resets the session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

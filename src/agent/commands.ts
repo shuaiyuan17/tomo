@@ -428,7 +428,13 @@ export class ChatCommandHandler {
     const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
     if (!identity) {
       log.warn({ channel: channel.name, chatId }, "/login refused (sender is not a configured identity)");
-      await channel.send({ chatId, text: "Only a configured owner can refresh Claude login." });
+      // /login mutates Claude credentials, so unlike /model and /restore it
+      // never falls open when no identities exist — instead point the user at
+      // the setup path.
+      const text = config.identities.length === 0
+        ? "No owner identity is configured, so /login is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /login again."
+        : "Only a configured owner can refresh Claude login.";
+      await channel.send({ chatId, text });
       return;
     }
 

@@ -303,10 +303,12 @@ export const initCommand = new Command("init")
       }
 
       const userId = (telegramUserId as string).trim();
+      const ownerIdentity = deriveOwnerIdentity(personality?.userName ?? "", userId);
       const config: Record<string, unknown> = {
         channels: {
           telegram: { token: token as string, allowlist: [userId] },
         },
+        identities: [ownerIdentity],
         model,
       };
       if ((city as string)?.trim()) {
@@ -320,6 +322,9 @@ export const initCommand = new Command("init")
       backupFileIfExistsSync(configPath, CONFIG_BACKUP_PATH, { mode: 0o600 });
       writeJsonAtomicSync(configPath, config, { mode: 0o600 });
       p.log.success("Config saved");
+      p.log.info(
+        `Owner identity "${ownerIdentity.name}" created — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Manage it later with \`tomo config\` → Identities.`,
+      );
     }
 
     // 4b. Autostart (first-time only, macOS only)
@@ -362,6 +367,23 @@ export const initCommand = new Command("init")
       p.outro(`Run \`tomo start\` to meet ${agentLabel}!`);
     }
   });
+
+/** Owner identity seeded at init. Binding the owner's Telegram user ID makes
+ *  owner-gated commands (/login, /model, /summon) work from day one and gives
+ *  the owner's DM a unified dm:<name> session key. The name feeds that session
+ *  key (lowercased by the router), so use only the first word of the display
+ *  name and fall back to "owner" when none was given. */
+export function deriveOwnerIdentity(
+  userName: string,
+  telegramUserId: string,
+): { name: string; channels: Record<string, string>; replyPolicy: string } {
+  const first = userName.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  return {
+    name: first || "owner",
+    channels: { telegram: telegramUserId },
+    replyPolicy: "last-active",
+  };
+}
 
 async function askPersonality(): Promise<Personality | null> {
   const agentName = await p.text({

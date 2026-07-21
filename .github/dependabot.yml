@@ -9,6 +9,10 @@ updates:
         update-types:
           - version-update:semver-minor
           - version-update:semver-major
+      # TS 7 blocked: typescript-eslint peer range doesn't allow it yet (npm ERESOLVE).
+      # Remove this once typescript-eslint supports TS 7, then upgrade deliberately.
+      - dependency-name: "typescript"
+        versions: ["7.x"]
     groups:
       dev-dependencies:
         dependency-type: development

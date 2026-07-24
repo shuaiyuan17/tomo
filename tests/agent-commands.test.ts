@@ -482,7 +482,7 @@ describe("chat commands", () => {
     let lastCall = calls[calls.length - 1]?.[0] as {
       options?: { env?: Record<string, string | undefined>; model?: string };
     };
-    expect(lastCall.options?.model).toBe("claude-opus-4-8[1m]");
+    expect(lastCall.options?.model).toBe("claude-opus-5[1m]");
     expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
 
     await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
@@ -600,7 +600,7 @@ describe("chat commands", () => {
 
     await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
 
-    expect(tg.sent.at(-1)?.text).toBe("Switched to claude-opus-4-8[1m]");
+    expect(tg.sent.at(-1)?.text).toBe("Switched to claude-opus-5[1m]");
     expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
 
     await agent.stop();

@@ -255,8 +255,8 @@ describe("model resolution", () => {
   it("maps short names to full model IDs", () => {
     expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5");
     expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5[1m]");
-    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-4-8");
-    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-4-8[1m]");
+    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5");
+    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5[1m]");
     expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-4-5");
   });
 

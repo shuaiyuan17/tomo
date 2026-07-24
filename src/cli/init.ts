@@ -255,8 +255,8 @@ export const initCommand = new Command("init")
         options: [
           { value: DEFAULT_MODEL, label: "Claude Sonnet 5 1M", hint: "fast, recommended, long context" },
           { value: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "fast" },
-          { value: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 1M", hint: "most capable, long context" },
-          { value: "claude-opus-4-8", label: "Claude Opus 4.8", hint: "most capable" },
+          { value: "claude-opus-5[1m]", label: "Claude Opus 5 1M", hint: "most capable, long context" },
+          { value: "claude-opus-5", label: "Claude Opus 5", hint: "most capable" },
           { value: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "cheapest" },
         ],
       });

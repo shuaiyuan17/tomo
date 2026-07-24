@@ -5,16 +5,18 @@ export const DEFAULT_MODEL = "claude-sonnet-5[1m]";
 export const MODEL_ALIASES: Record<string, string> = {
   "sonnet": "claude-sonnet-5",
   "sonnet-1m": DEFAULT_MODEL,
-  "opus": "claude-opus-4-8",
-  "opus-1m": "claude-opus-4-8[1m]",
+  "opus": "claude-opus-5",
+  "opus-1m": "claude-opus-5[1m]",
   "haiku": "claude-haiku-4-5",
 };
 
 const MODEL_LABELS: Record<string, string> = {
   "claude-sonnet-5": "Sonnet 5 (fast)",
   "claude-sonnet-5[1m]": "Sonnet 5 1M (fast, long context)",
-  "claude-opus-4-8": "Opus 4.8 (most capable)",
-  "claude-opus-4-8[1m]": "Opus 4.8 1M (most capable, long context)",
+  "claude-opus-5": "Opus 5 (most capable)",
+  "claude-opus-5[1m]": "Opus 5 1M (most capable, long context)",
+  "claude-opus-4-8": "Opus 4.8",
+  "claude-opus-4-8[1m]": "Opus 4.8 1M (long context)",
   "claude-haiku-4-5": "Haiku 4.5 (cheapest)",
 };
 

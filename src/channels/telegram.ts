@@ -90,7 +90,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "model", "restore", "login", "status", "cost", "pet", "summon", "dismiss", "pause", "resume"]) {
+    for (const cmd of ["new", "model", "restore", "login", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]) {
       this.bot.command(cmd, async (ctx) => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
@@ -869,6 +869,7 @@ export class TelegramChannel implements Channel {
       { command: "login", description: "Refresh Claude login (owner DM only)" },
       { command: "status", description: "Show current session status" },
       { command: "cost", description: "Show current session costs" },
+      { command: "usage", description: "Show Claude subscription usage limits" },
       { command: "pet", description: "Check on Tomo's pet" },
       { command: "summon", description: "Pull your main Tomo session into this group" },
       { command: "dismiss", description: "Hand this group back to its own Tomo session" },

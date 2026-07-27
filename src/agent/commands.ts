@@ -20,6 +20,7 @@ import { log } from "../logger.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
 import { ClaudeLoginManager } from "./claude-login.js";
+import { buildUsageReport } from "./usage.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export function backupConfigFile(): void {
@@ -210,6 +211,11 @@ export class ChatCommandHandler {
     if (command === "cost") {
       const logPath = join(config.logsDir, "tomo.log");
       await channel.send({ chatId, text: buildSessionCostReport(key, { logPath }) });
+      return;
+    }
+
+    if (command === "usage") {
+      await channel.send({ chatId, text: await buildUsageReport() });
       return;
     }
 

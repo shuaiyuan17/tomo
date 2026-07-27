@@ -504,7 +504,7 @@ export class BlueBubblesChannel implements Channel {
       const parts = text.slice(1).split(/\s+/);
       const command = parts[0];
       const args = parts.slice(1).join(" ");
-      if (command === "new" || command === "model" || command === "restore" || command === "login" || command === "status" || command === "cost" || command === "pet" || command === "summon" || command === "dismiss" || command === "pause" || command === "resume") {
+      if (command === "new" || command === "model" || command === "restore" || command === "login" || command === "status" || command === "cost" || command === "usage" || command === "pet" || command === "summon" || command === "dismiss" || command === "pause" || command === "resume") {
         // Normalized exactly like the message path's senderId below, so owner
         // checks (identityForSender) match however BlueBubbles formats the
         // address.

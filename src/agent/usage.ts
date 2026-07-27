@@ -48,7 +48,27 @@ interface UsageDeps {
   now?: () => number;
   /** Injectable token loader for tests; defaults to the real Keychain reader. */
   loadCredentials?: () => Promise<ClaudeCredentials>;
+  /**
+   * Anthropic auth mode for direct Claude sessions (`config.auth.method`).
+   * "api-key" means there is no subscription session/weekly cap at all — usage
+   * is billed per-token in the Console — so we short-circuit to a pointer
+   * instead of a zeroed/empty subscription report. This is the authoritative
+   * signal; we do NOT infer api-key mode from a merely-absent Keychain token
+   * (a stale token can linger after switching auth modes).
+   */
+  authMethod?: "subscription" | "api-key";
+  /**
+   * True when a LiteLLM gateway is configured (`config.litellm.baseUrl`). The
+   * subscription numbers still render, but with a caveat that this session may
+   * bill through the gateway rather than the subscription.
+   */
+  gatewayActive?: boolean;
 }
+
+const API_KEY_MESSAGE =
+  "📊 API-key auth — no subscription limits. Usage is billed per-token; see console.anthropic.com/settings/usage";
+const GATEWAY_CAVEAT =
+  "(gateway mode active — these are your Claude subscription limits, not necessarily what this session bills to)";
 
 /**
  * Reads the current Claude subscription usage (5-hour and 7-day windows) and
@@ -60,6 +80,13 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const now = deps.now ?? Date.now;
   const loadCredentials = deps.loadCredentials ?? readClaudeCredentials;
+
+  // API-key auth has no session/weekly subscription cap — report that plainly
+  // instead of an empty or zeroed subscription block. Authoritative config
+  // signal, so it wins even if a stale Keychain OAuth token is still present.
+  if (deps.authMethod === "api-key") {
+    return API_KEY_MESSAGE;
+  }
 
   let creds: ClaudeCredentials;
   try {
@@ -110,11 +137,16 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
     return "Claude usage unavailable: could not parse the usage response.";
   }
 
-  return formatUsageReport(data, now(), oauth?.subscriptionType);
+  return formatUsageReport(data, now(), oauth?.subscriptionType, deps.gatewayActive);
 }
 
 /** Turn a parsed usage payload into the plain-text chat report. */
-export function formatUsageReport(data: UsageResponse, now: number, subscriptionType?: string): string {
+export function formatUsageReport(
+  data: UsageResponse,
+  now: number,
+  subscriptionType?: string,
+  gatewayActive?: boolean,
+): string {
   const planLabel = subscriptionLabel(subscriptionType);
   const lines: string[] = [`📊 Claude usage${planLabel ? ` (${planLabel})` : ""}`, ""];
 
@@ -133,6 +165,11 @@ export function formatUsageReport(data: UsageResponse, now: number, subscription
     const limit = typeof extra.monthly_limit === "number" ? extra.monthly_limit : 0;
     lines.push("");
     lines.push(`Extra usage: ${currency}${used.toFixed(2)} / ${currency}${limit} this month`);
+  }
+
+  if (gatewayActive) {
+    lines.push("");
+    lines.push(GATEWAY_CAVEAT);
   }
 
   return lines.join("\n");

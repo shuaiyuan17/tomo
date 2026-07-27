@@ -71,7 +71,7 @@ export class ChatCommandHandler {
     }
 
     if (this.restoringConfig) {
-      await channel.send({ chatId, text: "Restore is already in progress. Restarting Tomo..." });
+      await channel.send({ chatId, text: "♻️ Restore is already in progress. Restarting Tomo..." });
       return;
     }
 
@@ -98,20 +98,20 @@ export class ChatCommandHandler {
       this.deps.closeLiveSession(key);
       this.deps.sessions.clearSdkSessionId(key);
       log.info({ channel: channel.name, chatId, sender: senderName }, "New session started via /new");
-      await channel.send({ chatId, text: "New session started." });
+      await channel.send({ chatId, text: "🆕 New session started." });
       return;
     }
 
     if (command === "model") {
       if (!this.isIdentityOwner(channel, senderId)) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/model refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: "Only a configured owner can change the model." });
+        await channel.send({ chatId, text: "⚠️ Only a configured owner can change the model." });
         return;
       }
       const arg = args?.trim();
       if (!arg) {
         const current = this.deps.modelOverrides.get(key) ?? config.model;
-        const lines = [`Current: ${current}`, "", "Switch with: /model <name>", ""];
+        const lines = [`🧠 Current: ${current}`, "", "Switch with: /model <name>", ""];
         for (const [shortName, fullName] of Object.entries(MODEL_ALIASES)) {
           const marker = fullName === current ? " (active)" : "";
           lines.push(`  ${shortName} — ${fullName}${marker}`);
@@ -128,21 +128,21 @@ export class ChatCommandHandler {
 
       const resolved = resolveModelName(arg);
       if (!resolved) {
-        await channel.send({ chatId, text: `Unknown model "${arg}". Use ${modelHelpText()}.` });
+        await channel.send({ chatId, text: `⚠️ Unknown model "${arg}". Use ${modelHelpText()}.` });
         return;
       }
       if (isLiteLlmProviderModel(resolved)) {
         if (!config.litellm?.baseUrl) {
           await channel.send({
             chatId,
-            text: `"${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
+            text: `⚠️ "${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
           });
           return;
         }
         if (config.litellm.mode === CHATGPT_SUBSCRIPTION_MODE && !isChatGptSubscriptionModel(resolved)) {
           await channel.send({
             chatId,
-            text: `The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`,
+            text: `⚠️ The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`,
           });
           return;
         }
@@ -150,7 +150,7 @@ export class ChatCommandHandler {
       if (!this.persistModelOverride(key, resolved)) {
         await channel.send({
           chatId,
-          text: "[error] Could not save the model override to ~/.tomo/config.json — model unchanged. Check the file (or /restore) and try again.",
+          text: "⚠️ [error] Could not save the model override to ~/.tomo/config.json — model unchanged. Check the file (or /restore) and try again.",
         });
         return;
       }
@@ -161,14 +161,14 @@ export class ChatCommandHandler {
       // resuming.
       this.deps.closeLiveSession(key);
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
-      await channel.send({ chatId, text: `Switched to ${resolved}` });
+      await channel.send({ chatId, text: `🔄 Switched to ${resolved}` });
       return;
     }
 
     if (command === "restore") {
       if (!this.isIdentityOwner(channel, senderId)) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/restore refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: "Only a configured owner can restore config." });
+        await channel.send({ chatId, text: "⚠️ Only a configured owner can restore config." });
         return;
       }
       await this.restoreConfigAndRestart(channel, chatId);
@@ -179,7 +179,7 @@ export class ChatCommandHandler {
       const store = new PetStore(join(config.tomoHome, "data", "pet.json"));
       let pet = store.load();
       if (!pet) {
-        await channel.send({ chatId, text: "Tomo doesn't have a pet yet. Ask Tomo to hatch one!" });
+        await channel.send({ chatId, text: "🦀 Tomo doesn't have a pet yet. Ask Tomo to hatch one!" });
         return;
       }
 
@@ -191,7 +191,7 @@ export class ChatCommandHandler {
       ));
       const dayLabel = ageDays === 1 ? "day" : "days";
       const lines = [
-        `🐾 ${pet.name} the ${pet.species}`,
+        `🦀 ${pet.name} the ${pet.species}`,
         `Stage: ${pet.stage} · Age: ${ageDays} ${dayLabel} · Mood: ${store.computeMood(pet)}`,
         `Hunger: ${Math.round(pet.hunger)}/100 · Happiness: ${Math.round(pet.happiness)}/100`,
         `Energy: ${Math.round(pet.energy)}/100 · Health: ${Math.round(pet.health)}/100`,
@@ -210,12 +210,18 @@ export class ChatCommandHandler {
 
     if (command === "cost") {
       const logPath = join(config.logsDir, "tomo.log");
-      await channel.send({ chatId, text: buildSessionCostReport(key, { logPath }) });
+      await channel.send({ chatId, text: `💰 ${buildSessionCostReport(key, { logPath })}` });
       return;
     }
 
     if (command === "usage") {
-      await channel.send({ chatId, text: await buildUsageReport() });
+      await channel.send({
+        chatId,
+        text: await buildUsageReport({
+          authMethod: config.auth.method,
+          gatewayActive: Boolean(config.litellm?.baseUrl),
+        }),
+      });
       return;
     }
 
@@ -225,6 +231,8 @@ export class ChatCommandHandler {
       const entry = this.deps.sessions.getEntry(key);
 
       const lines: string[] = [];
+      lines.push("📋 Status");
+      lines.push("");
       lines.push(`Session: ${key}`);
       lines.push(`Channel: ${channel.name}`);
       const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
@@ -282,7 +290,7 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (!isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: `/${command} only works in group chats.` });
+      await channel.send({ chatId, text: `⚠️ /${command} only works in group chats.` });
       return;
     }
     if (!this.deps.router.isAllowed(channel.name, chatId)) {
@@ -295,7 +303,7 @@ export class ChatCommandHandler {
     if (command === "dismiss") {
       const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
       if (!summoned) {
-        await channel.send({ chatId, text: "No main session is summoned here." });
+        await channel.send({ chatId, text: "⚠️ No main session is summoned here." });
         return;
       }
       this.deps.router.dismissGroup(channel.name, chatId);
@@ -307,20 +315,20 @@ export class ChatCommandHandler {
           { name: rawKey },
         ),
       );
-      await channel.send({ chatId, text: "Handed back to this group's own Tomo session." });
+      await channel.send({ chatId, text: "👋 Handed back to this group's own Tomo session." });
       return;
     }
 
     const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
     if (!identity) {
       log.info({ channel: channel.name, chatId, sender: senderName }, "/summon refused (sender is not a configured identity)");
-      await channel.send({ chatId, text: "Only the owner of a configured identity can summon their main session." });
+      await channel.send({ chatId, text: "⚠️ Only the owner of a configured identity can summon their main session." });
       return;
     }
 
     const already = this.deps.router.getSummonedIdentity(channel.name, chatId);
     if (already) {
-      await channel.send({ chatId, text: `Main session dm:${already} is already summoned here. /dismiss first to hand back.` });
+      await channel.send({ chatId, text: `⚠️ Main session dm:${already} is already summoned here. /dismiss first to hand back.` });
       return;
     }
 
@@ -339,7 +347,7 @@ export class ChatCommandHandler {
     log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
     await channel.send({
       chatId,
-      text: `${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
+      text: `📞 ${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
     });
   }
 
@@ -358,32 +366,32 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (!isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: `/${command} only works in group chats.` });
+      await channel.send({ chatId, text: `⚠️ /${command} only works in group chats.` });
       return;
     }
 
     if (command === "pause") {
       if (this.deps.pauses.isPaused(rawKey)) {
-        await channel.send({ chatId, text: "Tomo is already paused here. Send /resume to bring it back." });
+        await channel.send({ chatId, text: "⚠️ Tomo is already paused here. Send /resume to bring it back." });
         return;
       }
       this.deps.pauses.pause(rawKey, senderName);
       log.info({ channel: channel.name, chatId, sender: senderName }, "Group paused via /pause");
       await channel.send({
         chatId,
-        text: "Tomo is paused in this group. Messages sent here will be completely ignored (not read, not remembered) until someone sends /resume.",
+        text: "⏸️ Tomo is paused in this group. Messages sent here will be completely ignored (not read, not remembered) until someone sends /resume.",
       });
       return;
     }
 
     if (!this.deps.pauses.resume(rawKey)) {
-      await channel.send({ chatId, text: "Tomo isn't paused in this group." });
+      await channel.send({ chatId, text: "⚠️ Tomo isn't paused in this group." });
       return;
     }
     log.info({ channel: channel.name, chatId, sender: senderName }, "Group resumed via /resume");
     await channel.send({
       chatId,
-      text: "Tomo is back. Messages sent while paused were ignored; new messages will be handled normally.",
+      text: "▶️ Tomo is back. Messages sent while paused were ignored; new messages will be handled normally.",
     });
   }
 
@@ -427,7 +435,7 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "/login is only available in a configured owner's private DM." });
+      await channel.send({ chatId, text: "⚠️ /login is only available in a configured owner's private DM." });
       return;
     }
 
@@ -438,8 +446,8 @@ export class ChatCommandHandler {
       // never falls open when no identities exist — instead point the user at
       // the setup path.
       const text = config.identities.length === 0
-        ? "No owner identity is configured, so /login is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /login again."
-        : "Only a configured owner can refresh Claude login.";
+        ? "⚠️ No owner identity is configured, so /login is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /login again."
+        : "⚠️ Only a configured owner can refresh Claude login.";
       await channel.send({ chatId, text });
       return;
     }
@@ -449,7 +457,7 @@ export class ChatCommandHandler {
       const cancelled = this.claudeLogin.cancel(identity.name);
       await channel.send({
         chatId,
-        text: cancelled ? "Claude login cancelled." : "No Claude login is currently waiting.",
+        text: cancelled ? "🔑 Claude login cancelled." : "⚠️ No Claude login is currently waiting.",
       });
       return;
     }
@@ -460,7 +468,7 @@ export class ChatCommandHandler {
         await channel.send({
           chatId,
           text: [
-            reused ? "Claude login is already waiting." : "Claude login started.",
+            reused ? "🔑 Claude login is already waiting." : "🔑 Claude login started.",
             "",
             url,
             "",
@@ -492,7 +500,7 @@ export class ChatCommandHandler {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       log.warn({ err, identity: identity.name }, "Claude login command failed");
-      await channel.send({ chatId, text: `[error] Claude login failed: ${detail}` });
+      await channel.send({ chatId, text: `⚠️ [error] Claude login failed: ${detail}` });
     }
   }
 
@@ -514,7 +522,7 @@ export class ChatCommandHandler {
 
   private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
     if (!existsSync(CONFIG_BACKUP_PATH)) {
-      await channel.send({ chatId, text: "No config backup found at ~/.tomo/config.json.bak." });
+      await channel.send({ chatId, text: "⚠️ No config backup found at ~/.tomo/config.json.bak." });
       return;
     }
 
@@ -528,12 +536,12 @@ export class ChatCommandHandler {
       writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
 
       this.restoringConfig = true;
-      await channel.send({ chatId, text: "Restored config.json from config.json.bak. Restarting Tomo..." });
+      await channel.send({ chatId, text: "♻️ Restored config.json from config.json.bak. Restarting Tomo..." });
 
       this.scheduleRestart();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      await channel.send({ chatId, text: `[error] restore failed: ${detail}` });
+      await channel.send({ chatId, text: `⚠️ [error] restore failed: ${detail}` });
     }
   }
 }

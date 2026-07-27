@@ -53,6 +53,15 @@ describe("formatUsageReport", () => {
     expect(report).not.toContain("Sonnet");
   });
 
+  it("appends a gateway caveat when gatewayActive is set", () => {
+    const report = formatUsageReport({
+      five_hour: { utilization: 2, resets_at: "2026-07-28T02:59:59+00:00" },
+      seven_day: { utilization: 36, resets_at: "2026-08-02T14:59:59+00:00" },
+    }, NOW, "max_20x", true);
+    expect(report).toContain("gateway mode active");
+    expect(report).toContain("not necessarily what this session bills to");
+  });
+
   it("adds per-model rows when present and omits disabled extra usage", () => {
     const report = formatUsageReport({
       five_hour: { utilization: 0, resets_at: "2026-07-28T02:59:59+00:00" },
@@ -90,6 +99,37 @@ describe("buildUsageReport", () => {
     expect(seenBeta).toBe("oauth-2025-04-20");
     expect(report).toContain("Session (5h):  2%");
     expect(report).toContain("Weekly (7d):   36%");
+  });
+
+  it("short-circuits to the API-key message and never reads credentials", async () => {
+    let loaded = false;
+    let fetched = false;
+    const report = await buildUsageReport({
+      now: () => NOW,
+      authMethod: "api-key",
+      loadCredentials: async () => { loaded = true; return CREDS; },
+      fetchImpl: (async () => { fetched = true; return okResponse({}); }) as unknown as typeof fetch,
+    });
+    expect(loaded).toBe(false);
+    expect(fetched).toBe(false);
+    expect(report).toBe(
+      "📊 API-key auth — no subscription limits. Usage is billed per-token; see console.anthropic.com/settings/usage",
+    );
+  });
+
+  it("shows subscription numbers with a gateway caveat under gateway mode", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      authMethod: "subscription",
+      gatewayActive: true,
+      loadCredentials: async () => CREDS,
+      fetchImpl: (async () => okResponse({
+        five_hour: { utilization: 2, resets_at: "2026-07-28T02:59:59+00:00" },
+        seven_day: { utilization: 36, resets_at: "2026-08-02T14:59:59+00:00" },
+      })) as unknown as typeof fetch,
+    });
+    expect(report).toContain("Session (5h):  2%");
+    expect(report).toContain("gateway mode active");
   });
 
   it("reports a friendly message when no credentials exist", async () => {

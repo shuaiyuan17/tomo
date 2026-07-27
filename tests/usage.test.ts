@@ -76,6 +76,86 @@ describe("formatUsageReport", () => {
   });
 });
 
+describe("formatUsageReport with the limits array", () => {
+  // The real live shape verified against the endpoint.
+  const LIMITS = [
+    { kind: "session", group: "session", percent: 5, severity: "normal", resets_at: "2026-07-28T03:00:00Z", scope: null, is_active: false },
+    { kind: "weekly_all", group: "weekly", percent: 36, severity: "normal", resets_at: "2026-08-02T15:00:00Z", scope: null, is_active: false },
+    { kind: "weekly_scoped", group: "weekly", percent: 43, severity: "normal", resets_at: "2026-08-02T15:00:00Z", scope: { model: { id: null, display_name: "Fable" }, surface: null }, is_active: true },
+  ];
+
+  it("renders one line per limit with kind/scope labels, percent, and countdown", () => {
+    const report = formatUsageReport({ limits: LIMITS }, NOW, "max_20x");
+    const lines = report.split("\n");
+    expect(lines[0]).toBe("📊 Claude usage (Max 20x)");
+    expect(report).toContain("Session (5h):");
+    expect(report).toContain("Weekly (all):");
+    // Scoped limit reads its model name from scope, not hardcoded.
+    expect(report).toContain("Weekly · Fable:");
+    expect(report).toContain("5%");
+    expect(report).toContain("36%");
+    expect(report).toContain("43%");
+    expect(report).toContain("resets in 4h 24m");
+    expect(report).toContain("resets in 5d 16h");
+  });
+
+  it("marks the active limit and leaves inactive ones unmarked", () => {
+    const report = formatUsageReport({ limits: LIMITS }, NOW);
+    const fableLine = report.split("\n").find((l) => l.includes("Fable"));
+    const sessionLine = report.split("\n").find((l) => l.startsWith("Session"));
+    expect(fableLine).toContain("← active");
+    expect(sessionLine).not.toContain("← active");
+  });
+
+  it("prefixes an elevated-severity limit with a warning and renders unknown kinds generically", () => {
+    const report = formatUsageReport({
+      limits: [
+        { kind: "session", group: "session", percent: 92, severity: "warning", resets_at: "2026-07-28T03:00:00Z", scope: null, is_active: true },
+        { kind: "five_hour_scoped", group: "session", percent: 10, resets_at: "2026-07-28T03:00:00Z", scope: { model: { display_name: "Opus" }, surface: "code" }, is_active: false },
+      ],
+    }, NOW);
+    // Elevated severity → ⚠️ prefix on that line.
+    const warnLine = report.split("\n").find((l) => l.includes("92%"));
+    expect(warnLine?.startsWith("⚠️")).toBe(true);
+    // Unknown kind is not dropped — rendered from kind + scope generically.
+    expect(report).toContain("Five Hour Scoped · Opus · code:");
+    expect(report).toContain("10%");
+  });
+
+  it("orders session limits before weekly ones regardless of input order", () => {
+    const report = formatUsageReport({
+      limits: [
+        { kind: "weekly_all", group: "weekly", percent: 36, resets_at: "2026-08-02T15:00:00Z", scope: null, is_active: false },
+        { kind: "session", group: "session", percent: 5, resets_at: "2026-07-28T03:00:00Z", scope: null, is_active: false },
+      ],
+    }, NOW);
+    const body = report.split("\n").filter((l) => l.includes("%"));
+    expect(body[0]).toContain("Session");
+    expect(body[1]).toContain("Weekly");
+  });
+
+  it("still appends the extra-usage and gateway-caveat lines under the limits path", () => {
+    const report = formatUsageReport({
+      limits: LIMITS,
+      extra_usage: { is_enabled: true, monthly_limit: 5000, used_credits: 1.5, currency: "USD" },
+    }, NOW, "max", true);
+    expect(report).toContain("Extra usage: $1.50 / $5000 this month");
+    expect(report).toContain("gateway mode active");
+  });
+
+  it("falls back to the legacy five_hour/seven_day windows when limits is empty or absent", () => {
+    const legacy = { five_hour: { utilization: 5, resets_at: "2026-07-28T03:00:00Z" }, seven_day: { utilization: 36, resets_at: "2026-08-02T15:00:00Z" } };
+    const fromEmpty = formatUsageReport({ ...legacy, limits: [] }, NOW, "max");
+    const fromAbsent = formatUsageReport(legacy, NOW, "max");
+    for (const report of [fromEmpty, fromAbsent]) {
+      expect(report).toContain("Session (5h):  5%");
+      expect(report).toContain("Weekly (7d):   36%");
+      expect(report).not.toContain("← active");
+      expect(report).not.toContain("· resets"); // legacy uses the two-line layout, not the "· resets" limits layout
+    }
+  });
+});
+
 describe("buildUsageReport", () => {
   it("fetches with the OAuth bearer + beta header and formats the result", async () => {
     let seenAuth = "";

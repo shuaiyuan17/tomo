@@ -25,7 +25,32 @@ interface ExtraUsage {
   currency?: string | null;
 }
 
+/** Scope a limit applies to — a specific model and/or surface, or null (all). */
+interface UsageLimitScope {
+  model?: { id?: string | null; display_name?: string | null } | null;
+  surface?: string | null;
+}
+
+/**
+ * One entry of the `limits` array — the authoritative per-window / per-model
+ * usage cap. `kind` is open-ended (session / weekly_all / weekly_scoped and
+ * possibly others), so we render any kind generically rather than dropping it.
+ */
+interface UsageLimit {
+  kind?: string | null;
+  group?: string | null;
+  percent?: number | null;
+  severity?: string | null;
+  resets_at?: string | null;
+  scope?: UsageLimitScope | null;
+  is_active?: boolean | null;
+}
+
 interface UsageResponse {
+  /** Authoritative source of truth when present/non-empty. */
+  limits?: UsageLimit[] | null;
+  // Legacy top-level windows — fallback for older/other account shapes that
+  // don't return `limits`. These miss scoped (per-model) caps.
   five_hour?: UsageWindow | null;
   seven_day?: UsageWindow | null;
   seven_day_opus?: UsageWindow | null;
@@ -150,13 +175,20 @@ export function formatUsageReport(
   const planLabel = subscriptionLabel(subscriptionType);
   const lines: string[] = [`📊 Claude usage${planLabel ? ` (${planLabel})` : ""}`, ""];
 
-  lines.push(...windowLines("Session (5h): ", data.five_hour, now));
-  lines.push(...windowLines("Weekly (7d):  ", data.seven_day, now));
-
-  const opus = windowLines("  Opus (7d):  ", data.seven_day_opus, now, true);
-  if (opus.length > 0) lines.push(...opus);
-  const sonnet = windowLines("  Sonnet (7d):", data.seven_day_sonnet, now, true);
-  if (sonnet.length > 0) lines.push(...sonnet);
+  const limits = Array.isArray(data.limits) ? data.limits.filter((l): l is UsageLimit => Boolean(l)) : [];
+  if (limits.length > 0) {
+    // Primary path: render every limit entry so nothing (esp. active scoped
+    // caps like a Fable weekly wall) is silently dropped.
+    lines.push(...renderLimits(limits, now));
+  } else {
+    // Fallback for account shapes that don't return `limits`.
+    lines.push(...windowLines("Session (5h): ", data.five_hour, now));
+    lines.push(...windowLines("Weekly (7d):  ", data.seven_day, now));
+    const opus = windowLines("  Opus (7d):  ", data.seven_day_opus, now, true);
+    if (opus.length > 0) lines.push(...opus);
+    const sonnet = windowLines("  Sonnet (7d):", data.seven_day_sonnet, now, true);
+    if (sonnet.length > 0) lines.push(...sonnet);
+  }
 
   const extra = data.extra_usage;
   if (extra && extra.is_enabled) {
@@ -194,6 +226,80 @@ function windowLines(label: string, window: UsageWindow | null | undefined, now:
   const out = [`${label} ${pct}`];
   if (reset) out.push(`  resets in ${reset.countdown}  (${reset.clock})`);
   return out;
+}
+
+/**
+ * Render the `limits` array, one line per entry, grouped session-then-weekly
+ * (then anything else), with the label column padded so percents align.
+ */
+function renderLimits(limits: UsageLimit[], now: number): string[] {
+  // Stable sort (V8 Array.sort is stable): session group first, weekly next,
+  // unknown groups last — original order preserved within each group.
+  const sorted = [...limits].sort((a, b) => groupRank(a) - groupRank(b));
+  const labels = sorted.map(limitLabel);
+  const colWidth = Math.max(...labels.map((l) => l.length + 1)) + 2; // +1 colon, +2 gap
+  return sorted.map((limit, i) => renderLimitLine(limit, labels[i], colWidth, now));
+}
+
+/** Rank a limit's group for ordering: session (0), weekly (1), other (2). */
+function groupRank(limit: UsageLimit): number {
+  const group = (limit.group ?? "").toLowerCase();
+  const kind = (limit.kind ?? "").toLowerCase();
+  if (group === "session" || kind.startsWith("session")) return 0;
+  if (group === "weekly" || kind.includes("weekly")) return 1;
+  return 2;
+}
+
+/** Build a human label from a limit's kind + scope (e.g. "Weekly · Fable"). */
+function limitLabel(limit: UsageLimit): string {
+  let base: string;
+  switch (limit.kind) {
+    case "session": base = "Session (5h)"; break;
+    case "weekly_all": base = "Weekly (all)"; break;
+    case "weekly_scoped": base = "Weekly"; break;
+    default: base = prettifyKind(limit.kind);
+  }
+  const parts = [base];
+  const model = limit.scope?.model?.display_name?.trim();
+  if (model) parts.push(model);
+  const surface = typeof limit.scope?.surface === "string" ? limit.scope.surface.trim() : "";
+  if (surface) parts.push(surface);
+  return parts.join(" · ");
+}
+
+/** Turn an unknown kind like "five_hour_scoped" into "Five Hour Scoped". */
+function prettifyKind(kind: string | null | undefined): string {
+  if (!kind) return "Usage";
+  return kind
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/**
+ * One rendered limit line:
+ *   `Weekly · Fable:      43%  ← active · resets in 5d 16h (Aug 2, 7:59 AM)`
+ * Elevated severity prefixes the line with ⚠️.
+ */
+function renderLimitLine(limit: UsageLimit, label: string, colWidth: number, now: number): string {
+  const pct = typeof limit.percent === "number" ? `${Math.round(limit.percent)}%` : "n/a";
+  const reset = limit.resets_at ? formatReset(limit.resets_at, now) : null;
+
+  let line = `${label}:`.padEnd(colWidth) + pct.padEnd(5);
+  if (limit.is_active) line += "← active ";
+  if (reset) line += `· resets in ${reset.countdown} (${reset.clock})`;
+  line = line.replace(/\s+$/, "");
+
+  if (isElevatedSeverity(limit.severity)) line = `⚠️ ${line}`;
+  return line;
+}
+
+/** Any severity other than normal/none is treated as elevated (⚠️). */
+function isElevatedSeverity(severity: string | null | undefined): boolean {
+  if (!severity) return false;
+  const s = severity.toLowerCase();
+  return s !== "normal" && s !== "none" && s !== "ok";
 }
 
 /** Format an ISO reset timestamp into a human countdown + local clock time. */

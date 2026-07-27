@@ -21,6 +21,7 @@ import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
 import { ClaudeLoginManager } from "./claude-login.js";
 import { buildUsageReport } from "./usage.js";
+import { litellmRoutesModel } from "../litellm.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export function backupConfigFile(): void {
@@ -215,11 +216,26 @@ export class ChatCommandHandler {
     }
 
     if (command === "usage") {
+      // /usage exposes account-wide plan + utilization + scoped caps, so gate it
+      // like /login: owner's private DM only. A group is shared, so any member
+      // could otherwise read the owner's subscription state.
+      if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
+        await channel.send({ chatId, text: "⚠️ /usage is only available in a configured owner's private DM." });
+        return;
+      }
+      if (!this.isIdentityOwner(channel, senderId)) {
+        log.info({ channel: channel.name, chatId, sender: senderName }, "/usage refused (sender is not a configured identity)");
+        await channel.send({ chatId, text: "⚠️ Only a configured owner can view usage." });
+        return;
+      }
+      // Classify gateway routing the same way the SDK does — from the session's
+      // effective model, not merely "is a gateway configured".
+      const effectiveModel = this.deps.modelOverrides.get(key) ?? config.model;
       await channel.send({
         chatId,
         text: await buildUsageReport({
           authMethod: config.auth.method,
-          gatewayActive: Boolean(config.litellm?.baseUrl),
+          gatewayActive: litellmRoutesModel(config.litellm, effectiveModel),
         }),
       });
       return;

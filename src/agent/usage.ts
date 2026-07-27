@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA = "oauth-2025-04-20";
+const REQUEST_TIMEOUT_MS = 10_000;
+const TIMEOUT_MESSAGE = "Claude usage unavailable: usage request timed out.";
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** Fallback credentials file used on Linux / non-macOS installs. */
 const CREDENTIALS_FILE = join(homedir(), ".claude", ".credentials.json");
@@ -133,6 +135,11 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
     return "Claude usage unavailable: access token expired. Re-login to Claude Code (`claude` → /login).";
   }
 
+  // One deadline covers both the request and the body read: passing the signal
+  // to fetch ties it to the response stream, so a stalled body aborts too.
+  // Without this, /usage could hang indefinitely on an unresponsive endpoint.
+  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+
   let res: Response;
   try {
     res = await fetchImpl(USAGE_ENDPOINT, {
@@ -142,10 +149,13 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
         "anthropic-beta": OAUTH_BETA,
         Accept: "application/json",
       },
+      signal,
     });
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    return `Claude usage unavailable: network error (${detail}).`;
+    if (isTimeout(err)) return TIMEOUT_MESSAGE;
+    // Never interpolate the raw error: a future fetch wrapper that echoed
+    // request headers could leak the bearer token through err.message.
+    return "Claude usage unavailable: network error.";
   }
 
   if (res.status === 401 || res.status === 403) {
@@ -155,14 +165,21 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
     return `Claude usage unavailable: usage endpoint returned HTTP ${res.status}.`;
   }
 
-  let data: UsageResponse;
+  let data: unknown;
   try {
-    data = await res.json() as UsageResponse;
-  } catch {
+    data = await res.json();
+  } catch (err) {
+    if (isTimeout(err)) return TIMEOUT_MESSAGE;
     return "Claude usage unavailable: could not parse the usage response.";
   }
 
-  return formatUsageReport(data, now(), oauth?.subscriptionType, deps.gatewayActive);
+  // The format phase must not throw out of the never-throws boundary: malformed
+  // endpoint data is guarded per-field, and this catch is the final backstop.
+  try {
+    return formatUsageReport(data as UsageResponse, now(), oauth?.subscriptionType, deps.gatewayActive);
+  } catch {
+    return "Claude usage unavailable: could not parse the usage response.";
+  }
 }
 
 /** Turn a parsed usage payload into the plain-text chat report. */
@@ -172,29 +189,39 @@ export function formatUsageReport(
   subscriptionType?: string,
   gatewayActive?: boolean,
 ): string {
+  // Endpoint data is untrusted: a JSON body of literal `null`, or fields with
+  // the wrong type (e.g. group: 7), must degrade gracefully rather than throw
+  // out of the never-throws boundary. Coerce to a safe object up front and
+  // normalize each field before any string/number method runs on it.
+  const d: UsageResponse = data && typeof data === "object" ? data : {};
+
   const planLabel = subscriptionLabel(subscriptionType);
   const lines: string[] = [`📊 Claude usage${planLabel ? ` (${planLabel})` : ""}`, ""];
 
-  const limits = Array.isArray(data.limits) ? data.limits.filter((l): l is UsageLimit => Boolean(l)) : [];
+  const limits = (Array.isArray(d.limits) ? d.limits : [])
+    .map(toSafeLimit)
+    .filter((l): l is SafeLimit => l !== null);
   if (limits.length > 0) {
     // Primary path: render every limit entry so nothing (esp. active scoped
     // caps like a Fable weekly wall) is silently dropped.
     lines.push(...renderLimits(limits, now));
   } else {
     // Fallback for account shapes that don't return `limits`.
-    lines.push(...windowLines("Session (5h): ", data.five_hour, now));
-    lines.push(...windowLines("Weekly (7d):  ", data.seven_day, now));
-    const opus = windowLines("  Opus (7d):  ", data.seven_day_opus, now, true);
+    lines.push(...windowLines("Session (5h): ", d.five_hour, now));
+    lines.push(...windowLines("Weekly (7d):  ", d.seven_day, now));
+    const opus = windowLines("  Opus (7d):  ", d.seven_day_opus, now, true);
     if (opus.length > 0) lines.push(...opus);
-    const sonnet = windowLines("  Sonnet (7d):", data.seven_day_sonnet, now, true);
+    const sonnet = windowLines("  Sonnet (7d):", d.seven_day_sonnet, now, true);
     if (sonnet.length > 0) lines.push(...sonnet);
   }
 
-  const extra = data.extra_usage;
-  if (extra && extra.is_enabled) {
-    const currency = extra.currency === "USD" || !extra.currency ? "$" : `${extra.currency} `;
-    const used = typeof extra.used_credits === "number" ? extra.used_credits : 0;
-    const limit = typeof extra.monthly_limit === "number" ? extra.monthly_limit : 0;
+  const extra = d.extra_usage;
+  if (extra && typeof extra === "object" && extra.is_enabled) {
+    const used = typeof extra.used_credits === "number" && Number.isFinite(extra.used_credits) ? extra.used_credits : 0;
+    const limit = typeof extra.monthly_limit === "number" && Number.isFinite(extra.monthly_limit) ? extra.monthly_limit : 0;
+    const currency = typeof extra.currency === "string" && extra.currency && extra.currency !== "USD"
+      ? `${extra.currency} `
+      : "$";
     lines.push("");
     lines.push(`Extra usage: ${currency}${used.toFixed(2)} / ${currency}${limit} this month`);
   }
@@ -215,9 +242,11 @@ export function formatUsageReport(
  * When `compact` is set, the two lines are joined so per-model rows stay tight.
  */
 function windowLines(label: string, window: UsageWindow | null | undefined, now: number, compact = false): string[] {
-  if (!window) return [];
-  const pct = typeof window.utilization === "number" ? `${Math.round(window.utilization)}%` : "n/a";
-  const reset = window.resets_at ? formatReset(window.resets_at, now) : null;
+  if (!window || typeof window !== "object") return [];
+  const pct = typeof window.utilization === "number" && Number.isFinite(window.utilization)
+    ? `${Math.round(window.utilization)}%`
+    : "n/a";
+  const reset = typeof window.resets_at === "string" ? formatReset(window.resets_at, now) : null;
 
   if (compact) {
     return [reset ? `${label} ${pct} — resets in ${reset.countdown} (${reset.clock})` : `${label} ${pct}`];
@@ -229,10 +258,46 @@ function windowLines(label: string, window: UsageWindow | null | undefined, now:
 }
 
 /**
+ * A limit entry with every field narrowed to a safe, already-typed value, so
+ * the render helpers below never call a string/number method on untrusted data.
+ */
+interface SafeLimit {
+  kind: string;
+  group: string;
+  percent: number | null;
+  severity: string;
+  resetsAt: string | null;
+  modelName: string;
+  surface: string;
+  isActive: boolean;
+}
+
+/**
+ * Normalize one raw `limits` entry into a SafeLimit, coercing every field with
+ * a typeof check. Returns null for a non-object entry (dropped by the caller).
+ */
+function toSafeLimit(raw: unknown): SafeLimit | null {
+  if (!raw || typeof raw !== "object") return null;
+  const l = raw as Record<string, unknown>;
+  const scope = l.scope && typeof l.scope === "object" ? l.scope as Record<string, unknown> : undefined;
+  const model = scope?.model && typeof scope.model === "object" ? scope.model as Record<string, unknown> : undefined;
+  return {
+    kind: typeof l.kind === "string" ? l.kind : "",
+    group: typeof l.group === "string" ? l.group : "",
+    percent: typeof l.percent === "number" && Number.isFinite(l.percent) ? l.percent : null,
+    severity: typeof l.severity === "string" ? l.severity : "",
+    resetsAt: typeof l.resets_at === "string" ? l.resets_at : null,
+    modelName: typeof model?.display_name === "string" ? model.display_name.trim() : "",
+    surface: typeof scope?.surface === "string" ? scope.surface.trim() : "",
+    isActive: l.is_active === true,
+  };
+}
+
+/**
  * Render the `limits` array, one line per entry, grouped session-then-weekly
  * (then anything else), with the label column padded so percents align.
  */
-function renderLimits(limits: UsageLimit[], now: number): string[] {
+function renderLimits(limits: SafeLimit[], now: number): string[] {
   // Stable sort (V8 Array.sort is stable): session group first, weekly next,
   // unknown groups last — original order preserved within each group.
   const sorted = [...limits].sort((a, b) => groupRank(a) - groupRank(b));
@@ -242,16 +307,16 @@ function renderLimits(limits: UsageLimit[], now: number): string[] {
 }
 
 /** Rank a limit's group for ordering: session (0), weekly (1), other (2). */
-function groupRank(limit: UsageLimit): number {
-  const group = (limit.group ?? "").toLowerCase();
-  const kind = (limit.kind ?? "").toLowerCase();
+function groupRank(limit: SafeLimit): number {
+  const group = limit.group.toLowerCase();
+  const kind = limit.kind.toLowerCase();
   if (group === "session" || kind.startsWith("session")) return 0;
   if (group === "weekly" || kind.includes("weekly")) return 1;
   return 2;
 }
 
 /** Build a human label from a limit's kind + scope (e.g. "Weekly · Fable"). */
-function limitLabel(limit: UsageLimit): string {
+function limitLabel(limit: SafeLimit): string {
   let base: string;
   switch (limit.kind) {
     case "session": base = "Session (5h)"; break;
@@ -260,21 +325,16 @@ function limitLabel(limit: UsageLimit): string {
     default: base = prettifyKind(limit.kind);
   }
   const parts = [base];
-  const model = limit.scope?.model?.display_name?.trim();
-  if (model) parts.push(model);
-  const surface = typeof limit.scope?.surface === "string" ? limit.scope.surface.trim() : "";
-  if (surface) parts.push(surface);
+  if (limit.modelName) parts.push(limit.modelName);
+  if (limit.surface) parts.push(limit.surface);
   return parts.join(" · ");
 }
 
 /** Turn an unknown kind like "five_hour_scoped" into "Five Hour Scoped". */
-function prettifyKind(kind: string | null | undefined): string {
-  if (!kind) return "Usage";
-  return kind
-    .split(/[_\s]+/)
-    .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
+function prettifyKind(kind: string): string {
+  const words = kind.split(/[_\s]+/).filter(Boolean);
+  if (words.length === 0) return "Usage";
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
 /**
@@ -282,12 +342,12 @@ function prettifyKind(kind: string | null | undefined): string {
  *   `Weekly · Fable:      43%  ← active · resets in 5d 16h (Aug 2, 7:59 AM)`
  * Elevated severity prefixes the line with ⚠️.
  */
-function renderLimitLine(limit: UsageLimit, label: string, colWidth: number, now: number): string {
-  const pct = typeof limit.percent === "number" ? `${Math.round(limit.percent)}%` : "n/a";
-  const reset = limit.resets_at ? formatReset(limit.resets_at, now) : null;
+function renderLimitLine(limit: SafeLimit, label: string, colWidth: number, now: number): string {
+  const pct = limit.percent !== null ? `${Math.round(limit.percent)}%` : "n/a";
+  const reset = limit.resetsAt ? formatReset(limit.resetsAt, now) : null;
 
   let line = `${label}:`.padEnd(colWidth) + pct.padEnd(5);
-  if (limit.is_active) line += "← active ";
+  if (limit.isActive) line += "← active ";
   if (reset) line += `· resets in ${reset.countdown} (${reset.clock})`;
   line = line.replace(/\s+$/, "");
 
@@ -296,7 +356,7 @@ function renderLimitLine(limit: UsageLimit, label: string, colWidth: number, now
 }
 
 /** Any severity other than normal/none is treated as elevated (⚠️). */
-function isElevatedSeverity(severity: string | null | undefined): boolean {
+function isElevatedSeverity(severity: string): boolean {
   if (!severity) return false;
   const s = severity.toLowerCase();
   return s !== "normal" && s !== "none" && s !== "ok";
@@ -372,18 +432,21 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
       "security",
       ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
       { timeout: 5000 },
-      (err, stdout) => {
+      (err, stdout, stderr) => {
         if (err) {
           const code = (err as NodeJS.ErrnoException).code;
+          // ONLY the `security` binary being absent (non-macOS / not on PATH)
+          // may fall back to the on-disk credentials file. Node reports this as
+          // a string "ENOENT" code; a real Keychain error carries a numeric
+          // exit code instead.
           if (code === "ENOENT") {
-            // `security` not on PATH — not macOS-like; let the file path try.
             reject(new UsageCredentialError("`security` command not found on PATH.", true));
             return;
           }
-          reject(new UsageCredentialError(
-            "no Claude Code credentials in the macOS Keychain. Log in with Claude Code first.",
-            true,
-          ));
+          // Operational Keychain failures (item-not-found, locked, access
+          // denied, timeout) must NOT fall back to a possibly-stale on-disk
+          // credential — surface an actionable message instead.
+          reject(new UsageCredentialError(keychainErrorMessage(code, stderr), false));
           return;
         }
         try {
@@ -394,6 +457,19 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
       },
     );
   });
+}
+
+/** Map a `security` non-ENOENT failure to a fixed, actionable message. */
+function keychainErrorMessage(code: string | number | undefined, stderr: string | Buffer | undefined): string {
+  const text = String(stderr ?? "").toLowerCase();
+  // errSecItemNotFound → exit 44, or the tool prints "could not be found".
+  if (code === 44 || text.includes("could not be found")) {
+    return "no Claude Code credentials in the macOS Keychain. Log in with Claude Code first.";
+  }
+  if (text.includes("interaction is not allowed") || text.includes("denied") || text.includes("locked")) {
+    return "the macOS Keychain is locked or denied access — unlock it and try /usage again.";
+  }
+  return "could not read Claude Code credentials from the macOS Keychain.";
 }
 
 async function readFileCredentials(): Promise<ClaudeCredentials> {
@@ -421,7 +497,18 @@ class UsageCredentialError extends Error {
   }
 }
 
+/** AbortSignal.timeout aborts with a "TimeoutError" DOMException; a manually
+ *  aborted request surfaces as "AbortError". Treat both as a timeout. */
+function isTimeout(err: unknown): boolean {
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+}
+
+/**
+ * Surface only our own curated credential messages; anything else collapses to
+ * a fixed string. This structurally guarantees no arbitrary err.message (which
+ * a future layer could populate with sensitive data) reaches the chat.
+ */
 function usageError(err: unknown): string {
-  const detail = err instanceof Error ? err.message : String(err);
+  const detail = err instanceof UsageCredentialError ? err.message : "could not read Claude Code credentials.";
   return `Claude usage unavailable: ${detail}`;
 }

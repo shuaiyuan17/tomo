@@ -245,6 +245,40 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/usage refuses in a group chat (owner DM only)", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345", "-100777"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("usage", "-100777", "GroupMember", undefined, "99999");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("private DM");
+
+    await agent.stop();
+  });
+
+  it("/usage refuses an allowlisted sender who is not a configured owner", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("usage", "12345", "Other", undefined, "99999");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("configured owner");
+
+    await agent.stop();
+  });
+
   it("/pet reports when Tomo has no pet", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

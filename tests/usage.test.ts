@@ -237,13 +237,40 @@ describe("buildUsageReport", () => {
     expect(report).toContain("Re-login to Claude Code");
   });
 
-  it("handles a network error without throwing", async () => {
+  it("returns a FIXED network-error message that never echoes the raw error", async () => {
+    // The thrown message must not leak into the surfaced text (a future fetch
+    // wrapper could put the bearer token in an error). Assert exact string.
     const report = await buildUsageReport({
       now: () => NOW,
       loadCredentials: async () => CREDS,
-      fetchImpl: (async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
+      fetchImpl: (async () => { throw new Error("Authorization: Bearer sk-secret-leak"); }) as unknown as typeof fetch,
     });
-    expect(report).toContain("network error");
+    expect(report).toBe("Claude usage unavailable: network error.");
+    expect(report).not.toContain("sk-secret-leak");
+  });
+
+  it("maps a request timeout (AbortSignal.timeout) to a fixed timeout message", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      loadCredentials: async () => CREDS,
+      fetchImpl: (async () => {
+        throw new DOMException("The operation timed out.", "TimeoutError");
+      }) as unknown as typeof fetch,
+    });
+    expect(report).toBe("Claude usage unavailable: usage request timed out.");
+  });
+
+  it("maps a timeout during the body read to the timeout message", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      loadCredentials: async () => CREDS,
+      fetchImpl: (async () => ({
+        status: 200,
+        ok: true,
+        json: async () => { throw new DOMException("aborted", "AbortError"); },
+      })) as unknown as typeof fetch,
+    });
+    expect(report).toBe("Claude usage unavailable: usage request timed out.");
   });
 
   it("maps a non-200 to an HTTP status message", async () => {
@@ -253,5 +280,35 @@ describe("buildUsageReport", () => {
       fetchImpl: (async () => new Response("", { status: 500 })) as unknown as typeof fetch,
     });
     expect(report).toContain("HTTP 500");
+  });
+
+  it("never throws on malformed endpoint data — degrades per field", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      loadCredentials: async () => CREDS,
+      fetchImpl: (async () => okResponse({
+        limits: [
+          // Every field the wrong type — must not throw, renders "Usage: n/a".
+          { kind: 7, group: 7, percent: "x", severity: 7, resets_at: 7, scope: { model: { display_name: 7 }, surface: 7 }, is_active: "yes" },
+          // A valid entry still renders.
+          { kind: "session", group: "session", percent: 5, resets_at: "2026-07-28T03:00:00Z", scope: null, is_active: false },
+          "not-an-object",
+          null,
+        ],
+      })) as unknown as typeof fetch,
+    });
+    expect(report).toContain("📊 Claude usage");
+    expect(report).toContain("Session (5h):  5%");
+    expect(report).toContain("Usage:"); // the all-malformed entry degrades, not dropped
+    expect(report).toContain("n/a");
+  });
+
+  it("never throws when the JSON body is literally null", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      loadCredentials: async () => CREDS,
+      fetchImpl: (async () => new Response("null", { status: 200, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch,
+    });
+    expect(report).toContain("📊 Claude usage");
   });
 });

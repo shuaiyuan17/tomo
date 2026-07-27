@@ -370,8 +370,16 @@ describe("buildUsageReport", () => {
 describe("keychainErrorMessage", () => {
   const mk = (over: Partial<ExecFileException>): ExecFileException => over as ExecFileException;
 
-  it("maps an execFile timeout (killed/signal) to a timeout message", () => {
+  it("maps an execFile timeout (killed=true + signal) to a timeout message", () => {
     expect(keychainErrorMessage(mk({ killed: true, signal: "SIGTERM" }), "")).toContain("timed out");
+  });
+
+  it("does NOT treat an external SIGTERM (killed=false) as a timeout", () => {
+    // Node only sets killed=true when IT killed the child via the timeout; an
+    // externally-terminated child has killed:false and must fall through.
+    const msg = keychainErrorMessage(mk({ killed: false, signal: "SIGTERM" }), "");
+    expect(msg).not.toContain("timed out");
+    expect(msg).toContain("could not read");
   });
 
   it("maps exit code 44 (item not found) to a login prompt", () => {

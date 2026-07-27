@@ -476,10 +476,13 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
 
 /** Map a `security` non-ENOENT failure to a fixed, actionable message. */
 export function keychainErrorMessage(err: ExecFileException, stderr: string | Buffer | undefined): string {
-  // An execFile timeout kills the child (killed=true, signal set) and usually
-  // leaves stderr empty, so check it BEFORE the stderr-based branches or it
-  // collapses to the generic message.
-  if (err.killed || err.signal) {
+  // When Node's own execFile `timeout` fires, it kills the child and sets
+  // killed=true WITH the kill signal — that pair is the timeout signature.
+  // Require both: a child terminated externally by SIGTERM has killed=false
+  // (Node didn't kill it), so it must NOT be mislabeled a timeout — it falls
+  // through to the generic message. Checked first because a timeout usually
+  // leaves stderr empty, which the stderr branches can't distinguish.
+  if (err.killed === true && err.signal != null) {
     return "the macOS Keychain lookup timed out — unlock the Keychain and try /usage again.";
   }
   const code = err.code;

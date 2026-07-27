@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildUsageReport, formatCountdown, formatReset, formatUsageReport } from "../src/agent/usage.js";
+import type { ExecFileException } from "node:child_process";
+import { buildUsageReport, formatCountdown, formatReset, formatUsageReport, keychainErrorMessage } from "../src/agent/usage.js";
 
 // A fixed "now" so countdowns and clock times are deterministic.
 // 2026-07-27T15:36:00-07:00 == 2026-07-27T22:36:00Z
@@ -310,5 +311,78 @@ describe("buildUsageReport", () => {
       fetchImpl: (async () => new Response("null", { status: 200, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch,
     });
     expect(report).toContain("📊 Claude usage");
+  });
+
+  it("degrades to an actionable message when credentials are literally null", async () => {
+    let fetched = false;
+    const report = await buildUsageReport({
+      now: () => NOW,
+      // JSON.parse("null") is typeof "object"; accessing .claudeAiOauth would throw.
+      loadCredentials: (async () => null) as unknown as () => Promise<Record<string, never>>,
+      fetchImpl: (async () => { fetched = true; return okResponse({}); }) as unknown as typeof fetch,
+    });
+    expect(fetched).toBe(false);
+    expect(report).toContain("malformed");
+    expect(report).toContain("Re-login to Claude Code");
+  });
+
+  it("degrades when credentials parse to a primitive", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      loadCredentials: (async () => 42) as unknown as () => Promise<Record<string, never>>,
+    });
+    expect(report).toContain("malformed");
+  });
+
+  it("collapses an arbitrary credential-loader error to a fixed message (no leak)", async () => {
+    const report = await buildUsageReport({
+      now: () => NOW,
+      loadCredentials: async () => { throw new Error("Authorization: Bearer sk-secret-leak"); },
+    });
+    expect(report).toBe("Claude usage unavailable: could not read Claude Code credentials.");
+    expect(report).not.toContain("sk-secret-leak");
+  });
+
+  it("aborts a genuinely stalled body read via the shared timeout signal", async () => {
+    // Shorten the real deadline so the stalled body aborts fast instead of 10s.
+    const original = AbortSignal.timeout;
+    (AbortSignal as unknown as { timeout: (ms: number) => AbortSignal }).timeout =
+      (ms: number) => original(Math.min(ms, 30));
+    try {
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => CREDS,
+        fetchImpl: (async (_url: string, init: RequestInit) => ({
+          status: 200,
+          ok: true,
+          json: () => new Promise((_resolve, reject) => {
+            init.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+          }),
+        })) as unknown as typeof fetch,
+      });
+      expect(report).toBe("Claude usage unavailable: usage request timed out.");
+    } finally {
+      (AbortSignal as unknown as { timeout: typeof original }).timeout = original;
+    }
+  });
+});
+
+describe("keychainErrorMessage", () => {
+  const mk = (over: Partial<ExecFileException>): ExecFileException => over as ExecFileException;
+
+  it("maps an execFile timeout (killed/signal) to a timeout message", () => {
+    expect(keychainErrorMessage(mk({ killed: true, signal: "SIGTERM" }), "")).toContain("timed out");
+  });
+
+  it("maps exit code 44 (item not found) to a login prompt", () => {
+    expect(keychainErrorMessage(mk({ code: 44 as unknown as string }), "")).toContain("Log in with Claude Code");
+  });
+
+  it("maps a locked/denied Keychain to an unlock message", () => {
+    expect(keychainErrorMessage(mk({ code: "1" }), "SecKeychain: interaction is not allowed")).toContain("locked");
+  });
+
+  it("falls back to a generic read failure otherwise", () => {
+    expect(keychainErrorMessage(mk({ code: "1" }), "unexpected")).toContain("could not read");
   });
 });

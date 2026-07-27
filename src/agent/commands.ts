@@ -217,15 +217,21 @@ export class ChatCommandHandler {
 
     if (command === "usage") {
       // /usage exposes account-wide plan + utilization + scoped caps, so gate it
-      // like /login: owner's private DM only. A group is shared, so any member
-      // could otherwise read the owner's subscription state.
+      // EXACTLY like /login: owner's private DM only, and — unlike /model and
+      // /restore — it never falls open when no identities exist (channels
+      // default to open, so a bare DM must not read the owner's subscription
+      // state). A group is shared, so any member is refused regardless.
       if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
         await channel.send({ chatId, text: "⚠️ /usage is only available in a configured owner's private DM." });
         return;
       }
-      if (!this.isIdentityOwner(channel, senderId)) {
+      const usageIdentity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+      if (!usageIdentity) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/usage refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: "⚠️ Only a configured owner can view usage." });
+        const text = config.identities.length === 0
+          ? "⚠️ No owner identity is configured, so /usage is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /usage again."
+          : "⚠️ Only a configured owner can view usage.";
+        await channel.send({ chatId, text });
         return;
       }
       // Classify gateway routing the same way the SDK does — from the session's

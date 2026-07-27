@@ -279,6 +279,23 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/usage stays locked (does not fall open) when no identities are configured", async () => {
+    // Channels are open by default, so with zero identities a bare DM must NOT
+    // read account usage — it points at identity setup, exactly like /login.
+    resetConfig({ identities: [] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("usage", "12345", "Anyone", undefined, "12345");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("No owner identity is configured");
+    expect(tg.sent[0].text).toContain("tomo config");
+
+    await agent.stop();
+  });
+
   it("/pet reports when Tomo has no pet", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

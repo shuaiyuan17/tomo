@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -122,6 +122,13 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
     return usageError(err);
   }
 
+  // Parsed JSON can be semantically malformed (e.g. a literal `null`, which is
+  // typeof "object"): accessing `.claudeAiOauth` on it would throw outside any
+  // catch. Guard the shape before extraction.
+  if (!creds || typeof creds !== "object") {
+    return "Claude usage unavailable: Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).";
+  }
+
   const oauth = creds.claudeAiOauth;
   const token = oauth?.accessToken;
   if (!token) {
@@ -216,7 +223,7 @@ export function formatUsageReport(
   }
 
   const extra = d.extra_usage;
-  if (extra && typeof extra === "object" && extra.is_enabled) {
+  if (extra && typeof extra === "object" && extra.is_enabled === true) {
     const used = typeof extra.used_credits === "number" && Number.isFinite(extra.used_credits) ? extra.used_credits : 0;
     const limit = typeof extra.monthly_limit === "number" && Number.isFinite(extra.monthly_limit) ? extra.monthly_limit : 0;
     const currency = typeof extra.currency === "string" && extra.currency && extra.currency !== "USD"
@@ -434,7 +441,7 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
       { timeout: 5000 },
       (err, stdout, stderr) => {
         if (err) {
-          const code = (err as NodeJS.ErrnoException).code;
+          const code = err.code;
           // ONLY the `security` binary being absent (non-macOS / not on PATH)
           // may fall back to the on-disk credentials file. Node reports this as
           // a string "ENOENT" code; a real Keychain error carries a numeric
@@ -446,11 +453,19 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
           // Operational Keychain failures (item-not-found, locked, access
           // denied, timeout) must NOT fall back to a possibly-stale on-disk
           // credential — surface an actionable message instead.
-          reject(new UsageCredentialError(keychainErrorMessage(code, stderr), false));
+          reject(new UsageCredentialError(keychainErrorMessage(err, stderr), false));
           return;
         }
         try {
-          resolve(JSON.parse(stdout.trim()) as ClaudeCredentials);
+          const parsed: unknown = JSON.parse(stdout.trim());
+          if (!parsed || typeof parsed !== "object") {
+            reject(new UsageCredentialError(
+              "Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).",
+              false,
+            ));
+            return;
+          }
+          resolve(parsed as ClaudeCredentials);
         } catch {
           reject(new UsageCredentialError("Keychain credentials were not valid JSON.", false));
         }
@@ -460,10 +475,17 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
 }
 
 /** Map a `security` non-ENOENT failure to a fixed, actionable message. */
-function keychainErrorMessage(code: string | number | undefined, stderr: string | Buffer | undefined): string {
+export function keychainErrorMessage(err: ExecFileException, stderr: string | Buffer | undefined): string {
+  // An execFile timeout kills the child (killed=true, signal set) and usually
+  // leaves stderr empty, so check it BEFORE the stderr-based branches or it
+  // collapses to the generic message.
+  if (err.killed || err.signal) {
+    return "the macOS Keychain lookup timed out — unlock the Keychain and try /usage again.";
+  }
+  const code = err.code;
   const text = String(stderr ?? "").toLowerCase();
   // errSecItemNotFound → exit 44, or the tool prints "could not be found".
-  if (code === 44 || text.includes("could not be found")) {
+  if (code === 44 || code === "44" || text.includes("could not be found")) {
     return "no Claude Code credentials in the macOS Keychain. Log in with Claude Code first.";
   }
   if (text.includes("interaction is not allowed") || text.includes("denied") || text.includes("locked")) {
@@ -482,11 +504,19 @@ async function readFileCredentials(): Promise<ClaudeCredentials> {
       false,
     );
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as ClaudeCredentials;
+    parsed = JSON.parse(raw);
   } catch {
     throw new UsageCredentialError("Claude Code credentials file was not valid JSON.", false);
   }
+  if (!parsed || typeof parsed !== "object") {
+    throw new UsageCredentialError(
+      "Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).",
+      false,
+    );
+  }
+  return parsed as ClaudeCredentials;
 }
 
 /** Credential-loading failure carrying a chat-friendly message. */

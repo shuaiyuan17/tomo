@@ -35,7 +35,7 @@ const DEFAULT_RESTART_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000];
 const STABLE_CHILD_MS = 60_000;
 
 /** Slash commands recognized by all channels (mirrors the BlueBubbles channel). */
-const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "status", "cost", "pet", "summon", "dismiss", "pause", "resume"]);
+const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
 
 export interface ImsgCapabilities {
   /** RPC methods advertised by the installed imsg binary. */

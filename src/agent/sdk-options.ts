@@ -5,7 +5,7 @@ import { buildSystemPrompt } from "../workspace/index.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
-import { CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
+import { litellmRoutesModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 import { resolvePlugins } from "./plugins.js";
 
@@ -213,8 +213,7 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   // leftover per-session "opus" override — must bypass it and hit Anthropic
   // directly rather than be sent to a proxy that can't serve Claude.
   const litellm = config.litellm;
-  const useGateway = Boolean(litellm?.baseUrl)
-    && (litellm!.mode !== CHATGPT_SUBSCRIPTION_MODE || isChatGptSubscriptionModel(args.model));
+  const useGateway = litellmRoutesModel(litellm, args.model);
   const useDirectApiKey = !useGateway && config.auth.method === "api-key";
   if (!args.disableAutoCompact && !useGateway && !useDirectApiKey) return null;
 

@@ -245,6 +245,57 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/usage refuses in a group chat (owner DM only)", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345", "-100777"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("usage", "-100777", "GroupMember", undefined, "99999");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("private DM");
+
+    await agent.stop();
+  });
+
+  it("/usage refuses an allowlisted sender who is not a configured owner", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("usage", "12345", "Other", undefined, "99999");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("configured owner");
+
+    await agent.stop();
+  });
+
+  it("/usage stays locked (does not fall open) when no identities are configured", async () => {
+    // Channels are open by default, so with zero identities a bare DM must NOT
+    // read account usage — it points at identity setup, exactly like /login.
+    resetConfig({ identities: [] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("usage", "12345", "Anyone", undefined, "12345");
+
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].text).toContain("No owner identity is configured");
+    expect(tg.sent[0].text).toContain("tomo config");
+
+    await agent.stop();
+  });
+
   it("/pet reports when Tomo has no pet", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -253,7 +304,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("pet", "12345", "TestUser");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Tomo doesn't have a pet yet. Ask Tomo to hatch one!");
+    expect(tg.sent[0].text).toBe("🦀 Tomo doesn't have a pet yet. Ask Tomo to hatch one!");
 
     await agent.stop();
   });
@@ -277,7 +328,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("pet", "12345", "TestUser");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("🐾 Mochi the star fox");
+    expect(tg.sent[0].text).toContain("🦀 Mochi the star fox");
     expect(tg.sent[0].text).toContain("Stage: baby");
     expect(tg.sent[0].text).toContain("Mood: happy");
     expect(tg.sent[0].text).toContain("Hunger: 82/100 · Happiness: 74/100");
@@ -574,7 +625,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-5[1m]");
+    expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5[1m]");
 
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
@@ -600,7 +651,7 @@ describe("chat commands", () => {
 
     await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
 
-    expect(tg.sent.at(-1)?.text).toBe("Switched to claude-opus-5[1m]");
+    expect(tg.sent.at(-1)?.text).toBe("🔄 Switched to claude-opus-5[1m]");
     expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
 
     await agent.stop();
@@ -615,7 +666,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8[1m]");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-opus-4-8[1m]");
+    expect(tg.sent[0].text).toBe("🔄 Switched to claude-opus-4-8[1m]");
 
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
@@ -634,7 +685,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-5-1");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to claude-sonnet-5-1");
+    expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5-1");
 
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
@@ -660,7 +711,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("Switched to chatgpt/gpt-5.5");
+    expect(tg.sent[0].text).toBe("🔄 Switched to chatgpt/gpt-5.5");
 
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
@@ -1034,10 +1085,10 @@ describe("/pause and /resume", () => {
     agent.addChannel(tg);
 
     await tg.simulateCommand("pause", "12345", "TestUser");
-    expect(tg.sent[0].text).toBe("/pause only works in group chats.");
+    expect(tg.sent[0].text).toBe("⚠️ /pause only works in group chats.");
 
     await tg.simulateCommand("resume", "12345", "TestUser");
-    expect(tg.sent[1].text).toBe("/resume only works in group chats.");
+    expect(tg.sent[1].text).toBe("⚠️ /resume only works in group chats.");
 
     // DM messages still flow normally.
     tg.clearDelivered();

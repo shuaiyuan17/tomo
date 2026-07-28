@@ -71,6 +71,7 @@ tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 | `/login` | Refresh Claude login from a configured owner's private DM (`/login cancel` aborts a pending login) |
 | `/status` | Show session info (model, channel, message count) |
 | `/cost` | Show current-session cost for 1d / 7d / 1mo |
+| `/usage` | Show Claude subscription usage limits (5-hour and weekly windows + reset countdowns) |
 | `/pet` | Check Tomo's pet's mood, growth stage, and stats |
 | `/summon` | (groups) Pull your main DM session into this group temporarily |
 | `/dismiss` | (groups) Hand the group back to its own Tomo session |

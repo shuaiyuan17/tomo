@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage } from "../channels/types.js";
+import { IMESSAGE_SEND_EFFECTS } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { ReplyTarget, SessionEntry } from "../sessions/types.js";
@@ -12,7 +13,7 @@ import { extractAttachments } from "./text-utils.js";
 import { normalizeSendTarget } from "./send-target.js";
 import { formatTomoEvent } from "../tomo-event.js";
 
-export type SendResult = { ok: true } | { ok: false; error: string };
+export type SendResult = { ok: true; note?: string } | { ok: false; error: string };
 
 export interface SessionCatalog {
   identities: Array<{ name: string }>;
@@ -57,7 +58,7 @@ export class ProactiveSendService {
    * No Claude query is invoked for the recipient — the message arrives as-is.
    * A pending note is queued so the recipient's next Claude turn has context.
    */
-  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string }): Promise<SendResult> {
+  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string }): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
@@ -67,6 +68,28 @@ export class ProactiveSendService {
     const channel = this.deps.getChannel(replyTarget.channelName);
     if (!channel) {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
+    }
+
+    // Expressive-send effect: a delivery property of the send. The failure
+    // model is uniform with the channel layer's (degraded bridge, send.rich
+    // refusal): THE TEXT ALWAYS DELIVERS, THE EFFECT SILENTLY VANISHES — and
+    // the tool result note says so. A fire-and-forget send must never die on
+    // a typo'd effect name ("laser" for "lasers"): an error is only right
+    // when the caller can retry, and by the time this returns there is no
+    // retry that isn't a duplicate message. Only iMessage can render
+    // effects; on any other channel the field is dropped before the send, so
+    // nothing ever leaks into visible text.
+    let effect: string | undefined;
+    let effectNote: string | undefined;
+    if (options?.effect !== undefined) {
+      const normalized = options.effect.trim().toLowerCase();
+      if (!(IMESSAGE_SEND_EFFECTS as readonly string[]).includes(normalized)) {
+        effectNote = `Note: unknown effect "${options.effect}" was dropped — the message was sent without it. Valid effects: ${IMESSAGE_SEND_EFFECTS.join(", ")}.`;
+      } else if (channel.name === "imessage") {
+        effect = normalized;
+      } else {
+        effectNote = `Note: effect "${normalized}" was ignored — channel "${channel.name}" does not support iMessage effects; the message was sent without it.`;
+      }
     }
 
     // Resolve the reply-to substring to a provider message id before sending
@@ -81,9 +104,12 @@ export class ProactiveSendService {
 
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
     if (mediaPaths.length > 0 || stickerIds.length > 0) {
-      // Send text first (matches assistant response ordering)
+      // Send text first (matches assistant response ordering). The effect
+      // rides the text send — it modifies delivery of text, not attachments.
       if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: cleanText, ...(replyToId ? { replyTo: replyToId } : {}) });
+        await channel.send({ chatId: replyTarget.chatId, text: cleanText, ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+      } else if (effect) {
+        effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
       }
       const validPaths = mediaPaths.filter((p) => existsSync(p));
       for (const path of validPaths) {
@@ -102,7 +128,7 @@ export class ProactiveSendService {
       }
     } else {
       // No attachments: preserve verbatim text (direct-mode contract)
-      await channel.send({ chatId: replyTarget.chatId, text, ...(replyToId ? { replyTo: replyToId } : {}) });
+      await channel.send({ chatId: replyTarget.chatId, text, ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
     }
 
     // Attribute the send in the target session's record. Only claim it came
@@ -129,8 +155,8 @@ export class ProactiveSendService {
         ? `You sent the following message to this conversation earlier as a direct send: "${text}"`
         : `Tomo from another session sent the following message to this conversation earlier: "${text}"`));
 
-    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length }, "Message sent (direct)");
-    return { ok: true };
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect }, "Message sent (direct)");
+    return { ok: true, ...(effectNote ? { note: effectNote } : {}) };
   }
 
   /**

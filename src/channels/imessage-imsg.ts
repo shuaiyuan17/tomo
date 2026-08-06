@@ -33,6 +33,23 @@ const DEFAULT_CHAT_DB_PATH = join(homedir(), "Library", "Messages", "chat.db");
 // repeats forever; the index resets once a child stays up for STABLE_CHILD_MS.
 const DEFAULT_RESTART_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000];
 const STABLE_CHILD_MS = 60_000;
+// Silent retry schedule for a DEGRADED startup capability probe. The common
+// cause is a boot-order race: after a reboot (every macOS update) the daemon
+// comes up before Messages.app has relaunched with the bridge dylib injected,
+// so the first probe reports advanced_features=false even though the bridge
+// appears on its own moments later (#258). Retries are quiet; the loud
+// actionable warning fires only after the whole schedule is exhausted
+// (~2 minutes), by which point the bridge is genuinely absent and the
+// `imsg launch` advice is accurate. The schedule is a total window, not a
+// forever-loop: after it, on-demand re-probes (below) take over.
+const DEFAULT_CAPABILITY_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 15_000, 30_000, 60_000];
+// Floor between on-demand capability re-probes (a capability-gated call that
+// found the cached answer false). Each probe spawns `imsg status --json`, and
+// gated sites fire per message / per typing start — the floor keeps the
+// degraded steady state at one cheap subprocess per 30s instead of one per
+// call, while still picking a late-appearing bridge up within ~30s of the
+// next gated call.
+const DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS = 30_000;
 
 /** Slash commands recognized by all channels (mirrors the BlueBubbles channel). */
 const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
@@ -73,6 +90,10 @@ export interface ImsgChannelConfig {
   probeCapabilities?: () => Promise<ImsgCapabilities>;
   /** Test seam: restart backoff schedule. */
   restartDelaysMs?: number[];
+  /** Test seam: silent retry schedule for a degraded startup capability probe. */
+  capabilityRetryDelaysMs?: number[];
+  /** Test seam: rate-limit floor between on-demand capability re-probes. */
+  capabilityReprobeMinIntervalMs?: number;
   /** Max time to wait for a `drain` on a parked write before treating the child
    *  as wedged and restarting it. Default 10s. */
   drainWaitTimeoutMs?: number;
@@ -149,6 +170,14 @@ export class ImsgChannel implements Channel {
   private restartAttempt = 0;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private capabilities: ImsgCapabilities = NO_CAPABILITIES;
+  private readonly capabilityRetryDelaysMs: number[];
+  private readonly capabilityReprobeMinIntervalMs: number;
+  /** Pending timer of the silent startup capability-retry loop. */
+  private capabilityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Single-flight guard: at most one capability probe subprocess at a time. */
+  private capabilityProbeInFlight = false;
+  /** When the last capability probe started (rate-limits on-demand re-probes). */
+  private lastCapabilityProbeAt = 0;
   /** Exclusive chat.db rowid cursor; watch resubscribes after this row. */
   private lastRowId = 0;
   // Lowest rowid whose dispatch failed and hasn't been re-handled yet. While
@@ -181,6 +210,8 @@ export class ImsgChannel implements Channel {
     this.spawnFn = config.spawnFn ?? nodeSpawn;
     this.probeCapabilitiesFn = config.probeCapabilities ?? (() => this.probeStatus());
     this.restartDelaysMs = config.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS;
+    this.capabilityRetryDelaysMs = config.capabilityRetryDelaysMs ?? DEFAULT_CAPABILITY_RETRY_DELAYS_MS;
+    this.capabilityReprobeMinIntervalMs = config.capabilityReprobeMinIntervalMs ?? DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS;
     this.drainWaitTimeoutMs = config.drainWaitTimeoutMs ?? DEFAULT_DRAIN_WAIT_TIMEOUT_MS;
     this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
     this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
@@ -201,27 +232,29 @@ export class ImsgChannel implements Channel {
 
     // Capability probe: `imsg status --json` reports the injected bridge's
     // selector availability. Failure is non-fatal — the channel degrades to
-    // basic send/watch (AppleScript transport needs no bridge).
+    // basic send/watch (AppleScript transport needs no bridge). A degraded
+    // first probe is usually a boot-order race (daemon up before Messages.app
+    // has the bridge injected, #258), so it is NOT warned about here: the
+    // silent retry loop below re-probes with backoff and only warns once the
+    // schedule is exhausted, and capability-gated call sites keep re-probing
+    // on demand after that — a bridge that appears later is picked up without
+    // a daemon restart.
     try {
       this.capabilities = await this.probeCapabilitiesFn();
-      log.info({
-        advancedFeatures: this.capabilities.advancedFeatures,
-        typing: this.capabilities.typingIndicators,
-        readReceipts: this.capabilities.readReceipts,
-        editSupported: this.isEditSupported(),
-      }, "imsg capabilities probed");
-      // Hard operational prerequisite: without `imsg launch` (bridge injected),
-      // the IMCore-backed outbound RPCs — send.rich, tapback, message.unsend,
-      // group.rename, typing — have no live path and BLOCK until their request
-      // timeouts (30s / 5s) fire. Inbound watch and plain AppleScript `send`
-      // still work, but outbound is effectively dead. Warn loudly so a cutover
-      // that skipped `imsg launch` is obvious in the logs.
-      if (!this.capabilities.advancedFeatures) {
-        log.warn("imsg bridge NOT injected (advanced_features=false): run `imsg launch`. Until then, outbound tapback/typing/unsend/rename/threaded-reply RPCs will hang until timeout; only inbound watch and plain sends work.");
-      }
     } catch (err) {
       this.capabilities = NO_CAPABILITIES;
-      log.warn({ err }, "imsg status probe failed; assuming basic features only");
+      log.info({ err }, "imsg status probe failed; assuming basic features until a re-probe succeeds");
+    }
+    this.lastCapabilityProbeAt = Date.now();
+    log.info({
+      advancedFeatures: this.capabilities.advancedFeatures,
+      typing: this.capabilities.typingIndicators,
+      readReceipts: this.capabilities.readReceipts,
+      editSupported: this.isEditSupported(),
+    }, "imsg capabilities probed");
+    if (!this.capabilities.advancedFeatures) {
+      log.info({ retryDelaysMs: this.capabilityRetryDelaysMs }, "imsg bridge not available yet (advanced_features=false); re-probing quietly with backoff");
+      this.scheduleCapabilityRetry(0);
     }
 
     // First spawn + subscribe must succeed or daemon startup should fail
@@ -237,6 +270,10 @@ export class ImsgChannel implements Channel {
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
+    }
+    if (this.capabilityRetryTimer) {
+      clearTimeout(this.capabilityRetryTimer);
+      this.capabilityRetryTimer = null;
     }
 
     if (this.child && this.subscriptionId !== null) {
@@ -283,6 +320,11 @@ export class ImsgChannel implements Channel {
         } catch (err) {
           log.warn({ err, chatId: message.chatId }, "imsg threaded reply failed; falling back to plain send");
         }
+      } else if (threaded) {
+        // Bridge down per the cached snapshot → this reply goes out plain, as
+        // before. Kick a rate-limited background re-probe so a bridge that has
+        // since come up (#258) restores threading for the next send.
+        this.maybeReprobeCapabilities();
       }
       const result = await this.request("send", {
         chat_guid: message.chatId,
@@ -349,6 +391,10 @@ export class ImsgChannel implements Channel {
     // Messages.app on the BlueBubbles path (#227). Only proceed when the
     // startup selector probe confirmed one of them exists.
     if (!this.isEditSupported()) {
+      // No-op unless the BRIDGE itself is down (a stale degraded snapshot,
+      // #258). A missing edit selector with a live bridge is a real OS-level
+      // limit (macOS 26 removed both selectors) that no re-probe can change.
+      this.maybeReprobeCapabilities();
       throw new Error(
         "iMessage message editing is unsupported on this macOS: the IMCore edit selectors "
         + "(editMessageItem/editMessage) are unavailable per the imsg bridge probe. "
@@ -442,8 +488,11 @@ export class ImsgChannel implements Channel {
 
   startTyping(chatId: string): StopTyping {
     // Typing indicators require the IMCore bridge; without it every tick
-    // would error, so degrade to a no-op.
+    // would error, so degrade to a no-op — but kick a rate-limited background
+    // re-probe first, so a bridge that came up after the cached snapshot
+    // (#258) is noticed and the NEXT typing start works.
     if (!this.capabilities.typingIndicators) {
+      this.maybeReprobeCapabilities();
       return () => {};
     }
 
@@ -979,6 +1028,10 @@ export class ImsgChannel implements Channel {
     // Mark chat as read (best-effort; needs the bridge's read-receipt path).
     if (this.capabilities.readReceipts) {
       this.request("read", { chat_guid: chatGuid }, 5_000).catch(() => {});
+    } else {
+      // Skipped as before — but a degraded snapshot may be stale (#258), so
+      // kick a rate-limited background re-probe off the inbound path.
+      this.maybeReprobeCapabilities();
     }
 
     const imageSavedPaths = images.map((i) => i.savedPath).filter((p): p is string => Boolean(p));
@@ -1335,6 +1388,102 @@ export class ImsgChannel implements Channel {
   }
 
   // --- Capability probe ---
+
+  /**
+   * Silent startup retry loop for a degraded capability probe (#258). The
+   * common cause is a boot-order race — the daemon starts before Messages.app
+   * has come up with the bridge dylib injected (every macOS-update reboot) —
+   * so retries stay QUIET: no warning until the whole schedule is exhausted,
+   * and a retry that finds the bridge simply swaps the snapshot in (one info
+   * line from reprobeCapabilities) and ends the loop. Once exhausted, the
+   * loud warning fires — at that point the bridge is genuinely absent and
+   * `imsg launch` is accurate advice — and on-demand re-probes take over so a
+   * bridge that appears even later is still picked up without a restart.
+   * Never calls `imsg launch` itself: that kills and relaunches Messages.app
+   * and must stay a human decision.
+   */
+  private scheduleCapabilityRetry(attempt: number): void {
+    if (this.stopping || this.capabilityRetryTimer) return;
+    if (attempt >= this.capabilityRetryDelaysMs.length) {
+      // Hard operational prerequisite: without `imsg launch` (bridge
+      // injected), the IMCore-backed outbound RPCs — send.rich, tapback,
+      // message.unsend, group.rename, typing — have no live path and BLOCK
+      // until their request timeouts (30s / 5s) fire. Inbound watch and plain
+      // AppleScript `send` still work, but outbound is effectively dead. Warn
+      // loudly (only now, after the silent retries) so a cutover that skipped
+      // `imsg launch` is obvious in the logs.
+      log.warn(
+        { retriesExhausted: this.capabilityRetryDelaysMs.length },
+        "imsg bridge NOT injected (advanced_features=false) after startup retries: run `imsg launch`. Until then, outbound tapback/typing/unsend/rename/threaded-reply RPCs will hang until timeout; only inbound watch and plain sends work. The channel keeps re-probing in the background and picks the bridge up automatically once it is injected.",
+      );
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.capabilityRetryTimer = null;
+      if (this.stopping) return;
+      void this.reprobeCapabilities("startup retry").then(() => {
+        if (this.stopping || this.capabilities.advancedFeatures) return; // healed (or shutting down) — silently done
+        this.scheduleCapabilityRetry(attempt + 1);
+      });
+    }, this.capabilityRetryDelaysMs[attempt]);
+    // Don't hold the process open just for a pending capability retry.
+    timer.unref?.();
+    this.capabilityRetryTimer = timer;
+  }
+
+  /**
+   * Fire-and-forget re-probe for capability-gated call sites that found the
+   * cached answer false. The gated call itself still skips exactly as before
+   * (no subprocess, no latency on its path) — the probe runs in the
+   * background so the NEXT call sees a fresh answer. No-op when:
+   * - the bridge is already up (a per-selector false, e.g. editSupported on
+   *   macOS 26, is a real OS limit a re-probe cannot change),
+   * - the startup retry loop still owns probing, or
+   * - a probe ran within the last capabilityReprobeMinIntervalMs (keeps the
+   *   degraded steady state at ≤1 subprocess per interval, not one per call).
+   */
+  private maybeReprobeCapabilities(): void {
+    if (this.stopping) return;
+    if (this.capabilities.advancedFeatures) return;
+    if (this.capabilityRetryTimer) return;
+    if (Date.now() - this.lastCapabilityProbeAt < this.capabilityReprobeMinIntervalMs) return;
+    this.lastCapabilityProbeAt = Date.now(); // reserve the slot before the async probe
+    void this.reprobeCapabilities("on-demand");
+  }
+
+  /**
+   * Re-run the capability probe and swap in the fresh snapshot. Single-flight:
+   * concurrent callers coalesce into one subprocess. A probe FAILURE keeps the
+   * cached snapshot — callers only re-probe while degraded, so there is
+   * nothing to lose — and logs at debug (failures while degraded are expected
+   * noise, and the actionable warning already fired once at startup). The only
+   * non-debug output is one info line when the bridge transitions to
+   * available, so a transient boot-order race that resolves itself resolves
+   * without ever warning.
+   */
+  private async reprobeCapabilities(reason: string): Promise<void> {
+    if (this.capabilityProbeInFlight) return;
+    this.capabilityProbeInFlight = true;
+    try {
+      const caps = await this.probeCapabilitiesFn();
+      const hadBridge = this.capabilities.advancedFeatures;
+      this.capabilities = caps;
+      if (!hadBridge && caps.advancedFeatures) {
+        log.info({
+          reason,
+          advancedFeatures: caps.advancedFeatures,
+          typing: caps.typingIndicators,
+          readReceipts: caps.readReceipts,
+          editSupported: this.isEditSupported(),
+        }, "imsg bridge is now available; capabilities upgraded");
+      }
+    } catch (err) {
+      log.debug({ err, reason }, "imsg capability re-probe failed; keeping cached capabilities");
+    } finally {
+      this.lastCapabilityProbeAt = Date.now();
+      this.capabilityProbeInFlight = false;
+    }
+  }
 
   /** Run `imsg status --json` and normalize the capability surface. */
   private probeStatus(): Promise<ImsgCapabilities> {

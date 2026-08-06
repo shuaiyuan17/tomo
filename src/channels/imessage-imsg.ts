@@ -1450,7 +1450,7 @@ export class ImsgChannel implements Channel {
       } else {
         log.warn(
           { err: this.lastCapabilityProbeError, retriesExhausted: this.capabilityRetryDelaysMs.length },
-          "imsg status probe still failing after startup retries — capabilities UNKNOWN, assuming basic features. This is a probe failure, not (necessarily) a missing bridge: check the imsg binary first (`imsg status --json`) before reaching for `imsg launch`. Outbound tapback/typing/unsend/rename/threaded-reply stay disabled until a probe succeeds; the channel keeps re-probing in the background.",
+          "imsg status probe still failing after startup retries — capabilities UNKNOWN, assuming basic features. This is a probe failure, not (necessarily) a missing bridge: check the imsg binary first (`imsg status --json`) before reaching for `imsg launch`. Typing and threaded replies degrade to no-ops (they are capability-gated); tapback/unsend/rename are NOT gated and will still be attempted — if the bridge is in fact absent they hang until their request timeout. The channel keeps re-probing in the background.",
         );
       }
       return;

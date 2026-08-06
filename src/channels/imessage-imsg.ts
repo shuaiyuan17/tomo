@@ -4,7 +4,7 @@ import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
-import { formatImageMarker } from "./imageStore.js";
+import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
 import { log } from "../logger.js";
@@ -13,7 +13,8 @@ import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARK
 import { endsWithTrailingNoReply } from "../agent/text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
-import { convertHeicToJpeg, looksLikeHeic } from "./heic.js";
+import { convertHeicImage, heicHasAlpha, looksLikeHeic, type HeicTargetFormat } from "./heic.js";
+import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
@@ -129,11 +130,16 @@ export interface ImsgChannelConfig {
    */
   serviceLookup?: ServiceLookup;
   /**
-   * Test seam: HEIC/HEIF → JPEG converter. Given a source path, returns the
-   * path to a temp JPEG (the channel reads then unlinks it) or `null` on
-   * failure. Defaults to a macOS `sips`-backed implementation.
+   * Test seam: HEIC/HEIF converter. Given a source path and a target format,
+   * returns the path to a temp JPEG/PNG (the channel reads then unlinks it)
+   * or `null` on failure. Defaults to a macOS `sips`-backed implementation.
    */
-  convertHeic?: (srcPath: string) => Promise<string | null>;
+  convertHeic?: (srcPath: string, format: HeicTargetFormat) => Promise<string | null>;
+  /**
+   * Test seam: alpha-channel probe for a source image file. `true`/`false` on
+   * a clean probe, `null` when unknown. Defaults to `sips -g hasAlpha`.
+   */
+  probeHeicAlpha?: (srcPath: string) => Promise<boolean | null>;
 }
 
 interface PendingRequest {
@@ -179,7 +185,8 @@ export class ImsgChannel implements Channel {
   private readonly drainWaitTimeoutMs: number;
   private messageGuidDedupe: MessageGuidDedupeStore;
   private readonly serviceLookup: ServiceLookup;
-  private readonly convertHeicFn: (srcPath: string) => Promise<string | null>;
+  private readonly convertHeicFn: (srcPath: string, format: HeicTargetFormat) => Promise<string | null>;
+  private readonly probeHeicAlphaFn: (srcPath: string) => Promise<boolean | null>;
   // Settles a request's parked-on-'drain' write link, keyed by request id, so a
   // request timeout/cancel can release its own stuck write (else future writes
   // queue behind a forever-pending drain-wait).
@@ -248,7 +255,8 @@ export class ImsgChannel implements Channel {
     this.drainWaitTimeoutMs = config.drainWaitTimeoutMs ?? DEFAULT_DRAIN_WAIT_TIMEOUT_MS;
     this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
     this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
-    this.convertHeicFn = config.convertHeic ?? convertHeicToJpeg;
+    this.convertHeicFn = config.convertHeic ?? convertHeicImage;
+    this.probeHeicAlphaFn = config.probeHeicAlpha ?? heicHasAlpha;
     this.loadCursor();
   }
 
@@ -1126,8 +1134,14 @@ export class ImsgChannel implements Channel {
     }
 
     // Attachments arrive as local file paths (imsg reads chat.db directly).
+    // Stickers are counted apart from plain images: chat.db marks them
+    // (attachment.is_sticker, surfaced by imsg 0.13+) and a sticker described
+    // as just "an image" buries the expressive act (and, worse, hides that
+    // the source lives in StickerCache with its alpha channel intact).
     const rawAttachments = Array.isArray(data.attachments) ? data.attachments as Array<Record<string, unknown>> : [];
-    const intendedImageCount = rawAttachments.filter((a) => this.attachmentMime(a).startsWith("image/")).length;
+    const isImageAtt = (a: Record<string, unknown>) => this.attachmentMime(a).startsWith("image/");
+    const intendedStickerCount = rawAttachments.filter((a) => isImageAtt(a) && a.is_sticker === true).length;
+    const intendedImageCount = rawAttachments.filter((a) => isImageAtt(a) && a.is_sticker !== true).length;
     const intendedDocumentCount = rawAttachments.filter((a) => isSupportedDocumentMime(this.attachmentMime(a))).length;
     const { images, documents } = await this.loadAttachments(rawAttachments, chatGuid);
 
@@ -1144,8 +1158,10 @@ export class ImsgChannel implements Channel {
       this.maybeReprobeCapabilities();
     }
 
-    const imageSavedPaths = images.map((i) => i.savedPath).filter((p): p is string => Boolean(p));
+    const imageSavedPaths = images.filter((i) => !i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
+    const stickerSavedPaths = images.filter((i) => i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
     const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
+    const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths);
     const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
 
@@ -1181,7 +1197,7 @@ export class ImsgChannel implements Channel {
       )
       : "";
 
-    const markers = [satelliteMarker, replyMarker, imageMarker, docMarker].filter(Boolean).join(" ");
+    const markers = [satelliteMarker, replyMarker, stickerMarker, imageMarker, docMarker].filter(Boolean).join(" ");
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;
@@ -1432,10 +1448,15 @@ export class ImsgChannel implements Channel {
           // group photos, converted JPEG on a DM photo, 2026-07-07). The
           // harness image reader can't display HEIC, so normalize here as a
           // channel-side fallback: any HEIC (by mime, extension, OR ftyp magic
-          // bytes) is converted to JPEG via sips before it's stored/encoded.
+          // bytes) is converted via sips before it's stored/encoded — to PNG
+          // when the pixels carry alpha (a JPEG rendition flattens the
+          // transparency into a solid background), to JPEG otherwise.
           // Failure keeps the original bytes — never drop the attachment.
-          const { buffer: imageBuffer, mimeType: imageMime } = await this.normalizeHeicImage(buffer, mimeType, filePath);
-          images.push(await buildImageAttachment(imageBuffer, imageMime, meta, this.imageStoreBaseDir));
+          const isSticker = att.is_sticker === true;
+          const { buffer: imageBuffer, mimeType: imageMime } = await this.normalizeHeicImage(buffer, mimeType, filePath, isSticker);
+          const image = await buildImageAttachment(imageBuffer, imageMime, meta, this.imageStoreBaseDir);
+          if (isSticker) image.isSticker = true;
+          images.push(image);
         } else {
           const filename = (typeof att.transfer_name === "string" && att.transfer_name) || basename(filePath);
           documents.push(await buildDocumentAttachment(buffer, mimeType, { ...meta, filename }, this.imageStoreBaseDir));
@@ -1449,35 +1470,58 @@ export class ImsgChannel implements Channel {
   }
 
   /**
-   * Channel-side HEIC/HEIF → JPEG fallback. Returns the JPEG buffer + mime when
-   * the attachment is HEIC and the conversion succeeds; otherwise returns the
-   * inputs unchanged so a non-HEIC image passes through untouched and a failed
-   * conversion keeps the original bytes (never drops the attachment). Never
-   * throws. `filePath` is only used for extension sniffing — the convert reads
-   * the same on-disk file imsg pointed us at, and writes to a temp JPEG that we
-   * read then unlink; chat.db and Messages are never touched.
+   * Channel-side HEIC/HEIF → JPEG/PNG fallback. Returns the converted buffer
+   * + mime when the attachment is HEIC and the conversion succeeds; otherwise
+   * returns the inputs unchanged so a non-HEIC image passes through untouched
+   * and a failed conversion keeps the original bytes (never drops the
+   * attachment). Never throws. `filePath` is only used for extension sniffing
+   * and the alpha probe — the convert reads the same on-disk file imsg
+   * pointed us at, and writes to a temp file that we read then unlink;
+   * chat.db and Messages are never touched.
+   *
+   * Target format: transparency must survive the transcode — a transparent
+   * HEIC written to JPEG silently lands on a solid background (a die-cut
+   * sticker's backdrop turned black and nobody noticed for a day,
+   * 2026-08-05). Keeping HEIC isn't an option (the harness image reader
+   * can't display it), so PNG is the alpha-safe target. Stickers skip the
+   * probe entirely: their source (~/Library/Messages/StickerCache/…/*.heic)
+   * is transparent die-cut art by construction, and a PNG of one is also
+   * exactly what `send.sticker` accepts back, so the saved copy stays
+   * resendable as a native sticker. Non-sticker HEICs ask `sips -g hasAlpha`
+   * and fall back to JPEG when the probe can't answer — the pre-existing
+   * behavior for ordinary photos, where PNG would cost megabytes for
+   * nothing.
    */
   private async normalizeHeicImage(
     buffer: Buffer,
     mimeType: string,
     filePath: string,
+    isSticker = false,
   ): Promise<{ buffer: Buffer; mimeType: string }> {
     if (!looksLikeHeic(mimeType, filePath, buffer)) return { buffer, mimeType };
 
-    const jpegPath = await this.convertHeicFn(filePath).catch((err) => {
-      log.error({ err, path: filePath }, "HEIC->JPEG conversion threw; keeping original attachment");
+    let format: HeicTargetFormat;
+    if (isSticker) {
+      format = "png";
+    } else {
+      const alpha = await this.probeHeicAlphaFn(filePath).catch(() => null);
+      format = alpha === true ? "png" : "jpeg";
+    }
+
+    const outPath = await this.convertHeicFn(filePath, format).catch((err) => {
+      log.error({ err, path: filePath, format }, "HEIC conversion threw; keeping original attachment");
       return null;
     });
-    if (!jpegPath) return { buffer, mimeType };
+    if (!outPath) return { buffer, mimeType };
 
     try {
-      const jpegBuffer = await readFile(jpegPath);
-      return { buffer: jpegBuffer, mimeType: "image/jpeg" };
+      const converted = await readFile(outPath);
+      return { buffer: converted, mimeType: format === "png" ? "image/png" : "image/jpeg" };
     } catch (err) {
-      log.error({ err, path: filePath, jpegPath }, "Failed to read converted JPEG; keeping original attachment");
+      log.error({ err, path: filePath, outPath }, "Failed to read converted image; keeping original attachment");
       return { buffer, mimeType };
     } finally {
-      await unlink(jpegPath).catch(() => undefined);
+      await unlink(outPath).catch(() => undefined);
     }
   }
 
@@ -1579,7 +1623,22 @@ export class ImsgChannel implements Channel {
         // have dispatched the sticker before dying; propagate rather than
         // risk the recipient seeing the image twice.
         if (!(err instanceof ImsgRpcResponseError)) throw err;
-        log.warn({ err, chatId: chatGuid }, "imsg sticker send refused; falling back to a plain image attachment");
+        if (isStickerStagingRefusal(err)) {
+          // The dylib's staging-hygiene walk refused an already-staged path.
+          // imsg 0.13.4's send.sticker RPC stages the file itself (same
+          // StickerAssetPreparer step as the CLI), so this is NOT a
+          // missing-staging bug on our side — it means an ancestor of
+          // ~/Library/Messages/Attachments/imsg/stickers fails the dylib's
+          // per-component checks (user-owned, not world-writable, no
+          // symlinks). Diagnose locally so the log names the component and
+          // the remedy instead of parroting the opaque bridge error.
+          log.warn(
+            { err, chatId: chatGuid, ...stickerStagingDiagnosis() },
+            "imsg sticker send refused by the bridge's staging-hygiene check; falling back to a plain image attachment",
+          );
+        } else {
+          log.warn({ err, chatId: chatGuid }, "imsg sticker send refused; falling back to a plain image attachment");
+        }
       }
     } else {
       // Snapshot lacks the sticker surface. When the bridge itself is down

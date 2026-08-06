@@ -96,6 +96,22 @@ export function formatImageMarker(intendedCount: number, savedPaths: string[]): 
 }
 
 /**
+ * Sticker sibling of {@link formatImageMarker} — the iMessage counterpart of
+ * the Telegram channel's `describeSticker`. A sticker arriving as a bare
+ * "[Sent an image]" is indistinguishable from a photo, which buries the
+ * expressive act; naming it lets the agent react to it as a sticker and, via
+ * the resend hint, send the saved copy back as a native sticker later
+ * (`STICKER:<path>` accepts a local image path on the iMessage channel).
+ * The hint is only offered when a copy was actually persisted.
+ */
+export function formatStickerMarker(intendedCount: number, savedPaths: string[]): string {
+  if (intendedCount <= 0) return "";
+  const noun = intendedCount === 1 ? "a sticker" : `${intendedCount} stickers`;
+  if (savedPaths.length === 0) return `[Sent ${noun}]`;
+  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}; resend with STICKER:<saved path>]`;
+}
+
+/**
  * Locate the EXIF Orientation tag (0x0112) in a JPEG buffer.
  *
  * iPhone photos forwarded through iMessage/BlueBubbles preserve the original

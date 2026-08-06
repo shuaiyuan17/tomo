@@ -217,6 +217,8 @@ The harness strips the STICKER tag from visible text and sends the sticker. The 
 - Telegram: a \`file_id\` you have seen or been given in that chat.
 - iMessage: a local image path, sent as a native sticker balloon (falls back to a plain image attachment if native sticker send is unavailable). Curated sticker images live in \`~/.tomo/workspace/stickers/\` — see its README for what's there and when to use them.
 
+An inbound iMessage sticker arrives marked \`[Sent a sticker, saved to: <path>]\` — the saved PNG keeps its transparency and can be sent back later as a native sticker via \`STICKER:<that path>\`.
+
 ## Chat Formatting
 
 This is a messaging app, not a document. Keep responses chat-native:

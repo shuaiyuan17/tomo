@@ -16,7 +16,7 @@ vi.mock("../src/logger.js", () => ({
   },
 }));
 
-const { buildImagePath, findExifOrientation, mimeToExt, normalizeJpegBuffer, saveInboundImage } = await import("../src/channels/imageStore.js");
+const { buildImagePath, findExifOrientation, formatStickerMarker, mimeToExt, normalizeJpegBuffer, saveInboundImage } = await import("../src/channels/imageStore.js");
 
 /**
  * Build a minimal JPEG buffer that contains just enough structure for the EXIF
@@ -219,4 +219,26 @@ describe("normalizeJpegBuffer", () => {
   // The end-to-end "orientation 6 → rotated + patched to 1" path requires sips
   // and a real JPEG; it's covered manually on real iPhone photos and indirectly
   // through the saveInboundImage integration test on Mac CI.
+});
+
+describe("formatStickerMarker", () => {
+  it("returns empty for zero stickers", () => {
+    expect(formatStickerMarker(0, [])).toBe("");
+  });
+
+  it("names a sticker without a saved path (no resend hint without a copy)", () => {
+    expect(formatStickerMarker(1, [])).toBe("[Sent a sticker]");
+  });
+
+  it("includes the saved path and the STICKER: resend hint", () => {
+    expect(formatStickerMarker(1, ["/abs/s.png"])).toBe(
+      "[Sent a sticker, saved to: /abs/s.png; resend with STICKER:<saved path>]",
+    );
+  });
+
+  it("pluralizes multiple stickers", () => {
+    expect(formatStickerMarker(2, ["/abs/a.png", "/abs/b.png"])).toBe(
+      "[Sent 2 stickers, saved to: /abs/a.png, /abs/b.png; resend with STICKER:<saved path>]",
+    );
+  });
 });

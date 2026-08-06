@@ -59,7 +59,26 @@ export interface OutgoingMessage {
   photo?: string;
   /** Optional: Telegram sticker file_id to send */
   sticker?: string;
+  /**
+   * Optional: iMessage expressive-send effect for this message's text (one of
+   * IMESSAGE_SEND_EFFECTS). A delivery property, not a payload — channels that
+   * cannot render effects (Telegram, the AppleScript fallback) ignore the
+   * field entirely; it must never be rendered into visible message text.
+   */
+  effect?: string;
 }
+
+/**
+ * Expressive-send effect names accepted by OutgoingMessage.effect — the
+ * friendly names imsg's `send.rich` expands to Apple effect bundle ids
+ * (imsg ExpressiveSendEffect.expand). The first four are bubble effects
+ * (rendered on the bubble itself); the rest are full-screen effects.
+ */
+export const IMESSAGE_SEND_EFFECTS = [
+  "impact", "loud", "gentle", "invisibleink",
+  "confetti", "lasers", "fireworks", "balloons", "sparkles",
+  "spotlight", "echo", "love", "celebration",
+] as const;
 
 export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
 

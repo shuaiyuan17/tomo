@@ -1167,7 +1167,7 @@ export class Agent {
   // delegates so the MCP server wiring keeps calling Agent's public surface.
   // See agent/proactive-send.ts.
 
-  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string }): Promise<SendResult> {
+  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string }): Promise<SendResult> {
     return this.proactive.sendToSession(target, text, callerSessionKey, options);
   }
 

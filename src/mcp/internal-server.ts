@@ -83,21 +83,32 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           reply_to: z.string().optional().describe(
             "Direct mode only: send as a threaded reply. Case-insensitive substring of the target message's text, matched over the chat's recent messages (newest first, seen since Tomo started). Errors without sending if nothing matches.",
           ),
+          effect: z.string().optional().describe(
+            "Direct mode only, iMessage only: deliver the message with an expressive-send effect. Bubble effects: impact, loud, gentle, invisibleink. Full-screen effects: confetti, lasers, fireworks, balloons, sparkles, spotlight, echo, love, celebration. Use sparingly, for moments that genuinely warrant it (a real congratulations, big news) — an effect is loud. Best-effort: if the iMessage bridge is down the message sends plain, without the effect. Ignored with a note on channels that cannot render effects.",
+          ),
         },
-        async ({ target, message, mode, reply_to }) => {
+        async ({ target, message, mode, reply_to, effect }) => {
           if (reply_to !== undefined && mode !== "direct") {
             return {
               content: [{ type: "text" as const, text: "send_message failed: reply_to requires mode \"direct\"" }],
               isError: true,
             };
           }
+          if (effect !== undefined && mode !== "direct") {
+            return {
+              content: [{ type: "text" as const, text: "send_message failed: effect requires mode \"direct\"" }],
+              isError: true,
+            };
+          }
           const result = mode === "direct"
-            ? await agent.sendToSession(target, message, callerSessionKey, reply_to !== undefined ? { replyTo: reply_to } : undefined)
+            ? await agent.sendToSession(target, message, callerSessionKey, reply_to !== undefined || effect !== undefined
+              ? { ...(reply_to !== undefined ? { replyTo: reply_to } : {}), ...(effect !== undefined ? { effect } : {}) }
+              : undefined)
             : await agent.delegateToSession(target, message);
 
           if (result.ok) {
             return {
-              content: [{ type: "text" as const, text: `OK (${mode}).` }],
+              content: [{ type: "text" as const, text: result.note ? `OK (${mode}). ${result.note}` : `OK (${mode}).` }],
             };
           }
           return {

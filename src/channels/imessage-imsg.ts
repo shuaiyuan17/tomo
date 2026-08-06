@@ -58,6 +58,16 @@ const DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS = 30_000;
 /** Slash commands recognized by all channels (mirrors the BlueBubbles channel). */
 const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
 
+/**
+ * True when an outbound message part is exactly one http(s) URL and nothing
+ * else — the only shape eligible for a rich link preview send (send.rich's
+ * url mode carries no accompanying text).
+ */
+function isBareHttpUrl(part: string): boolean {
+  const trimmed = part.trim();
+  return /^https?:\/\/\S+$/i.test(trimmed);
+}
+
 export interface ImsgCapabilities {
   /** RPC methods advertised by the installed imsg binary. */
   rpcMethods: Set<string>;
@@ -322,34 +332,86 @@ export class ImsgChannel implements Channel {
 
     const chunks = splitText(text, TEXT_CHUNK_LIMIT);
     for (const [i, chunk] of chunks.entries()) {
-      // Threaded replies need the IMCore bridge (send.rich); plain sends stay
-      // on the AppleScript transport. Only the first chunk threads —
-      // continuation chunks read as one message, not repeated replies.
-      const threaded = i === 0 && message.replyTo;
-      if (threaded && this.capabilities.advancedFeatures) {
+      // Threaded replies and expressive-send effects need the IMCore bridge
+      // (send.rich); plain sends stay on the AppleScript transport. Only the
+      // first chunk carries either: continuation chunks read as one message,
+      // not repeated replies — and one effect per message, not one per chunk
+      // (three confetti bursts for one long message is noise, not emphasis).
+      const richParams = i === 0 && (message.replyTo || message.effect)
+        ? {
+          ...(message.replyTo ? { reply_to: message.replyTo } : {}),
+          ...(message.effect ? { effect: message.effect } : {}),
+        }
+        : null;
+      if (richParams && this.capabilities.advancedFeatures) {
         try {
           const result = await this.request("send.rich", {
             chat_guid: message.chatId,
             text: chunk,
-            reply_to: message.replyTo,
+            ...richParams,
             part_index: 0,
           });
           this.recordOwnSend(message.chatId, result, chunk);
           continue;
         } catch (err) {
-          log.warn({ err, chatId: message.chatId }, "imsg threaded reply failed; falling back to plain send");
+          log.warn({ err, chatId: message.chatId }, "imsg rich send failed; falling back to plain send");
         }
-      } else if (threaded) {
-        // Bridge down per the cached snapshot → this reply goes out plain, as
-        // before. Kick a rate-limited background re-probe so a bridge that has
-        // since come up (#258) restores threading for the next send.
+      } else if (richParams) {
+        // Bridge down per the cached snapshot → this goes out plain, as
+        // before (the effect is silently dropped — a structured field, so
+        // nothing can leak into the visible text). Kick a rate-limited
+        // background re-probe so a bridge that has since come up (#258)
+        // restores rich sends for the next send.
         this.maybeReprobeCapabilities();
+      } else if (isBareHttpUrl(chunk)) {
+        // A part that is exactly one URL: send it as an Apple rich link
+        // preview when the injected bridge supports it (the balloon iMessage
+        // renders when a human shares a link), else leave it a plain text
+        // send as before. send.rich's url mode accepts NO other params
+        // (no text/reply_to/effect), which is why this branch is mutually
+        // exclusive with the rich-text branch above.
+        if (this.richLinksSupported()) {
+          if (await this.trySendRichLink(message.chatId, chunk.trim())) continue;
+        } else {
+          // Degraded or pre-rich-link bridge snapshot — maybe stale (#258).
+          this.maybeReprobeCapabilities();
+        }
       }
       const result = await this.request("send", {
         chat_guid: message.chatId,
         text: chunk,
       });
       this.recordOwnSend(message.chatId, result, chunk);
+    }
+  }
+
+  /**
+   * Rich link previews need more than `advanced_features`: the injected
+   * bridge must expose both rich-link selectors (added in imsg 0.13 — an
+   * older bridge still running inside Messages.app reports neither, and
+   * send.rich's url mode refuses). The RPC handler re-checks the live bridge
+   * itself; this cached gate just avoids a doomed roundtrip per URL send.
+   */
+  private richLinksSupported(): boolean {
+    return this.capabilities.advancedFeatures
+      && this.capabilities.selectors.urlPreviewMessage === true
+      && this.capabilities.selectors.sendRichLinkAction === true;
+  }
+
+  /**
+   * Best-effort rich-link send. imsg fetches link metadata server-side with a
+   * bounded (~8s) deadline and degrades to a URL-only preview on fetch
+   * failure, so an error here means the send did NOT happen (validation or
+   * bridge refusal) — safe to fall back to a plain text send of the same URL.
+   */
+  private async trySendRichLink(chatId: string, url: string): Promise<boolean> {
+    try {
+      const result = await this.request("send.rich", { chat_guid: chatId, url });
+      this.recordOwnSend(chatId, result, url);
+      return true;
+    } catch (err) {
+      log.warn({ err, chatId }, "imsg rich link send failed; falling back to plain text send");
+      return false;
     }
   }
 

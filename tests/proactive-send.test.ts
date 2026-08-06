@@ -235,6 +235,55 @@ describe("ProactiveSendService.sendToSession", () => {
     expect(result).toEqual({ ok: true });
     expect(h.channel.sent).toHaveLength(1);
   });
+
+  it("passes a normalized effect through to an iMessage send", async () => {
+    const h = makeHarness({}, new FakeChannel("imessage"));
+
+    const result = await h.service.sendToSession("imessage:+15551234567", "恭喜!!", undefined, { effect: " Confetti " });
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.sent).toEqual([{ chatId: "+15551234567", text: "恭喜!!", effect: "confetti" }]);
+  });
+
+  it("rejects an unknown effect name without sending", async () => {
+    const h = makeHarness({}, new FakeChannel("imessage"));
+
+    const result = await h.service.sendToSession("imessage:+15551234567", "hi", undefined, { effect: "explosions" });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/unknown imessage effect "explosions".*confetti/i);
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it("drops the effect with a note on channels that cannot render it", async () => {
+    const h = makeHarness();
+
+    const result = await h.service.sendToSession("telegram:12345", "big news", undefined, { effect: "confetti" });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.note).toMatch(/effect "confetti" was ignored/i);
+    expect(h.channel.sent).toEqual([{ chatId: "12345", text: "big news" }]);
+    expect(JSON.stringify(h.channel.sent)).not.toContain("confetti");
+  });
+
+  it("rides the effect on the text send, never on attachments", async () => {
+    const h = makeHarness({}, new FakeChannel("imessage"));
+    const dir = join(tmpdir(), `tomo-effect-test-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    const photo = join(dir, "pic.png");
+    writeFileSync(photo, "fake");
+    try {
+      const result = await h.service.sendToSession("imessage:+15551234567", `celebrate! MEDIA:${photo}`, undefined, { effect: "confetti" });
+
+      expect(result).toEqual({ ok: true });
+      expect(h.channel.sent).toEqual([
+        { chatId: "+15551234567", text: "celebrate!", effect: "confetti" },
+        { chatId: "+15551234567", photo, text: "" },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("ProactiveSendService.delegateToSession", () => {

@@ -100,6 +100,12 @@ const CAPS_BASIC: ImsgCapabilities = {
   readReceipts: false,
 };
 
+/** Bridge with the imsg 0.13 rich-link selectors injected. */
+const CAPS_RICHLINK: ImsgCapabilities = {
+  ...CAPS_FULL,
+  selectors: { ...CAPS_FULL.selectors, urlPreviewMessage: true, sendRichLinkAction: true },
+};
+
 function makeChannel(options: {
   caps?: ImsgCapabilities;
   responder?: Responder;
@@ -811,6 +817,143 @@ describe("imsg outbound send", () => {
     await channel.send({ chatId: DM_GUID, text: "plain", replyTo: "guid-target" });
 
     expect(requests().map((r) => r.method)).not.toContain("send.rich");
+    await channel.stop();
+  });
+
+  it("sends the expressive-send effect via send.rich on the first chunk only", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const longText = `${"x".repeat(3990)} ${"y".repeat(100)}`;
+    await channel.send({ chatId: DM_GUID, text: longText, effect: "confetti" });
+
+    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(all[0].method).toBe("send.rich");
+    expect(all[0].params).toMatchObject({ chat_guid: DM_GUID, effect: "confetti", part_index: 0 });
+    for (const rest of all.slice(1)) {
+      expect(rest.method).toBe("send");
+      expect(rest.params).not.toHaveProperty("effect");
+    }
+    expect(all.map((s) => s.params.text).join(" ")).toBe(longText);
+    await channel.stop();
+  });
+
+  it("combines effect and reply threading in a single send.rich", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "boom", replyTo: "guid-target", effect: "impact" });
+
+    const rich = requests().filter((r) => r.method === "send.rich");
+    expect(rich).toHaveLength(1);
+    expect(rich[0].params).toMatchObject({ chat_guid: DM_GUID, text: "boom", reply_to: "guid-target", effect: "impact" });
+    await channel.stop();
+  });
+
+  it("drops the effect without the bridge — plain send, no marker in text", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "congrats!", effect: "confetti" });
+
+    const sends = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].method).toBe("send");
+    expect(sends[0].params.text).toBe("congrats!");
+    expect(sends[0].params).not.toHaveProperty("effect");
+    expect(JSON.stringify(sends[0].params)).not.toContain("confetti");
+    await channel.stop();
+  });
+
+  it("falls back to a plain send when send.rich rejects an effect", async () => {
+    const { channel, requests } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send.rich") return child.respondError(req.id, -32603, "Internal error", "bridge not running");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "congrats!", effect: "confetti" });
+
+    const methods = requests().map((r) => r.method);
+    expect(methods).toContain("send.rich");
+    expect(methods).toContain("send");
+    const plain = requests().filter((r) => r.method === "send");
+    expect(plain[0].params.text).toBe("congrats!");
+    await channel.stop();
+  });
+
+  it("sends a bare-URL message as a rich link when the bridge supports it", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_RICHLINK });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/post" });
+
+    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(all).toHaveLength(1);
+    expect(all[0].method).toBe("send.rich");
+    // url mode accepts ONLY the chat target and the url — no text/part_index.
+    expect(all[0].params).toEqual({ chat_guid: DM_GUID, url: "https://example.com/post" });
+    await channel.stop();
+  });
+
+  it("keeps bare URLs as plain sends when the bridge lacks rich-link selectors", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/post" });
+
+    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(all).toHaveLength(1);
+    expect(all[0].method).toBe("send");
+    expect(all[0].params.text).toBe("https://example.com/post");
+    await channel.stop();
+  });
+
+  it("falls back to a plain send when the rich link send fails", async () => {
+    const { channel, requests } = makeChannel({
+      caps: CAPS_RICHLINK,
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send.rich") return child.respondError(req.id, -32602, "Invalid params", "Invalid rich-link URL");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/post" });
+
+    const plain = requests().filter((r) => r.method === "send");
+    expect(plain).toHaveLength(1);
+    expect(plain[0].params.text).toBe("https://example.com/post");
+    await channel.stop();
+  });
+
+  it("does not rich-link a URL embedded in prose", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_RICHLINK });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "check this out https://example.com/post" });
+
+    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(all).toHaveLength(1);
+    expect(all[0].method).toBe("send");
+    await channel.stop();
+  });
+
+  it("prefers the reply/effect rich send over a rich link for a bare-URL reply", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_RICHLINK });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/post", replyTo: "guid-target" });
+
+    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(all).toHaveLength(1);
+    expect(all[0].method).toBe("send.rich");
+    expect(all[0].params).toMatchObject({ text: "https://example.com/post", reply_to: "guid-target" });
+    expect(all[0].params).not.toHaveProperty("url");
     await channel.stop();
   });
 

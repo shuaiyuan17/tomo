@@ -2334,6 +2334,92 @@ describe("imsg capability re-probe (#258)", () => {
     await channel.stop();
   });
 
+  it("does not leak the retry loop when startup fails after a degraded probe", async () => {
+    // scheduleCapabilityRetry arms only after spawn+subscribe succeeds: a
+    // channel whose start() rejected must not keep spawning `imsg status`
+    // probes (and eventually warn) for a channel that isn't running.
+    vi.useFakeTimers();
+    const probe = vi.fn(async () => CAPS_BASIC);
+    const { channel } = makeChannel({
+      config: { probeCapabilities: probe, capabilityRetryDelaysMs: [1_000] },
+      responder: (req, child) => child.respondError(req.id, -32603, "Internal error", "Full Disk Access required"),
+    });
+    await expect(channel.start()).rejects.toThrow(/Full Disk Access/);
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(probe).toHaveBeenCalledTimes(1); // the startup probe only — no orphan loop
+  });
+
+  it("reports a probe that kept THROWING as a probe failure, not as a missing bridge", async () => {
+    // A missing/broken imsg binary, spawn error, or timeout is operationally
+    // different from a healthy probe answering advanced_features=false —
+    // telling the operator to run `imsg launch` for it points at the wrong
+    // subsystem (the same confidently-wrong-message shape #258 is about).
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(log, "warn");
+    const probe = vi.fn(async () => { throw new Error("spawn imsg ENOENT"); });
+    const { channel } = makeChannel({
+      config: { probeCapabilities: probe, capabilityRetryDelaysMs: [1_000] },
+    });
+    await channel.start();
+    await vi.advanceTimersByTimeAsync(1_000); // retry throws too → schedule exhausted
+    expect(probe).toHaveBeenCalledTimes(2);
+
+    const probeFailWarns = warnSpy.mock.calls.filter((c) =>
+      c.some((a) => typeof a === "string" && a.includes("imsg status probe still failing")));
+    expect(probeFailWarns).toHaveLength(1);
+    expect(bridgeWarns(warnSpy)).toHaveLength(0); // never blames the bridge
+    await channel.stop();
+  });
+
+  it("blames the bridge at exhaustion when the LAST probe answered (even if earlier ones threw)", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(log, "warn");
+    let probeCount = 0;
+    const probe = vi.fn(async () => {
+      probeCount++;
+      if (probeCount === 1) throw new Error("not answering yet");
+      return CAPS_BASIC; // later probes answer: the bridge really is down
+    });
+    const { channel } = makeChannel({
+      config: { probeCapabilities: probe, capabilityRetryDelaysMs: [1_000] },
+    });
+    await channel.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(probe).toHaveBeenCalledTimes(2);
+
+    expect(bridgeWarns(warnSpy)).toHaveLength(1); // accurate: run `imsg launch`
+    const probeFailWarns = warnSpy.mock.calls.filter((c) =>
+      c.some((a) => typeof a === "string" && a.includes("imsg status probe still failing")));
+    expect(probeFailWarns).toHaveLength(0);
+    await channel.stop();
+  });
+
+  it("does not mutate the capability snapshot from a probe that resolves after stop()", async () => {
+    let release!: (caps: ImsgCapabilities) => void;
+    const gate = new Promise<ImsgCapabilities>((resolve) => { release = resolve; });
+    let probeCount = 0;
+    const probe = vi.fn(async () => {
+      probeCount++;
+      return probeCount === 1 ? CAPS_BASIC : gate; // the on-demand re-probe hangs
+    });
+    const { channel } = makeChannel({
+      config: { probeCapabilities: probe, capabilityRetryDelaysMs: [], capabilityReprobeMinIntervalMs: 0 },
+    });
+    await channel.start();
+
+    channel.startTyping(DM_GUID); // kicks the gated re-probe, which parks on the gate
+    await settle();
+    expect(probe).toHaveBeenCalledTimes(2);
+
+    await channel.stop();
+    release(CAPS_FULL); // the probe resolves on a stopped channel
+    await settle();
+
+    const internals = channel as unknown as { capabilities: ImsgCapabilities };
+    expect(internals.capabilities.advancedFeatures).toBe(false); // snapshot untouched
+  });
+
   it("cancels the startup retry loop on stop()", async () => {
     vi.useFakeTimers();
     const probe = vi.fn(async () => CAPS_BASIC);

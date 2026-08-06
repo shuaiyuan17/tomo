@@ -38,10 +38,14 @@ const STABLE_CHILD_MS = 60_000;
 // comes up before Messages.app has relaunched with the bridge dylib injected,
 // so the first probe reports advanced_features=false even though the bridge
 // appears on its own moments later (#258). Retries are quiet; the loud
-// actionable warning fires only after the whole schedule is exhausted
-// (~2 minutes), by which point the bridge is genuinely absent and the
-// `imsg launch` advice is accurate. The schedule is a total window, not a
-// forever-loop: after it, on-demand re-probes (below) take over.
+// actionable warning fires only after the whole schedule is exhausted, by
+// which point the bridge is genuinely absent and the `imsg launch` advice is
+// accurate. These are the gaps BETWEEN probe attempts (122s summed), and each
+// probe can itself take up to STATUS_PROBE_TIMEOUT_MS (15s), so the warning
+// lands ~2 minutes after start when probes answer promptly and up to ~4
+// minutes when every probe times out — a bound on retry pacing, not a
+// wall-clock deadline. The schedule is finite, not a forever-loop: after it,
+// on-demand re-probes (below) take over.
 const DEFAULT_CAPABILITY_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 15_000, 30_000, 60_000];
 // Floor between on-demand capability re-probes (a capability-gated call that
 // found the cached answer false). Each probe spawns `imsg status --json`, and
@@ -176,8 +180,16 @@ export class ImsgChannel implements Channel {
   private capabilityRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /** Single-flight guard: at most one capability probe subprocess at a time. */
   private capabilityProbeInFlight = false;
-  /** When the last capability probe started (rate-limits on-demand re-probes). */
+  /** When the last capability probe completed (rate-limits on-demand re-probes). */
   private lastCapabilityProbeAt = 0;
+  /**
+   * How the last capability probe ended: null = it answered (even if it
+   * reported the bridge down), otherwise the error it threw. The exhaustion
+   * warning branches on this — "bridge not injected" and "probe keeps
+   * failing" are operationally different failures with different remedies,
+   * and naming the wrong one sends the operator to the wrong subsystem.
+   */
+  private lastCapabilityProbeError: unknown = null;
   /** Exclusive chat.db rowid cursor; watch resubscribes after this row. */
   private lastRowId = 0;
   // Lowest rowid whose dispatch failed and hasn't been re-handled yet. While
@@ -241,8 +253,10 @@ export class ImsgChannel implements Channel {
     // a daemon restart.
     try {
       this.capabilities = await this.probeCapabilitiesFn();
+      this.lastCapabilityProbeError = null;
     } catch (err) {
       this.capabilities = NO_CAPABILITIES;
+      this.lastCapabilityProbeError = err;
       log.info({ err }, "imsg status probe failed; assuming basic features until a re-probe succeeds");
     }
     this.lastCapabilityProbeAt = Date.now();
@@ -252,14 +266,19 @@ export class ImsgChannel implements Channel {
       readReceipts: this.capabilities.readReceipts,
       editSupported: this.isEditSupported(),
     }, "imsg capabilities probed");
-    if (!this.capabilities.advancedFeatures) {
-      log.info({ retryDelaysMs: this.capabilityRetryDelaysMs }, "imsg bridge not available yet (advanced_features=false); re-probing quietly with backoff");
-      this.scheduleCapabilityRetry(0);
-    }
 
     // First spawn + subscribe must succeed or daemon startup should fail
     // loudly (missing binary, missing Full Disk Access, ...).
     await this.spawnChildAndSubscribe();
+
+    // Start the capability retry loop only once startup has SUCCEEDED. If the
+    // subscribe above throws, start() rejects and nothing here has armed a
+    // timer — otherwise a channel that never started would keep spawning
+    // `imsg status` probes and eventually warn about a bridge it isn't using.
+    if (!this.capabilities.advancedFeatures) {
+      log.info({ retryDelaysMs: this.capabilityRetryDelaysMs }, "imsg bridge not available yet (advanced_features=false); re-probing quietly with backoff");
+      this.scheduleCapabilityRetry(0);
+    }
 
     log.info("iMessage channel (imsg) ready");
   }
@@ -1396,9 +1415,11 @@ export class ImsgChannel implements Channel {
    * so retries stay QUIET: no warning until the whole schedule is exhausted,
    * and a retry that finds the bridge simply swaps the snapshot in (one info
    * line from reprobeCapabilities) and ends the loop. Once exhausted, the
-   * loud warning fires — at that point the bridge is genuinely absent and
-   * `imsg launch` is accurate advice — and on-demand re-probes take over so a
-   * bridge that appears even later is still picked up without a restart.
+   * loud warning fires — worded for what actually happened (bridge reported
+   * absent vs. probe kept failing; see the branch below) — and on-demand
+   * re-probes take over so a bridge that appears even later is still picked
+   * up without a restart. Only armed after start() has fully succeeded, so a
+   * failed startup never leaks a probing loop for a dead channel.
    * Never calls `imsg launch` itself: that kills and relaunches Messages.app
    * and must stay a human decision.
    */
@@ -1412,10 +1433,26 @@ export class ImsgChannel implements Channel {
       // AppleScript `send` still work, but outbound is effectively dead. Warn
       // loudly (only now, after the silent retries) so a cutover that skipped
       // `imsg launch` is obvious in the logs.
-      log.warn(
-        { retriesExhausted: this.capabilityRetryDelaysMs.length },
-        "imsg bridge NOT injected (advanced_features=false) after startup retries: run `imsg launch`. Until then, outbound tapback/typing/unsend/rename/threaded-reply RPCs will hang until timeout; only inbound watch and plain sends work. The channel keeps re-probing in the background and picks the bridge up automatically once it is injected.",
-      );
+      //
+      // Two operationally different failures reach this point, and the
+      // warning must say which it saw — a confidently wrong remedy is worse
+      // than none (#258's original sin):
+      // - the probe ANSWERED with advanced_features=false → the bridge is
+      //   genuinely not injected and `imsg launch` is the accurate remedy;
+      // - the probe kept THROWING (missing/broken binary, spawn error,
+      //   timeout, malformed JSON) → capabilities are UNKNOWN, the bridge may
+      //   be fine, and `imsg launch` likely won't help.
+      if (this.lastCapabilityProbeError == null) {
+        log.warn(
+          { retriesExhausted: this.capabilityRetryDelaysMs.length },
+          "imsg bridge NOT injected (advanced_features=false) after startup retries: run `imsg launch`. Until then, outbound tapback/typing/unsend/rename/threaded-reply RPCs will hang until timeout; only inbound watch and plain sends work. The channel keeps re-probing in the background and picks the bridge up automatically once it is injected.",
+        );
+      } else {
+        log.warn(
+          { err: this.lastCapabilityProbeError, retriesExhausted: this.capabilityRetryDelaysMs.length },
+          "imsg status probe still failing after startup retries — capabilities UNKNOWN, assuming basic features. This is a probe failure, not (necessarily) a missing bridge: check the imsg binary first (`imsg status --json`) before reaching for `imsg launch`. Outbound tapback/typing/unsend/rename/threaded-reply stay disabled until a probe succeeds; the channel keeps re-probing in the background.",
+        );
+      }
       return;
     }
     const timer = setTimeout(() => {
@@ -1447,7 +1484,10 @@ export class ImsgChannel implements Channel {
     if (this.capabilities.advancedFeatures) return;
     if (this.capabilityRetryTimer) return;
     if (Date.now() - this.lastCapabilityProbeAt < this.capabilityReprobeMinIntervalMs) return;
-    this.lastCapabilityProbeAt = Date.now(); // reserve the slot before the async probe
+    // No reservation needed before the async call: reprobeCapabilities sets
+    // its single-flight guard synchronously, so same-tick gated calls that
+    // also pass the rate check coalesce there, and the guard's finally block
+    // re-anchors lastCapabilityProbeAt on completion.
     void this.reprobeCapabilities("on-demand");
   }
 
@@ -1462,10 +1502,14 @@ export class ImsgChannel implements Channel {
    * without ever warning.
    */
   private async reprobeCapabilities(reason: string): Promise<void> {
-    if (this.capabilityProbeInFlight) return;
+    if (this.capabilityProbeInFlight || this.stopping) return;
     this.capabilityProbeInFlight = true;
     try {
       const caps = await this.probeCapabilitiesFn();
+      // stop() may have run while the probe was in flight — a stopped channel
+      // must not mutate its snapshot (or log an upgrade it can't honor).
+      if (this.stopping) return;
+      this.lastCapabilityProbeError = null;
       const hadBridge = this.capabilities.advancedFeatures;
       this.capabilities = caps;
       if (!hadBridge && caps.advancedFeatures) {
@@ -1478,10 +1522,12 @@ export class ImsgChannel implements Channel {
         }, "imsg bridge is now available; capabilities upgraded");
       }
     } catch (err) {
+      if (this.stopping) return;
+      this.lastCapabilityProbeError = err;
       log.debug({ err, reason }, "imsg capability re-probe failed; keeping cached capabilities");
     } finally {
-      this.lastCapabilityProbeAt = Date.now();
       this.capabilityProbeInFlight = false;
+      if (!this.stopping) this.lastCapabilityProbeAt = Date.now();
     }
   }
 

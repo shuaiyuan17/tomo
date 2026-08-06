@@ -1313,6 +1313,137 @@ describe("imsg sticker sends", () => {
   });
 });
 
+// --- Capability gate diagnosis ---------------------------------------------
+//
+// A closed gate must say WHAT it read and WHAT it saw, because a key's
+// absence from the probe output is otherwise indistinguishable from "probed
+// and refused" — the exact misreading that once had both humans and agents
+// concluding "the bridge lacks stickerSend" from a 0.12.x bridge that was
+// simply never going to mention it. Provenance the verdicts encode (verified
+// against imsg v0.13.4 source): rpc_methods is a static list compiled into
+// the CLI (kSupportedRPCMethods); selectors come from the dylib actually
+// running inside Messages.app, and 0.13+ dylibs emit every key they know as
+// explicit true/false — so ABSENT means "running dylib predates the
+// feature" (heals via a real relaunch) while FALSE means "the bridge asked
+// the OS and the surface is gone" (nothing heals it).
+
+describe("imsg capability gate diagnosis", () => {
+  const stickerFile = async (fn: (stickerPath: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-diag-"));
+    const stickerPath = join(dir, "dog.jpg");
+    writeFileSync(stickerPath, "fake-jpeg-bytes");
+    try {
+      await fn(stickerPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  const diagnosisOf = (spy: ReturnType<typeof vi.spyOn>, message: string) => {
+    const call = spy.mock.calls.find((c) => c.some((a) => typeof a === "string" && a.includes(message)));
+    expect(call, `expected a log containing "${message}"`).toBeDefined();
+    return call![0] as { checked: Record<string, string | boolean>; verdict: string };
+  };
+
+  it("names an ABSENT sticker selector and the quit-then-launch remedy (running bridge predates 0.13)", async () => {
+    await stickerFile(async (stickerPath) => {
+      const infoSpy = vi.spyOn(log, "info");
+      // The trap measured live: 0.13.4 CLI (send.sticker in rpc_methods) over
+      // a still-resident 0.12.x bridge whose probe never mentions stickerSend.
+      const { channel } = makeChannel({
+        caps: { ...CAPS_FULL, rpcMethods: new Set([...CAPS_FULL.rpcMethods, "send.sticker"]) },
+      });
+      await channel.start();
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const diag = diagnosisOf(infoSpy, "native sticker send unavailable");
+      expect(diag.checked).toMatchObject({
+        "advancedFeatures": true,
+        "rpcMethods.send.sticker": true,
+        "selectors.stickerSend": "absent",
+      });
+      expect(diag.verdict).toMatch(/ABSENT from the bridge's probe/);
+      expect(diag.verdict).toMatch(/quit Messages\.app, then `imsg launch`/);
+      expect(diag.verdict).toMatch(/no-ops while the old bridge still answers ping/);
+      await channel.stop();
+    });
+  });
+
+  it("blames the installed CLI (static rpc_methods list) when it predates send.sticker", async () => {
+    await stickerFile(async (stickerPath) => {
+      const infoSpy = vi.spyOn(log, "info");
+      // Inverse skew: 0.13+ bridge already injected, old CLI on PATH.
+      const { channel } = makeChannel({
+        caps: { ...CAPS_FULL, selectors: { ...CAPS_FULL.selectors, stickerSend: true } },
+      });
+      await channel.start();
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const diag = diagnosisOf(infoSpy, "native sticker send unavailable");
+      expect(diag.checked["rpcMethods.send.sticker"]).toBe(false);
+      expect(diag.verdict).toMatch(/static list compiled into the CLI/);
+      expect(diag.verdict).toMatch(/upgrade imsg/);
+      await channel.stop();
+    });
+  });
+
+  it("distinguishes a selector the live bridge probed FALSE (OS limit, nothing heals it)", async () => {
+    await stickerFile(async (stickerPath) => {
+      const infoSpy = vi.spyOn(log, "info");
+      const { channel } = makeChannel({
+        caps: {
+          ...CAPS_FULL,
+          rpcMethods: new Set([...CAPS_FULL.rpcMethods, "send.sticker"]),
+          selectors: { ...CAPS_FULL.selectors, stickerSend: false },
+        },
+      });
+      await channel.start();
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const diag = diagnosisOf(infoSpy, "native sticker send unavailable");
+      expect(diag.checked["selectors.stickerSend"]).toBe(false);
+      expect(diag.verdict).toMatch(/probed FALSE by the live bridge/);
+      expect(diag.verdict).toMatch(/no relaunch or upgrade/);
+      await channel.stop();
+    });
+  });
+
+  it("logs the rich-link gate's reads when a bare URL degrades to plain text", async () => {
+    const infoSpy = vi.spyOn(log, "info");
+    const { channel } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/a" });
+
+    const diag = diagnosisOf(infoSpy, "rich link preview unavailable");
+    expect(diag.checked).toMatchObject({
+      "advancedFeatures": true,
+      "selectors.urlPreviewMessage": "absent",
+      "selectors.sendRichLinkAction": "absent",
+    });
+    // The rich-link gate reads no rpc_methods entry, so the diagnosis must
+    // not claim one.
+    expect(Object.keys(diag.checked).some((k) => k.startsWith("rpcMethods."))).toBe(false);
+    expect(diag.verdict).toMatch(/ABSENT from the bridge's probe/);
+    await channel.stop();
+  });
+
+  it("logs the edit gate's reads (selectors probed FALSE on macOS 26) before throwing", async () => {
+    const warnSpy = vi.spyOn(log, "warn");
+    const { channel } = makeChannel({ caps: CAPS_FULL }); // editMessageItem/editMessage: false
+    await channel.start();
+    await expect(channel.editMessage(DM_GUID, "guid-1", "fixed")).rejects.toThrow(/unsupported on this macOS/i);
+
+    const diag = diagnosisOf(warnSpy, "message edit refused by capability gate");
+    expect(diag.checked).toMatchObject({
+      "rpcMethods.message.edit": true,
+      "selectors.editMessageItem": false,
+      "selectors.editMessage": false,
+    });
+    expect(diag.verdict).toMatch(/probed FALSE by the live bridge/);
+    await channel.stop();
+  });
+});
+
 // --- Tapback / unsend / edit -----------------------------------------------------
 
 describe("imsg tapback, unsend, and edit", () => {

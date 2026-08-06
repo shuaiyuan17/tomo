@@ -80,11 +80,29 @@ function isBareHttpUrl(part: string): boolean {
 class ImsgRpcResponseError extends Error {}
 
 export interface ImsgCapabilities {
-  /** RPC methods advertised by the installed imsg binary. */
+  /**
+   * RPC methods advertised by the installed imsg binary. Provenance (verified
+   * against imsg v0.13.4 source): this is `kSupportedRPCMethods` in
+   * Sources/imsg/RPCServer.swift — a STATIC list compiled into the CLI. It
+   * proves the CLI process we spawn can dispatch the method; it says NOTHING
+   * about the bridge dylib actually running inside Messages.app (which may be
+   * older: the injected copy persists across brew upgrades until Messages
+   * truly relaunches). Never gate a bridge-side surface on this alone.
+   */
   rpcMethods: Set<string>;
   /** IMCore bridge injected into Messages.app (advanced features live). */
   advancedFeatures: boolean;
-  /** Per-selector availability probed by the bridge (macOS-version dependent). */
+  /**
+   * Per-selector availability probed by the bridge — the LIVE signal: `imsg
+   * status` asks the injected dylib, which answers with the selector dict
+   * compiled into it. 0.13+ dylibs emit every key they know as an explicit
+   * true/false (a dictionary literal), which makes the two negative shapes
+   * distinguishable: key === false means the bridge probed the OS and the
+   * IMCore surface is missing (a real OS limit, e.g. the macOS 26 edit
+   * selectors); key ABSENT means the running dylib predates the feature
+   * entirely (e.g. a 0.12.x bridge never mentions `stickerSend`) — a state
+   * that heals only via a real Messages relaunch with the newer dylib.
+   */
   selectors: Record<string, boolean>;
   typingIndicators: boolean;
   readReceipts: boolean;
@@ -395,8 +413,14 @@ export class ImsgChannel implements Channel {
           // with the 0.13+ bridge adds the selectors while advanced_features
           // stays true throughout — hence evenIfBridged, or the reprobe
           // would early-return forever and rich links would need a daemon
-          // restart to ever light up.
+          // restart to ever light up. (Mind the operational trap the
+          // diagnosis names: `imsg launch` alone no-ops while the old bridge
+          // still answers ping — Messages must actually quit first.)
           this.maybeReprobeCapabilities({ evenIfBridged: true });
+          log.info(
+            { chatId: message.chatId, ...this.capabilityGateDiagnosis(null, ["urlPreviewMessage", "sendRichLinkAction"]) },
+            "imsg rich link preview unavailable; sending the URL as plain text",
+          );
         }
       }
       const result = await this.request("send", {
@@ -501,6 +525,10 @@ export class ImsgChannel implements Channel {
       // #258). A missing edit selector with a live bridge is a real OS-level
       // limit (macOS 26 removed both selectors) that no re-probe can change.
       this.maybeReprobeCapabilities();
+      log.warn(
+        { chatId, messageId, ...this.capabilityGateDiagnosis("message.edit", ["editMessageItem", "editMessage"]) },
+        "imsg message edit refused by capability gate",
+      );
       throw new Error(
         "iMessage message editing is unsupported on this macOS: the IMCore edit selectors "
         + "(editMessageItem/editMessage) are unavailable per the imsg bridge probe. "
@@ -1589,9 +1617,14 @@ export class ImsgChannel implements Channel {
       // bridge (advanced_features stays true throughout) — hence
       // evenIfBridged, exactly like rich links, or the reprobe would
       // early-return forever and native stickers could never light up
-      // without a daemon restart.
+      // without a daemon restart. (A relaunch means Messages actually
+      // quitting first — the diagnosis spells out why `imsg launch` alone
+      // may not be one.)
       this.maybeReprobeCapabilities({ evenIfBridged: true });
-      log.info({ chatId: chatGuid }, "imsg native sticker send unavailable; sending as a plain image attachment");
+      log.info(
+        { chatId: chatGuid, ...this.capabilityGateDiagnosis("send.sticker", ["stickerSend"]) },
+        "imsg native sticker send unavailable; sending as a plain image attachment",
+      );
     }
     const result = await this.request("send", { chat_guid: chatGuid, file: filePath });
     this.recordOwnSend(chatGuid, result, `[sticker: ${basename(filePath)}]`);
@@ -1657,6 +1690,59 @@ export class ImsgChannel implements Channel {
     // Don't hold the process open just for a pending capability retry.
     timer.unref?.();
     this.capabilityRetryTimer = timer;
+  }
+
+  /**
+   * Legible failure mode for a closed capability gate: names exactly what the
+   * gate read and what it saw, plus a one-line verdict on WHICH link of the
+   * chain broke and what (if anything) heals it. Logged at every refusal
+   * point so a reader seeing "stickers not sending" can tell, from the logs
+   * alone, whether the bridge lacks the surface or the gate misread it —
+   * absence of a key from a probe is otherwise indistinguishable from
+   * "probed and refused" (the exact confusion that shipped these gates
+   * pointing at signals nobody had verified; see the provenance notes on
+   * ImsgCapabilities).
+   *
+   * The checks mirror the gate conditions in short-circuit order:
+   * advancedFeatures, then the CLI-side rpc_methods entry (when the gate has
+   * one), then the bridge-side selectors. Pass `rpcMethod: null` for gates
+   * that don't read rpc_methods, so the diagnosis can never claim a check
+   * the gate doesn't make.
+   */
+  private capabilityGateDiagnosis(
+    rpcMethod: string | null,
+    selectorKeys: string[],
+  ): { checked: Record<string, string | boolean>; verdict: string } {
+    const caps = this.capabilities;
+    const checked: Record<string, string | boolean> = { advancedFeatures: caps.advancedFeatures };
+    if (rpcMethod !== null) checked[`rpcMethods.${rpcMethod}`] = caps.rpcMethods.has(rpcMethod);
+    const absent: string[] = [];
+    const probedFalse: string[] = [];
+    for (const key of selectorKeys) {
+      const value = caps.selectors[key];
+      checked[`selectors.${key}`] = value === undefined ? "absent" : value;
+      if (value === undefined) absent.push(key);
+      else if (value !== true) probedFalse.push(key);
+    }
+    let verdict: string;
+    if (!caps.advancedFeatures) {
+      verdict = "bridge not injected (advanced_features=false): run `imsg launch`";
+    } else if (rpcMethod !== null && !caps.rpcMethods.has(rpcMethod)) {
+      verdict = `installed imsg CLI does not implement ${rpcMethod} `
+        + "(rpc_methods is a static list compiled into the CLI, not a bridge probe): upgrade imsg";
+    } else if (absent.length > 0) {
+      verdict = Object.keys(caps.selectors).length === 0
+        ? "bridge is up but reported no selectors (its status probe failed or predates selector reporting); "
+          + "a background re-probe may heal this"
+        : `selector(s) ${absent.join(", ")} ABSENT from the bridge's probe output: the dylib running inside `
+          + "Messages.app predates this feature (0.13+ dylibs report every selector they know as explicit "
+          + "true/false). Heals only via a real relaunch: quit Messages.app, then `imsg launch` — "
+          + "launch alone silently no-ops while the old bridge still answers ping";
+    } else {
+      verdict = `selector(s) ${probedFalse.join(", ")} probed FALSE by the live bridge: the IMCore surface `
+        + "is missing on this macOS; no relaunch or upgrade changes this";
+    }
+    return { checked, verdict };
   }
 
   /**

@@ -70,19 +70,22 @@ export class ProactiveSendService {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
-    // Expressive-send effect: a delivery property of the send, validated here
-    // so a typo'd effect name fails the tool call instead of silently sending
-    // an effect-less message. Only iMessage can render effects — on any other
-    // channel the field is dropped before the send and the caller is told, so
-    // the message still goes out and nothing ever leaks into visible text.
+    // Expressive-send effect: a delivery property of the send. The failure
+    // model is uniform with the channel layer's (degraded bridge, send.rich
+    // refusal): THE TEXT ALWAYS DELIVERS, THE EFFECT SILENTLY VANISHES — and
+    // the tool result note says so. A fire-and-forget send must never die on
+    // a typo'd effect name ("laser" for "lasers"): an error is only right
+    // when the caller can retry, and by the time this returns there is no
+    // retry that isn't a duplicate message. Only iMessage can render
+    // effects; on any other channel the field is dropped before the send, so
+    // nothing ever leaks into visible text.
     let effect: string | undefined;
     let effectNote: string | undefined;
     if (options?.effect !== undefined) {
       const normalized = options.effect.trim().toLowerCase();
       if (!(IMESSAGE_SEND_EFFECTS as readonly string[]).includes(normalized)) {
-        return { ok: false, error: `Unknown iMessage effect "${options.effect}". Valid effects: ${IMESSAGE_SEND_EFFECTS.join(", ")}` };
-      }
-      if (channel.name === "imessage") {
+        effectNote = `Note: unknown effect "${options.effect}" was dropped — the message was sent without it. Valid effects: ${IMESSAGE_SEND_EFFECTS.join(", ")}.`;
+      } else if (channel.name === "imessage") {
         effect = normalized;
       } else {
         effectNote = `Note: effect "${normalized}" was ignored — channel "${channel.name}" does not support iMessage effects; the message was sent without it.`;

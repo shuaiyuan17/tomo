@@ -84,7 +84,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
             "Direct mode only: send as a threaded reply. Case-insensitive substring of the target message's text, matched over the chat's recent messages (newest first, seen since Tomo started). Errors without sending if nothing matches.",
           ),
           effect: z.string().optional().describe(
-            "Direct mode only, iMessage only: deliver the message with an expressive-send effect. Bubble effects: impact, loud, gentle, invisibleink. Full-screen effects: confetti, lasers, fireworks, balloons, sparkles, spotlight, echo, love, celebration. Use sparingly, for moments that genuinely warrant it (a real congratulations, big news) — an effect is loud. Best-effort: if the iMessage bridge is down the message sends plain, without the effect. Ignored with a note on channels that cannot render effects.",
+            "Direct mode only, iMessage only: deliver the message with an expressive-send effect. Bubble effects: impact, loud, gentle, invisibleink. Full-screen effects: confetti, lasers, fireworks, balloons, sparkles, spotlight, echo, love, celebration. Use sparingly, for moments that genuinely warrant it (a real congratulations, big news) — an effect is loud. Best-effort in every failure mode: the message always sends; the effect is dropped (with a note in the result) if the name is unknown, the channel cannot render effects, or the iMessage bridge is down.",
           ),
         },
         async ({ target, message, mode, reply_to, effect }) => {

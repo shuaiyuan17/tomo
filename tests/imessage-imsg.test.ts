@@ -943,6 +943,72 @@ describe("imsg outbound send", () => {
     await channel.stop();
   });
 
+  it("does not fall back to a plain send when a rich send fails ambiguously (no double-send)", async () => {
+    const { channel, requests } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send.rich") {
+          // Child dies with the request in flight: no error response exists
+          // to prove the message was NOT dispatched before the crash, so a
+          // fallback plain send could deliver the text twice.
+          child.emit("exit", 1, null);
+          return;
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    await expect(channel.send({ chatId: DM_GUID, text: "congrats!", effect: "confetti" })).rejects.toThrow(/send\.rich/);
+    expect(requests().filter((r) => r.method === "send")).toHaveLength(0);
+    await channel.stop();
+  });
+
+  it("does not fall back when a rich link send fails ambiguously (no double-send)", async () => {
+    const { channel, requests } = makeChannel({
+      caps: CAPS_RICHLINK,
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send.rich") {
+          child.emit("exit", 1, null);
+          return;
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    await expect(channel.send({ chatId: DM_GUID, text: "https://example.com/post" })).rejects.toThrow(/send\.rich/);
+    expect(requests().filter((r) => r.method === "send")).toHaveLength(0);
+    await channel.stop();
+  });
+
+  it("heals the rich-link selector snapshot via on-demand re-probe while the bridge stays up", async () => {
+    // advanced_features is true the WHOLE time — only the selectors change
+    // (Messages relaunched with a newer bridge dylib). This is the state the
+    // default reprobe gate early-returns on; the url path opts in.
+    let probes = 0;
+    const { channel, requests } = makeChannel({
+      config: {
+        probeCapabilities: async () => (++probes === 1 ? CAPS_FULL : CAPS_RICHLINK),
+        capabilityReprobeMinIntervalMs: 0,
+      },
+    });
+    await channel.start();
+
+    // Pre-relaunch snapshot: bare URL goes plain and kicks a background probe.
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/a" });
+    await settle();
+
+    await channel.send({ chatId: DM_GUID, text: "https://example.com/b" });
+
+    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(all.map((r) => r.method)).toEqual(["send", "send.rich"]);
+    expect(all[1].params).toEqual({ chat_guid: DM_GUID, url: "https://example.com/b" });
+    expect(probes).toBeGreaterThanOrEqual(2);
+    await channel.stop();
+  });
+
   it("prefers the reply/effect rich send over a rich link for a bare-URL reply", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_RICHLINK });
     await channel.start();

@@ -245,14 +245,17 @@ describe("ProactiveSendService.sendToSession", () => {
     expect(h.channel.sent).toEqual([{ chatId: "+15551234567", text: "恭喜!!", effect: "confetti" }]);
   });
 
-  it("rejects an unknown effect name without sending", async () => {
+  it("still sends the text when the effect name is a typo, and teaches via the note", async () => {
     const h = makeHarness({}, new FakeChannel("imessage"));
 
-    const result = await h.service.sendToSession("imessage:+15551234567", "hi", undefined, { effect: "explosions" });
+    const result = await h.service.sendToSession("imessage:+15551234567", "pew pew", undefined, { effect: "laser" });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toMatch(/unknown imessage effect "explosions".*confetti/i);
-    expect(h.channel.sent).toHaveLength(0);
+    // The failure model everywhere in this feature: the text always delivers,
+    // the effect silently vanishes. A typo'd name must not swallow the send.
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.note).toMatch(/unknown effect "laser".*lasers/i);
+    expect(h.channel.sent).toEqual([{ chatId: "+15551234567", text: "pew pew" }]);
+    expect(JSON.stringify(h.channel.sent)).not.toContain("effect");
   });
 
   it("drops the effect with a note on channels that cannot render it", async () => {

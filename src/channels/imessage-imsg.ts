@@ -68,6 +68,17 @@ function isBareHttpUrl(part: string): boolean {
   return /^https?:\/\/\S+$/i.test(trimmed);
 }
 
+/**
+ * A JSON-RPC error RESPONSE from the imsg child: the request was received,
+ * processed, and refused — proof the message was NOT sent, so recovering with
+ * a fallback plain send cannot double-deliver. Timeouts, child death, and
+ * write failures reject with plain Errors instead: the child may have
+ * consumed the request and dispatched the message before the failure, so a
+ * fallback there risks the recipient seeing the text twice. A missing message
+ * is the recoverable failure; a duplicate is the visible one.
+ */
+class ImsgRpcResponseError extends Error {}
+
 export interface ImsgCapabilities {
   /** RPC methods advertised by the installed imsg binary. */
   rpcMethods: Set<string>;
@@ -354,7 +365,13 @@ export class ImsgChannel implements Channel {
           this.recordOwnSend(message.chatId, result, chunk);
           continue;
         } catch (err) {
-          log.warn({ err, chatId: message.chatId }, "imsg rich send failed; falling back to plain send");
+          // Fall back to a plain send only on a definite refusal (an RPC
+          // error response proves nothing was sent). An ambiguous failure —
+          // timeout, child death — may have dispatched the message before
+          // dying; resending the text plain would double-deliver, so
+          // propagate instead: prefer a missing message over a duplicate.
+          if (!(err instanceof ImsgRpcResponseError)) throw err;
+          log.warn({ err, chatId: message.chatId }, "imsg rich send refused; falling back to plain send");
         }
       } else if (richParams) {
         // Bridge down per the cached snapshot → this goes out plain, as
@@ -373,8 +390,13 @@ export class ImsgChannel implements Channel {
         if (this.richLinksSupported()) {
           if (await this.trySendRichLink(message.chatId, chunk.trim())) continue;
         } else {
-          // Degraded or pre-rich-link bridge snapshot — maybe stale (#258).
-          this.maybeReprobeCapabilities();
+          // Snapshot lacks the rich-link selectors. Unlike a missing edit
+          // selector (an OS limit), this state heals: a Messages relaunch
+          // with the 0.13+ bridge adds the selectors while advanced_features
+          // stays true throughout — hence evenIfBridged, or the reprobe
+          // would early-return forever and rich links would need a daemon
+          // restart to ever light up.
+          this.maybeReprobeCapabilities({ evenIfBridged: true });
         }
       }
       const result = await this.request("send", {
@@ -401,8 +423,10 @@ export class ImsgChannel implements Channel {
   /**
    * Best-effort rich-link send. imsg fetches link metadata server-side with a
    * bounded (~8s) deadline and degrades to a URL-only preview on fetch
-   * failure, so an error here means the send did NOT happen (validation or
-   * bridge refusal) — safe to fall back to a plain text send of the same URL.
+   * failure, so an error RESPONSE here means the send did NOT happen
+   * (validation or bridge refusal) — safe to fall back to a plain text send
+   * of the same URL. An ambiguous failure (timeout, child death) propagates:
+   * the message may already be out, and a fallback would double-send it.
    */
   private async trySendRichLink(chatId: string, url: string): Promise<boolean> {
     try {
@@ -410,7 +434,8 @@ export class ImsgChannel implements Channel {
       this.recordOwnSend(chatId, result, url);
       return true;
     } catch (err) {
-      log.warn({ err, chatId }, "imsg rich link send failed; falling back to plain text send");
+      if (!(err instanceof ImsgRpcResponseError)) throw err;
+      log.warn({ err, chatId }, "imsg rich link send refused; falling back to plain text send");
       return false;
     }
   }
@@ -928,7 +953,11 @@ export class ImsgChannel implements Channel {
       if (payload.error) {
         const error = payload.error as { code?: number; message?: string; data?: string };
         const detail = error.data ? `: ${error.data}` : "";
-        req.reject(new Error(`imsg rpc ${req.method} failed (${error.code ?? "?"}) ${error.message ?? "error"}${detail}`));
+        // Typed rejection: an error RESPONSE proves the child processed and
+        // refused the request (nothing was sent) — callers with a fallback
+        // send key on this to avoid double-delivering after ambiguous
+        // failures (timeout/child-death), which reject as plain Errors.
+        req.reject(new ImsgRpcResponseError(`imsg rpc ${req.method} failed (${error.code ?? "?"}) ${error.message ?? "error"}${detail}`));
       } else {
         req.resolve((payload.result ?? {}) as Record<string, unknown>);
       }
@@ -1536,14 +1565,20 @@ export class ImsgChannel implements Channel {
    * (no subprocess, no latency on its path) — the probe runs in the
    * background so the NEXT call sees a fresh answer. No-op when:
    * - the bridge is already up (a per-selector false, e.g. editSupported on
-   *   macOS 26, is a real OS limit a re-probe cannot change),
+   *   macOS 26, is a real OS limit a re-probe cannot change) — UNLESS the
+   *   caller passes `evenIfBridged`, for selectors whose absence means "the
+   *   injected bridge predates the feature" rather than "the OS removed it":
+   *   the rich-link selectors appear when Messages relaunches with a newer
+   *   bridge dylib, an event the daemon survives with advanced_features true
+   *   throughout — so without the opt-in this gate would return early
+   *   forever and the cached selector snapshot could never heal,
    * - the startup retry loop still owns probing, or
    * - a probe ran within the last capabilityReprobeMinIntervalMs (keeps the
    *   degraded steady state at ≤1 subprocess per interval, not one per call).
    */
-  private maybeReprobeCapabilities(): void {
+  private maybeReprobeCapabilities(options: { evenIfBridged?: boolean } = {}): void {
     if (this.stopping) return;
-    if (this.capabilities.advancedFeatures) return;
+    if (this.capabilities.advancedFeatures && !options.evenIfBridged) return;
     if (this.capabilityRetryTimer) return;
     if (Date.now() - this.lastCapabilityProbeAt < this.capabilityReprobeMinIntervalMs) return;
     // No reservation needed before the async call: reprobeCapabilities sets

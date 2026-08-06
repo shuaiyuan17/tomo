@@ -1517,11 +1517,25 @@ export class ImsgChannel implements Channel {
 
   /**
    * OutgoingMessage.sticker carries one of two channel-bound payload shapes:
-   * a Telegram `file_id` (URL-safe-base64-ish, never starts with `/` or `~`)
-   * or a local image path for iMessage (always does). Discriminate by shape:
-   * path-shaped values go to `send.sticker` (native sticker balloon via the
-   * IMCore bridge), non-path values are Telegram ids that mean nothing here
-   * and keep the old warn-and-drop.
+   * a Telegram `file_id` or a local image path for iMessage (always starts
+   * with `/` or `~`). Discriminate by shape: path-shaped values go to
+   * `send.sticker` (native sticker balloon via the IMCore bridge), non-path
+   * values are Telegram ids that mean nothing here and keep the old
+   * warn-and-drop.
+   *
+   * The discriminator leans on file_ids being URL-safe-base64-ish — an
+   * OBSERVED property, not a documented contract (the Bot API only promises
+   * "a string"). The ambiguity is inherent to a single-valued tag, and we
+   * accept it deliberately: for a mis-shaped file_id to do anything on this
+   * branch it would have to be sent on the iMessage channel at all (already
+   * a model error — a file_id is only meaningful on the channel it came
+   * from), begin with `/` or `~`, AND exactly name an existing local file;
+   * failing that last coincidence the existence check below drops it, same
+   * outcome as the non-path branch. And if it does name a real file, sending
+   * that file is precisely the surface MEDIA: already exposes from the same
+   * model text. Every stricter heuristic we considered (extension checks,
+   * charset tests on the non-path side) narrows legitimate paths without
+   * changing that posture. Do not add a second tag for this.
    *
    * A sticker that can't send natively must NOT vanish: unlike an effect
    * (a delivery property riding on text), the sticker IS the message —

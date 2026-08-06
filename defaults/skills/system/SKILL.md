@@ -82,7 +82,7 @@ By default, user messages that arrive during a long tool-using turn are injected
 To send an image/file to the user, include `MEDIA:/path/to/file.png` in your response. The harness strips it from text and sends the file. Text before/after becomes the caption.
 
 ### STICKER: tag
-To send a Telegram sticker by file_id, include `STICKER:<telegram_file_id>` in your response. The harness strips it from text and sends the sticker on Telegram; other channels ignore sticker sends. Only use file_ids you have seen or been given.
+To send a sticker, include `STICKER:<value>` in your response — the harness strips it from text and sends the sticker. The value is channel-bound: on Telegram, a `file_id` you have seen or been given; on iMessage, a local image path (e.g. from `~/.tomo/workspace/stickers/`), sent as a native sticker balloon with a plain image attachment as fallback. Pick the shape that matches the conversation's channel.
 
 ### NO_REPLY
 Reply with exactly `NO_REPLY` to suppress delivery to the channel. Use for background tasks that found nothing to report.

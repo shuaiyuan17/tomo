@@ -57,7 +57,14 @@ export interface OutgoingMessage {
   replyTo?: string;
   /** Optional: file path to send as photo */
   photo?: string;
-  /** Optional: Telegram sticker file_id to send */
+  /**
+   * Optional: sticker to send. The value is channel-bound and discriminated
+   * by shape at the channel layer: a Telegram `file_id` (URL-safe-base64-ish,
+   * never starts with `/` or `~`) resends a sticker Telegram already hosts; a
+   * local image path (always starts with `/` or `~`) sends a native iMessage
+   * sticker. Each channel routes its own shape and drops the other — a
+   * file_id is only meaningful on the channel it came from.
+   */
   sticker?: string;
   /**
    * Optional: iMessage expressive-send effect for this message's text (one of

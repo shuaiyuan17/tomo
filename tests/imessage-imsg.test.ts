@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
@@ -104,6 +104,13 @@ const CAPS_BASIC: ImsgCapabilities = {
 const CAPS_RICHLINK: ImsgCapabilities = {
   ...CAPS_FULL,
   selectors: { ...CAPS_FULL.selectors, urlPreviewMessage: true, sendRichLinkAction: true },
+};
+
+/** Bridge with the imsg 0.13 sticker surface: send.sticker RPC + stickerSend selector. */
+const CAPS_STICKER: ImsgCapabilities = {
+  ...CAPS_FULL,
+  rpcMethods: new Set([...CAPS_FULL.rpcMethods, "send.sticker"]),
+  selectors: { ...CAPS_FULL.selectors, stickerSend: true },
 };
 
 function makeChannel(options: {
@@ -1122,6 +1129,190 @@ describe("imsg outbound send", () => {
   });
 });
 
+// --- Sticker sends (#259) --------------------------------------------------------
+
+describe("imsg sticker sends", () => {
+  const withStickerFile = async (fn: (stickerPath: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sticker-"));
+    const stickerPath = join(dir, "dog-big-nose.jpg");
+    writeFileSync(stickerPath, "fake-jpeg-bytes");
+    try {
+      await fn(stickerPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("routes a path-shaped sticker value to send.sticker when the bridge supports it", async () => {
+    await withStickerFile(async (stickerPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const all = requests().filter((r) => r.method === "send" || r.method === "send.sticker");
+      expect(all).toHaveLength(1);
+      expect(all[0].method).toBe("send.sticker");
+      // Standalone sticker: exactly the chat target and the file — no
+      // attach_to/part_index (attaching to a message is deliberately unwired).
+      expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
+      await channel.stop();
+    });
+  });
+
+  it("expands a leading ~ before the existence check and the RPC", async () => {
+    const name = `.tomo-imsg-sticker-test-${process.pid}-${Date.now()}.jpg`;
+    const absolute = join(homedir(), name);
+    writeFileSync(absolute, "fake-jpeg-bytes");
+    try {
+      const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: `~/${name}` });
+
+      const stickers = requests().filter((r) => r.method === "send.sticker");
+      expect(stickers).toHaveLength(1);
+      expect(stickers[0].params.file).toBe(absolute);
+      await channel.stop();
+    } finally {
+      rmSync(absolute, { force: true });
+    }
+  });
+
+  it("drops a Telegram file_id-shaped sticker value (channel-bound id)", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" });
+
+    expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
+    await channel.stop();
+  });
+
+  it("sends nothing when the sticker path does not exist", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
+    await channel.start();
+
+    await channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" });
+
+    expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
+    await channel.stop();
+  });
+
+  it("falls back to a plain attachment send when the bridge lacks the sticker surface", async () => {
+    await withStickerFile(async (stickerPath) => {
+      // CAPS_FULL: bridge up, but no send.sticker RPC / stickerSend selector
+      // (the currently-injected pre-0.13 bridge on a live cutover machine).
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const all = requests().filter((r) => r.method === "send" || r.method === "send.sticker");
+      expect(all).toHaveLength(1);
+      expect(all[0].method).toBe("send");
+      expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
+      await channel.stop();
+    });
+  });
+
+  it("heals the sticker selector snapshot via on-demand re-probe while the bridge stays up", async () => {
+    // advanced_features is true the WHOLE time — only the sticker surface
+    // appears (Messages relaunched with the 0.13 bridge dylib). The default
+    // reprobe gate early-returns on a live bridge; the sticker path opts in
+    // with evenIfBridged, mirroring rich links.
+    await withStickerFile(async (stickerPath) => {
+      let probes = 0;
+      const { channel, requests } = makeChannel({
+        config: {
+          probeCapabilities: async () => (++probes === 1 ? CAPS_FULL : CAPS_STICKER),
+          capabilityReprobeMinIntervalMs: 0,
+        },
+      });
+      await channel.start();
+
+      // Pre-relaunch snapshot: sticker degrades to a plain attachment and
+      // kicks a background probe.
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+      await settle();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const all = requests().filter((r) => r.method === "send" || r.method === "send.sticker");
+      expect(all.map((r) => r.method)).toEqual(["send", "send.sticker"]);
+      expect(probes).toBeGreaterThanOrEqual(2);
+      await channel.stop();
+    });
+  });
+
+  it("falls back to a plain attachment send when send.sticker is refused", async () => {
+    await withStickerFile(async (stickerPath) => {
+      const { channel, requests } = makeChannel({
+        caps: CAPS_STICKER,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          if (req.method === "send.sticker") return child.respondError(req.id, -32602, "Invalid params", "Sticker image must be between 1 byte and 512000 bytes");
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const methods = requests().map((r) => r.method);
+      expect(methods).toContain("send.sticker");
+      const plain = requests().filter((r) => r.method === "send");
+      expect(plain).toHaveLength(1);
+      expect(plain[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
+      await channel.stop();
+    });
+  });
+
+  it("does not fall back when send.sticker fails ambiguously (no double-send)", async () => {
+    await withStickerFile(async (stickerPath) => {
+      const { channel, requests } = makeChannel({
+        caps: CAPS_STICKER,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          if (req.method === "send.sticker") {
+            // Child dies with the request in flight: no error response proves
+            // the sticker was NOT dispatched, so a fallback could deliver it twice.
+            child.emit("exit", 1, null);
+            return;
+          }
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      await expect(channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath })).rejects.toThrow(/send\.sticker/);
+      expect(requests().filter((r) => r.method === "send")).toHaveLength(0);
+      await channel.stop();
+    });
+  });
+
+  it("records a native sticker send for substring targeting (unsend)", async () => {
+    await withStickerFile(async (stickerPath) => {
+      const { channel } = makeChannel({
+        caps: CAPS_STICKER,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          if (req.method === "send.sticker") return child.respond(req.id, { ok: true, guid: "sticker-guid-1" });
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      const recent = channel.recentMessages(DM_GUID);
+      expect(recent).toHaveLength(1);
+      expect(recent[0]).toMatchObject({ id: "sticker-guid-1", text: "[sticker: dog-big-nose.jpg]", fromMe: true });
+      await channel.stop();
+    });
+  });
+});
+
 // --- Tapback / unsend / edit -----------------------------------------------------
 
 describe("imsg tapback, unsend, and edit", () => {
@@ -1323,6 +1514,24 @@ describe("imsg outbound RPC param-name contract", () => {
       await channel.start();
       await channel.send({ chatId: DM_GUID, photo: photoPath });
       expect(keysOf(requests, "send")).toEqual(["chat_guid", "file"]);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("send.sticker → chat_guid, file", async () => {
+    // Verified against imsg v0.13.4 RPCServer+StickerHandlers.swift:
+    // supported params are chat_id|chat_identifier|chat_guid, file, attach_to,
+    // part_index; we send exactly chat_guid + file (standalone sticker).
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-contract-"));
+    const stickerPath = join(dir, "sticker.png");
+    writeFileSync(stickerPath, "x");
+    try {
+      const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
+      await channel.start();
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+      expect(keysOf(requests, "send.sticker")).toEqual(["chat_guid", "file"]);
       await channel.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });

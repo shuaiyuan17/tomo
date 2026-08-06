@@ -206,13 +206,16 @@ MEDIA:/path/to/file.png
 
 The harness will detect it, strip it from the text, and send the file to the channel. You can include text before or after the MEDIA tag.
 
-To send a Telegram sticker by file_id, include:
+To send a sticker, include one of:
 
 \`\`\`
 STICKER:<telegram_file_id>
+STICKER:/absolute/path/to/image.png
 \`\`\`
 
-The harness strips the STICKER tag from visible text and sends the sticker on Telegram. Other channels ignore sticker sends. Only use sticker file_ids you have seen or been given.
+The harness strips the STICKER tag from visible text and sends the sticker. The value is channel-bound — pick the shape that matches the conversation's channel:
+- Telegram: a \`file_id\` you have seen or been given in that chat.
+- iMessage: a local image path, sent as a native sticker balloon (falls back to a plain image attachment if native sticker send is unavailable). Curated sticker images live in \`~/.tomo/workspace/stickers/\` — see its README for what's there and when to use them.
 
 ## Chat Formatting
 

@@ -329,7 +329,7 @@ export class ImsgChannel implements Channel {
 
   async send(message: OutgoingMessage): Promise<void> {
     if (message.sticker) {
-      log.warn({ chatId: message.chatId }, "Ignoring unsupported sticker send on iMessage channel");
+      await this.sendSticker(message.chatId, message.sticker);
       return;
     }
 
@@ -1495,6 +1495,92 @@ export class ImsgChannel implements Channel {
     if (caption) {
       await this.send({ chatId: chatGuid, text: caption });
     }
+  }
+
+  // --- Outbound stickers ---
+
+  /**
+   * The whole native-sticker path is live: bridge injected, the installed
+   * imsg advertises `send.sticker` (added in 0.13), AND the bridge selector
+   * probe confirmed the sticker IMCore surface (`stickerSend` is the
+   * conjunction imsg computes over the five transfer/message selectors it
+   * needs). Like the rich-link selectors — and unlike the macOS-26 edit
+   * selectors — an absent `stickerSend` with a live bridge usually means the
+   * injected bridge dylib predates 0.13, a state that heals when Messages
+   * relaunches with the newer bridge; see the reprobe in sendSticker.
+   */
+  private stickerSendSupported(): boolean {
+    return this.capabilities.advancedFeatures
+      && this.capabilities.rpcMethods.has("send.sticker")
+      && this.capabilities.selectors.stickerSend === true;
+  }
+
+  /**
+   * OutgoingMessage.sticker carries one of two channel-bound payload shapes:
+   * a Telegram `file_id` (URL-safe-base64-ish, never starts with `/` or `~`)
+   * or a local image path for iMessage (always does). Discriminate by shape:
+   * path-shaped values go to `send.sticker` (native sticker balloon via the
+   * IMCore bridge), non-path values are Telegram ids that mean nothing here
+   * and keep the old warn-and-drop.
+   *
+   * A sticker that can't send natively must NOT vanish: unlike an effect
+   * (a delivery property riding on text), the sticker IS the message —
+   * dropping it leaves the recipient nothing. So every definite non-native
+   * outcome (unsupported bridge, send.sticker refusal — e.g. image over
+   * imsg's 500KB/618px sticker caps, or an SMS chat) degrades to a plain
+   * image attachment send: the picture arriving as a picture is most of the
+   * value, and sticker-balloon-vs-inline-image is cosmetic. Ambiguous
+   * failures (timeout, child death) propagate instead — the sticker may
+   * already be out, and a fallback would double-deliver (same rule as
+   * send.rich).
+   *
+   * `attach_to` (sticking onto an existing message) is deliberately not
+   * wired: the STICKER: tag is single-valued and cannot name a target
+   * message, and overloading `replyTo` would silently turn "threaded reply"
+   * into the visually different "affixed to bubble" act. If that act is ever
+   * wanted it needs its own surface, not a half-wiring of this one.
+   */
+  private async sendSticker(chatGuid: string, sticker: string): Promise<void> {
+    if (!sticker.startsWith("/") && !sticker.startsWith("~")) {
+      log.warn({ chatId: chatGuid }, "Ignoring non-path sticker value on iMessage channel (Telegram file_ids are channel-bound)");
+      return;
+    }
+    // Expand a leading `~` ourselves: imsg's send.sticker expands it too, but
+    // the fallback plain `send` may not, and our own existence check below
+    // certainly doesn't.
+    const filePath = sticker.replace(/^~(?=$|\/)/, homedir());
+    if (!existsSync(filePath)) {
+      log.warn({ path: filePath, chatId: chatGuid }, "Sticker file not found; nothing sent");
+      return;
+    }
+
+    if (this.stickerSendSupported()) {
+      try {
+        const result = await this.request("send.sticker", { chat_guid: chatGuid, file: filePath });
+        this.recordOwnSend(chatGuid, result, `[sticker: ${basename(filePath)}]`);
+        return;
+      } catch (err) {
+        // Degrade to a plain attachment only on a definite refusal (an RPC
+        // error response proves nothing was sent). Ambiguous failures may
+        // have dispatched the sticker before dying; propagate rather than
+        // risk the recipient seeing the image twice.
+        if (!(err instanceof ImsgRpcResponseError)) throw err;
+        log.warn({ err, chatId: chatGuid }, "imsg sticker send refused; falling back to a plain image attachment");
+      }
+    } else {
+      // Snapshot lacks the sticker surface. When the bridge itself is down
+      // this is the usual stale-snapshot case (#258); when the bridge is up
+      // but `stickerSend` is absent, the injected dylib predates imsg 0.13
+      // and the selector appears once Messages relaunches with the newer
+      // bridge (advanced_features stays true throughout) — hence
+      // evenIfBridged, exactly like rich links, or the reprobe would
+      // early-return forever and native stickers could never light up
+      // without a daemon restart.
+      this.maybeReprobeCapabilities({ evenIfBridged: true });
+      log.info({ chatId: chatGuid }, "imsg native sticker send unavailable; sending as a plain image attachment");
+    }
+    const result = await this.request("send", { chat_guid: chatGuid, file: filePath });
+    this.recordOwnSend(chatGuid, result, `[sticker: ${basename(filePath)}]`);
   }
 
   // --- Capability probe ---

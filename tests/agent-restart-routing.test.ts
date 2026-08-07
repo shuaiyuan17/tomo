@@ -16,7 +16,8 @@ import {
   mockSdk,
   resetConfig,
 } from "./helpers/agent-harness.js";
-import { serializeRestartReason } from "../src/restart-reason.js";
+import { restartReasonSessionFile, writeRestartReasonFile } from "../src/restart-reason.js";
+import { log } from "../src/logger.js";
 
 installAgentTestHooks();
 
@@ -59,14 +60,15 @@ describe("restart reason routing", () => {
     await seedDmAndGroupSessions(agent, tg);
 
     const reason = "mirroir session reload, resume reading the notes";
-    writeFileSync(agentEnv.restartReasonFilePath, serializeRestartReason({ reason, sessionKey: GROUP_KEY }), "utf-8");
+    writeRestartReasonFile(agentEnv.restartReasonFilePath, { reason, sessionKey: GROUP_KEY });
 
     mockSdk.responseFn = (text) => (text.includes(RESTART_MARKER) ? "Back online, resuming." : "unexpected");
     await agent.start();
     await drainQueue(agent);
 
-    // The reason file is consumed exactly once.
+    // The reason file and its sidecar are consumed exactly once.
     expect(existsSync(agentEnv.restartReasonFilePath)).toBe(false);
+    expect(existsSync(restartReasonSessionFile(agentEnv.restartReasonFilePath))).toBe(false);
 
     // The restart notice ran on exactly one session's context...
     const prompts = restartPrompts();
@@ -89,11 +91,10 @@ describe("restart reason routing", () => {
     agent.addChannel(tg);
     await seedDmAndGroupSessions(agent, tg);
 
-    writeFileSync(
-      agentEnv.restartReasonFilePath,
-      serializeRestartReason({ reason: "Claude login refreshed via owner DM", sessionKey: "dm:shuai" }),
-      "utf-8",
-    );
+    writeRestartReasonFile(agentEnv.restartReasonFilePath, {
+      reason: "Claude login refreshed via owner DM",
+      sessionKey: "dm:shuai",
+    });
 
     mockSdk.responseFn = (text) => (text.includes(RESTART_MARKER) ? "Login restart done." : "unexpected");
     await agent.start();
@@ -105,7 +106,7 @@ describe("restart reason routing", () => {
     await agent.stop();
   });
 
-  it("keeps legacy blessed-session delivery for an unattributed old-format plain-text reason", async () => {
+  it("keeps legacy blessed-session delivery for a reason with no attribution sidecar (old-binary file)", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: DM_CHAT }, replyPolicy: "last-active" }],
     });
@@ -114,7 +115,8 @@ describe("restart reason routing", () => {
     agent.addChannel(tg);
     await seedDmAndGroupSessions(agent, tg);
 
-    // Exactly what an older binary (or `tomo update`) writes: bare text.
+    // Exactly what an older binary (or an unattributed `tomo restart`)
+    // leaves on disk: bare reason text, no sidecar.
     writeFileSync(agentEnv.restartReasonFilePath, "Updated from v0.8.11 to v0.8.12", "utf-8");
 
     mockSdk.responseFn = (text) => (text.includes(RESTART_MARKER) ? "Update applied." : "unexpected");
@@ -140,20 +142,26 @@ describe("restart reason routing", () => {
     agent.addChannel(tg);
     await seedDmAndGroupSessions(agent, tg);
 
-    writeFileSync(
-      agentEnv.restartReasonFilePath,
-      serializeRestartReason({ reason: "private resume context", sessionKey: "telegram:-999vanished" }),
-      "utf-8",
-    );
+    writeRestartReasonFile(agentEnv.restartReasonFilePath, {
+      reason: "private resume context",
+      sessionKey: "telegram:-999vanished",
+    });
 
     await agent.start();
     await drainQueue(agent);
 
     // Misdelivery is the bug this guards against: no session may see the
-    // reason, so it is dropped (with a log line) rather than rerouted.
+    // reason, so it is dropped rather than rerouted...
     expect(restartPrompts()).toHaveLength(0);
     expect(tg.sent).toHaveLength(0);
     expect(existsSync(agentEnv.restartReasonFilePath)).toBe(false);
+
+    // ...and the warn log is the only trace an operator gets that the
+    // reason vanished, so pin it.
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionKey: "telegram:-999vanished" }),
+      expect.stringContaining("unknown session"),
+    );
 
     await agent.stop();
   });

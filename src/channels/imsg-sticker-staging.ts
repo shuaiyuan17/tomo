@@ -27,13 +27,20 @@ import { join } from "node:path";
  *    and a path outside the root yields "Sticker must use imsg's trusted
  *    staging directory".
  *
- * So a staging refusal on a correctly-formed RPC call almost always means an
- * ANCESTOR directory fails the hygiene test (the staged leaf itself was just
- * created 0700/0600 by imsg). This module reproduces the dylib's checks from
- * the daemon side so the log can name the offending component and the exact
- * remedy, instead of leaving an opaque bridge error. (Observed live
- * 2026-08-06: `~/Library/Messages` chmod'd 0777 — world-writable — which
- * fails the S_IWOTH check and blocked every sticker send on the machine.)
+ * This module reproduces the dylib's checks from the daemon side so the log
+ * can name the offending component and the exact remedy, instead of leaving
+ * an opaque bridge error. (Observed live 2026-08-06: `~/Library/Messages`
+ * chmod'd 0777 — world-writable — which fails the S_IWOTH check.)
+ *
+ * IMPORTANT CAVEAT (learned the hard way, same day): a clean walk here does
+ * NOT mean the send will work. The dylib runs inside Messages.app's sandbox
+ * and begins its secure walk by opening the user's HOME directory — a path
+ * the sandbox denies (its exceptions cover only ~/Library/Messages). That
+ * first open fails regardless of permissions, so on current imsg (≤0.13.4)
+ * the sticker path is refused unconditionally while the rich-link path —
+ * which starts its walk at the trusted root — works. Tracked upstream as
+ * openclaw/imsg#211; until it lands, the all-clear verdict below points
+ * there rather than at the user's filesystem.
  */
 
 /**
@@ -130,7 +137,11 @@ export function stickerStagingDiagnosis(home: string = homedir()): StickerStagin
   return {
     stagingRoot,
     checked,
-    verdict: "every ancestor of the staging root passes the dylib's hygiene checks from this process's view; "
-      + `the refusal came from inside Messages.app for a state not visible here (path checked: ${current})`,
+    verdict: "every ancestor of the staging root passes the dylib's hygiene checks from this process's view. "
+      + "The refusal is then almost certainly openclaw/imsg#211: the dylib's secure walk starts by opening the "
+      + "user's HOME directory, which Messages.app's sandbox denies (its file exceptions cover only "
+      + "~/Library/Messages), so the walk fails before any per-component check runs. Nothing user-side fixes "
+      + "this — no chmod, no relaunch; it needs the upstream fix (start the walk at the trusted root, as the "
+      + `rich-link path already does). Path checked: ${current}`,
   };
 }

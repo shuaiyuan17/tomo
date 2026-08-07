@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
@@ -7,7 +7,8 @@ import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { IdentityRouter } from "../router.js";
 import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
-import { isGroupSessionKey } from "../sessions/keys.js";
+import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
+import { writeRestartReasonFile } from "../restart-reason.js";
 import { DEFAULT_MODEL, MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "../models.js";
 import { buildSessionCostReport } from "../costs.js";
 import {
@@ -172,7 +173,7 @@ export class ChatCommandHandler {
         await channel.send({ chatId, text: "⚠️ Only a configured owner can restore config." });
         return;
       }
-      await this.restoreConfigAndRestart(channel, chatId);
+      await this.restoreConfigAndRestart(channel, chatId, key);
       return;
     }
 
@@ -507,8 +508,12 @@ export class ChatCommandHandler {
       const reason = completion.verified
         ? "Claude login refreshed via owner DM"
         : "Claude login refreshed via owner DM; verification probe failed";
-      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
-      writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
+      // Attribute the owner's DM session so the post-restart notice routes
+      // back to it instead of the blessed default session.
+      writeRestartReasonFile(RESTART_REASON_FILE, {
+        reason,
+        sessionKey: dmSessionKeyForIdentity(identity.name),
+      });
       await channel.send({
         chatId,
         text: completion.verified
@@ -542,7 +547,7 @@ export class ChatCommandHandler {
     }, 100);
   }
 
-  private async restoreConfigAndRestart(channel: Channel, chatId: string): Promise<void> {
+  private async restoreConfigAndRestart(channel: Channel, chatId: string, sessionKey: string): Promise<void> {
     if (!existsSync(CONFIG_BACKUP_PATH)) {
       await channel.send({ chatId, text: "⚠️ No config backup found at ~/.tomo/config.json.bak." });
       return;
@@ -554,8 +559,9 @@ export class ChatCommandHandler {
       chmodSync(CONFIG_PATH, 0o600);
 
       const reason = "Restored ~/.tomo/config.json from ~/.tomo/config.json.bak";
-      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
-      writeFileSync(RESTART_REASON_FILE, reason, "utf-8");
+      // Attribute the session that issued /restore so the post-restart notice
+      // routes back to it.
+      writeRestartReasonFile(RESTART_REASON_FILE, { reason, sessionKey });
 
       this.restoringConfig = true;
       await channel.send({ chatId, text: "♻️ Restored config.json from config.json.bak. Restarting Tomo..." });

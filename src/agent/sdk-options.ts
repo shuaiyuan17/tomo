@@ -8,6 +8,7 @@ import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.
 import { litellmRoutesModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 import { resolvePlugins } from "./plugins.js";
+import { TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -120,7 +121,11 @@ export function sdkOptions(
   const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
   systemPrompt += `\n\n# RUNTIME — Current Model\nYou are currently running on: ${modelDisplay}. This is the real model serving this session right now — trust it over any introspective guess about which model you are.`;
 
-  const sdkEnv = buildSdkEnv({ disableAutoCompact: shouldDisableAutoCompact, model: effectiveModel });
+  const sdkEnv = buildSdkEnv({
+    disableAutoCompact: shouldDisableAutoCompact,
+    model: effectiveModel,
+    sessionKey: sessionContext?.sessionKey,
+  });
   const thinking = omittedAdaptiveThinkingForModel(effectiveModel);
 
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
@@ -205,7 +210,11 @@ function omittedAdaptiveThinkingForModel(model: string): { type: "adaptive"; dis
     : undefined;
 }
 
-function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): NodeJS.ProcessEnv | null {
+function buildSdkEnv(args: {
+  disableAutoCompact: boolean;
+  model: string;
+  sessionKey?: string;
+}): NodeJS.ProcessEnv | null {
   // Decide whether this session routes through the LiteLLM proxy. A generic
   // anthropic-compatible proxy forwards every model (that's its purpose), so it
   // routes all sessions. A chatgpt-subscription proxy only serves its LiteLLM
@@ -215,7 +224,7 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   const litellm = config.litellm;
   const useGateway = litellmRoutesModel(litellm, args.model);
   const useDirectApiKey = !useGateway && config.auth.method === "api-key";
-  if (!args.disableAutoCompact && !useGateway && !useDirectApiKey) return null;
+  if (!args.disableAutoCompact && !useGateway && !useDirectApiKey && !args.sessionKey) return null;
 
   // Note: SDK `env` fully replaces the child's env (not merged despite the
   // d.ts claim), so we must spread process.env ourselves — otherwise the
@@ -242,6 +251,14 @@ function buildSdkEnv(args: { disableAutoCompact: boolean; model: string }): Node
   }
   if (args.disableAutoCompact) {
     env.DISABLE_AUTO_COMPACT = "1";
+  }
+  // Stamp the session's own key into its SDK child env. The Bash tool
+  // inherits it, so CLI commands a session runs (`tomo restart --reason ...`)
+  // can attribute their initiator — that's how a restart reason finds its way
+  // back to the session that asked for the restart instead of a blessed
+  // default session. See src/restart-reason.ts.
+  if (args.sessionKey) {
+    env[TOMO_SESSION_KEY_ENV] = args.sessionKey;
   }
   // Preserve the 1-hour prompt-cache TTL under api-key/gateway auth — without
   // this flag it silently drops to the 5-minute default, so idle-but-alive

@@ -14,7 +14,10 @@ import { log } from "../logger.js";
  * on group photos on 2026-07-07). The harness image reader can't display HEIC,
  * so any un-converted HEIC lands unreadable. This module is the channel-side
  * fallback: detect HEIC by mime, extension, or magic bytes and convert with
- * macOS `sips` so the image lands as JPEG regardless of DM vs group.
+ * macOS `sips` regardless of DM vs group. The target format is the caller's
+ * choice: PNG when the source carries alpha (iMessage stickers arrive as
+ * transparent HEIC; a JPEG rendition flattens the transparency to a solid
+ * background), JPEG for ordinary photos.
  */
 
 const HEIC_MIME_RE = /^image\/(heic|heif)(-sequence)?$/i;
@@ -66,14 +69,61 @@ export function looksLikeHeic(mime: string | undefined, filePath: string, buffer
   return isHeicMimeType(mime) || hasHeicExtension(filePath) || sniffHeic(buffer);
 }
 
+/** Output formats the HEIC converter can target. */
+export type HeicTargetFormat = "jpeg" | "png";
+
 /**
- * Convert a HEIC/HEIF file to JPEG via macOS `sips`, returning the path to a
- * freshly written temp `.jpg` (caller reads then unlinks it), or `null` on any
- * failure. Spawned with an args array (never a shell string) and never throws —
- * a failed convert must leave the caller free to fall back to the original.
+ * Probe whether an image file carries an alpha channel, via `sips -g
+ * hasAlpha`. Returns `true`/`false` on a clean probe, `null` on any failure
+ * (sips missing, unreadable file, unparseable output) — the caller decides
+ * what "unknown" means for its context. Never throws.
+ *
+ * Why it matters: JPEG cannot carry alpha, so converting a transparent HEIC
+ * (an iMessage sticker, a cut-out subject) to JPEG silently flattens the
+ * transparent background to a solid color. The probe lets the converter pick
+ * PNG for exactly those files without paying PNG's size cost on ordinary
+ * photos.
  */
-export function convertHeicToJpeg(srcPath: string): Promise<string | null> {
-  const outPath = join(tmpdir(), `tomo-heic-${randomUUID()}.jpg`);
+export function heicHasAlpha(srcPath: string): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let settled = false;
+    const done = (result: boolean | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    const child = spawn("sips", ["-g", "hasAlpha", srcPath], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+    child.on("error", (err) => {
+      log.warn({ err, srcPath }, "sips hasAlpha probe spawn failed");
+      done(null);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0) return done(null);
+      const match = /hasAlpha:\s*(yes|no)/i.exec(stdout);
+      if (!match) {
+        log.warn({ srcPath, stdout: stdout.trim().slice(0, 200) }, "sips hasAlpha probe output unparseable");
+        return done(null);
+      }
+      done(match[1].toLowerCase() === "yes");
+    });
+  });
+}
+
+/**
+ * Convert a HEIC/HEIF file to JPEG or PNG via macOS `sips`, returning the
+ * path to a freshly written temp file (caller reads then unlinks it), or
+ * `null` on any failure. The caller picks the target format — PNG when the
+ * source carries alpha (JPEG would flatten it), JPEG otherwise. Spawned with
+ * an args array (never a shell string) and never throws — a failed convert
+ * must leave the caller free to fall back to the original.
+ */
+export function convertHeicImage(srcPath: string, format: HeicTargetFormat): Promise<string | null> {
+  const outPath = join(tmpdir(), `tomo-heic-${randomUUID()}.${format === "png" ? "png" : "jpg"}`);
   return new Promise((resolve) => {
     let stderr = "";
     let settled = false;
@@ -90,20 +140,20 @@ export function convertHeicToJpeg(srcPath: string): Promise<string | null> {
       unlink(outPath).catch(() => undefined).finally(() => done(null));
     };
 
-    const child = spawn("sips", ["-s", "format", "jpeg", srcPath, "--out", outPath], {
+    const child = spawn("sips", ["-s", "format", format, srcPath, "--out", outPath], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
     child.on("error", (err) => {
-      log.error({ err, srcPath }, "sips HEIC->JPEG spawn failed; keeping original attachment");
+      log.error({ err, srcPath, format }, "sips HEIC conversion spawn failed; keeping original attachment");
       failWithCleanup();
     });
     child.on("exit", (code) => {
       if (code === 0) {
-        log.info({ srcPath, outPath }, "Converted HEIC attachment to JPEG");
+        log.info({ srcPath, outPath, format }, "Converted HEIC attachment");
         done(outPath);
       } else {
-        log.error({ srcPath, code, stderr: stderr.trim().slice(0, 200) }, "sips HEIC->JPEG failed; keeping original attachment");
+        log.error({ srcPath, code, format, stderr: stderr.trim().slice(0, 200) }, "sips HEIC conversion failed; keeping original attachment");
         failWithCleanup();
       }
     });

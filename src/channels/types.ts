@@ -5,6 +5,13 @@ export interface ImageAttachment {
   mediaType: string;
   /** Absolute path on disk if the channel persisted the image (saveInboundImages). */
   savedPath?: string;
+  /**
+   * True when the source channel marked this image as a sticker (iMessage
+   * chat.db `attachment.is_sticker`). Stickers get their own inline marker so
+   * the agent knows a sticker arrived — and can resend the saved copy as one —
+   * instead of seeing an indistinguishable "image".
+   */
+  isSticker?: boolean;
 }
 
 export interface DocumentAttachment {

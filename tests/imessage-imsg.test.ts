@@ -446,7 +446,7 @@ describe("imsg inbound message mapping", () => {
         writeFileSync(out, Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"));
         return out;
       });
-      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -465,7 +465,7 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(convertHeic).toHaveBeenCalledWith(heicPath);
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "jpeg");
       const msg = handler.mock.calls[0][0];
       expect(msg.images).toHaveLength(1);
       expect(msg.images![0].mediaType).toBe("image/jpeg");
@@ -489,7 +489,7 @@ describe("imsg inbound message mapping", () => {
       });
       // Mime lies ("image/jpeg") and the extension is .jpg; only the ftyp magic
       // bytes reveal it's really HEIC.
-      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => null, imageStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -503,7 +503,7 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(convertHeic).toHaveBeenCalledWith(srcPath);
+      expect(convertHeic).toHaveBeenCalledWith(srcPath, "jpeg");
       const msg = handler.mock.calls[0][0];
       expect(msg.images).toHaveLength(1);
       expect(msg.images![0].mediaType).toBe("image/jpeg");
@@ -521,7 +521,7 @@ describe("imsg inbound message mapping", () => {
 
     try {
       const convertHeic = vi.fn(async (_src: string) => null); // conversion failed
-      const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -539,7 +539,7 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(convertHeic).toHaveBeenCalledWith(heicPath);
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "jpeg");
       const msg = handler.mock.calls[0][0];
       // Attachment is NOT dropped — original HEIC bytes/mime are kept.
       expect(msg.images).toHaveLength(1);
@@ -575,6 +575,131 @@ describe("imsg inbound message mapping", () => {
       expect(msg.images).toHaveLength(1);
       expect(msg.images![0].mediaType).toBe("image/png");
       expect(Buffer.from(msg.images![0].data, "base64").toString("hex")).toBe("89504e470d0a1a0a");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("describes an inbound sticker as a sticker and converts its HEIC to PNG (alpha preserved)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sticker-in-"));
+    // chat.db points a received sticker at ~/Library/Messages/StickerCache/
+    // <hash>-<guid>/<guid>.heic — transparent HEIC. Simulate with a local file.
+    const heicPath = join(dir, "19EE35CB.heic");
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      const probeHeicAlpha = vi.fn(async () => true);
+      const convertHeic = vi.fn(async (_src: string, format: string) => {
+        const out = join(dir, `converted.${format === "png" ? "png" : "jpg"}`);
+        writeFileSync(out, Buffer.from("89504e470d0a1a0a", "hex"));
+        return out;
+      });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "sticker-in-1",
+        text: "",
+        attachments: [{
+          filename: "19EE35CB.heic",
+          mime_type: "image/heic",
+          uti: "public.heic",
+          original_path: heicPath,
+          total_bytes: 12845,
+          missing: false,
+          is_sticker: true,
+        }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      // Stickers force PNG without consulting the alpha probe — the source is
+      // die-cut transparent art by construction.
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "png");
+      expect(probeHeicAlpha).not.toHaveBeenCalled();
+
+      const msg = handler.mock.calls[0][0];
+      expect(msg.text).toMatch(/^\[Sent a sticker, saved to: .*\.png; resend with STICKER:<saved path>\]$/);
+      expect(msg.images).toHaveLength(1);
+      expect(msg.images![0].mediaType).toBe("image/png");
+      expect(msg.images![0].isSticker).toBe(true);
+      expect(msg.images![0].savedPath).toMatch(/\.png$/);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps sticker and plain-image markers separate on a mixed message", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sticker-mix-"));
+    const stickerPath = join(dir, "sticker.heic");
+    writeFileSync(stickerPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+    const photoPath = join(dir, "photo.png");
+    writeFileSync(photoPath, Buffer.from("89504e470d0a1a0a", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string, format: string) => {
+        const out = join(dir, `converted.${format === "png" ? "png" : "jpg"}`);
+        writeFileSync(out, Buffer.from("89504e470d0a1a0a", "hex"));
+        return out;
+      });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => null, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "sticker-in-2",
+        text: "look at this",
+        attachments: [
+          { filename: "sticker.heic", mime_type: "image/heic", original_path: stickerPath, missing: false, is_sticker: true },
+          { filename: "photo.png", mime_type: "image/png", original_path: photoPath, missing: false, is_sticker: false },
+        ],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      const msg = handler.mock.calls[0][0];
+      expect(msg.text).toMatch(/^\[Sent a sticker, saved to: .*; resend with STICKER:<saved path>\] \[Sent an image, saved to: .*\] look at this$/);
+      expect(msg.images).toHaveLength(2);
+      expect(msg.images!.filter((i: { isSticker?: boolean }) => i.isSticker)).toHaveLength(1);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("converts a non-sticker HEIC to PNG when the alpha probe reports transparency", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-alpha-"));
+    const heicPath = join(dir, "cutout.heic");
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      const probeHeicAlpha = vi.fn(async () => true);
+      const convertHeic = vi.fn(async (_src: string, format: string) => {
+        const out = join(dir, `converted.${format === "png" ? "png" : "jpg"}`);
+        writeFileSync(out, Buffer.from("89504e470d0a1a0a", "hex"));
+        return out;
+      });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "alpha-guid-1",
+        text: "",
+        attachments: [{ filename: "cutout.heic", mime_type: "image/heic", original_path: heicPath, missing: false, is_sticker: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(probeHeicAlpha).toHaveBeenCalledWith(heicPath);
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "png");
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images![0].mediaType).toBe("image/png");
+      expect(msg.images![0].isSticker).toBeUndefined();
+      expect(msg.text).toBe(`[Sent an image, saved to: ${msg.images![0].savedPath}]`);
       await channel.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -1264,6 +1389,39 @@ describe("imsg sticker sends", () => {
       const plain = requests().filter((r) => r.method === "send");
       expect(plain).toHaveLength(1);
       expect(plain[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
+      await channel.stop();
+    });
+  });
+
+  it("diagnoses a staging-hygiene refusal (dylib secure-open) and still falls back", async () => {
+    await withStickerFile(async (stickerPath) => {
+      const warnSpy = vi.spyOn(log, "warn");
+      const { channel, requests } = makeChannel({
+        caps: CAPS_STICKER,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          // The exact refusal observed live 2026-08-06: imsg staged the file
+          // fine, but the dylib's openUserOwnedDirectorySecurely walk refused
+          // (~/Library/Messages was world-writable).
+          if (req.method === "send.sticker") return child.respondError(req.id, -32603, "Internal error", "Dylib error: Could not securely open sticker directory");
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
+
+      // Fallback still happens: the refusal is definite, the sticker must not vanish.
+      const plain = requests().filter((r) => r.method === "send");
+      expect(plain).toHaveLength(1);
+
+      // And the log carries the staging diagnosis, not just the opaque bridge error.
+      const call = warnSpy.mock.calls.find((c) => c.some((a) => typeof a === "string" && a.includes("staging-hygiene")));
+      expect(call, "expected a staging-hygiene diagnosis log").toBeDefined();
+      const fields = call![0] as { stagingRoot: string; checked: Record<string, string>; verdict: string };
+      expect(fields.stagingRoot).toMatch(/Library\/Messages\/Attachments\/imsg\/stickers$/);
+      expect(typeof fields.verdict).toBe("string");
+      expect(Object.keys(fields.checked).length).toBeGreaterThan(0);
       await channel.stop();
     });
   });

@@ -1,7 +1,8 @@
 import { Command } from "commander";
-import { existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { RESTART_REASON_FILE } from "../config.js";
+import { TOMO_SESSION_KEY_ENV, writeRestartReasonFile } from "../restart-reason.js";
 import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
@@ -36,10 +37,16 @@ export const stopCommand = new Command("stop")
 export const restartCommand = new Command("restart")
   .description("Restart Tomo daemon")
   .option("--reason <reason>", "Reason for restart (sent to agent after restart)")
-  .action(async (opts: { reason?: string }) => {
+  .option("--session <key>", `Session key the reason belongs to (defaults to $${TOMO_SESSION_KEY_ENV}, injected into every session's shell)`)
+  .action(async (opts: { reason?: string; session?: string }) => {
     if (opts.reason) {
-      mkdirSync(dirname(RESTART_REASON_FILE), { recursive: true });
-      writeFileSync(RESTART_REASON_FILE, opts.reason, "utf-8");
+      // Attribute the initiator so the reason is delivered back to the
+      // session that asked for the restart (and only there). The env var is
+      // stamped into every session's Bash environment by the daemon; the
+      // flag exists as an explicit override. Terminal-run restarts have
+      // neither → unattributed → legacy blessed-session delivery.
+      const sessionKey = opts.session?.trim() || process.env[TOMO_SESSION_KEY_ENV]?.trim() || undefined;
+      writeRestartReasonFile(RESTART_REASON_FILE, { reason: opts.reason, ...(sessionKey ? { sessionKey } : {}) });
     }
     if (isAutostartEnabled()) {
       try {

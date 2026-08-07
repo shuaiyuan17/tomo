@@ -34,11 +34,12 @@ import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
 import { formatTomoEvent } from "./tomo-event.js";
+import { consumeRestartReasonFile } from "./restart-reason.js";
 import { pruneTools } from "./lcm/index.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
@@ -1116,6 +1117,27 @@ export class Agent {
       });
   }
 
+  /**
+   * Deliver a restart notice to the session that initiated the restart — the
+   * one whose key was persisted alongside the reason. Unlike handleContinuity
+   * this runs on the exact initiating session (group sessions included: the
+   * reason is that session's own context, so no cross-session leak), never on
+   * a blessed fallback. If the key no longer resolves to a known session the
+   * reason is dropped with a log line rather than rerouted — misdelivery is
+   * the failure mode this exists to prevent.
+   */
+  handleRestartForSession(prompt: string, sessionKey: string): Promise<void> {
+    const known = this.sessions.listActiveEntries().some((e) => e.channelKey === sessionKey);
+    if (!known) {
+      log.warn({ sessionKey }, "Restart reason attributed to unknown session; dropping instead of rerouting");
+      return Promise.resolve();
+    }
+    return this.enqueueForSession(sessionKey, () => this.processContinuity(prompt, sessionKey))
+      .catch((err) => {
+        log.error({ err, sessionKey }, "Restart notice failed in queue");
+      });
+  }
+
   private async processContinuity(prompt: string, key: string): Promise<void> {
     await this.turnRunner.runTurn({
       key,
@@ -1130,9 +1152,15 @@ export class Agent {
         kind: "deferred-send",
         resolveTarget: () => {
           const identityName = dmIdentityFromSessionKey(key);
+          // Final fallback covers raw keys only (dm: keys don't parse), so
+          // heartbeats — always DM-keyed — are unaffected; it lets a
+          // restart notice routed to its initiating group session (see
+          // handleRestartForSession) deliver even without a persisted
+          // reply target.
           const replyTarget = this.router.getReplyTarget(key)
             ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
-            ?? privateReplyTargetFromSessionKey(key);
+            ?? privateReplyTargetFromSessionKey(key)
+            ?? replyTargetFromRawSessionKey(key);
           if (!replyTarget) return undefined;
           const channel = this.getChannel(replyTarget.channelName);
           return channel ? { channel, chatId: replyTarget.chatId } : undefined;
@@ -1311,16 +1339,24 @@ export class Agent {
     await Promise.all(this.channels.map((ch) => ch.start()));
     log.info("Tomo is running");
 
-    // Check for restart reason and notify via continuity-style message
-    if (existsSync(RESTART_REASON_FILE)) {
-      const reason = readFileSync(RESTART_REASON_FILE, "utf-8").trim();
-      try { unlinkSync(RESTART_REASON_FILE); } catch { /* ignore */ }
-      if (reason) {
-        log.info({ reason }, "Restart reason found, notifying agent");
-        this.handleContinuity(formatTomoEvent("restart", `Restarted. Reason: ${reason}`)).catch((err) =>
-          log.error({ err }, "Failed to send restart reason")
-        );
-      }
+    // Check for restart reason and notify via continuity-style message.
+    // An attributed reason (the restart was initiated from a session — its
+    // key rides in the reason file, stamped from TOMO_SESSION_KEY) routes to
+    // that session and ONLY that session: the reason is its resume-context,
+    // and delivering it anywhere else leaks that session's context across
+    // session boundaries (worst case DM→group) and reads to the receiver as
+    // its own pending work. Unattributed reasons (auto-update, a human in a
+    // terminal, pre-upgrade plain-text files) keep the legacy delivery to
+    // the blessed continuity session.
+    const restart = consumeRestartReasonFile(RESTART_REASON_FILE);
+    if (restart) {
+      const { reason, sessionKey } = restart;
+      log.info({ reason, sessionKey }, "Restart reason found, notifying agent");
+      const prompt = formatTomoEvent("restart", `Restarted. Reason: ${reason}`);
+      const delivery = sessionKey
+        ? this.handleRestartForSession(prompt, sessionKey)
+        : this.handleContinuity(prompt);
+      delivery.catch((err) => log.error({ err }, "Failed to send restart reason"));
     }
   }
 

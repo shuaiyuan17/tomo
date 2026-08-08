@@ -1,6 +1,6 @@
 {
   "name": "tomo-ai",
-  "version": "0.8.12",
+  "version": "0.8.13",
   "description": "Personal assistant powered by Claude Agent SDK",
   "type": "module",
   "main": "dist/index.js",
@@ -45,7 +45,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.195",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.226",
     "@clack/prompts": "^1.4.0",
     "commander": "^15.0.0",
     "croner": "^10.0.1",

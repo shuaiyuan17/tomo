@@ -36,6 +36,11 @@ import { ProactiveSendService, type SendResult, type SessionCatalog } from "./ag
 import { resolveBlockRange } from "./lcm/blocks.js";
 import { formatTomoEvent } from "./tomo-event.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
+import {
+  consumeRestartRequestFromToolResult,
+  restartWorkerInvocation,
+  type RestartRequest,
+} from "./restart-request.js";
 import { pruneTools } from "./lcm/index.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
@@ -43,6 +48,7 @@ import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
+import { spawn } from "node:child_process";
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
 
@@ -126,6 +132,7 @@ export class Agent {
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
   private liveSessionManager: LiveSessionManager;
+  private restartInFlight = false;
   private proactive: ProactiveSendService;
   // Last inbound audience per dm: session ("dm" or a raw group key). With
   // summoning, one session interleaves private and group traffic — this is
@@ -221,6 +228,9 @@ export class Agent {
       buildGroupContext: (key) => this.buildGroupContext(key),
       handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
+      handleToolResult: (key, toolName, content, isError) => {
+        this.handleToolResult(key, toolName, content, isError);
+      },
       maybeNudgeCompact: (key, ctx) => this.maybeNudgeCompact(key, ctx),
       refreshExternalMcpToken: (serverName) => this.mcpOAuthManager
         .refreshServerToken(serverName, config.mcpServers ?? {})
@@ -1495,6 +1505,69 @@ export class Agent {
 
   private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
     this.pendingNotesQueue.queueError(sessionKey, visibleError);
+  }
+
+  /**
+   * A session-originated `tomo restart` is acknowledged only when its Bash
+   * result comes back through the SDK event stream. Starting the helper here
+   * gives us an exact persistence boundary instead of racing daemon shutdown
+   * against an arbitrary timer.
+   */
+  private handleToolResult(
+    sessionKey: string,
+    toolName: string,
+    content: unknown,
+    isError: boolean,
+  ): void {
+    if (toolName !== "Bash" || isError) return;
+    const request = consumeRestartRequestFromToolResult(content, sessionKey);
+    if (!request) return;
+
+    if (this.restartInFlight) {
+      this.queuePendingErrorNote(sessionKey, "A Tomo restart was already in progress; the duplicate restart request was ignored.");
+      return;
+    }
+    this.restartInFlight = true;
+    this.launchAcknowledgedRestart(request);
+  }
+
+  private launchAcknowledgedRestart(request: RestartRequest): void {
+    const cliPath = process.argv[1];
+    if (!cliPath) {
+      this.reportScheduledRestartFailure(request.sessionKey, "CLI entry point is unavailable");
+      return;
+    }
+
+    const worker = restartWorkerInvocation(request, cliPath);
+    const child = spawn(worker.command, worker.args, {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: worker.env,
+    });
+    let stderr = "";
+    let failureReported = false;
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr = `${stderr}${String(chunk)}`.slice(-2_000);
+    });
+    const reportFailure = (detail: string) => {
+      if (failureReported) return;
+      failureReported = true;
+      this.reportScheduledRestartFailure(request.sessionKey, detail);
+    };
+    child.once("error", (err) => reportFailure(err.message));
+    child.once("exit", (code, signal) => {
+      if (code === 0) return;
+      const detail = stderr.trim() || `restart helper exited with ${signal ? `signal ${signal}` : `code ${code ?? "unknown"}`}`;
+      reportFailure(detail);
+    });
+    child.unref();
+  }
+
+  private reportScheduledRestartFailure(sessionKey: string, detail: string): void {
+    this.restartInFlight = false;
+    const message = `Scheduled Tomo restart failed: ${detail}`;
+    log.error({ sessionKey, detail }, "Scheduled restart failed");
+    this.queuePendingErrorNote(sessionKey, message);
   }
 
   /** Drain notes queued for this session and return them as a prefix. */

@@ -3,7 +3,8 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RESTART_REASON_FILE } from "../config.js";
 import { TOMO_SESSION_KEY_ENV, resolveRestartInitiator, writeRestartReasonFile } from "../restart-reason.js";
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { createRestartRequest, formatRestartRequestResult } from "../restart-request.js";
+import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import {
@@ -17,70 +18,10 @@ import type { PidFileRecord } from "./pidfile.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
-export const TOMO_DEFERRED_RESTART_PARENT_PID_ENV = "TOMO_DEFERRED_RESTART_PARENT_PID";
-const RESTART_RESULT_SETTLE_MS = 1_500;
-const RESTART_PARENT_EXIT_TIMEOUT_MS = 5_000;
-
-type DetachedSpawn = (
-  command: string,
-  args: string[],
-  options: SpawnOptions,
-) => Pick<ChildProcess, "unref">;
-
-export function shouldDeferRestart(
-  explicitSession: string | undefined,
+export function shouldScheduleRestart(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return env[TOMO_DEFERRED_RESTART_PARENT_PID_ENV] === undefined &&
-    resolveRestartInitiator(explicitSession, env) !== undefined;
-}
-
-/**
- * Launch a detached restart worker and return immediately. The worker waits
- * for this CLI process to exit, then gives the SDK a short settle window to
- * persist the Bash tool result before it signals the daemon.
- */
-export function scheduleDeferredRestart(
-  cliPath: string,
-  env: NodeJS.ProcessEnv = process.env,
-  parentPid: number = process.pid,
-  spawnFn: DetachedSpawn = spawn,
-): void {
-  const child = spawnFn(process.execPath, [cliPath, "restart"], {
-    detached: true,
-    stdio: "ignore",
-    env: {
-      ...env,
-      [TOMO_DEFERRED_RESTART_PARENT_PID_ENV]: String(parentPid),
-    },
-  });
-  child.unref();
-}
-
-function deferredRestartParentPid(env: NodeJS.ProcessEnv = process.env): number | null {
-  const raw = env[TOMO_DEFERRED_RESTART_PARENT_PID_ENV];
-  if (raw === undefined) return null;
-  const pid = Number(raw);
-  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForRestartResultSettle(parentPid: number | null): Promise<void> {
-  if (parentPid !== null) {
-    const deadline = Date.now() + RESTART_PARENT_EXIT_TIMEOUT_MS;
-    while (processIsAlive(parentPid) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  await new Promise((resolve) => setTimeout(resolve, RESTART_RESULT_SETTLE_MS));
+  return Boolean(env[TOMO_SESSION_KEY_ENV]?.trim());
 }
 
 export interface StopDeps {
@@ -230,25 +171,16 @@ export const restartCommand = new Command("restart")
   .option("--reason <reason>", "Reason for restart (sent to agent after restart)")
   .option("--session <key>", `Session key the reason belongs to (defaults to $${TOMO_SESSION_KEY_ENV}, injected into every session's shell)`)
   .action(async (opts: { reason?: string; session?: string }) => {
-    if (opts.reason) {
-      recordRestartReason(opts.reason, opts.session);
-    }
-
-    if (shouldDeferRestart(opts.session)) {
-      const cliPath = process.argv[1];
-      if (!cliPath) {
-        throw new Error("Cannot schedule restart: CLI entry point is unavailable.");
-      }
-      scheduleDeferredRestart(cliPath);
-      console.log("Restart scheduled. Tomo will restart shortly after this command exits.");
+    if (shouldScheduleRestart()) {
+      const sessionKey = resolveRestartInitiator(opts.session);
+      if (!sessionKey) throw new Error("Cannot schedule restart: session key is unavailable.");
+      const request = createRestartRequest(sessionKey, opts.reason);
+      console.log(formatRestartRequestResult(request));
       return;
     }
 
-    // A worker spawned by the session-aware path must not signal the daemon
-    // until its parent CLI has exited and the Bash result has had time to reach
-    // the SDK transcript. Bare terminal restarts skip this delay.
-    if (process.env[TOMO_DEFERRED_RESTART_PARENT_PID_ENV] !== undefined) {
-      await waitForRestartResultSettle(deferredRestartParentPid());
+    if (opts.reason) {
+      recordRestartReason(opts.reason, opts.session);
     }
 
     if (isAutostartEnabled()) {

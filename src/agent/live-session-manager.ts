@@ -93,6 +93,8 @@ export interface LiveSessionManagerDeps {
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
+  /** Observe persisted SDK tool-result events for daemon control handshakes. */
+  handleToolResult?(key: string, toolName: string, content: unknown, isError: boolean): void;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
   maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
   /**
@@ -280,6 +282,9 @@ export class LiveSessionManager {
       timeoutMs: config.liveSessionTimeoutMs,
       showThinking: config.showThinking,
       onMcpAuthError: (serverName) => this.deps.refreshExternalMcpToken(serverName),
+      onToolResult: (toolName, content, isError) => {
+        this.deps.handleToolResult?.(key, toolName, content, isError);
+      },
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
     // yields — it can spend real time on OAuth — and stop() may have run its

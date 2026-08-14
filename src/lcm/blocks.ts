@@ -48,6 +48,8 @@ export interface ResolvedRange {
   lastUuid?: string;
   /** Human-readable explanation of what gets compacted */
   description: string;
+  /** True when writing this range will replace a summary block with the same tag. */
+  replacesExistingBlock: boolean;
 }
 
 interface SdkEvent {
@@ -362,6 +364,7 @@ export function resolveBlockRange(
     firstUuid: events[firstIdx].uuid,
     lastUuid: events[lastIdx].uuid,
     description,
+    replacesExistingBlock: existingBlock !== undefined,
   };
 }
 
@@ -448,6 +451,8 @@ export interface DuePromotion {
   level: BlockLevel;
   period: string;
   childCount: number;
+  /** True when this promotion rebuilds and replaces an existing block. */
+  replacesExistingBlock: boolean;
 }
 
 export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string): DuePromotion[] {
@@ -531,17 +536,17 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
 
   for (const [wk, count] of weeklyChildrenByWeek) {
     if (!haveTags.has(`weekly ${wk}`)) {
-      due.push({ level: "weekly", period: wk, childCount: count });
+      due.push({ level: "weekly", period: wk, childCount: count, replacesExistingBlock: false });
     }
   }
   for (const [m, count] of monthlyChildrenByMonth) {
     if (!haveTags.has(`monthly ${m}`)) {
-      due.push({ level: "monthly", period: m, childCount: count });
+      due.push({ level: "monthly", period: m, childCount: count, replacesExistingBlock: false });
     }
   }
   for (const [y, count] of yearlyChildrenByYear) {
     if (!haveTags.has(`yearly ${y}`)) {
-      due.push({ level: "yearly", period: y, childCount: count });
+      due.push({ level: "yearly", period: y, childCount: count, replacesExistingBlock: false });
     }
   }
 
@@ -585,7 +590,12 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
       ? counts.total >= FLOOR_WITH_BLOCK
       : counts.conversational >= CONV_FLOOR_WITHOUT_BLOCK || counts.total >= MACHINERY_ONLY_FLOOR;
     if (isDue) {
-      due.push({ level: "daily", period: day, childCount: counts.total });
+      due.push({
+        level: "daily",
+        period: day,
+        childCount: counts.total,
+        replacesExistingBlock: hasBlock,
+      });
     }
   }
 

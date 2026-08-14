@@ -106,6 +106,7 @@ describe("resolveBlockRange — daily fresh-tail behavior", () => {
     expect(result!.firstUuid).toBe(events[0].uuid);
     expect(result!.lastUuid).toBe(events[9].uuid);
     expect(result!.description).toContain("10 events");
+    expect(result!.replacesExistingBlock).toBe(false);
     // No "kept raw" suffix for past-day rollups.
     expect(result!.description).not.toContain("kept raw");
   });
@@ -229,6 +230,7 @@ describe("findDuePromotions — past-day nudging", () => {
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(1);
+    expect(dailyDue!.replacesExistingBlock).toBe(false);
   });
 
   it("flags a large machinery-only past day with no daily block", () => {
@@ -272,6 +274,11 @@ describe("findDuePromotions — past-day nudging", () => {
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(8);
+    expect(dailyDue!.replacesExistingBlock).toBe(true);
+
+    const range = resolveBlockRange(sessionId, "daily", pastDay);
+    expect(range).not.toBeNull();
+    expect(range!.replacesExistingBlock).toBe(true);
   });
 
   it("does NOT flag a past day with a block and 7 leftover raw events", () => {

@@ -810,6 +810,7 @@ export class Agent {
     let prunableTokens = 0;
     let prunableSufficient = false;
     let dailyRangeAvailable = true;
+    let dailyRangeReplacesExistingBlock = false;
 
     if (shouldPrecheckContextNudge) {
       sid = this.sessions.getSdkSessionId(key);
@@ -820,7 +821,9 @@ export class Agent {
         prunableSufficient = prunableTokens >= PRUNE_NUDGE_MIN_FRAC * ctx.contextMax;
       }
       if (nudged === "prune" || !prunableSufficient) {
-        dailyRangeAvailable = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir) !== null;
+        const dailyRange = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir);
+        dailyRangeAvailable = dailyRange !== null;
+        dailyRangeReplacesExistingBlock = dailyRange?.replacesExistingBlock ?? false;
       }
     }
 
@@ -862,9 +865,13 @@ export class Agent {
         log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
       }
     } else if (decision.kind === "daily") {
+      const replaceFlag = dailyRangeReplacesExistingBlock ? " --replace" : "";
+      const replacementNote = dailyRangeReplacesExistingBlock
+        ? " (1) A daily block already exists, so this command uses `--replace`; write a complete summary covering the whole day and preserve prior details worth keeping."
+        : " (1) A later repeat compact requires `--replace` and a fresh whole-day summary; rollups never append automatically.";
       nudge = formatTomoEvent(
         "context-nudge",
-        `Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+        `Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid}${replaceFlag} --summary "<today-so-far>"\` to roll up today's activity. Two things to know:${replacementNote} (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
         { name: "daily" },
       );
       log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");

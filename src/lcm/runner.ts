@@ -28,17 +28,15 @@ function isDaytime(): boolean {
   return h >= DAY_START_HOUR && h < DAY_END_HOUR;
 }
 
-function commandFor(p: DuePromotion): string {
+function commandFor(p: DuePromotion, sdkSessionId: string): string {
   const flag = p.level === "daily" ? "--date" :
                p.level === "weekly" ? "--week" :
                p.level === "monthly" ? "--month" : "--year";
-  return `tomo lcm ${p.level} --session-id <SESSION_ID> ${flag} ${p.period} --summary "..."`;
+  const replaceFlag = p.replacesExistingBlock ? " --replace" : "";
+  return `tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period}${replaceFlag} --summary "<your text>"`;
 }
 
-function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
-  const flag = p.level === "daily" ? "--date" :
-               p.level === "weekly" ? "--week" :
-               p.level === "monthly" ? "--month" : "--year";
+export function buildRollupNudge(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
   const childLabel = p.level === "daily" ? "raw events" : "child blocks";
   const higherLevelBudget = Math.max(
     BLOCK_SUMMARY_TOKEN_BUDGETS.weekly,
@@ -48,8 +46,13 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
   const lines = [
     `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
+    ...(p.replacesExistingBlock ? [
+      `WARNING: \`${p.level} ${p.period}\` already has a summary block. This rollup REPLACES that summary; it does not append to it.`,
+      "Write a complete replacement that preserves prior details worth keeping and incorporates the newly eligible events. The explicit `--replace` flag below is required.",
+      "",
+    ] : []),
     "The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:",
-    `  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`,
+    `  ${commandFor(p, sdkSessionId)}`,
     "",
     "Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.",
     "Token budget per block:",
@@ -67,7 +70,6 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
       "",
     );
   }
-  void commandFor; // keep reference for potential future use
   return formatTomoEvent("lcm-rollup", lines.join("\n"), { name: `${p.level} ${p.period}` });
 }
 
@@ -131,7 +133,7 @@ export class RollupRunner {
           { sessionKey, picking: `${next.level} ${next.period}`, deferred: fresh.length - 1 },
           "Rollup nudge (one level/tick)",
         );
-        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
+        await this.agent.handleCronMessage(buildRollupNudge(next, sdkSessionId, sessionKey), sessionKey, {
           showTyping: false,
           suppressDelivery: isGroupSessionKey(sessionKey),
         });

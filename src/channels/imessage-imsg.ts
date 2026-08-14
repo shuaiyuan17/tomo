@@ -57,7 +57,7 @@ const DEFAULT_CAPABILITY_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 15_000, 30_000
 const DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS = 30_000;
 
 /** Slash commands recognized by all channels (mirrors the BlueBubbles channel). */
-const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
+const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
 
 /**
  * True when an outbound message part is exactly one http(s) URL and nothing

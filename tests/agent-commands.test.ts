@@ -177,6 +177,184 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("/mcp lists live external-server status and starts one explicit login", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const getServerStatuses = vi.fn(() => [{
+      name: "cloudflare-api",
+      state: "not-mounted" as const,
+      oauth: true,
+      mounted: false,
+      authRequired: true,
+    }]);
+    const startLogin = vi.fn(async () => ({
+      url: "https://auth.example/authorize?state=test",
+      reused: false,
+      startedAt: Date.now(),
+    }));
+    const internals = agent as unknown as {
+      mcpOAuthManager: {
+        getServerStatuses: typeof getServerStatuses;
+        startLogin: typeof startLogin;
+      };
+    };
+    internals.mcpOAuthManager.getServerStatuses = getServerStatuses;
+    internals.mcpOAuthManager.startLogin = startLogin;
+
+    await tg.simulateCommand("mcp", "12345", "Shuai", undefined, "12345");
+
+    expect(getServerStatuses).toHaveBeenCalledOnce();
+    expect(tg.sent[0].text).toContain("cloudflare-api — not mounted · login required");
+
+    await tg.simulateCommand("mcp", "12345", "Shuai", "login cloudflare-api", "12345");
+
+    expect(startLogin).toHaveBeenCalledWith("cloudflare-api", expect.any(Object));
+    expect(tg.sent[1].text).toContain("MCP login started");
+    expect(tg.sent[1].text).toContain("https://auth.example/authorize?state=test");
+    expect(tg.sent[1].text).toContain("paste the full localhost redirect URL");
+
+    await agent.stop();
+  });
+
+  it("/mcp is owner-DM-only and does not create a group session when refused", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345", "-100123"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const startLogin = vi.fn();
+    const internals = agent as unknown as {
+      mcpOAuthManager: { startLogin: typeof startLogin };
+      sessions: InstanceType<typeof SessionStore>;
+    };
+    internals.mcpOAuthManager.startLogin = startLogin;
+
+    await tg.simulateCommand("mcp", "-100123", "Shuai", "login cloudflare-api", "12345");
+
+    expect(startLogin).not.toHaveBeenCalled();
+    expect(tg.sent[0].text).toContain("private DM");
+    expect(internals.sessions.listActiveEntries()).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("/mcp reports whether a configured server is mounted in the current live session", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      mcpServers: {
+        docs: { server: { type: "http", url: "https://docs.example/mcp" } },
+      },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "start session" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await tg.simulateCommand("mcp", "12345", "Shuai", undefined, "12345");
+
+    expect(tg.sent[0].text).toContain("docs — connected · no OAuth");
+
+    await agent.stop();
+  });
+
+  it("consumes a matching pasted MCP callback in the owner DM before it reaches model context", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const completeAuthorizationFromChat = vi.fn()
+      .mockResolvedValueOnce({
+        status: "completed" as const,
+        serverName: "cloudflare-api",
+        expiresAt: 4_600_000,
+      })
+      .mockResolvedValueOnce({ status: "unknown-state" as const });
+    const internals = agent as unknown as {
+      mcpOAuthManager: { completeAuthorizationFromChat: typeof completeAuthorizationFromChat };
+      sessions: InstanceType<typeof SessionStore>;
+    };
+    internals.mcpOAuthManager.completeAuthorizationFromChat = completeAuthorizationFromChat;
+
+    const callback = "http://localhost:53682/callback?code=secret&state=pending";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: callback }));
+
+    expect(completeAuthorizationFromChat).toHaveBeenCalledWith(callback);
+    expect(tg.sent[0].text).toContain('MCP login completed for "cloudflare-api"');
+    expect(mockSdk.userContents).toHaveLength(0);
+    expect(internals.sessions.listActiveEntries()).toHaveLength(0);
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "12345",
+      senderId: "12345",
+      text: "http://localhost:53682/callback?code=other&state=unknown",
+    }));
+
+    expect(tg.sent[1].text).toContain("does not match an active login");
+    expect(mockSdk.userContents).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("passes an ordinary URL with a code query parameter through as normal DM content", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const ordinaryUrl = "https://github.com/login/device?code=promo-code";
+    mockSdk.responseFn = (text) => text.includes(ordinaryUrl) ? "I see the ordinary link." : "unexpected";
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: ordinaryUrl }));
+    await drainQueue(agent);
+
+    const prompt = mockSdk.userContents.flat().map((block) => block.text ?? "").join("");
+    expect(prompt).toContain(ordinaryUrl);
+    expect(tg.delivered.map((message) => message.text)).toContain("I see the ordinary link.");
+
+    await agent.stop();
+  });
+
+  it("never treats a group-pasted localhost callback as OAuth completion", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      channelAllowlists: { telegram: ["12345", "-100123"] },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const completeAuthorizationFromChat = vi.fn();
+    const internals = agent as unknown as {
+      mcpOAuthManager: { completeAuthorizationFromChat: typeof completeAuthorizationFromChat };
+    };
+    internals.mcpOAuthManager.completeAuthorizationFromChat = completeAuthorizationFromChat;
+    mockSdk.responseFn = () => "NO_REPLY";
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100123",
+      senderId: "12345",
+      text: "http://localhost:53682/callback?code=secret&state=pending",
+      isGroup: true,
+      isMentioned: true,
+    }));
+    await drainQueue(agent);
+
+    expect(completeAuthorizationFromChat).not.toHaveBeenCalled();
+
+    await agent.stop();
+  });
+
   it("/new resets the session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

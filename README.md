@@ -69,6 +69,7 @@ tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 | `/model` | Switch model (Claude aliases, direct model IDs, or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/login` | Refresh Claude login from a configured owner's private DM (`/login cancel` aborts a pending login) |
+| `/mcp` | Show external MCP health; `/mcp login <server>` starts per-server OAuth (owner DM only) |
 | `/status` | Show session info (model, channel, message count) |
 | `/cost` | Show current-session cost for 1d / 7d / 1mo |
 | `/usage` | Show Claude subscription usage limits (5-hour and weekly windows + reset countdowns) |
@@ -191,7 +192,7 @@ Use `type: "http"` for streamable HTTP, `type: "sse"` for SSE, or omit `type` fo
 
 Remote HTTP/SSE servers can also use harness-managed OAuth by adding an `oauth` block. Tomo discovers the authorization server from the MCP server's RFC 9728 `WWW-Authenticate` challenge unless `authorizationServer` is set explicitly, uses authorization-code + PKCE, registers a dynamic client when needed, stores tokens in `~/.tomo/workspace/secrets/mcp-oauth.json` with mode `0600`, silently refreshes near-expiry tokens, and injects `Authorization: Bearer <token>` into MCP headers. The agent never sees the tokens.
 
-If browser login is needed, Tomo forwards the authorize URL to your private chat and waits for the localhost callback before starting the agent session.
+If browser login is needed, Tomo forwards the authorize URL to your private chat without blocking the agent session. When the browser is on another device and its localhost redirect cannot reach the Tomo host, paste the full redirect URL back into the configured owner's private DM; Tomo matches its single-use `state`, exchanges the code with the server-side PKCE verifier, and stores the resulting token. `/mcp` shows configured servers, per-session mount state, token expiry, pending authorization, and the latest auth failure; `/mcp login <server>` starts or reuses one background flow for that server.
 
 ### Claude Code Plugins
 

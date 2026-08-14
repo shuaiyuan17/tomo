@@ -138,6 +138,21 @@ describe("McpOAuthManager", () => {
       },
     });
     expect(errors).toEqual([{ name: "broken", message: "network down" }]);
+    expect(manager.getServerStatuses({
+      broken: {
+        server: { type: "http", url: "https://broken.example/mcp" },
+        oauth: {
+          authorizationServer: "https://auth.example",
+          clientId: "client-123",
+          scopes: [],
+          tokenStoreKey: "broken",
+        },
+      },
+    })[0]).toMatchObject({
+      state: "auth-failed",
+      authRequired: true,
+      lastError: "network down",
+    });
   });
 
   it("refreshes near-expiry access tokens and injects Authorization without dropping static headers", async () => {
@@ -412,5 +427,216 @@ describe("McpOAuthManager", () => {
 
     rejectAuthorize(new Error("login abandoned"));
     await expect(authFailed).resolves.toEqual({ name: "cloudflare-api", message: "login abandoned" });
+  });
+
+  it("completes a remote localhost callback pasted into chat and rejects replay", async () => {
+    resetDir();
+    const tokenStorePath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const servers: Record<string, ExternalMcpServerConfig> = {
+      "cloudflare-api": {
+        server: { type: "http", url: "https://api.cloudflare.example/mcp" },
+        oauth: {
+          authorizationServer: "https://auth.example",
+          clientId: "client-123",
+          scopes: ["account:read"],
+          tokenStoreKey: "cloudflare-api",
+        },
+      },
+    };
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      tokenStorePath,
+      now: () => 1_000_000,
+      fetchImpl: async (input, init) => {
+        if (String(input) === "https://auth.example/.well-known/oauth-authorization-server") {
+          return new Response(JSON.stringify({
+            authorization_endpoint: "https://auth.example/authorize",
+            token_endpoint: "https://auth.example/token",
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (String(input) === "https://auth.example/token") {
+          const body = new URLSearchParams(String(init?.body));
+          expect(body.get("code_verifier")).toBeTruthy();
+          return new Response(JSON.stringify({
+            access_token: `access-${body.get("code")}`,
+            refresh_token: "refresh-token",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected fetch ${String(input)}`);
+      },
+    });
+
+    let resolveAuthorize!: (url: string) => void;
+    const authorizeUrl = new Promise<string>((resolve) => { resolveAuthorize = resolve; });
+    await manager.buildServersWithAuth(servers, async (_name, url) => resolveAuthorize(url), {
+      authorizationWaitMs: 0,
+    });
+    const url = new URL(await authorizeUrl);
+    const state = url.searchParams.get("state");
+    const redirect = new URL(url.searchParams.get("redirect_uri")!);
+    redirect.searchParams.set("code", "remote-code");
+    redirect.searchParams.set("state", state!);
+
+    expect(manager.getServerStatuses(servers)[0]).toMatchObject({
+      name: "cloudflare-api",
+      state: "auth-pending",
+      mounted: false,
+    });
+    const ordinaryUrl = "https://github.com/login/device?code=promo-code";
+    await expect(manager.completeAuthorizationFromChat(ordinaryUrl)).resolves.toEqual({
+      status: "not-matched",
+    });
+    expect(manager.getServerStatuses(servers)[0]?.state).toBe("auth-pending");
+    const wrongRedirect = new URL(redirect);
+    wrongRedirect.searchParams.set("state", "not-the-pending-state");
+    await expect(manager.completeAuthorizationFromChat(wrongRedirect.toString())).resolves.toEqual({
+      status: "unknown-state",
+    });
+    expect(manager.getServerStatuses(servers)[0]?.state).toBe("auth-pending");
+    await expect(manager.completeAuthorizationFromChat(redirect.toString())).resolves.toEqual({
+      status: "completed",
+      serverName: "cloudflare-api",
+      expiresAt: 4_600_000,
+    });
+    expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth["cloudflare-api"].accessToken)
+      .toBe("access-remote-code");
+    expect(manager.getServerStatuses(servers, new Set(["cloudflare-api"]))[0]).toMatchObject({
+      state: "connected",
+      mounted: true,
+      authRequired: false,
+      expiresAt: 4_600_000,
+    });
+    await expect(manager.completeAuthorizationFromChat(redirect.toString())).resolves.toEqual({
+      status: "already-completed",
+      serverName: "cloudflare-api",
+    });
+  });
+
+  it("forces per-server re-login and accepts a bare code when exactly one flow is pending", async () => {
+    resetDir();
+    const tokenStorePath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(tokenStorePath, JSON.stringify({
+      mcpOAuth: {
+        docs: {
+          accessToken: "still-valid",
+          tokenType: "Bearer",
+          expiresAt: 9_000_000,
+          updatedAt: 900_000,
+        },
+      },
+    }));
+    const servers: Record<string, ExternalMcpServerConfig> = {
+      docs: {
+        server: { type: "http", url: "https://docs.example/mcp" },
+        oauth: {
+          authorizationServer: "https://auth.example",
+          clientId: "client-123",
+          scopes: [],
+          tokenStoreKey: "docs",
+        },
+      },
+    };
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      tokenStorePath,
+      now: () => 1_000_000,
+      fetchImpl: async (input, init) => {
+        if (String(input).includes(".well-known/oauth-authorization-server")) {
+          return new Response(JSON.stringify({
+            authorization_endpoint: "https://auth.example/authorize",
+            token_endpoint: "https://auth.example/token",
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (String(input) === "https://auth.example/token") {
+          const body = new URLSearchParams(String(init?.body));
+          return new Response(JSON.stringify({
+            access_token: `replacement-${body.get("code")}`,
+            token_type: "Bearer",
+            expires_in: 7200,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected fetch ${String(input)}`);
+      },
+    });
+
+    const login = await manager.startLogin("docs", servers);
+    expect(login.reused).toBe(false);
+    expect(login.url).toContain("https://auth.example/authorize");
+    await expect(manager.startLogin("docs", servers)).resolves.toMatchObject({
+      url: login.url,
+      reused: true,
+    });
+
+    await expect(manager.completeAuthorizationFromChat("code=trimmed-code")).resolves.toEqual({
+      status: "completed",
+      serverName: "docs",
+      expiresAt: 8_200_000,
+    });
+    expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.docs.accessToken)
+      .toBe("replacement-trimmed-code");
+  });
+
+  it("starts a fresh explicit login immediately after a failed background build", async () => {
+    resetDir();
+    const servers: Record<string, ExternalMcpServerConfig> = {
+      docs: {
+        server: { type: "http", url: "https://docs.example/mcp" },
+        oauth: {
+          authorizationServer: "https://auth.example",
+          clientId: "client-123",
+          scopes: [],
+          tokenStoreKey: "docs",
+        },
+      },
+    };
+    let metadataCalls = 0;
+    let signalFailure!: () => void;
+    const failureSeen = new Promise<void>((resolve) => { signalFailure = resolve; });
+    let releaseFailure!: () => void;
+    const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      fetchImpl: async (input, init) => {
+        if (String(input).includes(".well-known/oauth-authorization-server")) {
+          metadataCalls++;
+          if (metadataCalls === 1) throw new Error("transient discovery failure");
+          return new Response(JSON.stringify({
+            authorization_endpoint: "https://auth.example/authorize",
+            token_endpoint: "https://auth.example/token",
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (String(input) === "https://auth.example/token") {
+          const body = new URLSearchParams(String(init?.body));
+          return new Response(JSON.stringify({
+            access_token: `fresh-${body.get("code")}`,
+            token_type: "Bearer",
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected fetch ${String(input)}`);
+      },
+      onServerAuthError: async () => {
+        signalFailure();
+        await failureGate;
+      },
+    });
+
+    await manager.buildServersWithAuth(servers, async () => {}, { authorizationWaitMs: 0 });
+    await failureSeen;
+
+    const retry = manager.startLogin("docs", servers);
+    releaseFailure();
+    await expect(retry).resolves.toMatchObject({
+      reused: false,
+      url: expect.stringContaining("https://auth.example/authorize"),
+    });
+    expect(metadataCalls).toBe(2);
+
+    await expect(manager.completeAuthorizationFromChat("code=retry-code")).resolves.toMatchObject({
+      status: "completed",
+      serverName: "docs",
+    });
   });
 });

@@ -66,6 +66,7 @@ export interface LiveSessionManagerDeps {
  */
 export class LiveSessionManager {
   private liveSessions = new Map<string, LiveSession>();
+  private externalMcpServersBySession = new Map<string, ReadonlySet<string>>();
   // Sessions whose system prompt is out of date (workspace changed since they
   // were built). They STAY in liveSessions so in-flight conversations keep
   // their steering target; each is retired at its next idle boundary instead
@@ -85,6 +86,10 @@ export class LiveSessionManager {
 
   isAlive(key: string): boolean {
     return this.liveSessions.get(key)?.isAlive() ?? false;
+  }
+
+  mountedExternalMcpServers(key: string): ReadonlySet<string> {
+    return this.externalMcpServersBySession.get(key) ?? new Set();
   }
 
   /** Last turn result for a session still in the map (context-nudge default). */
@@ -160,6 +165,7 @@ export class LiveSessionManager {
     // shutdown) while we waited — nothing left to retire.
     if (this.liveSessions.get(key) !== session) return;
     this.liveSessions.delete(key);
+    this.externalMcpServersBySession.delete(key);
     session.close();
     log.info({ key }, "Prompt-stale session retired at idle boundary");
   }
@@ -195,6 +201,7 @@ export class LiveSessionManager {
       timeoutMs: config.liveSessionTimeoutMs,
     });
     this.liveSessions.set(key, session);
+    this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
     log.info(
       {
         key,
@@ -213,6 +220,7 @@ export class LiveSessionManager {
       this.promptStale.delete(session);
       session.close();
       this.liveSessions.delete(key);
+      this.externalMcpServersBySession.delete(key);
     }
   }
 
@@ -350,6 +358,7 @@ export class LiveSessionManager {
     // retirement, so this loop covers them too.
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
+    this.externalMcpServersBySession.clear();
     this.promptStale.clear();
   }
 }

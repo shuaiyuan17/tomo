@@ -20,6 +20,7 @@ import {
 import { log } from "../logger.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
+import type { ExternalMcpServerStatus, McpLoginStart } from "../mcp/oauth.js";
 import { ClaudeLoginManager } from "./claude-login.js";
 import { buildUsageReport } from "./usage.js";
 import { litellmRoutesModel } from "../litellm.js";
@@ -40,11 +41,13 @@ export interface ChatCommandDeps {
   closeLiveSession(key: string): void;
   isSessionLive(key: string): boolean;
   queuePendingNote(sessionKey: string, note: string): void;
+  getExternalMcpStatuses(sessionKey: string): ExternalMcpServerStatus[];
+  startExternalMcpLogin(serverName: string): Promise<McpLoginStart>;
 }
 
 /**
  * Handles slash commands typed in chat (/new, /model, /status, /pet,
- * /cost, /restore, /login, /pause, /resume).
+ * /cost, /restore, /login, /mcp, /pause, /resume).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -81,6 +84,11 @@ export class ChatCommandHandler {
     // create or mutate a conversation entry as a side effect.
     if (command === "login") {
       await this.handleClaudeLogin(channel, chatId, senderId, args);
+      return;
+    }
+
+    if (command === "mcp") {
+      await this.handleExternalMcpCommand(channel, chatId, senderId, args);
       return;
     }
 
@@ -531,6 +539,69 @@ export class ChatCommandHandler {
     }
   }
 
+  private async handleExternalMcpCommand(
+    channel: Channel,
+    chatId: string,
+    senderId?: string,
+    args?: string,
+  ): Promise<void> {
+    const rawKey = `${channel.name}:${chatId}`;
+    if (isGroupSessionKey(rawKey)) {
+      await channel.send({ chatId, text: "⚠️ /mcp is only available in a configured owner's private DM." });
+      return;
+    }
+
+    const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+    if (!identity) {
+      log.warn({ channel: channel.name, chatId }, "/mcp refused (sender is not a configured identity)");
+      const text = config.identities.length === 0
+        ? "⚠️ No owner identity is configured, so /mcp is locked. On the machine running Tomo, run `tomo config` → Identities and bind your user ID, then try /mcp again."
+        : "⚠️ Only a configured owner can inspect or re-authenticate external MCP servers.";
+      await channel.send({ chatId, text });
+      return;
+    }
+
+    const arg = args?.trim() ?? "";
+    if (!arg) {
+      const sessionKey = dmSessionKeyForIdentity(identity.name);
+      const statuses = this.deps.getExternalMcpStatuses(sessionKey);
+      if (statuses.length === 0) {
+        await channel.send({ chatId, text: "🔌 No external MCP servers are configured." });
+        return;
+      }
+      await channel.send({
+        chatId,
+        text: ["🔌 External MCP servers", "", ...statuses.map(formatExternalMcpStatus)].join("\n"),
+      });
+      return;
+    }
+
+    const match = /^login\s+(\S+)$/i.exec(arg);
+    if (!match) {
+      await channel.send({ chatId, text: "⚠️ Usage: /mcp or /mcp login <server>" });
+      return;
+    }
+
+    const serverName = match[1];
+    try {
+      const login = await this.deps.startExternalMcpLogin(serverName);
+      await channel.send({
+        chatId,
+        text: [
+          login.reused ? `🔑 MCP login for "${serverName}" is already waiting.` : `🔑 MCP login started for "${serverName}".`,
+          "",
+          login.url,
+          "",
+          "Complete authorization in your browser, then paste the full localhost redirect URL back into this private DM.",
+          "The request expires after 10 minutes. The next live session will mount the server after login succeeds.",
+        ].join("\n"),
+      });
+    } catch (err) {
+      log.warn({ err, serverName }, "External MCP login command failed");
+      await channel.send({ chatId, text: `⚠️ [error] MCP login failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  }
+
   private scheduleRestart(): void {
     if (process.env.NODE_ENV === "test") return;
     setTimeout(() => {
@@ -572,4 +643,25 @@ export class ChatCommandHandler {
       await channel.send({ chatId, text: `⚠️ [error] restore failed: ${detail}` });
     }
   }
+}
+
+function formatExternalMcpStatus(status: ExternalMcpServerStatus): string {
+  const expiry = status.expiresAt !== undefined ? new Date(status.expiresAt).toLocaleString() : undefined;
+  const lastError = status.lastError ? ` · last error: ${status.lastError}` : "";
+  if (status.state === "auth-pending") {
+    return `• ${status.name} — auth pending since ${new Date(status.startedAt ?? Date.now()).toLocaleString()}`;
+  }
+  if (status.state === "auth-failed") {
+    const when = status.lastErrorAt !== undefined ? ` at ${new Date(status.lastErrorAt).toLocaleString()}` : "";
+    return `• ${status.name} — auth failed${when}: ${status.lastError ?? "login required"}`;
+  }
+  if (status.state === "connected") {
+    const token = status.oauth ? (expiry ? ` · token valid until ${expiry}` : " · OAuth token has no expiry") : " · no OAuth";
+    return `• ${status.name} — connected${token}${lastError}`;
+  }
+  if (status.authRequired) {
+    return `• ${status.name} — not mounted · login required (/mcp login ${status.name})${lastError}`;
+  }
+  const token = status.oauth ? (expiry ? ` · token valid until ${expiry}` : " · OAuth token ready") : "";
+  return `• ${status.name} — not mounted in this session${token}${lastError}`;
 }

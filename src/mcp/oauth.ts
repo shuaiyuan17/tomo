@@ -59,6 +59,8 @@ export interface McpOAuthManagerOptions {
   now?: () => number;
   tokenStorePath?: string;
   onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
+  /** Best-effort notification after a fresh authenticated server config is ready. */
+  onServerAuthReady?: (serverName: string, server: McpServerConfig) => void | Promise<void>;
 }
 
 export interface BuildServersWithAuthOptions {
@@ -125,6 +127,7 @@ export class McpOAuthManager {
   private now: () => number;
   private tokenStorePath: string;
   private onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
+  private onServerAuthReady?: (serverName: string, server: McpServerConfig) => void | Promise<void>;
   /** One interactive/refresh flow per configured server. Session churn must
    * not open duplicate callback listeners or send duplicate login links. */
   private serverAuthBuilds = new Map<string, ServerAuthBuild>();
@@ -138,6 +141,7 @@ export class McpOAuthManager {
     this.now = options.now ?? Date.now;
     this.tokenStorePath = options.tokenStorePath ?? join(options.workspaceDir, "secrets", "mcp-oauth.json");
     this.onServerAuthError = options.onServerAuthError;
+    this.onServerAuthReady = options.onServerAuthReady;
   }
 
   async buildServersWithAuth(
@@ -306,6 +310,13 @@ export class McpOAuthManager {
     const tracked = raw
       .then((server) => {
         this.serverFailures.delete(serverName);
+        // Hot-mounting is deliberately detached from the auth build: session
+        // creation may itself be awaiting this promise, and a runtime control
+        // failure must never turn a successfully stored token into an OAuth
+        // failure. The host owns logging and next-session fallback behavior.
+        void Promise.resolve()
+          .then(() => this.onServerAuthReady?.(serverName, server))
+          .catch(() => {});
         return server;
       })
       .catch(async (err) => {

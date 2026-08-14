@@ -17,6 +17,11 @@ interface FakeSession {
   close(): void;
   waitForIdle(): Promise<void>;
   getSessionId(): string | null;
+  setMcpServers(servers: Record<string, unknown>): Promise<{
+    added: string[];
+    removed: string[];
+    errors: Record<string, string>;
+  } | null>;
   send(prompt: string): Promise<string>;
   steer(prompt: string): Promise<string>;
 }
@@ -25,6 +30,12 @@ const { mockState } = vi.hoisted(() => ({
   mockState: {
     instances: [] as FakeSession[],
     sendImpl: null as null | ((prompt: string, session: FakeSession) => Promise<string>),
+    mcpSetCalls: [] as Array<{ session: FakeSession; servers: Record<string, unknown> }>,
+    mcpSetImpl: null as null | ((servers: Record<string, unknown>, session: FakeSession) => Promise<{
+      added: string[];
+      removed: string[];
+      errors: Record<string, string>;
+    } | null>),
     compactTriggered: false,
   },
 }));
@@ -48,6 +59,11 @@ vi.mock("../src/agent/live-session.js", () => {
     close() { this.closed = true; }
     waitForIdle() { return new Promise<void>((r) => this.idleResolvers.push(r)); }
     getSessionId() { return this.sessionId; }
+    async setMcpServers(servers: Record<string, unknown>) {
+      mockState.mcpSetCalls.push({ session: this, servers });
+      if (mockState.mcpSetImpl) return mockState.mcpSetImpl(servers, this);
+      return { added: Object.keys(servers), removed: [], errors: {} };
+    }
     async send(prompt: string) { return mockState.sendImpl ? mockState.sendImpl(prompt, this) : "ok"; }
     async steer(prompt: string) { return mockState.sendImpl ? mockState.sendImpl(prompt, this) : "steered"; }
   }
@@ -80,6 +96,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const { LiveSessionManager } = await import("../src/agent/live-session-manager.js");
+const { log } = await import("../src/logger.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
 function makeDeps(overrides: Partial<Deps> = {}): Deps {
@@ -109,6 +126,8 @@ async function flushMicrotasks(): Promise<void> {
 beforeEach(() => {
   mockState.instances = [];
   mockState.sendImpl = null;
+  mockState.mcpSetCalls = [];
+  mockState.mcpSetImpl = null;
   mockState.compactTriggered = false;
 });
 
@@ -254,6 +273,162 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(manager.isAlive("telegram:1")).toBe(true);
     expect(manager.isBusy("telegram:1")).toBe(true);
     expect(manager.lastResult("telegram:1")).toEqual({ contextUsed: 10, contextMax: 100 });
+  });
+
+  it("hot-mounts an authenticated server with the complete existing MCP map", async () => {
+    const existing = { type: "http" as const, url: "https://existing.example/mcp" };
+    const fresh = {
+      type: "http" as const,
+      url: "https://docs.example/mcp",
+      headers: { Authorization: "Bearer fresh" },
+    };
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => ({ existing }),
+    }));
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await manager.hotMountExternalMcpServer("docs", fresh);
+
+    expect(mockState.mcpSetCalls).toHaveLength(1);
+    expect(mockState.mcpSetCalls[0].servers).toMatchObject({
+      existing,
+      docs: fresh,
+      "tomo-internal": expect.any(Object),
+    });
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["existing", "docs"]));
+  });
+
+  it("does not remount a server already present in the live session", async () => {
+    const docs = {
+      type: "http" as const,
+      url: "https://docs.example/mcp",
+      headers: { Authorization: "Bearer existing" },
+    };
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => ({ docs }),
+    }));
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await manager.hotMountExternalMcpServer("docs", {
+      ...docs,
+      headers: { Authorization: "Bearer refreshed" },
+    });
+
+    expect(mockState.mcpSetCalls).toHaveLength(0);
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["docs"]));
+  });
+
+  it("discards a hot-mount result when its session was replaced in flight", async () => {
+    let releaseSet!: () => void;
+    const setGate = new Promise<void>((resolve) => { releaseSet = resolve; });
+    mockState.mcpSetImpl = async () => {
+      await setGate;
+      return { added: ["docs"], removed: [], errors: {} };
+    };
+    const manager = new LiveSessionManager(makeDeps());
+    const original = await manager.getOrCreateLiveSession("telegram:1");
+
+    const mounting = manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+    await flushMicrotasks();
+    expect(mockState.mcpSetCalls).toHaveLength(1);
+
+    manager.closeLiveSession("telegram:1");
+    const replacement = await manager.getOrCreateLiveSession("telegram:1");
+    expect(replacement).not.toBe(original);
+    releaseSet();
+    await mounting;
+
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set());
+    mockState.mcpSetImpl = null;
+    await manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+    expect(mockState.mcpSetCalls).toHaveLength(2);
+    expect(mockState.mcpSetCalls[1].session).toBe(replacement);
+  });
+
+  it("serializes simultaneous hot-mounts so neither replacement drops the other", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await Promise.all([
+      manager.hotMountExternalMcpServer("alpha", { type: "http", url: "https://alpha.example/mcp" }),
+      manager.hotMountExternalMcpServer("beta", { type: "http", url: "https://beta.example/mcp" }),
+    ]);
+
+    expect(mockState.mcpSetCalls).toHaveLength(2);
+    expect(mockState.mcpSetCalls[0].servers).toHaveProperty("alpha");
+    expect(mockState.mcpSetCalls[1].servers).toMatchObject({
+      alpha: expect.any(Object),
+      beta: expect.any(Object),
+      "tomo-internal": expect.any(Object),
+    });
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["alpha", "beta"]));
+  });
+
+  it("waits for an already-started session creation before hot-mounting", async () => {
+    let releaseBuild!: () => void;
+    const buildGate = new Promise<void>((resolve) => { releaseBuild = resolve; });
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => {
+        await buildGate;
+        return {};
+      },
+    }));
+
+    const creating = manager.getOrCreateLiveSession("telegram:1");
+    const mounting = manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+    await flushMicrotasks();
+    expect(mockState.mcpSetCalls).toHaveLength(0);
+
+    releaseBuild();
+    await creating;
+    await mounting;
+    expect(mockState.mcpSetCalls).toHaveLength(1);
+    expect(manager.mountedExternalMcpServers("telegram:1")).toContain("docs");
+  });
+
+  it("keeps next-session fallback when the runtime lacks MCP updates", async () => {
+    mockState.mcpSetImpl = async () => null;
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+
+    expect(manager.mountedExternalMcpServers("telegram:1")).not.toContain("docs");
+    expect(log.warn).toHaveBeenCalledWith(
+      { serverName: "docs", sessions: 1 },
+      "Agent SDK does not support live MCP updates; a later session will mount the server",
+    );
+  });
+
+  it("keeps bookkeeping unchanged and logs once when the control request fails", async () => {
+    mockState.mcpSetImpl = async () => { throw new Error("control unavailable"); };
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+
+    expect(manager.mountedExternalMcpServers("telegram:1")).not.toContain("docs");
+    const failureMessage = "External MCP hot-mount failed for live sessions; a later session will retry";
+    expect(log.warn).toHaveBeenCalledWith(
+      { serverName: "docs", failures: [{ key: "telegram:1", error: "control unavailable" }] },
+      failureMessage,
+    );
+    expect(vi.mocked(log.warn).mock.calls.filter(([, message]) => message === failureMessage)).toHaveLength(1);
   });
 });
 

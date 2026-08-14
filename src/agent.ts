@@ -166,6 +166,8 @@ export class Agent {
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
       onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
+      onServerAuthReady: (serverName, server) =>
+        this.liveSessionManager.hotMountExternalMcpServer(serverName, server),
     });
     this.liveSessionManager = new LiveSessionManager({
       buildSystemPrompt: () => buildSystemPrompt(),
@@ -459,7 +461,7 @@ export class Agent {
       : "";
     await channel.send({
       chatId: message.chatId,
-      text: `✅ MCP login completed for "${result.serverName}".${expiry} New live sessions will mount it automatically.`,
+      text: `✅ MCP login completed for "${result.serverName}".${expiry} Tomo will attach it to live sessions automatically; if runtime hot-mounting is unavailable, the next session will use it.`,
     });
     return true;
   }
@@ -586,7 +588,7 @@ export class Agent {
         url,
         "",
         "Open the link and finish login. If the browser is on another device, paste the full localhost redirect URL back into this private DM so Tomo can complete the callback.",
-        "The current turn will continue without this server; a later live session will use it after login completes.",
+        "The current turn will continue without this server. After login, Tomo will attach it to live sessions automatically; if runtime hot-mounting is unavailable, the next session will use it.",
       ].join("\n"),
     });
   }

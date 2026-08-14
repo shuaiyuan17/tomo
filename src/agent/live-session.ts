@@ -1,4 +1,11 @@
-import { query, type Query, type SDKUserMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type McpServerConfig,
+  type McpSetServersResult,
+  type Query,
+  type SDKUserMessage,
+  type SDKMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
@@ -754,6 +761,15 @@ export class LiveSession {
 
   isAlive(): boolean {
     return this.alive;
+  }
+
+  /** Replace the live query's complete dynamic MCP set when the SDK supports it. */
+  async setMcpServers(servers: Record<string, McpServerConfig>): Promise<McpSetServersResult | null> {
+    const runtimeQuery = this.q as unknown as {
+      setMcpServers?: (next: Record<string, McpServerConfig>) => Promise<McpSetServersResult>;
+    };
+    if (typeof runtimeQuery.setMcpServers !== "function") return null;
+    return runtimeQuery.setMcpServers.call(this.q, servers);
   }
 
   close(): void {

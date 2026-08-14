@@ -593,7 +593,7 @@ export class ChatCommandHandler {
           login.url,
           "",
           "Complete authorization in your browser, then paste the full localhost redirect URL back into this private DM.",
-          "The request expires after 10 minutes. The next live session will mount the server after login succeeds.",
+          "The request expires after 10 minutes. Tomo will attach the server to live sessions after login; if runtime hot-mounting is unavailable, the next session will use it.",
         ].join("\n"),
       });
     } catch (err) {

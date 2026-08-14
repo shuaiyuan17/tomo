@@ -47,9 +47,10 @@ reminder, the summon-time pending note, the `send_message` tool description, and
    `sessionKey: dm:<identity>` + the dm session's private reply target. Group traffic touches
    the summon's activity clock; expiry is detected lazily on the next lookup (no timer) and
    fires `onSummonExpired`, which posts a handback notice to the group and queues a pending
-   note for the dm session. Two hardening details: routing is resolved **once, at receipt
-   time**, and carried with the queued message — a `/summon` or `/dismiss` that lands while a
-   message waits (in-flight turn, iMessage settle window) cannot re-route it; and a **stale
+   note for the dm session. Two hardening details: routing is captured at receipt time, then
+   revalidated in one safe direction at processing time — an active `/summon` takes ownership
+   of pre-summon backlog so the dormant group session cannot revive concurrently, while a later
+   `/dismiss` never pulls already-summoned work back out of the dm session; and a **stale
    summon** (identity renamed/removed since `summons.json` was written, so no private reply
    target exists) is dropped rather than falling back to replying in the group.
 2. **Persistence** (`src/sessions/summon-store.ts`): summon state lives in

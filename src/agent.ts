@@ -181,6 +181,10 @@ export class Agent {
       buildExternalMcpServers: (key) => this.mcpOAuthManager.buildServersWithAuth(
         config.mcpServers ?? {},
         (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
+        // Interactive OAuth may wait ten minutes for a browser callback. Never
+        // put chat/session revival behind that wait: the auth flow continues in
+        // the background and the server joins a later live session.
+        { authorizationWaitMs: 0 },
       ),
       buildGroupContext: (key) => this.buildGroupContext(key),
       handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
@@ -412,11 +416,47 @@ export class Agent {
       log.debug({ dropped: items.length - allowed.length }, "Batched items dropped (no longer in allowlist, or group paused)");
     }
     if (allowed.length === 0) return;
-    if (allowed.length === 1) {
-      await this.handleMessage(allowed[0].channel, allowed[0].message, steer, allowed[0].resolution);
+
+    // Receipt-time routing remains stable in the ordinary direction: a
+    // /dismiss cannot pull a message already accepted by a summoned dm:
+    // session back into the group session. The reverse direction is special:
+    // an active /summon owns the group exclusively, so pre-summon backlog must
+    // move to that dm: queue instead of reviving the dormant group session.
+    const routed = allowed.map((item) => this.rerouteQueuedItemToActiveSummon(item));
+    const receiptKey = allowed[0].resolution.sessionKey;
+    const routedKey = routed[0].resolution.sessionKey;
+    if (routedKey !== receiptKey) {
+      this.enqueueForSession(routedKey, () => this.processInboundItems(routed))
+        .catch((err) => log.error({ err, sessionKey: routedKey }, "Unhandled error rerouting queued group message to summoned session"));
       return;
     }
-    await this.handleBatchedMessages(allowed, steer);
+
+    if (routed.length === 1) {
+      await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution);
+      return;
+    }
+    await this.handleBatchedMessages(routed, steer);
+  }
+
+  private rerouteQueuedItemToActiveSummon(item: InboundItem): InboundItem {
+    if (!(item.message.isGroup ?? false) || isDmSessionKey(item.resolution.sessionKey)) return item;
+    const current = this.router.resolve(item.channel.name, item.message.chatId, true);
+    if (!isDmSessionKey(current.sessionKey)) return item;
+    log.info(
+      { from: item.resolution.sessionKey, to: current.sessionKey, messageId: item.message.id },
+      "Queued group message handed to active summoned session",
+    );
+    return { ...item, resolution: current };
+  }
+
+  /** Active summon owner for a raw group-session key, without extending the
+   * inactivity clock (cron/restart work is not fresh group traffic). */
+  private summonedDmKeyForGroupSession(sessionKey: string): string | undefined {
+    if (!isGroupSessionKey(sessionKey)) return undefined;
+    const parsed = parseRawSessionKey(sessionKey);
+    if (!parsed) return undefined;
+    const identity = this.router.getSummonedIdentity(parsed.channelName, parsed.chatId);
+    return identity ? `dm:${identity}` : undefined;
   }
 
   /** A summon lapsed from inactivity (lazy-detected by the router). Always brief
@@ -484,7 +524,7 @@ export class Agent {
         "",
         url,
         "",
-        "Open the link and finish login. Tomo will continue after the browser callback completes.",
+        "Open the link and finish login. The current turn will continue without this server; a later live session will use it after the browser callback completes.",
       ].join("\n"),
     });
   }
@@ -1048,6 +1088,25 @@ export class Agent {
   }
 
   private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<boolean> {
+    const summonedKey = this.summonedDmKeyForGroupSession(sessionKey);
+    if (summonedKey) {
+      const parsed = parseRawSessionKey(sessionKey)!;
+      const prompt = `${message}\n${this.summonReminder([`${parsed.channelName}:${parsed.chatId}`])}`;
+      log.info({ from: sessionKey, to: summonedKey }, "Group background turn handed to active summoned session");
+      // This path is also used by send_message(delegate). If the summoning dm:
+      // session requested that delegate, awaiting its own queue would deadlock;
+      // schedule the owned follow-up and report that it was accepted.
+      this.enqueueForSession(summonedKey, () => this.processCronMessage(prompt, summonedKey, {
+        ...options,
+        // Summoned turns retain the private-output safety model. Group-facing
+        // output must use the explicit direct-send path named in the reminder.
+        deliveryTarget: undefined,
+      })).catch((err) => {
+        log.error({ err, sessionKey: summonedKey }, "Summoned group background turn failed in queue");
+      });
+      return true;
+    }
+
     const key = sessionKey;
     const delivery = options.deliveryTarget
       ? this.channelDeliveryTarget(options.deliveryTarget, sessionKey, "Cron")

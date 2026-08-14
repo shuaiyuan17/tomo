@@ -318,6 +318,34 @@ describe("cron message delivery", () => {
 
     await agent.stop();
   });
+
+  it("runs group background work on the summoned dm session without reviving the group session", async () => {
+    resetConfig({
+      identities: [
+        { name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" },
+      ],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+    };
+    internals.router.summonGroup("telegram", "-100270", "shuai");
+    mockSdk.responseFn = () => "NO_REPLY";
+
+    await expect(agent.handleCronMessage("Scheduled group task", "telegram:-100270")).resolves.toBe(true);
+    await drainQueue(agent);
+
+    const prompt = mockSdk.userContents.flat().map((block) => block.text ?? "").join("");
+    expect(prompt).toContain("Scheduled group task");
+    expect(prompt).toContain('type="summon-reminder"');
+    expect(agent.listActiveSessions().map(([key]) => key)).toContain("dm:shuai");
+    expect(agent.listActiveSessions().map(([key]) => key)).not.toContain("telegram:-100270");
+    expect(tg.delivered).toHaveLength(0);
+
+    await agent.stop();
+  });
 });
 
 // ===== Background task notification delivery =====

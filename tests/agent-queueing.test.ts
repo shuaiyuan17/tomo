@@ -387,6 +387,55 @@ describe("message queueing", () => {
 
     await agent.stop();
   });
+
+  it("hands pre-summon group backlog to the summoned dm session before it can revive the group session", async () => {
+    resetConfig({
+      identities: [
+        { name: "shuai", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" },
+      ],
+    });
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+    const groupKey = "imessage:any;+;group270";
+    const internals = agent as unknown as {
+      sessionQueue: { enqueue<T>(key: string, task: () => Promise<T>): Promise<T> };
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+    };
+
+    let releaseBlocker!: () => void;
+    const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+    const blocker = internals.sessionQueue.enqueue(groupKey, () => blockerGate);
+    const prompts: string[] = [];
+    mockSdk.responseFn = (text) => {
+      prompts.push(text);
+      return "NO_REPLY";
+    };
+
+    // Receipt resolves to the ordinary group session, then waits behind work
+    // already queued there. The summon lands before that item is processed.
+    await im.simulateMessage(makeMsg({
+      id: "pre-summon",
+      chatId: "any;+;group270",
+      chatTitle: "Issue 270",
+      text: "Claw, can you review this?",
+      senderName: "Alice",
+      isGroup: true,
+      isMentioned: true,
+    }));
+    internals.router.summonGroup("imessage", "any;+;group270", "shuai");
+    releaseBlocker();
+    await blocker;
+    await drainQueue(agent);
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('[group "Issue 270"] Alice: Claw, can you review this?');
+    expect(prompts[0]).toContain('type="summon-reminder"');
+    expect(agent.listActiveSessions().map(([key]) => key)).toContain("dm:shuai");
+    expect(agent.listActiveSessions().map(([key]) => key)).not.toContain(groupKey);
+
+    await agent.stop();
+  });
 });
 
 // ===== Message isolation across ingress paths =====

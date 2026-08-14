@@ -61,11 +61,30 @@ export interface McpOAuthManagerOptions {
   onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
 }
 
+export interface BuildServersWithAuthOptions {
+  /**
+   * Maximum time session creation may wait for an OAuth-enabled server.
+   * When the deadline wins, authorization keeps running in the background and
+   * the server is omitted from this session; a later session picks up the
+   * stored token. Undefined preserves the blocking behavior for explicit
+   * callers and tests.
+   */
+  authorizationWaitMs?: number;
+}
+
+type AuthBuildOutcome =
+  | { status: "ready"; server: McpServerConfig }
+  | { status: "failed" }
+  | { status: "pending" };
+
 export class McpOAuthManager {
   private fetchImpl: typeof fetch;
   private now: () => number;
   private tokenStorePath: string;
   private onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
+  /** One interactive/refresh flow per configured server. Session churn must
+   * not open duplicate callback listeners or send duplicate login links. */
+  private serverAuthBuilds = new Map<string, Promise<McpServerConfig>>();
 
   constructor(options: McpOAuthManagerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -77,6 +96,7 @@ export class McpOAuthManager {
   async buildServersWithAuth(
     servers: Record<string, ExternalMcpServerConfig>,
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
+    options: BuildServersWithAuthOptions = {},
   ): Promise<Record<string, McpServerConfig>> {
     const result: Record<string, McpServerConfig> = {};
     for (const [name, entry] of Object.entries(servers)) {
@@ -85,13 +105,62 @@ export class McpOAuthManager {
         continue;
       }
 
-      try {
-        result[name] = await this.withOAuthHeader(name, entry, sendAuthorizeUrl);
-      } catch (err) {
-        await this.onServerAuthError?.(name, err);
-      }
+      const build = this.getOrStartServerAuthBuild(name, entry, sendAuthorizeUrl);
+      const outcome = options.authorizationWaitMs === undefined
+        ? await this.waitForAuthBuild(build)
+        : await this.waitForAuthBuild(build, options.authorizationWaitMs);
+      if (outcome.status === "ready") result[name] = outcome.server;
     }
     return result;
+  }
+
+  private getOrStartServerAuthBuild(
+    serverName: string,
+    entry: ExternalMcpServerConfig,
+    sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
+  ): Promise<McpServerConfig> {
+    const existing = this.serverAuthBuilds.get(serverName);
+    if (existing) return existing;
+
+    const raw = this.withOAuthHeader(serverName, entry, sendAuthorizeUrl);
+    const tracked = raw
+      .catch(async (err) => {
+        await this.onServerAuthError?.(serverName, err);
+        throw err;
+      })
+      .finally(() => {
+        this.serverAuthBuilds.delete(serverName);
+      });
+    // A zero-wait session intentionally leaves this promise running. Observe
+    // its rejection here so a ten-minute unattended login timeout never turns
+    // into an unhandled rejection; the configured callback above still logs
+    // and notifies exactly once.
+    void tracked.catch(() => {});
+    this.serverAuthBuilds.set(serverName, tracked);
+    return tracked;
+  }
+
+  private async waitForAuthBuild(
+    build: Promise<McpServerConfig>,
+    waitMs?: number,
+  ): Promise<AuthBuildOutcome> {
+    const settled = build.then<AuthBuildOutcome, AuthBuildOutcome>(
+      (server) => ({ status: "ready", server }),
+      () => ({ status: "failed" }),
+    );
+    if (waitMs === undefined) return settled;
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        settled,
+        new Promise<AuthBuildOutcome>((resolve) => {
+          timer = setTimeout(() => resolve({ status: "pending" }), Math.max(0, waitMs));
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async withOAuthHeader(
@@ -432,6 +501,9 @@ async function startCallbackServer(configuredRedirectUri?: string) {
     server.once("error", reject);
     server.listen(port, host, () => resolve());
   });
+  // OAuth authorization is allowed to outlive the session spawn that started
+  // it, but it must not keep an otherwise-stopped daemon process alive.
+  server.unref();
 
   const address = server.address();
   const actualPort = typeof address === "object" && address ? address.port : port;
@@ -455,6 +527,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
       promise,
       new Promise<T>((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error("OAuth login timed out")), ms);
+        timer.unref();
       }),
     ]);
   } finally {

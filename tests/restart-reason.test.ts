@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,7 +8,12 @@ import {
   restartReasonSessionFile,
   writeRestartReasonFile,
 } from "../src/restart-reason.js";
-import { recordRestartReason } from "../src/cli/daemon.js";
+import {
+  TOMO_DEFERRED_RESTART_PARENT_PID_ENV,
+  recordRestartReason,
+  scheduleDeferredRestart,
+  shouldDeferRestart,
+} from "../src/cli/daemon.js";
 
 let tmpDir: string;
 let reasonFile: string;
@@ -151,5 +156,47 @@ describe("recordRestartReason (CLI writer seam)", () => {
     recordRestartReason("manual restart", undefined, {}, reasonFile);
     expect(readFileSync(reasonFile, "utf-8")).toBe("manual restart");
     expect(existsSync(sidecarFile)).toBe(false);
+  });
+});
+
+describe("session-aware restart deferral", () => {
+  it("defers a restart attributed by the session env or explicit flag", () => {
+    expect(shouldDeferRestart(undefined, { TOMO_SESSION_KEY: "dm:shuai" })).toBe(true);
+    expect(shouldDeferRestart("dm:shuai", {})).toBe(true);
+  });
+
+  it("keeps terminal restarts synchronous and prevents worker recursion", () => {
+    expect(shouldDeferRestart(undefined, {})).toBe(false);
+    expect(shouldDeferRestart(undefined, {
+      TOMO_SESSION_KEY: "dm:shuai",
+      [TOMO_DEFERRED_RESTART_PARENT_PID_ENV]: "1234",
+    })).toBe(false);
+  });
+
+  it("spawns a detached worker marked with its parent PID", () => {
+    const unref = vi.fn();
+    const spawnFn = vi.fn(() => ({ unref }));
+
+    scheduleDeferredRestart(
+      "/opt/tomo/dist/cli.js",
+      { TOMO_SESSION_KEY: "dm:shuai", KEEP_ME: "yes" },
+      4321,
+      spawnFn,
+    );
+
+    expect(spawnFn).toHaveBeenCalledWith(
+      process.execPath,
+      ["/opt/tomo/dist/cli.js", "restart"],
+      {
+        detached: true,
+        stdio: "ignore",
+        env: {
+          TOMO_SESSION_KEY: "dm:shuai",
+          KEEP_ME: "yes",
+          [TOMO_DEFERRED_RESTART_PARENT_PID_ENV]: "4321",
+        },
+      },
+    );
+    expect(unref).toHaveBeenCalledOnce();
   });
 });

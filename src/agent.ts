@@ -32,7 +32,7 @@ import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipelin
 import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
-import { resolveBlockRange } from "./lcm/blocks.js";
+import { replacementPolicy, resolveBlockRange, rollupCommand } from "./lcm/blocks.js";
 import { formatTomoEvent } from "./tomo-event.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { pruneTools } from "./lcm/index.js";
@@ -810,7 +810,6 @@ export class Agent {
     let prunableTokens = 0;
     let prunableSufficient = false;
     let dailyRangeAvailable = true;
-    let dailyRangeReplacesExistingBlock = false;
 
     if (shouldPrecheckContextNudge) {
       sid = this.sessions.getSdkSessionId(key);
@@ -823,7 +822,6 @@ export class Agent {
       if (nudged === "prune" || !prunableSufficient) {
         const dailyRange = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir);
         dailyRangeAvailable = dailyRange !== null;
-        dailyRangeReplacesExistingBlock = dailyRange?.replacesExistingBlock ?? false;
       }
     }
 
@@ -865,13 +863,16 @@ export class Agent {
         log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
       }
     } else if (decision.kind === "daily") {
-      const replaceFlag = dailyRangeReplacesExistingBlock ? " --replace" : "";
-      const replacementNote = dailyRangeReplacesExistingBlock
-        ? " (1) A daily block already exists, so this command uses `--replace`; write a complete summary covering the whole day and preserve prior details worth keeping."
-        : " (1) A later repeat compact requires `--replace` and a fresh whole-day summary; rollups never append automatically.";
+      const dailyCommand = rollupCommand({
+        level: "daily",
+        sdkSessionId: sid!,
+        replace: true,
+        summaryPlaceholder: "<today-so-far>",
+      });
+      const replacement = replacementPolicy("daily <today>");
       nudge = formatTomoEvent(
         "context-nudge",
-        `Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid}${replaceFlag} --summary "<today-so-far>"\` to roll up today's activity. Two things to know:${replacementNote} (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+        `Context usage is at ${pct}% of the window. Please run \`${dailyCommand}\` to roll up today's activity. Two things to know: (1) The queued command always includes \`--replace\` so it remains valid if another rollup creates today's block before this turn runs. If it replaces a block, ${replacement.instruction} (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
         { name: "daily" },
       );
       log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");

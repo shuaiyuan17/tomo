@@ -15,6 +15,50 @@ import { stripLeadingTomoEvents } from "../tomo-event.js";
  */
 export type BlockLevel = "daily" | "weekly" | "monthly" | "yearly";
 
+const PERIOD_FLAGS: Record<BlockLevel, string> = {
+  daily: "--date",
+  weekly: "--week",
+  monthly: "--month",
+  yearly: "--year",
+};
+
+export function rollupCommand(opts: {
+  level: BlockLevel;
+  sdkSessionId: string;
+  period?: string;
+  replace?: boolean;
+  summaryPlaceholder: string;
+}): string {
+  const parts = ["tomo", "lcm", opts.level, "--session-id", opts.sdkSessionId];
+  if (opts.period) parts.push(PERIOD_FLAGS[opts.level], opts.period);
+  if (opts.replace) parts.push("--replace");
+  parts.push("--summary", `"${opts.summaryPlaceholder}"`);
+  return parts.join(" ");
+}
+
+export function replacementPolicy(blockTag: string): { warning: string; instruction: string } {
+  return {
+    warning: `\`${blockTag}\` already has a summary block. This rollup REPLACES that summary; it does not append to it.`,
+    instruction: "Write a complete replacement that preserves prior details worth keeping and incorporates the newly eligible events.",
+  };
+}
+
+export function blockReplacementError(
+  resolved: Pick<ResolvedRange, "blockTag" | "replacesExistingBlock">,
+  allowReplace: boolean,
+  sdkSessionId: string,
+  level?: BlockLevel,
+): string | null {
+  if (!resolved.replacesExistingBlock || allowReplace) return null;
+  const inspectLevel = level ? ` --level ${level}` : "";
+  const policy = replacementPolicy(resolved.blockTag);
+  return [
+    policy.warning.replaceAll("`", ""),
+    `Inspect the existing summary with \`tomo lcm blocks --session-id ${sdkSessionId}${inspectLevel} --full\`.`,
+    `Then rerun with \`--replace\`. ${policy.instruction}`,
+  ].join(" ");
+}
+
 /** Soft token budgets per rollup level (matches the guidance in runner.ts nudge text). */
 export const BLOCK_SUMMARY_TOKEN_BUDGETS: Record<BlockLevel, number> = {
   daily: 1500,
@@ -65,6 +109,16 @@ function loadEvents(sdkSessionId: string, sdkSessionsDir: string): SdkEvent[] {
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return [];
   return readJsonlFileSync<SdkEvent>(path);
+}
+
+export function hasSummaryBlockTag(
+  sdkSessionId: string,
+  blockTag: string,
+  sdkSessionsDir: string,
+): boolean {
+  return loadEvents(sdkSessionId, sdkSessionsDir).some(
+    (event) => event.isCompactSummary && event.blockTag === blockTag,
+  );
 }
 
 /** ISO week tag for a Date (YYYY-Www). Matches Python's isocalendar. */
@@ -535,19 +589,28 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
   const due: DuePromotion[] = [];
 
   for (const [wk, count] of weeklyChildrenByWeek) {
-    if (!haveTags.has(`weekly ${wk}`)) {
-      due.push({ level: "weekly", period: wk, childCount: count, replacesExistingBlock: false });
-    }
+    due.push({
+      level: "weekly",
+      period: wk,
+      childCount: count,
+      replacesExistingBlock: haveTags.has(`weekly ${wk}`),
+    });
   }
   for (const [m, count] of monthlyChildrenByMonth) {
-    if (!haveTags.has(`monthly ${m}`)) {
-      due.push({ level: "monthly", period: m, childCount: count, replacesExistingBlock: false });
-    }
+    due.push({
+      level: "monthly",
+      period: m,
+      childCount: count,
+      replacesExistingBlock: haveTags.has(`monthly ${m}`),
+    });
   }
   for (const [y, count] of yearlyChildrenByYear) {
-    if (!haveTags.has(`yearly ${y}`)) {
-      due.push({ level: "yearly", period: y, childCount: count, replacesExistingBlock: false });
-    }
+    due.push({
+      level: "yearly",
+      period: y,
+      childCount: count,
+      replacesExistingBlock: haveTags.has(`yearly ${y}`),
+    });
   }
 
   // Nudge for any past day that has raw (non-summary) user/assistant events

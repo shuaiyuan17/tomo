@@ -4,7 +4,7 @@ vi.mock("../src/config.js", () => ({
   config: { lcm: { dailyFreshTail: 32, globalFreshTail: false } },
 }));
 
-import { blockReplacementError } from "../src/cli/lcm.js";
+import { blockReplacementError, rollupCommand } from "../src/lcm/blocks.js";
 import { buildRollupNudge } from "../src/lcm/runner.js";
 
 describe("LCM replacement safety", () => {
@@ -61,5 +61,17 @@ describe("LCM replacement safety", () => {
 
     expect(nudge).not.toContain("already has a summary block");
     expect(nudge).not.toContain("--replace");
+  });
+
+  it("uses one command builder for initial and replacement rollups", () => {
+    expect(rollupCommand({
+      level: "monthly",
+      sdkSessionId: "session-123",
+      period: "2026-07",
+      replace: true,
+      summaryPlaceholder: "<your text>",
+    })).toBe(
+      'tomo lcm monthly --session-id session-123 --month 2026-07 --replace --summary "<your text>"',
+    );
   });
 });

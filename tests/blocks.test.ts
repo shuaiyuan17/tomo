@@ -12,6 +12,7 @@ import {
   findDuePromotions as findDuePromotionsImpl,
   isWarmTailCandidate,
   globalFreshTailStartIdx,
+  hasSummaryBlockTag,
   summaryBudgetCheck,
   type BlockLevel,
 } from "../src/lcm/blocks.js";
@@ -279,6 +280,7 @@ describe("findDuePromotions — past-day nudging", () => {
     const range = resolveBlockRange(sessionId, "daily", pastDay);
     expect(range).not.toBeNull();
     expect(range!.replacesExistingBlock).toBe(true);
+    expect(hasSummaryBlockTag(sessionId, `daily ${pastDay}`, SDK_SESSIONS_DIR)).toBe(true);
   });
 
   it("does NOT flag a past day with a block and 7 leftover raw events", () => {
@@ -653,5 +655,32 @@ describe("findDuePromotions — default-off weekly behavior unchanged", () => {
 
     const due = findDuePromotions(sessionId);
     expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeDefined();
+  });
+
+  it("rebuilds existing higher-level blocks when late child blocks arrive", () => {
+    const summary = (blockTag: string, timestamp: string) => ({
+      type: "user",
+      uuid: randomUUID(),
+      timestamp,
+      isCompactSummary: true,
+      blockTag,
+      message: { role: "user", content: `[${blockTag} — summary]\n\nexisting` },
+    });
+    archivePath = writeArchive(sessionId, [
+      summary("weekly 2026-W15", new Date(2026, 3, 6, 1).toISOString()),
+      summary("daily 2026-04-08", new Date(2026, 3, 8, 1).toISOString()),
+      summary("monthly 2026-04", new Date(2026, 3, 1, 1).toISOString()),
+      summary("weekly 2026-W16", new Date(2026, 3, 13, 1).toISOString()),
+      summary("yearly 2025", new Date(2025, 0, 1, 1).toISOString()),
+      summary("monthly 2025-12", new Date(2025, 11, 1, 1).toISOString()),
+    ]);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((p) => p.level === "weekly" && p.period === "2026-W15"))
+      .toMatchObject({ childCount: 1, replacesExistingBlock: true });
+    expect(due.find((p) => p.level === "monthly" && p.period === "2026-04"))
+      .toMatchObject({ childCount: 2, replacesExistingBlock: true });
+    expect(due.find((p) => p.level === "yearly" && p.period === "2025"))
+      .toMatchObject({ childCount: 1, replacesExistingBlock: true });
   });
 });

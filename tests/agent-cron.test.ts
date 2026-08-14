@@ -659,6 +659,7 @@ describe("compact nudges", () => {
 
     await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
     expect(nudgePrompts()[0]).toContain("tomo lcm daily");
+    expect(nudgePrompts()[0]).toContain("--replace");
     expect(nudgePrompts()[0]).not.toContain("prune-tools");
 
     await agent.stop();
@@ -676,6 +677,7 @@ describe("compact nudges", () => {
     await drainQueue(agent);
     await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
     expect(nudgePrompts()[0]).toContain("tomo lcm daily");
+    expect(nudgePrompts()[0]).toContain("--replace");
 
     // Crossing 80% escalates to a compact nudge even though daily fired.
     mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 };

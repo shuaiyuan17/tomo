@@ -2,7 +2,13 @@ import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
 import { pruneTools } from "../lcm/prune-tools.js";
-import { resolveBlockRange, summaryBudgetCheck, type BlockLevel, type ResolvedRange } from "../lcm/blocks.js";
+import {
+  blockReplacementError,
+  hasSummaryBlockTag,
+  resolveBlockRange,
+  summaryBudgetCheck,
+  type BlockLevel,
+} from "../lcm/blocks.js";
 import { SessionStore } from "../sessions/store.js";
 import { join } from "node:path";
 
@@ -16,20 +22,6 @@ async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: 
 
 export const lcmCommand = new Command("lcm")
   .description("Context management tools");
-
-export function blockReplacementError(
-  resolved: Pick<ResolvedRange, "blockTag" | "replacesExistingBlock">,
-  allowReplace: boolean,
-  sdkSessionId: string,
-  level: BlockLevel,
-): string | null {
-  if (!resolved.replacesExistingBlock || allowReplace) return null;
-  return [
-    `${resolved.blockTag} already has a summary block; this rollup would replace it.`,
-    `Inspect the existing summary with \`tomo lcm blocks --session-id ${sdkSessionId} --level ${level} --full\`.`,
-    "Then rerun with `--replace` and a complete summary containing any prior details worth keeping.",
-  ].join(" ");
-}
 
 lcmCommand
   .command("session-id")
@@ -263,6 +255,7 @@ lcmCommand
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
   .option("--block-tag <tag>", 'Optional block tag (e.g. "monthly 2026-04") so the resulting summary joins the rollup hierarchy')
+  .option("--replace", "Allow replacing an existing block summary")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
     // Resolve timestamps to indices using context_stats
@@ -280,6 +273,25 @@ lcmCommand
     if (!resolved) {
       console.error(JSON.stringify({ status: "error", error: `No events found in time range ${fromTime} to ${toTime}` }));
       process.exit(1);
+    }
+
+    if (opts.blockTag) {
+      const replacementError = blockReplacementError(
+        {
+          blockTag: opts.blockTag,
+          replacesExistingBlock: hasSummaryBlockTag(opts.sessionId, opts.blockTag, paths.sdkSessionsDir),
+        },
+        opts.replace === true,
+        opts.sessionId,
+      );
+      if (replacementError) {
+        console.error(JSON.stringify({
+          status: "error",
+          error: replacementError,
+          blockTag: opts.blockTag,
+        }));
+        process.exit(1);
+      }
     }
 
     // Archive file is keyed by SDK session id — matches store.searchArchive()

@@ -31,7 +31,7 @@ See [DAILY.md](DAILY.md) — write at end of day (or mid-day when the tail gets 
 tomo lcm daily --session-id SESSION_ID --summary "<today's summary>"
 ```
 
-The CLI auto-resolves today's date and finds raw events to compact. If a `daily 2026-04-17` block already exists from an earlier-in-day rebuild, it's replaced (same tag, new summary absorbs newer raw events).
+The CLI auto-resolves today's date and finds raw events to compact. If a `daily 2026-04-17` block already exists, inspect it with `tomo lcm blocks --session-id SESSION_ID --level daily --full`, then rerun with `--replace` and a complete whole-day summary that preserves prior details while absorbing newer raw events. A flag-less rerun refuses to overwrite the block.
 
 ## Weekly / Monthly / Yearly flow
 

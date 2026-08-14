@@ -8,9 +8,17 @@ A `daily YYYY-MM-DD` block replaces today's (or an explicit date's) raw user/ass
 tomo lcm daily --session-id SESSION_ID --summary "<today's summary>"
 ```
 
+If the day already has a block, inspect it and explicitly authorize a complete replacement:
+
+```bash
+tomo lcm blocks --session-id SESSION_ID --level daily --full
+tomo lcm daily --session-id SESSION_ID --replace --summary "<complete refreshed summary>"
+```
+
 - Defaults to today in your local timezone.
 - `--date YYYY-MM-DD` lets you roll up an earlier day that got missed.
-- If a `daily <date>` block already exists, it's **replaced**, and any new raw events since it was written get absorbed. Safe to run multiple times a day (mid-day + end-of-day refresh).
+- If a `daily <date>` block already exists, a flag-less rerun exits without changing it. Use `--replace` only after reading the prior block, then write a complete whole-day summary that preserves important prior details while absorbing newly eligible raw events.
+- Repeated mid-day/end-of-day refreshes are safe when they follow that inspect-and-replace flow; rollups never append automatically.
 
 ## When to run
 

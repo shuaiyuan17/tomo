@@ -1,7 +1,13 @@
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
-import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, type DuePromotion } from "./blocks.js";
+import {
+  BLOCK_SUMMARY_TOKEN_BUDGETS,
+  findDuePromotions,
+  replacementPolicy,
+  rollupCommand,
+  type DuePromotion,
+} from "./blocks.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
 import { formatTomoEvent } from "../tomo-event.js";
@@ -28,16 +34,9 @@ function isDaytime(): boolean {
   return h >= DAY_START_HOUR && h < DAY_END_HOUR;
 }
 
-function commandFor(p: DuePromotion, sdkSessionId: string): string {
-  const flag = p.level === "daily" ? "--date" :
-               p.level === "weekly" ? "--week" :
-               p.level === "monthly" ? "--month" : "--year";
-  const replaceFlag = p.replacesExistingBlock ? " --replace" : "";
-  return `tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period}${replaceFlag} --summary "<your text>"`;
-}
-
 export function buildRollupNudge(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
   const childLabel = p.level === "daily" ? "raw events" : "child blocks";
+  const policy = replacementPolicy(`${p.level} ${p.period}`);
   const higherLevelBudget = Math.max(
     BLOCK_SUMMARY_TOKEN_BUDGETS.weekly,
     BLOCK_SUMMARY_TOKEN_BUDGETS.monthly,
@@ -47,12 +46,18 @@ export function buildRollupNudge(p: DuePromotion, sdkSessionId: string, sessionK
     `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
     ...(p.replacesExistingBlock ? [
-      `WARNING: \`${p.level} ${p.period}\` already has a summary block. This rollup REPLACES that summary; it does not append to it.`,
-      "Write a complete replacement that preserves prior details worth keeping and incorporates the newly eligible events. The explicit `--replace` flag below is required.",
+      `WARNING: ${policy.warning}`,
+      `${policy.instruction} The explicit \`--replace\` flag below is required.`,
       "",
     ] : []),
     "The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:",
-    `  ${commandFor(p, sdkSessionId)}`,
+    `  ${rollupCommand({
+      level: p.level,
+      sdkSessionId,
+      period: p.period,
+      replace: p.replacesExistingBlock,
+      summaryPlaceholder: "<your text>",
+    })}`,
     "",
     "Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.",
     "Token budget per block:",

@@ -72,10 +72,53 @@ export interface BuildServersWithAuthOptions {
   authorizationWaitMs?: number;
 }
 
+export interface ExternalMcpServerStatus {
+  name: string;
+  state: "connected" | "auth-pending" | "auth-failed" | "not-mounted";
+  oauth: boolean;
+  mounted: boolean;
+  authRequired?: boolean;
+  expiresAt?: number;
+  updatedAt?: number;
+  startedAt?: number;
+  lastError?: string;
+  lastErrorAt?: number;
+}
+
+export interface McpLoginStart {
+  url: string;
+  reused: boolean;
+  startedAt: number;
+}
+
+export type McpCallbackCompletion =
+  | { status: "not-matched" }
+  | { status: "unknown-state" }
+  | { status: "ambiguous" }
+  | { status: "already-completed"; serverName: string }
+  | { status: "completed"; serverName: string; expiresAt?: number }
+  | { status: "failed"; serverName: string; error: string };
+
 type AuthBuildOutcome =
   | { status: "ready"; server: McpServerConfig }
   | { status: "failed" }
   | { status: "pending" };
+
+interface ServerAuthBuild {
+  promise: Promise<McpServerConfig>;
+  startedAt: number;
+  forceInteractive: boolean;
+  authorizeUrl?: string;
+  authorizeUrlReady: Promise<string | undefined>;
+  resolveAuthorizeUrl: (url: string | undefined) => void;
+}
+
+interface PendingCallback {
+  serverName: string;
+  tokenStoreKey: string;
+  startedAt: number;
+  complete(code: string, state: string): boolean;
+}
 
 export class McpOAuthManager {
   private fetchImpl: typeof fetch;
@@ -84,7 +127,11 @@ export class McpOAuthManager {
   private onServerAuthError?: (serverName: string, err: unknown) => void | Promise<void>;
   /** One interactive/refresh flow per configured server. Session churn must
    * not open duplicate callback listeners or send duplicate login links. */
-  private serverAuthBuilds = new Map<string, Promise<McpServerConfig>>();
+  private serverAuthBuilds = new Map<string, ServerAuthBuild>();
+  private pendingCallbacks = new Map<string, PendingCallback>();
+  private completedCallbackStates = new Map<string, { serverName: string; completedAt: number }>();
+  private serverFailures = new Map<string, { error: string; at: number }>();
+  private chatCallbackCompletions = new Set<string>();
 
   constructor(options: McpOAuthManagerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -107,37 +154,174 @@ export class McpOAuthManager {
 
       const build = this.getOrStartServerAuthBuild(name, entry, sendAuthorizeUrl);
       const outcome = options.authorizationWaitMs === undefined
-        ? await this.waitForAuthBuild(build)
-        : await this.waitForAuthBuild(build, options.authorizationWaitMs);
+        ? await this.waitForAuthBuild(build.promise)
+        : await this.waitForAuthBuild(build.promise, options.authorizationWaitMs);
       if (outcome.status === "ready") result[name] = outcome.server;
     }
     return result;
+  }
+
+  getServerStatuses(
+    servers: Record<string, ExternalMcpServerConfig>,
+    mountedServerNames: ReadonlySet<string> = new Set(),
+  ): ExternalMcpServerStatus[] {
+    const store = this.readStore();
+    return Object.entries(servers).map(([name, entry]) => {
+      const mounted = mountedServerNames.has(name);
+      const failure = this.serverFailures.get(name);
+      if (!entry.oauth) {
+        return {
+          name,
+          state: mounted ? "connected" : "not-mounted",
+          oauth: false,
+          mounted,
+        };
+      }
+
+      const build = this.serverAuthBuilds.get(name);
+      const token = store.mcpOAuth?.[entry.oauth.tokenStoreKey];
+      const authRequired = !token || this.isExpiring(token);
+      const shared = {
+        name,
+        oauth: true,
+        mounted,
+        authRequired,
+        ...(token?.expiresAt !== undefined ? { expiresAt: token.expiresAt } : {}),
+        ...(token?.updatedAt !== undefined ? { updatedAt: token.updatedAt } : {}),
+        ...(failure ? { lastError: failure.error, lastErrorAt: failure.at } : {}),
+      };
+      if (build) return { ...shared, state: "auth-pending" as const, startedAt: build.startedAt };
+      if (failure && authRequired) return { ...shared, state: "auth-failed" as const };
+      return { ...shared, state: mounted ? "connected" as const : "not-mounted" as const };
+    });
+  }
+
+  async startLogin(
+    serverName: string,
+    servers: Record<string, ExternalMcpServerConfig>,
+  ): Promise<McpLoginStart> {
+    const entry = servers[serverName];
+    if (!entry) throw new Error(`Unknown external MCP server "${serverName}"`);
+    if (!entry.oauth) throw new Error(`MCP server "${serverName}" does not use OAuth`);
+    if (!supportsHeaders(entry.server)) throw new Error(`MCP server "${serverName}" cannot use OAuth headers`);
+
+    const existing = this.serverAuthBuilds.get(serverName);
+    if (existing) {
+      const url = existing.authorizeUrl ?? await existing.authorizeUrlReady;
+      if (url) return { url, reused: true, startedAt: existing.startedAt };
+      // A refresh may have completed while /mcp login was being requested.
+      // The explicit command still means "start browser auth", so fall
+      // through to a forced interactive build after the old single-flight
+      // record has settled and removed itself.
+      await existing.promise;
+    }
+
+    const build = this.getOrStartServerAuthBuild(serverName, entry, async () => {}, true);
+    const url = build.authorizeUrl ?? await build.authorizeUrlReady;
+    if (!url) {
+      await build.promise;
+      throw new Error(`MCP server "${serverName}" did not start an interactive OAuth flow`);
+    }
+    return { url, reused: false, startedAt: build.startedAt };
+  }
+
+  async completeAuthorizationFromChat(text: string): Promise<McpCallbackCompletion> {
+    this.pruneCompletedCallbackStates();
+    const parsed = parsePastedCallback(text);
+    if (!parsed) return { status: "not-matched" };
+
+    let state = parsed.state;
+    if (!state) {
+      if (this.pendingCallbacks.size !== 1) {
+        return this.pendingCallbacks.size > 1 ? { status: "ambiguous" } : { status: "unknown-state" };
+      }
+      state = this.pendingCallbacks.keys().next().value as string;
+    }
+
+    const completed = this.completedCallbackStates.get(state);
+    if (completed) return { status: "already-completed", serverName: completed.serverName };
+
+    const pending = this.pendingCallbacks.get(state);
+    if (!pending) return { status: "unknown-state" };
+    if (!pending.complete(parsed.code, state)) {
+      return { status: "already-completed", serverName: pending.serverName };
+    }
+    this.completedCallbackStates.set(state, { serverName: pending.serverName, completedAt: this.now() });
+
+    const build = this.serverAuthBuilds.get(pending.serverName);
+    if (!build) return { status: "failed", serverName: pending.serverName, error: "OAuth flow ended before token exchange" };
+    this.chatCallbackCompletions.add(pending.serverName);
+    try {
+      await build.promise;
+      const token = this.readStore().mcpOAuth?.[pending.tokenStoreKey];
+      return {
+        status: "completed",
+        serverName: pending.serverName,
+        ...(token?.expiresAt !== undefined ? { expiresAt: token.expiresAt } : {}),
+      };
+    } catch (err) {
+      return {
+        status: "failed",
+        serverName: pending.serverName,
+        error: errorMessage(err),
+      };
+    } finally {
+      this.chatCallbackCompletions.delete(pending.serverName);
+    }
   }
 
   private getOrStartServerAuthBuild(
     serverName: string,
     entry: ExternalMcpServerConfig,
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
-  ): Promise<McpServerConfig> {
+    forceInteractive = false,
+  ): ServerAuthBuild {
     const existing = this.serverAuthBuilds.get(serverName);
     if (existing) return existing;
 
-    const raw = this.withOAuthHeader(serverName, entry, sendAuthorizeUrl);
+    let resolveAuthorizeUrl!: (url: string | undefined) => void;
+    const authorizeUrlReady = new Promise<string | undefined>((resolve) => { resolveAuthorizeUrl = resolve; });
+    const build: ServerAuthBuild = {
+      promise: Promise.resolve(entry.server),
+      startedAt: this.now(),
+      forceInteractive,
+      authorizeUrlReady,
+      resolveAuthorizeUrl,
+    };
+    const raw = Promise.resolve().then(() => this.withOAuthHeader(
+      serverName,
+      entry,
+      async (name, url) => {
+        build.authorizeUrl = url;
+        build.resolveAuthorizeUrl(url);
+        await sendAuthorizeUrl(name, url);
+      },
+      forceInteractive,
+    ));
     const tracked = raw
+      .then((server) => {
+        this.serverFailures.delete(serverName);
+        return server;
+      })
       .catch(async (err) => {
-        await this.onServerAuthError?.(serverName, err);
+        this.serverFailures.set(serverName, { error: errorMessage(err), at: this.now() });
+        if (!this.chatCallbackCompletions.has(serverName)) {
+          await this.onServerAuthError?.(serverName, err);
+        }
         throw err;
       })
       .finally(() => {
-        this.serverAuthBuilds.delete(serverName);
+        if (this.serverAuthBuilds.get(serverName) === build) this.serverAuthBuilds.delete(serverName);
+        build.resolveAuthorizeUrl(undefined);
       });
     // A zero-wait session intentionally leaves this promise running. Observe
     // its rejection here so a ten-minute unattended login timeout never turns
     // into an unhandled rejection; the configured callback above still logs
     // and notifies exactly once.
     void tracked.catch(() => {});
-    this.serverAuthBuilds.set(serverName, tracked);
-    return tracked;
+    build.promise = tracked;
+    this.serverAuthBuilds.set(serverName, build);
+    return build;
   }
 
   private async waitForAuthBuild(
@@ -167,10 +351,11 @@ export class McpOAuthManager {
     serverName: string,
     entry: ExternalMcpServerConfig,
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
+    forceInteractive = false,
   ): Promise<McpServerConfig> {
     if (!entry.oauth || !supportsHeaders(entry.server)) return entry.server;
 
-    const token = await this.getFreshToken(serverName, entry.server, entry.oauth, sendAuthorizeUrl);
+    const token = await this.getFreshToken(serverName, entry.server, entry.oauth, sendAuthorizeUrl, forceInteractive);
     return {
       ...entry.server,
       headers: {
@@ -185,12 +370,13 @@ export class McpOAuthManager {
     server: McpServerConfig,
     oauth: McpOAuthConfig,
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
+    forceInteractive = false,
   ): Promise<OAuthTokenRecord> {
     const store = this.readStore();
     const existing = store.mcpOAuth?.[oauth.tokenStoreKey];
-    if (existing && !this.isExpiring(existing)) return existing;
+    if (!forceInteractive && existing && !this.isExpiring(existing)) return existing;
 
-    if (existing?.refreshToken) {
+    if (!forceInteractive && existing?.refreshToken) {
       try {
         const refreshed = await this.refreshToken(existing, oauth);
         this.writeToken(oauth.tokenStoreKey, refreshed);
@@ -237,6 +423,12 @@ export class McpOAuthManager {
       if (scope) authUrl.searchParams.set("scope", scope);
       if (discovery.resource.resource) authUrl.searchParams.set("resource", discovery.resource.resource);
 
+      this.pendingCallbacks.set(state, {
+        serverName,
+        tokenStoreKey: oauth.tokenStoreKey,
+        startedAt: this.now(),
+        complete: (code, callbackState) => callback.complete(code, callbackState),
+      });
       await sendAuthorizeUrl(serverName, authUrl.toString());
       const callbackResult = await callback.waitForCallback(state);
 
@@ -260,7 +452,17 @@ export class McpOAuthManager {
         resource: discovery.resource.resource,
       });
     } finally {
+      for (const [state, pending] of this.pendingCallbacks) {
+        if (pending.serverName === serverName) this.pendingCallbacks.delete(state);
+      }
       await callback.close();
+    }
+  }
+
+  private pruneCompletedCallbackStates(): void {
+    const cutoff = this.now() - AUTH_TIMEOUT_MS;
+    for (const [state, completed] of this.completedCallbackStates) {
+      if (completed.completedAt < cutoff) this.completedCallbackStates.delete(state);
     }
   }
 
@@ -407,6 +609,30 @@ export class McpOAuthManager {
   }
 }
 
+function parsePastedCallback(text: string): { code: string; state?: string } | null {
+  const trimmed = text.trim();
+  let params: URLSearchParams;
+  try {
+    if (/^https?:\/\//i.test(trimmed)) {
+      params = new URL(trimmed).searchParams;
+    } else if (/^\??code=/i.test(trimmed)) {
+      params = new URLSearchParams(trimmed.replace(/^\?/, ""));
+    } else {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const code = params.get("code");
+  if (!code) return null;
+  const state = params.get("state") ?? undefined;
+  return { code, state };
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function normalizeToken(
   token: Record<string, unknown>,
   now: number,
@@ -463,6 +689,7 @@ async function startCallbackServer(configuredRedirectUri?: string) {
   const expectedPath = configured?.pathname || "/oauth/callback";
   let resolveCallback: ((value: { code: string; state: string | null }) => void) | null = null;
   let rejectCallback: ((err: Error) => void) | null = null;
+  let callbackSettled = false;
 
   const callbackPromise = new Promise<{ code: string; state: string | null }>((resolve, reject) => {
     resolveCallback = resolve;
@@ -480,20 +707,33 @@ async function startCallbackServer(configuredRedirectUri?: string) {
     if (error) {
       res.writeHead(400);
       res.end("OAuth failed. You can close this tab.");
-      rejectCallback?.(new Error(error));
+      if (!callbackSettled) {
+        callbackSettled = true;
+        rejectCallback?.(new Error(error));
+      }
       return;
     }
     const code = url.searchParams.get("code");
     if (!code) {
       res.writeHead(400);
       res.end("Missing OAuth code. You can close this tab.");
-      rejectCallback?.(new Error("Missing OAuth code"));
+      if (!callbackSettled) {
+        callbackSettled = true;
+        rejectCallback?.(new Error("Missing OAuth code"));
+      }
       return;
     }
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Tomo received the OAuth login. You can close this tab.");
-    resolveCallback?.({ code, state: url.searchParams.get("state") });
+    complete(code, url.searchParams.get("state"));
   });
+
+  const complete = (code: string, state: string | null): boolean => {
+    if (callbackSettled) return false;
+    callbackSettled = true;
+    resolveCallback?.({ code, state });
+    return true;
+  };
 
   const host = configured?.hostname ?? "127.0.0.1";
   const port = configured?.port ? Number(configured.port) : 0;
@@ -516,6 +756,7 @@ async function startCallbackServer(configuredRedirectUri?: string) {
       if (result.state !== expectedState) throw new Error("OAuth state mismatch");
       return result;
     },
+    complete: (code: string, state: string) => complete(code, state),
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

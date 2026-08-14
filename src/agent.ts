@@ -154,6 +154,14 @@ export class Agent {
       closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
       isSessionLive: (key) => this.liveSessionManager.isAlive(key),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
+      getExternalMcpStatuses: (key) => this.mcpOAuthManager.getServerStatuses(
+        config.mcpServers ?? {},
+        this.liveSessionManager.mountedExternalMcpServers(key),
+      ),
+      startExternalMcpLogin: (serverName) => this.mcpOAuthManager.startLogin(
+        serverName,
+        config.mcpServers ?? {},
+      ),
     });
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
@@ -372,6 +380,16 @@ export class Agent {
       return;
     }
 
+    // A provider redirect opened on another device cannot reach this Mac's
+    // localhost callback listener. Let a configured owner paste that full
+    // redirect into their DM instead; consume callback-shaped secrets before
+    // they can enter a transcript or model context. Groups and non-owners
+    // never reach the OAuth manager.
+    if (!isGroup && message.senderId && this.router.identityForSender(channel.name, message.senderId)) {
+      const consumed = await this.handlePastedMcpCallback(channel, message);
+      if (consumed) return;
+    }
+
     // /pause gate, BEFORE resolving: a paused group's messages are dropped
     // entirely — they never reach a session, the batcher, or the transcript
     // (and must not extend a summon's activity clock). /resume lifts it;
@@ -401,6 +419,45 @@ export class Agent {
     }
 
     this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
+  }
+
+  private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
+    const result = await this.mcpOAuthManager.completeAuthorizationFromChat(message.text);
+    if (result.status === "not-matched") return false;
+    if (result.status === "unknown-state") {
+      log.warn({ channel: channel.name, chatId: message.chatId }, "Ignored MCP OAuth callback with no matching pending state");
+      return true;
+    }
+    if (result.status === "ambiguous") {
+      await channel.send({
+        chatId: message.chatId,
+        text: "⚠️ More than one MCP login is pending. Paste the full localhost redirect URL so its state can identify the server.",
+      });
+      return true;
+    }
+    if (result.status === "already-completed") {
+      await channel.send({
+        chatId: message.chatId,
+        text: `⚠️ MCP login for "${result.serverName}" was already completed; this callback is single-use.`,
+      });
+      return true;
+    }
+    if (result.status === "failed") {
+      await channel.send({
+        chatId: message.chatId,
+        text: `⚠️ [error] MCP login for "${result.serverName}" failed: ${result.error}`,
+      });
+      return true;
+    }
+
+    const expiry = result.expiresAt !== undefined
+      ? ` Token valid until ${new Date(result.expiresAt).toLocaleString()}.`
+      : "";
+    await channel.send({
+      chatId: message.chatId,
+      text: `✅ MCP login completed for "${result.serverName}".${expiry} New live sessions will mount it automatically.`,
+    });
+    return true;
   }
 
   private async processInboundItems(items: InboundItem[], steer = false): Promise<void> {
@@ -524,7 +581,8 @@ export class Agent {
         "",
         url,
         "",
-        "Open the link and finish login. The current turn will continue without this server; a later live session will use it after the browser callback completes.",
+        "Open the link and finish login. If the browser is on another device, paste the full localhost redirect URL back into this private DM so Tomo can complete the callback.",
+        "The current turn will continue without this server; a later live session will use it after login completes.",
       ].join("\n"),
     });
   }

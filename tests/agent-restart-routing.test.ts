@@ -82,6 +82,48 @@ describe("restart reason routing", () => {
     await agent.stop();
   });
 
+  it("keeps a persisted summon exclusive when a group restart reason is resumed", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: DM_CHAT }, replyPolicy: "last-active" }],
+    });
+
+    // Seed the raw group session and persist the summon in one daemon
+    // instance, then reconstruct the Agent to exercise the real restart edge.
+    const beforeRestart = new Agent();
+    const firstTg = new MockChannel("telegram");
+    beforeRestart.addChannel(firstTg);
+    await seedDmAndGroupSessions(beforeRestart, firstTg);
+    const internals = beforeRestart as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+    };
+    internals.router.summonGroup("telegram", GROUP_CHAT, "shuai");
+    await beforeRestart.stop();
+
+    const afterRestart = new Agent();
+    const secondTg = new MockChannel("telegram");
+    afterRestart.addChannel(secondTg);
+    mockSdk.responseFn = () => "NO_REPLY";
+
+    await afterRestart.handleRestartForSession(
+      `${RESTART_MARKER} resume the group-owned task`,
+      GROUP_KEY,
+    );
+    await drainQueue(afterRestart);
+
+    const prompts = restartPrompts();
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('type="summon-reminder"');
+    expect(prompts[0]).toContain(GROUP_KEY);
+    const liveSessions = afterRestart as unknown as {
+      liveSessionManager: { isAlive(key: string): boolean };
+    };
+    expect(liveSessions.liveSessionManager.isAlive("dm:shuai")).toBe(true);
+    expect(liveSessions.liveSessionManager.isAlive(GROUP_KEY)).toBe(false);
+    expect(secondTg.delivered).toHaveLength(0);
+
+    await afterRestart.stop();
+  });
+
   it("delivers an attributed reason to the initiating DM session without touching groups", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: DM_CHAT }, replyPolicy: "last-active" }],

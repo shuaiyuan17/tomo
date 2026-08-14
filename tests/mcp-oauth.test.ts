@@ -341,5 +341,76 @@ describe("McpOAuthManager", () => {
       url: "https://agent.robinhood.com/mcp/trading",
       headers: { Authorization: "Bearer still-good" },
     });
+
+    // The non-blocking session-spawn mode must still include servers whose
+    // token is already ready; only refresh/browser waits are omitted.
+    await expect(manager.buildServersWithAuth({
+      robinhood: {
+        server: { type: "sse", url: "https://agent.robinhood.com/mcp/trading" },
+        oauth: { scopes: [], tokenStoreKey: "robinhood" },
+      },
+    }, async () => {
+      throw new Error("auth should not be requested");
+    }, { authorizationWaitMs: 0 })).resolves.toEqual({
+      robinhood: {
+        type: "sse",
+        url: "https://agent.robinhood.com/mcp/trading",
+        headers: { Authorization: "Bearer still-good" },
+      },
+    });
+  });
+
+  it("does not block session startup on interactive auth and dedupes the background login", async () => {
+    resetDir();
+    let authorizeStarted!: () => void;
+    const started = new Promise<void>((resolve) => { authorizeStarted = resolve; });
+    let rejectAuthorize!: (err: Error) => void;
+    const authorizeGate = new Promise<void>((_resolve, reject) => { rejectAuthorize = reject; });
+    let authError!: (value: { name: string; message: string }) => void;
+    const authFailed = new Promise<{ name: string; message: string }>((resolve) => { authError = resolve; });
+    let authorizeCalls = 0;
+
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      fetchImpl: async (input) => {
+        expect(String(input)).toBe("https://auth.example/.well-known/oauth-authorization-server");
+        return new Response(JSON.stringify({
+          authorization_endpoint: "https://auth.example/authorize",
+          token_endpoint: "https://auth.example/token",
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      onServerAuthError: (name, err) => {
+        authError({ name, message: err instanceof Error ? err.message : String(err) });
+      },
+    });
+    const servers: Record<string, ExternalMcpServerConfig> = {
+      "cloudflare-api": {
+        server: { type: "http", url: "https://api.cloudflare.example/mcp" },
+        oauth: {
+          authorizationServer: "https://auth.example",
+          clientId: "client-123",
+          scopes: [],
+          tokenStoreKey: "cloudflare-api",
+        },
+      },
+    };
+    const sendAuthorizeUrl = async () => {
+      authorizeCalls++;
+      authorizeStarted();
+      await authorizeGate;
+    };
+
+    // Both session builds return without waiting for the browser callback.
+    // The second one joins the first background flow rather than opening a
+    // second callback listener or sending another authorization link.
+    await expect(manager.buildServersWithAuth(servers, sendAuthorizeUrl, { authorizationWaitMs: 0 }))
+      .resolves.toEqual({});
+    await started;
+    await expect(manager.buildServersWithAuth(servers, sendAuthorizeUrl, { authorizationWaitMs: 0 }))
+      .resolves.toEqual({});
+    expect(authorizeCalls).toBe(1);
+
+    rejectAuthorize(new Error("login abandoned"));
+    await expect(authFailed).resolves.toEqual({ name: "cloudflare-api", message: "login abandoned" });
   });
 });

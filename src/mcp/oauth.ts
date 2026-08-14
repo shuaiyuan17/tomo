@@ -213,7 +213,12 @@ export class McpOAuthManager {
       // The explicit command still means "start browser auth", so fall
       // through to a forced interactive build after the old single-flight
       // record has settled and removed itself.
-      await existing.promise;
+      try {
+        await existing.promise;
+      } catch {
+        // A failed background build is diagnostic history, not a latch. The
+        // explicit retry below must start fresh on its first attempt.
+      }
     }
 
     const build = this.getOrStartServerAuthBuild(serverName, entry, async () => {}, true);
@@ -612,8 +617,10 @@ export class McpOAuthManager {
 function parsePastedCallback(text: string): { code: string; state?: string } | null {
   const trimmed = text.trim();
   let params: URLSearchParams;
+  let urlForm = false;
   try {
     if (/^https?:\/\//i.test(trimmed)) {
+      urlForm = true;
       params = new URL(trimmed).searchParams;
     } else if (/^\??code=/i.test(trimmed)) {
       params = new URLSearchParams(trimmed.replace(/^\?/, ""));
@@ -626,6 +633,10 @@ function parsePastedCallback(text: string): { code: string; state?: string } | n
   const code = params.get("code");
   if (!code) return null;
   const state = params.get("state") ?? undefined;
+  // A random link with ?code= is ordinary chat content. Only a full OAuth
+  // redirect carrying its routing state is callback-shaped; the state-less
+  // convenience form is deliberately limited to an explicit bare `code=`.
+  if (urlForm && !state) return null;
   return { code, state };
 }
 

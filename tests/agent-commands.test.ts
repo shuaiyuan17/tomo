@@ -273,11 +273,13 @@ describe("chat commands", () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const completeAuthorizationFromChat = vi.fn(async () => ({
-      status: "completed" as const,
-      serverName: "cloudflare-api",
-      expiresAt: 4_600_000,
-    }));
+    const completeAuthorizationFromChat = vi.fn()
+      .mockResolvedValueOnce({
+        status: "completed" as const,
+        serverName: "cloudflare-api",
+        expiresAt: 4_600_000,
+      })
+      .mockResolvedValueOnce({ status: "unknown-state" as const });
     const internals = agent as unknown as {
       mcpOAuthManager: { completeAuthorizationFromChat: typeof completeAuthorizationFromChat };
       sessions: InstanceType<typeof SessionStore>;
@@ -291,6 +293,35 @@ describe("chat commands", () => {
     expect(tg.sent[0].text).toContain('MCP login completed for "cloudflare-api"');
     expect(mockSdk.userContents).toHaveLength(0);
     expect(internals.sessions.listActiveEntries()).toHaveLength(0);
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "12345",
+      senderId: "12345",
+      text: "http://localhost:53682/callback?code=other&state=unknown",
+    }));
+
+    expect(tg.sent[1].text).toContain("does not match an active login");
+    expect(mockSdk.userContents).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  it("passes an ordinary URL with a code query parameter through as normal DM content", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const ordinaryUrl = "https://github.com/login/device?code=promo-code";
+    mockSdk.responseFn = (text) => text.includes(ordinaryUrl) ? "I see the ordinary link." : "unexpected";
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: ordinaryUrl }));
+    await drainQueue(agent);
+
+    const prompt = mockSdk.userContents.flat().map((block) => block.text ?? "").join("");
+    expect(prompt).toContain(ordinaryUrl);
+    expect(tg.delivered.map((message) => message.text)).toContain("I see the ordinary link.");
 
     await agent.stop();
   });

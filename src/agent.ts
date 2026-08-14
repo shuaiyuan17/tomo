@@ -426,6 +426,10 @@ export class Agent {
     if (result.status === "not-matched") return false;
     if (result.status === "unknown-state") {
       log.warn({ channel: channel.name, chatId: message.chatId }, "Ignored MCP OAuth callback with no matching pending state");
+      await channel.send({
+        chatId: message.chatId,
+        text: "⚠️ That MCP OAuth callback does not match an active login. Start a new flow with /mcp login <server> and paste its full redirect URL.",
+      });
       return true;
     }
     if (result.status === "ambiguous") {

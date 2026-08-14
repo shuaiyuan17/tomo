@@ -484,6 +484,11 @@ describe("McpOAuthManager", () => {
       state: "auth-pending",
       mounted: false,
     });
+    const ordinaryUrl = "https://github.com/login/device?code=promo-code";
+    await expect(manager.completeAuthorizationFromChat(ordinaryUrl)).resolves.toEqual({
+      status: "not-matched",
+    });
+    expect(manager.getServerStatuses(servers)[0]?.state).toBe("auth-pending");
     const wrongRedirect = new URL(redirect);
     wrongRedirect.searchParams.set("state", "not-the-pending-state");
     await expect(manager.completeAuthorizationFromChat(wrongRedirect.toString())).resolves.toEqual({
@@ -572,5 +577,66 @@ describe("McpOAuthManager", () => {
     });
     expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.docs.accessToken)
       .toBe("replacement-trimmed-code");
+  });
+
+  it("starts a fresh explicit login immediately after a failed background build", async () => {
+    resetDir();
+    const servers: Record<string, ExternalMcpServerConfig> = {
+      docs: {
+        server: { type: "http", url: "https://docs.example/mcp" },
+        oauth: {
+          authorizationServer: "https://auth.example",
+          clientId: "client-123",
+          scopes: [],
+          tokenStoreKey: "docs",
+        },
+      },
+    };
+    let metadataCalls = 0;
+    let signalFailure!: () => void;
+    const failureSeen = new Promise<void>((resolve) => { signalFailure = resolve; });
+    let releaseFailure!: () => void;
+    const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      fetchImpl: async (input, init) => {
+        if (String(input).includes(".well-known/oauth-authorization-server")) {
+          metadataCalls++;
+          if (metadataCalls === 1) throw new Error("transient discovery failure");
+          return new Response(JSON.stringify({
+            authorization_endpoint: "https://auth.example/authorize",
+            token_endpoint: "https://auth.example/token",
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (String(input) === "https://auth.example/token") {
+          const body = new URLSearchParams(String(init?.body));
+          return new Response(JSON.stringify({
+            access_token: `fresh-${body.get("code")}`,
+            token_type: "Bearer",
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected fetch ${String(input)}`);
+      },
+      onServerAuthError: async () => {
+        signalFailure();
+        await failureGate;
+      },
+    });
+
+    await manager.buildServersWithAuth(servers, async () => {}, { authorizationWaitMs: 0 });
+    await failureSeen;
+
+    const retry = manager.startLogin("docs", servers);
+    releaseFailure();
+    await expect(retry).resolves.toMatchObject({
+      reused: false,
+      url: expect.stringContaining("https://auth.example/authorize"),
+    });
+    expect(metadataCalls).toBe(2);
+
+    await expect(manager.completeAuthorizationFromChat("code=retry-code")).resolves.toMatchObject({
+      status: "completed",
+      serverName: "docs",
+    });
   });
 });

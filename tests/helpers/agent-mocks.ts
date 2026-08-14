@@ -65,6 +65,7 @@ export const mockSdk = {
    *  found" that trip runWithRetry's reset-and-retry branch. */
   failNextQuery: null as string | null,
   queryControllers: [] as MockQueryController[],
+  mcpServerSets: [] as Array<Record<string, unknown>>,
 };
 
 export function resetMockSdk(): void {
@@ -75,6 +76,7 @@ export function resetMockSdk(): void {
   mockSdk.contextUsage = { totalTokens: 5000, maxTokens: 200000 };
   mockSdk.failNextQuery = null;
   mockSdk.queryControllers = [];
+  mockSdk.mcpServerSets = [];
 }
 
 /** Track in-flight mock queries so tests can assert no concurrency */
@@ -270,6 +272,10 @@ function createMockQuery(prompt: AsyncGenerator) {
         percentage: (totalTokens / maxTokens) * 100,
         categories: [{ name: "conversation", tokens: totalTokens }],
       };
+    },
+    async setMcpServers(servers: Record<string, unknown>) {
+      mockSdk.mcpServerSets.push(servers);
+      return { added: Object.keys(servers), removed: [], errors: {} };
     },
   };
 

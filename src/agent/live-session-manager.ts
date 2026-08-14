@@ -8,6 +8,7 @@ import type {
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { checkAndClearCompactTrigger } from "../lcm/index.js";
+import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
 import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
@@ -67,6 +68,8 @@ export interface LiveSessionManagerDeps {
 export class LiveSessionManager {
   private liveSessions = new Map<string, LiveSession>();
   private externalMcpServersBySession = new Map<string, ReadonlySet<string>>();
+  private mcpServerConfigsBySession = new Map<string, Record<string, McpServerConfig>>();
+  private hotMountQueue: Promise<void> = Promise.resolve();
   // Sessions whose system prompt is out of date (workspace changed since they
   // were built). They STAY in liveSessions so in-flight conversations keep
   // their steering target; each is retired at its next idle boundary instead
@@ -90,6 +93,20 @@ export class LiveSessionManager {
 
   mountedExternalMcpServers(key: string): ReadonlySet<string> {
     return this.externalMcpServersBySession.get(key) ?? new Set();
+  }
+
+  /**
+   * Add an authenticated external server to every live session that missed it
+   * at spawn time. Calls are serialized because setMcpServers replaces the
+   * complete dynamic set: two simultaneous token completions must compose,
+   * rather than racing and removing one another.
+   */
+  hotMountExternalMcpServer(serverName: string, server: McpServerConfig): Promise<void> {
+    const operation = this.hotMountQueue.then(() => this.applyExternalMcpHotMount(serverName, server));
+    this.hotMountQueue = operation.catch((err) => {
+      log.warn({ serverName, err }, "External MCP hot-mount failed; a later session will retry");
+    });
+    return operation;
   }
 
   /** Last turn result for a session still in the map (context-nudge default). */
@@ -166,6 +183,7 @@ export class LiveSessionManager {
     if (this.liveSessions.get(key) !== session) return;
     this.liveSessions.delete(key);
     this.externalMcpServersBySession.delete(key);
+    this.mcpServerConfigsBySession.delete(key);
     session.close();
     log.info({ key }, "Prompt-stale session retired at idle boundary");
   }
@@ -190,7 +208,8 @@ export class LiveSessionManager {
     const externalMcpServers = await this.deps.buildExternalMcpServers(key);
     // Per-session server instance: binds the caller's session key so tool
     // handlers (e.g. send_message) can attribute cross-session sends.
-    const opts = sdkOptions(this.deps.createInternalMcpServer(key), resumeId ?? undefined, model, {
+    const internalMcpServer = this.deps.createInternalMcpServer(key);
+    const opts = sdkOptions(internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.deps.buildGroupContext(key),
@@ -202,6 +221,10 @@ export class LiveSessionManager {
     });
     this.liveSessions.set(key, session);
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
+    this.mcpServerConfigsBySession.set(key, {
+      ...externalMcpServers,
+      [TOMO_INTERNAL_MCP_NAME]: internalMcpServer,
+    });
     log.info(
       {
         key,
@@ -221,6 +244,69 @@ export class LiveSessionManager {
       session.close();
       this.liveSessions.delete(key);
       this.externalMcpServersBySession.delete(key);
+      this.mcpServerConfigsBySession.delete(key);
+    }
+  }
+
+  private async applyExternalMcpHotMount(serverName: string, server: McpServerConfig): Promise<void> {
+    // If auth won the race just after a zero-wait build omitted the server,
+    // allow those already-started creations to publish their LiveSession
+    // before taking the target snapshot. The OAuth notification is detached
+    // from its build promise, so this cannot deadlock session creation.
+    const creating = [...this.liveSessionCreates.values()];
+    if (creating.length > 0) await Promise.allSettled(creating);
+
+    let mounted = 0;
+    let unsupported = 0;
+    const failures: Array<{ key: string; error: string }> = [];
+
+    for (const [key, session] of [...this.liveSessions]) {
+      if (!session.isAlive() || this.externalMcpServersBySession.get(key)?.has(serverName)) continue;
+      const current = this.mcpServerConfigsBySession.get(key);
+      if (!current) continue;
+      const desired = { ...current, [serverName]: server };
+
+      try {
+        const result = await session.setMcpServers(desired);
+        if (!result) {
+          unsupported++;
+          continue;
+        }
+
+        this.mcpServerConfigsBySession.set(key, desired);
+        const mountedNames = new Set(this.externalMcpServersBySession.get(key) ?? []);
+        for (const name of result.removed) mountedNames.delete(name);
+        for (const name of result.added) {
+          if (name !== TOMO_INTERNAL_MCP_NAME && !result.errors[name]) mountedNames.add(name);
+        }
+        for (const name of Object.keys(result.errors)) mountedNames.delete(name);
+
+        if (!result.errors[serverName] && !result.removed.includes(serverName)) {
+          mountedNames.add(serverName);
+          mounted++;
+        } else {
+          failures.push({ key, error: result.errors[serverName] ?? "server was removed" });
+        }
+        this.externalMcpServersBySession.set(key, mountedNames);
+      } catch (err) {
+        failures.push({ key, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    if (mounted > 0) {
+      log.info({ serverName, sessions: mounted }, "External MCP server hot-mounted into live sessions");
+    }
+    if (unsupported > 0) {
+      log.warn(
+        { serverName, sessions: unsupported },
+        "Agent SDK does not support live MCP updates; a later session will mount the server",
+      );
+    }
+    if (failures.length > 0) {
+      log.warn(
+        { serverName, failures },
+        "External MCP hot-mount failed for live sessions; a later session will retry",
+      );
     }
   }
 
@@ -359,6 +445,7 @@ export class LiveSessionManager {
     for (const [, s] of this.liveSessions) s.close();
     this.liveSessions.clear();
     this.externalMcpServersBySession.clear();
+    this.mcpServerConfigsBySession.clear();
     this.promptStale.clear();
   }
 }

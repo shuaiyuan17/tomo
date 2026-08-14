@@ -18,6 +18,10 @@ interface Harness {
 }
 
 const harnessRef = vi.hoisted(() => ({ current: null as Harness | null }));
+const mcpRuntime = vi.hoisted(() => ({
+  available: true,
+  calls: [] as Array<Record<string, unknown>>,
+}));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string }> }) => {
@@ -47,7 +51,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       fail: (err) => { error = err; wake?.(); },
     };
 
-    return {
+    const queryHandle: Record<string, unknown> = {
       async *[Symbol.asyncIterator]() {
         while (true) {
           while (eventQueue.length === 0 && !done && !error) {
@@ -62,6 +66,13 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       close: () => { done = true; wake?.(); },
       getContextUsage: async () => ({ totalTokens: 100, maxTokens: 1000, percentage: 10, categories: [] }),
     };
+    if (mcpRuntime.available) {
+      queryHandle.setMcpServers = async (servers: Record<string, unknown>) => {
+        mcpRuntime.calls.push(servers);
+        return { added: Object.keys(servers), removed: [], errors: {} };
+      };
+    }
+    return queryHandle;
   }),
 }));
 
@@ -124,10 +135,39 @@ const resultEvent = () => ({
 beforeEach(() => {
   vi.clearAllMocks();
   harnessRef.current = null;
+  mcpRuntime.available = true;
+  mcpRuntime.calls = [];
 });
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("LiveSession runtime MCP management", () => {
+  it("delegates the complete server map to a capable live query", async () => {
+    const { session } = makeSession();
+    const servers = {
+      docs: { type: "http" as const, url: "https://docs.example/mcp" },
+      internal: { type: "sdk" as const, name: "internal", instance: {} as never },
+    };
+
+    await expect(session.setMcpServers(servers)).resolves.toEqual({
+      added: ["docs", "internal"],
+      removed: [],
+      errors: {},
+    });
+    expect(mcpRuntime.calls).toEqual([servers]);
+    session.close();
+  });
+
+  it("returns null when an older live query lacks setMcpServers", async () => {
+    mcpRuntime.available = false;
+    const { session } = makeSession();
+
+    await expect(session.setMcpServers({})).resolves.toBeNull();
+    expect(mcpRuntime.calls).toHaveLength(0);
+    session.close();
+  });
 });
 
 describe("LiveSession timeouts", () => {

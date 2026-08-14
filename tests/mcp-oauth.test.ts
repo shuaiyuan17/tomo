@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -87,6 +87,52 @@ describe("McpOAuthManager", () => {
       url: "https://example.com/mcp",
       headers: { "X-Static": "yes" },
     });
+  });
+
+  it("notifies the host when an authenticated server config becomes ready", async () => {
+    resetDir();
+    const tokenStorePath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(tokenStorePath, JSON.stringify({
+      mcpOAuth: {
+        docs: {
+          accessToken: "fresh-access",
+          tokenType: "Bearer",
+          expiresAt: 4_600_000,
+          updatedAt: 1_000_000,
+        },
+      },
+    }));
+    const onServerAuthReady = vi.fn();
+    let signalReady!: () => void;
+    const ready = new Promise<void>((resolve) => { signalReady = resolve; });
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      tokenStorePath,
+      now: () => 1_000_000,
+      fetchImpl: async () => { throw new Error("fetch should not be called"); },
+      onServerAuthReady: (name, server) => {
+        onServerAuthReady(name, server);
+        signalReady();
+      },
+    });
+
+    await expect(manager.buildServersWithAuth({
+      docs: {
+        server: { type: "http", url: "https://docs.example/mcp" },
+        oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "docs" },
+      },
+    }, async () => {})).resolves.toMatchObject({
+      docs: {
+        type: "http",
+        url: "https://docs.example/mcp",
+        headers: { Authorization: "Bearer fresh-access" },
+      },
+    });
+    await ready;
+    expect(onServerAuthReady).toHaveBeenCalledWith("docs", expect.objectContaining({
+      headers: { Authorization: "Bearer fresh-access" },
+    }));
   });
 
   it("isolates per-server auth failures and returns working servers", async () => {

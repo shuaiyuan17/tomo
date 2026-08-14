@@ -298,6 +298,59 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["existing", "docs"]));
   });
 
+  it("does not remount a server already present in the live session", async () => {
+    const docs = {
+      type: "http" as const,
+      url: "https://docs.example/mcp",
+      headers: { Authorization: "Bearer existing" },
+    };
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => ({ docs }),
+    }));
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await manager.hotMountExternalMcpServer("docs", {
+      ...docs,
+      headers: { Authorization: "Bearer refreshed" },
+    });
+
+    expect(mockState.mcpSetCalls).toHaveLength(0);
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["docs"]));
+  });
+
+  it("discards a hot-mount result when its session was replaced in flight", async () => {
+    let releaseSet!: () => void;
+    const setGate = new Promise<void>((resolve) => { releaseSet = resolve; });
+    mockState.mcpSetImpl = async () => {
+      await setGate;
+      return { added: ["docs"], removed: [], errors: {} };
+    };
+    const manager = new LiveSessionManager(makeDeps());
+    const original = await manager.getOrCreateLiveSession("telegram:1");
+
+    const mounting = manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+    await flushMicrotasks();
+    expect(mockState.mcpSetCalls).toHaveLength(1);
+
+    manager.closeLiveSession("telegram:1");
+    const replacement = await manager.getOrCreateLiveSession("telegram:1");
+    expect(replacement).not.toBe(original);
+    releaseSet();
+    await mounting;
+
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set());
+    mockState.mcpSetImpl = null;
+    await manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+    expect(mockState.mcpSetCalls).toHaveLength(2);
+    expect(mockState.mcpSetCalls[1].session).toBe(replacement);
+  });
+
   it("serializes simultaneous hot-mounts so neither replacement drops the other", async () => {
     const manager = new LiveSessionManager(makeDeps());
     await manager.getOrCreateLiveSession("telegram:1");

@@ -268,6 +268,7 @@ export class LiveSessionManager {
 
       try {
         const result = await session.setMcpServers(desired);
+        if (this.liveSessions.get(key) !== session) continue;
         if (!result) {
           unsupported++;
           continue;

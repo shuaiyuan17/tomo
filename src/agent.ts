@@ -1179,11 +1179,13 @@ export class Agent {
   /**
    * Deliver a restart notice to the session that initiated the restart — the
    * one whose key was persisted alongside the reason. Unlike handleContinuity
-   * this runs on the exact initiating session (group sessions included: the
-   * reason is that session's own context, so no cross-session leak), never on
-   * a blessed fallback. If the key no longer resolves to a known session the
-   * reason is dropped with a log line rather than rerouted — misdelivery is
-   * the failure mode this exists to prevent.
+   * this never uses a blessed fallback. A raw group session normally receives
+   * its own reason, but an active persisted summon owns that group exclusively,
+   * so the restart turn moves to the summoned dm: session with the same
+   * group-reply reminder as other background work. If the initiating key no
+   * longer resolves to a known session, the reason is dropped with a log line
+   * rather than rerouted — misdelivery is the failure mode this exists to
+   * prevent.
    */
   handleRestartForSession(prompt: string, sessionKey: string): Promise<void> {
     const known = this.sessions.listActiveEntries().some((e) => e.channelKey === sessionKey);
@@ -1191,9 +1193,19 @@ export class Agent {
       log.warn({ sessionKey }, "Restart reason attributed to unknown session; dropping instead of rerouting");
       return Promise.resolve();
     }
-    return this.enqueueForSession(sessionKey, () => this.processContinuity(prompt, sessionKey))
+
+    const summonedKey = this.summonedDmKeyForGroupSession(sessionKey);
+    const targetKey = summonedKey ?? sessionKey;
+    let routedPrompt = prompt;
+    if (summonedKey) {
+      const parsed = parseRawSessionKey(sessionKey)!;
+      routedPrompt = `${prompt}\n${this.summonReminder([`${parsed.channelName}:${parsed.chatId}`])}`;
+      log.info({ from: sessionKey, to: summonedKey }, "Group restart notice handed to active summoned session");
+    }
+
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey))
       .catch((err) => {
-        log.error({ err, sessionKey }, "Restart notice failed in queue");
+        log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
   }
 
@@ -1213,8 +1225,8 @@ export class Agent {
           const identityName = dmIdentityFromSessionKey(key);
           // Final fallback covers raw keys only (dm: keys don't parse), so
           // heartbeats — always DM-keyed — are unaffected; it lets a
-          // restart notice routed to its initiating group session (see
-          // handleRestartForSession) deliver even without a persisted
+          // unsummoned restart notice routed to its initiating group session
+          // (see handleRestartForSession) deliver even without a persisted
           // reply target.
           const replyTarget = this.router.getReplyTarget(key)
             ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)

@@ -50,9 +50,11 @@ reminder, the summon-time pending note, the `send_message` tool description, and
    note for the dm session. Two hardening details: routing is captured at receipt time, then
    revalidated in one safe direction at processing time — an active `/summon` takes ownership
    of pre-summon backlog so the dormant group session cannot revive concurrently, while a later
-   `/dismiss` never pulls already-summoned work back out of the dm session; and a **stale
-   summon** (identity renamed/removed since `summons.json` was written, so no private reply
-   target exists) is dropped rather than falling back to replying in the group.
+   `/dismiss` never pulls already-summoned work back out of the dm session; group cron/delegate
+   turns and attributed restart reasons also hand off to the summoned dm session instead of
+   reviving the raw group session; and a **stale summon** (identity renamed/removed since
+   `summons.json` was written, so no private reply target exists) is dropped rather than falling
+   back to replying in the group.
 2. **Persistence** (`src/sessions/summon-store.ts`): summon state lives in
    `~/.tomo/data/summons.json` (atomic writes, corrupt-file tolerant) and survives daemon
    restarts. Activity touches are persisted at most once per minute per key.

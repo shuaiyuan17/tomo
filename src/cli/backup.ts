@@ -19,7 +19,12 @@ import { defaultRuntimePaths } from "../runtime-paths.js";
 const TOMO_HOME = config.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
 const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
-const RETENTION_DAYS = 14;
+// Local backups are one leg of three (local / iCloud / R2), and each one is a
+// full copy — they do not dedupe. A daily archive grew from 1.7 GB to 2.8 GB
+// over two weeks, so 14 days was holding 32 GB on a disk that was down to 21 GB
+// free. Seven days of local history plus the other two legs is the trade we
+// picked (2026-08-16). Override with TOMO_BACKUP_RETENTION_DAYS.
+const RETENTION_DAYS = Number(process.env.TOMO_BACKUP_RETENTION_DAYS ?? 7);
 
 function timestamp(): string {
   const now = new Date();

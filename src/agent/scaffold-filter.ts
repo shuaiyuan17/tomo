@@ -33,7 +33,7 @@ const NARRATOR_PARAGRAPH_START = "Now the user turns to you";
 // begin a line with `<system-reminder>`.
 const ENVELOPE_LINE_RES = [
   // `user<system-reminder>`, `assistant[...]`, `user[imessage · ...]`
-  /^\s*(?:user|assistant|human)\s*[<\[]/i,
+  /^\s*(?:user|assistant|human)\s*[<[]/i,
   // A bare harness tag opening a line.
   /^\s*<\/?(?:system-reminder|task-notification|tomo-event|task-id|function_results)\b/i,
   // The literal banner the harness puts on background-task events.

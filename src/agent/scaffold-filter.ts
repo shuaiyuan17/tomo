@@ -21,6 +21,25 @@ const END_OF_DIALOG_LINE_RE = /^\s*_?end_of_dialog_?\s*$/i;
 // Paragraph-start narrator scaffold. Anchored to the start of a paragraph.
 const NARRATOR_PARAGRAPH_START = "Now the user turns to you";
 
+// Harness envelope leak. The model sometimes emits the *inbound* framing it
+// normally only reads — a role marker, a system-reminder block, or a
+// task-notification — as if it were composing the transcript rather than a
+// reply. Observed 2026-08-20: an entire `<system-reminder>` background-task
+// notice reached a Telegram chat, one bubble per line, after a bare internal
+// token on its own line.
+//
+// Anchored to the start of a line so ordinary prose that merely mentions these
+// words is untouched: a sentence about "the system-reminder block" does not
+// begin a line with `<system-reminder>`.
+const ENVELOPE_LINE_RES = [
+  // `user<system-reminder>`, `assistant[...]`, `user[imessage · ...]`
+  /^\s*(?:user|assistant|human)\s*[<\[]/i,
+  // A bare harness tag opening a line.
+  /^\s*<\/?(?:system-reminder|task-notification|tomo-event|task-id|function_results)\b/i,
+  // The literal banner the harness puts on background-task events.
+  /^\s*\[?SYSTEM NOTIFICATION - NOT USER INPUT\]?\s*$/i,
+];
+
 export interface ScaffoldFilterResult {
   text: string;
   /** True when scaffold was detected and stripped. */
@@ -31,6 +50,15 @@ function endOfDialogIndex(text: string): number {
   let offset = 0;
   for (const line of text.split("\n")) {
     if (END_OF_DIALOG_LINE_RE.test(line)) return offset;
+    offset += line.length + 1;
+  }
+  return -1;
+}
+
+function envelopeIndex(text: string): number {
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    if (ENVELOPE_LINE_RES.some((re) => re.test(line))) return offset;
     offset += line.length + 1;
   }
   return -1;
@@ -53,7 +81,7 @@ function narratorParagraphIndex(text: string): number {
  * preserved verbatim. Callers log a warning when `filtered` is true.
  */
 export function filterScaffoldLeak(text: string): ScaffoldFilterResult {
-  const candidates = [endOfDialogIndex(text), narratorParagraphIndex(text)].filter((i) => i >= 0);
+  const candidates = [endOfDialogIndex(text), narratorParagraphIndex(text), envelopeIndex(text)].filter((i) => i >= 0);
   if (candidates.length === 0) return { text, filtered: false };
   const cut = Math.min(...candidates);
   return { text: text.slice(0, cut).replace(/\s+$/, ""), filtered: true };

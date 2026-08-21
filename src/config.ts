@@ -126,6 +126,16 @@ export interface TomoConfig {
   /** Steer messages that arrive while a turn is in flight into that turn at the
    *  next tool-call boundary, instead of queueing them behind it. Default true. */
   steering: boolean;
+  /** Stream assistant text to the channel token-by-token as it is generated.
+   *  Default true.
+   *
+   *  Turning this off does NOT hide mid-turn messages. LiveSession already has
+   *  a path for text blocks that arrive with no preceding deltas (SDK errors
+   *  surface that way), so each block is pushed whole instead of growing in
+   *  place, and the text -> tool -> text block boundaries still fire. What is
+   *  lost is the typewriter effect, which only Telegram renders — iMessage
+   *  ships per completed block regardless. */
+  streaming: boolean;
   /** Inactivity timeout for one LiveSession send()/steer() turn. Default 10 minutes. */
   liveSessionTimeoutMs: number;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
@@ -544,6 +554,7 @@ function buildConfig(): TomoConfig {
     saveInboundImages: validated("saveInboundImages", boolLike, file.saveInboundImages, true),
     maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
+    streaming: validated("streaming (TOMO_STREAMING)", boolLike, envVar("TOMO_STREAMING") ?? file.streaming, true),
     liveSessionTimeoutMs: validated(
       "liveSessionTimeoutMs (TOMO_LIVE_SESSION_TIMEOUT_MS)",
       positiveInt,

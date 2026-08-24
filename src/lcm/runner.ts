@@ -35,7 +35,7 @@ function commandFor(p: DuePromotion): string {
   return `tomo lcm ${p.level} --session-id <SESSION_ID> ${flag} ${p.period} --summary "..."`;
 }
 
-function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
+export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
   const flag = p.level === "daily" ? "--date" :
                p.level === "weekly" ? "--week" :
                p.level === "monthly" ? "--month" : "--year";
@@ -52,6 +52,12 @@ function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): s
     `  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`,
     "",
     "Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.",
+    "When an elapsed interval carries meaning, write the interval next to the date, not just the date:",
+    '  "opened 8/7, sat 17 days" — not "opened 8/7". "took 8 hours" — not "01:30 → 09:30".',
+    "  A date is the durable truth; the interval is the form a later reader can act on without",
+    "  doing arithmetic they will not actually do. Cases where it matters: how long something took,",
+    "  how long something has gone untouched, and how long since two events were connected.",
+    "  Skip it where duration is not load-bearing — an interval on every line is noise.",
     "Token budget per block:",
     `  - daily: ≤ ${BLOCK_SUMMARY_TOKEN_BUDGETS.daily} tokens (texture-curate, not texture-collect — pick 1-2 texture pieces worth keeping; let the rest stay in raw events)`,
     `  - weekly / monthly / yearly: ~500-${higherLevelBudget} tokens (compress harder at each level)`,

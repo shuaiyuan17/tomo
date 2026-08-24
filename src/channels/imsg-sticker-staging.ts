@@ -36,11 +36,16 @@ import { join } from "node:path";
  * NOT mean the send will work. The dylib runs inside Messages.app's sandbox
  * and begins its secure walk by opening the user's HOME directory — a path
  * the sandbox denies (its exceptions cover only ~/Library/Messages). That
- * first open fails regardless of permissions, so on current imsg (≤0.13.4)
- * the sticker path is refused unconditionally while the rich-link path —
- * which starts its walk at the trusted root — works. Tracked upstream as
- * openclaw/imsg#211; until it lands, the all-clear verdict below points
- * there rather than at the user's filesystem.
+ * first open fails regardless of permissions, so on imsg ≤0.13.4 the sticker
+ * path was refused unconditionally while the rich-link path — which starts
+ * its walk at the trusted root — worked. Reported as openclaw/imsg#211 and
+ * FIXED in imsg v0.14.0.
+ *
+ * VERIFIED WORKING 2026-08-24 on imsg 0.14.1: native sticker send lands as a
+ * real sticker balloon. The all-clear verdict below therefore no longer points
+ * at #211 as the likely cause — on a current imsg a clean walk plus a refusal
+ * means something we have not characterised yet, so say that instead of naming
+ * a bug that is already fixed.
  */
 
 /**
@@ -137,11 +142,11 @@ export function stickerStagingDiagnosis(home: string = homedir()): StickerStagin
   return {
     stagingRoot,
     checked,
-    verdict: "every ancestor of the staging root passes the dylib's hygiene checks from this process's view. "
-      + "The refusal is then almost certainly openclaw/imsg#211: the dylib's secure walk starts by opening the "
-      + "user's HOME directory, which Messages.app's sandbox denies (its file exceptions cover only "
-      + "~/Library/Messages), so the walk fails before any per-component check runs. Nothing user-side fixes "
-      + "this — no chmod, no relaunch; it needs the upstream fix (start the walk at the trusted root, as the "
-      + `rich-link path already does). Path checked: ${current}`,
+    verdict: "every ancestor of the staging root passes the dylib's hygiene checks from this process's view, "
+      + "so the refusal is not a filesystem-permission problem — no chmod and no relaunch will change it. "
+      + "It is also no longer openclaw/imsg#211: the dylib used to begin its secure walk at $HOME, which "
+      + "Messages.app's sandbox denies, and that was fixed in imsg v0.14.0 (native sticker send verified "
+      + "working on 0.14.1 on 2026-08-24). On a current imsg this combination is uncharacterised — report the "
+      + `bridge error verbatim instead of naming a cause we no longer have evidence for. Path checked: ${current}`,
   };
 }

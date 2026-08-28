@@ -786,7 +786,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(zipPath, Buffer.from("PK ssh keys in here"));
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -826,7 +826,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(zipPath, Buffer.from(secret));
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -858,7 +858,7 @@ describe("imsg arbitrary file attachments", () => {
     truncateSync(bigPath, 33 * 1024 * 1024); // sparse; 1 MB over the 32 MB cap
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -887,7 +887,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(srcPath, "x");
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -921,7 +921,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(pngPath, Buffer.from("89504e470d0a1a0a", "hex"));
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -952,7 +952,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(pdfPath, Buffer.from("%PDF-1.7 fake"));
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -986,7 +986,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(bPath, "second");
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1016,7 +1016,7 @@ describe("imsg arbitrary file attachments", () => {
   it("announces a file the channel could not resolve a local path for", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-file-"));
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1053,7 +1053,7 @@ describe("imsg arbitrary file attachments", () => {
   it("announces a file flagged missing rather than dropping it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-file-"));
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1090,7 +1090,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(blob, "x");
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1133,7 +1133,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(notes, "<template/>");
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1172,7 +1172,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(payload, "plist");
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1204,7 +1204,7 @@ describe("imsg arbitrary file attachments", () => {
     writeFileSync(payload, "plist");
 
     try {
-      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir } });
+      const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
       const handler = vi.fn(async () => {});
       channel.onMessage(handler);
@@ -1218,6 +1218,56 @@ describe("imsg arbitrary file attachments", () => {
 
       expect(storedFiles(dir)).toHaveLength(0);
       expect(handler.mock.calls[0][0].text).toBe("https://example.com");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The opt-out has to survive the constructor. start.ts translates
+  // saveInboundFiles=false into `fileStoreBaseDir: undefined` while
+  // saveInboundImages=true (the default) keeps `imageStoreBaseDir` set — so a
+  // `?? imageStoreBaseDir` fallback here would quietly store arbitrary files
+  // for every operator who never touched the new key's counterpart. Inheritance
+  // belongs to the config parser and only there.
+  it("does not store files when the file store is off but the image store is on", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-file-"));
+    const zipPath = join(dir, "220446_imessage_abcd.bin");
+    writeFileSync(zipPath, Buffer.from("PK ssh keys in here"));
+
+    try {
+      // Exactly the shape start.ts produces for saveInboundImages=true +
+      // saveInboundFiles=false: images on, files explicitly undefined.
+      const { channel, children } = makeChannel({
+        config: { imageStoreBaseDir: dir, fileStoreBaseDir: undefined },
+      });
+      await channel.start();
+      const handler = vi.fn(async () => {});
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "zip-guid-optout",
+        text: "",
+        attachments: [{
+          transfer_name: "dmit-207121-id_rsa.zip",
+          mime_type: "application/zip",
+          original_path: zipPath,
+          missing: false,
+        }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      // Nothing on disk, anywhere under the workspace.
+      expect(storedFiles(dir)).toHaveLength(0);
+
+      // But NOT silence — the 2026-08-27 incident was the message vanishing.
+      // The agent is still told what arrived and why there is no path.
+      const text = handler.mock.calls[0][0].text ?? "";
+      expect(text).toContain("dmit-207121-id_rsa.zip");
+      expect(text).toContain("application/zip");
+      expect(text).toContain("inbound attachment storage is disabled");
+      // No path is offered, because none exists.
+      expect(text).not.toContain("incoming-files");
       await channel.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -182,7 +182,13 @@ export interface ImsgChannelConfig {
   dbPath?: string;
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
   imageStoreBaseDir?: string;
-  /** Base dir for the path-only any-MIME file store. Defaults to `imageStoreBaseDir`. */
+  /**
+   * Base dir for the path-only any-MIME file store. Undefined means the store
+   * is OFF — there is deliberately no fallback to `imageStoreBaseDir` here.
+   * The "unset follows saveInboundImages" default belongs to the config parser
+   * (`saveInboundFiles` in config.ts) and lives there alone; repeating it in
+   * this constructor is what let `saveInboundFiles: false` keep writing files.
+   */
   fileStoreBaseDir?: string;
   /** Persistent cache for inbound message GUIDs. Null/undefined keeps it in memory only. */
   dedupeStorePath?: string | null;
@@ -328,9 +334,13 @@ export class ImsgChannel implements Channel {
     this.cliPath = config.cliPath ?? "imsg";
     this.dbPath = config.dbPath;
     this.imageStoreBaseDir = config.imageStoreBaseDir;
-    // Falls back to the image setting when unset so an existing install that
-    // opted out of inbound storage stays opted out of all of it.
-    this.fileStoreBaseDir = config.fileStoreBaseDir ?? config.imageStoreBaseDir;
+    // No `?? config.imageStoreBaseDir` here. Undefined means OFF, full stop —
+    // the `storage-disabled` notice path covers it, so the agent is still told
+    // a file arrived. Inheriting the image setting is the config parser's job
+    // (config.ts, `saveInboundFiles`), and doing it in two places meant
+    // `saveInboundFiles: false` was silently overridden whenever
+    // `saveInboundImages` stayed at its default of true.
+    this.fileStoreBaseDir = config.fileStoreBaseDir;
     this.cursorStorePath = config.cursorStorePath ?? null;
     this.spawnFn = config.spawnFn ?? nodeSpawn;
     this.probeCapabilitiesFn = config.probeCapabilities ?? (() => this.probeStatus());

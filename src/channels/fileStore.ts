@@ -299,8 +299,15 @@ function describeNotice(notice: SavedFileNotice): string {
   // Every interpolated field is bounded before it gets here: the filename by
   // sanitizeAttachmentFilename (charset [A-Za-z0-9._-]), the MIME by
   // formatMimeToken (RFC 2045 token/token), the size by formatBytes, and the
-  // path by buildFilePath (ours, built from the same sanitised parts). None
-  // of them can contain a newline or a bracket.
+  // path by buildFilePath. None of them can contain a newline or a bracket.
+  //
+  // The path is the only one not derived from sender input: buildFilePath
+  // joins the sanitised parts onto `baseDir`, which comes from the operator's
+  // `workspaceDir`. That end is held by checkWorkspaceDirRenderable() in
+  // config.ts, which refuses to start on a workspace path containing a control
+  // character or a bracket. Deliberately validated there rather than
+  // neutralised here: this path exists to be opened, and a full-width `］`
+  // substituted into it would name a file that does not exist.
   const mime = formatMimeToken(notice.mimeType);
   const type = notice.mimeUnknown ? `type unknown, treated as ${mime}` : mime;
   const head = `${notice.filename} (${type}, ${formatBytes(notice.byteSize)})`;

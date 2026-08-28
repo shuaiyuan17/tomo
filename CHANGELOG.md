@@ -18,7 +18,11 @@
 
   The unsaved notice no longer contradicts itself: "read from the path if you need it" was appended unconditionally, including to notices that had just said `NOT saved` and had no path. The tail is now conditional on at least one file actually having been written.
 
-- **`saveInboundFiles` config key and `TOMO_SAVE_INBOUND_FILES` env override.** Gates the any-MIME store independently of `saveInboundImages` — it costs disk but never context, so the two are worth separating. **Defaults to the value of `saveInboundImages`** when unspecified, so an install that already opted out of inbound attachment storage stays opted out rather than being quietly re-enabled by a new key. Turning it off does not silence the notice; the agent is still told a file arrived, just without a path to open.
+- **`saveInboundFiles` config key and `TOMO_SAVE_INBOUND_FILES` env override.** Gates the any-MIME store independently of `saveInboundImages` — the stored bytes are not attached to the message and are not sent to the API automatically (the assistant is told the path and can open it deliberately), so the two are worth separating. **Defaults to the value of `saveInboundImages`** when unspecified, so an install that already opted out of inbound attachment storage stays opted out rather than being quietly re-enabled by a new key. Turning it off does not silence the notice; the agent is still told a file arrived, just without a path to open.
+
+  The opt-out is honoured in exactly one place. The `ImsgChannel` constructor used to re-derive `fileStoreBaseDir` from `imageStoreBaseDir` when it was unset, which meant `saveInboundFiles: false` was silently overridden for anyone leaving `saveInboundImages` at its default of `true` — arbitrary files kept being written despite the explicit opt-out. Undefined now means off, full stop; the "unset follows `saveInboundImages`" inheritance lives only in the config parser.
+
+- **A workspace path that cannot be rendered in an attachment notice is rejected at config load.** The inbound file notice is a single bracketed line by construction, which every sender-controlled field earns by sanitisation — but the saved path is built from `workspaceDir`, and `TOMO_WORKSPACE` is free-form. A workspace path containing a newline or a `]` would have split or truncated the notice. It is now refused at load with a named config issue rather than neutralised in the notice: that path exists to be opened, and substituting a full-width `］` into it would produce a line naming a file that does not exist.
 
 ## 0.8.14 (2026-08-14)
 

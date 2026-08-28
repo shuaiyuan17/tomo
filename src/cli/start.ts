@@ -118,8 +118,12 @@ async function startForeground(): Promise<void> {
   const agent = new Agent();
 
   const imageStoreBaseDir = config.saveInboundImages ? config.workspaceDir : undefined;
-  // Separate gate from images: the any-MIME store is path-only, so keeping it
-  // on costs disk but never context. Defaults to the image setting in config.ts.
+  // Separate gate from images: the any-MIME store is path-only — the bytes are
+  // not attached to the message and are not sent to the API automatically, so
+  // keeping it on costs disk while leaving the assistant free to open the path
+  // deliberately. Defaults to the image setting in config.ts.
+  // `undefined` is load-bearing: it is what turns the store OFF in the channel,
+  // which no longer re-derives the value from `imageStoreBaseDir`.
   const fileStoreBaseDir = config.saveInboundFiles ? config.workspaceDir : undefined;
 
   if (config.telegramToken) {

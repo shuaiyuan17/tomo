@@ -11,7 +11,7 @@ import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
-import { LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -28,6 +28,20 @@ function isRecoverableSessionError(errMsg: string): boolean {
     || /session (?:is )?closed/i.test(errMsg)
     || /process exited/i.test(errMsg);
 }
+
+/**
+ * Upper bound on how long shutdown waits for in-flight turns to flush their
+ * block transcripts before the daemon exits.
+ *
+ * `min(DELIVERY_TIMEOUT_MS, 5s)` — 5s, the short cap. The flush itself is
+ * synchronous once a turn's promise settles, and `LiveSession.close()` now
+ * settles it synchronously, so this is insurance and not a budget we expect to
+ * spend. It has to stay well under the per-block delivery timeout, or one
+ * wedged channel send could hold the daemon open for a minute; and well under
+ * the ~10s SIGTERM grace period init systems allow, or shutdown gets SIGKILLed
+ * and we lose the very entries this wait exists to write.
+ */
+export const SHUTDOWN_FLUSH_TIMEOUT_MS = Math.min(DELIVERY_TIMEOUT_MS, 5_000);
 
 /**
  * The narrow surface the session lifecycle needs from the Agent: the durable
@@ -78,6 +92,12 @@ export class LiveSessionManager {
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private lastPromptHash: string = "";
   private stopping = false;
+  /**
+   * Turns currently inside runWithRetry. Shutdown waits on these (bounded) so
+   * the process does not exit between a turn's session dying and its block
+   * transcript being flushed.
+   */
+  private inFlightTurns = new Set<Promise<string>>();
 
   constructor(private readonly deps: LiveSessionManagerDeps) {}
 
@@ -316,7 +336,22 @@ export class LiveSessionManager {
     return createHash("sha256").update(s).digest("hex");
   }
 
+  /**
+   * Run one turn, with the retry and shutdown policy below. Registered in
+   * `inFlightTurns` for its whole life so `stop()` can wait for it to finish
+   * flushing before the daemon exits.
+   */
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
+    const turn = this.dispatchTurn(req);
+    this.inFlightTurns.add(turn);
+    try {
+      return await turn;
+    } finally {
+      this.inFlightTurns.delete(turn);
+    }
+  }
+
+  private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
     const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped } = req;
 
     try {
@@ -336,7 +371,20 @@ export class LiveSessionManager {
       const errMsg = err instanceof Error ? err.message : "";
 
       if (this.stopping && errMsg.includes("closed")) {
-        log.info({ key }, "Session closed during shutdown; preserving SDK session link");
+        // FLUSH BEFORE CONVERTING, NOT AFTER — there is no after. Resolving
+        // with NO_REPLY makes this a SUCCESSFUL turn as far as TurnRunner is
+        // concerned, so its rejection path (which is what normally flushes a
+        // turn's per-block transcript slots) never runs, and its success path
+        // records the joined response — this fabricated "NO_REPLY" — as the
+        // turn's outcome. A block already on the owner's phone would be
+        // replaced in the transcript by an assertion that the turn was silent.
+        // So the sink writes what it delivered first; the sink also tells
+        // TurnRunner it has recorded, which suppresses the NO_REPLY entry.
+        const recorded = req.flushOnShutdown?.() ?? false;
+        log.info(
+          { key, flushedBlocks: recorded },
+          "Session closed during shutdown; preserving SDK session link",
+        );
         return "NO_REPLY";
       }
 
@@ -466,8 +514,18 @@ export class LiveSessionManager {
     this.deps.maybeNudgeCompact(key, session.lastResult);
   }
 
-  /** Close every live session for shutdown; retries are disabled from here on. */
-  stop(): void {
+  /**
+   * Close every live session for shutdown; retries are disabled from here on.
+   *
+   * Awaited, because closing a session is only half of shutting a turn down:
+   * the turn still has to observe its rejection and flush what it delivered
+   * into the transcript. Exiting the process before that resolves loses the
+   * record of messages the owner is already holding.
+   */
+  async stop(): Promise<void> {
+    // Synchronous up to the await: `stopping` is set and every session is
+    // closed (and its in-flight turn rejected) before anything yields, so no
+    // newly arriving turn can slip in and take the retry path.
     this.stopping = true;
     // Prompt-stale sessions stay in the map until their idle-boundary
     // retirement, so this loop covers them too.
@@ -476,5 +534,29 @@ export class LiveSessionManager {
     this.externalMcpServersBySession.clear();
     this.mcpServerConfigsBySession.clear();
     this.promptStale.clear();
+    await this.awaitInFlightFlush();
+  }
+
+  /** Wait for in-flight turns to settle (and so to flush), bounded. */
+  private async awaitInFlightFlush(): Promise<void> {
+    const turns = [...this.inFlightTurns];
+    if (turns.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([
+        Promise.allSettled(turns).then(() => "flushed" as const),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), SHUTDOWN_FLUSH_TIMEOUT_MS);
+        }),
+      ]);
+      if (outcome === "timeout") {
+        log.warn(
+          { turns: turns.length, timeoutMs: SHUTDOWN_FLUSH_TIMEOUT_MS },
+          "Gave up waiting for in-flight turns to flush their block transcripts",
+        );
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }

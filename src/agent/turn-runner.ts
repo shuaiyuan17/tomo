@@ -29,6 +29,20 @@ export interface RunWithRetryRequest {
    * retry consults this before resuming (see LiveSessionManager.runWithRetry).
    */
   hasShipped?: () => boolean;
+  /**
+   * SHUTDOWN IS ABOUT TO SWALLOW THIS TURN'S REJECTION.
+   *
+   * LiveSessionManager converts an in-flight "Session is closed" into a
+   * SUCCESSFUL `NO_REPLY` while stopping, to keep the SDK session link across
+   * a restart. That resolution skips the rejection path in `runDelivery`, so
+   * the per-block transcript slots this turn is holding would never be
+   * appended — a block the owner is already reading would be missing from the
+   * transcript entirely, and the success path would record `NO_REPLY` over the
+   * top of it. The manager calls this BEFORE converting: filled slots are
+   * appended in order, still-open ones are closed with the failure marker.
+   * Returns true if anything was recorded.
+   */
+  flushOnShutdown?: () => boolean;
 }
 
 export { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
@@ -241,6 +255,7 @@ export class TurnRunner {
         onBlock: sink.onBlock,
         onBlockAbandoned: sink.onBlockAbandoned,
         hasShipped: sink.hasShipped,
+        flushOnShutdown: sink.flushBlockTranscript,
         ...(reply
           ? { images: reply.images, documents: reply.documents, steer: reply.steer }
           : {}),
@@ -257,7 +272,7 @@ export class TurnRunner {
       // the `[error] …` entry the thrown-error path records for the failure
       // itself. ("on-delivery" turns have already recorded theirs as they
       // settled; this only closes out anything still in flight.)
-      sink.recordShippedTranscript();
+      sink.flushBlockTranscript();
       throw err;
     }
 
@@ -295,7 +310,16 @@ export class TurnRunner {
     // "always" records the model's literal output even when it never ships
     // (user turns keep silent and error text in the transcript); "on-delivery"
     // records only what actually reached the chat (#203).
-    if (spec.transcript === "always" && reply) {
+    //
+    // NOT WHEN THE SINK HAS ALREADY RECORDED. `always` turns defer their
+    // per-block entries precisely so this line can record the joined response
+    // instead — the two are alternatives, never both. Shutdown is the one path
+    // that reaches here with both: the sink flushed the blocks the owner
+    // actually received, and `response` is the manager's FABRICATED
+    // "NO_REPLY". Appending it on top would assert silence for a turn that
+    // spoke. Nothing else can flush and then arrive here (the turn-died path
+    // rethrows), so this guard only ever bites on shutdown.
+    if (spec.transcript === "always" && reply && !sink.recordedAny()) {
       this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
     }
 
@@ -399,7 +423,8 @@ export class TurnRunner {
     onBlockAbandoned: () => void;
     handledAny: () => boolean;
     hasShipped: () => boolean;
-    recordShippedTranscript: () => void;
+    flushBlockTranscript: () => boolean;
+    recordedAny: () => boolean;
   } {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
@@ -425,9 +450,17 @@ export class TurnRunner {
     // is abandoned, or the turn dies. See block-transcript.ts. `always` turns
     // hold their entries back — they record the joined response after a
     // successful turn, and want these only on the path where that never runs.
+    //
+    // `recordedAny` is true once a per-block entry has actually reached the
+    // transcript (a slot with no resolved channel records nothing). Read by
+    // the post-turn `always` append, which must not record a joined response on
+    // top of blocks the sink already wrote (see runDelivery).
+    let recordedAny = false;
     const transcript = createOrderedBlockTranscript(
       (entry) => {
-        if (channelName) this.deps.appendAssistantTranscript(spec.key, entry, channelName);
+        if (!channelName) return;
+        this.deps.appendAssistantTranscript(spec.key, entry, channelName);
+        recordedAny = true;
       },
       { defer: spec.transcript !== "on-delivery" },
     );
@@ -504,7 +537,12 @@ export class TurnRunner {
       onBlockAbandoned: () => transcript.abandonOldest(),
       handledAny: () => handledAny,
       hasShipped: () => shipped,
-      recordShippedTranscript: () => transcript.flushAll(),
+      // Shared by BOTH paths on which the post-turn recording never runs: the
+      // turn threw, and shutdown converting its rejection into a bare
+      // NO_REPLY. Filled slots are appended in order; still-open ones are
+      // closed with the failure marker.
+      flushBlockTranscript: () => { transcript.flushAll(); return recordedAny; },
+      recordedAny: () => recordedAny,
     };
   }
 

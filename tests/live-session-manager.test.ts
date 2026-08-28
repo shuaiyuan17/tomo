@@ -79,6 +79,7 @@ vi.mock("../src/agent/live-session.js", () => {
     LiveSession: FakeLiveSession,
     QUERY_TIMEOUT_ERROR_PREFIX: "Query timed out after",
     STEER_MERGED: "",
+    DELIVERY_TIMEOUT_MS: 60_000,
   };
 });
 
@@ -103,7 +104,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
@@ -261,7 +262,7 @@ describe("LiveSessionManager session lifecycle", () => {
     prompt = "v2";
     const current = await manager.getOrCreateLiveSession("telegram:2");
 
-    manager.stop();
+    await manager.stop();
 
     expect(busySession.closed).toBe(true);
     expect(current.isAlive()).toBe(false);
@@ -616,13 +617,80 @@ describe("LiveSessionManager.runWithRetry", () => {
     const manager = new LiveSessionManager(deps);
     mockState.sendImpl = async () => { throw new Error("Session is closed"); };
 
-    manager.stop();
+    await manager.stop();
     const response = await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
 
     expect(response).toBe("NO_REPLY");
     expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
     // Only the initial creation — no retry session
     expect(mockState.instances).toHaveLength(1);
+  });
+
+  it("flushes the turn's block transcript BEFORE converting a shutdown rejection to NO_REPLY", async () => {
+    // Resolving with NO_REPLY makes this a successful turn, which skips
+    // TurnRunner's rejection flush and records the fabricated NO_REPLY as the
+    // turn's outcome. Anything already delivered has to reach the transcript
+    // first, or the shutdown reads back as silence.
+    const manager = new LiveSessionManager(makeDeps());
+    mockState.sendImpl = async () => { throw new Error("Session is closed"); };
+    const events: string[] = [];
+
+    await manager.stop();
+    const response = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { events.push("flush"); return true; },
+    });
+    events.push(`resolved:${response}`);
+
+    expect(events).toEqual(["flush", "resolved:NO_REPLY"]);
+  });
+
+  it("waits for an in-flight turn to settle before stop() resolves", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    let release!: () => void;
+    const parked = new Promise<void>((r) => { release = r; });
+    let flushed = false;
+    mockState.sendImpl = async () => { await parked; throw new Error("Session is closed"); };
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { flushed = true; return true; },
+    });
+    await flushMicrotasks();
+
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await flushMicrotasks();
+    expect(stopped).toBe(false);
+
+    release();
+    await stopping;
+    expect(stopped).toBe(true);
+    expect(flushed).toBe(true);
+    expect(await turn).toBe("NO_REPLY");
+  });
+
+  it("gives up on a turn that never settles instead of blocking the exit", async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = new LiveSessionManager(makeDeps());
+      mockState.sendImpl = () => new Promise<string>(() => {}); // never settles
+
+      void manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+      await flushMicrotasks();
+
+      const stopping = manager.stop();
+      await vi.advanceTimersByTimeAsync(SHUTDOWN_FLUSH_TIMEOUT_MS);
+      await expect(stopping).resolves.toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ turns: 1 }),
+        expect.stringContaining("Gave up waiting for in-flight turns"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("returns the max-turns fallback message without retrying", async () => {

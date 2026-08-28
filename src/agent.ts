@@ -1538,7 +1538,10 @@ export class Agent {
   async stop(): Promise<void> {
     log.info("Shutting down");
     this.commands.stop();
-    this.liveSessionManager.stop();
+    // Awaited: closing the live sessions rejects their in-flight turns, and
+    // those turns still have to flush the blocks they delivered into the
+    // transcript. `start.ts` calls process.exit() the moment this resolves.
+    await this.liveSessionManager.stop();
     await Promise.all(this.channels.map((ch) => ch.stop()));
   }
 }

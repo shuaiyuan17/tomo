@@ -58,8 +58,10 @@ export interface OrderedBlockTranscript {
   abandonOldest(): void;
   /**
    * Close out every still-open slot as abandoned and append everything held.
-   * For the turn-died path: the blocks reached the owner (or may have), and an
-   * unrecorded delivery is invisible to recall.
+   * For the two paths on which the turn's own post-turn recording never runs —
+   * the turn died, or shutdown converted its rejection into a bare NO_REPLY.
+   * Either way the blocks reached the owner (or may have), and an unrecorded
+   * delivery is invisible to recall.
    */
   flushAll(): void;
 }

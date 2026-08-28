@@ -53,6 +53,16 @@ export interface MessageRequest extends TurnRequest {
   message: SDKUserMessage;
 }
 
+/**
+ * One block's in-flight delivery. `abandoned` is the latch that keeps
+ * `onBlockAbandoned` to exactly one call per block, whoever gives up first —
+ * the delivery budget expiring, the sink throwing, or the session closing.
+ */
+interface OutstandingDelivery {
+  req: TurnRequest;
+  abandoned: boolean;
+}
+
 export type UnownedTurnFactory = () => TurnRequest | undefined;
 
 /**
@@ -384,6 +394,15 @@ export class LiveSession {
    * DISARMED and refreshes are ignored — see shipBlock for why.
    */
   private deliverySuspensions = 0;
+  /**
+   * The block whose `onBlock` is currently being awaited, if any. Published so
+   * `close()` can give up on it SYNCHRONOUSLY — a session that is being torn
+   * down must not leave a transcript slot open while the sink waits out the
+   * delivery budget. At most one exists at any instant, because delivery is
+   * serialized (handleEvent does not pull the next event until shipBlock has
+   * returned).
+   */
+  private outstandingDelivery: OutstandingDelivery | null = null;
 
   constructor(
     options: ReturnType<typeof sdkOptions>,
@@ -495,8 +514,12 @@ export class LiveSession {
    * conversation that this wrapper now believes is idle.
    */
   private timeoutTurn(err: Error): void {
-    this.close();
+    // FAIL FIRST, THEN CLOSE. close() now rejects the in-flight turn itself,
+    // with a generic "Session is closed" — running it first would hand the
+    // caller that instead of this specific timeout, and LiveSessionManager
+    // keys on the timeout prefix to retire the stale SDK session id.
     this.failTurn(err);
+    this.close();
   }
 
   /**
@@ -633,6 +656,8 @@ export class LiveSession {
       return;
     }
 
+    const outstanding: OutstandingDelivery = { req, abandoned: false };
+    this.outstandingDelivery = outstanding;
     this.deliverySuspensions++;
     this.clearActivityTimeout();
     try {
@@ -643,13 +668,26 @@ export class LiveSession {
       );
     } catch (err) {
       log.error({ err, session: this.sessionKey }, "Per-block delivery failed");
-      req.onBlockAbandoned?.();
+      this.abandonDelivery(outstanding);
     } finally {
+      if (this.outstandingDelivery === outstanding) this.outstandingDelivery = null;
       this.deliverySuspensions--;
       // Back on the clock, with a FULL window: the turn has been making
       // progress the whole time, it was only our accounting that was paused.
       this.refreshActivityTimeout();
     }
+  }
+
+  /**
+   * Report this block to the sink as given up on, exactly once. The send
+   * itself keeps running — there is no cancellation to hand a channel — but
+   * its OUTCOME OF RECORD is settled here, in order, at the moment we stop
+   * treating it as pending.
+   */
+  private abandonDelivery(outstanding: OutstandingDelivery): void {
+    if (outstanding.abandoned) return;
+    outstanding.abandoned = true;
+    outstanding.req.onBlockAbandoned?.();
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
@@ -1116,9 +1154,28 @@ export class LiveSession {
     return runtimeQuery.setMcpServers.call(this.q, servers);
   }
 
+  /**
+   * Retire the session. Everything here is SYNCHRONOUS on purpose: shutdown
+   * has a few seconds at most, and both of the things that used to be left
+   * asynchronous cost the owner transcript entries.
+   *
+   * OPEN DELIVERY, ABANDONED HERE. A block whose send is still outstanding
+   * holds an open transcript slot, and every slot behind it. Waiting for the
+   * 60s delivery budget to expire (it is the only other thing that closes the
+   * slot) means the flush that follows shutdown finds it still dangling. So we
+   * give up on it now, in order, before anything else can be dispatched.
+   *
+   * IN-FLIGHT TURN, REJECTED HERE. `consumeEvents` also rejects it, but only
+   * once the SDK's async iterator has actually ended — and it cannot end while
+   * the event loop is parked in `await onBlock` on a wedged send. That left
+   * the owner's turn pending for a full delivery budget after the daemon had
+   * decided to exit, which is exactly the window shutdown does not have.
+   */
   close(): void {
     this.alive = false;
+    if (this.outstandingDelivery) this.abandonDelivery(this.outstandingDelivery);
     this.inputWaiter?.();
     this.q.close();
+    this.failTurn(new Error("Session is closed"));
   }
 }

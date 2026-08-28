@@ -16,14 +16,15 @@ export async function configChannels(): Promise<void> {
       hint: tgToken ? `configured | ${tgAllow.length} allowed` : "not configured",
     });
 
-    const imUrl = channels.imessage?.url as string | undefined;
-    const imProvider = (channels.imessage?.provider as string | undefined) ?? "bluebubbles";
-    const imConfigured = imProvider === "imsg" || Boolean(imUrl);
+    // `channels.imessage.provider` is a single-valued opt-in: "imsg" enables
+    // the channel, absent leaves it off. It stays a named provider rather than
+    // a boolean so existing config files need no migration.
+    const imEnabled = channels.imessage?.provider === "imsg";
     const imAllow = (channels.imessage?.allowlist ?? []) as string[];
     options.push({
       value: "imessage",
       label: "iMessage",
-      hint: imConfigured ? `${imProvider} | ${imAllow.length} allowed` : "not configured",
+      hint: imEnabled ? `imsg | ${imAllow.length} allowed` : "not configured",
     });
 
     options.push({ value: "back", label: "Back" });
@@ -65,8 +66,11 @@ export async function configChannels(): Promise<void> {
       const action = await p.select({
         message: "iMessage",
         options: [
-          { value: "provider", label: "Provider", hint: imProvider },
-          { value: "connection", label: "BlueBubbles connection settings", hint: imUrl ?? "not set" },
+          {
+            value: "toggle",
+            label: imEnabled ? "Disable iMessage" : "Enable iMessage",
+            hint: imEnabled ? "provider: imsg" : "imsg CLI — needs Full Disk Access",
+          },
           { value: "imsg", label: "imsg CLI settings", hint: (channels.imessage?.cliPath as string) ?? "imsg (PATH)" },
           { value: "allowlist", label: "Allowlist", hint: `${imAllow.length} user(s)` },
           { value: "back", label: "Back" },
@@ -74,21 +78,17 @@ export async function configChannels(): Promise<void> {
       });
       if (p.isCancel(action) || action === "back") continue;
 
-      if (action === "provider") {
-        const provider = await p.select({
-          message: "iMessage backend",
-          options: [
-            { value: "bluebubbles", label: "BlueBubbles", hint: "external server + webhook" },
-            { value: "imsg", label: "imsg CLI", hint: "local imsg rpc child (needs Full Disk Access)" },
-          ],
-          initialValue: imProvider,
-        });
-        if (p.isCancel(provider)) continue;
+      // One backend, so this is a toggle rather than a picker: writing the
+      // provider key enables the channel, removing it turns iMessage off.
+      if (action === "toggle") {
         if (!channels.imessage) channels.imessage = {};
-        channels.imessage.provider = provider as string;
+        if (imEnabled) delete channels.imessage.provider;
+        else channels.imessage.provider = "imsg";
         cfg.channels = channels;
         saveConfig(cfg);
-        p.log.success(`iMessage provider set to ${provider as string}`);
+        p.log.success(imEnabled
+          ? "iMessage disabled"
+          : "iMessage enabled (imsg CLI — Tomo needs Full Disk Access)");
       }
 
       if (action === "imsg") {
@@ -105,36 +105,6 @@ export async function configChannels(): Promise<void> {
         cfg.channels = channels;
         saveConfig(cfg);
         p.log.success("imsg CLI settings saved");
-      }
-
-      if (action === "connection") {
-        const url = await p.text({
-          message: "BlueBubbles server URL",
-          placeholder: "http://localhost:1234",
-          initialValue: (channels.imessage?.url as string) ?? "",
-        });
-        if (p.isCancel(url)) continue;
-
-        const password = await p.text({
-          message: "BlueBubbles password",
-          initialValue: (channels.imessage?.password as string) ?? "",
-        });
-        if (p.isCancel(password)) continue;
-
-        const port = await p.text({
-          message: "Webhook port (tomo listens on this for incoming messages)",
-          placeholder: "3100",
-          initialValue: (channels.imessage?.webhookPort as string) ?? "3100",
-        });
-        if (p.isCancel(port)) continue;
-
-        if (!channels.imessage) channels.imessage = {};
-        channels.imessage.url = (url as string).trim();
-        channels.imessage.password = (password as string).trim();
-        channels.imessage.webhookPort = (port as string).trim();
-        cfg.channels = channels;
-        saveConfig(cfg);
-        p.log.success("iMessage (BlueBubbles) saved");
       }
 
       if (action === "allowlist") {
@@ -179,7 +149,7 @@ async function manageAllowlist(
         : "Phone number or email (e.g. +15551234567)";
       const hint = channelName === "telegram"
         ? "Find your ID: message @userinfobot on Telegram"
-        : "The chat GUID from BlueBubbles";
+        : "A phone number/email, or a chat.db chat GUID (iMessage;-;+1555…, any;+;<hex>)";
 
       p.log.info(hint);
       const id = await p.text({ message: "User/chat ID to allow", placeholder });

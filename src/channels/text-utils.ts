@@ -21,9 +21,11 @@ export function restoreLiteralNewlines(text: string): string {
 export const SATELLITE_MARKER = "[via satellite — sender off-grid, text-only, keep it short]";
 
 /**
- * BlueBubbles reports satellite messages with the "iMessageLite" service rather
- * than "iMessage". Match defensively on any service containing "lite" so a
- * future variant spelling still gets flagged.
+ * Apple reports satellite messages with the "iMessageLite" service rather than
+ * "iMessage" (observed first via the BlueBubbles backend, removed 2026-08-27;
+ * the imsg channel reads the same value out of chat.db). Match defensively on
+ * any service containing "lite" so a future variant spelling still gets
+ * flagged.
  */
 export function isSatelliteService(service: unknown): boolean {
   return typeof service === "string" && service.toLowerCase().includes("lite");
@@ -69,7 +71,7 @@ export function splitOutboundMessageText(text: string): string[] {
 /**
  * Split text into chunks of at most `limit` characters, preferring to break
  * at a newline, then a space, falling back to a hard cut. Shared by channels
- * whose APIs cap message length (Telegram: 4096, BlueBubbles: 4000).
+ * whose APIs cap message length (Telegram: 4096, iMessage: 4000).
  */
 export function splitText(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];

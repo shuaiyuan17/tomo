@@ -90,11 +90,11 @@ export interface TomoConfig {
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
   identities: IdentityConfig[];
-  /** iMessage backend: BlueBubbles server (default) or the imsg CLI. */
-  imessageProvider: "bluebubbles" | "imsg";
-  imessageUrl: string;
-  imessagePassword: string;
-  imessageWebhookPort: number;
+  /** iMessage backend, from `channels.imessage.provider`. `"imsg"` (the only
+   *  backend) enables the channel; `null` means iMessage is off. Kept as a
+   *  named provider rather than a boolean because it is what existing config
+   *  files already carry on disk. */
+  imessageProvider: "imsg" | null;
   /** Path to the imsg binary (provider "imsg"). Defaults to "imsg" on PATH. */
   imsgCliPath: string;
   /** Optional chat.db path forwarded to `imsg rpc --db` (provider "imsg"). */
@@ -223,12 +223,14 @@ const chatId = z.union([z.string(), z.number()]).transform(String);
 
 const channelEntrySchema = z.looseObject({
   token: z.string().optional(),
-  url: z.string().optional(),
-  password: z.string().optional(),
-  provider: z.enum(["bluebubbles", "imsg"]).optional(),
+  // Deliberately a bare string, not an enum: an unrecognized provider must not
+  // fail the WHOLE channel entry (which would fall the allowlist back to {} as
+  // well). The value is checked on its own at the `imessageProvider` build
+  // site, so a stale `"bluebubbles"` yields one targeted issue, not a wiped
+  // iMessage config.
+  provider: z.string().optional(),
   cliPath: z.string().optional(),
   dbPath: z.string().optional(),
-  webhookPort: positiveInt.optional(),
   inboundSettleMs: nonNegativeInt.optional(),
   inboundMaxSettleMs: nonNegativeInt.optional(),
   typingStartDelayMs: nonNegativeInt.optional(),
@@ -237,6 +239,30 @@ const channelEntrySchema = z.looseObject({
   passiveGroups: z.array(chatId).optional(),
 });
 type ChannelEntry = z.output<typeof channelEntrySchema>;
+
+/**
+ * `channels.imessage.provider`. Only `"imsg"` remains — the BlueBubbles
+ * backend was removed on 2026-08-27.
+ *
+ * An absent key means iMessage is off (see `validated()`: undefined/null takes
+ * the fallback without an issue), so installs that never opted in keep working
+ * and never spawn an `imsg` child they didn't ask for. A config still pinned to
+ * `"bluebubbles"` deliberately raises a startup issue instead of being quietly
+ * switched to a backend the owner never chose, or quietly losing its iMessage
+ * channel.
+ */
+const imessageProviderSchema = z.unknown().transform((value, ctx): "imsg" | null => {
+  if (value === "imsg") return "imsg";
+  if (value === "bluebubbles") {
+    ctx.addIssue({
+      code: "custom",
+      message: 'the BlueBubbles backend has been removed — set "imsg" to use the local imsg CLI, or delete the key to turn iMessage off',
+    });
+    return z.NEVER;
+  }
+  ctx.addIssue({ code: "custom", message: 'expected "imsg"' });
+  return z.NEVER;
+});
 
 const identitySchema = z.object({
   name: z.string().min(1, "expected a non-empty name"),
@@ -489,12 +515,10 @@ function buildConfig(): TomoConfig {
     identities: parseIdentities(file.identities),
     imessageProvider: validated(
       "channels.imessage.provider (IMESSAGE_PROVIDER)",
-      z.enum(["bluebubbles", "imsg"]),
+      imessageProviderSchema,
       envVar("IMESSAGE_PROVIDER") ?? channels.imessage?.provider,
-      "bluebubbles",
+      null,
     ),
-    imessageUrl: process.env.IMESSAGE_URL ?? channels.imessage?.url ?? "",
-    imessagePassword: process.env.IMESSAGE_PASSWORD ?? channels.imessage?.password ?? "",
     imsgCliPath: validated(
       "channels.imessage.cliPath (IMSG_CLI_PATH)",
       z.string().min(1, "expected a non-empty path"),
@@ -506,12 +530,6 @@ function buildConfig(): TomoConfig {
       z.string().min(1, "expected a non-empty path").nullable(),
       envVar("IMSG_DB_PATH") ?? channels.imessage?.dbPath,
       null,
-    ),
-    imessageWebhookPort: validated(
-      "channels.imessage.webhookPort (IMESSAGE_WEBHOOK_PORT)",
-      positiveInt,
-      envVar("IMESSAGE_WEBHOOK_PORT") ?? channels.imessage?.webhookPort,
-      3100,
     ),
     imessageInboundSettleMs: validated(
       "channels.imessage.inboundSettleMs (IMESSAGE_INBOUND_SETTLE_MS)",
@@ -600,17 +618,16 @@ export function assertConfigValid(issueList: readonly string[] = configIssues): 
 export function assertChannelsConfigured(cfg: TomoConfig = config): void {
   if (!cfg.telegramToken && !imessageConfigured(cfg)) {
     throw new Error(
-      "No channels configured. Run 'tomo init' or set TELEGRAM_BOT_TOKEN / IMESSAGE_URL.",
+      "No channels configured. Run 'tomo init' or set TELEGRAM_BOT_TOKEN / IMESSAGE_PROVIDER.",
     );
   }
 }
 
 /**
- * Whether an iMessage backend is configured: BlueBubbles needs a server URL,
- * while the imsg provider only needs to be selected (the CLI path defaults to
- * "imsg" on PATH).
+ * Whether the iMessage channel is enabled. Selecting the provider is the whole
+ * of it — the imsg CLI path defaults to "imsg" on PATH, so there is nothing
+ * else to configure.
  */
-export function imessageConfigured(cfg: Pick<TomoConfig, "imessageProvider" | "imessageUrl"> = config): boolean {
-  if (cfg.imessageProvider === "imsg") return true;
-  return Boolean(cfg.imessageUrl);
+export function imessageConfigured(cfg: Pick<TomoConfig, "imessageProvider"> = config): boolean {
+  return cfg.imessageProvider === "imsg";
 }

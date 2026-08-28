@@ -56,7 +56,7 @@ const DEFAULT_CAPABILITY_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 15_000, 30_000
 // next gated call.
 const DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS = 30_000;
 
-/** Slash commands recognized by all channels (mirrors the BlueBubbles channel). */
+/** Slash commands recognized by all channels. */
 const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
 
 /**
@@ -168,9 +168,9 @@ interface PendingRequest {
 }
 
 /**
- * iMessage channel backed by the `imsg` CLI (github.com/openclaw/imsg),
- * successor to the BlueBubbles channel. One long-lived `imsg rpc` child
- * speaks JSON-RPC 2.0 as newline-delimited JSON over stdio:
+ * iMessage channel backed by the `imsg` CLI (github.com/openclaw/imsg).
+ * One long-lived `imsg rpc` child speaks JSON-RPC 2.0 as newline-delimited
+ * JSON over stdio:
  *
  * - inbound: `watch.subscribe` notifications (method "message"), which carry
  *   attachments with local file paths and built-in reply context
@@ -181,13 +181,16 @@ interface PendingRequest {
  *   replies, `tapback`, `typing`, `read`, `message.unsend` (IMCore bridge)
  *
  * Chat ids are chat.db chat GUIDs verbatim (e.g. "any;-;+15551234567",
- * "any;+;<hex>" on macOS 26) — the same values BlueBubbles reported — so
- * existing session keys survive the BlueBubbles → imsg cutover unchanged.
+ * "any;+;<hex>" on macOS 26). Never normalize them: the session key is derived
+ * from this string, so rewriting it orphans every existing session file.
+ * (Verbatim passthrough is also what let session keys survive the cutover from
+ * the older BlueBubbles backend, removed 2026-08-27, which reported the same
+ * GUIDs.)
  *
  * Message edit is gated on the bridge selector probe (`imsg status --json`):
  * on macOS 26 Apple removed both edit selectors OS-wide, so the channel
- * refuses cleanly instead of calling `message.edit` blindly (see tomo#227 for
- * what calling it blindly did to BlueBubbles).
+ * refuses cleanly instead of calling `message.edit` blindly — see tomo#227 for
+ * what calling it blindly did to Messages.app.
  */
 export class ImsgChannel implements Channel {
   readonly name = "imessage";
@@ -526,8 +529,8 @@ export class ImsgChannel implements Channel {
     if (!text.trim()) throw new Error("Edited message text cannot be empty");
     // Apple removed both IMCore edit selectors (editMessageItem and the older
     // editMessage) in macOS 26 — calling message.edit blindly is what crashed
-    // Messages.app on the BlueBubbles path (#227). Only proceed when the
-    // startup selector probe confirmed one of them exists.
+    // Messages.app in #227. Only proceed when the startup selector probe
+    // confirmed one of them exists.
     if (!this.isEditSupported()) {
       // No-op unless the BRIDGE itself is down (a stale degraded snapshot,
       // #258). A missing edit selector with a live bridge is a real OS-level
@@ -586,8 +589,8 @@ export class ImsgChannel implements Channel {
     // Blocks whose trailing line(s) are bare NO_REPLY are dropped WHOLE —
     // narration ending in the token is not for the channel (owner decision
     // 2026-07-08). Inline mentions of NO_REPLY mid-text still ship; other
-    // blocks in the same turn are unaffected. Mirrors the BlueBubbles channel
-    // and Telegram's final-flush retraction.
+    // blocks in the same turn are unaffected. Mirrors Telegram's final-flush
+    // retraction.
     let buffer = "";
     let canceled = false;
     // Group replies carry the triggering message's GUID; thread only the
@@ -645,8 +648,8 @@ export class ImsgChannel implements Channel {
     let ttl: ReturnType<typeof setTimeout> | null = null;
 
     // The bridge's indicator persistence across time isn't documented, so
-    // refresh periodically like the BlueBubbles channel does (at a gentler
-    // cadence — each tick is a local IMCore call, not an HTTP hop).
+    // refresh periodically. The cadence can be gentle: each tick is a local
+    // IMCore call, not a network round trip.
     const INTERVAL_MS = 10_000;
     const TTL_MS = 2 * 60 * 1000;
     const MAX_ERRORS = 5;
@@ -661,8 +664,8 @@ export class ImsgChannel implements Channel {
       if (interval) clearInterval(interval);
       if (ttl) clearTimeout(ttl);
       if (tickInFlight) await tickInFlight.catch(() => {});
-      // Unlike BlueBubbles (whose server decays the indicator), the bridge
-      // indicator has no known decay — always stop it explicitly.
+      // The bridge indicator has no known decay — nothing turns it off on our
+      // behalf, so always stop it explicitly.
       try {
         await setTypingState(false);
       } catch (err) {
@@ -1091,9 +1094,9 @@ export class ImsgChannel implements Channel {
     const timestamp = typeof data.created_at === "string" ? Date.parse(data.created_at) : NaN;
     const timestampMs = Number.isFinite(timestamp) ? timestamp : Date.now();
 
-    // Inbound tapbacks surface as reaction events (include_reactions: true) —
-    // BlueBubbles dropped these entirely. Handled before ring recording so a
-    // reaction row never pollutes substring targeting. Tapbacks are ambient;
+    // Inbound tapbacks surface as reaction events (include_reactions: true).
+    // Handled before ring recording so a reaction row never pollutes substring
+    // targeting. Tapbacks are ambient;
     // dispatch is best-effort and the cursor always advances past them.
     if (data.is_reaction === true) {
       await this.handleInboundReaction(chatGuid, data, { guid, isFromMe, sender, senderName, timestampMs });
@@ -1124,10 +1127,11 @@ export class ImsgChannel implements Channel {
     }
 
     // The rowid cursor makes exact replays unlikely, but keep the persistent
-    // GUID dedupe as a second layer: it also spans the BlueBubbles → imsg
-    // cutover (same chat.db message GUIDs), so messages the BlueBubbles
-    // channel already dispatched are not dispatched again by this one. CHECK
-    // only here — the GUID is recorded after dispatch, below.
+    // GUID dedupe as a second layer — the store is keyed on chat.db message
+    // GUIDs, so it survives restarts and backend changes alike (it is what
+    // stopped the 2026-07-07 cutover from the now-removed BlueBubbles backend
+    // re-dispatching already-delivered messages). CHECK only here — the GUID is
+    // recorded after dispatch, below.
     if (guid && this.messageGuidDedupe.has(guid)) {
       log.debug({ guid }, "Dropping replayed imsg message (guid already seen)");
       this.advanceCursor(rowId);
@@ -1195,22 +1199,21 @@ export class ImsgChannel implements Channel {
 
     // Satellite (iMessageLite) detection. imsg's JSON exposes no message
     // service, so read `message.service` straight from chat.db (see
-    // imsg-satellite.ts) and reuse the exact BlueBubbles indicator (#208).
-    // Only when there's real text — mirrors the BlueBubbles guard and avoids
-    // a sqlite hit on every attachment-only/ghost row.
+    // imsg-satellite.ts) and reuse the same SATELLITE_MARKER indicator (#208).
+    // Only when there's real text — a marker on an attachment-only/ghost row
+    // says nothing, and the guard avoids a sqlite hit on every such row.
     const isSatelliteMessage = Boolean(text.trim())
       && isSatelliteService(this.serviceLookup.serviceForGuid(guid));
     const satelliteMarker = isSatelliteMessage ? SATELLITE_MARKER : "";
 
     // Reply context gates on thread_originator_guid ONLY — chat.db sets that
-    // column solely on genuine long-press → Reply messages, matching what the
-    // BlueBubbles channel keyed on (threadOriginatorGuid). imsg also emits
+    // column solely on genuine long-press → Reply messages. imsg also emits
     // reply_to_guid, but that mirrors chat.db's message.reply_to_guid column,
     // which is populated on virtually EVERY message (it points at the message
     // that preceded it in the conversation — usually our own last outbound),
     // so falling back to it tagged every plain inbound send as a reply
-    // quoting our latest message (100% reply rate after the BB → imsg
-    // cutover). For genuine threaded replies imsg resolves reply_to_text from
+    // quoting our latest message (a 100% reply rate, observed live when the
+    // channel first shipped). For genuine threaded replies imsg resolves reply_to_text from
     // the originator (thread_originator_guid takes precedence over
     // reply_to_guid in its lookup), so the quoted excerpt is the right
     // message; when imsg couldn't resolve it, fall back to the recent-message
@@ -1242,10 +1245,9 @@ export class ImsgChannel implements Channel {
       id: guid,
       // chat_guid is passed through VERBATIM as the session's chatId — no
       // normalization. On macOS 26 chat.db stores GUIDs as `any;-;+E164`
-      // (DMs) and `any;+;<hex>` (groups), and BlueBubbles reported those same
-      // strings; keeping them identical is what lets existing session keys
-      // (imessage_any_-__… / imessage_any___<hex>) survive the BB → imsg
-      // cutover unchanged.
+      // (DMs) and `any;+;<hex>` (groups); the session key is derived straight
+      // from this string (imessage_any_-__… / imessage_any___<hex>), so any
+      // rewriting here orphans existing session files.
       chatId: chatGuid,
       senderName,
       // Normalized so the same person matches whether the handle is reported
@@ -1450,8 +1452,9 @@ export class ImsgChannel implements Channel {
 
       try {
         if (isDocument) {
-          // Cap document reads before touching the bytes (mirror the
-          // BlueBubbles channel's pre-download and streaming caps).
+          // Cap document reads before touching the bytes — check the declared
+          // size first, then cap the read itself, since the declared size can
+          // be missing or wrong.
           const declared = att.total_bytes ?? att.byte_size;
           if (typeof declared === "number" && declared > MAX_DOCUMENT_BYTES) {
             log.warn({ path: filePath, declared, max: MAX_DOCUMENT_BYTES }, "Skipping oversized document attachment (declared)");

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **The BlueBubbles iMessage backend is removed.** `imsg` replaced it on 2026-07-07 and BlueBubbles has not been exercised since; `src/channels/imessage.ts` and its 1,000-line test file are gone, along with the `channels.imessage.url` / `password` / `webhookPort` settings and the `IMESSAGE_URL` / `IMESSAGE_PASSWORD` / `IMESSAGE_WEBHOOK_PORT` environment overrides. `channels.imessage.provider` survives, because it is the only signal that turns the iMessage channel on, but its value collapses to `"imsg"`. **The default changed**: it used to fall back to `"bluebubbles"`, so any install that never set the key silently selected an unmaintained backend; it is now unset, which means iMessage is off and no `imsg` child is spawned unless asked for. Existing configs carrying `"provider": "imsg"` load unchanged. A config still pinned to `"provider": "bluebubbles"` raises one targeted startup issue naming the removal and the fix, rather than failing the whole `channels.imessage` entry (which would have taken the allowlist with it). The interactive `tomo config` iMessage menu loses its provider picker and BlueBubbles connection prompts, becoming an enable/disable toggle. Comments recording chat.db, IMCore, and Apple behaviour that BlueBubbles happened to surface first were kept and reattributed, not deleted.
+
 ## 0.8.14 (2026-08-14)
 
 ### Features

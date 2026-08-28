@@ -124,20 +124,20 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       tool(
         "rename_group_chat",
         [
-          "Rename a real group chat in Telegram or iMessage/BlueBubbles.",
+          "Rename a real group chat in Telegram or iMessage.",
           "",
           "Use only when the user explicitly asks to change the group chat title. This mutates the actual chat title visible to participants.",
           "",
           "Target must be a group session key from `list_sessions` (for example `telegram:-1001234567` or `imessage:iMessage;+;chat...`). Do not pass identity names or DM sessions.",
           "",
-          "Telegram requires the bot to be an admin with permission to change chat info. BlueBubbles requires the Private API/helper to be enabled.",
+          "Telegram requires the bot to be an admin with permission to change chat info. iMessage requires the imsg IMCore bridge to be injected (`imsg launch`).",
         ].join("\n"),
         {
           target: z.string().describe(
             "Group session key from list_sessions, e.g. `telegram:-1001234567` or `imessage:iMessage;+;chat...`.",
           ),
           title: z.string().min(1).max(128).describe(
-            "New group chat title. Telegram accepts 1-128 characters; iMessage/BlueBubbles also requires a non-empty displayName.",
+            "New group chat title. Telegram accepts 1-128 characters; iMessage also requires a non-empty displayName.",
           ),
         },
         async ({ target, title }) => {
@@ -154,7 +154,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           };
         },
         {
-          searchHint: "rename group chat title telegram imessage bluebubbles setChatTitle displayName",
+          searchHint: "rename group chat title telegram imessage imsg setChatTitle displayName",
         },
       ),
       tool(
@@ -168,7 +168,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           "",
           "`match` is a case-insensitive substring of the target message's text, searched over the chat's recent messages (newest first, seen since Tomo started). If nothing matches, the tool errors and nothing is sent.",
           "",
-          "Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`. Telegram maps these to close emoji reactions; iMessage/BlueBubbles sends native tapbacks and requires the Private API/helper.",
+          "Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`. Telegram maps these to close emoji reactions; iMessage sends native tapbacks and requires the imsg IMCore bridge (`imsg launch`).",
         ].join("\n"),
         {
           target: z.string().describe(
@@ -198,7 +198,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           };
         },
         {
-          searchHint: "react reaction tapback latest message match telegram imessage bluebubbles like love laugh",
+          searchHint: "react reaction tapback latest message match telegram imessage imsg like love laugh",
         },
       ),
       tool(
@@ -210,7 +210,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           "",
           "The target is normally the current Session key from the system prompt. `match` is a case-insensitive substring of the message's current text, searched over Tomo's own recent messages in the chat (newest first). Without `match`, the most recent message Tomo sent there is edited. Only messages sent since Tomo started are targetable. Long replies ship as multiple provider messages — each is edited separately, so use `match` to pick the right one.",
           "",
-          "Platform limits: Telegram bots can edit their own messages for ~48 hours; the message shows an \"edited\" label. iMessage requires the BlueBubbles Private API on macOS Ventura+, Apple allows edits only within 15 minutes of sending (max 5 edits, recipients can view the edit history), and pre-iOS 16 recipients see the edit as a separate \"Edited to: ...\" message. Telegram edits are capped at 4096 characters.",
+          "Platform limits: Telegram bots can edit their own messages for ~48 hours; the message shows an \"edited\" label. iMessage edits go through the imsg IMCore bridge (`imsg launch`) and are refused outright on macOS 26, where Apple removed the edit selectors OS-wide; where they do work, Apple allows edits only within 15 minutes of sending (max 5 edits, recipients can view the edit history), and pre-iOS 16 recipients see the edit as a separate \"Edited to: ...\" message. Telegram edits are capped at 4096 characters.",
         ].join("\n"),
         {
           target: z.string().describe(
@@ -237,7 +237,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           };
         },
         {
-          searchHint: "edit sent message fix typo correct reword change text telegram imessage bluebubbles",
+          searchHint: "edit sent message fix typo correct reword change text telegram imessage imsg",
         },
       ),
       tool(
@@ -249,7 +249,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           "",
           "Targeting works like edit_message: `match` is a case-insensitive substring searched over Tomo's own recent messages in the chat (newest first); without it, the most recent message Tomo sent there is unsent. Only messages sent since Tomo started are targetable, and long replies ship as multiple provider messages that must be unsent one by one.",
           "",
-          "Platform limits: Telegram bots can delete their own messages for ~48 hours; deletion is silent (no placeholder). iMessage requires the BlueBubbles Private API on macOS Ventura+, Apple allows unsend only within 2 minutes of sending, recipients see a \"message was unsent\" notice, and pre-iOS 16 recipients keep the original text.",
+          "Platform limits: Telegram bots can delete their own messages for ~48 hours; deletion is silent (no placeholder). iMessage unsend goes through the imsg IMCore bridge (`imsg launch`), Apple allows unsend only within 2 minutes of sending, recipients see a \"message was unsent\" notice, and pre-iOS 16 recipients keep the original text.",
         ].join("\n"),
         {
           target: z.string().describe(
@@ -273,7 +273,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           };
         },
         {
-          searchHint: "unsend delete retract undo sent message telegram imessage bluebubbles",
+          searchHint: "unsend delete retract undo sent message telegram imessage imsg",
         },
       ),
       ...buildCronTools(),

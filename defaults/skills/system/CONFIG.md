@@ -25,9 +25,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
       "passiveGroups": ["-1001234567"]
     },
     "imessage": {
-      "url": "https://your-bluebubbles.example.com",
-      "password": "bluebubbles-password",
-      "webhookPort": 3100,
+      "provider": "imsg",
       "allowlist": ["+15551234567", "iMessage;-;+15551234567"]
     }
   },
@@ -91,9 +89,9 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `channels.telegram.token` | string | BotFather token (`123456:...`). Required to enable the Telegram channel. |
 | `channels.telegram.allowlist` | string[] | Telegram user IDs (as strings) permitted to DM the bot. Identity-bound chatIds are auto-allowed even if missing here. |
 | `channels.telegram.passiveGroups` | string[] | Telegram group chatIds (negative IDs as strings) where Tomo should listen to every message — no `@mention` required. Tomo decides via `NO_REPLY` whether to respond. iMessage groups are always passive regardless of this list. |
-| `channels.imessage.url` | string | BlueBubbles server URL. Required to enable the iMessage channel. |
-| `channels.imessage.password` | string | BlueBubbles server password. |
-| `channels.imessage.webhookPort` | number | Port Tomo listens on for BlueBubbles webhooks. Default `3100`. |
+| `channels.imessage.provider` | string | `"imsg"` — the only backend, and required to enable the iMessage channel. Omit the key to leave iMessage off. Tomo needs Full Disk Access; advanced features (tapbacks, typing, unsend, rename, threaded replies) also need `imsg launch`. |
+| `channels.imessage.cliPath` | string | Optional path to the `imsg` binary. Default: `imsg` resolved from `PATH`. |
+| `channels.imessage.dbPath` | string | Optional chat.db path forwarded to `imsg rpc --db`. |
 | `channels.imessage.allowlist` | string[] | Phone numbers (`+15551234567`) or iMessage chat GUIDs (`iMessage;-;+15551234567`, `iMessage;+;chat...`). |
 | `identities[].name` | string | Unified identity name (lowercased to form the session key `dm:<name>`). |
 | `identities[].channels` | object | `{ channelName: chatId }` — maps each channel the identity uses to its chatId. |
@@ -140,6 +138,6 @@ Start it with `litellm --config ~/litellm-chatgpt.yaml`, then set Tomo's model t
 
 ## Requirements and overrides
 
-- **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.url`. Startup fails otherwise.
-- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_URL`, `IMESSAGE_PASSWORD`, `IMESSAGE_WEBHOOK_PORT`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_CONTINUITY_INTERVAL_MINUTES`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`, `TOMO_STEERING`.
+- **At least one channel must be configured** — either `channels.telegram.token` or `channels.imessage.provider: "imsg"`. Startup fails otherwise.
+- **Env vars override file values** where they exist: `TELEGRAM_BOT_TOKEN`, `IMESSAGE_PROVIDER`, `IMSG_CLI_PATH`, `IMSG_DB_PATH`, `CLAUDE_MODEL`, `TOMO_LITELLM_BASE_URL`, `TOMO_LITELLM_API_KEY`, `TOMO_LITELLM_MODE`, `TOMO_CITY`, `TOMO_CONTINUITY`, `TOMO_CONTINUITY_INTERVAL_MINUTES`, `TOMO_WORKSPACE`, `SESSIONS_DIR`, `HISTORY_LIMIT`, `TOMO_MAX_TURNS`, `TOMO_STEERING`.
 - `workspaceDir`, `sessionsDir`, `historyLimit` are env-only — they're not read from the JSON file.

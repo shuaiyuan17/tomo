@@ -229,7 +229,7 @@ describe("imsg inbound message mapping", () => {
     const msg = handler.mock.calls[0][0];
     expect(msg).toMatchObject({
       id: "msg-guid-1",
-      chatId: DM_GUID, // verbatim — session keys survive the BlueBubbles cutover
+      chatId: DM_GUID, // verbatim — the session key is derived from this string
       senderName: "Alice Smith",
       senderId: "+15551234567",
       text: "hello there",
@@ -2114,8 +2114,8 @@ describe("imsg session-key passthrough", () => {
 
     // DMs on macOS 26 are stored as any;-;+E164; groups as any;+;<hex>.
     // These map to ~/.tomo/data/sessions/imessage_any_-__<E164>.jsonl and
-    // imessage_any___<hex>.jsonl — BlueBubbles reported the identical GUIDs,
-    // so passthrough (no normalization) keeps existing session keys valid.
+    // imessage_any___<hex>.jsonl — passthrough (no normalization) is what
+    // keeps existing session keys valid; rewriting the GUID orphans them.
     children[0].notifyMessage(inboundMessage({ guid: "dm-1", text: "hi", chat_guid: "any;-;+15551234567" }));
     children[0].notifyMessage(inboundMessage({ guid: "grp-1", text: "yo", chat_guid: "any;+;a70f2f5b3ea847759d38c0b8e3cba57d", is_group: true }));
     await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));

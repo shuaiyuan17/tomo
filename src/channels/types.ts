@@ -176,15 +176,29 @@ export interface Channel {
 
   /**
    * Edit the text of a message we previously sent, if supported by the
-   * channel. Providers enforce their own windows (Telegram ~48h for bot
-   * messages; iMessage 15 minutes, Private API + macOS Ventura+).
+   * channel. The time windows are the provider's own: Telegram ~48h for bot
+   * messages; iMessage 15 minutes, which is Apple's limit and applies however
+   * the edit is delivered.
+   *
+   * Declaring the method is not the same as the edit landing. The iMessage
+   * implementation drives Apple's IMCore through the imsg bridge (`imsg
+   * launch`) and gates every call on a startup selector probe: Apple removed
+   * both edit selectors OS-wide in macOS 26, so there the channel refuses with
+   * an explicit error instead of calling IMCore blindly. Implementers should
+   * do the same — surface an unsupported edit as a thrown error the caller can
+   * report, never a silent no-op.
    */
   editMessage?(chatId: string, messageId: string, text: string): Promise<void>;
 
   /**
    * Unsend/delete a message we previously sent, if supported by the channel.
-   * Providers enforce their own windows (Telegram ~48h for bot messages;
-   * iMessage 2 minutes, Private API + macOS Ventura+).
+   * The time windows are the provider's own: Telegram ~48h for bot messages;
+   * iMessage 2 minutes, which is Apple's limit. Visibility differs too —
+   * Telegram deletion is silent, while iMessage shows recipients a "message
+   * was unsent" notice.
+   *
+   * The iMessage implementation needs the imsg IMCore bridge (`imsg launch`)
+   * for this; unlike edit it is not blocked on macOS 26.
    */
   unsendMessage?(chatId: string, messageId: string): Promise<void>;
 

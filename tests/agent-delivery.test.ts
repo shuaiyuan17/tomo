@@ -26,9 +26,9 @@ installAgentTestHooks();
 
 // ===== Outbound delivery, end to end (iMessage + Telegram) =====
 //
-// Delivery is non-streaming: the turn runs to completion, its content blocks
-// are rendered into one response, and that response ships as ONE channel
-// message (newlines and all). Nothing pattern-matches the model's words.
+// Delivery is non-streaming but not end-of-turn: each content block ships as
+// ONE channel message the moment the SDK closes it, newlines and all. Nothing
+// pattern-matches the model's words — block TYPE decides what ships.
 
 describe("outbound delivery", () => {
   it("iMessage ships a single-block response as one message", async () => {
@@ -48,25 +48,25 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  it("joins a multi-block turn into one iMessage", async () => {
+  it("ships each block of a multi-block turn as its own iMessage", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
     // Three text blocks in a single turn (text → tool → text → tool → text).
-    // One turn is one reply, so they arrive as one message, not three.
+    // Each ships as its own message as it completes, so the owner is answered
+    // during the turn instead of after it.
     mockSdk.responseFn = () => ["first block", "second block", "third block"];
 
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("first block\nsecond block\nthird block");
+    expect(im.delivered.map((d) => d.text)).toEqual(["first block", "second block", "third block"]);
 
     await agent.stop();
   });
 
-  it("joins a multi-block turn into one Telegram message", async () => {
+  it("ships each block of a multi-block turn as its own Telegram message", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -76,8 +76,7 @@ describe("outbound delivery", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe("alpha\nbeta\ngamma");
+    expect(tg.delivered.map((d) => d.text)).toEqual(["alpha", "beta", "gamma"]);
 
     await agent.stop();
   });
@@ -215,13 +214,14 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  // The whole mechanism is the block-TYPE gate in renderResponseBlocks: the
-  // same turn, the same two blocks, only the flag differs. Delete the gate and
-  // the showThinking:false row ships the reasoning and fails; delete the
-  // marker and the showThinking:true row fails.
+  // The whole mechanism is the block-TYPE gate in renderBlock: the same turn,
+  // the same two blocks, only the flag differs. Delete the gate and the
+  // showThinking:false row ships the reasoning and fails; delete the marker
+  // and the showThinking:true row fails. Each block is its own message, so
+  // the reasoning arrives BEFORE the answer rather than glued to it.
   it.each([
-    { showThinking: false, expected: "public answer" },
-    { showThinking: true, expected: "💭 the user probably wants X\npublic answer" },
+    { showThinking: false, expected: ["public answer"] },
+    { showThinking: true, expected: ["💭 the user probably wants X", "public answer"] },
   ])("renders a thinking + text turn by block type (showThinking=$showThinking)", async ({ showThinking, expected }) => {
     resetConfig({ showThinking });
     const agent = new Agent();
@@ -236,11 +236,11 @@ describe("outbound delivery", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe(expected);
+    expect(tg.delivered.map((d) => d.text)).toEqual(expected);
     // Spelled out both ways so the assertion cannot pass by coincidence.
-    expect(tg.delivered[0].text.includes("the user probably wants X")).toBe(showThinking);
-    expect(tg.delivered[0].text.includes("💭 ")).toBe(showThinking);
+    const all = tg.delivered.map((d) => d.text).join("\n");
+    expect(all.includes("the user probably wants X")).toBe(showThinking);
+    expect(all.includes("💭 ")).toBe(showThinking);
 
     await agent.stop();
   });
@@ -270,25 +270,26 @@ describe("outbound delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("before\nafter");
+    expect(im.delivered.map((d) => d.text)).toEqual(["before", "after"]);
 
     await agent.stop();
   });
 
-  it("suppresses the whole turn when its LAST block is a bare NO_REPLY", async () => {
+  it("suppresses only itself when the LAST block is a bare NO_REPLY", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
-    // Housekeeping narration that ends with the token is not for the channel
-    // (owner decision 2026-07-08) — nothing ships, not even the narration.
+    // Under end-of-turn delivery this trailing token suppressed the earlier
+    // narration too. Mid-turn it cannot: "did the housekeeping" was already
+    // sent when the model wrote the token. The token still ships nothing
+    // itself, which is the part that was ever load-bearing.
     mockSdk.responseFn = () => ["did the housekeeping", "NO_REPLY"];
 
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(0);
+    expect(im.delivered.map((d) => d.text)).toEqual(["did the housekeeping"]);
 
     await agent.stop();
   });
@@ -391,10 +392,10 @@ describe("outbound delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("A\nB");
-    expect(im.delivered[0].text).not.toContain("housekeeping");
-    expect(im.delivered[0].text).not.toContain("NO_REPLY");
+    expect(im.delivered.map((d) => d.text)).toEqual(["A", "B"]);
+    const all = im.delivered.map((d) => d.text).join("\n");
+    expect(all).not.toContain("housekeeping");
+    expect(all).not.toContain("NO_REPLY");
 
     await agent.stop();
   });
@@ -414,8 +415,7 @@ describe("outbound delivery", () => {
     await drainQueue(agent);
 
     expect(tg.delivered.some((d) => d.photo)).toBe(false);
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe("A\nB");
+    expect(tg.delivered.map((d) => d.text)).toEqual(["A", "B"]);
 
     await agent.stop();
   });
@@ -431,9 +431,8 @@ describe("outbound delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("A\nB");
-    expect(im.delivered[0].text).not.toContain("system-reminder");
+    expect(im.delivered.map((d) => d.text)).toEqual(["A", "B"]);
+    expect(im.delivered.map((d) => d.text).join("\n")).not.toContain("system-reminder");
 
     await agent.stop();
   });
@@ -459,18 +458,19 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  it("still merges adjacent text-only blocks into one send", async () => {
+  it("never merges adjacent text-only blocks", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
+    // Mid-turn there is nothing to merge WITH: when A completes, B has not
+    // been written yet. One completed block is one message.
     mockSdk.responseFn = () => ["A", "B"];
 
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe("A\nB");
+    expect(tg.delivered.map((d) => d.text)).toEqual(["A", "B"]);
 
     await agent.stop();
   });

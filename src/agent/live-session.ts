@@ -17,17 +17,50 @@ export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
   reject: (err: Error) => void | Promise<void>;
   /**
-   * Out-channel for the turn's per-block delivery units, in order, called
-   * immediately before `resolve`. The response string is exactly these blocks
-   * joined with "\n"; the delivery layer needs the unjoined form because a
-   * joined string cannot be re-split into blocks, and attachment placement
-   * ("A, MEDIA:, B" ships A → photo → B) is defined per block.
+   * Out-channel for ONE completed delivery unit, called the moment the SDK
+   * closes that content block — WHILE THE TURN IS STILL RUNNING, not after it
+   * ends. That is the whole point: a turn that spends twenty minutes in a
+   * subagent still answers the owner with the text it produced first, twenty
+   * minutes before the turn resolves.
+   *
+   * What this does NOT promise is that the block lands before the tool the
+   * model just announced starts running. It usually does not. See handleEvent.
+   *
+   * Awaited, so the event loop backpressures on delivery and blocks reach the
+   * channel in the order the model produced them. Never rejects — a failed
+   * send is logged by the sink, not allowed to kill the turn.
    */
-  onBlocks?: (blocks: string[]) => void;
+  onBlock?: (block: string) => void | Promise<void>;
+  /**
+   * The block most recently handed to `onBlock` has been GIVEN UP ON: its
+   * delivery blew the budget (or the sink threw), the turn is moving on, and
+   * the still-running promise must no longer be treated as this block's
+   * outcome.
+   *
+   * Called synchronously, before the next block is handed over, so a sink that
+   * keeps ordered transcript slots can close this one out IN ORDER. The
+   * abandoned send may still complete — there is no cancellation to hand a
+   * channel — but by then its slot is closed and it changes nothing.
+   *
+   * Unambiguous because delivery is serialized: `handleEvent` does not pull the
+   * next SDK event until the current `shipBlock` has returned, so exactly one
+   * block is outstanding when this fires.
+   */
+  onBlockAbandoned?: () => void;
 }
 
 export interface MessageRequest extends TurnRequest {
   message: SDKUserMessage;
+}
+
+/**
+ * One block's in-flight delivery. `abandoned` is the latch that keeps
+ * `onBlockAbandoned` to exactly one call per block, whoever gives up first —
+ * the delivery budget expiring, the sink throwing, or the session closing.
+ */
+interface OutstandingDelivery {
+  req: TurnRequest;
+  abandoned: boolean;
 }
 
 export type UnownedTurnFactory = () => TurnRequest | undefined;
@@ -44,6 +77,34 @@ export const STEER_MERGED = "";
 export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
+
+/**
+ * How long ONE block's delivery may take before we give up on it.
+ *
+ * Separate from the inactivity timeout on purpose, and much shorter. The
+ * inactivity timeout asks "is the MODEL still working?" and kills the session
+ * when the answer is no. This one asks "is the CHANNEL still taking bytes?"
+ * and answers only for this block — a wedged iMessage send loses its own
+ * message and nothing else. Sixty seconds is far beyond a healthy send (tens
+ * of milliseconds) and far below the ten-minute inactivity window, so it fires
+ * only on a genuine hang.
+ */
+export const DELIVERY_TIMEOUT_MS = 60 * 1000;
+
+/** Reject after `ms` unless `work` settles first. Always clears its timer. */
+async function withDeliveryTimeout(work: Promise<void>, ms: number, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export interface LiveSessionSettings {
   timeoutMs?: number;
@@ -64,37 +125,77 @@ export interface ResponseBlock {
   text: string;
 }
 
-/** A rendered turn: the per-block delivery units and their joined text. */
+/**
+ * A rendered turn. Delivery units are NOT part of it: blocks ship as they
+ * complete (see renderBlock), so by the time a turn is rendered there is
+ * nothing left to hand a channel — only the joined text the turn-level
+ * bookkeeping needs.
+ */
 export interface RenderedTurn {
-  /** `blocks` joined with "\n" — logging, transcript, error/silence checks. */
+  /** The kept blocks joined with "\n" — logging, transcript, error/silence checks. */
   text: string;
-  /** Per-block delivery units, in order, after filtering. */
-  blocks: string[];
   /** True when at least one block had a training-scaffold leak stripped. */
   scaffoldFiltered: boolean;
 }
 
+/** What one content block turns into once the per-block rules have run. */
+export type BlockRender =
+  /** Ships as one channel message. */
+  | { kind: "ship"; text: string; scaffoldFiltered: boolean }
+  /** Trailing line(s) were the bare control token — the block ships nothing. */
+  | { kind: "no-reply"; scaffoldFiltered: boolean }
+  /** Wrong type for this session, or nothing left after filtering. */
+  | { kind: "empty"; scaffoldFiltered: boolean };
+
 /**
- * Render a turn's collected content blocks into the response.
+ * Decide what ONE completed content block ships, from its `type` alone.
  *
  * This is the ONLY place that decides what reaches a channel, and it decides
- * purely on the SDK block `type` — never by inspecting the text. A `text`
- * block is the model's chosen words and always ships, even when it happens to
- * read like reasoning (`思考: ...`) or like tool debris (`count`). A
- * `thinking` block ships only when showThinking is on, marked so it is
- * distinguishable. `redacted_thinking` carries no readable text and is
- * dropped at collection time.
+ * purely on the SDK block `type` — never by inspecting the text to judge
+ * whether it is "really" a reply. A `text` block is the model's chosen words
+ * and always ships, even when it happens to read like reasoning (`思考: ...`)
+ * or like tool debris (`count`). A `thinking` block ships only when
+ * showThinking is on, marked so it is distinguishable. `redacted_thinking`
+ * carries no readable text and is dropped at collection time.
  *
- * Everything else here runs PER BLOCK, before the join, because that is where
- * the streaming predecessor ran it (each block was a separate channel send):
+ * The two remaining rules are per block by design (#292) and now also per
+ * block in TIME — they run as the block completes, because that is when it
+ * ships:
  *   1. scaffold-leak filter — a leak truncates its own block, not the turn, so
  *      blocks after a `<system-reminder>` slip still ship;
  *   2. bare-NO_REPLY drop — a block whose trailing line(s) are only the token
  *      is dropped WHOLE (text, MEDIA: and STICKER: alike), so housekeeping
  *      narration and its attachments never leak out of a mid-turn slip.
- * Running either one over the joined string instead silently changes both:
- * the scaffold cut eats every later block, and the NO_REPLY drop only fires
- * when the token is the entire turn.
+ */
+export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockRender {
+  if (block.type === "thinking" && !showThinking) return { kind: "empty", scaffoldFiltered: false };
+
+  const scaffold = filterScaffoldLeak(block.text);
+  const scaffoldFiltered = scaffold.filtered;
+  const text = scaffold.text.trim();
+  if (!text) return { kind: "empty", scaffoldFiltered };
+  if (endsWithTrailingNoReply(text)) return { kind: "no-reply", scaffoldFiltered };
+
+  return {
+    kind: "ship",
+    text: block.type === "thinking" ? `${THINKING_MARKER}${text}` : text,
+    scaffoldFiltered,
+  };
+}
+
+/**
+ * Join a turn's collected content blocks into its RESPONSE STRING.
+ *
+ * Delivery no longer goes through here — each block was already shipped by
+ * `renderBlock` as it completed. What is left is everything that legitimately
+ * needs the whole turn: the transcript, the response log line, the value
+ * `send()`/`steer()` resolve with, and the end-of-turn silence and
+ * agent-error checks.
+ *
+ * Because those checks read this string, the trailing bare NO_REPLY is still
+ * represented here even though the block itself shipped nothing — otherwise a
+ * housekeeping turn would render as empty and be replaced by the "I'm not sure
+ * how to respond to that." fallback in the transcript.
  */
 export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: boolean): RenderedTurn {
   const rendered: string[] = [];
@@ -104,19 +205,15 @@ export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: bool
   let lastKeptWasNoReply = false;
 
   for (const block of blocks) {
-    if (block.type === "thinking" && !showThinking) continue;
-
-    const scaffold = filterScaffoldLeak(block.text);
-    if (scaffold.filtered) scaffoldFiltered = true;
-    const text = scaffold.text.trim();
-    if (!text) continue;
-
-    if (endsWithTrailingNoReply(text)) {
+    const result = renderBlock(block, showThinking);
+    if (result.scaffoldFiltered) scaffoldFiltered = true;
+    if (result.kind === "empty") continue;
+    if (result.kind === "no-reply") {
       lastKeptWasNoReply = true;
       continue;
     }
     lastKeptWasNoReply = false;
-    rendered.push(block.type === "thinking" ? `${THINKING_MARKER}${text}` : text);
+    rendered.push(result.text);
   }
 
   // NO_REPLY is Tomo's own control token, not the model's prose. A block whose
@@ -127,7 +224,7 @@ export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: bool
   // layer's trailing-NO_REPLY check to find.
   const kept = lastKeptWasNoReply ? [...rendered, "NO_REPLY"] : rendered;
 
-  return { text: kept.join("\n").trim(), blocks: kept, scaffoldFiltered };
+  return { text: kept.join("\n").trim(), scaffoldFiltered };
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number {
@@ -292,6 +389,20 @@ export class LiveSession {
   /** Agent tool_use id → subagent_type, so a subagent's tool logs can name which agent ran them. */
   private subagentTypeById = new Map<string, string>();
   private activityTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Depth of in-flight `onBlock` delivery. While > 0 the inactivity timer is
+   * DISARMED and refreshes are ignored — see shipBlock for why.
+   */
+  private deliverySuspensions = 0;
+  /**
+   * The block whose `onBlock` is currently being awaited, if any. Published so
+   * `close()` can give up on it SYNCHRONOUSLY — a session that is being torn
+   * down must not leave a transcript slot open while the sink waits out the
+   * delivery budget. At most one exists at any instant, because delivery is
+   * serialized (handleEvent does not pull the next event until shipBlock has
+   * returned).
+   */
+  private outstandingDelivery: OutstandingDelivery | null = null;
 
   constructor(
     options: ReturnType<typeof sdkOptions>,
@@ -378,6 +489,11 @@ export class LiveSession {
   }
 
   private refreshActivityTimeout(): void {
+    // Inactivity accounting is SUSPENDED while a block is being delivered.
+    // Guarded here as well as at the suspend site because send()/steer() can
+    // refresh from another task while the event loop sits in `await onBlock`,
+    // which would silently re-arm the timer we just disarmed.
+    if (this.deliverySuspensions > 0) return;
     if (!this.alive || !this.isBusy()) {
       this.clearActivityTimeout();
       return;
@@ -398,8 +514,12 @@ export class LiveSession {
    * conversation that this wrapper now believes is idle.
    */
   private timeoutTurn(err: Error): void {
-    this.close();
+    // FAIL FIRST, THEN CLOSE. close() now rejects the in-flight turn itself,
+    // with a generic "Session is closed" — running it first would hand the
+    // caller that instead of this specific timeout, and LiveSessionManager
+    // keys on the timeout prefix to retire the stale SDK session id.
     this.failTurn(err);
+    this.close();
   }
 
   /**
@@ -410,21 +530,164 @@ export class LiveSession {
     return this.currentRequest !== null || this.mergedRequests.length > 0 || this.pendingSteers.length > 0;
   }
 
+  /**
+   * Claim an SDK-initiated (unowned) turn for the session's default delivery
+   * target, synchronously.
+   *
+   * SYNCHRONOUS IS THE POINT. The check and the assignment happen in one step
+   * with no await between them, so this can never interleave with the
+   * check-and-claim in `acquireTurn` — whichever runs first wins and the other
+   * observes a busy session. That is half of "wait for idle then claim is
+   * atomic"; the other half is the loop in `acquireTurn`.
+   *
+   * Called on the FIRST event of an unowned turn whatever that event carries —
+   * a root `tool_use` claims exactly like text does. It used to claim only on
+   * `text`/`thinking`, which left a tool-first autonomous turn invisible to
+   * `isBusy()`: a heartbeat, cron or user `send()` sailed through
+   * `waitForIdle()`, took `currentRequest` for itself and cleared `parts`, and
+   * the unowned turn's later text then flowed out through the WRONG turn's
+   * sink.
+   */
   private claimUnownedTurn(reason: string): TurnRequest | null {
     if (this.currentRequest) return this.currentRequest;
     const req = this.unownedTurnFactory?.();
-    if (req) {
-      this.currentRequest = req;
-      this.unownedTurnDropLogged = false;
+    if (!req) return null;
+    this.currentRequest = req;
+    this.unownedTurnDropLogged = false;
+    this.refreshActivityTimeout();
+    log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
+    return req;
+  }
+
+  /**
+   * Claim an unowned turn from its first assistant event, labelling the claim
+   * with the kind of block that opened it.
+   *
+   * The label is not decoration. On 2026-08-28 a DM reply the owner never
+   * received was traced to `reason: "assistant_thinking"` in the log: the model
+   * had written its answer inside a `thinking` block, and with `showThinking`
+   * off that block is dropped by design (renderBlock decides from the TYPE).
+   * Nothing was broken and nothing was logged above info — the reply simply did
+   * not exist as far as delivery was concerned, and it took a log forensics
+   * pass to establish that. So an unowned turn that OPENS with a hidden
+   * thinking block is now a warn, with the length that made it worth noticing.
+   */
+  private claimFirstUnownedEvent(content: unknown[]): void {
+    let reason = "assistant_event";
+    let openedWithHiddenThinking = false;
+    let chars = 0;
+    for (const block of content) {
+      if (isTextBlock(block)) { reason = "assistant_text"; break; }
+      if (isThinkingBlock(block)) {
+        reason = "assistant_thinking";
+        openedWithHiddenThinking = !this.showThinking;
+        chars = block.thinking.length;
+        break;
+      }
+      if (isToolUseBlock(block)) { reason = "assistant_tool_use"; break; }
+    }
+
+    this.claimUnownedTurn(reason);
+
+    if (openedWithHiddenThinking) {
+      log.warn(
+        { session: this.sessionKey, chars },
+        "Unowned SDK turn opened with a hidden thinking block (showThinking off); nothing from it will be delivered",
+      );
+    }
+  }
+
+  /**
+   * Hand one completed content block to the turn's delivery sink.
+   *
+   * Awaited by the event loop, which is what keeps blocks in model order: the
+   * next SDK event is not pulled until this one has shipped. A send that fails
+   * is logged and swallowed — a dead channel must not abort a turn that is
+   * still doing useful work.
+   *
+   * INACTIVITY ACCOUNTING IS SUSPENDED FOR THE DURATION OF THE SEND.
+   *
+   * The inactivity timer exists to notice a MODEL that has stopped producing.
+   * A slow channel is not that, but it used to look exactly like it: the timer
+   * was refreshed on the event that carried this block and then we sat in
+   * `await onBlock`, unable to refresh again, because refreshes only happen
+   * when we consume an SDK event and we are no longer consuming any. Real
+   * events kept arriving and piling up in the SDK's own queue, invisible to
+   * the timer. A wedged iMessage send therefore ran the clock down on a
+   * perfectly healthy turn and killed the session — the owner got his late
+   * block AND a spurious timeout error.
+   *
+   * So the timer is disarmed before the await and re-armed after, and delivery
+   * gets its own, much shorter budget instead. A block that blows that budget
+   * is abandoned: logged, reported to the sink as abandoned, turn continues.
+   * The turn is never killed for it.
+   *
+   * ABANDONMENT IS DECIDED HERE, NOT DEFERRED TO THE LATE PROMISE. The promise
+   * is left running because there is no cancellation to hand a channel, but the
+   * block's OUTCOME OF RECORD is settled the moment we give up on it — the sink
+   * is told (`onBlockAbandoned`) before the next block is handed over. Letting
+   * the late promise write the outcome instead is what let block B's transcript
+   * entry overtake block A's, or made A's vanish entirely when its send never
+   * settled at all.
+   */
+  private async shipBlock(block: ResponseBlock): Promise<void> {
+    // A scaffold leak is reported once per turn at `result`, over the same
+    // per-block filter — not logged again here.
+    const rendered = renderBlock(block, this.showThinking);
+    if (rendered.kind !== "ship") return;
+
+    const req = this.currentRequest;
+    const onBlock = req?.onBlock;
+    if (!req || !onBlock) {
+      if (!this.unownedTurnDropLogged) {
+        this.unownedTurnDropLogged = true;
+        // ERROR, not warn: this is the one path on which a block the model
+        // actually wrote reaches nobody and is never retried. Silent loss of
+        // the owner's reply is the worst failure this subsystem has, so it must
+        // not sit at a level that routine log reading skips. Latched to once
+        // per turn so a chatty orphan turn cannot flood the log. Logged HERE,
+        // at the drop, rather than at claim time: a turn that claims nothing
+        // because it opened with a tool call has lost no content yet.
+        log.error(
+          { session: this.sessionKey },
+          "Unowned SDK turn has no default delivery target; DROPPING the content block",
+        );
+      }
+      return;
+    }
+
+    const outstanding: OutstandingDelivery = { req, abandoned: false };
+    this.outstandingDelivery = outstanding;
+    this.deliverySuspensions++;
+    this.clearActivityTimeout();
+    try {
+      await withDeliveryTimeout(
+        Promise.resolve(onBlock(rendered.text)),
+        DELIVERY_TIMEOUT_MS,
+        `Block delivery timed out after ${formatTimeout(DELIVERY_TIMEOUT_MS)}`,
+      );
+    } catch (err) {
+      log.error({ err, session: this.sessionKey }, "Per-block delivery failed");
+      this.abandonDelivery(outstanding);
+    } finally {
+      if (this.outstandingDelivery === outstanding) this.outstandingDelivery = null;
+      this.deliverySuspensions--;
+      // Back on the clock, with a FULL window: the turn has been making
+      // progress the whole time, it was only our accounting that was paused.
       this.refreshActivityTimeout();
-      log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
-      return req;
     }
-    if (!this.unownedTurnDropLogged) {
-      this.unownedTurnDropLogged = true;
-      log.warn({ session: this.sessionKey, reason }, "Unowned SDK turn has no default delivery target");
-    }
-    return null;
+  }
+
+  /**
+   * Report this block to the sink as given up on, exactly once. The send
+   * itself keeps running — there is no cancellation to hand a channel — but
+   * its OUTCOME OF RECORD is settled here, in order, at the moment we stop
+   * treating it as pending.
+   */
+  private abandonDelivery(outstanding: OutstandingDelivery): void {
+    if (outstanding.abandoned) return;
+    outstanding.abandoned = true;
+    outstanding.req.onBlockAbandoned?.();
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
@@ -444,20 +707,44 @@ export class LiveSession {
       return;
     }
 
+    // An `assistant` event carries COMPLETE content blocks. There are no
+    // deltas to reassemble (#292 removed streaming), so this is the earliest
+    // moment a block is finished and can ship. Waiting for `result` instead is
+    // what left the owner unanswered for the length of a turn.
+    //
+    // WHAT AWAITING shipBlock DOES AND DOES NOT BUY US. It orders our own
+    // sends: the next SDK event is not handled until this block has reached
+    // the channel, so blocks arrive in model order. It does NOT hold back the
+    // CLI. `Query.readMessages()` (SDK 0.3.246) drains the transport into an
+    // internal queue on its own schedule, independent of how fast we consume
+    // it — so by the time block A is on the owner's phone the CLI has very
+    // likely already started, and may already have finished, the tool_use that
+    // A precedes. Blocking the CLI is not something this layer can do and is
+    // not what the feature needs: the requirement is "my text reaches him
+    // while the turn is still running", which is exactly what awaiting here
+    // delivers.
     if (event.type === "assistant" && event.message?.content) {
+      // CLAIM ON THE FIRST EVENT OF THE TURN, WHATEVER IT CARRIES.
+      //
+      // An assistant event with no owner is an SDK-initiated (autonomous /
+      // task-notification) turn, and it is in flight from this instant — even
+      // when its first event is only a root `tool_use` and the text comes
+      // minutes later. Claiming here is what makes `isBusy()` true for the
+      // whole of such a turn, so a heartbeat, cron or user `send()` queues
+      // behind it instead of stealing `currentRequest` (and clearing `parts`)
+      // out from under it and receiving its text in the wrong sink.
+      if (!this.currentRequest) this.claimFirstUnownedEvent(event.message.content);
+
       for (const block of event.message.content) {
         if (isTextBlock(block)) {
-          // Claim the turn so an SDK-initiated (unowned) turn still has a
-          // request to resolve into at result time. Delivery itself happens
-          // once, after the turn completes — nothing ships per block.
-          if (!this.currentRequest) this.claimUnownedTurn("assistant_text");
           this.parts.push({ type: "text", text: block.text });
+          await this.shipBlock({ type: "text", text: block.text });
         } else if (isThinkingBlock(block)) {
           // Kept as a typed block; whether it reaches the channel is decided
-          // by renderResponseBlocks from the TYPE, never from the text.
+          // by renderBlock from the TYPE, never from the text.
           // `redacted_thinking` carries no readable text and never gets here.
-          if (!this.currentRequest) this.claimUnownedTurn("assistant_thinking");
           this.parts.push({ type: "thinking", text: block.thinking });
+          await this.shipBlock({ type: "thinking", text: block.thinking });
         } else if (isToolUseBlock(block)) {
           if (block.id) this.pendingToolNames.set(block.id, block.name);
           if (block.id && (block.name === "Agent" || block.name === "Task")) {
@@ -535,21 +822,18 @@ export class LiveSession {
       // Await context usage before resolving so stats are complete
       await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
-      // The turn is over: render its collected content blocks into the one
-      // response callers deliver, transcribe and log. Block TYPE alone decides
-      // what is included (see renderResponseBlocks) — the text is never
-      // inspected.
+      // The turn is over. Its blocks have ALREADY shipped, one by one, as they
+      // completed; what is assembled here is only the response string — the
+      // transcript, the log line, and the value send()/steer() resolve with.
       const rendered = renderResponseBlocks(this.parts, this.showThinking);
       if (rendered.scaffoldFiltered) {
         log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
       }
       const response = rendered.text || "I'm not sure how to respond to that.";
-      const responseBlocks = rendered.blocks.length > 0 ? rendered.blocks : [response];
       this.parts = [];
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
       if (this.pendingSteers.length === 0) this.clearActivityTimeout();
-      req?.onBlocks?.(responseBlocks);
       await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
@@ -728,22 +1012,73 @@ export class LiveSession {
     );
   }
 
+  /**
+   * Serialize the whole "wait for idle, then claim" sequence.
+   *
+   * Held only until the claim is made, never for the length of the turn, so a
+   * second caller enters the section and starts its own wait as soon as the
+   * first has dispatched. Nothing on the event-loop side takes this lock —
+   * `claimUnownedTurn` is synchronous — so the section can never be waiting on
+   * a turn that is waiting on it.
+   */
+  private claimLock: Promise<void> = Promise.resolve();
+
+  private async withClaimLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.claimLock;
+    let release!: () => void;
+    this.claimLock = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Take ownership of the next turn for `req` and dispatch it.
+   *
+   * ATOMIC CHECK-AND-CLAIM. `await waitForIdle(); this.currentRequest = req;`
+   * was not: two woken waiters both observed an idle session and both claimed
+   * (the second silently clearing the first's `parts`), and an unowned turn
+   * could claim in the window between the wait resolving and the assignment,
+   * after which the turn's text left through the wrong sink. Here the busy
+   * check and the assignment are in ONE synchronous step with no await between
+   * them, re-tested after every wake, so exactly one claimant can win — against
+   * another `send()` and against `claimUnownedTurn` alike. The lock around it
+   * keeps waiters in arrival order rather than letting them race on wake.
+   */
+  private async acquireTurn(req: MessageRequest): Promise<void> {
+    await this.withClaimLock(async () => {
+      for (;;) {
+        if (!this.alive) throw new Error("Session is closed");
+        if (!this.isBusy()) {
+          // Fresh maxTurns budget per user message — warnings fire once per
+          // send(), and it is reset when the turn actually starts rather than
+          // when the caller began waiting for it.
+          if (this.turnBudget) resetTurnBudget(this.turnBudget);
+          this.currentRequest = req;
+          this.parts = [];
+          this.refreshActivityTimeout();
+          this.pushInput(req.message);
+          return;
+        }
+        // Steered messages can keep the session busy past the turn that the
+        // agent-level queue serialized against (they may run as a follow-up
+        // turn), so wait for true idleness before dispatching.
+        await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+      }
+    });
+  }
+
   async send(
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    onBlocks?: (blocks: string[]) => void,
+    onBlock?: (block: string) => void | Promise<void>,
+    onBlockAbandoned?: () => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-
-    // Steered messages can keep the session busy past the turn that the
-    // agent-level queue serialized against (they may run as a follow-up
-    // turn), so wait for true idleness before dispatching.
-    await this.waitForIdle();
-    if (!this.alive) throw new Error("Session is closed");
-
-    // Fresh maxTurns budget per user message — warnings fire once per send().
-    if (this.turnBudget) resetTurnBudget(this.turnBudget);
 
     const content = buildContentBlocks(text, images, documents);
 
@@ -752,12 +1087,12 @@ export class LiveSession {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
         resolve,
         reject,
-        ...(onBlocks ? { onBlocks } : {}),
+        ...(onBlock ? { onBlock } : {}),
+        ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
       };
-      this.currentRequest = req;
-      this.parts = [];
-      this.refreshActivityTimeout();
-      this.pushInput(req.message);
+      // Rejects only if the session dies before the claim; once claimed, the
+      // turn's own resolve/reject settle this promise.
+      this.acquireTurn(req).catch(reject);
     });
   }
 
@@ -775,10 +1110,11 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    onBlocks?: (blocks: string[]) => void,
+    onBlock?: (block: string) => void | Promise<void>,
+    onBlockAbandoned?: () => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, images, documents, onBlocks);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -793,7 +1129,8 @@ export class LiveSession {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
         resolve,
         reject,
-        ...(onBlocks ? { onBlocks } : {}),
+        ...(onBlock ? { onBlock } : {}),
+        ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
       };
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);
@@ -817,9 +1154,28 @@ export class LiveSession {
     return runtimeQuery.setMcpServers.call(this.q, servers);
   }
 
+  /**
+   * Retire the session. Everything here is SYNCHRONOUS on purpose: shutdown
+   * has a few seconds at most, and both of the things that used to be left
+   * asynchronous cost the owner transcript entries.
+   *
+   * OPEN DELIVERY, ABANDONED HERE. A block whose send is still outstanding
+   * holds an open transcript slot, and every slot behind it. Waiting for the
+   * 60s delivery budget to expire (it is the only other thing that closes the
+   * slot) means the flush that follows shutdown finds it still dangling. So we
+   * give up on it now, in order, before anything else can be dispatched.
+   *
+   * IN-FLIGHT TURN, REJECTED HERE. `consumeEvents` also rejects it, but only
+   * once the SDK's async iterator has actually ended — and it cannot end while
+   * the event loop is parked in `await onBlock` on a wedged send. That left
+   * the owner's turn pending for a full delivery budget after the daemon had
+   * decided to exit, which is exactly the window shutdown does not have.
+   */
   close(): void {
     this.alive = false;
+    if (this.outstandingDelivery) this.abandonDelivery(this.outstandingDelivery);
     this.inputWaiter?.();
     this.q.close();
+    this.failTurn(new Error("Session is closed"));
   }
 }

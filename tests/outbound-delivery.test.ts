@@ -1,5 +1,6 @@
 /**
- * Counterexamples for the non-streaming, block-typed outbound delivery design.
+ * Counterexamples for the block-typed outbound delivery design (now per block,
+ * shipped as each block completes).
  *
  * The rejected predecessor (#291) tried to keep thinking text and tool-call
  * debris out of chats by pattern-matching the outbound STRING. That filtered
@@ -45,6 +46,9 @@ class FakeChannel implements Channel {
   }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
+  closeIngestion(): void {}
+  async quiesce(): Promise<void> {}
+  async teardown(): Promise<void> {}
   async stop(): Promise<void> {}
 }
 
@@ -67,9 +71,14 @@ function makePipeline(channel: FakeChannel = new FakeChannel()) {
   });
   const deliver = (response: string) =>
     pipeline.deliverResponse("dm:owner", channel, "chat1", response);
-  /** Deliver a turn as the delivery layer really receives it: as blocks. */
-  const deliverBlocks = (blocks: string[], options: { replyTo?: string } = {}) =>
-    pipeline.deliverResponse("dm:owner", channel, "chat1", blocks.join("\n"), undefined, { ...options, blocks });
+  /**
+   * Deliver a turn as the delivery layer really receives it: block by block,
+   * through ONE sender, in the order the model completed them.
+   */
+  const deliverBlocks = async (blocks: string[], options: { replyTo?: string } = {}) => {
+    const sender = pipeline.createBlockSender(channel, "chat1", options);
+    for (const block of blocks) await sender.deliver(block);
+  };
   return { channel, pipeline, notes, deliver, deliverBlocks };
 }
 
@@ -229,12 +238,18 @@ describe("block-ordered attachment delivery", () => {
     ]);
   });
 
-  it("merges adjacent text-only blocks into a single send", async () => {
+  it("never merges adjacent text-only blocks", async () => {
     const { channel, deliverBlocks } = makePipeline();
 
+    // Each block ships as it completes, so there is never a second completed
+    // block sitting in hand to merge the first one with.
     await deliverBlocks(["A", "B", "C"]);
 
-    expect(channel.sent).toEqual([{ chatId: "chat1", text: "A\nB\nC" }]);
+    expect(channel.sent).toEqual([
+      { chatId: "chat1", text: "A" },
+      { chatId: "chat1", text: "B" },
+      { chatId: "chat1", text: "C" },
+    ]);
   });
 
   it("keeps each caption with the media of its own block", async () => {
@@ -333,6 +348,9 @@ describe("block-ordered attachment delivery", () => {
 
     await deliverBlocks(["A", `MEDIA:${photoPath}\nNO_REPLY`, "B"]);
 
-    expect(channel.sent).toEqual([{ chatId: "chat1", text: "A\nB" }]);
+    expect(channel.sent).toEqual([
+      { chatId: "chat1", text: "A" },
+      { chatId: "chat1", text: "B" },
+    ]);
   });
 });

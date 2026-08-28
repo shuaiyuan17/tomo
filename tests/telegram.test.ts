@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   POLLING_HEALTHY_RUN_MS,
   POLLING_RESTART_MAX_MS,
@@ -583,5 +583,123 @@ describe("nextPollingBackoff", () => {
   it("keeps backing off when the run died just under the health threshold", () => {
     const { delayMs } = nextPollingBackoff(12_000, POLLING_HEALTHY_RUN_MS - 1);
     expect(delayMs).toBe(12_000);
+  });
+});
+
+/**
+ * SHUTDOWN — where the refusal guard may and may not sit.
+ *
+ * grammY acknowledges an update BEFORE our middleware runs: `handleUpdates`
+ * sets `lastTriedUpdateId` and only then calls the middleware, and `bot.stop()`
+ * confirms `lastTriedUpdateId + 1` with a final `getUpdates` without waiting for
+ * the middleware stack (grammy 1.45.1, out/bot.js). So there is no such thing
+ * as declining an update back to Telegram: an update refused half-way through
+ * a photo download is LOST, not replayed. The guard therefore sits at the
+ * ENTRY, and anything already inside the middleware has to be allowed to
+ * finish into the agent — which is what `quiesce()` waits for.
+ */
+describe("TelegramChannel shutdown phases", () => {
+  interface BotInternals {
+    botInfo: unknown;
+    api: Record<string, unknown>;
+    handleUpdate: (update: unknown) => Promise<void>;
+  }
+
+  function makeChannel() {
+    const channel = new TelegramChannel("000000:test-token");
+    const bot = (channel as unknown as { bot: BotInternals }).bot;
+    // handleUpdate refuses to run before the bot knows who it is.
+    bot.botInfo = {
+      id: 1, is_bot: true, first_name: "Tomo", username: "mybot",
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business_account: false,
+      has_main_web_app: false,
+    };
+    return { channel, bot };
+  }
+
+  const chat = { id: 42, type: "private" as const, first_name: "Alice" };
+  const from = { id: 7, is_bot: false, first_name: "Alice" };
+
+  const textUpdate = (updateId: number, text: string) => ({
+    update_id: updateId,
+    message: { message_id: updateId, date: 1_700_000_000, chat, from, text },
+  });
+
+  const photoUpdate = (updateId: number) => ({
+    update_id: updateId,
+    message: {
+      message_id: updateId, date: 1_700_000_000, chat, from,
+      photo: [{ file_id: "file-1", file_unique_id: "u1", width: 10, height: 10 }],
+      caption: "mid-download",
+    },
+  });
+
+  it("lets an update already mid-download finish into the agent, and quiesces until it does", async () => {
+    const { channel, bot } = makeChannel();
+
+    let releaseDownload!: () => void;
+    const downloadGate = new Promise<void>((resolve) => { releaseDownload = resolve; });
+    let downloadStarted = false;
+    bot.api.getFile = async () => {
+      downloadStarted = true;
+      await downloadGate;
+      return {}; // no file_path: the photo is skipped, no network is touched
+    };
+
+    const seen: string[] = [];
+    channel.onMessage(async (msg) => { seen.push(msg.text); return true; });
+
+    void bot.handleUpdate(photoUpdate(1));
+    await vi.waitFor(() => expect(downloadStarted).toBe(true));
+
+    // SIGTERM lands with the update parked inside the middleware.
+    channel.closeIngestion();
+
+    let quiesced = false;
+    const quiescing = channel.quiesce().then(() => { quiesced = true; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(quiesced).toBe(false);
+    expect(seen).toEqual([]);
+
+    releaseDownload();
+    await quiescing;
+
+    // It reached the agent instead of being dropped. Telegram had already
+    // acknowledged it, so this is the only outcome that is not a loss.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("mid-download");
+  });
+
+  it("refuses an update that had not started when ingestion closed", async () => {
+    const { channel, bot } = makeChannel();
+    const seen: string[] = [];
+    channel.onMessage(async (msg) => { seen.push(msg.text); return true; });
+
+    channel.closeIngestion();
+    await bot.handleUpdate(textUpdate(2, "after the door closed"));
+    await channel.quiesce();
+
+    expect(seen).toEqual([]);
+  });
+
+  it("keeps sending while ingestion is closed, and only teardown ends the bot", async () => {
+    const { channel, bot } = makeChannel();
+    const sent: string[] = [];
+    bot.api.sendMessage = async (_chatId: unknown, text: string) => {
+      sent.push(text);
+      return { message_id: 1 };
+    };
+    let stopped = false;
+    (bot as unknown as { stop: () => Promise<void> }).stop = async () => { stopped = true; };
+
+    channel.closeIngestion();
+    // The agent is still draining turns here; outbound must survive it.
+    await channel.send({ chatId: "42", text: "delivered during the drain" });
+    expect(sent).toEqual(["delivered during the drain"]);
+    expect(stopped).toBe(false);
+
+    await channel.teardown();
+    expect(stopped).toBe(true);
   });
 });

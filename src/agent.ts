@@ -30,6 +30,7 @@ import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
 import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
@@ -41,6 +42,7 @@ import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
+import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
 
@@ -75,6 +77,16 @@ interface CronTurnOptions {
    *  session key). */
   deliveryTarget?: ReplyTarget;
 }
+
+/**
+ * Deadlines for the two channel-side shutdown steps. Both exist because
+ * `start.ts` cannot call `process.exit()` until `stop()` resolves, so an
+ * unbounded await here is a daemon that will not die: `quiesce` waits on
+ * attachment IO and a network download, and `teardown` waits on grammY's final
+ * `getUpdates`, whose own client timeout defaults to 500 seconds.
+ */
+const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
+const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
 
 // Context-usage percentage at which the nudge escalates from a daily rollup
 // (config.lcm.nudgeAtPct) to a full lcm compact.
@@ -364,8 +376,14 @@ export class Agent {
    * coalesce rapid messages into one turn; mention-required groups process
    * per-message (mention filtering would be lost otherwise). Resolves once
    * queued, not when the turn completes.
+   *
+   * Resolves to whether the agent took CUSTODY of the message — see
+   * MessageHandler. `true` covers deliberate drops (allowlist, /pause) as well
+   * as queued work: the decision was made and recorded here, and the channel
+   * should acknowledge the message rather than replay it forever. Only a
+   * batcher already drained for shutdown answers `false`.
    */
-  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<boolean> {
     const isGroup = message.isGroup ?? false;
 
     // Allowlist gate at receipt, BEFORE resolving: a disallowed chat must not
@@ -379,7 +397,7 @@ export class Agent {
       } else {
         log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked at receipt (not in allowlist)");
       }
-      return;
+      return true;
     }
 
     // A provider redirect opened on another device cannot reach this Mac's
@@ -389,7 +407,7 @@ export class Agent {
     // never reach the OAuth manager.
     if (!isGroup && message.senderId && this.router.identityForSender(channel.name, message.senderId)) {
       const consumed = await this.handlePastedMcpCallback(channel, message);
-      if (consumed) return;
+      if (consumed) return true;
     }
 
     // /pause gate, BEFORE resolving: a paused group's messages are dropped
@@ -398,7 +416,7 @@ export class Agent {
     // slash commands bypass this path, which is how /resume gets through.
     if (isGroup && this.pauses.isPaused(`${channel.name}:${message.chatId}`)) {
       log.debug({ channel: channel.name, chatId: message.chatId }, "Message dropped (group is paused via /pause)");
-      return;
+      return true;
     }
 
     // Resolve ONCE, at receipt — this decides both which queue the message
@@ -417,10 +435,10 @@ export class Agent {
       // task can wait behind an in-flight turn, and both can change meanwhile.
       this.enqueueForSession(sessionKey, () => this.processInboundItems([{ channel, message, resolution }]))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      return;
+      return true;
     }
 
-    this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
+    return this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
   }
 
   private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
@@ -689,7 +707,20 @@ export class Agent {
     const { channel, chatId } = target;
     const stopTyping = this.startTurnTyping(channel, chatId, this.isPassiveReplyTarget(channel.name, chatId));
     let settled = false;
-    let responseBlocks: string[] | undefined;
+    // One sender for the whole background turn, so its blocks ship as they
+    // complete — same path as every other ingress.
+    const sender = this.delivery.createBlockSender(channel, chatId);
+    // Ordered per-block transcript, same rule as every owned turn: the slot is
+    // taken at dispatch and filled at settle, so an abandoned send cannot let a
+    // later block's entry overtake it (see agent/block-transcript.ts).
+    const transcript = createOrderedBlockTranscript((entry) => {
+      this.sessions.append(key, {
+        role: "assistant",
+        content: entry,
+        channel: channel.name,
+        timestamp: Date.now(),
+      });
+    });
 
     const stop = async () => {
       try {
@@ -700,25 +731,37 @@ export class Agent {
     };
 
     return {
-      onBlocks: (blocks) => { responseBlocks = blocks; },
+      onBlock: async (block) => {
+        // Error text is not a reply: it is handled once, at resolve, so it
+        // reaches the chat prefixed and with a pending note queued.
+        if (isAgentErrorResponse(block) || isSilentReply(block)) return;
+        const slot = transcript.reserve(block);
+        try {
+          await sender.deliver(block);
+          // Recorded per shipped block — an unrecorded delivery is invisible
+          // to recall_conversation (#203) — but recorded AFTER the send, never
+          // before. Writing on intent made the transcript claim deliveries
+          // that never happened (A sends, B throws, transcript shows both).
+          slot.settle(block);
+        } catch (err) {
+          log.error({ err, key }, "Background task block delivery failed");
+          // Still recorded, but MARKED: the turn composed this text, and it is
+          // not known to have reached the owner.
+          slot.settle(`${DELIVERY_FAILED_MARKER}${block}`);
+        }
+      },
+      onBlockAbandoned: () => transcript.abandonOldest(),
       resolve: async (response) => {
         if (settled) return;
         settled = true;
         try {
           this.maybeNudgeCompact(key);
-          if (!isSilentReply(response) && !isAgentErrorResponse(response)) {
-            this.sessions.append(key, {
-              role: "assistant",
-              content: response,
-              channel: channel.name,
-              timestamp: Date.now(),
-            });
-          }
           log.info({ channel: channel.name, session: key }, "Tomo: %s", response);
-          await this.delivery.deliverResponse(
-            key, channel, chatId, response, undefined,
-            responseBlocks ? { blocks: responseBlocks } : {},
-          );
+          // The turn's own blocks have already shipped; only an agent error
+          // still needs delivering (and a pending note queued for it).
+          if (isAgentErrorResponse(response)) {
+            await this.delivery.deliverResponse(key, channel, chatId, response);
+          }
         } catch (err) {
           log.error({ err, key }, "Background task response delivery failed");
         } finally {
@@ -873,9 +916,18 @@ export class Agent {
       return;
     }
 
+    // ALWAYS suppressed, in every session type. A context nudge (compact /
+    // daily / prune-tools) is internal housekeeping: it runs an `lcm` command
+    // and has nothing to say to anyone. It used to rely on the prompt's
+    // closing "reply NO_REPLY", which only worked while delivery happened at
+    // END of turn and that trailing token suppressed the whole turn. Per-block
+    // delivery ships an early narration block ("Compacting context…") as soon
+    // as it completes, before the NO_REPLY that was meant to silence it — and
+    // a sent message cannot be recalled. Silence here must not depend on the
+    // model's cooperation.
     this.handleCronMessage(nudge, key, {
       showTyping: false,
-      suppressDelivery: isGroupSessionKey(key),
+      suppressDelivery: true,
     }).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });
@@ -1270,12 +1322,26 @@ export class Agent {
       source: "continuity",
       prompt,
       // No timestamp stamp, no typing indicator — continuity turns are
-      // invisible unless the model chooses to speak. When it does speak, the
-      // delivered message must reach the transcript like any other assistant
-      // message (#203: heartbeat/restart deliveries were silently missing
-      // from recall history).
+      // invisible. A heartbeat speaks only through the explicit `send_message`
+      // tool, never through its own text blocks (owner decision 2026-08-28,
+      // option A).
+      //
+      // WHY THE PROMPT ALONE IS NOT ENOUGH ANY MORE. CONTINUITY.md asks for a
+      // closing NO_REPLY, and under end-of-turn delivery that trailing token
+      // suppressed the whole turn retroactively — narration included. Per-block
+      // delivery ships each block as it completes, so a heartbeat that narrates
+      // ("Checking the morning routine…"), calls a tool, and only then answers
+      // NO_REPLY has already put the narration on the owner's phone, and a sent
+      // message cannot be recalled. Silence for a turn nobody asked for must
+      // not depend on the model's cooperation.
+      //
+      // The target is still resolved (and still deferred) because the error
+      // policy and `send_message` need it; only the turn's own output is
+      // dropped.
       delivery: {
         kind: "deferred-send",
+        suppressDelivery: true,
+        suppressedLog: "Continuity output suppressed from chat delivery (heartbeats speak via send_message)",
         resolveTarget: () => {
           const identityName = dmIdentityFromSessionKey(key);
           // Final fallback covers raw keys only (dm: keys don't parse), so
@@ -1477,7 +1543,7 @@ export class Agent {
     if (restart) {
       const { reason, sessionKey } = restart;
       log.info({ reason, sessionKey }, "Restart reason found, notifying agent");
-      const prompt = formatTomoEvent("restart", `Restarted. Reason: ${reason}`);
+      const prompt = formatTomoEvent("restart", `Restarted. Reason: ${reason} ${CONTINUITY_DELIVERY_NOTE}`);
       const delivery = sessionKey
         ? this.handleRestartForSession(prompt, sessionKey)
         : this.handleContinuity(prompt);
@@ -1485,10 +1551,159 @@ export class Agent {
     }
   }
 
+  /**
+   * Shut down in five phases, ordered by what each one can lose.
+   *
+   * 1. `closeIngestion()` on every channel — synchronous, no I/O, so the whole
+   *    fleet's inbound door is shut within one turn of the event loop. This
+   *    bounds the set of messages we owe the user.
+   * 2. `quiesce()` — let work already INSIDE a channel's parse path finish
+   *    landing in the batcher. A row refused at this stage would be lost, not
+   *    replayed: imsg may be seconds into attachment loading, and Telegram has
+   *    already told the server it has the update.
+   * 3. Drain the batcher into the transcript. Durable, and now working against
+   *    a set that cannot grow.
+   * 4. Stop the manager: reject in-flight turns and let them flush the blocks
+   *    they delivered. Also durable.
+   * 5. Only now, physical channel teardown — the slow, fallible part.
+   *
+   * The order of 4 and 5 is the whole point of the split. Tearing a channel
+   * down first meant the manager drained into a dead channel, so blocks
+   * produced during shutdown were recorded `[delivery failed]` for messages
+   * that would otherwise have shipped. And awaiting teardown BEFORE the drain
+   * staked every durable write on grammY's final `getUpdates`, which carries a
+   * 500 s default client timeout — one stalled network call and nothing was
+   * recorded at all.
+   *
+   * Hence the nested `finally`s: the recording and the manager stop run even
+   * if quiesce fails, and teardown runs even if they do. Both awaits are
+   * bounded, because `start.ts` cannot exit until this resolves.
+   */
   async stop(): Promise<void> {
     log.info("Shutting down");
     this.commands.stop();
-    this.liveSessionManager.stop();
-    await Promise.all(this.channels.map((ch) => ch.stop()));
+
+    for (const ch of this.channels) {
+      try {
+        ch.closeIngestion();
+      } catch (err) {
+        // Contractually I/O-free, so this is a bug rather than a failure mode
+        // — but one channel must not keep the others ingesting.
+        log.error({ err, channel: ch.name }, "Channel closeIngestion threw");
+      }
+    }
+
+    try {
+      await this.boundedShutdownStep(
+        "channel quiesce",
+        CHANNEL_QUIESCE_TIMEOUT_MS,
+        () => Promise.all(this.channels.map((ch) => ch.quiesce())),
+      );
+    } finally {
+      try {
+        // The batcher is guaranteed not to grow again. These are messages the
+        // user has already sent and we are choosing not to answer; the
+        // transcript record is what keeps that a visible non-answer instead of
+        // a silent drop.
+        this.recordUnprocessedInbound();
+
+        // Closing the live sessions rejects their in-flight turns, and those
+        // turns still have to flush the blocks they delivered into the
+        // transcript. Channels are still alive here, so a block produced
+        // during this drain still reaches the user.
+        await this.liveSessionManager.stop();
+      } finally {
+        await this.boundedShutdownStep(
+          "channel teardown",
+          CHANNEL_TEARDOWN_TIMEOUT_MS,
+          () => Promise.all(this.channels.map((ch) => ch.teardown())),
+        );
+      }
+    }
+  }
+
+  /**
+   * Run one shutdown step under a deadline, swallowing failures.
+   *
+   * Neither a rejection nor a stall may propagate: every caller is on the path
+   * to `process.exit()`, and a shutdown step that hangs is indistinguishable
+   * from a daemon that refuses to die. The timer is cleared on the fast path
+   * so it cannot hold the loop open, and the abandoned work is left running
+   * rather than cancelled — there is no cancellation to hand a channel.
+   */
+  private async boundedShutdownStep(label: string, timeoutMs: number, run: () => Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([
+        run().then(() => "done" as const, (err) => { log.error({ err, step: label }, "Shutdown step failed"); return "done" as const; }),
+        expiry,
+      ]);
+      if (outcome === "timeout") {
+        log.warn({ step: label, timeoutMs }, "Shutdown step timed out; continuing");
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Write the transcript record for inbound that shutdown will never process.
+   *
+   * Not dispatched instead, deliberately: dispatching would mean starting a
+   * turn we are about to reject anyway (the manager's admission gate closes a
+   * few lines below) and staking the shutdown deadline on a model round-trip.
+   * Recording is bounded and keeps the promise that matters — recall has the
+   * message, and the marker says plainly that nobody answered it.
+   *
+   * The user's text is appended verbatim, with the marker as its own
+   * assistant entry, so the record reads the way the same message would if it
+   * had died one stage later in `TurnRunner` (same marker, same shape) and the
+   * user's words are not editorialised.
+   *
+   * The transcript record is the ONLY durable trace for everything drained
+   * here, on both channels. Neither one replays what is already in the
+   * batcher:
+   *
+   * - imsg advanced its rowid cursor at the end of the dispatch that put the
+   *   message here, so there is nothing left to un-acknowledge.
+   * - Telegram acknowledged it too, whatever we do. grammY sets
+   *   `lastTriedUpdateId` BEFORE running middleware (bot.js) and `bot.stop()`
+   *   confirms `lastTriedUpdateId + 1` with a final `getUpdates` without
+   *   waiting for the middleware stack. An earlier version of this comment
+   *   claimed Telegram's offset was "only committed for updates it has handed
+   *   over" and that declining one made `getUpdates` redeliver it. That was
+   *   false: the update is confirmed either way, so a refusal here loses it.
+   *
+   * Replay is real only for a message refused BEFORE the channel started
+   * processing it, and only on imsg (`handleWatchMessage`'s entry guard leaves
+   * the cursor un-advanced). That is why the shutdown sequence lets in-flight
+   * parses finish into this batcher instead of refusing them late.
+   */
+  private recordUnprocessedInbound(): void {
+    const pending = this.batcher.drainForShutdown();
+    for (const [key, items] of pending) {
+      for (const { channel, message } of items) {
+        this.sessions.append(key, {
+          role: "user",
+          content: this.formatGroupText(channel, message, key),
+          channel: channel.name,
+          senderName: message.senderName,
+          timestamp: message.timestamp,
+        });
+        this.sessions.append(key, {
+          role: "assistant",
+          content: SHUTDOWN_NOT_PROCESSED,
+          channel: channel.name,
+          timestamp: Date.now(),
+        });
+      }
+      log.info(
+        { sessionKey: key, count: items.length },
+        "Recorded inbound messages shutdown will not process",
+      );
+    }
   }
 }

@@ -142,7 +142,19 @@ export interface StopTypingOptions {
 
 export type StopTyping = (options?: StopTypingOptions) => void | Promise<void>;
 
-export type MessageHandler = (message: IncomingMessage) => Promise<void>;
+/**
+ * Inbound hand-off. Resolves to whether the agent ACCEPTED custody of the
+ * message — `true` means "it is now the agent's problem: it will be processed,
+ * or recorded in the transcript as deliberately not processed". `false` means
+ * the agent refused it (shutdown drain already past), so nothing downstream
+ * remembers it and the channel must NOT acknowledge it: no dedupe record, no
+ * cursor advance. A channel that ignores the answer turns a refusal into a
+ * silent drop, which is the exact failure this signature exists to prevent.
+ *
+ * A throw is a different, harder failure (the hand-off itself broke) and stays
+ * a throw — channels treat it as "row not handled" and replay.
+ */
+export type MessageHandler = (message: IncomingMessage) => Promise<boolean>;
 /**
  * Slash command handler. `senderId` is the channel's provider-verified sender
  * identifier (Telegram user id, iMessage handle address) — unlike
@@ -216,6 +228,51 @@ export interface Channel {
   /** Start listening for messages */
   start(): Promise<void>;
 
-  /** Gracefully shut down the channel */
+  /**
+   * Shut the inbound door. SYNCHRONOUS and I/O-free by contract: it may only
+   * flip an in-memory flag and clear timers. The Agent calls it on every
+   * channel before it does anything else, so "no new work can enter" is true
+   * for the whole fleet in one turn of the event loop, with nothing that can
+   * stall or reject in between.
+   *
+   * It refuses only work that has NOT STARTED. Anything already inside the
+   * channel's parse path keeps going — see quiesce().
+   *
+   * Outbound must keep working: the agent is still draining turns whose blocks
+   * have to reach the user. Physical teardown belongs in teardown().
+   */
+  closeIngestion(): void;
+
+  /**
+   * Wait for work already inside the parse path (attachment download, HEIC
+   * conversion, middleware) to finish handing itself to the agent.
+   *
+   * This is the half of shutdown that `closeIngestion` cannot cover: a row
+   * that passed the entry guard a moment before stop() landed is mid-parse,
+   * and neither refusing it later (it may already be acknowledged) nor
+   * abandoning it (it is gone) is acceptable. Letting it complete INTO the
+   * batcher, before the batcher is drained, is what makes it recoverable.
+   *
+   * Bounded by the caller, and must not throw for ordinary in-flight failures.
+   */
+  quiesce(): Promise<void>;
+
+  /**
+   * Release the physical resources: kill the child process, end the polling
+   * connection, close file handles.
+   *
+   * Slow and fallible by nature (grammY's final `getUpdates` rides a 500 s
+   * client timeout), which is exactly why it is last: nothing durable may wait
+   * behind it. After this the channel can no longer send, so it runs only once
+   * the agent has finished draining.
+   */
+  teardown(): Promise<void>;
+
+  /**
+   * The whole sequence, for callers shutting one channel down on its own
+   * (tests, scripts). `Agent.stop()` does NOT call this — it interleaves the
+   * phases across all channels, with the batcher drain and the manager stop
+   * sandwiched between quiesce and teardown.
+   */
   stop(): Promise<void>;
 }

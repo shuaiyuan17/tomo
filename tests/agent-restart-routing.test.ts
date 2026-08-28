@@ -18,6 +18,7 @@ import {
 } from "./helpers/agent-harness.js";
 import { restartReasonSessionFile, writeRestartReasonFile } from "../src/restart-reason.js";
 import { log } from "../src/logger.js";
+import { CONTINUITY_DELIVERY_NOTE } from "../src/continuity-defaults.js";
 
 installAgentTestHooks();
 
@@ -49,6 +50,21 @@ function restartPrompts(): string[] {
     .filter((text) => text.includes(RESTART_MARKER));
 }
 
+/**
+ * Which SESSIONS ran the restart notice.
+ *
+ * Routing used to be read off the delivered message's chatId. It cannot be any
+ * more: a restart notice is a continuity turn, and continuity turns suppress
+ * their own output (owner decision 2026-08-28, option A) — the model speaks
+ * from them only via `send_message`. The session a turn ran on is the property
+ * these tests were always really about, so assert it directly.
+ */
+function restartSessions(): string[] {
+  return mockSdk.promptsBySession
+    .filter((p) => p.text.includes(RESTART_MARKER))
+    .map((p) => p.sessionKey);
+}
+
 describe("restart reason routing", () => {
   it("delivers an attributed reason to the initiating group session, and only there", async () => {
     resetConfig({
@@ -74,10 +90,17 @@ describe("restart reason routing", () => {
     const prompts = restartPrompts();
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toContain(reason);
+    // The notice runs as a continuity turn, so its own text goes nowhere. Say
+    // so in the event itself, not only in CONTINUITY.md.
+    expect(prompts[0]).toContain(CONTINUITY_DELIVERY_NOTE);
 
-    // ...and the response went to the initiating group chat, never the DM.
-    expect(tg.sent.map((m) => m.chatId)).toEqual([GROUP_CHAT]);
-    expect(tg.sent[0].text).toBe("Back online, resuming.");
+    // ...the initiating group session's, never the DM's...
+    expect(restartSessions()).toEqual([GROUP_KEY]);
+
+    // ...and none of that turn's own text reached a chat. "Back online,
+    // resuming." is exactly the unbidden narration option A suppresses; a
+    // restart notice that genuinely needs to speak calls send_message.
+    expect(tg.sent).toHaveLength(0);
 
     await agent.stop();
   });
@@ -143,7 +166,9 @@ describe("restart reason routing", () => {
     await drainQueue(agent);
 
     expect(restartPrompts()).toHaveLength(1);
-    expect(tg.sent.map((m) => m.chatId)).toEqual([DM_CHAT]);
+    expect(restartSessions()).toEqual(["dm:shuai"]);
+    // Suppressed like every continuity turn — routing is the claim here.
+    expect(tg.sent).toHaveLength(0);
 
     await agent.stop();
   });
@@ -169,8 +194,9 @@ describe("restart reason routing", () => {
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toContain("Updated from v0.8.11 to v0.8.12");
 
-    // Legacy behavior: the first DM session gets it; the group stays silent.
-    expect(tg.sent.map((m) => m.chatId)).toEqual([DM_CHAT]);
+    // Legacy behavior: the first DM session gets it; the group never sees it.
+    expect(restartSessions()).toEqual(["dm:shuai"]);
+    expect(tg.sent).toHaveLength(0);
 
     await agent.stop();
   });

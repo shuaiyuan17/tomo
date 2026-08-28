@@ -59,6 +59,7 @@ async function startForeground(): Promise<void> {
   }
 
   const { Agent } = await import("../agent.js");
+  const { log } = await import("../logger.js");
   const { TelegramChannel } = await import("../channels/index.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
   const { PetScheduler } = await import("../mcp/pet-scheduler.js");
@@ -225,7 +226,16 @@ async function startForeground(): Promise<void> {
     continuity.stop();
     petScheduler.stop();
     scheduler.stop();
-    await agent.stop();
+    // `agent.stop()` bounds and swallows its own steps, but a throw escaping it
+    // must still not strand the process: the daemon would sit there with a
+    // stale PID file, holding the port and the imsg child, and `tomo restart`
+    // would find a pid that never dies. Exit is the one thing that always
+    // happens.
+    try {
+      await agent.stop();
+    } catch (err) {
+      log.error({ err }, "Agent shutdown failed; exiting anyway");
+    }
     try { unlinkSync(PID_FILE); } catch { /* ignore */ }
     process.exit(0);
   };

@@ -653,3 +653,41 @@ describe("LiveSession per-block filtering", () => {
     expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => msg === "model scaffold leak filtered")).toBe(true);
   });
 });
+
+describe("LiveSession close during an outstanding block delivery", () => {
+  it("abandons the open block synchronously and rejects the turn without waiting out the delivery budget", async () => {
+    // Shutdown's whole budget is a few seconds. A block whose send is parked
+    // holds an open transcript slot (and every slot behind it), and the only
+    // other thing that closes it is the 60s per-block delivery timeout — which
+    // is also what keeps the event loop parked, so `consumeEvents` cannot end
+    // and reject the turn either. Both have to happen inside close() itself.
+    const { session, harness } = makeSession();
+    const events: string[] = [];
+    let releaseSend!: () => void;
+    const parked = new Promise<void>((r) => { releaseSend = r; });
+
+    const turn = session.send(
+      "go",
+      undefined,
+      undefined,
+      async () => { events.push("send-parked"); await parked; events.push("send-late-completed"); },
+      () => events.push("abandoned"),
+    );
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantEvent("A"));
+    await waitFor(() => events.includes("send-parked"));
+
+    session.close();
+
+    // Synchronous: the slot is closed before close() returns, not a microtask
+    // or a minute later.
+    expect(events).toEqual(["send-parked", "abandoned"]);
+    await expect(turn).rejects.toThrow("Session is closed");
+
+    // The parked send has no cancellation to be handed; it completes late and
+    // must not be reported as this block's outcome a second time.
+    releaseSend();
+    await flushMicrotasks(10);
+    expect(events).toEqual(["send-parked", "abandoned", "send-late-completed"]);
+  });
+});

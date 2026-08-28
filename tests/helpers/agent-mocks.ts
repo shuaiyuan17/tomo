@@ -66,6 +66,11 @@ export const mockSdk = {
   failNextQuery: null as string | null,
   queryControllers: [] as MockQueryController[],
   mcpServerSets: [] as Array<Record<string, unknown>>,
+  /** Every prompt the mock received, tagged with the session it ran on
+   *  (from options.env.TOMO_SESSION_KEY). Lets a test assert WHICH session a
+   *  turn ran on without depending on that turn delivering anything — which
+   *  suppressed turns (continuity, restart notice) deliberately do not. */
+  promptsBySession: [] as Array<{ sessionKey: string; text: string }>,
 };
 
 export function resetMockSdk(): void {
@@ -77,6 +82,7 @@ export function resetMockSdk(): void {
   mockSdk.failNextQuery = null;
   mockSdk.queryControllers = [];
   mockSdk.mcpServerSets = [];
+  mockSdk.promptsBySession = [];
 }
 
 /** Track in-flight mock queries so tests can assert no concurrency */
@@ -160,7 +166,7 @@ function enqueueAssistantTurnEvents(
   wakeConsumer();
 }
 
-function createMockQuery(prompt: AsyncGenerator) {
+function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
   // One-shot failure injection: this query's event stream throws instead of
   // producing events.
   const failWith = mockSdk.failNextQuery;
@@ -207,6 +213,7 @@ function createMockQuery(prompt: AsyncGenerator) {
           for (const block of content) {
             if (block.type === "text") text += block.text;
           }
+          mockSdk.promptsBySession.push({ sessionKey, text });
         }
 
         const responseValue = await mockSdk.responseFn(text);
@@ -363,7 +370,8 @@ export function workspaceModuleMock() {
 
 export function sdkModuleMock() {
   return {
-    query: vi.fn(({ prompt }: { prompt: AsyncGenerator }) => createMockQuery(prompt)),
+    query: vi.fn(({ prompt, options }: { prompt: AsyncGenerator; options?: { env?: Record<string, string> } }) =>
+      createMockQuery(prompt, options?.env?.TOMO_SESSION_KEY ?? "")),
     createSdkMcpServer: vi.fn((opts: { name: string }) => ({ type: "sdk", name: opts.name, instance: {} })),
     tool: vi.fn((name: string, description: string, inputSchema: unknown, handler: unknown) => ({
       name, description, inputSchema, handler,

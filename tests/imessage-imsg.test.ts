@@ -208,7 +208,7 @@ describe("imsg RPC framing", () => {
   it("parses payloads split across stdout chunks", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     const payload = JSON.stringify({ jsonrpc: "2.0", method: "message", params: { subscription: 1, message: inboundMessage() } });
@@ -227,7 +227,7 @@ describe("imsg inbound message mapping", () => {
   it("maps a DM to an IncomingMessage with the chat.db chat_guid as chatId", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage());
@@ -251,7 +251,7 @@ describe("imsg inbound message mapping", () => {
   it("normalizes formatted sender handles into senderId", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ sender: "+1 (555) 123-4567" }));
@@ -264,7 +264,7 @@ describe("imsg inbound message mapping", () => {
   it("maps a group message as mentioned with its chat title", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({
@@ -288,7 +288,7 @@ describe("imsg inbound message mapping", () => {
   it("prefixes reply context from the inline reply_to_text (no lookup round-trip)", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({
@@ -313,7 +313,7 @@ describe("imsg inbound message mapping", () => {
     // Only thread_originator_guid marks a genuine long-press → Reply.
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({
@@ -332,7 +332,7 @@ describe("imsg inbound message mapping", () => {
   it("quotes the thread originator from the recent ring when imsg left reply_to_text unresolved", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     // Seed the ring with the originator (an is_from_me watch row).
@@ -358,7 +358,7 @@ describe("imsg inbound message mapping", () => {
   it("degrades to a quote-less reply marker when the originator text is unavailable", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({
@@ -380,7 +380,7 @@ describe("imsg inbound message mapping", () => {
     try {
       const { channel, children } = makeChannel();
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -417,7 +417,7 @@ describe("imsg inbound message mapping", () => {
     try {
       const { channel, children } = makeChannel();
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -456,7 +456,7 @@ describe("imsg inbound message mapping", () => {
       });
       const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -499,7 +499,7 @@ describe("imsg inbound message mapping", () => {
       // bytes reveal it's really HEIC.
       const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => null, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -531,7 +531,7 @@ describe("imsg inbound message mapping", () => {
       const convertHeic = vi.fn(async (_src: string) => null); // conversion failed
       const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -568,7 +568,7 @@ describe("imsg inbound message mapping", () => {
       const convertHeic = vi.fn(async (_src: string) => null);
       const { channel, children } = makeChannel({ config: { convertHeic, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -605,7 +605,7 @@ describe("imsg inbound message mapping", () => {
       });
       const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -655,7 +655,7 @@ describe("imsg inbound message mapping", () => {
       });
       const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => null, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -692,7 +692,7 @@ describe("imsg inbound message mapping", () => {
       });
       const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha, imageStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -717,7 +717,7 @@ describe("imsg inbound message mapping", () => {
   it("skips attachments marked missing and still delivers the text", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({
@@ -736,7 +736,7 @@ describe("imsg inbound message mapping", () => {
   it("drops empty ghost rows", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ guid: "ghost-1", text: "   " }));
@@ -749,7 +749,7 @@ describe("imsg inbound message mapping", () => {
   it("dispatches slash commands with a normalized senderId", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const commandHandler = vi.fn(async () => {});
+    const commandHandler = vi.fn(async () => true);
     channel.onCommand(commandHandler);
 
     children[0].notifyMessage(inboundMessage({
@@ -796,7 +796,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -836,7 +836,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -868,7 +868,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -897,7 +897,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -931,7 +931,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -962,7 +962,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -996,7 +996,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1026,7 +1026,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       // imsg could not resolve the local file: no original_path, no path,
@@ -1063,7 +1063,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1100,7 +1100,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1143,7 +1143,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1182,7 +1182,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1214,7 +1214,7 @@ describe("imsg arbitrary file attachments", () => {
     try {
       const { channel, children } = makeChannel({ config: { imageStoreBaseDir: dir, fileStoreBaseDir: dir } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1250,7 +1250,7 @@ describe("imsg arbitrary file attachments", () => {
         config: { imageStoreBaseDir: dir, fileStoreBaseDir: undefined },
       });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -1289,7 +1289,7 @@ describe("imsg echo and replay dedupe", () => {
   it("never dispatches is_from_me rows but records them for substring targeting", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ guid: "own-1", text: "our own send", is_from_me: true }));
@@ -1306,7 +1306,7 @@ describe("imsg echo and replay dedupe", () => {
   it("drops a replayed GUID within one process", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ guid: "dup-1" }));
@@ -1323,7 +1323,7 @@ describe("imsg echo and replay dedupe", () => {
     try {
       const first = makeChannel({ config: { dedupeStorePath } });
       await first.channel.start();
-      const firstHandler = vi.fn(async () => {});
+      const firstHandler = vi.fn(async () => true);
       first.channel.onMessage(firstHandler);
       first.children[0].notifyMessage(inboundMessage({ guid: "persist-1" }));
       await settle();
@@ -1332,7 +1332,7 @@ describe("imsg echo and replay dedupe", () => {
 
       const second = makeChannel({ config: { dedupeStorePath } });
       await second.channel.start();
-      const secondHandler = vi.fn(async () => {});
+      const secondHandler = vi.fn(async () => true);
       second.channel.onMessage(secondHandler);
       second.children[0].notifyMessage(inboundMessage({ guid: "persist-1" }));
       await settle();
@@ -1349,7 +1349,7 @@ describe("imsg echo and replay dedupe", () => {
     try {
       const first = makeChannel({ config: { cursorStorePath } });
       await first.channel.start();
-      first.channel.onMessage(vi.fn(async () => {}));
+      first.channel.onMessage(vi.fn(async () => true));
       first.children[0].notifyMessage(inboundMessage({ id: 4242, guid: "cursor-1" }));
       await settle();
       await first.channel.stop();
@@ -1371,7 +1371,7 @@ describe("imsg inbound tapbacks", () => {
   it("surfaces another sender's tapback add with the original excerpt", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ guid: "orig-1", text: "pizza tonight?" }));
@@ -1397,7 +1397,7 @@ describe("imsg inbound tapbacks", () => {
   it("ignores tapback removals and our own tapbacks", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({
@@ -2312,6 +2312,17 @@ describe("imsg captioned photo hands an unapplied reply target to the caption", 
 describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () => {
   const pipeline = new DeliveryPipeline({ queuePendingErrorNote: () => {} });
 
+  /** Ship a turn's blocks through ONE per-turn sender, as they complete. */
+  const deliverBlocks = async (
+    channel: Parameters<typeof pipeline.createBlockSender>[0],
+    chatId: string,
+    blocks: string[],
+    options: { replyTo?: string } = {},
+  ) => {
+    const sender = pipeline.createBlockSender(channel, chatId, options);
+    for (const block of blocks) await sender.deliver(block);
+  };
+
   const withPhoto = async (fn: (photoPath: string) => Promise<void>) => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-e2e-"));
     const photoPath = join(dir, "pic.png");
@@ -2328,7 +2339,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send.attachment", "send"]);
@@ -2344,7 +2355,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: CAPS_FULL });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
@@ -2359,7 +2370,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: { ...CAPS_STICKER, rpcMethods: new Set([...CAPS_STICKER.rpcMethods, "send.attachment"]), selectors: { ...CAPS_STICKER.selectors, sendAttachment: true } } });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`STICKER:${stickerPath}`, "B"], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`STICKER:${stickerPath}`, "B"], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.sticker"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send.sticker", "send.rich"]);
@@ -2378,7 +2389,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: CAPS_FULL });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`caption\nMEDIA:${photoPath}`], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`caption\nMEDIA:${photoPath}`], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
@@ -2543,7 +2554,7 @@ describe("imsg tapback, unsend, and edit", () => {
   it("unsends via message.unsend and drops the cached row", async () => {
     const { channel, children, requests } = makeChannel();
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
 
     children[0].notifyMessage(inboundMessage({ guid: "mine-1", text: "oops wrong chat", is_from_me: true }));
     await settle();
@@ -2653,7 +2664,7 @@ describe("imsg mark-as-read", () => {
   it("marks the chat read after an inbound message when read receipts work", async () => {
     const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
 
     children[0].notifyMessage(inboundMessage());
     await settle();
@@ -2665,7 +2676,7 @@ describe("imsg mark-as-read", () => {
   it("skips the read call without the bridge", async () => {
     const { channel, children, requests } = makeChannel({ caps: CAPS_BASIC });
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
 
     children[0].notifyMessage(inboundMessage());
     await settle();
@@ -2778,7 +2789,7 @@ describe("imsg outbound RPC param-name contract", () => {
   it("read → chat_guid", async () => {
     const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
     children[0].notifyMessage(inboundMessage());
     await vi.waitFor(() => expect(requests().some((r) => r.method === "read")).toBe(true));
     expect(keysOf(requests, "read")).toEqual(["chat_guid"]);
@@ -2826,7 +2837,7 @@ describe("imsg rpc child lifecycle", () => {
     vi.useFakeTimers();
     const { channel, children, spawnFn } = makeChannel({ config: { restartDelaysMs: [1_000, 5_000] } });
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
     expect(spawnFn).toHaveBeenCalledTimes(1);
 
     children[0].notifyMessage(inboundMessage({ id: 777, guid: "pre-crash" }));
@@ -2844,7 +2855,7 @@ describe("imsg rpc child lifecycle", () => {
     expect(resubscribe.params.since_rowid).toBe(777);
 
     // The new child works: inbound flows again.
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
     children[1].notifyMessage(inboundMessage({ id: 778, guid: "post-crash" }));
     await settle();
@@ -2978,7 +2989,7 @@ describe("imsg rpc child lifecycle", () => {
     vi.useFakeTimers();
     const { channel, children } = makeChannel({ config: { restartDelaysMs: [1_000] } });
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
     const child0 = children[0];
 
@@ -3008,7 +3019,7 @@ describe("imsg recent-message cache addressing", () => {
   it("resolves a bare DM handle to its chat-GUID ring, but never a group", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
 
     children[0].notifyMessage(inboundMessage({ guid: "g-dm", text: "direct message" }));
     children[0].notifyMessage(inboundMessage({
@@ -3031,7 +3042,7 @@ describe("imsg session-key passthrough", () => {
   it("emits chat_guid verbatim so keys match the on-disk any-format sessions", async () => {
     const { channel, children } = makeChannel();
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     // DMs on macOS 26 are stored as any;-;+E164; groups as any;+;<hex>.
@@ -3063,7 +3074,7 @@ describe("imsg satellite detection", () => {
     const { lookup } = makeLookup({ "sat-1": "iMessageLite" });
     const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ guid: "sat-1", text: "we are off-grid" }));
@@ -3077,7 +3088,7 @@ describe("imsg satellite detection", () => {
     const { lookup } = makeLookup({ "plain-1": "iMessage" });
     const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
     await channel.start();
-    const handler = vi.fn(async () => {});
+    const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
     children[0].notifyMessage(inboundMessage({ guid: "plain-1", text: "normal message" }));
@@ -3095,7 +3106,7 @@ describe("imsg satellite detection", () => {
       const { lookup, spy } = makeLookup({});
       const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({
@@ -3122,7 +3133,7 @@ describe("imsg at-least-once persist ordering", () => {
     try {
       const { channel, children } = makeChannel({ config: { cursorStorePath } });
       await channel.start();
-      const handler = vi.fn(async () => {});
+      const handler = vi.fn(async () => true);
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({ id: 900, guid: "ok-1", text: "delivered" }));
@@ -3149,7 +3160,7 @@ describe("imsg at-least-once persist ordering", () => {
       const { channel, children } = makeChannel({ config: { cursorStorePath } });
       await channel.start();
       // Succeeds for row 400, throws for row 500.
-      channel.onMessage(async (m) => { if (m.id === "throws-1") throw new Error("boom"); });
+      channel.onMessage(async (m) => { if (m.id === "throws-1") throw new Error("boom"); return true; });
 
       children[0].notifyMessage(inboundMessage({ id: 400, guid: "good-1", text: "ok" }));
       children[0].notifyMessage(inboundMessage({ id: 500, guid: "throws-1", text: "will throw" }));
@@ -3185,6 +3196,7 @@ describe("imsg at-least-once persist ordering", () => {
       channel.onMessage(async (m) => {
         if (m.id === "throws-1") throw new Error("boom");
         seen.push(m.id);
+        return true;
       });
 
       children[0].notifyMessage(inboundMessage({ id: 400, guid: "good-1", text: "ok" }));
@@ -3212,7 +3224,7 @@ describe("imsg at-least-once persist ordering", () => {
     try {
       const { channel, children } = makeChannel({ config: { cursorStorePath } });
       await channel.start();
-      channel.onMessage(async (m) => { if (m.id === "no-rowid") throw new Error("boom"); });
+      channel.onMessage(async (m) => { if (m.id === "no-rowid") throw new Error("boom"); return true; });
 
       // A malformed row with no numeric rowid (parses to 0) whose dispatch
       // throws can't be replayed by since_rowid. Flooring at 0 would block
@@ -3265,7 +3277,7 @@ describe("imsg at-least-once persist ordering", () => {
       const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [60_000] } });
       await channel.start();
       const seen: string[] = [];
-      channel.onMessage(async (m) => { seen.push(m.id); });
+      channel.onMessage(async (m) => { seen.push(m.id); return true; });
       // A slash-command handler that throws.
       channel.onCommand(async (command) => { if (command === "model") throw new Error("cmd boom"); });
 
@@ -3302,9 +3314,10 @@ describe("imsg at-least-once persist ordering", () => {
         if (m.id === "row-500" && !allowReplay) {
           // The OLD-generation delivery hangs until we reject it later.
           await new Promise<void>((_, rej) => { gateReject = rej; });
-          return;
+          return true;
         }
         seen.push(m.id);
+        return true;
       });
 
       // Old generation: row 500 arrives and hangs mid-dispatch.
@@ -3358,7 +3371,7 @@ describe("imsg at-least-once persist ordering", () => {
       const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [10] } });
       await channel.start();
       const seen: string[] = [];
-      channel.onMessage(async (m) => { seen.push(m.id); });
+      channel.onMessage(async (m) => { seen.push(m.id); return true; });
 
       // Old generation: row 500 carries a FIFO attachment, so loadAttachments
       // blocks on readFile BEFORE the dispatch side effect.
@@ -3414,6 +3427,7 @@ describe("imsg watch FIFO serialization", () => {
       order.push(`start:${m.id}`);
       if (m.id === "first") await firstGate;
       order.push(`end:${m.id}`);
+      return true;
     });
 
     children[0].notifyMessage(inboundMessage({ id: 1, guid: "first", text: "one" }));
@@ -3908,7 +3922,7 @@ describe("imsg capability re-probe (#258)", () => {
       config: { probeCapabilities: probe, capabilityRetryDelaysMs: [], capabilityReprobeMinIntervalMs: 0 },
     });
     await channel.start();
-    channel.onMessage(vi.fn(async () => {}));
+    channel.onMessage(vi.fn(async () => true));
 
     // The bridge comes up after the (degraded) startup snapshot. The next
     // inbound message still skips the read receipt (cached answer), but its
@@ -4061,5 +4075,140 @@ describe("imsg capability re-probe (#258)", () => {
     await channel.stop();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(probe).toHaveBeenCalledTimes(1); // no probes after stop
+  });
+});
+
+// --- Shutdown: rows already inside processWatchRow (round-6 #1) --------------
+//
+// The entry guard in `handleWatchMessage` only refuses rows that have not
+// STARTED. A row that is already parsing — attachment load can park it for
+// seconds — is past that guard, and killing the channel under it used to lose
+// it in both directions at once: never dispatched (the generation bump made it
+// stale), and never replayed (nothing said it had failed). The phase split
+// exists for exactly this row: `closeIngestion()` shuts the door, `quiesce()`
+// holds shutdown open until the row lands, `teardown()` runs afterwards.
+
+describe("imsg shutdown quiesces rows that are mid-parse", () => {
+  it("lets a row parked in attachment loading finish into the agent, then advances its cursor", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-quiesce-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    const heicPath = join(dir, "photo.heic");
+    // Minimal HEIC: ftyp box with the `heic` major brand.
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      // The HEIC converter is the parked point: a real await inside
+      // loadAttachments, i.e. squarely inside processWatchRow and past the
+      // entry guard.
+      let releaseConversion!: () => void;
+      const conversionGate = new Promise<void>((resolve) => { releaseConversion = resolve; });
+      let conversionStarted = false;
+      const convertHeic = vi.fn(async (_src: string) => {
+        conversionStarted = true;
+        await conversionGate;
+        const out = join(dir, "converted.jpg");
+        writeFileSync(out, Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"));
+        return out;
+      });
+
+      const { channel, children } = makeChannel({
+        config: { cursorStorePath, convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir },
+      });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        id: 500,
+        guid: "midparse-1",
+        text: "",
+        attachments: [{ filename: "photo.heic", mime_type: "image/heic", original_path: heicPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(conversionStarted).toBe(true));
+
+      // SIGTERM lands here. Ingestion closes synchronously; the parked row is
+      // NOT abandoned and the child is NOT killed.
+      channel.closeIngestion();
+
+      let quiesced = false;
+      const quiescing = channel.quiesce().then(() => { quiesced = true; });
+      await settle();
+      // The whole point: quiesce is still holding shutdown open for this row.
+      expect(quiesced).toBe(false);
+      expect(handler).not.toHaveBeenCalled();
+
+      releaseConversion();
+      await quiescing;
+
+      // The row completed into the agent, and only then was its cursor
+      // committed — the ordinary at-least-once contract, unchanged by shutdown.
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler.mock.calls[0][0].id).toBe("midparse-1");
+      expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(500);
+
+      await channel.teardown();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT record the GUID or advance the cursor when the agent REFUSES the row", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-refused-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath } });
+      await channel.start();
+
+      // The agent answers `false` only past its shutdown drain: nothing
+      // downstream is holding the message. A refusal is not a delivery, and
+      // reading it as one is what acknowledged a message into oblivion.
+      let refuse = true;
+      const handler = vi.fn(async () => !refuse);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({ id: 900, guid: "refused-1", text: "refused" }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      await settle();
+
+      // Cursor never committed: the next process resubscribes from before this
+      // row and redelivers it.
+      expect(existsSync(cursorStorePath)).toBe(false);
+
+      // And the GUID was never recorded, so the replay is not deduped away as
+      // a "duplicate" of a message that was never actually handled.
+      refuse = false;
+      children[0].notifyMessage(inboundMessage({ id: 900, guid: "refused-1", text: "refused" }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => {
+        expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(900);
+      });
+
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still refuses — and leaves replayable — a row that had not started when ingestion closed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-entryguard-"));
+    const cursorStorePath = join(dir, "cursor.json");
+    try {
+      const { channel, children } = makeChannel({ config: { cursorStorePath } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      channel.closeIngestion();
+      children[0].notifyMessage(inboundMessage({ id: 700, guid: "too-late", text: "after the door closed" }));
+      await settle();
+      await channel.quiesce();
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(existsSync(cursorStorePath)).toBe(false);
+
+      await channel.teardown();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

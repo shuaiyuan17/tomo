@@ -22,14 +22,18 @@ interface FakeSession {
     removed: string[];
     errors: Record<string, string>;
   } | null>;
-  send(prompt: string): Promise<string>;
-  steer(prompt: string): Promise<string>;
+  send(prompt: string, images?: unknown, documents?: unknown, onBlock?: (b: string) => void | Promise<void>): Promise<string>;
+  steer(prompt: string, images?: unknown, documents?: unknown, onBlock?: (b: string) => void | Promise<void>): Promise<string>;
 }
 
 const { mockState } = vi.hoisted(() => ({
   mockState: {
     instances: [] as FakeSession[],
-    sendImpl: null as null | ((prompt: string, session: FakeSession) => Promise<string>),
+    sendImpl: null as null | ((
+      prompt: string,
+      session: FakeSession,
+      onBlock?: (b: string) => void | Promise<void>,
+    ) => Promise<string>),
     mcpSetCalls: [] as Array<{ session: FakeSession; servers: Record<string, unknown> }>,
     mcpSetImpl: null as null | ((servers: Record<string, unknown>, session: FakeSession) => Promise<{
       added: string[];
@@ -64,13 +68,18 @@ vi.mock("../src/agent/live-session.js", () => {
       if (mockState.mcpSetImpl) return mockState.mcpSetImpl(servers, this);
       return { added: Object.keys(servers), removed: [], errors: {} };
     }
-    async send(prompt: string) { return mockState.sendImpl ? mockState.sendImpl(prompt, this) : "ok"; }
-    async steer(prompt: string) { return mockState.sendImpl ? mockState.sendImpl(prompt, this) : "steered"; }
+    async send(prompt: string, _i?: unknown, _d?: unknown, onBlock?: (b: string) => void | Promise<void>) {
+      return mockState.sendImpl ? mockState.sendImpl(prompt, this, onBlock) : "ok";
+    }
+    async steer(prompt: string, _i?: unknown, _d?: unknown, onBlock?: (b: string) => void | Promise<void>) {
+      return mockState.sendImpl ? mockState.sendImpl(prompt, this, onBlock) : "steered";
+    }
   }
   return {
     LiveSession: FakeLiveSession,
     QUERY_TIMEOUT_ERROR_PREFIX: "Query timed out after",
     STEER_MERGED: "",
+    DELIVERY_TIMEOUT_MS: 60_000,
   };
 });
 
@@ -95,7 +104,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
@@ -124,6 +133,7 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   mockState.instances = [];
   mockState.sendImpl = null;
   mockState.mcpSetCalls = [];
@@ -253,7 +263,7 @@ describe("LiveSessionManager session lifecycle", () => {
     prompt = "v2";
     const current = await manager.getOrCreateLiveSession("telegram:2");
 
-    manager.stop();
+    await manager.stop();
 
     expect(busySession.closed).toBe(true);
     expect(current.isAlive()).toBe(false);
@@ -479,6 +489,83 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances[0].closed).toBe(true);
   });
 
+  /**
+   * Delivery is IRREVERSIBLE, so the retry policy has to know about it.
+   *
+   * A recoverable session error re-runs the whole prompt. That was free while
+   * delivery happened at end of turn — nothing had left the machine, so the
+   * re-run produced the one message the owner ever saw. With per-block
+   * delivery a turn can die AFTER putting text on his phone, and the re-run
+   * regenerates that text. Asked the same question twice, the model says the
+   * same thing twice.
+   *
+   * Skipping the first N blocks of the retry by index was rejected: the retry
+   * is a fresh sampling, not a replay, so index is not identity. Refusing to
+   * retry cannot double-send by construction, which is the property that
+   * matters here.
+   */
+  it("refuses to retry once a block has shipped, so the owner receives it exactly once", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    const received: string[] = [];
+    let shipped = false;
+    let attempts = 0;
+
+    mockState.sendImpl = async (_prompt, _session, onBlock) => {
+      attempts++;
+      // Both attempts would produce the same first block — the whole hazard.
+      await onBlock?.("A");
+      if (attempts === 1) throw new Error("process exited");
+      return "A";
+    };
+
+    const outcome = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      // The real sink (TurnRunner.makeBlockSink) marks the turn shipped as it
+      // attempts each send; mirrored here.
+      onBlock: async (b) => { shipped = true; received.push(b); },
+      hasShipped: () => shipped,
+    } as never).then(() => "resolved", (e: Error) => `rejected: ${e.message}`);
+
+    // THE assertion: the owner has exactly one copy of A. Without the guard
+    // this reads ["A", "A"].
+    expect(received).toEqual(["A"]);
+    // Because there was no second attempt...
+    expect(attempts).toBe(1);
+    // ...and the failure is surfaced instead. He already has A, and an error
+    // note beats a duplicate he cannot tell apart from the original.
+    expect(outcome).toBe("rejected: process exited");
+  });
+
+  it("still retries a recoverable error that happens before anything shipped", async () => {
+    // The overwhelmingly common case: the child dies while starting or
+    // resuming, before any content block exists. Refusing to retry there would
+    // be a regression, so the guard must be about DELIVERY, not about failure.
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    const received: string[] = [];
+    let attempts = 0;
+
+    mockState.sendImpl = async (_prompt, _session, onBlock) => {
+      attempts++;
+      if (attempts === 1) throw new Error("Session is closed");
+      await onBlock?.("A");
+      return "A";
+    };
+
+    const response = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      onBlock: async (b) => { received.push(b); },
+      hasShipped: () => received.length > 0,
+    } as never);
+
+    expect(response).toBe("A");
+    expect(attempts).toBe(2);
+    expect(received).toEqual(["A"]);
+  });
+
   it("keeps the SDK session id on 'Session is closed' errors and retries once", async () => {
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);
@@ -526,18 +613,198 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances).toHaveLength(1);
   });
 
-  it("never resets or retries during shutdown", async () => {
+  it("refuses a turn admitted after stop(), instead of building a session and running it", async () => {
+    // This test used to assert `NO_REPLY` and one constructed session, which
+    // LOOKED like refusal but wasn't: the mock's `send` threw "Session is
+    // closed", so the NO_REPLY came from the shutdown CONVERSION, not from the
+    // manager declining the work. A real newly-constructed LiveSession has a
+    // live SDK child and would have run the turn to completion while the
+    // daemon was trying to exit. Admission is what has to close.
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);
-    mockState.sendImpl = async () => { throw new Error("Session is closed"); };
+    let ran = false;
+    mockState.sendImpl = async () => { ran = true; return "ran anyway"; };
 
-    manager.stop();
+    await manager.stop();
     const response = await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
 
-    expect(response).toBe("NO_REPLY");
+    expect(response).toBe(SHUTDOWN_NOT_PROCESSED);
+    expect(ran).toBe(false);
     expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
-    // Only the initial creation — no retry session
+    // Not "one session and no retry" — NO session. The turn never reached one.
+    expect(mockState.instances).toHaveLength(0);
+  });
+
+  it("flushes a refused turn's block transcript so nothing delivered is lost", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    const events: string[] = [];
+
+    await manager.stop();
+    const response = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { events.push("flush"); return false; },
+    });
+
+    expect(events).toEqual(["flush"]);
+    expect(response).toBe(SHUTDOWN_NOT_PROCESSED);
+  });
+
+  it("closes a session built after stop() began instead of publishing it", async () => {
+    // The turn was admitted BEFORE stop() and is parked inside
+    // buildExternalMcpServers when shutdown sweeps the map. Without the
+    // post-await re-check it publishes a brand-new, ALIVE session into the map
+    // stop() has already cleared, and runs its turn past the daemon's exit.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => { await gate; return {}; },
+    }));
+    let ran = false;
+    let flushed = false;
+    mockState.sendImpl = async () => { ran = true; return "ran anyway"; };
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { flushed = true; return false; },
+    });
+    await flushMicrotasks();
+
+    const stopping = manager.stop();
+    release();
+    await stopping;
+
+    expect(await turn).toBe(SHUTDOWN_NOT_PROCESSED);
+    expect(ran).toBe(false);
     expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(true);
+    expect(manager.isAlive("telegram:1")).toBe(false);
+    expect(flushed).toBe(true);
+  });
+
+  it("flushes the turn's block transcript BEFORE converting a shutdown rejection to NO_REPLY", async () => {
+    // Resolving with NO_REPLY makes this a successful turn, which skips
+    // TurnRunner's rejection flush and records the fabricated NO_REPLY as the
+    // turn's outcome. Anything already delivered has to reach the transcript
+    // first, or the shutdown reads back as silence.
+    const manager = new LiveSessionManager(makeDeps());
+    let release!: () => void;
+    const parked = new Promise<void>((r) => { release = r; });
+    mockState.sendImpl = async () => { await parked; throw new Error("Session is closed"); };
+    const events: string[] = [];
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { events.push("flush"); return true; },
+    });
+    await flushMicrotasks();
+
+    const stopping = manager.stop();
+    release();
+    await stopping;
+    events.push(`resolved:${await turn}`);
+
+    expect(events).toEqual(["flush", "resolved:NO_REPLY"]);
+  });
+
+  it("keeps draining turns that join the in-flight set after the first snapshot", async () => {
+    // Admission is closed, so a late arrival should now be unreachable — this
+    // is defence in depth, and it is injected directly for exactly that
+    // reason: the drain must not depend on the set being COMPLETE at snapshot
+    // time, so that a future path which finds a way in is still waited on
+    // rather than abandoned mid-flush.
+    const manager = new LiveSessionManager(makeDeps());
+    const inFlight = (manager as unknown as { inFlightTurns: Set<Promise<string>> }).inFlightTurns;
+
+    let releaseFirst!: () => void;
+    const first = new Promise<void>((r) => { releaseFirst = r; });
+    let releaseLate!: () => void;
+    const late = new Promise<void>((r) => { releaseLate = r; });
+    let lateFlushed = false;
+    mockState.sendImpl = async () => { await first; throw new Error("Session is closed"); };
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      // Lands DURING the first turn's flush — after stop() took its snapshot.
+      flushOnShutdown: () => {
+        inFlight.add(late.then(() => { lateFlushed = true; return "NO_REPLY"; }));
+        return true;
+      },
+    });
+    await flushMicrotasks();
+
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await flushMicrotasks();
+    expect(stopped).toBe(false);
+
+    releaseFirst();
+    expect(await turn).toBe("NO_REPLY");
+    // A real timer tick, not just microtasks: a snapshot-once drain resolves
+    // here, and only a macrotask yield is slow enough to catch it doing so.
+    await new Promise((r) => setTimeout(r, 5));
+    // The first turn is done; the late arrival is not, and stop() must still
+    // be waiting on it rather than having exited on the stale snapshot.
+    expect(lateFlushed).toBe(false);
+    expect(stopped).toBe(false);
+
+    releaseLate();
+    await stopping;
+    expect(lateFlushed).toBe(true);
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("Gave up waiting for in-flight turns"),
+    );
+  });
+
+  it("waits for an in-flight turn to settle before stop() resolves", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    let release!: () => void;
+    const parked = new Promise<void>((r) => { release = r; });
+    let flushed = false;
+    mockState.sendImpl = async () => { await parked; throw new Error("Session is closed"); };
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { flushed = true; return true; },
+    });
+    await flushMicrotasks();
+
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await flushMicrotasks();
+    expect(stopped).toBe(false);
+
+    release();
+    await stopping;
+    expect(stopped).toBe(true);
+    expect(flushed).toBe(true);
+    expect(await turn).toBe("NO_REPLY");
+  });
+
+  it("gives up on a turn that never settles instead of blocking the exit", async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = new LiveSessionManager(makeDeps());
+      mockState.sendImpl = () => new Promise<string>(() => {}); // never settles
+
+      void manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+      await flushMicrotasks();
+
+      const stopping = manager.stop();
+      await vi.advanceTimersByTimeAsync(SHUTDOWN_FLUSH_TIMEOUT_MS);
+      await expect(stopping).resolves.toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ turns: 1 }),
+        expect.stringContaining("Gave up waiting for in-flight turns"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("returns the max-turns fallback message without retrying", async () => {

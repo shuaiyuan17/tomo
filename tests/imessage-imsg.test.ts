@@ -2112,6 +2112,197 @@ describe("imsg threaded photo and sticker sends", () => {
 });
 
 /**
+ * P2-1 (#292's third review): the plain-text fallback used to return `void`.
+ *
+ * `Channel.send` returning nothing means "delivered as asked", and the
+ * pipeline retires the turn's reply target on it. But the AppleScript `send`
+ * has no `reply_to` param at all — every fallback onto it drops the target on
+ * the floor. Claiming success there is worse than not threading: the target
+ * is spent, so no later block in the turn is ever offered it either.
+ */
+describe("imsg threaded text sends report a reply target they could not apply", () => {
+  it("reports the drop when the bridge is down and the text goes out plain", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "threaded?", replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.map((r) => r.method)).toEqual(["send"]);
+    expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, text: "threaded?" });
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("reports the drop when send.rich refuses and the text falls back to plain", async () => {
+    const { channel, requests } = makeChannel({
+      caps: CAPS_FULL,
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send.rich") return child.respondError(req.id, -32603, "Internal error", "bridge not running");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "threaded?", replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.map((r) => r.method)).toEqual(["send.rich", "send"]);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("stays silent when send.rich accepted the reply target", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "threaded!", replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.map((r) => r.method)).toEqual(["send.rich"]);
+    expect(outbound[0].params).toMatchObject({ reply_to: "guid-target" });
+    expect(result?.threaded).not.toBe(false);
+    await channel.stop();
+  });
+
+  it("reports the drop on a chunked long message whose first chunk went out plain", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    const longText = `${"x".repeat(3990)} ${"y".repeat(100)}`;
+    const result = await channel.send({ chatId: DM_GUID, text: longText, replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.length).toBeGreaterThan(1);
+    expect(outbound.every((r) => r.method === "send")).toBe(true);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("reports the drop when there was no text to carry the target at all", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "", replyTo: "guid-target" });
+
+    expect(requests().filter((r) => r.method === "send" || r.method === "send.rich")).toHaveLength(0);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("says nothing about threading when no reply target was requested", async () => {
+    const { channel } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    expect(await channel.send({ chatId: DM_GUID, text: "plain" })).toBeUndefined();
+    await channel.stop();
+  });
+
+  it("says nothing about threading when only an effect could not be applied", async () => {
+    // An effect is a delivery property, not a target the caller can reoffer:
+    // SendResult reports `replyTo` drops only.
+    const { channel } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    expect(await channel.send({ chatId: DM_GUID, text: "boom", effect: "impact" })).toBeUndefined();
+    await channel.stop();
+  });
+});
+
+/**
+ * P2-2 (#292's third review): a captioned photo left a threadable turn
+ * unthreaded. Text threading (`send.rich`) and attachment threading
+ * (`send.attachment`) are SEPARATE bridge surfaces, so an imsg too old for the
+ * latter can still thread the caption. And for a final one-block
+ * `caption + MEDIA:path` the caption is the last message of the turn — there
+ * is no later send for the pipeline to reoffer the target to, so a target
+ * dropped here is a turn that ends unthreaded for no reason.
+ */
+describe("imsg captioned photo hands an unapplied reply target to the caption", () => {
+  const withPhoto = async (fn: (photoPath: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-caption-reply-"));
+    const photoPath = join(dir, "pic.png");
+    writeFileSync(photoPath, "fake-png-bytes");
+    try {
+      await fn(photoPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("threads the caption via send.rich when only send.attachment is missing", async () => {
+    await withPhoto(async (photoPath) => {
+      // CAPS_FULL: bridge up and threading text, but no attachment surface.
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
+      expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      expect(outbound[1].params).toMatchObject({ chat_guid: DM_GUID, text: "caption", reply_to: "guid-target" });
+      // The turn IS threaded — the caller must not reoffer a spent target.
+      expect(result?.threaded).not.toBe(false);
+      await channel.stop();
+    });
+  });
+
+  it("reports the drop when the bridge cannot thread the photo OR the caption", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send"]);
+      expect(outbound[1].params).toEqual({ chat_guid: DM_GUID, text: "caption" });
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    });
+  });
+
+  it("reports the drop when the caption's own send.rich is refused", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({
+        caps: CAPS_FULL,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          if (req.method === "send.rich") return child.respondError(req.id, -32603, "Internal error", "bridge not running");
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich", "send"]);
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    });
+  });
+
+  it("leaves the caption plain when the photo itself took the target", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      // One reply per turn: the picture is it, so the caption stays plain.
+      expect(outbound.map((r) => r.method)).toEqual(["send.attachment", "send"]);
+      expect(outbound[1].params).toEqual({ chat_guid: DM_GUID, text: "caption" });
+      expect(result?.threaded).not.toBe(false);
+      await channel.stop();
+    });
+  });
+});
+
+/**
  * The pipeline and the channel wired together, because the P2-2 regression
  * lived exactly in the seam: the pipeline decided the photo had taken the
  * reply target while the channel threw it away, so NEITHER the photo nor the
@@ -2174,6 +2365,25 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       expect(outbound.map((r) => r.method)).toEqual(["send.sticker", "send.rich"]);
       expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
       expect(outbound[1].params).toMatchObject({ text: "B", reply_to: "guid-target" });
+      await channel.stop();
+    });
+  });
+
+  it("threads the caption of a FINAL one-block caption + MEDIA, which has no next send", async () => {
+    await withPhoto(async (photoPath) => {
+      // The hard case: one block, so the pipeline makes exactly one
+      // channel.send call and there is no later message to reoffer the target
+      // to. CAPS_FULL cannot thread the picture but can thread the caption,
+      // so the turn must still end threaded.
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      await pipeline.deliverAssistantContent(channel, DM_GUID, [`caption\nMEDIA:${photoPath}`], { replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
+      expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      expect(outbound[1].params).toMatchObject({ text: "caption", reply_to: "guid-target" });
       await channel.stop();
     });
   });

@@ -446,8 +446,15 @@ export class ImsgChannel implements Channel {
     }
 
     const text = message.text;
-    if (!text) return;
+    // Nothing to ship: an empty text send cannot carry the target either, so
+    // report the drop rather than let the caller retire it on a no-op.
+    if (!text) return message.replyTo ? { threaded: false } : undefined;
 
+    // Only a `send.rich` that actually carried `reply_to` threads anything.
+    // Every other route out of this loop — bridge down, a rich refusal, a
+    // continuation chunk — lands on the plain `send` below, which has no
+    // reply_to param at all. Track the one success rather than assume it.
+    let threaded = false;
     const chunks = splitText(text, TEXT_CHUNK_LIMIT);
     for (const [i, chunk] of chunks.entries()) {
       // Threaded replies and expressive-send effects need the IMCore bridge
@@ -470,6 +477,7 @@ export class ImsgChannel implements Channel {
             part_index: 0,
           });
           this.recordOwnSend(message.chatId, result, chunk);
+          if (message.replyTo) threaded = true;
           continue;
         } catch (err) {
           // Fall back to a plain send only on a definite refusal (an RPC
@@ -518,6 +526,11 @@ export class ImsgChannel implements Channel {
       });
       this.recordOwnSend(message.chatId, result, chunk);
     }
+    // The text shipped, but if it shipped PLAIN the reply target did not go
+    // with it: the AppleScript `send` has no reply_to. Returning nothing here
+    // would read as "delivered as asked" and the pipeline would retire a
+    // target that never reached a bubble, stranding the rest of the turn.
+    return message.replyTo && !threaded ? { threaded: false } : undefined;
   }
 
   /**
@@ -1726,11 +1739,16 @@ export class ImsgChannel implements Channel {
    * target to exactly one message, and before this the channel dropped it
    * silently, leaving both the photo and the text after it unthreaded.
    *
-   * The caption follow-up is never threaded. If the attachment could not be,
-   * the target goes back to the caller instead of being spent here — the
-   * caption ships from inside this call, but the caller owns which message in
-   * the TURN gets the reply, and on a bridge-down channel the caption's own
-   * plain send could not thread either.
+   * The caption follow-up is threaded only as a FALLBACK. Behind a threaded
+   * picture it ships plain — one reply per turn, and the picture already is
+   * it. But when the picture could not thread, the caption inherits the
+   * target and its result becomes this call's result: text threading
+   * (`send.rich`) and attachment threading (`send.attachment`) are separate
+   * bridge surfaces, so an imsg too old for the latter can still thread the
+   * caption. That matters for a final one-block `caption + MEDIA:path`, where
+   * there is no later send for the caller to reoffer the target to. With the
+   * bridge genuinely down the caption falls back to a plain send and reports
+   * `{ threaded: false }` itself, which propagates unchanged.
    */
   private async sendAttachment(
     chatGuid: string,
@@ -1774,7 +1792,20 @@ export class ImsgChannel implements Channel {
     }
 
     if (caption) {
-      await this.send({ chatId: chatGuid, text: caption });
+      // If the picture could not take the target, the caption is the turn's
+      // last chance at it: a final `caption + MEDIA:path` block has no later
+      // send for the caller to reoffer it to, and text threads through
+      // `send.rich` even when the attachment surface is missing. Hand the
+      // target down and let the caption's own result speak for the whole
+      // attachment send — it threads when only send.attachment was missing,
+      // and reports `{ threaded: false }` when the bridge is genuinely down.
+      const offerTarget = Boolean(replyTo) && !threaded;
+      const captionResult = await this.send({
+        chatId: chatGuid,
+        text: caption,
+        ...(offerTarget ? { replyTo } : {}),
+      });
+      if (offerTarget) return captionResult ?? undefined;
     }
     return replyTo && !threaded ? { threaded: false } : undefined;
   }

@@ -30,7 +30,7 @@ import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
 import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
-import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER } from "./agent/block-transcript.js";
+import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
@@ -1538,10 +1538,71 @@ export class Agent {
   async stop(): Promise<void> {
     log.info("Shutting down");
     this.commands.stop();
-    // Awaited: closing the live sessions rejects their in-flight turns, and
-    // those turns still have to flush the blocks they delivered into the
-    // transcript. `start.ts` calls process.exit() the moment this resolves.
-    await this.liveSessionManager.stop();
+
+    // Channels FIRST (#294). Stopping the manager first left the front door
+    // open while the house emptied: channels kept ingesting, each message
+    // landed in the in-memory batcher (and imsg committed its cursor on the
+    // way in), and the process exited before any of it ran — acknowledged,
+    // unprocessed, unrecorded, unreplayable. Closing ingestion first is what
+    // makes the set of messages we owe the user finite.
     await Promise.all(this.channels.map((ch) => ch.stop()));
+
+    // Then the batcher, which is now guaranteed not to grow again. These are
+    // messages the user has already sent and we are choosing not to answer;
+    // the transcript record is what keeps that a visible non-answer instead of
+    // a silent drop.
+    this.recordUnprocessedInbound();
+
+    // Manager last, and awaited: closing the live sessions rejects their
+    // in-flight turns, and those turns still have to flush the blocks they
+    // delivered into the transcript. `start.ts` calls process.exit() the
+    // moment this resolves.
+    await this.liveSessionManager.stop();
+  }
+
+  /**
+   * Write the transcript record for inbound that shutdown will never process.
+   *
+   * Not dispatched instead, deliberately: dispatching would mean starting a
+   * turn we are about to reject anyway (the manager's admission gate closes a
+   * few lines below) and staking the shutdown deadline on a model round-trip.
+   * Recording is bounded and keeps the promise that matters — recall has the
+   * message, and the marker says plainly that nobody answered it.
+   *
+   * The user's text is appended verbatim, with the marker as its own
+   * assistant entry, so the record reads the way the same message would if it
+   * had died one stage later in `TurnRunner` (same marker, same shape) and the
+   * user's words are not editorialised.
+   *
+   * Cursors are untouched. For a channel that can replay (Telegram's offset is
+   * only committed for updates it has handed over), leaving the cursor alone
+   * is what lets a restart re-deliver. For imsg it is moot — the cursor was
+   * persisted at enqueue, before this message ever reached the batcher, so
+   * there is nothing left to un-acknowledge and the transcript record IS the
+   * durable trace.
+   */
+  private recordUnprocessedInbound(): void {
+    const pending = this.batcher.drainForShutdown();
+    for (const [key, items] of pending) {
+      for (const { channel, message } of items) {
+        this.sessions.append(key, {
+          role: "user",
+          content: this.formatGroupText(channel, message, key),
+          channel: channel.name,
+          senderName: message.senderName,
+          timestamp: message.timestamp,
+        });
+        this.sessions.append(key, {
+          role: "assistant",
+          content: SHUTDOWN_NOT_PROCESSED,
+          channel: channel.name,
+          timestamp: Date.now(),
+        });
+      }
+      log.info(
+        { sessionKey: key, count: items.length },
+        "Recorded inbound messages shutdown will not process",
+      );
+    }
   }
 }

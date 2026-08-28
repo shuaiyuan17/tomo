@@ -68,11 +68,27 @@ export class MockChannel implements Channel {
       this.typingStops.push({ chatId, options });
     };
   }
+  /** Set by stop(); mirrors the real channels' `stopping` ingestion gate. */
+  stopped = false;
+
   async start() {}
-  async stop() {}
+  async stop() { this.stopped = true; }
 
   // Test helpers
-  async simulateMessage(msg: IncomingMessage) { await this.messageHandler?.(msg); }
+
+  /**
+   * Deliver an inbound message, unless the channel has stopped — the real
+   * channels refuse at exactly this point (telegram `dispatch`, imsg
+   * `handleWatchMessage`), and a mock that kept accepting would hide the
+   * shutdown hole the agent's stop order exists to close.
+   *
+   * Returns whether the message was accepted.
+   */
+  async simulateMessage(msg: IncomingMessage): Promise<boolean> {
+    if (this.stopped) return false;
+    await this.messageHandler?.(msg);
+    return true;
+  }
   async simulateCommand(cmd: string, chatId: string, sender: string, args?: string, senderId?: string) {
     await this.commandHandler?.(cmd, chatId, sender, args, senderId);
   }

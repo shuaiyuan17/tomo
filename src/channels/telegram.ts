@@ -373,6 +373,16 @@ export class TelegramChannel implements Channel {
       });
     }
 
+    // Refuse anything still in flight through grammy when stop() lands: the
+    // agent drains its batcher right after the channels stop, so a handoff
+    // after that point lands in a batcher nobody will drain again. Declining
+    // here also leaves the update un-acknowledged, so `getUpdates` redelivers
+    // it to the next process rather than losing it.
+    if (this.stopping) {
+      log.warn({ chatId: msg.chatId, messageId: msg.id }, "Telegram message refused: channel stopped");
+      return;
+    }
+
     // Fire-and-forget: the agent's per-session queue handles ordering.
     // Awaiting here would let grammy serialize updates against the SDK turn,
     // preventing rapid messages from piling up for the queue to coalesce.

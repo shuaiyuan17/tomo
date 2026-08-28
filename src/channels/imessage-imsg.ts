@@ -1084,6 +1084,18 @@ export class ImsgChannel implements Channel {
 
   private async handleWatchMessage(data: Record<string, unknown>, generation: number): Promise<void> {
     const rowId = typeof data.id === "number" ? data.id : 0;
+
+    // Refuse rows that arrive (or were already parsed and queued) once stop()
+    // has run. Returning BEFORE processWatchRow is what keeps this safe: the
+    // cursor is only advanced at the end of a successful dispatch, so
+    // declining here leaves it pointing at this row and the next process
+    // replays it from `since_rowid`. Dispatching instead would hand the agent
+    // a message for a batcher it has already drained.
+    if (this.stopping) {
+      log.info({ rowId }, "imsg row refused: channel stopped (cursor left un-advanced, row replays on restart)");
+      return;
+    }
+
     try {
       await this.processWatchRow(data, rowId, generation);
     } catch (err) {

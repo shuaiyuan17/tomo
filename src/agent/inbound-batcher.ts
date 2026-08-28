@@ -38,8 +38,39 @@ export class InboundBatcher {
   private pendingBatchSettleStartedAt = new Map<string, number>();
   private pendingBatchDrainScheduled = new Set<string>();
   private lastImessageReceiptAt = new Map<string, number>();
+  private stopping = false;
 
   constructor(private readonly host: InboundBatcherHost) {}
+
+  /**
+   * Shutdown: close admission and surrender everything still parked here.
+   *
+   * The batcher is pure memory — `pendingBatches` is a Map and nothing about
+   * it is persisted — while the channel that fed it has usually already
+   * acknowledged the message (imsg commits its rowid cursor the moment the
+   * enqueue returns). So an item still sitting here when the process exits is
+   * gone in both directions at once: never processed, and never replayed.
+   * Handing it back to the caller is what lets it reach the transcript
+   * instead.
+   *
+   * Synchronous, and it sets `stopping` before it yields anything, so the
+   * sweep is one-time: a late `enqueue` is refused rather than landing in a
+   * Map nobody will look at again. Clearing the settle bookkeeping also
+   * releases any parked drain — `waitForBatchSettle` sees no deadline and
+   * returns, and `drainPendingBatch` then finds its batch already taken.
+   */
+  drainForShutdown(): Map<string, InboundItem[]> {
+    this.stopping = true;
+    const pending = new Map<string, InboundItem[]>();
+    for (const [key, items] of this.pendingBatches) {
+      if (items.length > 0) pending.set(key, items);
+    }
+    this.pendingBatches.clear();
+    this.pendingBatchSettleUntil.clear();
+    this.pendingBatchSettleStartedAt.clear();
+    this.pendingBatchDrainScheduled.clear();
+    return pending;
+  }
 
   /**
    * Queue a message for its session. For DMs and passive groups
@@ -59,6 +90,18 @@ export class InboundBatcher {
     canCoalesce: boolean,
     resolution: SessionResolution,
   ): void {
+    // Past drainForShutdown nothing here will ever run again, so accepting an
+    // item would be the same silent drop this class just closed. Channels are
+    // stopped before the drain, so reaching this is already the exception —
+    // log it rather than swallow it.
+    if (this.stopping) {
+      log.warn(
+        { sessionKey, messageId: message.id, channel: channel.name },
+        "Inbound message refused: shutting down",
+      );
+      return;
+    }
+
     const receivedAt = Date.now();
     const item: InboundItem = { channel, message, resolution };
 

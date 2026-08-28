@@ -8,6 +8,7 @@ import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../s
 import { NULL_SERVICE_LOOKUP, type ServiceLookup } from "../src/channels/imsg-satellite.js";
 import { log } from "../src/logger.js";
 import { SATELLITE_MARKER } from "../src/channels/text-utils.js";
+import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -111,6 +112,13 @@ const CAPS_STICKER: ImsgCapabilities = {
   ...CAPS_FULL,
   rpcMethods: new Set([...CAPS_FULL.rpcMethods, "send.sticker"]),
   selectors: { ...CAPS_FULL.selectors, stickerSend: true },
+};
+
+/** Bridge with the attachment surface: send.attachment RPC + sendAttachment selector. */
+const CAPS_ATTACHMENT: ImsgCapabilities = {
+  ...CAPS_FULL,
+  rpcMethods: new Set([...CAPS_FULL.rpcMethods, "send.attachment"]),
+  selectors: { ...CAPS_FULL.selectors, sendAttachment: true },
 };
 
 function makeChannel(options: {
@@ -1673,66 +1681,9 @@ describe("imsg outbound send", () => {
     await channel.stop();
   });
 
-  it("threads only the first shipped block of a streamed group reply", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
 
-    const stream = channel.createStreamingMessage(GROUP_GUID, "guid-trigger");
-    stream.update("first block");
-    await stream.commitBlock();
-    stream.update("second block");
-    await stream.finish();
 
-    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
-    expect(all).toHaveLength(2);
-    expect(all[0].method).toBe("send.rich");
-    expect(all[0].params).toMatchObject({ text: "first block", reply_to: "guid-trigger" });
-    expect(all[1].method).toBe("send");
-    expect(all[1].params.text).toBe("second block");
-    await channel.stop();
-  });
 
-  it("drops a whole streamed block whose trailing line is a bare NO_REPLY", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-
-    const stream = channel.createStreamingMessage(DM_GUID);
-    stream.update("archived the logs, nothing urgent\nNO_REPLY");
-    await stream.finish();
-
-    expect(requests().filter((r) => r.method === "send" || r.method === "send.rich")).toHaveLength(0);
-    await channel.stop();
-  });
-
-  it("ships a streamed block that merely mentions NO_REPLY inline", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-
-    const stream = channel.createStreamingMessage(DM_GUID);
-    stream.update("the literal token is NO_REPLY, for reference");
-    await stream.finish();
-
-    const sends = requests().filter((r) => r.method === "send");
-    expect(sends).toHaveLength(1);
-    expect(sends[0].params.text).toBe("the literal token is NO_REPLY, for reference");
-    await channel.stop();
-  });
-
-  it("still ships earlier real blocks when a later block is NO_REPLY-only", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-
-    const stream = channel.createStreamingMessage(DM_GUID);
-    stream.update("real block");
-    await stream.commitBlock();
-    stream.update("NO_REPLY");
-    await stream.finish();
-
-    const sends = requests().filter((r) => r.method === "send");
-    expect(sends).toHaveLength(1);
-    expect(sends[0].params.text).toBe("real block");
-    await channel.stop();
-  });
 
   it("sends a photo via the send file param with a separate caption", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-photo-"));
@@ -2002,6 +1953,441 @@ describe("imsg sticker sends", () => {
 // explicit true/false — so ABSENT means "running dylib predates the
 // feature" (heals via a real relaunch) while FALSE means "the bridge asked
 // the OS and the surface is gone" (nothing heals it).
+
+/**
+ * Threaded attachments and stickers (P2 on #292's second review).
+ *
+ * The delivery pipeline hands the turn's reply target to exactly ONE message
+ * and considers it spent once that send returns. A channel that accepts a
+ * `replyTo` on a photo or a sticker and then quietly drops it therefore does
+ * not just lose the thread on that bubble — it strands the whole turn
+ * unthreaded, because the text after it never gets offered the target. So the
+ * contract here is: thread it, or say you did not.
+ */
+describe("imsg threaded photo and sticker sends", () => {
+  const withPhoto = async (fn: (photoPath: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-photo-reply-"));
+    const photoPath = join(dir, "pic.png");
+    writeFileSync(photoPath, "fake-png-bytes");
+    try {
+      await fn(photoPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("threads a photo through send.attachment when the bridge has the surface", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "", replyTo: "guid-target" });
+
+      const all = requests().filter((r) => r.method === "send" || r.method === "send.attachment");
+      expect(all).toHaveLength(1);
+      expect(all[0].method).toBe("send.attachment");
+      expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath, reply_to: "guid-target" });
+      // Target honoured, so the caller must NOT reoffer it to the next block.
+      expect(result?.threaded).not.toBe(false);
+      await channel.stop();
+    });
+  });
+
+  it("leaves an unthreaded photo on the plain send path (no replyTo, no bridge round-trip)", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, photo: photoPath, text: "" });
+
+      const all = requests().filter((r) => r.method === "send" || r.method === "send.attachment");
+      expect(all).toHaveLength(1);
+      expect(all[0].method).toBe("send");
+      expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      await channel.stop();
+    });
+  });
+
+  it("ships the photo unthreaded and REPORTS the drop when the bridge lacks send.attachment", async () => {
+    await withPhoto(async (photoPath) => {
+      // CAPS_FULL: bridge up, but no send.attachment RPC / sendAttachment
+      // selector — an imsg older than the attachment surface.
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "", replyTo: "guid-target" });
+
+      const all = requests().filter((r) => r.method === "send" || r.method === "send.attachment");
+      expect(all).toHaveLength(1);
+      expect(all[0].method).toBe("send");
+      expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    });
+  });
+
+  it("falls back to an unthreaded send and reports the drop when send.attachment is refused", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({
+        caps: CAPS_ATTACHMENT,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          if (req.method === "send.attachment") return child.respondError(req.id, -32602, "Invalid params", "no reply target");
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "", replyTo: "guid-target" });
+
+      const methods = requests().filter((r) => r.method === "send" || r.method === "send.attachment").map((r) => r.method);
+      expect(methods).toEqual(["send.attachment", "send"]);
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    });
+  });
+
+  it("reports the drop when the attachment file is missing, so nothing shipped spends the target", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text: "", replyTo: "guid-target" });
+
+    expect(requests().filter((r) => r.method === "send" || r.method === "send.attachment")).toHaveLength(0);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("never threads the caption follow-up behind a threaded photo", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+
+      await channel.send({ chatId: DM_GUID, photo: photoPath, text: "here it is", replyTo: "guid-target" });
+
+      const rich = requests().filter((r) => r.method === "send.rich");
+      expect(rich).toHaveLength(0);
+      const plain = requests().filter((r) => r.method === "send");
+      expect(plain).toHaveLength(1);
+      expect(plain[0].params).toEqual({ chat_guid: DM_GUID, text: "here it is" });
+      await channel.stop();
+    });
+  });
+
+  it("reports that a sticker cannot be threaded instead of swallowing the target", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sticker-reply-"));
+    const stickerPath = join(dir, "dog.png");
+    writeFileSync(stickerPath, "fake-png-bytes");
+    try {
+      const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath, replyTo: "guid-target" });
+
+      const stickers = requests().filter((r) => r.method === "send.sticker");
+      expect(stickers).toHaveLength(1);
+      // send.sticker takes no reply_to at all — imsg rejects the param.
+      expect(stickers[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says nothing about threading when a sticker send was never asked to thread", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sticker-noreply-"));
+    const stickerPath = join(dir, "dog.png");
+    writeFileSync(stickerPath, "fake-png-bytes");
+    try {
+      const { channel } = makeChannel({ caps: CAPS_STICKER });
+      await channel.start();
+
+      expect(await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath })).toBeUndefined();
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * P2-1 (#292's third review): the plain-text fallback used to return `void`.
+ *
+ * `Channel.send` returning nothing means "delivered as asked", and the
+ * pipeline retires the turn's reply target on it. But the AppleScript `send`
+ * has no `reply_to` param at all — every fallback onto it drops the target on
+ * the floor. Claiming success there is worse than not threading: the target
+ * is spent, so no later block in the turn is ever offered it either.
+ */
+describe("imsg threaded text sends report a reply target they could not apply", () => {
+  it("reports the drop when the bridge is down and the text goes out plain", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "threaded?", replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.map((r) => r.method)).toEqual(["send"]);
+    expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, text: "threaded?" });
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("reports the drop when send.rich refuses and the text falls back to plain", async () => {
+    const { channel, requests } = makeChannel({
+      caps: CAPS_FULL,
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send.rich") return child.respondError(req.id, -32603, "Internal error", "bridge not running");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "threaded?", replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.map((r) => r.method)).toEqual(["send.rich", "send"]);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("stays silent when send.rich accepted the reply target", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "threaded!", replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.map((r) => r.method)).toEqual(["send.rich"]);
+    expect(outbound[0].params).toMatchObject({ reply_to: "guid-target" });
+    expect(result?.threaded).not.toBe(false);
+    await channel.stop();
+  });
+
+  it("reports the drop on a chunked long message whose first chunk went out plain", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    const longText = `${"x".repeat(3990)} ${"y".repeat(100)}`;
+    const result = await channel.send({ chatId: DM_GUID, text: longText, replyTo: "guid-target" });
+
+    const outbound = requests().filter((r) => r.method === "send" || r.method === "send.rich");
+    expect(outbound.length).toBeGreaterThan(1);
+    expect(outbound.every((r) => r.method === "send")).toBe(true);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("reports the drop when there was no text to carry the target at all", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const result = await channel.send({ chatId: DM_GUID, text: "", replyTo: "guid-target" });
+
+    expect(requests().filter((r) => r.method === "send" || r.method === "send.rich")).toHaveLength(0);
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("says nothing about threading when no reply target was requested", async () => {
+    const { channel } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    expect(await channel.send({ chatId: DM_GUID, text: "plain" })).toBeUndefined();
+    await channel.stop();
+  });
+
+  it("says nothing about threading when only an effect could not be applied", async () => {
+    // An effect is a delivery property, not a target the caller can reoffer:
+    // SendResult reports `replyTo` drops only.
+    const { channel } = makeChannel({ caps: CAPS_BASIC });
+    await channel.start();
+
+    expect(await channel.send({ chatId: DM_GUID, text: "boom", effect: "impact" })).toBeUndefined();
+    await channel.stop();
+  });
+});
+
+/**
+ * P2-2 (#292's third review): a captioned photo left a threadable turn
+ * unthreaded. Text threading (`send.rich`) and attachment threading
+ * (`send.attachment`) are SEPARATE bridge surfaces, so an imsg too old for the
+ * latter can still thread the caption. And for a final one-block
+ * `caption + MEDIA:path` the caption is the last message of the turn — there
+ * is no later send for the pipeline to reoffer the target to, so a target
+ * dropped here is a turn that ends unthreaded for no reason.
+ */
+describe("imsg captioned photo hands an unapplied reply target to the caption", () => {
+  const withPhoto = async (fn: (photoPath: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-caption-reply-"));
+    const photoPath = join(dir, "pic.png");
+    writeFileSync(photoPath, "fake-png-bytes");
+    try {
+      await fn(photoPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("threads the caption via send.rich when only send.attachment is missing", async () => {
+    await withPhoto(async (photoPath) => {
+      // CAPS_FULL: bridge up and threading text, but no attachment surface.
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
+      expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      expect(outbound[1].params).toMatchObject({ chat_guid: DM_GUID, text: "caption", reply_to: "guid-target" });
+      // The turn IS threaded — the caller must not reoffer a spent target.
+      expect(result?.threaded).not.toBe(false);
+      await channel.stop();
+    });
+  });
+
+  it("reports the drop when the bridge cannot thread the photo OR the caption", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send"]);
+      expect(outbound[1].params).toEqual({ chat_guid: DM_GUID, text: "caption" });
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    });
+  });
+
+  it("reports the drop when the caption's own send.rich is refused", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({
+        caps: CAPS_FULL,
+        responder: (req, child) => {
+          if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+          if (req.method === "send.rich") return child.respondError(req.id, -32603, "Internal error", "bridge not running");
+          child.respond(req.id, { ok: true });
+        },
+      });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich", "send"]);
+      expect(result).toEqual({ threaded: false });
+      await channel.stop();
+    });
+  });
+
+  it("leaves the caption plain when the photo itself took the target", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+
+      const result = await channel.send({ chatId: DM_GUID, photo: photoPath, text: "caption", replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      // One reply per turn: the picture is it, so the caption stays plain.
+      expect(outbound.map((r) => r.method)).toEqual(["send.attachment", "send"]);
+      expect(outbound[1].params).toEqual({ chat_guid: DM_GUID, text: "caption" });
+      expect(result?.threaded).not.toBe(false);
+      await channel.stop();
+    });
+  });
+});
+
+/**
+ * The pipeline and the channel wired together, because the P2-2 regression
+ * lived exactly in the seam: the pipeline decided the photo had taken the
+ * reply target while the channel threw it away, so NEITHER the photo nor the
+ * text after it was threaded. A turn that asks to thread must end with
+ * something threaded whenever the channel can thread anything at all.
+ */
+describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () => {
+  const pipeline = new DeliveryPipeline({ queuePendingErrorNote: () => {} });
+
+  const withPhoto = async (fn: (photoPath: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-e2e-"));
+    const photoPath = join(dir, "pic.png");
+    writeFileSync(photoPath, "fake-png-bytes");
+    try {
+      await fn(photoPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("threads the photo of [MEDIA, B] and leaves B plain", async () => {
+    await withPhoto(async (photoPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+
+      await pipeline.deliverAssistantContent(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send.attachment", "send"]);
+      expect(outbound[0].params).toMatchObject({ file: photoPath, reply_to: "guid-target" });
+      expect(outbound[1].params).toEqual({ chat_guid: DM_GUID, text: "B" });
+      await channel.stop();
+    });
+  });
+
+  it("threads B instead when the bridge cannot thread the photo", async () => {
+    await withPhoto(async (photoPath) => {
+      // CAPS_FULL threads text (send.rich) but has no attachment surface.
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      await pipeline.deliverAssistantContent(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
+      expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      expect(outbound[1].params).toMatchObject({ text: "B", reply_to: "guid-target" });
+      await channel.stop();
+    });
+  });
+
+  it("threads B after an unthreadable sticker", async () => {
+    await withPhoto(async (stickerPath) => {
+      const { channel, requests } = makeChannel({ caps: { ...CAPS_STICKER, rpcMethods: new Set([...CAPS_STICKER.rpcMethods, "send.attachment"]), selectors: { ...CAPS_STICKER.selectors, sendAttachment: true } } });
+      await channel.start();
+
+      await pipeline.deliverAssistantContent(channel, DM_GUID, [`STICKER:${stickerPath}`, "B"], { replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.sticker"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send.sticker", "send.rich"]);
+      expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
+      expect(outbound[1].params).toMatchObject({ text: "B", reply_to: "guid-target" });
+      await channel.stop();
+    });
+  });
+
+  it("threads the caption of a FINAL one-block caption + MEDIA, which has no next send", async () => {
+    await withPhoto(async (photoPath) => {
+      // The hard case: one block, so the pipeline makes exactly one
+      // channel.send call and there is no later message to reoffer the target
+      // to. CAPS_FULL cannot thread the picture but can thread the caption,
+      // so the turn must still end threaded.
+      const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+
+      await pipeline.deliverAssistantContent(channel, DM_GUID, [`caption\nMEDIA:${photoPath}`], { replyTo: "guid-target" });
+
+      const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
+      expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
+      expect(outbound[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath });
+      expect(outbound[1].params).toMatchObject({ text: "caption", reply_to: "guid-target" });
+      await channel.stop();
+    });
+  });
+});
 
 describe("imsg capability gate diagnosis", () => {
   const stickerFile = async (fn: (stickerPath: string) => Promise<void>) => {
@@ -2339,6 +2725,24 @@ describe("imsg outbound RPC param-name contract", () => {
       await channel.start();
       await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
       expect(keysOf(requests, "send.sticker")).toEqual(["chat_guid", "file"]);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("send.attachment (threaded attachment) → chat_guid, file, reply_to", async () => {
+    // Verified against the installed imsg 0.14.1 RPC: `send.attachment`
+    // rejects unknown params by name ("unknown send.attachment param: ..."),
+    // and accepts reply_to — the only outbound RPC that threads a file.
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-contract-"));
+    const photoPath = join(dir, "pic.png");
+    writeFileSync(photoPath, "x");
+    try {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+      await channel.send({ chatId: DM_GUID, photo: photoPath, replyTo: "guid-target" });
+      expect(keysOf(requests, "send.attachment")).toEqual(["chat_guid", "file", "reply_to"]);
       await channel.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });

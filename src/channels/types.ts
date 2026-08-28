@@ -94,6 +94,29 @@ export const IMESSAGE_SEND_EFFECTS = [
   "spotlight", "echo", "love", "celebration",
 ] as const;
 
+/**
+ * What a channel reports back about a send the caller cannot otherwise see.
+ *
+ * Only `replyTo` needs reporting today. Threading support is per message KIND,
+ * not per channel: iMessage can thread text (`send.rich`) and attachments
+ * (`send.attachment`), both bridge-only, but stickers never (`send.sticker`
+ * takes no `reply_to`, and the bridge's `stickerReplyTo` selector is absent).
+ * A channel that silently drops the target strands the whole turn unthreaded,
+ * because the delivery pipeline attaches it to exactly one message and would
+ * consider it spent.
+ */
+export interface SendResult {
+  /**
+   * Whether the requested `replyTo` was actually applied to a message that
+   * shipped. Set it to `false` — and only then — when the caller asked to
+   * thread and this send could not (unsupported kind, bridge down, nothing
+   * shipped at all); the pipeline then keeps the target for the next send.
+   * Omit the field (or return nothing) when the target was honoured, when no
+   * `replyTo` was requested, or when threading is not a concept here.
+   */
+  threaded?: boolean;
+}
+
 export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
 
 /**
@@ -119,34 +142,6 @@ export interface StopTypingOptions {
 
 export type StopTyping = (options?: StopTypingOptions) => void | Promise<void>;
 
-export interface StreamingMessage {
-  /** Append text to the streaming message */
-  update(text: string): void;
-  /** Finalize the message (flush remaining content) */
-  finish(): Promise<void>;
-  /**
-   * Cancel the streaming message. If a message has already been sent
-   * (e.g. via Telegram's incremental edit flow), it is deleted. Implementations
-   * that buffer until finish (e.g. iMessage) can no-op.
-   */
-  cancel(): Promise<void>;
-  /**
-   * Drop only the current in-flight block and reset state for the next block.
-   * Used when a block is delivered through a non-text path (for example, as a
-   * captioned media attachment) after any speculative streamed text must be
-   * cleared.
-   */
-  discardBlock(): Promise<void>;
-  /**
-   * Seal the current text block and reset state for the next block in the
-   * same turn. Called between text blocks of a multi-block assistant turn
-   * (text → tool → text). Channels that ship text per block (Telegram,
-   * iMessage) finalize the in-flight message and start fresh on the next
-   * `update()`. No-op when nothing has been buffered.
-   */
-  commitBlock(): Promise<void>;
-}
-
 export type MessageHandler = (message: IncomingMessage) => Promise<void>;
 /**
  * Slash command handler. `senderId` is the channel's provider-verified sender
@@ -165,8 +160,14 @@ export interface Channel {
   /** Register a handler for slash commands */
   onCommand(handler: CommandHandler): void;
 
-  /** Send a message through this channel */
-  send(message: OutgoingMessage): Promise<void>;
+  /**
+   * Send a message through this channel.
+   *
+   * Returning nothing means "delivered as asked" — the common case. Return a
+   * SendResult only to report something the caller cannot see, currently just
+   * a `replyTo` the channel could not honour (see SendResult.threaded).
+   */
+  send(message: OutgoingMessage): Promise<SendResult | void>;
 
   /** Rename a group chat/conversation, if supported by the channel. */
   setChatTitle?(chatId: string, title: string): Promise<void>;
@@ -208,9 +209,6 @@ export interface Channel {
    * (react_to_message `match`) and threaded replies (send_message `reply_to`).
    */
   recentMessages?(chatId: string): RecentChatMessage[];
-
-  /** Create a streaming message that can be updated incrementally */
-  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage;
 
   /** Show typing indicator. Returns a stop function. */
   startTyping(chatId: string): StopTyping;

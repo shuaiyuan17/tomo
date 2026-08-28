@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
@@ -16,9 +16,7 @@ import {
   type SavedFileNotice,
 } from "./fileStore.js";
 import { log } from "../logger.js";
-import { deliverTextParts } from "./delivery.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
-import { endsWithTrailingNoReply } from "../agent/text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import { convertHeicImage, heicHasAlpha, looksLikeHeic, type HeicTargetFormat } from "./heic.js";
@@ -430,20 +428,33 @@ export class ImsgChannel implements Channel {
     this.serviceLookup.close();
   }
 
-  async send(message: OutgoingMessage): Promise<void> {
+  async send(message: OutgoingMessage): Promise<SendResult | void> {
     if (message.sticker) {
       await this.sendSticker(message.chatId, message.sticker);
-      return;
+      // A sticker can never carry a reply target here: `send.sticker` takes no
+      // `reply_to` (verified against imsg 0.14.1 — it rejects the param
+      // outright), and the bridge's own `stickerReplyTo` selector probes
+      // false. `attach_to` is a DIFFERENT act (affixing the sticker onto an
+      // existing bubble), deliberately not wired; see sendSticker. So report
+      // the drop rather than swallow it — the caller threads exactly one
+      // message per turn and would otherwise spend the target on nothing.
+      return message.replyTo ? { threaded: false } : undefined;
     }
 
     if (message.photo) {
-      await this.sendAttachment(message.chatId, message.photo, message.text);
-      return;
+      return await this.sendAttachment(message.chatId, message.photo, message.text, message.replyTo);
     }
 
     const text = message.text;
-    if (!text) return;
+    // Nothing to ship: an empty text send cannot carry the target either, so
+    // report the drop rather than let the caller retire it on a no-op.
+    if (!text) return message.replyTo ? { threaded: false } : undefined;
 
+    // Only a `send.rich` that actually carried `reply_to` threads anything.
+    // Every other route out of this loop — bridge down, a rich refusal, a
+    // continuation chunk — lands on the plain `send` below, which has no
+    // reply_to param at all. Track the one success rather than assume it.
+    let threaded = false;
     const chunks = splitText(text, TEXT_CHUNK_LIMIT);
     for (const [i, chunk] of chunks.entries()) {
       // Threaded replies and expressive-send effects need the IMCore bridge
@@ -466,6 +477,7 @@ export class ImsgChannel implements Channel {
             part_index: 0,
           });
           this.recordOwnSend(message.chatId, result, chunk);
+          if (message.replyTo) threaded = true;
           continue;
         } catch (err) {
           // Fall back to a plain send only on a definite refusal (an RPC
@@ -514,6 +526,11 @@ export class ImsgChannel implements Channel {
       });
       this.recordOwnSend(message.chatId, result, chunk);
     }
+    // The text shipped, but if it shipped PLAIN the reply target did not go
+    // with it: the AppleScript `send` has no reply_to. Returning nothing here
+    // would read as "delivered as asked" and the pipeline would retire a
+    // target that never reached a bubble, stranding the rest of the turn.
+    return message.replyTo && !threaded ? { threaded: false } : undefined;
   }
 
   /**
@@ -655,54 +672,6 @@ export class ImsgChannel implements Channel {
         return;
       }
     }
-  }
-
-  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
-    // iMessage can't stream into a sent bubble — buffer per block, ship at
-    // boundary (commitBlock between text blocks, finish at end of turn).
-    // Blocks whose trailing line(s) are bare NO_REPLY are dropped WHOLE —
-    // narration ending in the token is not for the channel (owner decision
-    // 2026-07-08). Inline mentions of NO_REPLY mid-text still ship; other
-    // blocks in the same turn are unaffected. Mirrors Telegram's final-flush
-    // retraction.
-    let buffer = "";
-    let canceled = false;
-    // Group replies carry the triggering message's GUID; thread only the
-    // first shipped block — one reply, not one per block.
-    let pendingReplyTo = replyTo;
-
-    const shipBuffer = async () => {
-      if (canceled || !buffer) return;
-      if (endsWithTrailingNoReply(buffer)) { buffer = ""; return; }
-      const text = buffer;
-      buffer = "";
-      const threadTarget = pendingReplyTo;
-      pendingReplyTo = undefined;
-      await deliverTextParts(this, chatId, text, { replyTo: threadTarget });
-    };
-
-    return {
-      update: (text: string) => {
-        if (canceled) return;
-        buffer = text;
-      },
-      commitBlock: async () => {
-        if (canceled) return;
-        await shipBuffer();
-      },
-      finish: async () => {
-        if (canceled) return;
-        await shipBuffer();
-      },
-      cancel: async () => {
-        canceled = true;
-        buffer = "";
-      },
-      discardBlock: async () => {
-        if (canceled) return;
-        buffer = "";
-      },
-    };
   }
 
   startTyping(chatId: string): StopTyping {
@@ -1746,18 +1715,102 @@ export class ImsgChannel implements Channel {
 
   // --- Outbound attachments ---
 
-  private async sendAttachment(chatGuid: string, filePath: string, caption?: string): Promise<void> {
+  /**
+   * Threading an attachment needs the IMCore bridge: `send.attachment` is the
+   * only RPC that accepts `reply_to`, and it is bridge-only (verified against
+   * imsg 0.14.1 — a `reply_to` send reports transport `bridge_v2`, while the
+   * plain `send` file param rides AppleScript). Gate it like every other
+   * bridge surface so an un-injected Messages.app degrades to an unthreaded
+   * attachment instead of failing the send.
+   */
+  private attachmentReplyToSupported(): boolean {
+    return this.capabilities.advancedFeatures
+      && this.capabilities.rpcMethods.has("send.attachment")
+      && this.capabilities.selectors.sendAttachment === true;
+  }
+
+  /**
+   * Send a file, optionally threaded to `replyTo` and optionally followed by a
+   * caption as its own message (iMessage attachments carry no caption field).
+   *
+   * Returns `{ threaded: false }` only when a `replyTo` was asked for and
+   * NEITHER the picture NOR its caption went out threaded — bridge down, RPC
+   * refusal with no caption to fall back to, or the file missing so nothing
+   * shipped at all. If the picture could not thread but a caption follows, the
+   * caption is offered the target and ITS result is what this method returns.
+   * The caller needs an honest answer either way: it hands the target to
+   * exactly one message, and before this the channel dropped it silently,
+   * leaving both the photo and the text after it unthreaded.
+   *
+   * The caption follow-up is threaded only as a FALLBACK. Behind a threaded
+   * picture it ships plain — one reply per turn, and the picture already is
+   * it. But when the picture could not thread, the caption inherits the
+   * target and its result becomes this call's result: text threading
+   * (`send.rich`) and attachment threading (`send.attachment`) are separate
+   * bridge surfaces, so an imsg too old for the latter can still thread the
+   * caption. That matters for a final one-block `caption + MEDIA:path`, where
+   * there is no later send for the caller to reoffer the target to. With the
+   * bridge genuinely down the caption falls back to a plain send and reports
+   * `{ threaded: false }` itself, which propagates unchanged.
+   */
+  private async sendAttachment(
+    chatGuid: string,
+    filePath: string,
+    caption?: string,
+    replyTo?: string,
+  ): Promise<SendResult | void> {
     if (!existsSync(filePath)) {
       log.warn({ path: filePath }, "Attachment file not found");
-      return;
+      return replyTo ? { threaded: false } : undefined;
     }
-    // The plain `send` file param works on the AppleScript transport — no
-    // bridge required (send.attachment is bridge-only).
-    await this.request("send", { chat_guid: chatGuid, file: filePath });
+
+    let threaded = false;
+    if (replyTo && this.attachmentReplyToSupported()) {
+      try {
+        await this.request("send.attachment", { chat_guid: chatGuid, file: filePath, reply_to: replyTo });
+        threaded = true;
+      } catch (err) {
+        // Same rule as send.rich: fall back to a plain send only on a definite
+        // refusal (an RPC error response proves nothing was sent). An
+        // ambiguous failure may already have dispatched the attachment, and
+        // resending it would double-deliver the picture.
+        if (!(err instanceof ImsgRpcResponseError)) throw err;
+        log.warn({ err, chatId: chatGuid }, "imsg threaded attachment send refused; falling back to an unthreaded send");
+      }
+    } else if (replyTo) {
+      // Bridge down (or an imsg too old for send.attachment): the picture
+      // still ships, unthreaded. Kick a rate-limited re-probe so a bridge that
+      // has since come up threads the next one (#258).
+      this.maybeReprobeCapabilities();
+      log.info(
+        { chatId: chatGuid, ...this.capabilityGateDiagnosis("send.attachment", ["sendAttachment"]) },
+        "imsg threaded attachment send unavailable; sending the attachment unthreaded",
+      );
+    }
+
+    if (!threaded) {
+      // The plain `send` file param works on the AppleScript transport — no
+      // bridge required (send.attachment is bridge-only).
+      await this.request("send", { chat_guid: chatGuid, file: filePath });
+    }
 
     if (caption) {
-      await this.send({ chatId: chatGuid, text: caption });
+      // If the picture could not take the target, the caption is the turn's
+      // last chance at it: a final `caption + MEDIA:path` block has no later
+      // send for the caller to reoffer it to, and text threads through
+      // `send.rich` even when the attachment surface is missing. Hand the
+      // target down and let the caption's own result speak for the whole
+      // attachment send — it threads when only send.attachment was missing,
+      // and reports `{ threaded: false }` when the bridge is genuinely down.
+      const offerTarget = Boolean(replyTo) && !threaded;
+      const captionResult = await this.send({
+        chatId: chatGuid,
+        text: caption,
+        ...(offerTarget ? { replyTo } : {}),
+      });
+      if (offerTarget) return captionResult ?? undefined;
     }
+    return replyTo && !threaded ? { threaded: false } : undefined;
   }
 
   // --- Outbound stickers ---

@@ -2,8 +2,7 @@ import { afterEach, beforeEach, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, StreamingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
-import { splitOutboundMessageText } from "../../src/channels/text-utils.js";
+import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
 import { agentEnv, mockConfig, mockWorkspace, queryState, resetMockSdk } from "./agent-mocks.js";
 
 // ---------------------------------------------------------------------------
@@ -38,10 +37,8 @@ export class MockChannel implements Channel {
   private commandHandler: CommandHandler | null = null;
   /** Messages sent via channel.send() */
   sent: OutgoingMessage[] = [];
-  /** All delivered messages (both streamed and sent) */
+  /** All delivered messages (mirrors `sent`; kept for readability at call sites). */
   delivered: Delivery[] = [];
-  /** Raw streaming update calls before a block is committed. */
-  streamUpdates: Delivery[] = [];
   typingStarts: string[] = [];
   typingStops: Array<{ chatId: string; options?: StopTypingOptions }> = [];
   renamed: Array<{ chatId: string; title: string }> = [];
@@ -65,36 +62,6 @@ export class MockChannel implements Channel {
     this.reacted.push({ chatId, messageId, reaction, remove });
   }
 
-  createStreamingMessage(chatId: string, _replyTo?: string): StreamingMessage {
-    // Mock mirrors the per-block streaming contract: update() sets the
-    // current-block buffer, commitBlock() ships it as one delivery and
-    // resets, finish() ships the trailing buffer.
-    let text = "";
-    let canceled = false;
-    let finished = false;
-    const NO_REPLY_RE = /^\s*NO_REPLY\s*$/i;
-    const ship = () => {
-      if (canceled || !text) return;
-      if (NO_REPLY_RE.test(text)) { text = ""; return; }
-      for (const part of splitOutboundMessageText(text)) {
-        this.delivered.push({ chatId, text: part });
-      }
-      text = "";
-    };
-    return {
-      update: (t: string) => {
-        if (!canceled && !finished) {
-          text = t;
-          this.streamUpdates.push({ chatId, text: t });
-        }
-      },
-      commitBlock: async () => { if (!canceled && !finished) ship(); },
-      finish: async () => { if (finished) return; finished = true; ship(); },
-      cancel: async () => { canceled = true; text = ""; },
-      discardBlock: async () => { if (!canceled && !finished) text = ""; },
-    };
-  }
-
   startTyping(chatId: string) {
     this.typingStarts.push(chatId);
     return (options?: StopTypingOptions) => {
@@ -112,7 +79,6 @@ export class MockChannel implements Channel {
   clearDelivered() {
     this.sent = [];
     this.delivered = [];
-    this.streamUpdates = [];
     this.typingStarts = [];
     this.typingStops = [];
     this.renamed = [];

@@ -218,6 +218,7 @@ export class LiveSessionManager {
 
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {
       timeoutMs: config.liveSessionTimeoutMs,
+      showThinking: config.showThinking,
     });
     this.liveSessions.set(key, session);
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
@@ -316,21 +317,16 @@ export class LiveSessionManager {
   }
 
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
-    const {
-      key,
-      prompt,
-      onText,
-      images,
-      onBlockComplete,
-      documents,
-      steer = false,
-    } = req;
+    const { key, prompt, images, documents, steer = false, onResponseBlocks } = req;
+    // Fabricated (non-model) responses below still need a block list — they
+    // are single-block by construction.
+    const oneBlock = (text: string) => { onResponseBlocks?.([text]); return text; };
 
     try {
       const session = await this.getOrCreateLiveSession(key);
       const response = steer
-        ? await session.steer(prompt, onText, images, onBlockComplete, documents)
-        : await session.send(prompt, onText, images, onBlockComplete, documents);
+        ? await session.steer(prompt, images, documents, onResponseBlocks)
+        : await session.send(prompt, images, documents, onResponseBlocks);
 
       // Merged into another request's in-flight turn — that turn's owner
       // does the per-turn bookkeeping (stats, compact triggers) when it
@@ -344,12 +340,12 @@ export class LiveSessionManager {
 
       if (this.stopping && errMsg.includes("closed")) {
         log.info({ key }, "Session closed during shutdown; preserving SDK session link");
-        return "NO_REPLY";
+        return oneBlock("NO_REPLY");
       }
 
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
-        return "I ran out of steps trying to complete that. Can you try a simpler request?";
+        return oneBlock("I ran out of steps trying to complete that. Can you try a simpler request?");
       }
 
       if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
@@ -378,7 +374,7 @@ export class LiveSessionManager {
         }
 
         const session = await this.getOrCreateLiveSession(key);
-        const response = await session.send(prompt, onText, images, onBlockComplete, documents);
+        const response = await session.send(prompt, images, documents, onResponseBlocks);
         this.recordTurnCompletion(key, session);
         return response;
       }

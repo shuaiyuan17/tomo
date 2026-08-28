@@ -42,15 +42,31 @@ export function endsWithTrailingNoReply(text: string): boolean {
 
 export const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
 export const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
-export const ATTACHMENT_TAG_RE = /\b(?:MEDIA|STICKER):\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
+
+/**
+ * Stands in for a removed attachment tag until the text is cleaned up, so we
+ * can tell "this line held nothing but a tag" (drop the line — otherwise the
+ * caption grows a blank line where the tag used to be) from "this line had a
+ * tag at the end of a sentence" (keep the line, drop the tag).
+ */
+const TAG_PLACEHOLDER = "\u0000";
+
+function dropTagOnlyLines(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => !(line.includes(TAG_PLACEHOLDER) && line.replaceAll(TAG_PLACEHOLDER, "").trim() === ""))
+    .join("\n")
+    .replaceAll(TAG_PLACEHOLDER, "")
+    .trim();
+}
 
 export function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
   const mediaPaths: string[] = [];
-  const cleanText = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
+  const withoutMedia = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
     mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
-    return "";
-  }).trim();
-  return { cleanText, mediaPaths };
+    return TAG_PLACEHOLDER;
+  });
+  return { cleanText: dropTagOnlyLines(withoutMedia), mediaPaths };
 }
 
 export function extractAttachments(text: string): { cleanText: string; mediaPaths: string[]; stickerIds: string[] } {
@@ -58,11 +74,11 @@ export function extractAttachments(text: string): { cleanText: string; mediaPath
   const stickerIds: string[] = [];
   const withoutMedia = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
     mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
-    return "";
+    return TAG_PLACEHOLDER;
   });
-  const cleanText = withoutMedia.replace(STICKER_RE, (_match, quotedId, unquotedId) => {
+  const withoutStickers = withoutMedia.replace(STICKER_RE, (_match, quotedId, unquotedId) => {
     stickerIds.push(String(quotedId ?? unquotedId).trim());
-    return "";
-  }).trim();
-  return { cleanText, mediaPaths, stickerIds };
+    return TAG_PLACEHOLDER;
+  });
+  return { cleanText: dropTagOnlyLines(withoutStickers), mediaPaths, stickerIds };
 }

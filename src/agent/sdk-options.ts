@@ -126,7 +126,11 @@ export function sdkOptions(
     model: effectiveModel,
     sessionKey: sessionContext?.sessionKey,
   });
-  const thinking = omittedAdaptiveThinkingForModel(effectiveModel);
+  // Thinking DISPLAY is the model-side half of config.showThinking: with
+  // `display: "omitted"` the SDK never emits `thinking` content blocks at all,
+  // so no downstream flag could surface them. Resolved at session spawn — a
+  // mid-session config change only takes effect on the next session (restart).
+  const thinking = adaptiveThinkingForModel(effectiveModel, config.showThinking);
 
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
@@ -176,10 +180,10 @@ export function sdkOptions(
     // that bypassPermissions otherwise routes here as denials.
     canUseTool: skillsCanUseTool,
     ...(sessionContext?.onMcpElicitation ? { onElicitation: sessionContext.onMcpElicitation } : {}),
-    // Off makes each assistant text block ship whole rather than growing in
-    // place; LiveSession's no-deltas path already handles that, so mid-turn
-    // messages between tool calls are unaffected. See config.streaming.
-    includePartialMessages: config.streaming,
+    // Delivery is non-streaming: the turn runs to completion and its content
+    // blocks are delivered once (see delivery-pipeline.ts). Partial messages
+    // would only add per-token events nothing consumes.
+    includePartialMessages: false,
     ...(thinking ? { thinking } : {}),
     maxTurns: config.maxTurns,
     ...buildHooksOption({
@@ -199,7 +203,20 @@ export function sdkOptions(
   };
 }
 
-function omittedAdaptiveThinkingForModel(model: string): { type: "adaptive"; display: "omitted" } | undefined {
+/**
+ * Adaptive-thinking config for models that support it (Sonnet/Opus 4.6+).
+ *
+ * `display` is the only knob the SDK exposes (`ThinkingAdaptive` in
+ * @anthropic-ai/claude-agent-sdk `sdk.d.ts` — `display?: 'summarized' |
+ * 'omitted'`; there is no `'full'`). `"omitted"` suppresses the `thinking`
+ * content blocks entirely, so it is the mechanism that hides reasoning by
+ * default; `"summarized"` is what makes the SDK emit them, which is what
+ * `showThinking` needs before LiveSession has anything to render.
+ */
+function adaptiveThinkingForModel(
+  model: string,
+  showThinking: boolean,
+): { type: "adaptive"; display: "summarized" | "omitted" } | undefined {
   const resolved = resolveModelName(model) ?? model;
   if (isLiteLlmProviderModel(resolved)) return undefined;
 
@@ -209,7 +226,7 @@ function omittedAdaptiveThinkingForModel(model: string): { type: "adaptive"; dis
     /^claude-opus-(?:4-(?:[6-9]|\d{2,})|[5-9](?:-\d+)?|\d{2,}(?:-\d+)?)$/.test(base);
 
   return adaptiveThinkingModel
-    ? { type: "adaptive", display: "omitted" }
+    ? { type: "adaptive", display: showThinking ? "summarized" : "omitted" }
     : undefined;
 }
 

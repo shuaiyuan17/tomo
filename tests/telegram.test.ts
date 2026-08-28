@@ -219,74 +219,6 @@ describe("streaming message flush serialization", () => {
   });
 });
 
-// NO_REPLY suppression in the streaming flush. The regex is duplicated here
-// to keep the test self-contained — it must match the one in
-// src/channels/telegram.ts:createStreamingMessage.
-describe("streaming message NO_REPLY prefix suppression", () => {
-  const NO_REPLY_PREFIX_RE = /^\s*(N(O(_(R(E(P(L(Y)?)?)?)?)?)?)?)?\s*$/i;
-
-  it("matches every prefix of NO_REPLY (including empty)", () => {
-    for (const s of ["", "N", "NO", "NO_", "NO_R", "NO_RE", "NO_REP", "NO_REPL", "NO_REPLY"]) {
-      expect(NO_REPLY_PREFIX_RE.test(s)).toBe(true);
-    }
-  });
-
-  it("matches case-insensitively and tolerates surrounding whitespace", () => {
-    expect(NO_REPLY_PREFIX_RE.test("no_reply")).toBe(true);
-    expect(NO_REPLY_PREFIX_RE.test("No_Reply")).toBe(true);
-    expect(NO_REPLY_PREFIX_RE.test("  NO_REPLY  ")).toBe(true);
-    expect(NO_REPLY_PREFIX_RE.test("\nNO_REPLY\n")).toBe(true);
-  });
-
-  it("does not match real replies that diverge from the NO_REPLY prefix", () => {
-    expect(NO_REPLY_PREFIX_RE.test("Hello")).toBe(false);
-    expect(NO_REPLY_PREFIX_RE.test("Hi")).toBe(false);
-    expect(NO_REPLY_PREFIX_RE.test("NX")).toBe(false);
-    expect(NO_REPLY_PREFIX_RE.test("NO_REPLY plus more text")).toBe(false);
-    expect(NO_REPLY_PREFIX_RE.test("Sure thing")).toBe(false);
-  });
-
-  it("flush is suppressed while buffer is a NO_REPLY prefix, then resumes if content diverges", async () => {
-    const calls: string[] = [];
-    let messageId: number | null = null;
-    let flushPending = Promise.resolve();
-    let buffer = "";
-    let lastSent = "";
-
-    const flush = () => {
-      flushPending = flushPending.then(async () => {
-        if (buffer === lastSent || !buffer) return;
-        if (NO_REPLY_PREFIX_RE.test(buffer)) return;
-        lastSent = buffer;
-        if (!messageId) {
-          messageId = 1;
-          calls.push(`send:${buffer}`);
-        } else {
-          calls.push(`edit:${buffer}`);
-        }
-      });
-      return flushPending;
-    };
-
-    // Simulate the buffer growing as the model streams "NO" → "NO_REPLY"
-    buffer = "NO";
-    await (flush(), flushPending);
-    buffer = "NO_REPLY";
-    await (flush(), flushPending);
-
-    // No flush has happened — buffer is still a NO_REPLY prefix the entire time.
-    expect(calls).toEqual([]);
-    expect(messageId).toBeNull();
-
-    // Now the model "changes its mind" and writes a real reply.
-    buffer = "NO_REPLY just kidding, here's the answer";
-    await (flush(), flushPending);
-
-    expect(calls).toEqual(["send:NO_REPLY just kidding, here's the answer"]);
-    expect(messageId).toBe(1);
-  });
-});
-
 // Photo caption handling: Telegram rejects captions over 1024 chars, which
 // would lose both the photo and the text. Long captions must be sent as a
 // separate chunked message instead.
@@ -342,6 +274,59 @@ describe("TelegramChannel.send photo captions", () => {
     const { channel } = makeChannel();
     await channel.send({ chatId: "1", text: "", photo: "/tmp/pic.png" });
     expect(channel.recentMessages("1")).toHaveLength(0);
+  });
+});
+
+/**
+ * Telegram's counterpart to the iMessage P2 (#292 review): unlike imsg, the
+ * Bot API threads every send kind with the same `reply_parameters`, and this
+ * channel already forwards them to sendPhoto and sendSticker. Pinned so the
+ * asymmetry stays deliberate — imsg reports a dropped target BECAUSE it must,
+ * and Telegram never has to.
+ */
+describe("TelegramChannel.send threads photos and stickers", () => {
+  function makeChannel() {
+    const channel = new TelegramChannel("000000:test-token");
+    type Opts = { caption?: string; reply_parameters?: { message_id: number } };
+    const calls: Array<{ kind: string; replyToId?: number; caption?: string }> = [];
+    let nextId = 100;
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendPhoto: async (_chatId: string | number, _file: unknown, opts?: Opts) => {
+        calls.push({ kind: "photo", replyToId: opts?.reply_parameters?.message_id, caption: opts?.caption });
+        return { message_id: nextId++ };
+      },
+      sendSticker: async (_chatId: string | number, _sticker: unknown, opts?: Opts) => {
+        calls.push({ kind: "sticker", replyToId: opts?.reply_parameters?.message_id });
+        return { message_id: nextId++ };
+      },
+      sendMessage: async (_chatId: string | number, _text: string, opts?: Opts) => {
+        calls.push({ kind: "text", replyToId: opts?.reply_parameters?.message_id });
+        return { message_id: nextId++ };
+      },
+    };
+    return { channel, calls };
+  }
+
+  it("forwards replyTo to sendPhoto and consumes the target", async () => {
+    const { channel, calls } = makeChannel();
+    const result = await channel.send({ chatId: "1", text: "cap", photo: "/tmp/pic.png", replyTo: "42" });
+    expect(calls).toEqual([{ kind: "photo", replyToId: 42, caption: "cap" }]);
+    // Nothing to report: the target really was applied.
+    expect(result?.threaded).not.toBe(false);
+  });
+
+  it("forwards replyTo to sendSticker", async () => {
+    const { channel, calls } = makeChannel();
+    const result = await channel.send({ chatId: "1", text: "", sticker: "CAACAgIAAxkBAAIBOWX1", replyTo: "42" });
+    expect(calls).toEqual([{ kind: "sticker", replyToId: 42 }]);
+    expect(result?.threaded).not.toBe(false);
+  });
+
+  it("threads the photo, not the overflow caption, when the caption is too long", async () => {
+    const { channel, calls } = makeChannel();
+    await channel.send({ chatId: "1", text: "x".repeat(2000), photo: "/tmp/pic.png", replyTo: "42" });
+    expect(calls[0]).toMatchObject({ kind: "photo", replyToId: 42 });
+    expect(calls.slice(1).every((c) => c.replyToId === undefined)).toBe(true);
   });
 });
 
@@ -542,169 +527,29 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     await expect(channel.unsendMessage("1", "100")).rejects.toThrow(/48 hours/);
   });
 
-  it("records streamed blocks once sealed so they are targetable", async () => {
+  it("records sent messages so they are targetable for edit/unsend", async () => {
     const { channel } = makeChannel();
 
-    const stream = channel.createStreamingMessage("1");
-    stream.update("first block");
-    await stream.commitBlock();
-    stream.update("second block");
-    await stream.finish();
+    await channel.send({ chatId: "1", text: "first message" });
+    await channel.send({ chatId: "1", text: "second message" });
 
     const recent = channel.recentMessages("1");
     expect(recent.map((m) => ({ text: m.text, fromMe: m.fromMe }))).toEqual([
-      { text: "second block", fromMe: true },
-      { text: "first block", fromMe: true },
+      { text: "second message", fromMe: true },
+      { text: "first message", fromMe: true },
     ]);
   });
 
-  // Trailing bare-NO_REPLY line(s) suppress the whole streamed block (owner
-  // decision 2026-07-08). Telegram streams progressively, so narration may
-  // already be on screen when the trailing token arrives in the final delta —
-  // finalFlush retracts it via deleteMessage (flicker-then-retraction is
-  // accepted; matches unsend semantics).
-  it("retracts an already-streamed block when the final delta ends in NO_REPLY (multi-part path)", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    stream.update("archived the logs");
-    // Let the first-frame flush land so the narration is actually on screen.
-    await new Promise((r) => setTimeout(r, 0));
-    stream.update("archived the logs\nfound two stale sessions\nNO_REPLY");
-    await stream.finish();
-
-    expect(sent).toEqual([{ chatId: "1", text: "archived the logs" }]);
-    expect(deleted).toEqual([{ chatId: "1", messageId: 100 }]);
-    expect(channel.recentMessages("1")).toHaveLength(0);
-  });
-
-  it("delivers nothing for a bare NO_REPLY block (single-part path)", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    stream.update("NO_REPLY");
-    await stream.finish();
-
-    expect(sent).toHaveLength(0);
-    expect(deleted).toHaveLength(0);
-    expect(channel.recentMessages("1")).toHaveLength(0);
-  });
-
-  it("suppresses a multi-line NO_REPLY-terminated block even when nothing streamed yet", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    // Single delta straight to the final content — the flush guard skips the
-    // mid-stream send, and finalFlush must suppress BEFORE the multi-part
-    // deliverTextParts path ships "did housekeeping" as its own message.
-    stream.update("did housekeeping\nNO_REPLY");
-    await stream.finish();
-
-    expect(sent).toHaveLength(0);
-    expect(deleted).toHaveLength(0);
-    expect(channel.recentMessages("1")).toHaveLength(0);
-  });
-
-  it("still delivers real multi-line blocks through the multi-part path", async () => {
+  it("chunks an over-limit send instead of truncating it", async () => {
     const { channel, sent } = makeChannel();
 
-    const stream = channel.createStreamingMessage("1");
-    stream.update("line one\nline two");
-    await stream.finish();
+    const long = "x".repeat(5000);
+    await channel.send({ chatId: "1", text: long });
 
-    expect(sent.map((s) => s.text)).toContain("line one");
-    expect(sent.map((s) => s.text)).toContain("line two");
-  });
-
-  it("retracts finalized rollover heads too when the block ends in trailing NO_REPLY", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    // Over Telegram's 4096 limit: flush finalizes a head chunk (recorded, no
-    // longer the "current" message) and rolls the tail into a fresh message.
-    stream.update("x".repeat(5000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(sent).toHaveLength(2); // head (100, finalized) + tail (101) on screen
-
-    // Final delta reveals the block is housekeeping narration — suppression
-    // must retract the WHOLE block, finalized heads included.
-    stream.update(`${"x".repeat(5000)}\nNO_REPLY`);
-    await stream.finish();
-
-    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
-    expect(channel.recentMessages("1")).toHaveLength(0);
-  });
-
-  it("delivers the sliced tail of a real over-limit reply ending in NO_REPLY (no stall)", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    // A single-line real reply that happens to END with the token inline. The
-    // rollover hard-cuts at 4096, so the post-rollover slice is exactly
-    // "NO_REPLY" — the suppression guard must judge the FULL block buffer
-    // (inline mention → deliver), not the slice, or this tail stalls forever
-    // and finalFlush drops it.
-    stream.update(`${"x".repeat(4096)}NO_REPLY`);
-    await stream.finish();
-
-    expect(sent.map((s) => s.text)).toEqual(["x".repeat(4096), "NO_REPLY"]);
-    expect(deleted).toHaveLength(0);
-    expect(channel.recentMessages("1")).toHaveLength(2);
-  });
-
-  it("discardBlock retracts finalized rollover heads so attachment re-delivery isn't duplicated", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    // Over-limit block: flush finalizes a head (100) and rolls into a tail (101).
-    stream.update("x".repeat(5000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(sent).toHaveLength(2);
-
-    // The delivery pipeline's attachment path discards the streamed block and
-    // re-delivers the full content via deliverAssistantContent -> channel.send.
-    // Both streamed messages must be retracted and un-recorded, or the head
-    // content would sit on screen next to the re-delivery.
-    await stream.discardBlock();
-    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
-    expect(channel.recentMessages("1")).toHaveLength(0);
-
-    await channel.send({ chatId: "1", text: "full content with attachment" });
-    const recent = channel.recentMessages("1");
-    expect(recent).toHaveLength(1);
-    expect(recent[0].text).toBe("full content with attachment");
-  });
-
-  it("cancel retracts finalized rollover heads along with the current message", async () => {
-    const { channel, sent, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    stream.update("x".repeat(5000));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(sent).toHaveLength(2);
-
-    await stream.cancel();
-
-    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
-    expect(channel.recentMessages("1")).toHaveLength(0);
-  });
-
-  it("multi-part final delivery after rollover retracts heads so content ships exactly once", async () => {
-    const { channel, deleted } = makeChannel();
-
-    const stream = channel.createStreamingMessage("1");
-    // Rollover finalizes a head (100) and a tail (101)...
-    stream.update("x".repeat(5000));
-    await new Promise((r) => setTimeout(r, 0));
-    // ...then the block turns multi-line, so finalFlush re-delivers the FULL
-    // buffer via deliverTextParts. The streamed head/tail must be retracted
-    // or their content would appear on screen twice.
-    stream.update(`${"x".repeat(5000)}\nsecond line`);
-    await stream.finish();
-
-    expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
-    const recent = channel.recentMessages("1");
-    expect(recent.map((m) => m.text)).toEqual(["second line", "x".repeat(904), "x".repeat(4096)]);
+    const texts = sent.map((m) => m.text);
+    expect(texts).toHaveLength(2);
+    expect(texts.join("")).toBe(long);
+    for (const part of texts) expect(part.length).toBeLessThanOrEqual(4096);
   });
 });
 

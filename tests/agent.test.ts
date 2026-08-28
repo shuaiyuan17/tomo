@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
-import { splitOutboundMessageText } from "../src/channels/text-utils.js";
+import { restoreLiteralNewlines } from "../src/channels/text-utils.js";
 import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
@@ -68,7 +68,6 @@ describe("injectTimestamp", () => {
 // Test MEDIA extraction (extracted logic from agent.ts)
 const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
 const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
-const ATTACHMENT_TAG_RE = /\b(?:MEDIA|STICKER):\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
 
 function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
   const mediaPaths: string[] = [];
@@ -151,38 +150,21 @@ describe("extractAttachments", () => {
     expect(mediaPaths).toEqual(["/tmp/a.png"]);
     expect(stickerIds).toEqual(["CAAC-123"]);
   });
-
-  it("strips only the sticker tag from streamed text", () => {
-    const streamed = "here is STICKER:CAAC123 and more text".replace(ATTACHMENT_TAG_RE, "").trim();
-    expect(streamed).toBe("here is  and more text");
-  });
 });
 
-describe("splitOutboundMessageText", () => {
-  it("splits newline-delimited text into separate trimmed messages", () => {
-    expect(splitOutboundMessageText(" line A \nline B\n  line C  ")).toEqual([
-      "line A",
-      "line B",
-      "line C",
-    ]);
+describe("restoreLiteralNewlines", () => {
+  // Replies now ship as one message with their newlines intact, so [[NL]] is
+  // redundant — but the model still emits it, so it must never ship literally.
+  it("rewrites [[NL]] to a real newline", () => {
+    expect(restoreLiteralNewlines("intro[[NL]]detail\nnext")).toBe("intro\ndetail\nnext");
   });
 
-  it("drops blank lines instead of creating empty messages", () => {
-    expect(splitOutboundMessageText("first\n\n \nsecond")).toEqual(["first", "second"]);
+  it("absorbs a source newline that immediately follows the token", () => {
+    expect(restoreLiteralNewlines("intro[[NL]]\ndetail\nnext")).toBe("intro\ndetail\nnext");
   });
 
-  it("keeps [[NL]] as a literal newline inside one message", () => {
-    expect(splitOutboundMessageText("intro[[NL]]detail\nnext")).toEqual([
-      "intro\ndetail",
-      "next",
-    ]);
-  });
-
-  it("does not split when [[NL]] is followed by a source newline", () => {
-    expect(splitOutboundMessageText("intro[[NL]]\ndetail\nnext")).toEqual([
-      "intro\ndetail",
-      "next",
-    ]);
+  it("leaves text without the token untouched", () => {
+    expect(restoreLiteralNewlines(" line A \nline B ")).toBe(" line A \nline B ");
   });
 });
 

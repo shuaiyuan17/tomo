@@ -46,7 +46,6 @@ class FakeChannel implements Channel {
   unsendMessage? = async (chatId: string, messageId: string): Promise<void> => {
     this.unsent.push({ chatId, messageId });
   };
-  createStreamingMessage(): never { throw new Error("not used"); }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Channel, OutgoingMessage, StopTypingOptions, StreamingMessage } from "../src/channels/types.js";
+import type { Channel, OutgoingMessage, StopTypingOptions } from "../src/channels/types.js";
 import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 import { isSilentReply } from "../src/agent/text-utils.js";
 import { STEER_MERGED } from "../src/agent/live-session.js";
@@ -16,34 +16,15 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-interface StreamLog {
-  updates: string[];
-  finished: boolean;
-  canceled: boolean;
-  committed: number;
-}
-
 class FakeChannel implements Channel {
   readonly name: string;
   sent: OutgoingMessage[] = [];
-  streams: StreamLog[] = [];
 
   constructor(name = "telegram") { this.name = name; }
 
   onMessage(): void {}
   onCommand(): void {}
   async send(message: OutgoingMessage): Promise<void> { this.sent.push(message); }
-  createStreamingMessage(): StreamingMessage {
-    const log: StreamLog = { updates: [], finished: false, canceled: false, committed: 0 };
-    this.streams.push(log);
-    return {
-      update: (text) => { log.updates.push(text); },
-      finish: async () => { log.finished = true; },
-      cancel: async () => { log.canceled = true; },
-      discardBlock: async () => {},
-      commitBlock: async () => { log.committed++; },
-    };
-  }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
@@ -90,13 +71,13 @@ function makeHarness(respond: (req: RunWithRetryRequest) => Promise<string>): Ha
   return { runner: new TurnRunner(deps), channel, prompts, transcript, errorNotes, typingStarts, typingStops };
 }
 
-function streamSpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
+function replySpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
   return {
     key: "telegram:123",
     prompt: "hello",
     stampChannelName: "telegram",
     typing: { channel: h.channel, chatId: "123", passiveListen: false },
-    delivery: { kind: "stream", channel: h.channel, chatId: "123" },
+    delivery: { kind: "reply", channel: h.channel, chatId: "123" },
     silentMatcher: isSilentReply,
     transcript: "always",
     errors: {
@@ -163,50 +144,64 @@ describe("TurnRunner prompt assembly", () => {
   });
 });
 
-describe("TurnRunner stream turns", () => {
-  it("appends the transcript, finishes the stream, and stops typing", async () => {
-    const h = makeHarness(async () => "streamed reply");
-    const result = await h.runner.runTurn(streamSpec(h));
+describe("TurnRunner reply turns", () => {
+  it("appends the transcript, ships one message, and stops typing", async () => {
+    const h = makeHarness(async () => "the reply");
+    const result = await h.runner.runTurn(replySpec(h));
 
     expect(result).toBe(true);
-    expect(h.transcript).toEqual([{ sessionKey: "telegram:123", content: "streamed reply", channelName: "telegram" }]);
-    expect(h.channel.streams[0].finished).toBe(true);
+    expect(h.transcript).toEqual([{ sessionKey: "telegram:123", content: "the reply", channelName: "telegram" }]);
+    expect(h.channel.sent).toEqual([{ chatId: "123", text: "the reply" }]);
     expect(h.typingStarts).toEqual([{ chatId: "123", passiveListen: false }]);
     expect(h.typingStops).toEqual([{ clear: true }]);
   });
 
-  it("still appends a silent reply to the transcript but cancels the stream", async () => {
-    const h = makeHarness(async () => "NO_REPLY");
-    await h.runner.runTurn(streamSpec(h));
+  it("ships a multi-line reply as ONE send with its newlines intact", async () => {
+    const h = makeHarness(async () => "line one\nline two\nline three");
+    await h.runner.runTurn(replySpec(h));
 
-    expect(h.transcript).toHaveLength(1);
-    expect(h.channel.streams[0].canceled).toBe(true);
-    expect(h.channel.streams[0].finished).toBe(false);
+    expect(h.channel.sent).toEqual([{ chatId: "123", text: "line one\nline two\nline three" }]);
   });
 
-  it("uses the spec's silentMatcher for stream delivery", async () => {
-    const h = makeHarness(async () => "text then NO_REPLY");
-    await h.runner.runTurn(streamSpec(h, { silentMatcher: embeddedSilentMatcher }));
+  it("threads the reply to the triggering message when the spec carries one", async () => {
+    const h = makeHarness(async () => "on it");
+    await h.runner.runTurn(replySpec(h, {
+      delivery: { kind: "reply", channel: h.channel, chatId: "123", replyToMessageId: "msg-9" },
+    }));
 
-    expect(h.channel.streams[0].canceled).toBe(true);
-    expect(h.channel.streams[0].finished).toBe(false);
+    expect(h.channel.sent).toEqual([{ chatId: "123", text: "on it", replyTo: "msg-9" }]);
+  });
+
+  it("still appends a silent reply to the transcript but sends nothing", async () => {
+    const h = makeHarness(async () => "NO_REPLY");
+    await h.runner.runTurn(replySpec(h));
+
+    expect(h.transcript).toHaveLength(1);
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it("uses the spec's silentMatcher for reply delivery", async () => {
+    const h = makeHarness(async () => "text then NO_REPLY");
+    await h.runner.runTurn(replySpec(h, { silentMatcher: embeddedSilentMatcher }));
+
+    expect(h.channel.sent).toHaveLength(0);
   });
 
   it("short-circuits a steered turn that merged (STEER_MERGED)", async () => {
     const h = makeHarness(async () => STEER_MERGED);
-    const result = await h.runner.runTurn(streamSpec(h, {
-      delivery: { kind: "stream", channel: h.channel, chatId: "123", steer: true },
+    const result = await h.runner.runTurn(replySpec(h, {
+      delivery: { kind: "reply", channel: h.channel, chatId: "123", steer: true },
     }));
 
     expect(result).toBe(true);
     expect(h.transcript).toHaveLength(0);
-    expect(h.channel.streams[0].canceled).toBe(true);
+    expect(h.channel.sent).toHaveLength(0);
     expect(h.typingStops).toEqual([{ clear: true }]);
   });
 
   it("delivers thrown errors as [error] text through channel.send", async () => {
     const h = makeHarness(async () => { throw new Error("boom"); });
-    const result = await h.runner.runTurn(streamSpec(h));
+    const result = await h.runner.runTurn(replySpec(h));
 
     expect(result).toBe(false);
     expect(h.errorNotes).toEqual([{ sessionKey: "telegram:123", visibleError: "[error] boom" }]);
@@ -216,7 +211,7 @@ describe("TurnRunner stream turns", () => {
 
   it("suppresses thrown errors entirely for passive groups (thrown: ignore)", async () => {
     const h = makeHarness(async () => { throw new Error("boom"); });
-    const result = await h.runner.runTurn(streamSpec(h, {
+    const result = await h.runner.runTurn(replySpec(h, {
       errors: { visiblePrefix: "[error] ", response: "deliver", thrown: "ignore", thrownLogMessage: "Error handling message" },
     }));
 

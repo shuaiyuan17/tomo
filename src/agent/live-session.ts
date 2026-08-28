@@ -10,20 +10,20 @@ import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
+import { endsWithTrailingNoReply } from "./text-utils.js";
+import { filterScaffoldLeak } from "./scaffold-filter.js";
 
 export interface TurnRequest {
-  /** Called for each text-delta as it streams (cumulative running text). */
-  onText?: (text: string) => void;
-  /**
-   * Called once per text block when an `assistant` event arrives, after the
-   * block's deltas have all been streamed. Receives the block's full text.
-   * Channels can use this to seal the in-flight streamed message and start
-   * fresh on the next block, so multi-block turns ship as multiple messages
-   * instead of a single edit-in-place that drops earlier blocks.
-   */
-  onBlockComplete?: (text: string) => void | Promise<void>;
   resolve: (response: string) => void | Promise<void>;
   reject: (err: Error) => void | Promise<void>;
+  /**
+   * Out-channel for the turn's per-block delivery units, in order, called
+   * immediately before `resolve`. The response string is exactly these blocks
+   * joined with "\n"; the delivery layer needs the unjoined form because a
+   * joined string cannot be re-split into blocks, and attachment placement
+   * ("A, MEDIA:, B" ships A → photo → B) is defined per block.
+   */
+  onBlocks?: (blocks: string[]) => void;
 }
 
 export interface MessageRequest extends TurnRequest {
@@ -47,6 +47,87 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer
 
 export interface LiveSessionSettings {
   timeoutMs?: number;
+  /** Include `thinking` content blocks in the turn response (config.showThinking). */
+  showThinking?: boolean;
+}
+
+/**
+ * Marker prefixed to a thinking block when showThinking is on, so the reader
+ * can tell the model's reasoning from its reply. Chosen over a fenced block
+ * because chat channels render neither Markdown nor code fences.
+ */
+export const THINKING_MARKER = "💭 ";
+
+/** An assistant content block worth keeping for the turn response. */
+export interface ResponseBlock {
+  type: "text" | "thinking";
+  text: string;
+}
+
+/** A rendered turn: the per-block delivery units and their joined text. */
+export interface RenderedTurn {
+  /** `blocks` joined with "\n" — logging, transcript, error/silence checks. */
+  text: string;
+  /** Per-block delivery units, in order, after filtering. */
+  blocks: string[];
+  /** True when at least one block had a training-scaffold leak stripped. */
+  scaffoldFiltered: boolean;
+}
+
+/**
+ * Render a turn's collected content blocks into the response.
+ *
+ * This is the ONLY place that decides what reaches a channel, and it decides
+ * purely on the SDK block `type` — never by inspecting the text. A `text`
+ * block is the model's chosen words and always ships, even when it happens to
+ * read like reasoning (`思考: ...`) or like tool debris (`count`). A
+ * `thinking` block ships only when showThinking is on, marked so it is
+ * distinguishable. `redacted_thinking` carries no readable text and is
+ * dropped at collection time.
+ *
+ * Everything else here runs PER BLOCK, before the join, because that is where
+ * the streaming predecessor ran it (each block was a separate channel send):
+ *   1. scaffold-leak filter — a leak truncates its own block, not the turn, so
+ *      blocks after a `<system-reminder>` slip still ship;
+ *   2. bare-NO_REPLY drop — a block whose trailing line(s) are only the token
+ *      is dropped WHOLE (text, MEDIA: and STICKER: alike), so housekeeping
+ *      narration and its attachments never leak out of a mid-turn slip.
+ * Running either one over the joined string instead silently changes both:
+ * the scaffold cut eats every later block, and the NO_REPLY drop only fires
+ * when the token is the entire turn.
+ */
+export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: boolean): RenderedTurn {
+  const rendered: string[] = [];
+  let scaffoldFiltered = false;
+  // Tracks whether the last block that carried any content was a NO_REPLY
+  // block — a TRAILING one is load-bearing (see below), a mid-turn one is not.
+  let lastKeptWasNoReply = false;
+
+  for (const block of blocks) {
+    if (block.type === "thinking" && !showThinking) continue;
+
+    const scaffold = filterScaffoldLeak(block.text);
+    if (scaffold.filtered) scaffoldFiltered = true;
+    const text = scaffold.text.trim();
+    if (!text) continue;
+
+    if (endsWithTrailingNoReply(text)) {
+      lastKeptWasNoReply = true;
+      continue;
+    }
+    lastKeptWasNoReply = false;
+    rendered.push(block.type === "thinking" ? `${THINKING_MARKER}${text}` : text);
+  }
+
+  // NO_REPLY is Tomo's own control token, not the model's prose. A block whose
+  // trailing line(s) are the bare token MID-turn is a slip and is dropped —
+  // under per-block delivery the channels dropped it too. A TRAILING one is
+  // load-bearing: it marks the whole turn as not-for-the-channel (owner
+  // decision 2026-07-08), so exactly one is kept at the end for the delivery
+  // layer's trailing-NO_REPLY check to find.
+  const kept = lastKeptWasNoReply ? [...rendered, "NO_REPLY"] : rendered;
+
+  return { text: kept.join("\n").trim(), blocks: kept, scaffoldFiltered };
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number {
@@ -129,6 +210,10 @@ function isTextBlock(block: unknown): block is { type: "text"; text: string } {
   return isObject(block) && block.type === "text" && typeof block.text === "string";
 }
 
+function isThinkingBlock(block: unknown): block is { type: "thinking"; thinking: string } {
+  return isObject(block) && block.type === "thinking" && typeof block.thinking === "string";
+}
+
 function isToolUseBlock(block: unknown): block is { type: "tool_use"; id?: string; name: string; input?: Record<string, unknown> } {
   return isObject(block) && block.type === "tool_use" && typeof block.name === "string";
 }
@@ -171,7 +256,7 @@ export class LiveSession {
   private inputQueue: SDKUserMessage[] = [];
   private inputWaiter: (() => void) | null = null;
   // The request that owns the in-flight turn: its callbacks receive the
-  // stream and it resolves with the turn's full response.
+  // turn's collected blocks and it resolves with the turn's full response.
   private currentRequest: TurnRequest | null = null;
   // Steered requests confirmed merged into the in-flight turn (we saw the CLI
   // echo their message back mid-turn). Resolved with STEER_MERGED at result.
@@ -187,8 +272,7 @@ export class LiveSession {
   // send() callers waiting for the session to go idle (steered messages can
   // keep the session busy past the turn the agent-level queue saw finish).
   private idleWaiters: Array<() => void> = [];
-  private parts: string[] = [];
-  private streamingText = "";
+  private parts: ResponseBlock[] = [];
   private sessionId: string | null = null;
   private alive = true;
   lastResult: QueryResult | null = null;
@@ -199,6 +283,7 @@ export class LiveSession {
   private unownedTurnDropLogged = false;
   private unownedTurnFactory: UnownedTurnFactory | undefined;
   private timeoutMs: number;
+  private showThinking: boolean;
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -206,7 +291,6 @@ export class LiveSession {
   private pendingToolStarts = new Map<string, number>();
   /** Agent tool_use id → subagent_type, so a subagent's tool logs can name which agent ran them. */
   private subagentTypeById = new Map<string, string>();
-  private activeStreamBlockTypes = new Map<number, string>();
   private activityTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
@@ -220,6 +304,7 @@ export class LiveSession {
     this.turnBudget = turnBudget;
     this.unownedTurnFactory = unownedTurnFactory;
     this.timeoutMs = normalizeTimeoutMs(settings.timeoutMs);
+    this.showThinking = settings.showThinking ?? false;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -359,56 +444,20 @@ export class LiveSession {
       return;
     }
 
-    if (event.type === "stream_event") {
-      const se = event as unknown as {
-        event?: {
-          type: string;
-          index?: number;
-          content_block?: { type?: string };
-          delta?: { type: string; text?: string };
-        };
-      };
-      const streamEvent = se.event;
-
-      if (streamEvent?.type === "content_block_start" && typeof streamEvent.index === "number") {
-        const blockType = streamEvent.content_block?.type;
-        if (blockType) this.activeStreamBlockTypes.set(streamEvent.index, blockType);
-      }
-
-      if (streamEvent?.type === "content_block_delta" && streamEvent.delta?.type === "text_delta" && streamEvent.delta.text) {
-        const blockType = typeof streamEvent.index === "number"
-          ? this.activeStreamBlockTypes.get(streamEvent.index)
-          : undefined;
-        if (blockType === "text") {
-          this.streamingText += streamEvent.delta.text;
-          const req = this.currentRequest ?? this.claimUnownedTurn("stream_delta");
-          req?.onText?.(this.streamingText);
-        }
-      }
-
-      if (streamEvent?.type === "content_block_stop" && typeof streamEvent.index === "number") {
-        this.activeStreamBlockTypes.delete(streamEvent.index);
-      } else if (streamEvent?.type === "message_start" || streamEvent?.type === "message_stop") {
-        this.activeStreamBlockTypes.clear();
-      }
-    }
-
     if (event.type === "assistant" && event.message?.content) {
-      const hadStreamDeltas = this.streamingText.length > 0;
-      this.streamingText = "";
       for (const block of event.message.content) {
         if (isTextBlock(block)) {
-          const req = this.currentRequest ?? this.claimUnownedTurn("assistant_text");
-          this.parts.push(block.text);
-          // Some SDK-originated errors arrive as an assistant text block
-          // without preceding stream deltas. Push the full block into the
-          // channel stream before sealing it so the user sees the message.
-          if (!hadStreamDeltas) req?.onText?.(block.text);
-          // Signal block boundary so channels can seal the streamed message
-          // and start fresh on the next block (text → tool → text turns).
-          if (req?.onBlockComplete) {
-            await req.onBlockComplete(block.text);
-          }
+          // Claim the turn so an SDK-initiated (unowned) turn still has a
+          // request to resolve into at result time. Delivery itself happens
+          // once, after the turn completes — nothing ships per block.
+          if (!this.currentRequest) this.claimUnownedTurn("assistant_text");
+          this.parts.push({ type: "text", text: block.text });
+        } else if (isThinkingBlock(block)) {
+          // Kept as a typed block; whether it reaches the channel is decided
+          // by renderResponseBlocks from the TYPE, never from the text.
+          // `redacted_thinking` carries no readable text and never gets here.
+          if (!this.currentRequest) this.claimUnownedTurn("assistant_thinking");
+          this.parts.push({ type: "thinking", text: block.thinking });
         } else if (isToolUseBlock(block)) {
           if (block.id) this.pendingToolNames.set(block.id, block.name);
           if (block.id && (block.name === "Agent" || block.name === "Task")) {
@@ -486,18 +535,21 @@ export class LiveSession {
       // Await context usage before resolving so stats are complete
       await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
-      // Trim each block; drop empty ones; rejoin for the response string
-      // returned to callers (used for transcript storage and logging).
-      // Per-block delivery happens during the stream via `onBlockComplete`,
-      // not from this final snapshot.
-      const trimmed = this.parts.map((p) => p.trim()).filter((p) => p.length > 0);
-      const response = trimmed.join("\n").trim() || "I'm not sure how to respond to that.";
+      // The turn is over: render its collected content blocks into the one
+      // response callers deliver, transcribe and log. Block TYPE alone decides
+      // what is included (see renderResponseBlocks) — the text is never
+      // inspected.
+      const rendered = renderResponseBlocks(this.parts, this.showThinking);
+      if (rendered.scaffoldFiltered) {
+        log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
+      }
+      const response = rendered.text || "I'm not sure how to respond to that.";
+      const responseBlocks = rendered.blocks.length > 0 ? rendered.blocks : [response];
       this.parts = [];
-      this.streamingText = "";
-      this.activeStreamBlockTypes.clear();
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
       if (this.pendingSteers.length === 0) this.clearActivityTimeout();
+      req?.onBlocks?.(responseBlocks);
       await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
@@ -507,7 +559,7 @@ export class LiveSession {
       if (this.pendingSteers.length > 0) {
         // Steered messages that missed this turn's tool boundaries were
         // queued by the CLI and run next. Promote only the FIRST as the
-        // next turn's owner (its callbacks receive the stream); the rest
+        // next turn's owner (it resolves with that turn's response); the rest
         // stay pending — if the CLI batches them into the promoted turn we
         // detect it via replay echoes (see matchSteerEchoes), otherwise
         // they're promoted in order by subsequent results.
@@ -525,7 +577,7 @@ export class LiveSession {
   /**
    * Observability-only path for subagent events (parent_tool_use_id set):
    * log tool activity so subagent work shows up in the logs, but never touch
-   * turn state (parts/streamingText) or channel-facing callbacks.
+   * turn state (parts) or the owning request.
    */
   private logSubagentEvent(event: SDKMessage, agentName: string): void {
     if (event.type === "assistant" && event.message?.content) {
@@ -678,10 +730,9 @@ export class LiveSession {
 
   async send(
     text: string,
-    onText?: (text: string) => void,
     images?: Array<{ data: string; mediaType: string }>,
-    onBlockComplete?: (text: string) => void | Promise<void>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
+    onBlocks?: (blocks: string[]) => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -699,15 +750,12 @@ export class LiveSession {
     return new Promise<string>((resolve, reject) => {
       const req: MessageRequest = {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
-        onText,
-        onBlockComplete,
         resolve,
         reject,
+        ...(onBlocks ? { onBlocks } : {}),
       };
       this.currentRequest = req;
       this.parts = [];
-      this.streamingText = "";
-      this.activeStreamBlockTypes.clear();
       this.refreshActivityTimeout();
       this.pushInput(req.message);
     });
@@ -719,20 +767,18 @@ export class LiveSession {
    * if the turn has no boundary left, the CLI queues it and runs it as the
    * next turn. Resolution:
    *   - merged into the in-flight turn → resolves with STEER_MERGED; the
-   *     turn's owner request streams and resolves the combined response.
-   *   - ran as its own follow-up turn → resolves with that turn's response,
-   *     streamed through the callbacks passed here.
+   *     turn's owner request resolves with the combined response.
+   *   - ran as its own follow-up turn → resolves with that turn's response.
    * Falls back to a plain send() when no turn is in flight.
    */
   async steer(
     text: string,
-    onText?: (text: string) => void,
     images?: Array<{ data: string; mediaType: string }>,
-    onBlockComplete?: (text: string) => void | Promise<void>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
+    onBlocks?: (blocks: string[]) => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, onText, images, onBlockComplete, documents);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlocks);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -745,10 +791,9 @@ export class LiveSession {
         // explicitly so mid-turn injection (drained at tool boundaries via
         // getCommandsByMaxPriority("next")) doesn't depend on the default.
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
-        onText,
-        onBlockComplete,
         resolve,
         reject,
+        ...(onBlocks ? { onBlocks } : {}),
       };
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);

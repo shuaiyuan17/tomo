@@ -1,16 +1,25 @@
 import { existsSync } from "node:fs";
 import { log } from "../logger.js";
-import type { Channel, StreamingMessage } from "../channels/types.js";
-import { deliverTextParts } from "../channels/delivery.js";
+import type { Channel, OutgoingMessage, SendResult } from "../channels/types.js";
+import { deliverText } from "../channels/delivery.js";
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
-import { endsWithTrailingNoReply, extractAttachments, isSilentReply } from "./text-utils.js";
-import { filterScaffoldLeak } from "./scaffold-filter.js";
+import { endsWithTrailingNoReply, extractAttachments, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 
 interface DeliveryPipelineDeps {
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
 }
 
-type ParsedAttachments = ReturnType<typeof extractAttachments>;
+export interface DeliverOptions {
+  /** Thread the reply to this provider message id, if the channel supports it. */
+  replyTo?: string;
+  /**
+   * The turn's content blocks, in order (LiveSession's renderResponseBlocks).
+   * Attachment placement is defined per block: `A`, `MEDIA:x`, `B` ships
+   * A → photo → B, and a caption rides the media of its OWN block. Absent for
+   * callers that only have a string; then the whole response is one block.
+   */
+  blocks?: string[];
+}
 
 export function isAgentErrorResponse(response: string): boolean {
   const text = response.trim();
@@ -20,107 +29,129 @@ export function isAgentErrorResponse(response: string): boolean {
     || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
 }
 
+/**
+ * Outbound delivery for a completed turn.
+ *
+ * Delivery is non-streaming by design: the turn runs to completion,
+ * LiveSession renders its content blocks into one response string (block TYPE
+ * decides what is included — see live-session.ts renderResponseBlocks), and
+ * that string is delivered here as a single reply. Nothing in this file
+ * inspects the model's words to decide whether they are "really" a reply.
+ */
 export class DeliveryPipeline {
   constructor(private deps: DeliveryPipelineDeps) {}
 
   /**
-   * Finalize the streaming message after a turn completes. Per-block delivery
-   * happens during the run, so by the time this runs the stream's only
-   * remaining job is flushing any trailing buffer state. Callers with a
-   * different silent-reply policy (see TurnRunner's silent matchers) pass
-   * their own `isSilent`.
+   * Deliver a completed turn's response to a chat.
+   *
+   * Order matters: silence and agent errors are classified on the response as
+   * the model produced it, then trailing bare-NO_REPLY suppression runs, then
+   * whatever survives ships. Callers with a different silent-reply policy (see
+   * TurnRunner's silent matchers) pass their own `isSilent`.
    */
   async deliverResponse(
     sessionKey: string,
     replyChannel: Channel,
     replyChatId: string,
     response: string,
-    stream: StreamingMessage,
     isSilent: (response: string) => boolean = isSilentReply,
+    options: DeliverOptions = {},
   ): Promise<void> {
-    log.info({ channel: replyChannel.name, session: sessionKey }, "Tomo: %s", response);
-
-    if (isSilent(response)) {
-      log.info("Silent reply (no message sent)");
-      await stream.cancel();
-      return;
-    }
-
     if (isAgentErrorResponse(response)) {
       const visibleError = `[error] ${response}`;
       this.deps.queuePendingErrorNote(sessionKey, visibleError);
-      await stream.cancel();
       await replyChannel.send({ chatId: replyChatId, text: visibleError });
       return;
     }
 
-    await stream.finish();
+    // A response whose trailing line(s) are bare NO_REPLY ships NOTHING — no
+    // text, no media, no stickers (owner decision 2026-07-08). The agent
+    // narrates housekeeping turns and ends with NO_REPLY, and that narration
+    // is not for the channel. Only TRAILING lines are inspected, so prose that
+    // merely mentions NO_REPLY mid-line still delivers (#222).
+    const { visible, hadTrailingNoReply } = stripTrailingNoReply(response);
+    if (hadTrailingNoReply || isSilent(response) || !visible.trim()) {
+      log.info("Silent reply (no message sent)");
+      return;
+    }
+
+    await this.deliverAssistantContent(replyChannel, replyChatId, options.blocks ?? [visible], options);
   }
 
   /**
-   * Deliver assistant text that bypasses StreamingMessage. Caption text rides
-   * with the first MEDIA send; plain text is split the same way streamed text is.
+   * Ship a turn's content blocks in order.
+   *
+   * Attachments are extracted PER BLOCK, never from the joined turn, so a
+   * block's MEDIA:/STICKER: lands where the model put it: `A`, `MEDIA:x`, `B`
+   * ships A → photo → B, and a caption rides the media of its own block only.
+   * Adjacent text-only blocks are merged into ONE send, so the common all-text
+   * turn is still exactly one message with its newlines inside the bubble.
+   * Reply threading targets the first message that actually SHIPS THREADED,
+   * whatever its kind — a step that sends nothing, or a channel that cannot
+   * thread that kind of message, leaves the target for the next one.
    */
   async deliverAssistantContent(
     channel: Channel,
     chatId: string,
-    text: string,
-    parsed: ParsedAttachments = extractAttachments(text),
+    blocks: string[],
+    options: DeliverOptions = {},
   ): Promise<void> {
-    const { cleanText, mediaPaths, stickerIds } = parsed;
-    const validPaths = mediaPaths.filter((path) => existsSync(path));
-    const caption = restoreLiteralNewlines(cleanText);
-    let textSent = false;
-
-    for (const [i, path] of validPaths.entries()) {
-      await channel.send({ chatId, photo: path, text: i === 0 ? caption : "" });
-      if (i === 0 && caption) textSent = true;
-    }
-
-    if (!textSent) {
-      await deliverTextParts(channel, chatId, cleanText);
-    }
-
-    for (const stickerId of stickerIds) {
-      await channel.send({ chatId, text: "", sticker: stickerId });
-    }
-  }
-
-  /**
-   * Build the per-block handler passed to the live session. Channel-side
-   * delivery errors are caught here so they never kill the SDK event loop and
-   * cause a duplicate turn retry.
-   */
-  makeBlockHandler(
-    channel: Channel,
-    chatId: string,
-    stream: StreamingMessage,
-  ): (text: string) => Promise<void> {
-    return async (rawBlockText: string) => {
-      try {
-        if (isAgentErrorResponse(rawBlockText)) {
-          await stream.cancel();
-          return;
-        }
-        const scaffold = filterScaffoldLeak(rawBlockText);
-        if (scaffold.filtered) log.warn({ channel: channel.name }, "model scaffold leak filtered");
-        const blockText = scaffold.text;
-        const attachments = extractAttachments(blockText);
-        if (attachments.mediaPaths.length > 0 || attachments.stickerIds.length > 0) {
-          await stream.discardBlock();
-          // Attachment blocks bypass the StreamingMessage (and therefore the
-          // channels' trailing-NO_REPLY suppression), so enforce the semantics
-          // here: a block whose trailing line(s) are bare NO_REPLY ships
-          // NOTHING — no text, no media, no stickers (owner decision
-          // 2026-07-08). The stream buffer is already discarded above.
-          if (endsWithTrailingNoReply(blockText)) return;
-          await this.deliverAssistantContent(channel, chatId, blockText, attachments);
-          return;
-        }
-        await stream.commitBlock();
-      } catch (err) {
-        log.warn({ err, channel: channel.name }, "Block delivery failed");
-      }
+    // Thread only the FIRST shipped message — one reply, not one per send.
+    //
+    // "Shipped" is the whole difficulty. A step can decline to send (an empty
+    // text run, a tag-only block whose MEDIA: path does not exist) and a
+    // channel can send without threading (imsg stickers). Either way the
+    // target must survive to the next send, so it is offered to each send and
+    // only retired once a send confirms it took it.
+    let pendingReplyTo = options.replyTo;
+    const offerReplyTo = (): { replyTo?: string } => (pendingReplyTo ? { replyTo: pendingReplyTo } : {});
+    /**
+     * `null` = nothing shipped; `threaded: false` = shipped but the channel
+     * could not thread it. Both keep the target pending.
+     */
+    const settleReplyTo = (result: SendResult | null | void): void => {
+      if (result && result.threaded !== false) pendingReplyTo = undefined;
     };
+    /** channel.send returns nothing on the happy path; that counts as taken. */
+    const send = async (message: OutgoingMessage): Promise<void> => {
+      settleReplyTo(await channel.send(message) ?? {});
+    };
+
+    let textRun: string[] = [];
+    const flushTextRun = async () => {
+      if (textRun.length === 0) return;
+      const merged = textRun.join("\n");
+      textRun = [];
+      settleReplyTo(await deliverText(channel, chatId, merged, offerReplyTo()));
+    };
+
+    for (const block of blocks) {
+      // Defence in depth: the per-block bare-NO_REPLY drop already happened in
+      // renderResponseBlocks, but callers that hand us raw text get it here too.
+      if (endsWithTrailingNoReply(block)) continue;
+
+      const { cleanText, mediaPaths, stickerIds } = extractAttachments(block);
+      if (mediaPaths.length === 0 && stickerIds.length === 0) {
+        // No tags stripped, so no blank line to collapse: ship it verbatim.
+        if (block.trim()) textRun.push(block);
+        continue;
+      }
+
+      await flushTextRun();
+
+      const validPaths = mediaPaths.filter((path) => existsSync(path));
+      const caption = restoreLiteralNewlines(cleanText).trim();
+      let captionSent = false;
+      for (const [i, path] of validPaths.entries()) {
+        await send({ chatId, photo: path, text: i === 0 ? caption : "", ...offerReplyTo() });
+        if (i === 0 && caption) captionSent = true;
+      }
+      if (!captionSent) settleReplyTo(await deliverText(channel, chatId, cleanText, offerReplyTo()));
+      for (const stickerId of stickerIds) {
+        await send({ chatId, text: "", sticker: stickerId, ...offerReplyTo() });
+      }
+    }
+
+    await flushTextRun();
   }
 }

@@ -1,12 +1,10 @@
 /**
- * Placeholder the assistant can use when it wants a literal newline to remain
- * inside one outbound chat message instead of acting as a message separator.
+ * Placeholder the assistant emits when it wants a literal newline in an
+ * outbound message. Outbound replies now ship as one message with their
+ * newlines intact, so the token is redundant — but the model has been trained
+ * to emit it, so it is still rewritten to a real newline and must never
+ * reach a chat literally.
  */
-export const LITERAL_NEWLINE_TOKEN = "[[NL]]";
-
-const LITERAL_NEWLINE_SENTINEL = "\0TOMO_LITERAL_NEWLINE\0";
-// Models often write the token at the end of a source line; that physical
-// newline is formatting, not an extra message separator.
 const LITERAL_NEWLINE_TOKEN_RE = /\[\[NL\]\](?:[ \t]*(?:\r\n|\r|\n))?/g;
 
 export function restoreLiteralNewlines(text: string): string {
@@ -81,15 +79,6 @@ export function formatReplyContextMarker(originalText?: string): string {
     ? `${points.slice(0, REPLY_CONTEXT_EXCERPT_LIMIT).join("").trimEnd()}…`
     : sanitized;
   return `[replying to: "${excerpt}"]`;
-}
-
-export function splitOutboundMessageText(text: string): string[] {
-  if (!text) return [];
-  const protectedText = text.replace(LITERAL_NEWLINE_TOKEN_RE, LITERAL_NEWLINE_SENTINEL);
-  return protectedText
-    .split(/\r\n|\r|\n/g)
-    .map((part) => part.replaceAll(LITERAL_NEWLINE_SENTINEL, "\n").trim())
-    .filter((part) => part.length > 0);
 }
 
 /**

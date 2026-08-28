@@ -1733,11 +1733,14 @@ export class ImsgChannel implements Channel {
    * Send a file, optionally threaded to `replyTo` and optionally followed by a
    * caption as its own message (iMessage attachments carry no caption field).
    *
-   * Returns `{ threaded: false }` whenever a `replyTo` was asked for and the
-   * picture did NOT go out threaded — bridge down, RPC refusal, or the file
-   * missing so nothing shipped at all. The caller needs that: it hands the
-   * target to exactly one message, and before this the channel dropped it
-   * silently, leaving both the photo and the text after it unthreaded.
+   * Returns `{ threaded: false }` only when a `replyTo` was asked for and
+   * NEITHER the picture NOR its caption went out threaded — bridge down, RPC
+   * refusal with no caption to fall back to, or the file missing so nothing
+   * shipped at all. If the picture could not thread but a caption follows, the
+   * caption is offered the target and ITS result is what this method returns.
+   * The caller needs an honest answer either way: it hands the target to
+   * exactly one message, and before this the channel dropped it silently,
+   * leaving both the photo and the text after it unthreaded.
    *
    * The caption follow-up is threaded only as a FALLBACK. Behind a threaded
    * picture it ships plain — one reply per turn, and the picture already is

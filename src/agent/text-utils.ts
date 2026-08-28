@@ -42,7 +42,6 @@ export function endsWithTrailingNoReply(text: string): boolean {
 
 export const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
 export const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
-export const ATTACHMENT_TAG_RE = /\b(?:MEDIA|STICKER):\s*(?:"[^"\n]+"|[^\s\n"]+)/gi;
 
 export function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
   const mediaPaths: string[] = [];

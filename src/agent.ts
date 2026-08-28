@@ -22,7 +22,7 @@ import { log } from "./logger.js";
 import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
 import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
-import { isSilentReply, ATTACHMENT_TAG_RE } from "./agent/text-utils.js";
+import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
@@ -687,7 +687,6 @@ export class Agent {
     if (!target) return undefined;
 
     const { channel, chatId } = target;
-    const stream = channel.createStreamingMessage(chatId);
     const stopTyping = this.startTurnTyping(channel, chatId, this.isPassiveReplyTarget(channel.name, chatId));
     let settled = false;
 
@@ -700,8 +699,6 @@ export class Agent {
     };
 
     return {
-      onText: (text) => stream.update(text.replace(ATTACHMENT_TAG_RE, "").trim()),
-      onBlockComplete: this.delivery.makeBlockHandler(channel, chatId, stream),
       resolve: async (response) => {
         if (settled) return;
         settled = true;
@@ -715,14 +712,10 @@ export class Agent {
               timestamp: Date.now(),
             });
           }
-          await this.delivery.deliverResponse(key, channel, chatId, response, stream);
+          log.info({ channel: channel.name, session: key }, "Tomo: %s", response);
+          await this.delivery.deliverResponse(key, channel, chatId, response);
         } catch (err) {
           log.error({ err, key }, "Background task response delivery failed");
-          try {
-            await stream.cancel();
-          } catch {
-            // Best effort: the delivery failure was already logged above.
-          }
         } finally {
           await stop();
         }
@@ -731,13 +724,7 @@ export class Agent {
         if (settled) return;
         settled = true;
         log.error({ err, key }, "Background task turn failed");
-        try {
-          await stream.cancel();
-        } catch {
-          // Best effort; keep the SDK event loop alive.
-        } finally {
-          await stop();
-        }
+        await stop();
       },
     };
   }
@@ -897,7 +884,7 @@ export class Agent {
       stampChannelName: req.sourceChannelName,
       typing: { channel: req.replyChannel, chatId: req.replyChatId, passiveListen: req.passiveListen },
       delivery: {
-        kind: "stream",
+        kind: "reply",
         channel: req.replyChannel,
         chatId: req.replyChatId,
         replyToMessageId: req.replyToMessageId,
@@ -1206,7 +1193,6 @@ export class Agent {
       silentMatcher: isSilentReply,
       silentLog: "Cron completed silently (no reply sent)",
       transcript: "on-delivery",
-      logResponse: (response) => log.info({ channel: deliveryChannel.name }, "Tomo: %s", response),
       errors: {
         visiblePrefix: "[error] cron failed: ",
         response: suppressErrorDelivery ? "note-only" : "deliver",
@@ -1303,7 +1289,6 @@ export class Agent {
       },
       silentMatcher: isSilentReply,
       transcript: "on-delivery",
-      logResponse: (response) => log.info("Continuity response: %s", response.slice(0, 100)),
       errors: {
         visiblePrefix: "[error] continuity failed: ",
         response: "note-only",

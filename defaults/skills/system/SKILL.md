@@ -69,11 +69,13 @@ Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tom
 
 ## Harness Features
 
-### Streaming
-Responses stream to Telegram in real-time — messages update every 1.5s as tokens arrive.
+### One reply, one message
+Replies are not streamed. The turn runs to completion and its `text` content blocks are delivered as a **single** chat message, newlines included — a line break is formatting, not a message boundary. Replies longer than the channel's per-message cap (iMessage 4000, Telegram 4096) are chunked at a word boundary; nothing is truncated. Caption text before a `MEDIA:` tag rides with the media as one captioned message.
 
-### Message splitting (newlines)
-A newline in your reply splits the text into **separate chat messages** — natural texting rhythm instead of one block with linebreaks. Blank lines are separators (no empty messages are sent); each piece is trimmed. To keep a line break *inside* a single message (e.g. a code snippet or a list that must stay together), use the literal token `[[NL]]` — the harness restores it to a real newline and does **not** split there. Caption text before a `MEDIA:` tag still rides with the media as one captioned message rather than being split.
+The legacy `[[NL]]` token is still rewritten to a real newline, so it never ships literally — but it is no longer needed.
+
+### Thinking blocks
+Your `thinking` content blocks are dropped before delivery by default. Nothing inspects your reply text to guess what is reasoning: whatever you put in a `text` block ships verbatim, even a single word like `count`. Set `showThinking: true` (or `TOMO_SHOW_THINKING=true`) to have thinking delivered too, prefixed with `💭`.
 
 ### Message steering
 By default, user messages that arrive during a long tool-using turn are injected into the in-flight turn at the next tool-call boundary instead of waiting behind it. Use this to treat mid-task corrections like "stop", "wait", or added context as immediately relevant. If there is no remaining tool boundary, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns still queue normally. Set `steering: false` in `~/.tomo/config.json` to keep mid-turn user messages queued.

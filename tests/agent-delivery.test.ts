@@ -24,9 +24,13 @@ import {
 
 installAgentTestHooks();
 
-// ===== Per-block streaming delivery (iMessage + Telegram) =====
+// ===== Outbound delivery, end to end (iMessage + Telegram) =====
+//
+// Delivery is non-streaming: the turn runs to completion, its content blocks
+// are rendered into one response, and that response ships as ONE channel
+// message (newlines and all). Nothing pattern-matches the model's words.
 
-describe("per-block streaming delivery", () => {
+describe("outbound delivery", () => {
   it("iMessage ships a single-block response as one message", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
@@ -44,29 +48,25 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
-  it("iMessage ships each text block separately on multi-block turns", async () => {
+  it("joins a multi-block turn into one iMessage", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
-    // Three text blocks in a single turn (e.g. text → tool → text → tool → text).
-    // Without per-block ship, only the last block would survive the streaming
-    // buffer reset; with it, every block lands as its own message.
+    // Three text blocks in a single turn (text → tool → text → tool → text).
+    // One turn is one reply, so they arrive as one message, not three.
     mockSdk.responseFn = () => ["first block", "second block", "third block"];
 
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(3);
-    expect(im.delivered.map((d) => d.text)).toEqual(["first block", "second block", "third block"]);
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("first block\nsecond block\nthird block");
 
     await agent.stop();
   });
 
-  it("Telegram ships each text block as its own streamed message", async () => {
-    // Telegram now matches iMessage in shape: each block becomes its own
-    // sendMessage. Edit-in-place still applies *within* a block as deltas
-    // arrive; commitBlock seals it before the next block starts.
+  it("joins a multi-block turn into one Telegram message", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -76,13 +76,13 @@ describe("per-block streaming delivery", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.delivered).toHaveLength(3);
-    expect(tg.delivered.map((d) => d.text)).toEqual(["alpha", "beta", "gamma"]);
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toBe("alpha\nbeta\ngamma");
 
     await agent.stop();
   });
 
-  it("splits newline-delimited text within a block into separate iMessages", async () => {
+  it("keeps a three-line reply in one iMessage with its newlines", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
@@ -92,27 +92,29 @@ describe("per-block streaming delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered.map((d) => d.text)).toEqual(["line A", "line B", "line C"]);
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("line A\nline B\nline C");
 
     await agent.stop();
   });
 
-  it("trims newline-split pieces and drops blank Telegram messages", async () => {
+  it("delivers interior blank lines verbatim instead of splitting on them", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    mockSdk.responseFn = () => "  first burst  \n\n \n  second burst  ";
+    mockSdk.responseFn = () => "  first burst\n\nsecond burst  ";
 
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.delivered.map((d) => d.text)).toEqual(["first burst", "second burst"]);
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toBe("first burst\n\nsecond burst");
 
     await agent.stop();
   });
 
-  it("keeps [[NL]] as a literal newline within one outbound message", async () => {
+  it("rewrites [[NL]] to a real newline and never ships the token literally", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
@@ -122,7 +124,45 @@ describe("per-block streaming delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered.map((d) => d.text)).toEqual(["intro\ndetail", "next"]);
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("intro\ndetail\nnext");
+    expect(im.delivered[0].text).not.toContain("[[NL]]");
+
+    await agent.stop();
+  });
+
+  it("delivers a one-word `count` reply verbatim (#291 P1)", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockSdk.responseFn = () => "count";
+
+    await im.simulateMessage(makeMsg({
+      chatId: "iMessage;-;+15551112222",
+      text: "translate 计数 to English, one word",
+    }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("count");
+
+    await agent.stop();
+  });
+
+  it("delivers a text block that opens with 思考: verbatim (#291 P1)", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    const reply = "思考: 我建议分两步。 第一步先备份。 第二步再迁移。";
+    mockSdk.responseFn = () => reply;
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "怎么做" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe(reply);
 
     await agent.stop();
   });
@@ -175,7 +215,7 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
-  it("does not stream text-shaped deltas from thinking blocks", async () => {
+  it("drops thinking blocks by default, whatever their text looks like", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -188,8 +228,28 @@ describe("per-block streaming delivery", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.streamUpdates.map((d) => d.text)).toEqual(["public answer"]);
-    expect(tg.delivered.map((d) => d.text)).toEqual(["public answer"]);
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toBe("public answer");
+
+    await agent.stop();
+  });
+
+  it("delivers thinking blocks, marked, when showThinking is on", async () => {
+    resetConfig({ showThinking: true });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => [
+      { type: "thinking", thinking: "the user probably wants X" },
+      "public answer",
+    ];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toBe("💭 the user probably wants X\npublic answer");
 
     await agent.stop();
   });
@@ -209,9 +269,7 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
-  it("drops a NO_REPLY block but ships the others around it", async () => {
-    // Mid-turn NO_REPLY (e.g. a tool-only block whose text resolved to bare
-    // NO_REPLY) is suppressed by both channels' streaming guards.
+  it("drops a mid-turn bare NO_REPLY block but keeps the blocks around it", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
@@ -221,8 +279,25 @@ describe("per-block streaming delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered).toHaveLength(2);
-    expect(im.delivered.map((d) => d.text)).toEqual(["before", "after"]);
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("before\nafter");
+
+    await agent.stop();
+  });
+
+  it("suppresses the whole turn when its LAST block is a bare NO_REPLY", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    // Housekeeping narration that ends with the token is not for the channel
+    // (owner decision 2026-07-08) — nothing ships, not even the narration.
+    mockSdk.responseFn = () => ["did the housekeeping", "NO_REPLY"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(0);
 
     await agent.stop();
   });
@@ -245,46 +320,29 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
-  it("regression: a throwing commitBlock does not kill the live session", async () => {
-    // onBlockComplete fires inside the SDK event loop. If commitBlock throws
-    // (e.g. a transient channel transport error), the error must not propagate
-    // into LiveSession.consumeEvents — that would mark the session dead and
-    // trip runWithRetry's "session error" branch, double-firing the turn.
+  it("regression: a failing channel send does not re-run the turn", async () => {
+    // Delivery happens after the turn resolves, outside the SDK event loop,
+    // so a channel failure must surface as an error message — never as a
+    // session reset that re-runs the turn (and repeats its side effects).
     const agent = new Agent();
     const im = new MockChannel("imessage");
-
-    // Override commitBlock to throw on the first call only. The test verifies
-    // the turn still resolves cleanly, the response is captured, and the
-    // session isn't restarted (would manifest as queryState.maxConcurrent > 1
-    // or duplicate deliveries).
-    let firstCall = true;
-    const origCreate = im.createStreamingMessage.bind(im);
-    im.createStreamingMessage = (chatId: string, replyTo?: string) => {
-      const stream = origCreate(chatId, replyTo);
-      const realCommit = stream.commitBlock.bind(stream);
-      stream.commitBlock = async () => {
-        if (firstCall) {
-          firstCall = false;
-          throw new Error("transient channel transport error");
-        }
-        return realCommit();
-      };
-      return stream;
+    let firstSend = true;
+    const realSend = im.send.bind(im);
+    im.send = async (msg) => {
+      if (firstSend) {
+        firstSend = false;
+        throw new Error("transient iMessage transport error");
+      }
+      return realSend(msg);
     };
     agent.addChannel(im);
 
-    mockSdk.responseFn = () => ["block-a", "block-b"];
+    mockSdk.responseFn = () => "the reply";
 
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    // Block A's commit threw → no delivery for A. Block B succeeds.
-    // (We don't assert on A specifically — just that the turn didn't double-fire.)
     expect(queryState.maxConcurrent).toBe(1);
-    // Exactly one block delivered (block-b). Block-a was lost to the thrown
-    // commitBlock, but the run completed instead of restarting.
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("block-b");
 
     await agent.stop();
   });

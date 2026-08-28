@@ -218,6 +218,7 @@ export class LiveSessionManager {
 
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {
       timeoutMs: config.liveSessionTimeoutMs,
+      showThinking: config.showThinking,
     });
     this.liveSessions.set(key, session);
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
@@ -316,21 +317,13 @@ export class LiveSessionManager {
   }
 
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
-    const {
-      key,
-      prompt,
-      onText,
-      images,
-      onBlockComplete,
-      documents,
-      steer = false,
-    } = req;
+    const { key, prompt, images, documents, steer = false } = req;
 
     try {
       const session = await this.getOrCreateLiveSession(key);
       const response = steer
-        ? await session.steer(prompt, onText, images, onBlockComplete, documents)
-        : await session.send(prompt, onText, images, onBlockComplete, documents);
+        ? await session.steer(prompt, images, documents)
+        : await session.send(prompt, images, documents);
 
       // Merged into another request's in-flight turn — that turn's owner
       // does the per-turn bookkeeping (stats, compact triggers) when it
@@ -378,7 +371,7 @@ export class LiveSessionManager {
         }
 
         const session = await this.getOrCreateLiveSession(key);
-        const response = await session.send(prompt, onText, images, onBlockComplete, documents);
+        const response = await session.send(prompt, images, documents);
         this.recordTurnCompletion(key, session);
         return response;
       }

@@ -3,7 +3,7 @@ import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import { STEER_MERGED } from "./live-session.js";
-import { ATTACHMENT_TAG_RE, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
+import { isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
 import { filterScaffoldLeak } from "./scaffold-filter.js";
 
@@ -11,9 +11,7 @@ import { filterScaffoldLeak } from "./scaffold-filter.js";
 export interface RunWithRetryRequest {
   key: string;
   prompt: string;
-  onText?: (text: string) => void;
   images?: Array<{ data: string; mediaType: string }>;
-  onBlockComplete?: (text: string) => void | Promise<void>;
   documents?: Array<{ data: string; mediaType: string; filename?: string }>;
   steer?: boolean;
 }
@@ -29,9 +27,12 @@ export function embeddedSilentMatcher(response: string): boolean {
   return isSilentReply(response) || response.includes("NO_REPLY");
 }
 
-/** Streamed delivery with per-block handling (user turns). */
-export interface StreamTurnDelivery {
-  kind: "stream";
+/**
+ * Delivery back to the chat the turn came from (user turns). Carries the
+ * turn's inbound attachments and its reply-threading target.
+ */
+export interface ReplyTurnDelivery {
+  kind: "reply";
   channel: Channel;
   chatId: string;
   replyToMessageId?: string;
@@ -41,7 +42,7 @@ export interface StreamTurnDelivery {
   steer?: boolean;
 }
 
-/** Non-streaming delivery to a target resolved before the turn (cron turns). */
+/** Delivery to a target resolved before the turn (cron turns). */
 export interface SendTurnDelivery {
   kind: "send";
   channel: Channel;
@@ -53,23 +54,21 @@ export interface SendTurnDelivery {
   suppressedLog?: string;
 }
 
-/** Non-streaming delivery whose target is resolved only after a non-silent,
- *  non-error response (continuity turns). */
+/** Delivery whose target is resolved only after a non-silent, non-error
+ *  response (continuity turns). */
 export interface DeferredSendTurnDelivery {
   kind: "deferred-send";
   resolveTarget(): { channel: Channel; chatId: string } | undefined;
 }
 
-export type TurnDelivery = StreamTurnDelivery | SendTurnDelivery | DeferredSendTurnDelivery;
+export type TurnDelivery = ReplyTurnDelivery | SendTurnDelivery | DeferredSendTurnDelivery;
 
 export interface TurnErrorPolicy {
   /** Prefix for pending error notes and user-visible error messages,
    *  e.g. "[error] " or "[error] cron failed: ". */
   visiblePrefix: string;
-  /** Agent-error RESPONSE handling on send/deferred-send turns. "deliver"
-   *  sends the visible error to the chat; "note-only" only queues the pending
-   *  error note. Stream turns ignore this — DeliveryPipeline.deliverResponse
-   *  owns their error handling. */
+  /** Agent-error RESPONSE handling. "deliver" sends the visible error to the
+   *  chat; "note-only" only queues the pending error note. */
   response: "deliver" | "note-only";
   /** log.warn message when a response error is kept out of the chat. */
   responseSuppressedLog?: string;
@@ -105,9 +104,6 @@ export interface TurnSpec {
    *  recorded — an unrecorded delivery is invisible to recall_conversation
    *  (#203). */
   transcript: "always" | "on-delivery";
-  /** Response logging for non-streaming turns (stream turns log inside
-   *  DeliveryPipeline.deliverResponse). */
-  logResponse?: (response: string) => void;
   errors: TurnErrorPolicy;
 }
 
@@ -170,11 +166,7 @@ export class TurnRunner {
           ? injectTimestamp(spec.prompt, spec.stampChannelName)
           : spec.prompt);
 
-      if (spec.delivery.kind === "stream") {
-        ok = await this.runStreamTurn(spec, spec.delivery, prompt, stopTyping);
-      } else {
-        ok = await this.runSendTurn(spec, spec.delivery, prompt, stopTyping);
-      }
+      ok = await this.runDelivery(spec, prompt, stopTyping);
       return ok;
     } catch (err) {
       ok = await this.handleThrownError(spec, err, stopTyping);
@@ -190,77 +182,61 @@ export class TurnRunner {
     }
   }
 
-  private async runStreamTurn(
+  /**
+   * Run the turn, then deliver its response once. There is no per-block or
+   * per-token path: every ingress (user, cron, continuity) waits for the turn
+   * to complete and ships the rendered response as one reply.
+   */
+  private async runDelivery(
     spec: TurnSpec,
-    delivery: StreamTurnDelivery,
     prompt: string,
     stopTyping: StopTyping,
   ): Promise<boolean> {
-    const stream = delivery.channel.createStreamingMessage(delivery.chatId, delivery.replyToMessageId);
+    const delivery = spec.delivery;
+    const reply = delivery.kind === "reply" ? delivery : undefined;
+
     const rawResponse = await this.deps.runWithRetry({
       key: spec.key,
       prompt,
-      // Filter scaffold leaks from streamed updates too — `text` is the
-      // block's cumulative text, so once a marker appears every subsequent
-      // draft edit stays truncated (logging happens once, on the response).
-      onText: (text) => stream.update(filterScaffoldLeak(text).text.replace(ATTACHMENT_TAG_RE, "").trim()),
-      images: delivery.images,
-      onBlockComplete: this.deps.delivery.makeBlockHandler(delivery.channel, delivery.chatId, stream),
-      documents: delivery.documents,
-      steer: delivery.steer,
+      ...(reply
+        ? { images: reply.images, documents: reply.documents, steer: reply.steer }
+        : {}),
     });
-    const response = this.applyScaffoldFilter(spec.key, rawResponse);
 
-    if (delivery.steer && rawResponse === STEER_MERGED) {
+    if (reply?.steer && rawResponse === STEER_MERGED) {
       // Steered message merged into the in-flight turn — that turn's owner
-      // streams and records the combined reply; nothing to deliver here.
+      // records and delivers the combined reply; nothing to deliver here.
       await stopTyping({ clear: true });
-      await stream.cancel();
       return true;
     }
 
-    if (spec.transcript === "always") {
-      this.deps.appendAssistantTranscript(spec.key, response, delivery.channel.name);
-    }
+    const response = this.applyScaffoldFilter(spec.key, rawResponse);
+    // One response log per turn, whatever the ingress and whether or not the
+    // response ships (silent and suppressed turns still get a line). The
+    // channel label comes from the delivery spec, never from resolveTarget —
+    // deferred-send turns must not resolve a target for a response that is
+    // about to be suppressed.
+    const logChannel = delivery.kind === "deferred-send" ? undefined : delivery.channel.name;
+    log.info({ channel: logChannel, session: spec.key }, "Tomo: %s", response);
 
-    await this.deps.delivery.deliverResponse(
-      spec.key,
-      delivery.channel,
-      delivery.chatId,
-      response,
-      stream,
-      spec.silentMatcher,
-    );
-    await stopTyping({ clear: true });
-    return true;
-  }
-
-  private async runSendTurn(
-    spec: TurnSpec,
-    delivery: SendTurnDelivery | DeferredSendTurnDelivery,
-    prompt: string,
-    stopTyping: StopTyping,
-  ): Promise<boolean> {
-    const response = this.applyScaffoldFilter(
-      spec.key,
-      await this.deps.runWithRetry({ key: spec.key, prompt }),
-    );
-
-    // Send turns have no per-block delivery (unlike stream turns' onBlockComplete
-    // — see makeBlockHandler): the whole multi-block response arrives joined
-    // into one string. Trailing bare-NO_REPLY line(s) silence the ENTIRE turn
-    // by design (owner decision 2026-07-08): the agent narrates housekeeping
-    // turns and ends with NO_REPLY, and that narration is not for the channel —
-    // previously the narration plus the literal "NO_REPLY" text leaked. Only
+    // Trailing bare-NO_REPLY line(s) silence the ENTIRE response by design
+    // (owner decision 2026-07-08): the agent narrates housekeeping turns and
+    // ends with NO_REPLY, and that narration is not for the channel. Only
     // trailing lines are inspected, so prose that merely *mentions* NO_REPLY
-    // mid-line still delivers — that's all that remains of the #222 protection.
-    // The accepted tradeoff: a substantive reply that erroneously ends with a
-    // bare NO_REPLY line is eaten whole; the agent's contract is to never end
-    // a real reply with the token. `response` (unstripped) still drives the
-    // error/log checks below so they see the model's literal output.
+    // mid-line still delivers — that's all that remains of the #222
+    // protection. The accepted tradeoff: a substantive reply that erroneously
+    // ends with a bare NO_REPLY line is eaten whole; the agent's contract is
+    // to never end a real reply with the token. `response` (unstripped) still
+    // drives the error checks below so they see the model's literal output.
     const { visible: deliverText, hadTrailingNoReply } = stripTrailingNoReply(response);
     const silent = hadTrailingNoReply || deliverText.length === 0 || spec.silentMatcher(deliverText);
-    spec.logResponse?.(response);
+
+    // "always" records the model's literal output even when it never ships
+    // (user turns keep silent and error text in the transcript); "on-delivery"
+    // records only what actually reached the chat (#203).
+    if (spec.transcript === "always" && reply) {
+      this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
+    }
 
     if (isAgentErrorResponse(response)) {
       const visibleError = `${spec.errors.visiblePrefix}${response}`;
@@ -285,15 +261,24 @@ export class TurnRunner {
     }
 
     if (silent) {
-      if (spec.silentLog) log.info(spec.silentLog);
+      log.info(spec.silentLog ?? "Silent reply (no message sent)");
       await stopTyping({ clear: true });
       return true;
     }
 
     const target = this.resolveSendTarget(delivery);
     if (target) {
-      this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
-      await this.deps.delivery.deliverAssistantContent(target.channel, target.chatId, deliverText);
+      if (spec.transcript === "on-delivery") {
+        this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+      }
+      await this.deps.delivery.deliverResponse(
+        spec.key,
+        target.channel,
+        target.chatId,
+        deliverText,
+        spec.silentMatcher,
+        reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+      );
     }
     await stopTyping({ clear: true });
     return true;

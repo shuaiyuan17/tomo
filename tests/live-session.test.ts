@@ -88,7 +88,7 @@ const { LiveSession, STEER_MERGED } = await import("../src/agent/live-session.js
 const { log } = await import("../src/logger.js");
 const TIMEOUT_MS = 10 * 60 * 1000;
 
-function makeSession(settings?: { timeoutMs?: number }) {
+function makeSession(settings?: { timeoutMs?: number; showThinking?: boolean }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
   return { session, harness };
@@ -107,6 +107,7 @@ async function flushMicrotasks(times = 5): Promise<void> {
 }
 
 const textBlock = (text: string) => ({ type: "text", text });
+const thinkingBlock = (thinking: string) => ({ type: "thinking", thinking, signature: "sig" });
 const assistantEvent = (text: string) => ({ type: "assistant", message: { content: [textBlock(text)] } });
 const toolUseBlock = (name: string, id: string, input: Record<string, unknown> = {}) => ({ type: "tool_use", id, name, input });
 const assistantToolEvent = (name: string, id: string, input?: Record<string, unknown>) => ({
@@ -374,12 +375,11 @@ describe("LiveSession steering", () => {
 
   it("runs a steered message as its own follow-up turn when it misses the in-flight turn", async () => {
     const { session, harness } = makeSession();
-    const steeredBlocks: string[] = [];
 
     const p1 = session.send("first");
     await waitFor(() => harness.inputs.length === 1);
 
-    const p2 = session.steer("second", undefined, undefined, (t) => { steeredBlocks.push(t); });
+    const p2 = session.steer("second");
     await waitFor(() => harness.inputs.length === 2);
 
     // Turn 1 ends without the steered message being echoed → it spilled to
@@ -392,7 +392,6 @@ describe("LiveSession steering", () => {
     harness.pushEvent(assistantEvent("reply two"));
     harness.pushEvent(resultEvent());
     await expect(p2).resolves.toBe("reply two");
-    expect(steeredBlocks).toEqual(["reply two"]);
     expect(session.isBusy()).toBe(false);
   });
 
@@ -486,35 +485,34 @@ const subagentAssistantEvent = (text: string) => ({
 });
 
 describe("LiveSession subagent events", () => {
-  it("keeps subagent narration out of callbacks and the response", async () => {
+  it("keeps subagent narration out of the response", async () => {
     const { session, harness } = makeSession();
-    const texts: string[] = [];
-    const blocks: string[] = [];
 
-    const p = session.send("first", (t) => { texts.push(t); }, undefined, (b) => { blocks.push(b); });
+    const p = session.send("first");
     await waitFor(() => harness.inputs.length === 1);
 
     harness.pushEvent(subagentAssistantEvent("inner monologue"));
-    // Subagent stream deltas must not pollute the top-level streaming text.
+    harness.pushEvent(assistantEvent("real reply"));
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("real reply");
+  });
+
+  it("keeps a subagent's thinking out of the response even when showThinking is on", async () => {
+    const { session, harness } = makeSession({ showThinking: true });
+
+    const p = session.send("first");
+    await waitFor(() => harness.inputs.length === 1);
+
     harness.pushEvent({
-      type: "stream_event",
+      type: "assistant",
       parent_tool_use_id: "toolu_parent",
-      event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
-    });
-    harness.pushEvent({
-      type: "stream_event",
-      parent_tool_use_id: "toolu_parent",
-      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "leaky delta" } },
+      message: { content: [thinkingBlock("subagent reasoning")] },
     });
     harness.pushEvent(assistantEvent("real reply"));
     harness.pushEvent(resultEvent());
 
     await expect(p).resolves.toBe("real reply");
-    expect(blocks).toEqual(["real reply"]);
-    for (const t of texts) {
-      expect(t).not.toContain("inner monologue");
-      expect(t).not.toContain("leaky delta");
-    }
   });
 
   it("ignores subagent replay echoes for steer merge detection", async () => {
@@ -541,5 +539,69 @@ describe("LiveSession subagent events", () => {
     harness.pushEvent(assistantEvent("reply two"));
     harness.pushEvent(resultEvent());
     await expect(p2).resolves.toBe("reply two");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Thinking blocks
+//
+// Delivery is decided by SDK content-block TYPE, never by inspecting text.
+// `thinking` blocks are dropped from the turn response unless showThinking is
+// on; `text` blocks always ship, even when their text happens to look like
+// thinking (`思考:`) or like tool debris (`count`).
+// ---------------------------------------------------------------------------
+
+describe("LiveSession thinking blocks", () => {
+  it("drops thinking blocks by default, keeping only the text block", async () => {
+    const { session, harness } = makeSession();
+
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({
+      type: "assistant",
+      message: { content: [thinkingBlock("the user probably wants X"), textBlock("Sure — here's X.")] },
+    });
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("Sure — here's X.");
+  });
+
+  it("includes thinking blocks, marked, when showThinking is on", async () => {
+    const { session, harness } = makeSession({ showThinking: true });
+
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({
+      type: "assistant",
+      message: { content: [thinkingBlock("the user probably wants X"), textBlock("Sure — here's X.")] },
+    });
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("💭 the user probably wants X\nSure — here's X.");
+  });
+
+  it("never truncates a text block that looks like thinking or tool debris", async () => {
+    const { session, harness } = makeSession();
+
+    const p = session.send("translate 计数 to English, one word");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantEvent("count"));
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("count");
+  });
+
+  it("skips redacted_thinking blocks even when showThinking is on", async () => {
+    const { session, harness } = makeSession({ showThinking: true });
+
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({
+      type: "assistant",
+      message: { content: [{ type: "redacted_thinking", data: "opaque" }, textBlock("done")] },
+    });
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("done");
   });
 });

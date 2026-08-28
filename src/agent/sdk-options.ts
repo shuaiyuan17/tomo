@@ -176,10 +176,10 @@ export function sdkOptions(
     // that bypassPermissions otherwise routes here as denials.
     canUseTool: skillsCanUseTool,
     ...(sessionContext?.onMcpElicitation ? { onElicitation: sessionContext.onMcpElicitation } : {}),
-    // Off makes each assistant text block ship whole rather than growing in
-    // place; LiveSession's no-deltas path already handles that, so mid-turn
-    // messages between tool calls are unaffected. See config.streaming.
-    includePartialMessages: config.streaming,
+    // Delivery is non-streaming: the turn runs to completion and its content
+    // blocks are delivered once (see delivery-pipeline.ts). Partial messages
+    // would only add per-token events nothing consumes.
+    includePartialMessages: false,
     ...(thinking ? { thinking } : {}),
     maxTurns: config.maxTurns,
     ...buildHooksOption({

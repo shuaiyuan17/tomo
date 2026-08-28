@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, StreamingMessage, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
+import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
@@ -16,9 +16,7 @@ import {
   type SavedFileNotice,
 } from "./fileStore.js";
 import { log } from "../logger.js";
-import { deliverTextParts } from "./delivery.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
-import { endsWithTrailingNoReply } from "../agent/text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import { convertHeicImage, heicHasAlpha, looksLikeHeic, type HeicTargetFormat } from "./heic.js";
@@ -655,54 +653,6 @@ export class ImsgChannel implements Channel {
         return;
       }
     }
-  }
-
-  createStreamingMessage(chatId: string, replyTo?: string): StreamingMessage {
-    // iMessage can't stream into a sent bubble — buffer per block, ship at
-    // boundary (commitBlock between text blocks, finish at end of turn).
-    // Blocks whose trailing line(s) are bare NO_REPLY are dropped WHOLE —
-    // narration ending in the token is not for the channel (owner decision
-    // 2026-07-08). Inline mentions of NO_REPLY mid-text still ship; other
-    // blocks in the same turn are unaffected. Mirrors Telegram's final-flush
-    // retraction.
-    let buffer = "";
-    let canceled = false;
-    // Group replies carry the triggering message's GUID; thread only the
-    // first shipped block — one reply, not one per block.
-    let pendingReplyTo = replyTo;
-
-    const shipBuffer = async () => {
-      if (canceled || !buffer) return;
-      if (endsWithTrailingNoReply(buffer)) { buffer = ""; return; }
-      const text = buffer;
-      buffer = "";
-      const threadTarget = pendingReplyTo;
-      pendingReplyTo = undefined;
-      await deliverTextParts(this, chatId, text, { replyTo: threadTarget });
-    };
-
-    return {
-      update: (text: string) => {
-        if (canceled) return;
-        buffer = text;
-      },
-      commitBlock: async () => {
-        if (canceled) return;
-        await shipBuffer();
-      },
-      finish: async () => {
-        if (canceled) return;
-        await shipBuffer();
-      },
-      cancel: async () => {
-        canceled = true;
-        buffer = "";
-      },
-      discardBlock: async () => {
-        if (canceled) return;
-        buffer = "";
-      },
-    };
   }
 
   startTyping(chatId: string): StopTyping {

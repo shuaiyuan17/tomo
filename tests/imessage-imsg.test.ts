@@ -1673,66 +1673,9 @@ describe("imsg outbound send", () => {
     await channel.stop();
   });
 
-  it("threads only the first shipped block of a streamed group reply", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
 
-    const stream = channel.createStreamingMessage(GROUP_GUID, "guid-trigger");
-    stream.update("first block");
-    await stream.commitBlock();
-    stream.update("second block");
-    await stream.finish();
 
-    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
-    expect(all).toHaveLength(2);
-    expect(all[0].method).toBe("send.rich");
-    expect(all[0].params).toMatchObject({ text: "first block", reply_to: "guid-trigger" });
-    expect(all[1].method).toBe("send");
-    expect(all[1].params.text).toBe("second block");
-    await channel.stop();
-  });
 
-  it("drops a whole streamed block whose trailing line is a bare NO_REPLY", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-
-    const stream = channel.createStreamingMessage(DM_GUID);
-    stream.update("archived the logs, nothing urgent\nNO_REPLY");
-    await stream.finish();
-
-    expect(requests().filter((r) => r.method === "send" || r.method === "send.rich")).toHaveLength(0);
-    await channel.stop();
-  });
-
-  it("ships a streamed block that merely mentions NO_REPLY inline", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-
-    const stream = channel.createStreamingMessage(DM_GUID);
-    stream.update("the literal token is NO_REPLY, for reference");
-    await stream.finish();
-
-    const sends = requests().filter((r) => r.method === "send");
-    expect(sends).toHaveLength(1);
-    expect(sends[0].params.text).toBe("the literal token is NO_REPLY, for reference");
-    await channel.stop();
-  });
-
-  it("still ships earlier real blocks when a later block is NO_REPLY-only", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-
-    const stream = channel.createStreamingMessage(DM_GUID);
-    stream.update("real block");
-    await stream.commitBlock();
-    stream.update("NO_REPLY");
-    await stream.finish();
-
-    const sends = requests().filter((r) => r.method === "send");
-    expect(sends).toHaveLength(1);
-    expect(sends[0].params.text).toBe("real block");
-    await channel.stop();
-  });
 
   it("sends a photo via the send file param with a separate caption", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-photo-"));

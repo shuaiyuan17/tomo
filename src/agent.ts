@@ -689,6 +689,7 @@ export class Agent {
     const { channel, chatId } = target;
     const stopTyping = this.startTurnTyping(channel, chatId, this.isPassiveReplyTarget(channel.name, chatId));
     let settled = false;
+    let responseBlocks: string[] | undefined;
 
     const stop = async () => {
       try {
@@ -699,6 +700,7 @@ export class Agent {
     };
 
     return {
+      onBlocks: (blocks) => { responseBlocks = blocks; },
       resolve: async (response) => {
         if (settled) return;
         settled = true;
@@ -713,7 +715,10 @@ export class Agent {
             });
           }
           log.info({ channel: channel.name, session: key }, "Tomo: %s", response);
-          await this.delivery.deliverResponse(key, channel, chatId, response);
+          await this.delivery.deliverResponse(
+            key, channel, chatId, response, undefined,
+            responseBlocks ? { blocks: responseBlocks } : {},
+          );
         } catch (err) {
           log.error({ err, key }, "Background task response delivery failed");
         } finally {

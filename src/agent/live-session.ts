@@ -10,11 +10,20 @@ import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
-import { isSilentReply } from "./text-utils.js";
+import { endsWithTrailingNoReply } from "./text-utils.js";
+import { filterScaffoldLeak } from "./scaffold-filter.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
   reject: (err: Error) => void | Promise<void>;
+  /**
+   * Out-channel for the turn's per-block delivery units, in order, called
+   * immediately before `resolve`. The response string is exactly these blocks
+   * joined with "\n"; the delivery layer needs the unjoined form because a
+   * joined string cannot be re-split into blocks, and attachment placement
+   * ("A, MEDIA:, B" ships A → photo → B) is defined per block.
+   */
+  onBlocks?: (blocks: string[]) => void;
 }
 
 export interface MessageRequest extends TurnRequest {
@@ -55,8 +64,18 @@ export interface ResponseBlock {
   text: string;
 }
 
+/** A rendered turn: the per-block delivery units and their joined text. */
+export interface RenderedTurn {
+  /** `blocks` joined with "\n" — logging, transcript, error/silence checks. */
+  text: string;
+  /** Per-block delivery units, in order, after filtering. */
+  blocks: string[];
+  /** True when at least one block had a training-scaffold leak stripped. */
+  scaffoldFiltered: boolean;
+}
+
 /**
- * Render a turn's collected content blocks into the response string.
+ * Render a turn's collected content blocks into the response.
  *
  * This is the ONLY place that decides what reaches a channel, and it decides
  * purely on the SDK block `type` — never by inspecting the text. A `text`
@@ -65,28 +84,50 @@ export interface ResponseBlock {
  * `thinking` block ships only when showThinking is on, marked so it is
  * distinguishable. `redacted_thinking` carries no readable text and is
  * dropped at collection time.
+ *
+ * Everything else here runs PER BLOCK, before the join, because that is where
+ * the streaming predecessor ran it (each block was a separate channel send):
+ *   1. scaffold-leak filter — a leak truncates its own block, not the turn, so
+ *      blocks after a `<system-reminder>` slip still ship;
+ *   2. bare-NO_REPLY drop — a block whose trailing line(s) are only the token
+ *      is dropped WHOLE (text, MEDIA: and STICKER: alike), so housekeeping
+ *      narration and its attachments never leak out of a mid-turn slip.
+ * Running either one over the joined string instead silently changes both:
+ * the scaffold cut eats every later block, and the NO_REPLY drop only fires
+ * when the token is the entire turn.
  */
-export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: boolean): string {
+export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: boolean): RenderedTurn {
   const rendered: string[] = [];
+  let scaffoldFiltered = false;
+  // Tracks whether the last block that carried any content was a NO_REPLY
+  // block — a TRAILING one is load-bearing (see below), a mid-turn one is not.
+  let lastKeptWasNoReply = false;
+
   for (const block of blocks) {
     if (block.type === "thinking" && !showThinking) continue;
-    const text = block.text.trim();
+
+    const scaffold = filterScaffoldLeak(block.text);
+    if (scaffold.filtered) scaffoldFiltered = true;
+    const text = scaffold.text.trim();
     if (!text) continue;
+
+    if (endsWithTrailingNoReply(text)) {
+      lastKeptWasNoReply = true;
+      continue;
+    }
+    lastKeptWasNoReply = false;
     rendered.push(block.type === "thinking" ? `${THINKING_MARKER}${text}` : text);
   }
 
-  // NO_REPLY is Tomo's own control token, not the model's prose, so a block
-  // that is nothing but the bare token is protocol rather than content.
-  // A block like that MID-turn (the model emitted it between two real blocks)
-  // is a slip and is dropped — under per-block delivery the channels dropped
-  // it too. A TRAILING one is load-bearing: it marks the whole turn as
-  // not-for-the-channel (owner decision 2026-07-08), so exactly one is kept at
-  // the end for the delivery layer's trailing-NO_REPLY check to find.
-  const endedWithNoReply = rendered.length > 0 && isSilentReply(rendered[rendered.length - 1]);
-  const kept = rendered.filter((text) => !isSilentReply(text));
-  if (endedWithNoReply) kept.push("NO_REPLY");
+  // NO_REPLY is Tomo's own control token, not the model's prose. A block whose
+  // trailing line(s) are the bare token MID-turn is a slip and is dropped —
+  // under per-block delivery the channels dropped it too. A TRAILING one is
+  // load-bearing: it marks the whole turn as not-for-the-channel (owner
+  // decision 2026-07-08), so exactly one is kept at the end for the delivery
+  // layer's trailing-NO_REPLY check to find.
+  const kept = lastKeptWasNoReply ? [...rendered, "NO_REPLY"] : rendered;
 
-  return kept.join("\n").trim();
+  return { text: kept.join("\n").trim(), blocks: kept, scaffoldFiltered };
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number {
@@ -495,15 +536,20 @@ export class LiveSession {
       await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
       // The turn is over: render its collected content blocks into the one
-      // response string callers deliver, transcribe and log. Block TYPE alone
-      // decides what is included (see renderResponseBlocks) — the text is
-      // never inspected.
-      const response = renderResponseBlocks(this.parts, this.showThinking)
-        || "I'm not sure how to respond to that.";
+      // response callers deliver, transcribe and log. Block TYPE alone decides
+      // what is included (see renderResponseBlocks) — the text is never
+      // inspected.
+      const rendered = renderResponseBlocks(this.parts, this.showThinking);
+      if (rendered.scaffoldFiltered) {
+        log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
+      }
+      const response = rendered.text || "I'm not sure how to respond to that.";
+      const responseBlocks = rendered.blocks.length > 0 ? rendered.blocks : [response];
       this.parts = [];
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
       if (this.pendingSteers.length === 0) this.clearActivityTimeout();
+      req?.onBlocks?.(responseBlocks);
       await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
@@ -686,6 +732,7 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
+    onBlocks?: (blocks: string[]) => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -705,6 +752,7 @@ export class LiveSession {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
         resolve,
         reject,
+        ...(onBlocks ? { onBlocks } : {}),
       };
       this.currentRequest = req;
       this.parts = [];
@@ -727,9 +775,10 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
+    onBlocks?: (blocks: string[]) => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, images, documents);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlocks);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -744,6 +793,7 @@ export class LiveSession {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
         resolve,
         reject,
+        ...(onBlocks ? { onBlocks } : {}),
       };
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);

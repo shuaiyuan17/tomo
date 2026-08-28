@@ -56,7 +56,10 @@ function makePipeline() {
   });
   const deliver = (response: string) =>
     pipeline.deliverResponse("dm:owner", channel, "chat1", response);
-  return { channel, pipeline, notes, deliver };
+  /** Deliver a turn as the delivery layer really receives it: as blocks. */
+  const deliverBlocks = (blocks: string[], options: { replyTo?: string } = {}) =>
+    pipeline.deliverResponse("dm:owner", channel, "chat1", blocks.join("\n"), undefined, { ...options, blocks });
+  return { channel, pipeline, notes, deliver, deliverBlocks };
 }
 
 describe("outbound delivery never inspects the model's own words", () => {
@@ -175,5 +178,91 @@ describe("NO_REPLY suppression survives", () => {
 
     expect(channel.sent).toHaveLength(1);
     expect(channel.sent[0].text).toBe("I answer with NO_REPLY when I have nothing to add.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attachment placement is per BLOCK.
+//
+// Extracting MEDIA:/STICKER: from the joined turn hoists every attachment to
+// the front and collapses the text around it into one caption. The model put
+// the tag between two blocks on purpose; delivery has to keep it there.
+// ---------------------------------------------------------------------------
+
+describe("block-ordered attachment delivery", () => {
+  let dir: string;
+  let photoPath: string;
+  let otherPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "tomo-block-order-"));
+    photoPath = join(dir, "pic.png");
+    otherPath = join(dir, "other.png");
+    writeFileSync(photoPath, "fake");
+    writeFileSync(otherPath, "fake");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("ships A, photo, B in that order", async () => {
+    const { channel, deliverBlocks } = makePipeline();
+
+    await deliverBlocks(["A", `MEDIA:${photoPath}`, "B"]);
+
+    expect(channel.sent).toEqual([
+      { chatId: "chat1", text: "A" },
+      { chatId: "chat1", photo: photoPath, text: "" },
+      { chatId: "chat1", text: "B" },
+    ]);
+  });
+
+  it("merges adjacent text-only blocks into a single send", async () => {
+    const { channel, deliverBlocks } = makePipeline();
+
+    await deliverBlocks(["A", "B", "C"]);
+
+    expect(channel.sent).toEqual([{ chatId: "chat1", text: "A\nB\nC" }]);
+  });
+
+  it("keeps each caption with the media of its own block", async () => {
+    const { channel, deliverBlocks } = makePipeline();
+
+    await deliverBlocks([`first MEDIA:${photoPath}`, `second MEDIA:${otherPath}`]);
+
+    expect(channel.sent).toEqual([
+      { chatId: "chat1", photo: photoPath, text: "first" },
+      { chatId: "chat1", photo: otherPath, text: "second" },
+    ]);
+  });
+
+  it("threads the first shipped message even when it is a photo", async () => {
+    const { channel, deliverBlocks } = makePipeline();
+
+    await deliverBlocks([`MEDIA:${photoPath}`, "and here is the summary"], { replyTo: "msg-42" });
+
+    expect(channel.sent).toHaveLength(2);
+    expect(channel.sent[0]).toEqual({ chatId: "chat1", photo: photoPath, text: "", replyTo: "msg-42" });
+    // One reply per turn, not one per send.
+    expect(channel.sent[1].replyTo).toBeUndefined();
+  });
+
+  it("leaves no blank line where a whole-line tag was removed", async () => {
+    const { channel, deliverBlocks } = makePipeline();
+
+    await deliverBlocks([`above\nMEDIA:${photoPath}\nbelow`]);
+
+    expect(channel.sent).toEqual([
+      { chatId: "chat1", photo: photoPath, text: "above\nbelow" },
+    ]);
+  });
+
+  it("drops a mid-turn NO_REPLY block whole, attachments included", async () => {
+    const { channel, deliverBlocks } = makePipeline();
+
+    await deliverBlocks(["A", `MEDIA:${photoPath}\nNO_REPLY`, "B"]);
+
+    expect(channel.sent).toEqual([{ chatId: "chat1", text: "A\nB" }]);
   });
 });

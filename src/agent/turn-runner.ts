@@ -5,7 +5,6 @@ import type { TurnSource } from "../watch/protocol.js";
 import { STEER_MERGED } from "./live-session.js";
 import { isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
-import { filterScaffoldLeak } from "./scaffold-filter.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -14,6 +13,9 @@ export interface RunWithRetryRequest {
   images?: Array<{ data: string; mediaType: string }>;
   documents?: Array<{ data: string; mediaType: string; filename?: string }>;
   steer?: boolean;
+  /** Receives the turn's per-block delivery units just before the response
+   *  string resolves (see LiveSession's TurnRequest.onBlocks). */
+  onResponseBlocks?: (blocks: string[]) => void;
 }
 
 /**
@@ -195,9 +197,14 @@ export class TurnRunner {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
 
+    // The delivery units of the turn, in order. Attachment placement is
+    // defined per block ("A, MEDIA:, B" ships A → photo → B), and the joined
+    // response string cannot be re-split, so LiveSession hands them over here.
+    let responseBlocks: string[] | undefined;
     const rawResponse = await this.deps.runWithRetry({
       key: spec.key,
       prompt,
+      onResponseBlocks: (blocks) => { responseBlocks = blocks; },
       ...(reply
         ? { images: reply.images, documents: reply.documents, steer: reply.steer }
         : {}),
@@ -210,7 +217,10 @@ export class TurnRunner {
       return true;
     }
 
-    const response = this.applyScaffoldFilter(spec.key, rawResponse);
+    // The scaffold-leak filter runs PER BLOCK in renderResponseBlocks, before
+    // the join — running it here over the joined response would cut every
+    // later block at the first leaked marker.
+    const response = rawResponse;
     // One response log per turn, whatever the ingress and whether or not the
     // response ships (silent and suppressed turns still get a line). The
     // channel label comes from the delivery spec, never from resolveTarget —
@@ -277,7 +287,10 @@ export class TurnRunner {
         target.chatId,
         deliverText,
         spec.silentMatcher,
-        reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+        {
+          ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
+          ...(responseBlocks ? { blocks: responseBlocks } : {}),
+        },
       );
     }
     await stopTyping({ clear: true });
@@ -315,12 +328,5 @@ export class TurnRunner {
 
   private resolveSendTarget(delivery: TurnDelivery): { channel: Channel; chatId: string } | undefined {
     return delivery.kind === "deferred-send" ? delivery.resolveTarget() : delivery;
-  }
-
-  /** Strip training-scaffold leaks from an outbound response (see scaffold-filter.ts). */
-  private applyScaffoldFilter(sessionKey: string, response: string): string {
-    const { text, filtered } = filterScaffoldLeak(response);
-    if (filtered) log.warn({ sessionKey }, "model scaffold leak filtered");
-    return text;
   }
 }

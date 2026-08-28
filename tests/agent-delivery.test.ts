@@ -215,27 +215,15 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  it("drops thinking blocks by default, whatever their text looks like", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => [
-      { type: "thinking", thinking: "private reasoning that must not be sent", streamAsTextDelta: true },
-      "public answer",
-    ];
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe("public answer");
-
-    await agent.stop();
-  });
-
-  it("delivers thinking blocks, marked, when showThinking is on", async () => {
-    resetConfig({ showThinking: true });
+  // The whole mechanism is the block-TYPE gate in renderResponseBlocks: the
+  // same turn, the same two blocks, only the flag differs. Delete the gate and
+  // the showThinking:false row ships the reasoning and fails; delete the
+  // marker and the showThinking:true row fails.
+  it.each([
+    { showThinking: false, expected: "public answer" },
+    { showThinking: true, expected: "💭 the user probably wants X\npublic answer" },
+  ])("renders a thinking + text turn by block type (showThinking=$showThinking)", async ({ showThinking, expected }) => {
+    resetConfig({ showThinking });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -249,7 +237,10 @@ describe("outbound delivery", () => {
     await drainQueue(agent);
 
     expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe("💭 the user probably wants X\npublic answer");
+    expect(tg.delivered[0].text).toBe(expected);
+    // Spelled out both ways so the assertion cannot pass by coincidence.
+    expect(tg.delivered[0].text.includes("the user probably wants X")).toBe(showThinking);
+    expect(tg.delivered[0].text.includes("💭 ")).toBe(showThinking);
 
     await agent.stop();
   });
@@ -378,6 +369,131 @@ describe("outbound delivery", () => {
     ).getEntry("dm:shuai");
     expect(after?.sdkSessionId).toBe("old-session-id");
     expect(after?.unlinkedAt).toBeNull();
+  });
+
+  // ---------------------------------------------------------------------
+  // Per-block semantics. Joining first and filtering after changes what
+  // ships: the streaming predecessor applied the bare-NO_REPLY rule and the
+  // scaffold filter to each block on its own, and placed attachments where
+  // the model put them. Non-streaming delivery has to match that.
+  // ---------------------------------------------------------------------
+
+  it("drops a mid-turn block whose trailing line is NO_REPLY, narration and all", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    // The middle block is housekeeping narration the agent marked
+    // not-for-the-channel. Neither the narration nor the token may ship, and
+    // the blocks around it must survive.
+    mockSdk.responseFn = () => ["A", "housekeeping\nNO_REPLY", "B"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("A\nB");
+    expect(im.delivered[0].text).not.toContain("housekeeping");
+    expect(im.delivered[0].text).not.toContain("NO_REPLY");
+
+    await agent.stop();
+  });
+
+  it("drops the ATTACHMENTS of a mid-turn NO_REPLY block, not just its text", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "no-reply-block.png");
+    writeFileSync(imagePath, "fake image");
+
+    // A block marked not-for-the-channel ships NOTHING — text, media and
+    // stickers alike (owner decision 2026-07-08).
+    mockSdk.responseFn = () => ["A", `MEDIA:${imagePath}\nNO_REPLY`, "B"];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered.some((d) => d.photo)).toBe(false);
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toBe("A\nB");
+
+    await agent.stop();
+  });
+
+  it("cuts only the leaking block when scaffold leaks mid-turn", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    // Filtering the JOINED response would truncate at the marker and lose B.
+    mockSdk.responseFn = () => ["A", "<system-reminder>internal note</system-reminder>", "B"];
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered).toHaveLength(1);
+    expect(im.delivered[0].text).toBe("A\nB");
+    expect(im.delivered[0].text).not.toContain("system-reminder");
+
+    await agent.stop();
+  });
+
+  it("delivers an attachment block in place: A, photo, B", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "in-order.png");
+    writeFileSync(imagePath, "fake image");
+
+    mockSdk.responseFn = () => ["A", `MEDIA:${imagePath}`, "B"];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "A", photo: undefined, sticker: undefined },
+      { chatId: "12345", text: "", photo: imagePath, sticker: undefined },
+      { chatId: "12345", text: "B", photo: undefined, sticker: undefined },
+    ]);
+
+    await agent.stop();
+  });
+
+  it("still merges adjacent text-only blocks into one send", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => ["A", "B"];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].text).toBe("A\nB");
+
+    await agent.stop();
+  });
+
+  it("keeps a caption with the media of its OWN block", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "own-block-caption.png");
+    writeFileSync(imagePath, "fake image");
+
+    mockSdk.responseFn = () => ["A", `here it is MEDIA:${imagePath}`, "B"];
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "A", photo: undefined, sticker: undefined },
+      { chatId: "12345", text: "here it is", photo: imagePath, sticker: undefined },
+      { chatId: "12345", text: "B", photo: undefined, sticker: undefined },
+    ]);
+
+    await agent.stop();
   });
 
   it("ships STICKER tags as sticker sends without leaking the tag into text", async () => {

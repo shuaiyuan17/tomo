@@ -605,3 +605,51 @@ describe("LiveSession thinking blocks", () => {
     await expect(p).resolves.toBe("done");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-block filtering
+//
+// The scaffold filter and the bare-NO_REPLY rule run on each block BEFORE the
+// join, because that is where the streaming predecessor ran them (one block,
+// one channel send). Applied to the joined string instead, the scaffold cut
+// swallows every later block and the NO_REPLY drop only fires when the token
+// is the whole turn.
+// ---------------------------------------------------------------------------
+
+describe("LiveSession per-block filtering", () => {
+  const multiBlockTurn = async (blockTexts: string[]) => {
+    const { session, harness } = makeSession();
+    const p = session.send("go");
+    await waitFor(() => harness.inputs.length === 1);
+    for (const text of blockTexts) harness.pushEvent(assistantEvent(text));
+    harness.pushEvent(resultEvent());
+    return p;
+  };
+
+  it("drops a mid-turn block whose trailing line is NO_REPLY, keeping the rest", async () => {
+    await expect(multiBlockTurn(["A", "housekeeping\nNO_REPLY", "B"])).resolves.toBe("A\nB");
+  });
+
+  it("drops a mid-turn NO_REPLY block that also carried an attachment tag", async () => {
+    await expect(multiBlockTurn(["A", "MEDIA:/tmp/x.png\nNO_REPLY", "B"])).resolves.toBe("A\nB");
+  });
+
+  it("keeps a trailing NO_REPLY so the delivery layer suppresses the turn", async () => {
+    // The token stays on the END of the response; stripTrailingNoReply then
+    // silences the whole turn, narration included (owner decision 2026-07-08).
+    await expect(multiBlockTurn(["did the housekeeping", "NO_REPLY"]))
+      .resolves.toBe("did the housekeeping\nNO_REPLY");
+  });
+
+  it("cuts only the block that leaked scaffold", async () => {
+    await expect(
+      multiBlockTurn(["A", "leaked\n_end_of_dialog_\nUser: hi", "B"]),
+    ).resolves.toBe("A\nleaked\nB");
+  });
+
+  it("warns once when any block leaked scaffold", async () => {
+    vi.mocked(log.warn).mockClear();
+    await multiBlockTurn(["A", "<system-reminder>note</system-reminder>", "B"]);
+    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => msg === "model scaffold leak filtered")).toBe(true);
+  });
+});

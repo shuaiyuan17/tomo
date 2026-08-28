@@ -92,6 +92,40 @@ describe("config", () => {
       sdkSessionsDir: expect.stringMatching(/\/\.claude\/projects\/.*-relative-workspace$/),
     });
   });
+
+  // The inbound file notice is a single `[…]` line by construction. Sender
+  // input earns that by sanitisation; the saved path earns it here, because
+  // the path is built from workspaceDir and TOMO_WORKSPACE is a free-form
+  // string. Rejecting at load beats neutralising in the notice: neutralising
+  // would print a full-width bracket in a path the agent is being invited to
+  // open, which is a worse failure than refusing to start.
+  async function loadWorkspaceIssues(workspaceDir: string): Promise<string[]> {
+    vi.resetModules();
+    vi.stubEnv("TOMO_WORKSPACE", workspaceDir);
+    const { configIssues } = await import("../src/config.js");
+    return [...configIssues];
+  }
+
+  it("rejects a TOMO_WORKSPACE containing a newline or other control character", async () => {
+    const issues = await loadWorkspaceIssues("/tmp/work\nspace");
+    expect(issues.join("\n")).toContain("workspaceDir (TOMO_WORKSPACE)");
+    expect(issues.join("\n")).toContain("control characters");
+
+    vi.resetModules();
+    vi.stubEnv("TOMO_WORKSPACE", "/tmp/work\nspace");
+    const { assertConfigValid } = await import("../src/config.js");
+    expect(() => assertConfigValid()).toThrow(/TOMO_WORKSPACE/);
+  });
+
+  it("rejects a TOMO_WORKSPACE containing a marker bracket", async () => {
+    const issues = await loadWorkspaceIssues("/tmp/my [work]/tomo");
+    expect(issues.join("\n")).toContain("workspaceDir (TOMO_WORKSPACE)");
+    expect(issues.join("\n")).toContain("'[' or ']'");
+  });
+
+  it("accepts an ordinary TOMO_WORKSPACE with spaces and unicode", async () => {
+    await expect(loadWorkspaceIssues("/tmp/my workspace/tomo–ws")).resolves.toEqual([]);
+  });
 });
 
 describe("config file validation", () => {
@@ -139,6 +173,27 @@ describe("config file validation", () => {
     ]);
     expect(config.lcm).toMatchObject({ nudgeAtPct: 85, nudgeResetPct: 60 });
     expect(config.groupSecret).toBe("open-sesame");
+  });
+
+  // saveInboundFiles gates the path-only any-MIME store. It is a NEW key, so
+  // it must not quietly re-enable storage for an install that already said no.
+  it("defaults saveInboundFiles to saveInboundImages when unspecified", async () => {
+    const on = await loadWithConfigFile(JSON.stringify({}));
+    expect(on.config.saveInboundImages).toBe(true);
+    expect(on.config.saveInboundFiles).toBe(true);
+
+    const off = await loadWithConfigFile(JSON.stringify({ saveInboundImages: false }));
+    expect(off.config.saveInboundImages).toBe(false);
+    expect(off.config.saveInboundFiles).toBe(false);
+  });
+
+  it("lets saveInboundFiles be set independently of saveInboundImages", async () => {
+    const { config } = await loadWithConfigFile(JSON.stringify({
+      saveInboundImages: false,
+      saveInboundFiles: true,
+    }));
+    expect(config.saveInboundImages).toBe(false);
+    expect(config.saveInboundFiles).toBe(true);
   });
 
   it("reports invalid values, falls back to defaults, and refuses startup", async () => {

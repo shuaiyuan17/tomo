@@ -119,8 +119,24 @@ export interface TomoConfig {
   /** Minutes of group inactivity after which a /summon lapses and the group is
    *  handed back to its own session. 0 disables expiry. Default 60. */
   summonExpiryMinutes: number;
-  /** If true, inbound image attachments are also persisted to workspace/memory/incoming-images/. Default true. */
+  /** If true, inbound attachments are persisted under workspace/memory/:
+   *  images to incoming-images/, PDFs to incoming-documents/, and every other
+   *  MIME type to incoming-files/ (the last is path-only — those bytes are not
+   *  attached to the message and are not sent to the API automatically, though
+   *  the agent is told the path and may open it deliberately, so turning this
+   *  off means the agent is told a file arrived but has nothing to open).
+   *  Default true. */
   saveInboundImages: boolean;
+  /** If true, inbound attachments whose MIME is neither an image nor a
+   *  supported document are persisted to workspace/memory/incoming-files/.
+   *  This path is path-only: the bytes are not attached to the message and are
+   *  not sent to the API automatically — the agent is told the file arrived,
+   *  its type and size, and where it is, and can open it deliberately. When
+   *  unspecified this follows `saveInboundImages`, so an install that already
+   *  opted out of inbound storage stays opted out. Turning it off does NOT
+   *  silence the notice; the agent is still told a file arrived, just without
+   *  a path to open (silence is what caused the 2026-08-27 incident). */
+  saveInboundFiles: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
   /** Steer messages that arrive while a turn is in flight into that turn at the
@@ -471,9 +487,56 @@ function parsePlugins(raw: unknown): PluginSpec[] {
   return specs;
 }
 
+/**
+ * Reject a workspace path that could not be interpolated into a one-line
+ * attachment marker safely.
+ *
+ * `formatFileMarker` in channels/fileStore.ts claims its output is a single
+ * `[…]` line "by construction". Every sender-controlled part earns that:
+ * filenames are reduced to `[A-Za-z0-9._-]`, MIMEs to an RFC 2045 token. The
+ * saved path is the one field that is ours rather than the sender's — but
+ * "ours" means "derived from `workspaceDir`", and `TOMO_WORKSPACE` is a string
+ * an operator can put anything in, including a newline or a `]`.
+ *
+ * Validating here rather than neutralising in the notice is deliberate. The
+ * notice's whole purpose is to hand the assistant a path it can open; running
+ * it through `neutralizeMarkerDelimiters` would print a full-width `］` in a
+ * path that then does not exist on disk, trading a cosmetic problem for a
+ * broken one. There is no correct rendering of an unusable base dir, so the
+ * right moment to complain is config load, once, with the offending value
+ * named.
+ *
+ * Recorded as an issue rather than defaulted: every other path in the process
+ * derives from this one, so there is no sane fallback to swap in. The daemon
+ * refuses to start via `assertConfigValid()`, while `tomo init` / `tomo config`
+ * keep working so the value can be repaired.
+ */
+function checkWorkspaceDirRenderable(workspaceDir: string): void {
+  // eslint-disable-next-line no-control-regex
+  const control = /[\u0000-\u001F\u007F-\u009F]/.exec(workspaceDir);
+  if (control) {
+    issues.push(
+      `workspaceDir (TOMO_WORKSPACE): must not contain control characters `
+      + `(found ${describeValue(control[0])} at index ${control.index} of ${describeValue(workspaceDir)}; `
+      + `it would break the single-line inbound attachment notice). Move the workspace to a plainer path.`,
+    );
+    return;
+  }
+  const bracket = /[[\]]/.exec(workspaceDir);
+  if (bracket) {
+    issues.push(
+      `workspaceDir (TOMO_WORKSPACE): must not contain '[' or ']' `
+      + `(found at index ${bracket.index} of ${describeValue(workspaceDir)}; `
+      + `those delimit the inbound attachment notice and a path containing one could truncate it). `
+      + `Move the workspace to a plainer path.`,
+    );
+  }
+}
+
 function buildConfig(): TomoConfig {
   const file = loadConfigFile();
   const paths = defaultRuntimePaths;
+  checkWorkspaceDirRenderable(paths.workspaceDir);
   const channels = parseChannels(file.channels);
   const mcp = (file.mcp ?? {}) as Record<string, unknown>;
   const mcpServers = parseExternalMcpServers(file.mcpServers ?? mcp.servers);
@@ -490,6 +553,9 @@ function buildConfig(): TomoConfig {
     process.env.CLAUDE_MODEL ?? file.model,
     DEFAULT_MODEL,
   );
+
+  // Hoisted out of the returned object because saveInboundFiles defaults to it.
+  const saveInboundImages = validated("saveInboundImages", boolLike, file.saveInboundImages, true);
 
   const continuityIntervalMinutes = validated(
     "continuityIntervalMinutes (TOMO_CONTINUITY_INTERVAL_MINUTES)",
@@ -569,7 +635,16 @@ function buildConfig(): TomoConfig {
       envVar("TOMO_SUMMON_EXPIRY_MINUTES") ?? file.summonExpiryMinutes,
       60,
     ),
-    saveInboundImages: validated("saveInboundImages", boolLike, file.saveInboundImages, true),
+    saveInboundImages,
+    saveInboundFiles: validated(
+      "saveInboundFiles (TOMO_SAVE_INBOUND_FILES)",
+      boolLike,
+      envVar("TOMO_SAVE_INBOUND_FILES") ?? file.saveInboundFiles,
+      // Defaults to the image setting, not to `true`: an existing config with
+      // saveInboundImages=false has already said "do not keep inbound
+      // attachments", and a new key must not quietly re-enable that.
+      saveInboundImages,
+    ),
     maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
     streaming: validated("streaming (TOMO_STREAMING)", boolLike, envVar("TOMO_STREAMING") ?? file.streaming, true),

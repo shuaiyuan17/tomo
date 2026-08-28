@@ -41,6 +41,30 @@ const MARKER_DELIMITERS_RE = /[[\]<>]/g;
 const FULLWIDTH_DELIMITERS: Record<string, string> = { "[": "［", "]": "］", "<": "＜", ">": "＞" };
 
 /**
+ * Neutralise the delimiters that make a marker look like a marker.
+ *
+ * Any sender-controlled string that ends up *inside* one of our bracketed
+ * markers has to go through this: `[`, `]`, `<` and `>` become fullwidth
+ * lookalikes, so the text still reads correctly to a human but can no longer
+ * close our bracket and open a forged one ("[via satellite …]",
+ * "<tomo-event …>"). Newlines and other control characters collapse to a
+ * single space for the same reason — a marker is one line by construction,
+ * and a second line is exactly what a forged marker needs.
+ *
+ * Shared by {@link formatReplyContextMarker} (quoted reply excerpts) and the
+ * inbound file notice in `fileStore.ts` (sender-supplied MIME types).
+ */
+export function neutralizeMarkerDelimiters(text: string): string {
+  return text
+    // C0/C1 control characters — newline included — collapse to one space.
+    // The control class is the entire point here, so the rule is disabled
+    // deliberately: a newline reaching a marker is the forgery being stopped.
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001F\u007F-\u009F]+/g, " ")
+    .replace(MARKER_DELIMITERS_RE, (c) => FULLWIDTH_DELIMITERS[c]);
+}
+
+/**
  * Marker prepended to inbound threaded replies (long-press → Reply) so the
  * model sees which earlier message the sender is responding to. Same visual
  * family as SATELLITE_MARKER. When the original text is unavailable the
@@ -50,7 +74,7 @@ const FULLWIDTH_DELIMITERS: Record<string, string> = { "[": "［", "]": "］", "
 export function formatReplyContextMarker(originalText?: string): string {
   const collapsed = originalText?.replace(/\s+/g, " ").trim();
   if (!collapsed) return "[replying to an earlier message]";
-  const sanitized = collapsed.replace(MARKER_DELIMITERS_RE, (c) => FULLWIDTH_DELIMITERS[c]);
+  const sanitized = neutralizeMarkerDelimiters(collapsed);
   // Truncate by code points, not UTF-16 units — never split a surrogate pair.
   const points = Array.from(sanitized);
   const excerpt = points.length > REPLY_CONTEXT_EXCERPT_LIMIT

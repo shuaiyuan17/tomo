@@ -3,8 +3,8 @@ import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import { STEER_MERGED } from "./live-session.js";
-import { isSilentReply, stripTrailingNoReply } from "./text-utils.js";
-import { DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
+import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
+import { type BlockSender, DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -13,9 +13,10 @@ export interface RunWithRetryRequest {
   images?: Array<{ data: string; mediaType: string }>;
   documents?: Array<{ data: string; mediaType: string; filename?: string }>;
   steer?: boolean;
-  /** Receives the turn's per-block delivery units just before the response
-   *  string resolves (see LiveSession's TurnRequest.onBlocks). */
-  onResponseBlocks?: (blocks: string[]) => void;
+  /** Receives ONE completed delivery unit the moment the SDK closes it —
+   *  before the tool call that follows it runs (LiveSession's
+   *  TurnRequest.onBlock). Awaited, so blocks ship in model order. */
+  onBlock?: (block: string) => Promise<void>;
 }
 
 /**
@@ -185,9 +186,12 @@ export class TurnRunner {
   }
 
   /**
-   * Run the turn, then deliver its response once. There is no per-block or
-   * per-token path: every ingress (user, cron, continuity) waits for the turn
-   * to complete and ships the rendered response as one reply.
+   * Run the turn, shipping each completed block as it arrives.
+   *
+   * Every ingress (user, cron, continuity, background) uses the same sink, so
+   * a proactive send, a cron run and an owner reply all reach the channel the
+   * same way. What is left for after the turn is only what genuinely needs the
+   * whole response: the transcript, the log line, silence and error policy.
    */
   private async runDelivery(
     spec: TurnSpec,
@@ -197,14 +201,11 @@ export class TurnRunner {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
 
-    // The delivery units of the turn, in order. Attachment placement is
-    // defined per block ("A, MEDIA:, B" ships A → photo → B), and the joined
-    // response string cannot be re-split, so LiveSession hands them over here.
-    let responseBlocks: string[] | undefined;
+    const sink = this.makeBlockSink(spec);
     const rawResponse = await this.deps.runWithRetry({
       key: spec.key,
       prompt,
-      onResponseBlocks: (blocks) => { responseBlocks = blocks; },
+      onBlock: sink.onBlock,
       ...(reply
         ? { images: reply.images, documents: reply.documents, steer: reply.steer }
         : {}),
@@ -217,8 +218,8 @@ export class TurnRunner {
       return true;
     }
 
-    // The scaffold-leak filter runs PER BLOCK in renderResponseBlocks, before
-    // the join — running it here over the joined response would cut every
+    // The scaffold-leak filter already ran PER BLOCK in renderBlock, as each
+    // block shipped — running it here over the joined response would cut every
     // later block at the first leaked marker.
     const response = rawResponse;
     // One response log per turn, whatever the ingress and whether or not the
@@ -276,25 +277,108 @@ export class TurnRunner {
       return true;
     }
 
-    const target = this.resolveSendTarget(delivery);
-    if (target) {
-      if (spec.transcript === "on-delivery") {
-        this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+    // A model turn has already shipped, block by block. What reaches here
+    // unhandled is a FABRICATED response — LiveSessionManager's "I ran out of
+    // steps trying to complete that." and friends — which never produced
+    // content blocks and so never reached the sink.
+    if (!sink.handledAny()) {
+      const target = this.resolveSendTarget(delivery);
+      if (target) {
+        if (spec.transcript === "on-delivery") {
+          this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+        }
+        await this.deps.delivery.deliverResponse(
+          spec.key,
+          target.channel,
+          target.chatId,
+          deliverText,
+          spec.silentMatcher,
+          reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+        );
       }
-      await this.deps.delivery.deliverResponse(
-        spec.key,
-        target.channel,
-        target.chatId,
-        deliverText,
-        spec.silentMatcher,
-        {
-          ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
-          ...(responseBlocks ? { blocks: responseBlocks } : {}),
-        },
-      );
     }
     await stopTyping({ clear: true });
     return true;
+  }
+
+  /**
+   * The turn's outbound sink: one completed block in, at most one channel
+   * message out, immediately.
+   *
+   * TRAILING NO_REPLY, DECIDED (2026-08-28). Under end-of-turn delivery a
+   * trailing bare `NO_REPLY` suppressed the ENTIRE turn, earlier blocks
+   * included. Mid-turn that is not expressible — those blocks are already on
+   * the owner's phone, and a sent message cannot be recalled. The alternative
+   * was to hold the last block back until `result` so a trailing NO_REPLY
+   * could still cancel it; that was rejected because the final block is
+   * precisely the one the owner is waiting for, and holding it would reinstate
+   * the end-of-turn latency this change exists to remove — for every turn, to
+   * salvage a rare one. It would not even have saved the reported cron repro,
+   * where the narration is an EARLIER block than the token.
+   *
+   * So: a bare-NO_REPLY block suppresses ONLY ITSELF. The invariant that
+   * matters (owner decision 2026-07-08) still holds exactly, per block — a
+   * block whose trailing line is bare NO_REPLY ships nothing, its MEDIA: and
+   * STICKER: attachments included. A whole turn that is only NO_REPLY still
+   * sends nothing, because its one block sends nothing.
+   *
+   * Consequence worth naming: a cron turn that narrates in an early block and
+   * ends with NO_REPLY now delivers that early block. Turns that must stay
+   * silent whatever the model writes should use `suppressDelivery`, which is
+   * honoured here and does not depend on the model's cooperation.
+   */
+  private makeBlockSink(spec: TurnSpec): { onBlock: (block: string) => Promise<void>; handledAny: () => boolean } {
+    const delivery = spec.delivery;
+    const reply = delivery.kind === "reply" ? delivery : undefined;
+    const suppressed = delivery.kind === "send" && delivery.suppressDelivery === true;
+
+    // "This turn's output was the sink's job", not "bytes left the machine" —
+    // a block whose MEDIA: path is missing legitimately sends nothing. Set
+    // BEFORE the send so a channel failure cannot make the post-turn fallback
+    // re-deliver the whole response on top of blocks that already landed.
+    let handledAny = false;
+    // Resolved lazily, on the first block that actually ships. Continuity
+    // turns resolve their target only for a response that speaks, and an
+    // unresolvable target must not be reported for a turn that stays silent.
+    let sender: BlockSender | undefined;
+    let channelName: string | undefined;
+
+    const onBlock = async (block: string): Promise<void> => {
+      if (suppressed) return;
+      // Classified on the model's literal words, then handled once, after the
+      // turn, by the spec's error policy — never shipped as if it were a reply.
+      if (isAgentErrorResponse(block)) return;
+      // The 2026-07-08 invariant, per block: text and attachments together.
+      if (endsWithTrailingNoReply(block)) return;
+      if (spec.silentMatcher(block)) return;
+
+      if (!sender) {
+        const target = this.resolveSendTarget(delivery);
+        if (!target) return;
+        channelName = target.channel.name;
+        sender = this.deps.delivery.createBlockSender(
+          target.channel,
+          target.chatId,
+          reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+        );
+      }
+
+      // Every delivered message must be recorded, or it is invisible to
+      // recall_conversation (#203). "always" records the turn's literal
+      // response instead, once, after the turn.
+      if (spec.transcript === "on-delivery" && channelName) {
+        this.deps.appendAssistantTranscript(spec.key, block, channelName);
+      }
+
+      handledAny = true;
+      try {
+        await sender.deliver(block);
+      } catch (err) {
+        log.error({ err, sessionKey: spec.key }, "Block delivery failed");
+      }
+    };
+
+    return { onBlock, handledAny: () => handledAny };
   }
 
   private async handleThrownError(spec: TurnSpec, err: unknown, stopTyping: StopTyping): Promise<boolean> {

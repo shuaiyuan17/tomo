@@ -17,13 +17,17 @@ export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
   reject: (err: Error) => void | Promise<void>;
   /**
-   * Out-channel for the turn's per-block delivery units, in order, called
-   * immediately before `resolve`. The response string is exactly these blocks
-   * joined with "\n"; the delivery layer needs the unjoined form because a
-   * joined string cannot be re-split into blocks, and attachment placement
-   * ("A, MEDIA:, B" ships A → photo → B) is defined per block.
+   * Out-channel for ONE completed delivery unit, called the moment the SDK
+   * closes that content block — before the tool call the model is about to
+   * make, not after the turn ends. This is the whole point: a turn that spends
+   * twenty minutes in a subagent still answers the owner with the text it
+   * produced first.
+   *
+   * Awaited, so the event loop backpressures on delivery and blocks reach the
+   * channel in the order the model produced them. Never rejects — a failed
+   * send is logged by the sink, not allowed to kill the turn.
    */
-  onBlocks?: (blocks: string[]) => void;
+  onBlock?: (block: string) => void | Promise<void>;
 }
 
 export interface MessageRequest extends TurnRequest {
@@ -64,37 +68,77 @@ export interface ResponseBlock {
   text: string;
 }
 
-/** A rendered turn: the per-block delivery units and their joined text. */
+/**
+ * A rendered turn. Delivery units are NOT part of it: blocks ship as they
+ * complete (see renderBlock), so by the time a turn is rendered there is
+ * nothing left to hand a channel — only the joined text the turn-level
+ * bookkeeping needs.
+ */
 export interface RenderedTurn {
-  /** `blocks` joined with "\n" — logging, transcript, error/silence checks. */
+  /** The kept blocks joined with "\n" — logging, transcript, error/silence checks. */
   text: string;
-  /** Per-block delivery units, in order, after filtering. */
-  blocks: string[];
   /** True when at least one block had a training-scaffold leak stripped. */
   scaffoldFiltered: boolean;
 }
 
+/** What one content block turns into once the per-block rules have run. */
+export type BlockRender =
+  /** Ships as one channel message. */
+  | { kind: "ship"; text: string; scaffoldFiltered: boolean }
+  /** Trailing line(s) were the bare control token — the block ships nothing. */
+  | { kind: "no-reply"; scaffoldFiltered: boolean }
+  /** Wrong type for this session, or nothing left after filtering. */
+  | { kind: "empty"; scaffoldFiltered: boolean };
+
 /**
- * Render a turn's collected content blocks into the response.
+ * Decide what ONE completed content block ships, from its `type` alone.
  *
  * This is the ONLY place that decides what reaches a channel, and it decides
- * purely on the SDK block `type` — never by inspecting the text. A `text`
- * block is the model's chosen words and always ships, even when it happens to
- * read like reasoning (`思考: ...`) or like tool debris (`count`). A
- * `thinking` block ships only when showThinking is on, marked so it is
- * distinguishable. `redacted_thinking` carries no readable text and is
- * dropped at collection time.
+ * purely on the SDK block `type` — never by inspecting the text to judge
+ * whether it is "really" a reply. A `text` block is the model's chosen words
+ * and always ships, even when it happens to read like reasoning (`思考: ...`)
+ * or like tool debris (`count`). A `thinking` block ships only when
+ * showThinking is on, marked so it is distinguishable. `redacted_thinking`
+ * carries no readable text and is dropped at collection time.
  *
- * Everything else here runs PER BLOCK, before the join, because that is where
- * the streaming predecessor ran it (each block was a separate channel send):
+ * The two remaining rules are per block by design (#292) and now also per
+ * block in TIME — they run as the block completes, because that is when it
+ * ships:
  *   1. scaffold-leak filter — a leak truncates its own block, not the turn, so
  *      blocks after a `<system-reminder>` slip still ship;
  *   2. bare-NO_REPLY drop — a block whose trailing line(s) are only the token
  *      is dropped WHOLE (text, MEDIA: and STICKER: alike), so housekeeping
  *      narration and its attachments never leak out of a mid-turn slip.
- * Running either one over the joined string instead silently changes both:
- * the scaffold cut eats every later block, and the NO_REPLY drop only fires
- * when the token is the entire turn.
+ */
+export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockRender {
+  if (block.type === "thinking" && !showThinking) return { kind: "empty", scaffoldFiltered: false };
+
+  const scaffold = filterScaffoldLeak(block.text);
+  const scaffoldFiltered = scaffold.filtered;
+  const text = scaffold.text.trim();
+  if (!text) return { kind: "empty", scaffoldFiltered };
+  if (endsWithTrailingNoReply(text)) return { kind: "no-reply", scaffoldFiltered };
+
+  return {
+    kind: "ship",
+    text: block.type === "thinking" ? `${THINKING_MARKER}${text}` : text,
+    scaffoldFiltered,
+  };
+}
+
+/**
+ * Join a turn's collected content blocks into its RESPONSE STRING.
+ *
+ * Delivery no longer goes through here — each block was already shipped by
+ * `renderBlock` as it completed. What is left is everything that legitimately
+ * needs the whole turn: the transcript, the response log line, the value
+ * `send()`/`steer()` resolve with, and the end-of-turn silence and
+ * agent-error checks.
+ *
+ * Because those checks read this string, the trailing bare NO_REPLY is still
+ * represented here even though the block itself shipped nothing — otherwise a
+ * housekeeping turn would render as empty and be replaced by the "I'm not sure
+ * how to respond to that." fallback in the transcript.
  */
 export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: boolean): RenderedTurn {
   const rendered: string[] = [];
@@ -104,19 +148,15 @@ export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: bool
   let lastKeptWasNoReply = false;
 
   for (const block of blocks) {
-    if (block.type === "thinking" && !showThinking) continue;
-
-    const scaffold = filterScaffoldLeak(block.text);
-    if (scaffold.filtered) scaffoldFiltered = true;
-    const text = scaffold.text.trim();
-    if (!text) continue;
-
-    if (endsWithTrailingNoReply(text)) {
+    const result = renderBlock(block, showThinking);
+    if (result.scaffoldFiltered) scaffoldFiltered = true;
+    if (result.kind === "empty") continue;
+    if (result.kind === "no-reply") {
       lastKeptWasNoReply = true;
       continue;
     }
     lastKeptWasNoReply = false;
-    rendered.push(block.type === "thinking" ? `${THINKING_MARKER}${text}` : text);
+    rendered.push(result.text);
   }
 
   // NO_REPLY is Tomo's own control token, not the model's prose. A block whose
@@ -127,7 +167,7 @@ export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: bool
   // layer's trailing-NO_REPLY check to find.
   const kept = lastKeptWasNoReply ? [...rendered, "NO_REPLY"] : rendered;
 
-  return { text: kept.join("\n").trim(), blocks: kept, scaffoldFiltered };
+  return { text: kept.join("\n").trim(), scaffoldFiltered };
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number {
@@ -427,6 +467,30 @@ export class LiveSession {
     return null;
   }
 
+  /**
+   * Hand one completed content block to the turn's delivery sink.
+   *
+   * Awaited by the event loop, which is what keeps blocks in model order: the
+   * next SDK event is not pulled until this one has shipped. A send that fails
+   * is logged and swallowed — a dead channel must not abort a turn that is
+   * still doing useful work.
+   */
+  private async shipBlock(block: ResponseBlock): Promise<void> {
+    const onBlock = this.currentRequest?.onBlock;
+    if (!onBlock) return;
+
+    // A scaffold leak is reported once per turn at `result`, over the same
+    // per-block filter — not logged again here.
+    const rendered = renderBlock(block, this.showThinking);
+    if (rendered.kind !== "ship") return;
+
+    try {
+      await onBlock(rendered.text);
+    } catch (err) {
+      log.error({ err, session: this.sessionKey }, "Per-block delivery failed");
+    }
+  }
+
   private async handleEvent(event: SDKMessage): Promise<void> {
     this.refreshActivityTimeout();
 
@@ -444,20 +508,26 @@ export class LiveSession {
       return;
     }
 
+    // An `assistant` event carries COMPLETE content blocks. There are no
+    // deltas to reassemble (#292 removed streaming), and the SDK emits this
+    // event before it executes any tool_use it announces — so this is the
+    // exact moment a block is finished and can ship. Waiting for `result`
+    // instead is what left the owner unanswered for the length of a turn.
     if (event.type === "assistant" && event.message?.content) {
       for (const block of event.message.content) {
         if (isTextBlock(block)) {
-          // Claim the turn so an SDK-initiated (unowned) turn still has a
-          // request to resolve into at result time. Delivery itself happens
-          // once, after the turn completes — nothing ships per block.
+          // Claim the turn so an SDK-initiated (unowned) turn has a request to
+          // deliver through.
           if (!this.currentRequest) this.claimUnownedTurn("assistant_text");
           this.parts.push({ type: "text", text: block.text });
+          await this.shipBlock({ type: "text", text: block.text });
         } else if (isThinkingBlock(block)) {
           // Kept as a typed block; whether it reaches the channel is decided
-          // by renderResponseBlocks from the TYPE, never from the text.
+          // by renderBlock from the TYPE, never from the text.
           // `redacted_thinking` carries no readable text and never gets here.
           if (!this.currentRequest) this.claimUnownedTurn("assistant_thinking");
           this.parts.push({ type: "thinking", text: block.thinking });
+          await this.shipBlock({ type: "thinking", text: block.thinking });
         } else if (isToolUseBlock(block)) {
           if (block.id) this.pendingToolNames.set(block.id, block.name);
           if (block.id && (block.name === "Agent" || block.name === "Task")) {
@@ -535,21 +605,18 @@ export class LiveSession {
       // Await context usage before resolving so stats are complete
       await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
-      // The turn is over: render its collected content blocks into the one
-      // response callers deliver, transcribe and log. Block TYPE alone decides
-      // what is included (see renderResponseBlocks) — the text is never
-      // inspected.
+      // The turn is over. Its blocks have ALREADY shipped, one by one, as they
+      // completed; what is assembled here is only the response string — the
+      // transcript, the log line, and the value send()/steer() resolve with.
       const rendered = renderResponseBlocks(this.parts, this.showThinking);
       if (rendered.scaffoldFiltered) {
         log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
       }
       const response = rendered.text || "I'm not sure how to respond to that.";
-      const responseBlocks = rendered.blocks.length > 0 ? rendered.blocks : [response];
       this.parts = [];
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
       if (this.pendingSteers.length === 0) this.clearActivityTimeout();
-      req?.onBlocks?.(responseBlocks);
       await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
@@ -732,7 +799,7 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    onBlocks?: (blocks: string[]) => void,
+    onBlock?: (block: string) => void | Promise<void>,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -752,7 +819,7 @@ export class LiveSession {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
         resolve,
         reject,
-        ...(onBlocks ? { onBlocks } : {}),
+        ...(onBlock ? { onBlock } : {}),
       };
       this.currentRequest = req;
       this.parts = [];
@@ -775,10 +842,10 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    onBlocks?: (blocks: string[]) => void,
+    onBlock?: (block: string) => void | Promise<void>,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, images, documents, onBlocks);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlock);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -793,7 +860,7 @@ export class LiveSession {
         message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
         resolve,
         reject,
-        ...(onBlocks ? { onBlocks } : {}),
+        ...(onBlock ? { onBlock } : {}),
       };
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);

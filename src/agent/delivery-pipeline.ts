@@ -12,13 +12,18 @@ interface DeliveryPipelineDeps {
 export interface DeliverOptions {
   /** Thread the reply to this provider message id, if the channel supports it. */
   replyTo?: string;
-  /**
-   * The turn's content blocks, in order (LiveSession's renderResponseBlocks).
-   * Attachment placement is defined per block: `A`, `MEDIA:x`, `B` ships
-   * A → photo → B, and a caption rides the media of its OWN block. Absent for
-   * callers that only have a string; then the whole response is one block.
-   */
-  blocks?: string[];
+}
+
+/**
+ * Ships a turn's blocks, one at a time, as each completes.
+ *
+ * One sender per turn: the reply target is one-shot and has to survive from
+ * the block that was offered it to the block that finally takes it, which
+ * cannot be expressed by independent per-block calls.
+ */
+export interface BlockSender {
+  /** Ship one completed block. Resolves when it has reached the channel. */
+  deliver(block: string): Promise<void>;
 }
 
 export function isAgentErrorResponse(response: string): boolean {
@@ -30,19 +35,30 @@ export function isAgentErrorResponse(response: string): boolean {
 }
 
 /**
- * Outbound delivery for a completed turn.
+ * Outbound delivery, one completed content block at a time.
  *
- * Delivery is non-streaming by design: the turn runs to completion,
- * LiveSession renders its content blocks into one response string (block TYPE
- * decides what is included — see live-session.ts renderResponseBlocks), and
- * that string is delivered here as a single reply. Nothing in this file
- * inspects the model's words to decide whether they are "really" a reply.
+ * Delivery is non-streaming but not end-of-turn: there are no token deltas to
+ * split on (that was the rejected "几十条消息" design), and there is no waiting
+ * for the turn either (#292's regression — a reply written before a
+ * twenty-minute tool call sat in a buffer until the tool returned). A block
+ * ships the moment the SDK closes it. Newlines inside a block are formatting
+ * and stay inside one message.
+ *
+ * Nothing in this file inspects the model's words to decide whether they are
+ * "really" a reply; block TYPE decided that already (live-session.ts
+ * renderBlock).
  */
 export class DeliveryPipeline {
   constructor(private deps: DeliveryPipelineDeps) {}
 
   /**
-   * Deliver a completed turn's response to a chat.
+   * Deliver a WHOLE response string as one block.
+   *
+   * The model's own turns do not come through here any more — their blocks
+   * ship individually via `createBlockSender`. What is left are responses that
+   * never had blocks to begin with: the fabricated fallbacks in
+   * LiveSessionManager ("I ran out of steps trying to complete that.") and
+   * agent-error text.
    *
    * Order matters: silence and agent errors are classified on the response as
    * the model produced it, then trailing bare-NO_REPLY suppression runs, then
@@ -75,34 +91,33 @@ export class DeliveryPipeline {
       return;
     }
 
-    await this.deliverAssistantContent(replyChannel, replyChatId, options.blocks ?? [visible], options);
+    await this.createBlockSender(replyChannel, replyChatId, options).deliver(visible);
   }
 
   /**
-   * Ship a turn's content blocks in order.
+   * Open a sender for ONE turn. Every completed block of that turn goes
+   * through it, in order, as it completes.
    *
-   * Attachments are extracted PER BLOCK, never from the joined turn, so a
-   * block's MEDIA:/STICKER: lands where the model put it: `A`, `MEDIA:x`, `B`
-   * ships A → photo → B, and a caption rides the media of its own block only.
-   * Adjacent text-only blocks are merged into ONE send, so the common all-text
-   * turn is still exactly one message with its newlines inside the bubble.
-   * Reply threading targets the first message that actually SHIPS THREADED,
-   * whatever its kind — a step that sends nothing, or a channel that cannot
-   * thread that kind of message, leaves the target for the next one.
+   * Attachments are extracted PER BLOCK, never from a joined turn, so a
+   * block's MEDIA:/STICKER: lands where the model put it: blocks `A`,
+   * `MEDIA:x`, `B` ship A → photo → B, and a caption rides the media of its
+   * own block only.
+   *
+   * There is deliberately no merging of adjacent text blocks. Under
+   * end-of-turn delivery the whole turn was in hand at once and merging kept
+   * an all-text turn to a single bubble; mid-turn there is no second block to
+   * merge with — it has not been written yet — so a merge step here would be
+   * code for a case that cannot occur. One completed block is one message.
    */
-  async deliverAssistantContent(
-    channel: Channel,
-    chatId: string,
-    blocks: string[],
-    options: DeliverOptions = {},
-  ): Promise<void> {
-    // Thread only the FIRST shipped message — one reply, not one per send.
+  createBlockSender(channel: Channel, chatId: string, options: DeliverOptions = {}): BlockSender {
+    // Thread only the FIRST shipped message of the turn — one reply, not one
+    // per send. This is why the sender is per turn and not per block.
     //
-    // "Shipped" is the whole difficulty. A step can decline to send (an empty
-    // text run, a tag-only block whose MEDIA: path does not exist) and a
-    // channel can send without threading (imsg stickers). Either way the
-    // target must survive to the next send, so it is offered to each send and
-    // only retired once a send confirms it took it.
+    // "Shipped" is the whole difficulty. A step can decline to send (a block
+    // that is empty after filtering, a tag-only block whose MEDIA: path does
+    // not exist) and a channel can send without threading (imsg stickers).
+    // Either way the target must survive to the next send, so it is offered to
+    // each send and only retired once a send confirms it took it.
     let pendingReplyTo = options.replyTo;
     const offerReplyTo = (): { replyTo?: string } => (pendingReplyTo ? { replyTo: pendingReplyTo } : {});
     /**
@@ -117,41 +132,31 @@ export class DeliveryPipeline {
       settleReplyTo(await channel.send(message) ?? {});
     };
 
-    let textRun: string[] = [];
-    const flushTextRun = async () => {
-      if (textRun.length === 0) return;
-      const merged = textRun.join("\n");
-      textRun = [];
-      settleReplyTo(await deliverText(channel, chatId, merged, offerReplyTo()));
+    return {
+      deliver: async (block: string): Promise<void> => {
+        // Defence in depth: the bare-NO_REPLY drop already happened per block
+        // in renderBlock, but callers that hand us raw text get it here too.
+        if (endsWithTrailingNoReply(block)) return;
+
+        const { cleanText, mediaPaths, stickerIds } = extractAttachments(block);
+        if (mediaPaths.length === 0 && stickerIds.length === 0) {
+          // No tags stripped, so no blank line to collapse: ship it verbatim.
+          settleReplyTo(await deliverText(channel, chatId, block, offerReplyTo()));
+          return;
+        }
+
+        const validPaths = mediaPaths.filter((path) => existsSync(path));
+        const caption = restoreLiteralNewlines(cleanText).trim();
+        let captionSent = false;
+        for (const [i, path] of validPaths.entries()) {
+          await send({ chatId, photo: path, text: i === 0 ? caption : "", ...offerReplyTo() });
+          if (i === 0 && caption) captionSent = true;
+        }
+        if (!captionSent) settleReplyTo(await deliverText(channel, chatId, cleanText, offerReplyTo()));
+        for (const stickerId of stickerIds) {
+          await send({ chatId, text: "", sticker: stickerId, ...offerReplyTo() });
+        }
+      },
     };
-
-    for (const block of blocks) {
-      // Defence in depth: the per-block bare-NO_REPLY drop already happened in
-      // renderResponseBlocks, but callers that hand us raw text get it here too.
-      if (endsWithTrailingNoReply(block)) continue;
-
-      const { cleanText, mediaPaths, stickerIds } = extractAttachments(block);
-      if (mediaPaths.length === 0 && stickerIds.length === 0) {
-        // No tags stripped, so no blank line to collapse: ship it verbatim.
-        if (block.trim()) textRun.push(block);
-        continue;
-      }
-
-      await flushTextRun();
-
-      const validPaths = mediaPaths.filter((path) => existsSync(path));
-      const caption = restoreLiteralNewlines(cleanText).trim();
-      let captionSent = false;
-      for (const [i, path] of validPaths.entries()) {
-        await send({ chatId, photo: path, text: i === 0 ? caption : "", ...offerReplyTo() });
-        if (i === 0 && caption) captionSent = true;
-      }
-      if (!captionSent) settleReplyTo(await deliverText(channel, chatId, cleanText, offerReplyTo()));
-      for (const stickerId of stickerIds) {
-        await send({ chatId, text: "", sticker: stickerId, ...offerReplyTo() });
-      }
-    }
-
-    await flushTextRun();
   }
 }

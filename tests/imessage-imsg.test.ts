@@ -2312,6 +2312,17 @@ describe("imsg captioned photo hands an unapplied reply target to the caption", 
 describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () => {
   const pipeline = new DeliveryPipeline({ queuePendingErrorNote: () => {} });
 
+  /** Ship a turn's blocks through ONE per-turn sender, as they complete. */
+  const deliverBlocks = async (
+    channel: Parameters<typeof pipeline.createBlockSender>[0],
+    chatId: string,
+    blocks: string[],
+    options: { replyTo?: string } = {},
+  ) => {
+    const sender = pipeline.createBlockSender(channel, chatId, options);
+    for (const block of blocks) await sender.deliver(block);
+  };
+
   const withPhoto = async (fn: (photoPath: string) => Promise<void>) => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-e2e-"));
     const photoPath = join(dir, "pic.png");
@@ -2328,7 +2339,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send.attachment", "send"]);
@@ -2344,7 +2355,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: CAPS_FULL });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`MEDIA:${photoPath}`, "B"], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);
@@ -2359,7 +2370,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: { ...CAPS_STICKER, rpcMethods: new Set([...CAPS_STICKER.rpcMethods, "send.attachment"]), selectors: { ...CAPS_STICKER.selectors, sendAttachment: true } } });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`STICKER:${stickerPath}`, "B"], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`STICKER:${stickerPath}`, "B"], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.sticker"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send.sticker", "send.rich"]);
@@ -2378,7 +2389,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       const { channel, requests } = makeChannel({ caps: CAPS_FULL });
       await channel.start();
 
-      await pipeline.deliverAssistantContent(channel, DM_GUID, [`caption\nMEDIA:${photoPath}`], { replyTo: "guid-target" });
+      await deliverBlocks(channel, DM_GUID, [`caption\nMEDIA:${photoPath}`], { replyTo: "guid-target" });
 
       const outbound = requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method));
       expect(outbound.map((r) => r.method)).toEqual(["send", "send.rich"]);

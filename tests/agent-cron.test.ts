@@ -398,14 +398,14 @@ describe("background task notification delivery", () => {
 
   // A "background task/agent" notifying another session (e.g. via the
   // delegate send_message tool, or a scheduled cron job) runs through
-  // handleCronMessage -> TurnRunner.runSendTurn, which has no per-block
-  // delivery (unlike stream turns) — it collects the whole multi-block
-  // response into one string and only then decides whether to deliver it.
-  // A trailing bare-NO_REPLY block silences the ENTIRE turn (owner decision
-  // 2026-07-08): the narration is housekeeping, not for the channel. This
-  // inverts the #222 delivery of mid-turn text; the #222 protection that
-  // remains is that inline mentions of NO_REPLY do not silence (next test).
-  it("suppresses the whole send-turn when it ends in a trailing NO_REPLY block", async () => {
+  // handleCronMessage -> TurnRunner, on the SAME per-block delivery path as
+  // an owner reply: each completed block ships as it completes.
+  //
+  // NO_REPLY is therefore enforced per block (owner decision 2026-07-08, kept
+  // exactly, at block scope): a block whose trailing line is the bare token
+  // ships nothing at all, narration and attachments together. The #222
+  // protection is unchanged — inline mentions of NO_REPLY do not silence.
+  it("sends nothing for a send-turn whose narration block ends in NO_REPLY", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -415,7 +415,41 @@ describe("background task notification delivery", () => {
     await drainQueue(agent);
     tg.clearDelivered();
 
-    // Mirrors the reported repro shape: text -> tool_use -> tool_use -> NO_REPLY.
+    // The token is inside the narration block, so the block ships nothing —
+    // text and attachments together. This is the invariant that survives
+    // mid-turn delivery intact.
+    mockSdk.responseFn = () => [
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
+      "housekeeping narration not meant for the channel\nNO_REPLY",
+    ];
+    await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered).toHaveLength(0);
+    expect(tg.sent).toHaveLength(0);
+
+    await agent.stop();
+  });
+
+  /**
+   * The honest cost of mid-turn delivery, asserted rather than discovered.
+   *
+   * The reported repro shape is text -> tool_use -> tool_use -> NO_REPLY. The
+   * narration is its OWN completed block, so it reaches the channel before the
+   * model ever writes the token — no end-of-turn rule can recall it, and
+   * holding only the LAST block back would not have saved it either. A turn
+   * that must stay silent whatever the model writes has to say so up front
+   * with suppressDelivery (next test), which does not depend on the model.
+   */
+  it("cannot unsend an earlier narration block when a later block is NO_REPLY", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
     mockSdk.responseFn = () => [
       "housekeeping narration not meant for the channel",
       { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
@@ -423,6 +457,31 @@ describe("background task notification delivery", () => {
       "NO_REPLY",
     ];
     await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
+
+    expect(tg.delivered.map((d) => d.text)).toEqual(["housekeeping narration not meant for the channel"]);
+
+    await agent.stop();
+  });
+
+  it("suppressDelivery silences every block of a send-turn, mid-turn included", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => [
+      "narration the channel must never see",
+      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
+      "more narration",
+    ];
+    await expect(agent.handleCronMessage("System: background task done", "telegram:12345", {
+      showTyping: false,
+      suppressDelivery: true,
+    })).resolves.toBe(true);
 
     expect(tg.delivered).toHaveLength(0);
     expect(tg.sent).toHaveLength(0);

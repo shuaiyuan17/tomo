@@ -689,7 +689,9 @@ export class Agent {
     const { channel, chatId } = target;
     const stopTyping = this.startTurnTyping(channel, chatId, this.isPassiveReplyTarget(channel.name, chatId));
     let settled = false;
-    let responseBlocks: string[] | undefined;
+    // One sender for the whole background turn, so its blocks ship as they
+    // complete — same path as every other ingress.
+    const sender = this.delivery.createBlockSender(channel, chatId);
 
     const stop = async () => {
       try {
@@ -700,25 +702,35 @@ export class Agent {
     };
 
     return {
-      onBlocks: (blocks) => { responseBlocks = blocks; },
+      onBlock: async (block) => {
+        // Error text is not a reply: it is handled once, at resolve, so it
+        // reaches the chat prefixed and with a pending note queued.
+        if (isAgentErrorResponse(block) || isSilentReply(block)) return;
+        try {
+          // Recorded per shipped block — an unrecorded delivery is invisible
+          // to recall_conversation (#203).
+          this.sessions.append(key, {
+            role: "assistant",
+            content: block,
+            channel: channel.name,
+            timestamp: Date.now(),
+          });
+          await sender.deliver(block);
+        } catch (err) {
+          log.error({ err, key }, "Background task block delivery failed");
+        }
+      },
       resolve: async (response) => {
         if (settled) return;
         settled = true;
         try {
           this.maybeNudgeCompact(key);
-          if (!isSilentReply(response) && !isAgentErrorResponse(response)) {
-            this.sessions.append(key, {
-              role: "assistant",
-              content: response,
-              channel: channel.name,
-              timestamp: Date.now(),
-            });
-          }
           log.info({ channel: channel.name, session: key }, "Tomo: %s", response);
-          await this.delivery.deliverResponse(
-            key, channel, chatId, response, undefined,
-            responseBlocks ? { blocks: responseBlocks } : {},
-          );
+          // The turn's own blocks have already shipped; only an agent error
+          // still needs delivering (and a pending note queued for it).
+          if (isAgentErrorResponse(response)) {
+            await this.delivery.deliverResponse(key, channel, chatId, response);
+          }
         } catch (err) {
           log.error({ err, key }, "Background task response delivery failed");
         } finally {

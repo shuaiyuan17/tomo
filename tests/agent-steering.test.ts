@@ -155,16 +155,17 @@ describe("steering", () => {
     await waitFor(() => expect(getLiveSession(agent, "telegram:12345").pendingSteers).toHaveLength(1));
 
     release!();
-    // One turn is one reply: both blocks of the merged turn arrive together
-    // in a single message rather than as two sends.
+    // The merged turn owns both blocks, and each ships as its own message as
+    // it completes — the point of the test is that they ship ONCE, not that
+    // they ship together.
     await waitFor(() => {
-      expect(tg.delivered.map((d) => d.text)).toEqual(["reply one\nreply two"]);
+      expect(tg.delivered.map((d) => d.text)).toEqual(["reply one", "reply two"]);
     });
 
     // The steered request resolved as merged and must not deliver anything
     // extra (no duplicate, no error).
     await expectNoChangeFor(() => {
-      expect(tg.delivered).toHaveLength(1);
+      expect(tg.delivered).toHaveLength(2);
       expect(tg.delivered.some((d) => d.text.startsWith("[error]"))).toBe(false);
     });
     expect(getLiveSession(agent, "telegram:12345").isBusy()).toBe(false);

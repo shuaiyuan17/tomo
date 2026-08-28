@@ -317,16 +317,13 @@ export class LiveSessionManager {
   }
 
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
-    const { key, prompt, images, documents, steer = false, onResponseBlocks } = req;
-    // Fabricated (non-model) responses below still need a block list — they
-    // are single-block by construction.
-    const oneBlock = (text: string) => { onResponseBlocks?.([text]); return text; };
+    const { key, prompt, images, documents, steer = false, onBlock } = req;
 
     try {
       const session = await this.getOrCreateLiveSession(key);
       const response = steer
-        ? await session.steer(prompt, images, documents, onResponseBlocks)
-        : await session.send(prompt, images, documents, onResponseBlocks);
+        ? await session.steer(prompt, images, documents, onBlock)
+        : await session.send(prompt, images, documents, onBlock);
 
       // Merged into another request's in-flight turn — that turn's owner
       // does the per-turn bookkeeping (stats, compact triggers) when it
@@ -340,12 +337,12 @@ export class LiveSessionManager {
 
       if (this.stopping && errMsg.includes("closed")) {
         log.info({ key }, "Session closed during shutdown; preserving SDK session link");
-        return oneBlock("NO_REPLY");
+        return "NO_REPLY";
       }
 
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
-        return oneBlock("I ran out of steps trying to complete that. Can you try a simpler request?");
+        return "I ran out of steps trying to complete that. Can you try a simpler request?";
       }
 
       if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
@@ -374,7 +371,13 @@ export class LiveSessionManager {
         }
 
         const session = await this.getOrCreateLiveSession(key);
-        const response = await session.send(prompt, images, documents, onResponseBlocks);
+        // The retry gets the same per-block sink. Blocks the failed attempt
+        // already shipped stay shipped — mid-turn delivery is committed the
+        // moment it reaches the channel, and there is no unsend. Recoverable
+        // session errors are raised while starting or resuming the child, i.e.
+        // before any content block exists, so in practice the retry ships the
+        // whole reply and nothing is duplicated.
+        const response = await session.send(prompt, images, documents, onBlock);
         this.recordTurnCompletion(key, session);
         return response;
       }

@@ -50,6 +50,39 @@ describe("DM message routing", () => {
     await agent.stop();
   });
 
+  it("refuses to answer a summoned group when the private reply channel is not registered", async () => {
+    // The summon runs the group's messages on the owner's private dm: session
+    // and promises its plain output stays private. With the private channel
+    // (iMessage) down there is nowhere private to reply — the turn must not
+    // run into the group. Before, it did.
+    resetConfig({
+      identities: [{ name: "shuai", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+    };
+    internals.router.summonGroup("telegram", "-100270", "shuai");
+
+    mockSdk.responseFn = () => "private side-note for the owner";
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100270",
+      text: "@tomo what did we say in private?",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+    }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toEqual([]);
+    expect(mockSdk.promptsBySession).toEqual([]);
+
+    await agent.stop();
+  });
+
   it("routes DM and replies on the same channel", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

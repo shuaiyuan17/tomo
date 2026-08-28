@@ -80,6 +80,17 @@ export function legacySessionKeysForBinding(keys: Iterable<string>, channelName:
   return out;
 }
 
+/**
+ * The raw session key to hand a `dm:` session's cron jobs back to when the
+ * identity is removed: the actual key inbound traffic for that binding uses
+ * when one is known (an iMessage binding's real key is GUID-shaped — a chat
+ * GUID cannot be synthesised from a handle, the service prefix varies), else
+ * the literal `<channel>:<binding>` form.
+ */
+export function rawSessionKeyForBinding(channelName: string, bound: string, knownKeys: Iterable<string>): string {
+  return legacySessionKeysForBinding(knownKeys, channelName, bound)[0] ?? `${channelName}:${bound}`;
+}
+
 /** Extract the identifier from an iMessage chat GUID (e.g. "any;-;+15551234567" → "+15551234567") */
 export function extractImessageIdentifier(chatGuid: string): string | null {
   const parts = chatGuid.split(";");

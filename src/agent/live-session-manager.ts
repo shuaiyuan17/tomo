@@ -12,7 +12,7 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -403,8 +403,9 @@ export class LiveSessionManager {
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
     const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped, origin } = req;
 
+    let session: LiveSession | undefined;
     try {
-      const session = await this.getOrCreateLiveSession(key);
+      session = await this.getOrCreateLiveSession(key);
       // The session was built while we were parked in buildExternalMcpServers
       // and shutdown began in the meantime, so createLiveSession closed it
       // rather than publishing it (see there). Refuse rather than call send()
@@ -426,6 +427,18 @@ export class LiveSessionManager {
       this.recordTurnCompletion(key, session);
       return response;
     } catch (err) {
+      // The CLI ended the turn on an error result (max turns, budget, an
+      // execution error, an API error). The session is intact and the turn
+      // is over: record it like a completed turn — the SDK session id (a
+      // first turn that fails must still be resumable) and its stats — then
+      // let the failure through to TurnRunner's error policy. Never retried:
+      // the CLI did not lose the conversation, and a re-run would re-send any
+      // blocks that already shipped.
+      if (err instanceof SdkResultError) {
+        if (session) this.recordTurnCompletion(key, session);
+        throw err;
+      }
+
       const errMsg = err instanceof Error ? err.message : "";
 
       if (this.stopping && errMsg.includes("closed")) {

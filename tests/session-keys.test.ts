@@ -3,6 +3,7 @@ import {
   isGroupSessionKey,
   legacySessionKeysForBinding,
   matchesChannelBinding,
+  rawSessionKeyForBinding,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -65,5 +66,13 @@ describe("identity binding matchers", () => {
     expect(legacySessionKeysForBinding(keys, "telegram", "111")).toEqual(["telegram:111"]);
     expect(legacySessionKeysForBinding(keys, "imessage", "+15551234567")).toEqual(["imessage:any;-;+15551234567"]);
     expect(legacySessionKeysForBinding(keys, "imessage", "+15557777777")).toEqual([]);
+  });
+
+  it("hands cron jobs back to the key inbound traffic actually uses, else the literal binding", () => {
+    const known = ["imessage:any;-;+15551234567", "telegram:111", "dm:shuai"];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", known)).toBe("imessage:any;-;+15551234567");
+    expect(rawSessionKeyForBinding("telegram", "111", known)).toBe("telegram:111");
+    // No conversation seen yet: a chat GUID cannot be synthesised from a handle.
+    expect(rawSessionKeyForBinding("imessage", "+15550000000", known)).toBe("imessage:+15550000000");
   });
 });

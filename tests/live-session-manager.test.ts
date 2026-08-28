@@ -81,6 +81,12 @@ vi.mock("../src/agent/live-session.js", () => {
     STEER_MERGED: "",
     DELIVERY_TIMEOUT_MS: 60_000,
     MAX_TURNS_RESPONSE: "I ran out of steps trying to complete that. Can you try a simpler request?",
+    SdkResultError: class SdkResultError extends Error {
+      constructor(message: string, readonly subtype: string, readonly errors: string[] = []) {
+        super(message);
+        this.name = "SdkResultError";
+      }
+    },
   };
 });
 
@@ -806,6 +812,26 @@ describe("LiveSessionManager.runWithRetry", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("records a turn that ended on an SDK error result, then rethrows without retrying", async () => {
+    const { SdkResultError } = await import("../src/agent/live-session.js");
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async (_prompt, session) => {
+      session.lastResult = { costUsd: 0.2, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 0, contextMax: 0 };
+      throw new SdkResultError("I ran out of steps trying to complete that. Can you try a simpler request?", "error_max_turns", ["too many turns"]);
+    };
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toMatchObject({ subtype: "error_max_turns" });
+
+    // Not a session error: no reset, no second attempt.
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+    // The turn happened: its SDK session id and stats are recorded like a
+    // completed turn's, so a first turn that fails is still resumable.
+    expect(deps.setSdkSessionId).toHaveBeenCalledWith("telegram:1", expect.any(String));
+    expect(deps.updateStats).toHaveBeenCalledWith("telegram:1", expect.objectContaining({ costUsd: 0.2 }));
   });
 
   it("returns the max-turns fallback message without retrying", async () => {

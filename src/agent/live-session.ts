@@ -117,36 +117,45 @@ interface TokenTotals {
   cacheCreated: number;
 }
 
-export interface ResultFailure {
-  /** Owner-facing note shipped as a final block; absent for API-error turns,
-   *  whose text goes through the delivery pipeline's error policy instead. */
-  note?: string;
-  /** API error text carried by a `success` result with `is_error`. */
-  errorText?: string;
+/**
+ * A turn the CLI ended on a non-success result. Thrown (rejected) from
+ * send()/steer() so the failure travels the same path as any other turn
+ * error and TurnRunner's `TurnErrorPolicy` decides what the chat sees —
+ * delivered to a DM, note-only for a group cron, ignored for continuity —
+ * and CronScheduler records the run as failed. `message` is owner-facing
+ * (or, for an API-error result, the API error text, which the delivery
+ * pipeline's `isAgentErrorResponse` already classifies).
+ */
+export class SdkResultError extends Error {
+  constructor(message: string, readonly subtype: string, readonly errors: string[] = []) {
+    super(message);
+    this.name = "SdkResultError";
+  }
 }
 
 /**
- * Classify a turn-ending result. `null` for a clean success; otherwise how
- * the turn failed and what, if anything, to tell the owner.
+ * Classify a turn-ending result. `null` for a clean success; otherwise the
+ * typed error the turn should reject with.
  *
  * The SDK's result union (`SDKResultSuccess | SDKResultError`) is closed
- * today, but new error subtypes have been added before; anything not
- * recognised is treated as an execution error rather than as success.
+ * today, but new error subtypes have been added before; every one so far is
+ * `error_*`, so an unrecognised `error_*` subtype is treated as an execution
+ * error rather than as success.
  */
-export function describeResultFailure(result: SdkResultLike): ResultFailure | null {
+export function describeResultFailure(result: SdkResultLike): SdkResultError | null {
+  const errors = result.errors ?? [];
   switch (result.subtype) {
     case "success":
       if (!result.is_error) return null;
-      return { errorText: result.result?.trim() || "API Error: the turn ended on an API error" };
+      return new SdkResultError(result.result?.trim() || "API Error: the turn ended on an API error", result.subtype, errors);
     case "error_max_turns":
-      return { note: MAX_TURNS_RESPONSE };
+      return new SdkResultError(MAX_TURNS_RESPONSE, result.subtype, errors);
     case "error_max_budget_usd":
-      return { note: MAX_BUDGET_RESPONSE };
+      return new SdkResultError(MAX_BUDGET_RESPONSE, result.subtype, errors);
     default:
-      // Every SDK error subtype is `error_*` (`error_during_execution`,
-      // `error_max_structured_output_retries`, and whatever comes next).
-      // Anything else unrecognised is not treated as a failure.
-      return result.subtype.startsWith("error") || result.is_error ? { note: EXECUTION_ERROR_RESPONSE } : null;
+      return result.subtype.startsWith("error") || result.is_error
+        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors)
+        : null;
   }
 }
 
@@ -873,9 +882,12 @@ export class LiveSession {
       // so it is differenced against the previous result, like the cost.
       const { input, output, cacheRead, cacheCreated } = this.turnTokenUsage(result);
 
-      // Compute per-turn cost as delta from cumulative total
+      // Per-turn cost as the delta from the cumulative total. A total that
+      // went BACKWARDS is a reset, not a refund — crash results carry zeroed
+      // totals and a mid-session /clear restarts the running sum — so the
+      // cumulative value is then this turn's own; never persist a negative.
       const totalCost = result.total_cost_usd ?? 0;
-      const turnCost = totalCost - this.prevTotalCost;
+      const turnCost = totalCost >= this.prevTotalCost ? totalCost - this.prevTotalCost : totalCost;
       this.prevTotalCost = totalCost;
 
       // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
@@ -892,19 +904,6 @@ export class LiveSession {
           { session: this.sessionKey, subtype: result.subtype, errors: result.errors, turns: result.num_turns },
           "SDK turn ended on an error result",
         );
-        if (failure.note) {
-          // Ship the note through the same per-block path as model text so it
-          // reaches the owner even when earlier blocks already landed — the
-          // response string alone is not re-delivered once a block shipped.
-          this.parts.push({ type: "text", text: failure.note });
-          await this.shipBlock({ type: "text", text: failure.note });
-        } else if (this.parts.length === 0 && failure.errorText) {
-          // API-error turn with no assistant text of its own: surface the
-          // error text as the response so the delivery pipeline's agent-error
-          // classification (`isAgentErrorResponse`) sees it. Not shipped as a
-          // block — the error policy decides whether it reaches the chat.
-          this.parts.push({ type: "text", text: failure.errorText });
-        }
       }
 
       // Store result stats, get context usage, then resolve
@@ -933,7 +932,13 @@ export class LiveSession {
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
       if (this.pendingSteers.length === 0) this.clearActivityTimeout();
-      await req?.resolve(response);
+      // A failed turn REJECTS its owner (blocks already shipped stay shipped;
+      // the sink flushes their transcript slots on the rejection path) rather
+      // than resolving with a note the block sink would deliver as if the
+      // model had said it — bypassing the turn's error policy and reporting
+      // a clean run to cron.
+      if (failure) await req?.reject(failure);
+      else await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
       this.currentRequest = null;

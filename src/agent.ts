@@ -1004,7 +1004,7 @@ export class Agent {
     // changes can't re-route a message that was already queued.
     const resolution = receiptResolution ?? this.router.resolve(channel.name, message.chatId, isGroup);
     const key = resolution.sessionKey;
-    const { channel: replyChannel, chatId: replyChatId } = this.resolveReplyDestination(resolution, channel, message.chatId);
+    const destination = this.resolveReplyDestination(resolution, channel, message.chatId, isGroup);
 
     const textForAgent = this.formatGroupText(channel, message, key);
 
@@ -1029,6 +1029,11 @@ export class Agent {
       log.debug("Group message ignored (not mentioned)");
       return;
     }
+
+    // Recorded above so the transcript keeps the message; the turn itself is
+    // refused rather than answered somewhere it must not be.
+    if (!destination) return;
+    const { channel: replyChannel, chatId: replyChatId } = destination;
 
     // Summoned group message running on the dm session: remind the model how
     // reply routing works this turn, and flag audience hops (DM ↔ group).
@@ -1059,26 +1064,39 @@ export class Agent {
 
   /**
    * Where a turn's reply goes: the router's reply target when its channel is
-   * registered, else the inbound chat. CHANNEL AND CHAT ID MOVE TOGETHER — a
-   * fixed reply policy can name a channel that is not running (provider
-   * disabled, token missing), and falling back to the inbound channel while
-   * keeping the fixed channel's chatId would hand a Telegram chat id to the
-   * iMessage adapter (or the reverse).
+   * registered. When it is not (a fixed reply policy or a summon naming a
+   * provider that is disabled or has no token):
+   *
+   * - Inbound PRIVATE chat: reply there. CHANNEL AND CHAT ID MOVE TOGETHER —
+   *   falling back to the inbound channel while keeping the resolved chatId
+   *   would hand an iMessage handle to the Telegram bot (or the reverse). The
+   *   inbound DM is the identity's own bound chat, so the owner still gets an
+   *   answer — and the only place to tell them their reply channel is down.
+   * - Inbound GROUP: FAIL CLOSED (`undefined`; the caller skips the turn). A
+   *   summoned group runs on the owner's private dm: session, whose plain
+   *   output the router promises stays private; delivering it into the group
+   *   because the private channel is down would leak it.
    */
   private resolveReplyDestination(
     resolution: { replyTarget: { channelName: string; chatId: string } },
     inboundChannel: Channel,
     inboundChatId: string,
-  ): { channel: Channel; chatId: string } {
+    inboundIsGroup: boolean,
+  ): { channel: Channel; chatId: string } | undefined {
     const { channelName, chatId } = resolution.replyTarget;
     const channel = this.getChannel(channelName);
     if (channel) return { channel, chatId };
-    if (channelName !== inboundChannel.name) {
-      log.warn(
-        { replyChannel: channelName, inboundChannel: inboundChannel.name },
-        "Reply channel is not registered; replying on the inbound chat instead",
+    if (inboundIsGroup) {
+      log.error(
+        { replyChannel: channelName, inboundChannel: inboundChannel.name, chatId: inboundChatId },
+        "Reply channel is not registered and the message came from a group; refusing to reply into the group",
       );
+      return undefined;
     }
+    log.warn(
+      { replyChannel: channelName, inboundChannel: inboundChannel.name },
+      "Reply channel is not registered; replying on the inbound chat instead",
+    );
     return { channel: inboundChannel, chatId: inboundChatId };
   }
 
@@ -1110,7 +1128,7 @@ export class Agent {
     // so summon changes can't re-route an already-queued batch.
     const resolution = last.resolution;
     const key = resolution.sessionKey;
-    const { channel: replyChannel, chatId: replyChatId } = this.resolveReplyDestination(resolution, lastChannel, lastMessage.chatId);
+    const destination = this.resolveReplyDestination(resolution, lastChannel, lastMessage.chatId, isGroup);
 
     for (const { channel, message } of items) {
       if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId);
@@ -1124,6 +1142,10 @@ export class Agent {
         timestamp: message.timestamp,
       });
     }
+
+    // Transcript recorded; refuse the turn (see resolveReplyDestination).
+    if (!destination) return;
+    const { channel: replyChannel, chatId: replyChatId } = destination;
 
     const numbered = items.map((it, i) => {
       const text = this.formatGroupText(it.channel, it.message, key);

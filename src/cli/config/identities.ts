@@ -1,7 +1,7 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
 import { CronStore } from "../../cron/store.js";
-import { legacySessionKeysForBinding } from "../../sessions/keys.js";
+import { legacySessionKeysForBinding, rawSessionKeyForBinding } from "../../sessions/keys.js";
 import { loadConfig, saveConfig, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 
 export async function configIdentities(): Promise<void> {
@@ -193,7 +193,14 @@ function restoreCronJobsFromIdentity(identity: {
   if (entries.length === 0) return { count: 0, fallbackKey: null };
 
   const [ch, chatId] = entries[0];
-  const fallbackKey = `${ch}:${chatId}`;
+  // Prefer the key inbound traffic for this binding actually uses — for
+  // iMessage that is the GUID-shaped key (found among all registry entries,
+  // the unified migration having unlinked it), never `imessage:<handle>`,
+  // or the restored jobs and the next inbound turn would run on different
+  // sessions.
+  const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
+  const knownKeys = store.listAllSessions().map((e) => e.channelKey);
+  const fallbackKey = rawSessionKeyForBinding(ch, chatId, knownKeys);
   const cronStore = new CronStore();
   const count = cronStore.rewriteSessionKey(
     `dm:${identity.name.toLowerCase()}`,

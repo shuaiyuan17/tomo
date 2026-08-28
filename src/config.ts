@@ -119,7 +119,11 @@ export interface TomoConfig {
   /** Minutes of group inactivity after which a /summon lapses and the group is
    *  handed back to its own session. 0 disables expiry. Default 60. */
   summonExpiryMinutes: number;
-  /** If true, inbound image attachments are also persisted to workspace/memory/incoming-images/. Default true. */
+  /** If true, inbound attachments are persisted under workspace/memory/:
+   *  images to incoming-images/, PDFs to incoming-documents/, and every other
+   *  MIME type to incoming-files/ (the last is path-only — those bytes are
+   *  never loaded into context, so turning this off means the agent is told a
+   *  file arrived but has nothing to open). Default true. */
   saveInboundImages: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;

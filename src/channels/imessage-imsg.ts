@@ -7,6 +7,13 @@ import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, Command
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
+import {
+  formatFileMarker,
+  MAX_FILE_BYTES,
+  sanitizeAttachmentFilename,
+  saveInboundFile,
+  type SavedFileNotice,
+} from "./fileStore.js";
 import { log } from "../logger.js";
 import { deliverTextParts } from "./delivery.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
@@ -1175,7 +1182,7 @@ export class ImsgChannel implements Channel {
     const intendedStickerCount = rawAttachments.filter((a) => isImageAtt(a) && a.is_sticker === true).length;
     const intendedImageCount = rawAttachments.filter((a) => isImageAtt(a) && a.is_sticker !== true).length;
     const intendedDocumentCount = rawAttachments.filter((a) => isSupportedDocumentMime(this.attachmentMime(a))).length;
-    const { images, documents } = await this.loadAttachments(rawAttachments, chatGuid);
+    const { images, documents, files } = await this.loadAttachments(rawAttachments, chatGuid);
 
     // Attachment loading may have blocked long enough for a restart + replay to
     // supersede this row. Bail before any side effect (read, dispatch, cursor).
@@ -1196,6 +1203,9 @@ export class ImsgChannel implements Channel {
     const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths);
     const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
+    // Path-only marker: unlike the image/document markers this is the ONLY
+    // representation of the file the agent gets — no bytes are attached.
+    const fileMarker = formatFileMarker(files);
 
     // Satellite (iMessageLite) detection. imsg's JSON exposes no message
     // service, so read `message.service` straight from chat.db (see
@@ -1220,7 +1230,7 @@ export class ImsgChannel implements Channel {
     // ring before degrading to the quote-less marker. Only tag rows with real
     // content so a ghost row can't become a prompt.
     const threadOriginatorGuid = typeof data.thread_originator_guid === "string" ? data.thread_originator_guid : "";
-    const hasContent = Boolean(text.trim()) || images.length > 0 || documents.length > 0;
+    const hasContent = Boolean(text.trim()) || images.length > 0 || documents.length > 0 || files.length > 0;
     const replyMarker = threadOriginatorGuid && hasContent
       ? formatReplyContextMarker(
         (typeof data.reply_to_text === "string" && data.reply_to_text)
@@ -1228,7 +1238,7 @@ export class ImsgChannel implements Channel {
       )
       : "";
 
-    const markers = [satelliteMarker, replyMarker, stickerMarker, imageMarker, docMarker].filter(Boolean).join(" ");
+    const markers = [satelliteMarker, replyMarker, stickerMarker, imageMarker, docMarker, fileMarker].filter(Boolean).join(" ");
     const composedText = text
       ? (markers ? `${markers} ${text}` : text)
       : markers;
@@ -1434,18 +1444,33 @@ export class ImsgChannel implements Channel {
   private async loadAttachments(
     attachments: Array<Record<string, unknown>>,
     chatGuid: string,
-  ): Promise<{ images: ImageAttachment[]; documents: DocumentAttachment[] }> {
+  ): Promise<{ images: ImageAttachment[]; documents: DocumentAttachment[]; files: SavedFileNotice[] }> {
     const images: ImageAttachment[] = [];
     const documents: DocumentAttachment[] = [];
+    const files: SavedFileNotice[] = [];
 
     for (const att of attachments) {
       if (att.missing === true) continue;
       const mimeType = this.attachmentMime(att);
+      // No declared MIME at all: still skipped. These are overwhelmingly
+      // chat.db's synthetic rows (link-preview pluginPayloadAttachment and
+      // friends), and storing them would put a notice line in front of every
+      // shared URL. Real files carry a MIME.
       if (!mimeType) continue;
 
       const isImage = mimeType.startsWith("image/");
       const isDocument = isSupportedDocumentMime(mimeType);
-      if (!isImage && !isDocument) continue;
+      if (!isImage && !isDocument) {
+        // Everything else used to be dropped right here, silently. That is how
+        // a .zip of SSH keys arrived on 2026-08-27 as a lone
+        // object-replacement character with no text and no indication an
+        // attachment existed at all. We can't load these into context (the
+        // model can't read a zip, and a 32 MB binary must never reach the
+        // API), so persist the bytes and hand back a one-line notice instead.
+        const notice = await this.storeUnsupportedAttachment(att, mimeType, chatGuid);
+        if (notice) files.push(notice);
+        continue;
+      }
 
       const filePath = this.attachmentPath(att);
       if (!filePath) continue;
@@ -1497,7 +1522,69 @@ export class ImsgChannel implements Channel {
       }
     }
 
-    return { images, documents };
+    return { images, documents, files };
+  }
+
+  /**
+   * Persist an attachment whose MIME is neither an image nor a supported
+   * document, and describe it for the agent. The bytes are copied out of
+   * `~/Library/Messages/Attachments/…` into the workspace — Messages' own copy
+   * is not ours to rely on (it is pruned, and the directory is TCC-protected),
+   * and chat.db is never touched.
+   *
+   * Returns `null` only when there is nothing worth telling the agent about
+   * (no usable path); every other outcome, including "too large" and "write
+   * failed", still produces a notice, because the sender believes the file was
+   * delivered and silence is what caused the 2026-08-27 incident.
+   */
+  private async storeUnsupportedAttachment(
+    att: Record<string, unknown>,
+    mimeType: string,
+    chatGuid: string,
+  ): Promise<SavedFileNotice | null> {
+    const filePath = this.attachmentPath(att);
+    if (!filePath) return null;
+
+    // transfer_name is the name the sender's device attached ("id_rsa.zip");
+    // filename/basename are the on-disk copy, which is far less informative.
+    const originalName = (typeof att.transfer_name === "string" && att.transfer_name)
+      || (typeof att.filename === "string" && att.filename)
+      || basename(filePath);
+    const displayName = sanitizeAttachmentFilename(originalName, mimeType);
+
+    try {
+      const declared = att.total_bytes ?? att.byte_size;
+      const actual = (await stat(filePath)).size;
+      const byteSize = actual;
+
+      // Check the cap before reading: the whole point is never to pull an
+      // oversized blob into memory just to throw it away.
+      if (actual > MAX_FILE_BYTES || (typeof declared === "number" && declared > MAX_FILE_BYTES)) {
+        log.warn(
+          { path: filePath, mimeType, actual, declared, max: MAX_FILE_BYTES },
+          "Inbound file over size cap; not stored",
+        );
+        return { filename: displayName, mimeType, byteSize, status: "too-large" };
+      }
+
+      if (!this.imageStoreBaseDir) {
+        return { filename: displayName, mimeType, byteSize, status: "storage-disabled" };
+      }
+
+      const buffer = await readFile(filePath);
+      const savedPath = await saveInboundFile(
+        buffer,
+        mimeType,
+        { sessionKey: `imessage_${chatGuid}`, filename: originalName },
+        this.imageStoreBaseDir,
+      );
+      return savedPath
+        ? { filename: displayName, mimeType, byteSize, savedPath, status: "saved" }
+        : { filename: displayName, mimeType, byteSize, status: "save-failed" };
+    } catch (err) {
+      log.error({ err, path: filePath, mimeType }, "Failed to store inbound file attachment");
+      return { filename: displayName, mimeType, byteSize: 0, status: "save-failed" };
+    }
   }
 
   /**

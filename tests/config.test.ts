@@ -141,6 +141,27 @@ describe("config file validation", () => {
     expect(config.groupSecret).toBe("open-sesame");
   });
 
+  // saveInboundFiles gates the path-only any-MIME store. It is a NEW key, so
+  // it must not quietly re-enable storage for an install that already said no.
+  it("defaults saveInboundFiles to saveInboundImages when unspecified", async () => {
+    const on = await loadWithConfigFile(JSON.stringify({}));
+    expect(on.config.saveInboundImages).toBe(true);
+    expect(on.config.saveInboundFiles).toBe(true);
+
+    const off = await loadWithConfigFile(JSON.stringify({ saveInboundImages: false }));
+    expect(off.config.saveInboundImages).toBe(false);
+    expect(off.config.saveInboundFiles).toBe(false);
+  });
+
+  it("lets saveInboundFiles be set independently of saveInboundImages", async () => {
+    const { config } = await loadWithConfigFile(JSON.stringify({
+      saveInboundImages: false,
+      saveInboundFiles: true,
+    }));
+    expect(config.saveInboundImages).toBe(false);
+    expect(config.saveInboundFiles).toBe(true);
+  });
+
   it("reports invalid values, falls back to defaults, and refuses startup", async () => {
     const { config, configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
       maxTurns: "plenty",

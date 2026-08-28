@@ -125,6 +125,16 @@ export interface TomoConfig {
    *  never loaded into context, so turning this off means the agent is told a
    *  file arrived but has nothing to open). Default true. */
   saveInboundImages: boolean;
+  /** If true, inbound attachments whose MIME is neither an image nor a
+   *  supported document are persisted to workspace/memory/incoming-files/.
+   *  This path is path-only: the bytes are not attached to the message and are
+   *  not sent to the API automatically — the agent is told the file arrived,
+   *  its type and size, and where it is, and can open it deliberately. When
+   *  unspecified this follows `saveInboundImages`, so an install that already
+   *  opted out of inbound storage stays opted out. Turning it off does NOT
+   *  silence the notice; the agent is still told a file arrived, just without
+   *  a path to open (silence is what caused the 2026-08-27 incident). */
+  saveInboundFiles: boolean;
   /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
   maxTurns: number;
   /** Steer messages that arrive while a turn is in flight into that turn at the
@@ -495,6 +505,9 @@ function buildConfig(): TomoConfig {
     DEFAULT_MODEL,
   );
 
+  // Hoisted out of the returned object because saveInboundFiles defaults to it.
+  const saveInboundImages = validated("saveInboundImages", boolLike, file.saveInboundImages, true);
+
   const continuityIntervalMinutes = validated(
     "continuityIntervalMinutes (TOMO_CONTINUITY_INTERVAL_MINUTES)",
     positiveNumber,
@@ -573,7 +586,16 @@ function buildConfig(): TomoConfig {
       envVar("TOMO_SUMMON_EXPIRY_MINUTES") ?? file.summonExpiryMinutes,
       60,
     ),
-    saveInboundImages: validated("saveInboundImages", boolLike, file.saveInboundImages, true),
+    saveInboundImages,
+    saveInboundFiles: validated(
+      "saveInboundFiles (TOMO_SAVE_INBOUND_FILES)",
+      boolLike,
+      envVar("TOMO_SAVE_INBOUND_FILES") ?? file.saveInboundFiles,
+      // Defaults to the image setting, not to `true`: an existing config with
+      // saveInboundImages=false has already said "do not keep inbound
+      // attachments", and a new key must not quietly re-enable that.
+      saveInboundImages,
+    ),
     maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
     streaming: validated("streaming (TOMO_STREAMING)", boolLike, envVar("TOMO_STREAMING") ?? file.streaming, true),

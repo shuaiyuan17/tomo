@@ -8,6 +8,7 @@ import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
 import {
+  FALLBACK_MIME,
   formatFileMarker,
   MAX_FILE_BYTES,
   sanitizeAttachmentFilename,
@@ -124,6 +125,56 @@ const NO_CAPABILITIES: ImsgCapabilities = {
   readReceipts: false,
 };
 
+/**
+ * chat.db's synthetic link-preview rows, and only those.
+ *
+ * Every URL sent in Messages gets a companion `attachment` row holding the
+ * serialised rich-link plist. They are not files the sender chose to send, and
+ * announcing one would put a notice line in front of every shared link.
+ *
+ * The old test for this was `!mime_type`, on the reasoning that MIME-less rows
+ * are "overwhelmingly" link previews. Overwhelmingly is not always, and the
+ * gap was silently dropping real files. Measured against the live chat.db on
+ * 2026-08-28 (1,287 attachment rows): 181 carried no `mime_type`, of which 162
+ * were `.pluginPayloadAttachment` — and the other **19 were genuine files**
+ * whose extension macOS has no MIME mapping for. They had been dropped exactly
+ * the way the .zip was:
+ *
+ *   uti                          transfer_name              n
+ *   dyn.age80y65tr30a            *.jsonl                   10
+ *   dyn.age81q7pf                *.vue                      7
+ *   com.apple.iconcomposer.icon  Bloom.icon                 1
+ *   dyn.age81asa                 AuthKey_….p8               1   ← inbound
+ *
+ * The discriminator is therefore positive rather than residual: the payload
+ * rows are named `<UUID>.pluginPayloadAttachment` and carry the dynamic UTI
+ * `dyn.age81a5dzq7y066dbtf0g82peqf4hk2pdrb00n5xy` (that string is a stable
+ * base-32 encoding of the "pluginPayloadAttachment" filename-extension tag,
+ * not a per-machine id — all 162 rows here share it). Both signals are checked
+ * because either alone is one upstream rename away from failing open, and both
+ * are surfaced by imsg: `imsg history --attachments --json` emits `uti`,
+ * `transfer_name`, `filename`, `mime_type`, `original_path`, `total_bytes`,
+ * `is_sticker` and `missing` for every attachment (verified against imsg
+ * 0.14.1).
+ *
+ * Failing this test is the safe direction: an unrecognised MIME-less row is
+ * stored as `application/octet-stream` with "type unknown" in the notice. The
+ * worst case is a notice line for a preview row; the worst case of the old
+ * behaviour was losing a file.
+ */
+const PLUGIN_PAYLOAD_SUFFIX = ".pluginpayloadattachment";
+const PLUGIN_PAYLOAD_UTI = "dyn.age81a5dzq7y066dbtf0g82peqf4hk2pdrb00n5xy";
+
+function isPluginPayloadAttachment(att: Record<string, unknown>): boolean {
+  const uti = typeof att.uti === "string" ? att.uti.toLowerCase() : "";
+  if (uti === PLUGIN_PAYLOAD_UTI) return true;
+  for (const key of ["transfer_name", "filename", "original_path", "path"] as const) {
+    const value = att[key];
+    if (typeof value === "string" && value.toLowerCase().endsWith(PLUGIN_PAYLOAD_SUFFIX)) return true;
+  }
+  return false;
+}
+
 export interface ImsgChannelConfig {
   /** Path to the imsg binary. Defaults to "imsg" (resolved via PATH). */
   cliPath?: string;
@@ -131,6 +182,8 @@ export interface ImsgChannelConfig {
   dbPath?: string;
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
   imageStoreBaseDir?: string;
+  /** Base dir for the path-only any-MIME file store. Defaults to `imageStoreBaseDir`. */
+  fileStoreBaseDir?: string;
   /** Persistent cache for inbound message GUIDs. Null/undefined keeps it in memory only. */
   dedupeStorePath?: string | null;
   /** Persistent watch cursor (last seen chat.db rowid). Null/undefined keeps it in memory only. */
@@ -206,6 +259,7 @@ export class ImsgChannel implements Channel {
   private readonly cliPath: string;
   private readonly dbPath: string | undefined;
   private readonly imageStoreBaseDir: string | undefined;
+  private readonly fileStoreBaseDir: string | undefined;
   private readonly cursorStorePath: string | null;
   private readonly spawnFn: typeof nodeSpawn;
   private readonly probeCapabilitiesFn: () => Promise<ImsgCapabilities>;
@@ -274,6 +328,9 @@ export class ImsgChannel implements Channel {
     this.cliPath = config.cliPath ?? "imsg";
     this.dbPath = config.dbPath;
     this.imageStoreBaseDir = config.imageStoreBaseDir;
+    // Falls back to the image setting when unset so an existing install that
+    // opted out of inbound storage stays opted out of all of it.
+    this.fileStoreBaseDir = config.fileStoreBaseDir ?? config.imageStoreBaseDir;
     this.cursorStorePath = config.cursorStorePath ?? null;
     this.spawnFn = config.spawnFn ?? nodeSpawn;
     this.probeCapabilitiesFn = config.probeCapabilities ?? (() => this.probeStatus());
@@ -1245,7 +1302,11 @@ export class ImsgChannel implements Channel {
 
     // Ghost, poll, and system rows can arrive with no text or usable
     // attachment. Do not turn them into blank agent prompts.
-    if (!composedText.trim() && images.length === 0 && documents.length === 0) {
+    // `files` is included for the same reason as the other two: a file notice
+    // always contributes to composedText today, but the guard should not
+    // depend on that staying true — this check is the exact place the .zip
+    // died.
+    if (!composedText.trim() && images.length === 0 && documents.length === 0 && files.length === 0) {
       log.debug({ guid }, "Ignoring empty imsg message (no text or attachments)");
       this.advanceCursor(rowId);
       return;
@@ -1450,13 +1511,11 @@ export class ImsgChannel implements Channel {
     const files: SavedFileNotice[] = [];
 
     for (const att of attachments) {
-      if (att.missing === true) continue;
       const mimeType = this.attachmentMime(att);
-      // No declared MIME at all: still skipped. These are overwhelmingly
-      // chat.db's synthetic rows (link-preview pluginPayloadAttachment and
-      // friends), and storing them would put a notice line in front of every
-      // shared URL. Real files carry a MIME.
-      if (!mimeType) continue;
+      // A MIME-less row is skipped ONLY when it is positively identifiable as
+      // a synthetic link-preview payload (see isPluginPayloadAttachment).
+      // Everything else MIME-less is a real file and gets stored.
+      if (!mimeType && isPluginPayloadAttachment(att)) continue;
 
       const isImage = mimeType.startsWith("image/");
       const isDocument = isSupportedDocumentMime(mimeType);
@@ -1464,14 +1523,20 @@ export class ImsgChannel implements Channel {
         // Everything else used to be dropped right here, silently. That is how
         // a .zip of SSH keys arrived on 2026-08-27 as a lone
         // object-replacement character with no text and no indication an
-        // attachment existed at all. We can't load these into context (the
-        // model can't read a zip, and a 32 MB binary must never reach the
-        // API), so persist the bytes and hand back a one-line notice instead.
-        const notice = await this.storeUnsupportedAttachment(att, mimeType, chatGuid);
-        if (notice) files.push(notice);
+        // attachment existed at all. We don't attach these to the message (the
+        // model can't read a zip as an attachment, and a 32 MB binary must not
+        // be uploaded), so persist the bytes and hand back a one-line notice
+        // instead. Always a notice — never a silent drop, including when the
+        // file is missing or has no local path, which is the same invisible
+        // failure wearing a different hat.
+        files.push(await this.storeUnsupportedAttachment(att, mimeType, chatGuid));
         continue;
       }
 
+      // Images and documents are load-or-nothing: with no bytes there is
+      // nothing to put in the context, and the intended-count markers already
+      // tell the agent how many did not make it.
+      if (att.missing === true) continue;
       const filePath = this.attachmentPath(att);
       if (!filePath) continue;
 
@@ -1532,58 +1597,84 @@ export class ImsgChannel implements Channel {
    * is not ours to rely on (it is pruned, and the directory is TCC-protected),
    * and chat.db is never touched.
    *
-   * Returns `null` only when there is nothing worth telling the agent about
-   * (no usable path); every other outcome, including "too large" and "write
-   * failed", still produces a notice, because the sender believes the file was
-   * delivered and silence is what caused the 2026-08-27 incident.
+   * ALWAYS returns a notice. There is no outcome — too large, write failed,
+   * storage off, file missing, no local path at all — in which the right
+   * answer is silence. Returning `null` for "no usable path" was the original
+   * bug still alive in the failure path: nothing recorded that a file had been
+   * *intended*, so an attachment-only message reached the ghost-row check with
+   * no marker and was discarded, exactly as the .zip was.
    */
   private async storeUnsupportedAttachment(
     att: Record<string, unknown>,
     mimeType: string,
     chatGuid: string,
-  ): Promise<SavedFileNotice | null> {
+  ): Promise<SavedFileNotice> {
     const filePath = this.attachmentPath(att);
-    if (!filePath) return null;
-
     // transfer_name is the name the sender's device attached ("id_rsa.zip");
     // filename/basename are the on-disk copy, which is far less informative.
     const originalName = (typeof att.transfer_name === "string" && att.transfer_name)
       || (typeof att.filename === "string" && att.filename)
-      || basename(filePath);
+      || (filePath ? basename(filePath) : "");
     const displayName = sanitizeAttachmentFilename(originalName, mimeType);
+    // A MIME-less row that got past isPluginPayloadAttachment is a real file
+    // of a type macOS has no mapping for (.jsonl, .vue, .icon were all
+    // observed). Report the fallback type, flagged as unknown so the agent
+    // doesn't read "octet-stream" as a positive identification.
+    const mimeUnknown = !mimeType;
+    const effectiveMime = mimeType || FALLBACK_MIME;
+    // Declared size is the only size available when there are no bytes to
+    // stat; it still tells the agent whether a 2 KB key or a 2 GB video went
+    // missing.
+    const declaredSize = typeof att.total_bytes === "number"
+      ? att.total_bytes
+      : (typeof att.byte_size === "number" ? att.byte_size : undefined);
+    const unavailable = (status: "source-missing" | "source-unavailable"): SavedFileNotice => {
+      log.warn(
+        { path: filePath || undefined, mimeType: effectiveMime, name: displayName, status },
+        "Inbound file announced but no bytes available; reporting it anyway",
+      );
+      return { filename: displayName, mimeType: effectiveMime, byteSize: declaredSize, mimeUnknown, status };
+    };
+
+    // imsg says the local copy is gone (Messages pruned it, or the transfer
+    // never completed). "The sender attached keys.zip but it never
+    // downloaded" is information the agent needs, not a reason to say nothing.
+    if (att.missing === true) return unavailable("source-missing");
+    if (!filePath) return unavailable("source-unavailable");
 
     try {
       const declared = att.total_bytes ?? att.byte_size;
       const actual = (await stat(filePath)).size;
       const byteSize = actual;
+      const base = { filename: displayName, mimeType: effectiveMime, byteSize, mimeUnknown } as const;
 
       // Check the cap before reading: the whole point is never to pull an
       // oversized blob into memory just to throw it away.
       if (actual > MAX_FILE_BYTES || (typeof declared === "number" && declared > MAX_FILE_BYTES)) {
         log.warn(
-          { path: filePath, mimeType, actual, declared, max: MAX_FILE_BYTES },
+          { path: filePath, mimeType: effectiveMime, actual, declared, max: MAX_FILE_BYTES },
           "Inbound file over size cap; not stored",
         );
-        return { filename: displayName, mimeType, byteSize, status: "too-large" };
+        return { ...base, status: "too-large" };
       }
 
-      if (!this.imageStoreBaseDir) {
-        return { filename: displayName, mimeType, byteSize, status: "storage-disabled" };
+      if (!this.fileStoreBaseDir) {
+        return { ...base, status: "storage-disabled" };
       }
 
       const buffer = await readFile(filePath);
       const savedPath = await saveInboundFile(
         buffer,
-        mimeType,
+        effectiveMime,
         { sessionKey: `imessage_${chatGuid}`, filename: originalName },
-        this.imageStoreBaseDir,
+        this.fileStoreBaseDir,
       );
       return savedPath
-        ? { filename: displayName, mimeType, byteSize, savedPath, status: "saved" }
-        : { filename: displayName, mimeType, byteSize, status: "save-failed" };
+        ? { ...base, savedPath, status: "saved" }
+        : { ...base, status: "save-failed" };
     } catch (err) {
-      log.error({ err, path: filePath, mimeType }, "Failed to store inbound file attachment");
-      return { filename: displayName, mimeType, byteSize: 0, status: "save-failed" };
+      log.error({ err, path: filePath, mimeType: effectiveMime }, "Failed to store inbound file attachment");
+      return { filename: displayName, mimeType: effectiveMime, byteSize: declaredSize, mimeUnknown, status: "save-failed" };
     }
   }
 

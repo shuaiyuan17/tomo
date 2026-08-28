@@ -118,6 +118,9 @@ async function startForeground(): Promise<void> {
   const agent = new Agent();
 
   const imageStoreBaseDir = config.saveInboundImages ? config.workspaceDir : undefined;
+  // Separate gate from images: the any-MIME store is path-only, so keeping it
+  // on costs disk but never context. Defaults to the image setting in config.ts.
+  const fileStoreBaseDir = config.saveInboundFiles ? config.workspaceDir : undefined;
 
   if (config.telegramToken) {
     agent.addChannel(new TelegramChannel(config.telegramToken, { imageStoreBaseDir }));
@@ -129,6 +132,7 @@ async function startForeground(): Promise<void> {
       cliPath: config.imsgCliPath,
       dbPath: config.imsgDbPath ?? undefined,
       imageStoreBaseDir,
+      fileStoreBaseDir,
       // Path kept verbatim from the pre-2026-08-27 BlueBubbles channel: chat.db
       // message GUIDs were identical across both backends, so the store carried
       // over the cutover and messages already dispatched were not re-dispatched.

@@ -7,6 +7,7 @@ import {
   TurnRunner,
   embeddedSilentMatcher,
   injectTimestamp,
+  originForSource,
   type RunWithRetryRequest,
   type TurnRunnerDeps,
   type TurnSpec,
@@ -119,6 +120,17 @@ describe("injectTimestamp", () => {
 
   it("omits the channel label when none is given", () => {
     expect(injectTimestamp("hi")).toMatch(/^\[[^·]+\] hi$/);
+  });
+});
+
+describe("originForSource", () => {
+  it("stamps channel-relayed user turns as human and harness turns as unclassified", () => {
+    // The SDK fails closed at its strict isHuman() gates when origin is
+    // absent, so a person's message must say so; cron/continuity are not a
+    // person typing and none of the other SDK kinds describes them.
+    expect(originForSource("user")).toEqual({ kind: "human" });
+    expect(originForSource("cron")).toEqual({ kind: "unclassified" });
+    expect(originForSource("continuity")).toEqual({ kind: "unclassified" });
   });
 });
 

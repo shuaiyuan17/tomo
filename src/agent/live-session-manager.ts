@@ -12,7 +12,7 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-import { DELIVERY_TIMEOUT_MS, LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -401,7 +401,7 @@ export class LiveSessionManager {
   }
 
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
-    const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped } = req;
+    const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped, origin } = req;
 
     try {
       const session = await this.getOrCreateLiveSession(key);
@@ -415,8 +415,8 @@ export class LiveSessionManager {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
       const response = steer
-        ? await session.steer(prompt, images, documents, onBlock, onBlockAbandoned)
-        : await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
+        ? await session.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin)
+        : await session.send(prompt, images, documents, onBlock, onBlockAbandoned, origin);
 
       // Merged into another request's in-flight turn — that turn's owner
       // does the per-turn bookkeeping (stats, compact triggers) when it
@@ -446,9 +446,11 @@ export class LiveSessionManager {
         return "NO_REPLY";
       }
 
+      // Legacy: older CLIs threw on the max-turns limit. Current ones yield
+      // an `error_max_turns` result instead, which LiveSession handles.
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
-        return "I ran out of steps trying to complete that. Can you try a simpler request?";
+        return MAX_TURNS_RESPONSE;
       }
 
       if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
@@ -512,7 +514,7 @@ export class LiveSessionManager {
         const session = await this.getOrCreateLiveSession(key);
         // Safe to reuse the same sink: the guard above proved it has shipped
         // nothing, so this retry is the first and only delivery of the turn.
-        const response = await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
+        const response = await session.send(prompt, images, documents, onBlock, onBlockAbandoned, origin);
         this.recordTurnCompletion(key, session);
         return response;
       }

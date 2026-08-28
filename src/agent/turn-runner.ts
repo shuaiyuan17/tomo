@@ -2,6 +2,7 @@ import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js"
 import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
+import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
@@ -14,6 +15,8 @@ export interface RunWithRetryRequest {
   images?: Array<{ data: string; mediaType: string }>;
   documents?: Array<{ data: string; mediaType: string; filename?: string }>;
   steer?: boolean;
+  /** Provenance stamped on the SDK user message (see `originForSource`). */
+  origin?: SDKMessageOrigin;
   /** Receives ONE completed delivery unit the moment the SDK closes it —
    *  while the turn is still running, not after it ends (LiveSession's
    *  TurnRequest.onBlock). Awaited, so blocks ship in model order. */
@@ -171,6 +174,19 @@ export interface TurnRunnerDeps {
   delivery: DeliveryPipeline;
 }
 
+/**
+ * SDK message provenance for a turn's ingress. A person's channel message is
+ * `human` — the SDK fails closed at its strict isHuman() gates when the origin
+ * is absent, so a relayed message must say so explicitly. Harness-composed
+ * turns (cron, continuity) are not a person typing; none of the SDK's other
+ * kinds (`task-notification` is its own background-task surface, `peer` and
+ * `coordinator` are session-to-session traffic) describes them, so they go
+ * out `unclassified`.
+ */
+export function originForSource(source: TurnSource): SDKMessageOrigin {
+  return source === "user" ? { kind: "human" } : { kind: "unclassified" };
+}
+
 /** Prefix `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]` onto a prompt. */
 export function injectTimestamp(text: string, channelName?: string): string {
   const now = new Date();
@@ -252,6 +268,7 @@ export class TurnRunner {
       rawResponse = await this.deps.runWithRetry({
         key: spec.key,
         prompt,
+        origin: originForSource(spec.source),
         onBlock: sink.onBlock,
         onBlockAbandoned: sink.onBlockAbandoned,
         hasShipped: sink.hasShipped,

@@ -1004,8 +1004,7 @@ export class Agent {
     // changes can't re-route a message that was already queued.
     const resolution = receiptResolution ?? this.router.resolve(channel.name, message.chatId, isGroup);
     const key = resolution.sessionKey;
-    const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? channel;
-    const replyChatId = resolution.replyTarget.chatId;
+    const { channel: replyChannel, chatId: replyChatId } = this.resolveReplyDestination(resolution, channel, message.chatId);
 
     const textForAgent = this.formatGroupText(channel, message, key);
 
@@ -1059,6 +1058,31 @@ export class Agent {
   }
 
   /**
+   * Where a turn's reply goes: the router's reply target when its channel is
+   * registered, else the inbound chat. CHANNEL AND CHAT ID MOVE TOGETHER — a
+   * fixed reply policy can name a channel that is not running (provider
+   * disabled, token missing), and falling back to the inbound channel while
+   * keeping the fixed channel's chatId would hand a Telegram chat id to the
+   * iMessage adapter (or the reverse).
+   */
+  private resolveReplyDestination(
+    resolution: { replyTarget: { channelName: string; chatId: string } },
+    inboundChannel: Channel,
+    inboundChatId: string,
+  ): { channel: Channel; chatId: string } {
+    const { channelName, chatId } = resolution.replyTarget;
+    const channel = this.getChannel(channelName);
+    if (channel) return { channel, chatId };
+    if (channelName !== inboundChannel.name) {
+      log.warn(
+        { replyChannel: channelName, inboundChannel: inboundChannel.name },
+        "Reply channel is not registered; replying on the inbound chat instead",
+      );
+    }
+    return { channel: inboundChannel, chatId: inboundChatId };
+  }
+
+  /**
    * Process 2+ messages that piled up behind an in-flight turn as a single
    * follow-up turn. Handles DMs and passive groups; mention-required groups
    * never reach this path.
@@ -1086,8 +1110,7 @@ export class Agent {
     // so summon changes can't re-route an already-queued batch.
     const resolution = last.resolution;
     const key = resolution.sessionKey;
-    const replyChannel = this.getChannel(resolution.replyTarget.channelName) ?? lastChannel;
-    const replyChatId = resolution.replyTarget.chatId;
+    const { channel: replyChannel, chatId: replyChatId } = this.resolveReplyDestination(resolution, lastChannel, lastMessage.chatId);
 
     for (const { channel, message } of items) {
       if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId);

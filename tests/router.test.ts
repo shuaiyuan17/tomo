@@ -372,6 +372,26 @@ describe("IdentityRouter", () => {
       expect(sessions.getSdkSessionId("telegram:111")).toBeUndefined();
     });
 
+    it("migrates a GUID-keyed iMessage session bound by bare handle", () => {
+      // Inbound iMessage sessions are keyed by chat GUID, while the identity
+      // binds the bare handle — the two never compare equal as strings.
+      sessions.setSdkSessionId("imessage:any;-;+15551234567", "session-imsg");
+      sessions.setSdkSessionId("imessage:any;+;groupguid", "session-group");
+
+      const router = new IdentityRouter(
+        [{ name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+
+      const result = router.resolve("imessage", "any;-;+15551234567", false);
+      expect(result.sessionKey).toBe("dm:ivy");
+      expect(sessions.getSdkSessionId("dm:ivy")).toBe("session-imsg");
+      expect(sessions.getSdkSessionId("imessage:any;-;+15551234567")).toBeUndefined();
+      // Groups are never migration candidates.
+      expect(sessions.getSdkSessionId("imessage:any;+;groupguid")).toBe("session-group");
+    });
+
     it("does not migrate if unified key already has a session", () => {
       sessions.setSdkSessionId("dm:grace", "session-unified");
       sessions.setSdkSessionId("telegram:111", "session-old");

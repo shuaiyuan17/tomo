@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   isGroupSessionKey,
+  legacySessionKeysForBinding,
+  matchesChannelBinding,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -37,5 +39,31 @@ describe("session key helpers", () => {
       channelName: "telegram",
       chatId: "-100123",
     });
+  });
+});
+
+describe("identity binding matchers", () => {
+  it("matches exact chatIds on any channel and iMessage GUIDs by identifier", () => {
+    expect(matchesChannelBinding("telegram", "111", "111")).toBe(true);
+    expect(matchesChannelBinding("telegram", "222", "111")).toBe(false);
+    expect(matchesChannelBinding("imessage", "any;-;+15551234567", "+15551234567")).toBe(true);
+    expect(matchesChannelBinding("imessage", "iMessage;-;+15551234567", "+15551234567")).toBe(true);
+    expect(matchesChannelBinding("imessage", "+15551234567", "+15551234567")).toBe(true);
+    expect(matchesChannelBinding("imessage", "any;-;+15559999999", "+15551234567")).toBe(false);
+    expect(matchesChannelBinding("imessage", "any;-;+15551234567", undefined)).toBe(false);
+  });
+
+  it("finds the legacy per-channel keys an identity binding would have routed to, excluding groups", () => {
+    const keys = [
+      "telegram:111",
+      "telegram:-100999",
+      "imessage:any;-;+15551234567",
+      "imessage:any;+;groupguid",
+      "imessage:any;-;+15550000000",
+      "dm:someone",
+    ];
+    expect(legacySessionKeysForBinding(keys, "telegram", "111")).toEqual(["telegram:111"]);
+    expect(legacySessionKeysForBinding(keys, "imessage", "+15551234567")).toEqual(["imessage:any;-;+15551234567"]);
+    expect(legacySessionKeysForBinding(keys, "imessage", "+15557777777")).toEqual([]);
   });
 });

@@ -1,4 +1,4 @@
-import { Bot, type Context } from "grammy";
+import { Bot, GrammyError, type Context } from "grammy";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
@@ -11,6 +11,17 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { splitText } from "./text-utils.js";
+
+/**
+ * A Bot API 400 whose description names an entity-parsing failure — the one
+ * error that proves the message was refused for its Markdown and can be
+ * resent plain without risking a duplicate.
+ */
+export function isMarkdownParseError(err: unknown): boolean {
+  return err instanceof GrammyError
+    && err.error_code === 400
+    && /can't parse entities|can't find end of the entity|parse entities/i.test(err.description);
+}
 
 /** Telegram rejects sendMessage/editMessageText beyond 4096 chars. */
 const TELEGRAM_TEXT_LIMIT = 4096;
@@ -561,8 +572,15 @@ export class TelegramChannel implements Channel {
           ...params,
           parse_mode: "Markdown",
         });
-      } catch {
-        // Fallback to plain text if Markdown parsing fails
+      } catch (err) {
+        // Resend as plain text ONLY on a definite Markdown rejection: Telegram
+        // answered 400 "can't parse entities", so nothing was sent. Anything
+        // else propagates — a timeout or dropped connection may have landed
+        // the message already (a retry would double-send), and a 429 / chat
+        // not found / blocked bot would fail identically the second time
+        // while burying the real error under the fallback's.
+        if (!isMarkdownParseError(err)) throw err;
+        log.debug({ chatId: message.chatId, err }, "Telegram rejected Markdown; resending as plain text");
         sent = await this.bot.api.sendMessage(message.chatId, chunk, params);
       }
       this.recordOwnMessage(message.chatId, sent.message_id, chunk);

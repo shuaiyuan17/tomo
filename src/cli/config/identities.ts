@@ -1,6 +1,7 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
 import { CronStore } from "../../cron/store.js";
+import { legacySessionKeysForBinding } from "../../sessions/keys.js";
 import { loadConfig, saveConfig, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 
 export async function configIdentities(): Promise<void> {
@@ -168,8 +169,13 @@ function migrateCronJobsToIdentity(identity: {
   const cronStore = new CronStore();
   const unified = `dm:${identity.name.toLowerCase()}`;
   let total = 0;
+  // Match the jobs' actual keys rather than rebuilding them from the config
+  // value: an iMessage binding is a handle, the job key a chat GUID.
+  const jobKeys = new Set(cronStore.list().map((job) => job.sessionKey));
   for (const [ch, chatId] of Object.entries(identity.channels)) {
-    total += cronStore.rewriteSessionKey(`${ch}:${chatId}`, unified);
+    for (const oldKey of legacySessionKeysForBinding(jobKeys, ch, chatId)) {
+      total += cronStore.rewriteSessionKey(oldKey, unified);
+    }
   }
   return total;
 }
@@ -216,16 +222,21 @@ async function resolveUnifiedSession(identity: {
   if (store.getSdkSessionId(unifiedKey)) return; // already unified
 
   const candidates: Array<{ oldKey: string; channel: string; queries: number; lastActiveAt: number }> = [];
+  // Scan the live registry instead of rebuilding keys from config values —
+  // an iMessage binding ("+15551234567") never equals the GUID-shaped key
+  // its session actually lives under ("imessage:any;-;+15551234567").
+  const activeKeys = store.listActiveEntries().map((e) => e.channelKey);
   for (const [ch, chatId] of Object.entries(identity.channels)) {
-    const oldKey = `${ch}:${chatId}`;
-    const entry = store.getEntry(oldKey);
-    if (!entry) continue;
-    candidates.push({
-      oldKey,
-      channel: ch,
-      queries: entry.stats?.totalQueries ?? 0,
-      lastActiveAt: entry.lastActiveAt,
-    });
+    for (const oldKey of legacySessionKeysForBinding(activeKeys, ch, chatId)) {
+      const entry = store.getEntry(oldKey);
+      if (!entry) continue;
+      candidates.push({
+        oldKey,
+        channel: ch,
+        queries: entry.stats?.totalQueries ?? 0,
+        lastActiveAt: entry.lastActiveAt,
+      });
+    }
   }
 
   if (candidates.length === 0) return;

@@ -80,6 +80,7 @@ vi.mock("../src/agent/live-session.js", () => {
     QUERY_TIMEOUT_ERROR_PREFIX: "Query timed out after",
     STEER_MERGED: "",
     DELIVERY_TIMEOUT_MS: 60_000,
+    MAX_TURNS_RESPONSE: "I ran out of steps trying to complete that. Can you try a simpler request?",
   };
 });
 

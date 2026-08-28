@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { GrammyError } from "grammy";
 import {
+  isMarkdownParseError,
   POLLING_HEALTHY_RUN_MS,
   POLLING_RESTART_MAX_MS,
   POLLING_RESTART_MIN_MS,
@@ -701,5 +703,67 @@ describe("TelegramChannel shutdown phases", () => {
 
     await channel.teardown();
     expect(stopped).toBe(true);
+  });
+});
+
+// Markdown fallback. Telegram's Bot API answers a malformed Markdown body with
+// 400 "can't parse entities"; that is the ONLY failure that proves the message
+// was refused and can be resent plain. Retrying on anything else risks a
+// duplicate (a timeout after Telegram accepted the send) or just buries the
+// real error under a second identical failure.
+describe("TelegramChannel Markdown fallback", () => {
+  const parseError = () => new GrammyError(
+    "Call to 'sendMessage' failed!",
+    { ok: false, error_code: 400, description: "Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 3" },
+    "sendMessage",
+    {},
+  );
+
+  function makeChannel(failWith: (attempt: number) => Error | null) {
+    const channel = new TelegramChannel("000000:test-token");
+    const calls: Array<{ text: string; parseMode?: string }> = [];
+    let attempt = 0;
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendMessage: async (_chatId: string | number, text: string, opts?: { parse_mode?: string }) => {
+        calls.push({ text, parseMode: opts?.parse_mode });
+        const err = failWith(attempt++);
+        if (err) throw err;
+        return { message_id: 100 + attempt };
+      },
+    };
+    return { channel, calls };
+  }
+
+  it("classifies only a 400 entity-parsing GrammyError as a Markdown rejection", () => {
+    expect(isMarkdownParseError(parseError())).toBe(true);
+    expect(isMarkdownParseError(new GrammyError("x", { ok: false, error_code: 400, description: "Bad Request: chat not found" }, "sendMessage", {}))).toBe(false);
+    expect(isMarkdownParseError(new GrammyError("x", { ok: false, error_code: 429, description: "Too Many Requests: retry after 5" }, "sendMessage", {}))).toBe(false);
+    expect(isMarkdownParseError(new Error("Network request for 'sendMessage' failed!"))).toBe(false);
+  });
+
+  it("resends as plain text after a definite Markdown rejection", async () => {
+    const { channel, calls } = makeChannel((attempt) => (attempt === 0 ? parseError() : null));
+    await channel.send({ chatId: "1", text: "_broken" });
+    expect(calls).toEqual([
+      { text: "_broken", parseMode: "Markdown" },
+      { text: "_broken", parseMode: undefined },
+    ]);
+  });
+
+  it("propagates a timeout / transport failure without a second send", async () => {
+    const { channel, calls } = makeChannel(() => new Error("Request to 'sendMessage' timed out after 500 seconds"));
+    await expect(channel.send({ chatId: "1", text: "hello" })).rejects.toThrow(/timed out/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("propagates other Bot API errors without a second send", async () => {
+    const { channel, calls } = makeChannel(() => new GrammyError(
+      "Call to 'sendMessage' failed!",
+      { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" },
+      "sendMessage",
+      {},
+    ));
+    await expect(channel.send({ chatId: "1", text: "hello" })).rejects.toThrow(/blocked/);
+    expect(calls).toHaveLength(1);
   });
 });

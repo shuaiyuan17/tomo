@@ -45,6 +45,41 @@ export function privateReplyTargetFromSessionKey(key: string): ReplyTarget | und
   return { channelName: parsed.channelName, chatId: parsed.chatId };
 }
 
+/**
+ * Does a raw chatId belong to an identity's binding for that channel?
+ * Exact match, plus iMessage chat GUIDs matched by their identifier: config
+ * binds the handle ("+15551234567") while the provider keys sessions by chat
+ * GUID ("any;-;+15551234567"). Every place that compares a configured binding
+ * against a live chatId (inbound routing, send_message targets, session
+ * migration) must use this — a bare `===` silently misses iMessage.
+ */
+export function matchesChannelBinding(channelName: string, chatId: string, bound: string | undefined): boolean {
+  if (bound === undefined) return false;
+  if (bound === chatId) return true;
+  if (channelName === "imessage") {
+    const identifier = extractImessageIdentifier(chatId);
+    if (identifier !== null && identifier === bound) return true;
+  }
+  return false;
+}
+
+/**
+ * The raw `<channel>:<chatId>` session keys among `keys` that an identity's
+ * (channel, binding) pair would have routed to before the identity existed —
+ * the legacy per-channel sessions a new `dm:` session should adopt. Groups
+ * are never candidates.
+ */
+export function legacySessionKeysForBinding(keys: Iterable<string>, channelName: string, bound: string): string[] {
+  const out: string[] = [];
+  for (const key of keys) {
+    const parsed = parseRawSessionKey(key);
+    if (!parsed || parsed.channelName !== channelName) continue;
+    if (isGroupSessionKey(key)) continue;
+    if (matchesChannelBinding(channelName, parsed.chatId, bound)) out.push(key);
+  }
+  return out;
+}
+
 /** Extract the identifier from an iMessage chat GUID (e.g. "any;-;+15551234567" → "+15551234567") */
 export function extractImessageIdentifier(chatGuid: string): string | null {
   const parts = chatGuid.split(";");

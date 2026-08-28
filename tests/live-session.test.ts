@@ -13,6 +13,7 @@ type AnyEvent = Record<string, unknown>;
 interface Harness {
   inputs: string[];
   priorities: Array<string | undefined>;
+  origins: Array<unknown>;
   pushEvent: (e: AnyEvent) => void;
   fail: (err: Error) => void;
 }
@@ -24,9 +25,10 @@ const mcpRuntime = vi.hoisted(() => ({
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-  query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string }> }) => {
+  query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string; origin?: unknown }> }) => {
     const inputs: string[] = [];
     const priorities: Array<string | undefined> = [];
+    const origins: Array<unknown> = [];
     const eventQueue: AnyEvent[] = [];
     let wake: (() => void) | null = null;
     let done = false;
@@ -41,12 +43,14 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
         }
         inputs.push(text);
         priorities.push(msg.priority);
+        origins.push(msg.origin);
       }
     })().catch(() => {});
 
     harnessRef.current = {
       inputs,
       priorities,
+      origins,
       pushEvent: (e) => { eventQueue.push(e); wake?.(); },
       fail: (err) => { error = err; wake?.(); },
     };
@@ -689,5 +693,144 @@ describe("LiveSession close during an outstanding block delivery", () => {
     releaseSend();
     await flushMicrotasks(10);
     expect(events).toEqual(["send-parked", "abandoned", "send-late-completed"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Turn-ending results that are NOT clean successes. The SDK yields these like
+// any other result (nothing throws), so the handler has to read `subtype` /
+// `is_error` itself — before, every one of them resolved as an ordinary turn.
+// ---------------------------------------------------------------------------
+
+describe("LiveSession error results", () => {
+  const errorResult = (subtype: string, extra: Record<string, unknown> = {}) => ({
+    ...resultEvent(),
+    subtype,
+    is_error: true,
+    errors: [`${subtype} happened`],
+    ...extra,
+  });
+
+  it("ships a max-turns note as a final block and resolves with it", async () => {
+    const { session, harness } = makeSession();
+    const blocks: string[] = [];
+    const p = session.send("do a lot", undefined, undefined, async (b) => { blocks.push(b); });
+    await waitFor(() => harness.inputs.length === 1);
+
+    harness.pushEvent(assistantEvent("partial progress"));
+    harness.pushEvent(errorResult("error_max_turns"));
+
+    await expect(p).resolves.toBe("partial progress\nI ran out of steps trying to complete that. Can you try a simpler request?");
+    // The note reaches the owner even though a block already shipped — the
+    // response string alone is never re-delivered once a block landed.
+    expect(blocks).toEqual(["partial progress", "I ran out of steps trying to complete that. Can you try a simpler request?"]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ subtype: "error_max_turns", errors: ["error_max_turns happened"] }),
+      "SDK turn ended on an error result",
+    );
+    expect(session.isBusy()).toBe(false);
+  });
+
+  it("names the budget limit for error_max_budget_usd", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("expensive");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(errorResult("error_max_budget_usd"));
+    await expect(p).resolves.toBe("I hit the spending limit for this turn before finishing.");
+  });
+
+  it("treats error_during_execution (and any other error_* subtype) as a failed turn, not the generic fallback", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("crash");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(errorResult("error_during_execution"));
+    const response = await p;
+    expect(response).not.toBe("I'm not sure how to respond to that.");
+    expect(response).toContain("stopped early");
+
+    const p2 = session.send("again");
+    await waitFor(() => harness.inputs.length === 2);
+    harness.pushEvent(errorResult("error_max_structured_output_retries"));
+    await expect(p2).resolves.toContain("stopped early");
+  });
+
+  it("surfaces the API error text of a success result flagged is_error so the error policy can classify it", async () => {
+    const { session, harness } = makeSession();
+    const blocks: string[] = [];
+    const p = session.send("hi", undefined, undefined, async (b) => { blocks.push(b); });
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({ ...resultEvent(), is_error: true, result: "API Error: 429 rate limited" });
+
+    await expect(p).resolves.toBe("API Error: 429 rate limited");
+    // Not shipped as a block: whether it reaches the chat is the delivery
+    // pipeline's error-policy decision, not this layer's.
+    expect(blocks).toEqual([]);
+  });
+
+  it("leaves a clean success result untouched", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantEvent("fine"));
+    harness.pushEvent({ ...resultEvent(), is_error: false });
+    await expect(p).resolves.toBe("fine");
+    expect(log.warn).not.toHaveBeenCalledWith(expect.anything(), "SDK turn ended on an error result");
+  });
+});
+
+describe("LiveSession token accounting", () => {
+  const modelUsage = (n: number) => ({
+    "claude-x": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 100 * n, cacheCreationInputTokens: n },
+    "claude-sub": { inputTokens: 1000 * n, outputTokens: 500 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+  });
+
+  it("differences cumulative modelUsage per turn across every model, not the main-loop-only usage", async () => {
+    const { session, harness } = makeSession();
+
+    const p1 = session.send("one");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({ ...resultEvent(), usage: { input_tokens: 10, output_tokens: 5 }, modelUsage: modelUsage(1) });
+    await p1;
+    expect(session.lastResult).toMatchObject({ inputTokens: 1010, outputTokens: 505, cacheReadTokens: 100, cacheCreationTokens: 1 });
+
+    const p2 = session.send("two");
+    await waitFor(() => harness.inputs.length === 2);
+    harness.pushEvent({ ...resultEvent(), usage: { input_tokens: 10, output_tokens: 5 }, modelUsage: modelUsage(3) });
+    await p2;
+    // Cumulative 3× minus the 1× already recorded.
+    expect(session.lastResult).toMatchObject({ inputTokens: 2020, outputTokens: 1010, cacheReadTokens: 200, cacheCreationTokens: 2 });
+  });
+
+  it("falls back to usage when a result carries no modelUsage", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("one");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({ ...resultEvent(), usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 2 } });
+    await p;
+    expect(session.lastResult).toMatchObject({ inputTokens: 7, outputTokens: 3, cacheReadTokens: 2, cacheCreationTokens: 0 });
+  });
+});
+
+describe("LiveSession message origin", () => {
+  it("stamps the given origin on send() and steer() messages and omits it otherwise", async () => {
+    const { session, harness } = makeSession();
+
+    const p1 = session.send("typed", undefined, undefined, undefined, undefined, { kind: "human" });
+    await waitFor(() => harness.inputs.length === 1);
+    const p2 = session.steer("more", undefined, undefined, undefined, undefined, { kind: "unclassified" });
+    await waitFor(() => harness.inputs.length === 2);
+    expect(harness.origins).toEqual([{ kind: "human" }, { kind: "unclassified" }]);
+
+    harness.pushEvent(assistantEvent("ok"));
+    harness.pushEvent(userEcho("more"));
+    harness.pushEvent(resultEvent());
+    await p1;
+    await p2;
+
+    const p3 = session.send("bare");
+    await waitFor(() => harness.inputs.length === 3);
+    expect(harness.origins[2]).toBeUndefined();
+    harness.pushEvent(resultEvent());
+    await p3;
   });
 });

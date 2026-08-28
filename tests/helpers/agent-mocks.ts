@@ -150,7 +150,7 @@ function enqueueAssistantTurnEvents(
 
   eventQueue.push({
     type: "result",
-    subtype: "end_turn",
+    subtype: "success",
     session_id: "mock-sdk-session-123",
     total_cost_usd: 0.001,
     num_turns: 1,

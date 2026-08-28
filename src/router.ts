@@ -1,7 +1,7 @@
 import type { IdentityConfig } from "./config.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
-import { extractImessageIdentifier, isDmSessionKey } from "./sessions/keys.js";
+import { extractImessageIdentifier, isDmSessionKey, legacySessionKeysForBinding, matchesChannelBinding } from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
 
@@ -229,17 +229,7 @@ export class IdentityRouter {
   }
 
   private findIdentity(channelName: string, chatId: string): IdentityConfig | undefined {
-    return this.identities.find((id) => {
-      const configured = id.channels[channelName];
-      if (!configured) return false;
-      if (configured === chatId) return true;
-      // iMessage: match by identifier (e.g. config has "+15551234567", chatId is "any;-;+15551234567")
-      if (channelName === "imessage") {
-        const identifier = extractImessageIdentifier(chatId);
-        if (identifier && identifier === configured) return true;
-      }
-      return false;
-    });
+    return this.identities.find((id) => matchesChannelBinding(channelName, chatId, id.channels[channelName]));
   }
 
   private resolveReplyTarget(
@@ -266,11 +256,14 @@ export class IdentityRouter {
     // Already has a session under the unified key
     if (this.sessions.getSdkSessionId(sessionKey)) return;
 
-    // Collect all old channel-specific keys that have an active session
+    // Collect all old channel-specific keys that have an active session.
+    // Matched against the live registry rather than rebuilt from the config
+    // value: an iMessage binding is a handle ("+15551234567") while the
+    // session it routed to is keyed by chat GUID ("imessage:any;-;+1555…").
+    const activeKeys = this.sessions.listSdkSessionIds().map(([key]) => key);
     const candidates: string[] = [];
     for (const [chName, chId] of Object.entries(identity.channels)) {
-      const oldKey = `${chName}:${chId}`;
-      if (this.sessions.getSdkSessionId(oldKey)) candidates.push(oldKey);
+      candidates.push(...legacySessionKeysForBinding(activeKeys, chName, chId));
     }
 
     if (candidates.length === 0) return;

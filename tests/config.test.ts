@@ -40,17 +40,17 @@ describe("config", () => {
     vi.resetModules();
     vi.stubEnv("HISTORY_LIMIT", "abc");
     vi.stubEnv("TOMO_MAX_TURNS", "not-a-number");
-    vi.stubEnv("IMESSAGE_WEBHOOK_PORT", "");
+    vi.stubEnv("IMESSAGE_INBOUND_SETTLE_MS", "");
     const { config, configIssues, assertConfigValid } = await import("../src/config.js");
     expect(config.historyLimit).toBe(20);
     expect(config.maxTurns).toBe(50);
-    expect(config.imessageWebhookPort).toBe(3100);
+    expect(config.imessageInboundSettleMs).toBe(1500);
 
     // The fallbacks are no longer silent: each bad value is reported and the
     // daemon refuses to start. An empty env var counts as unset, not invalid.
     expect(configIssues.join("\n")).toContain("HISTORY_LIMIT");
     expect(configIssues.join("\n")).toContain("TOMO_MAX_TURNS");
-    expect(configIssues.join("\n")).not.toContain("IMESSAGE_WEBHOOK_PORT");
+    expect(configIssues.join("\n")).not.toContain("IMESSAGE_INBOUND_SETTLE_MS");
     expect(() => assertConfigValid()).toThrow(/HISTORY_LIMIT/);
   });
 
@@ -162,6 +162,52 @@ describe("config file validation", () => {
     expect(report).toContain("saveInboundImages");
     expect(report).toContain("lcm");
     expect(report).toContain("sessionModelOverrides");
+    expect(() => assertConfigValid()).toThrow(/Invalid Tomo configuration/);
+  });
+
+  // The BlueBubbles backend was removed on 2026-08-27, collapsing the provider
+  // to a single value. Live configs on disk carry `"provider": "imsg"`, so it
+  // must keep loading verbatim; an install that never set the key must end up
+  // with iMessage OFF rather than silently spawning an imsg child.
+  it("keeps loading an existing imsg provider and its allowlist", async () => {
+    const { config, configIssues, assertConfigValid, imessageConfigured } = await loadWithConfigFile(JSON.stringify({
+      channels: {
+        imessage: { provider: "imsg", cliPath: "/opt/homebrew/bin/imsg", allowlist: ["+15551234567"] },
+      },
+    }));
+
+    expect(configIssues).toEqual([]);
+    expect(() => assertConfigValid()).not.toThrow();
+    expect(config.imessageProvider).toBe("imsg");
+    expect(config.imsgCliPath).toBe("/opt/homebrew/bin/imsg");
+    expect(config.channelAllowlists).toEqual({ imessage: ["+15551234567"] });
+    expect(imessageConfigured(config)).toBe(true);
+  });
+
+  it("treats an absent provider as iMessage off, with no issue raised", async () => {
+    const { config, configIssues, imessageConfigured } = await loadWithConfigFile(JSON.stringify({
+      channels: { imessage: { allowlist: ["+15551234567"] } },
+    }));
+
+    expect(configIssues).toEqual([]);
+    expect(config.imessageProvider).toBeNull();
+    expect(imessageConfigured(config)).toBe(false);
+  });
+
+  it("reports a config still pinned to the removed bluebubbles provider", async () => {
+    const { config, configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
+      channels: {
+        imessage: { provider: "bluebubbles", url: "http://localhost:1234", allowlist: ["+15551234567"] },
+      },
+    }));
+
+    expect(config.imessageProvider).toBeNull();
+    // One targeted issue — the rest of the iMessage entry must survive, or the
+    // upgrade would silently drop the allowlist too.
+    expect(config.channelAllowlists).toEqual({ imessage: ["+15551234567"] });
+    const report = configIssues.join("\n");
+    expect(report).toContain("channels.imessage.provider");
+    expect(report).toContain("BlueBubbles backend has been removed");
     expect(() => assertConfigValid()).toThrow(/Invalid Tomo configuration/);
   });
 

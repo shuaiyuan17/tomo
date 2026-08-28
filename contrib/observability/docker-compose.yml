@@ -24,8 +24,9 @@ services:
   loki:
     image: grafana/loki:3.5.1
     # No host port: Grafana and Alloy reach Loki over the internal Docker
-    # network, and host 3100 is BlueBubbles' default webhook port — publishing
-    # it would collide with a default iMessage setup. To poke Loki directly:
+    # network, so there is nothing to gain from publishing 3100 on the host and
+    # a port to lose. (It was also BlueBubbles' default webhook port until that
+    # backend was removed on 2026-08-27.) To poke Loki directly:
     #   docker compose exec loki wget -qO- localhost:3100/ready
     volumes:
       - loki-data:/loki

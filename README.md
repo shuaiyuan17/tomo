@@ -35,7 +35,7 @@ That's it. Open Telegram and message your bot.
 - [Claude Code](https://claude.com/claude-code) installed. Direct Claude models can use a Claude subscription or an Anthropic API key; LiteLLM gateways support other backends.
 - At least one channel:
   - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)
-  - **iMessage** — [BlueBubbles](https://bluebubbles.app) server running on a Mac with iMessage signed in
+  - **iMessage** — the [imsg CLI](https://github.com/openclaw/imsg) on a Mac with iMessage signed in (Tomo needs Full Disk Access)
 
 ## CLI
 
@@ -110,7 +110,7 @@ Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonica
   - Image/photo support (sends to Claude as vision input)
   - Group chat: defaults to mention-required (only responds when @mentioned or replied to); per-group passive listen mode opt-in via `channels.telegram.passiveGroups`
   - Markdown rendering with plain-text fallback
-- **iMessage** — via [BlueBubbles](https://bluebubbles.app) (default) or the [imsg CLI](https://github.com/openclaw/imsg) (`channels.imessage.provider: "imsg"`)
+- **iMessage** — via the local [imsg CLI](https://github.com/openclaw/imsg), enabled with `channels.imessage.provider: "imsg"`
   - DM and group chat support
   - Image attachment support
   - Contact name resolution from Mac contacts
@@ -283,7 +283,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
       "allowlist": ["123456789"],
       "passiveGroups": ["-1001234567890"]
     },
-    "imessage": { "url": "http://localhost:1234", "password": "...", "allowlist": ["+15551234567"] }
+    "imessage": { "provider": "imsg", "allowlist": ["+15551234567"] }
   },
   "identities": [
     {
@@ -317,7 +317,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
 }
 ```
 
-To run iMessage through the local [imsg CLI](https://github.com/openclaw/imsg) instead of a BlueBubbles server (the Tomo process needs Full Disk Access; advanced features additionally need `imsg launch`):
+To enable iMessage (the Tomo process needs Full Disk Access; advanced features additionally need `imsg launch`):
 
 ```json
 {
@@ -333,8 +333,7 @@ Environment variables override config file values:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Use Anthropic API-key authentication; overrides the authentication stored in `config.json` |
 | `TELEGRAM_BOT_TOKEN` | Override Telegram token |
-| `IMESSAGE_URL` | Override BlueBubbles URL |
-| `IMESSAGE_PROVIDER` | iMessage backend: `bluebubbles` (default) or `imsg` |
+| `IMESSAGE_PROVIDER` | Set to `imsg` to enable the iMessage channel (unset = iMessage off) |
 | `IMSG_CLI_PATH` | Path to the `imsg` binary (default: `imsg` on PATH) |
 | `IMSG_DB_PATH` | Override chat.db path passed to `imsg rpc --db` |
 | `IMESSAGE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for ordinary turns (default: `1200`) |

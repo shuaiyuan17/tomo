@@ -4,9 +4,10 @@ import { log } from "../logger.js";
 /**
  * Resolves a message GUID to its chat.db `message.service` value.
  *
- * Why this exists: BlueBubbles serializes the message service into its webhook
- * payload, which lets the BlueBubbles channel flag satellite messages (Apple's
- * low-bandwidth emergency relay, `service = "iMessageLite"` — see tomo#208).
+ * Why this exists: satellite messages (Apple's low-bandwidth emergency relay)
+ * are identified by `service = "iMessageLite"` — see tomo#208. The BlueBubbles
+ * backend (removed 2026-08-27) serialized that service into its webhook payload
+ * and so could read it for free.
  * imsg's JSON (v0.12.3) exposes no service field on message rows, so the imsg
  * channel reads it straight from chat.db (Full Disk Access is already required
  * for imsg to function). Verified live 2026-07-07: `SELECT DISTINCT service

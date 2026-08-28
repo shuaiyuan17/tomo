@@ -11,7 +11,7 @@ const execFileP = promisify(execFile);
 export interface ImageSaveMeta {
   /** Logical session or chat identifier (e.g. "dm_shuai", "tg_12345"). */
   sessionKey?: string;
-  /** Upstream attachment identifier (BlueBubbles guid, Telegram file_id, etc.). */
+  /** Upstream attachment identifier (iMessage/chat.db guid, Telegram file_id, etc.). */
   guid?: string;
   /** When the image was received. Defaults to now. */
   timestamp?: Date;
@@ -114,7 +114,7 @@ export function formatStickerMarker(intendedCount: number, savedPaths: string[])
 /**
  * Locate the EXIF Orientation tag (0x0112) in a JPEG buffer.
  *
- * iPhone photos forwarded through iMessage/BlueBubbles preserve the original
+ * iPhone photos forwarded through iMessage preserve the original
  * orientation tag without baking the rotation into pixels. Without normalization,
  * a portrait-shot photo (orientation=6) appears sideways to downstream readers
  * that don't honor EXIF — including LLMs reading attached images.

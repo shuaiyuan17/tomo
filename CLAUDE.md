@@ -41,7 +41,7 @@ src/
   config.ts           # Config from ~/.tomo/config.json + env vars (zod-validated)
   tomo-event.ts       # <tomo-event> envelope for harness-composed messages
   auth.ts             # Anthropic auth resolution (env key > config; subscription or API key)
-  channels/           # Channel implementations (Telegram, iMessage/BlueBubbles)
+  channels/           # Channel implementations (Telegram, iMessage via the imsg CLI)
   sessions/           # Persistence (store.ts), key helpers (keys.ts), summon-store.ts
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
                       #   (cron-, people-, recall-, pet-tools); external-config.ts, oauth.ts

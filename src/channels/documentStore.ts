@@ -5,7 +5,7 @@ import { log } from "../logger.js";
 export interface DocumentSaveMeta {
   /** Logical session or chat identifier (e.g. "dm_shuai", "tg_12345"). */
   sessionKey?: string;
-  /** Upstream attachment identifier (BlueBubbles guid, Telegram file_id, etc.). */
+  /** Upstream attachment identifier (iMessage/chat.db guid, Telegram file_id, etc.). */
   guid?: string;
   /** Original filename if provided by the channel. */
   filename?: string;
@@ -135,8 +135,8 @@ export function formatDocumentMarker(intendedCount: number, savedPaths: string[]
  * cap-hit so the socket is freed promptly.
  *
  * Use this in addition to (not instead of) any pre-download size hint
- * checks (e.g. Telegram's `file_size`, BlueBubbles' `totalBytes`,
- * HTTP `Content-Length`); those hints can be missing or wrong.
+ * checks (e.g. Telegram's `file_size`, an attachment row's declared byte
+ * size, HTTP `Content-Length`); those hints can be missing or wrong.
  */
 export async function readBodyWithCap(
   res: Response,

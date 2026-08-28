@@ -247,7 +247,7 @@ describe("per-block streaming delivery", () => {
 
   it("regression: a throwing commitBlock does not kill the live session", async () => {
     // onBlockComplete fires inside the SDK event loop. If commitBlock throws
-    // (e.g. transient BlueBubbles HTTP error), the error must not propagate
+    // (e.g. a transient channel transport error), the error must not propagate
     // into LiveSession.consumeEvents — that would mark the session dead and
     // trip runWithRetry's "session error" branch, double-firing the turn.
     const agent = new Agent();
@@ -265,7 +265,7 @@ describe("per-block streaming delivery", () => {
       stream.commitBlock = async () => {
         if (firstCall) {
           firstCall = false;
-          throw new Error("transient BlueBubbles HTTP error");
+          throw new Error("transient channel transport error");
         }
         return realCommit();
       };

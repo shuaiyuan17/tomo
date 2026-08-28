@@ -39,7 +39,7 @@ export const startCommand = new Command("start")
 async function startForeground(): Promise<void> {
   // Refuse to start if another tomo (manual daemon or launchd-managed) already
   // owns the pidfile. Prevents two tomos fighting over Telegram polling, the
-  // BlueBubbles webhook port, and the session registry.
+  // `imsg rpc` child, and the session registry.
   const existing = getRunningPid();
   if (existing) {
     console.error(`Tomo is already running (PID ${existing}). Refusing to start a second instance.`);
@@ -129,20 +129,12 @@ async function startForeground(): Promise<void> {
       cliPath: config.imsgCliPath,
       dbPath: config.imsgDbPath ?? undefined,
       imageStoreBaseDir,
-      // Same GUID store as the BlueBubbles channel on purpose: chat.db message
-      // GUIDs are identical across both backends, so messages BlueBubbles
-      // already dispatched are not re-dispatched after a provider cutover.
+      // Path kept verbatim from the pre-2026-08-27 BlueBubbles channel: chat.db
+      // message GUIDs were identical across both backends, so the store carried
+      // over the cutover and messages already dispatched were not re-dispatched.
+      // Do not rename it — old installs still have GUIDs in this file.
       dedupeStorePath: join(config.tomoHome, "data", "imessage", "seen-message-guids.json"),
       cursorStorePath: join(config.tomoHome, "data", "imessage", "imsg-watch-cursor.json"),
-    }));
-  } else if (config.imessageUrl) {
-    const { BlueBubblesChannel } = await import("../channels/index.js");
-    agent.addChannel(new BlueBubblesChannel({
-      url: config.imessageUrl,
-      password: config.imessagePassword,
-      webhookPort: config.imessageWebhookPort,
-      imageStoreBaseDir,
-      dedupeStorePath: join(config.tomoHome, "data", "imessage", "seen-message-guids.json"),
     }));
   }
 

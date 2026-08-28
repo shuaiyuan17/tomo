@@ -22,9 +22,12 @@ interface DedupeOptions {
 }
 
 /**
- * Persistent inbound GUID cache for BlueBubbles message replays. BlueBubbles'
- * message poller scans a seven-day lookback window, so process-local state is
- * insufficient: both services may restart before an old row is emitted again.
+ * Persistent inbound GUID cache for replayed chat.db message rows. Built for
+ * the BlueBubbles backend (removed 2026-08-27), whose message poller scanned a
+ * seven-day lookback window; the imsg channel keeps it as a second layer behind
+ * its rowid cursor. Persistence is the point: process-local state is
+ * insufficient because the source can re-emit an old row after either side
+ * restarts.
  */
 export class MessageGuidDedupeStore {
   private entries = new Map<string, number>();

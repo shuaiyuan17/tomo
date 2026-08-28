@@ -104,7 +104,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
@@ -133,6 +133,7 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   mockState.instances = [];
   mockState.sendImpl = null;
   mockState.mcpSetCalls = [];
@@ -612,18 +613,74 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances).toHaveLength(1);
   });
 
-  it("never resets or retries during shutdown", async () => {
+  it("refuses a turn admitted after stop(), instead of building a session and running it", async () => {
+    // This test used to assert `NO_REPLY` and one constructed session, which
+    // LOOKED like refusal but wasn't: the mock's `send` threw "Session is
+    // closed", so the NO_REPLY came from the shutdown CONVERSION, not from the
+    // manager declining the work. A real newly-constructed LiveSession has a
+    // live SDK child and would have run the turn to completion while the
+    // daemon was trying to exit. Admission is what has to close.
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);
-    mockState.sendImpl = async () => { throw new Error("Session is closed"); };
+    let ran = false;
+    mockState.sendImpl = async () => { ran = true; return "ran anyway"; };
 
     await manager.stop();
     const response = await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
 
-    expect(response).toBe("NO_REPLY");
+    expect(response).toBe(SHUTDOWN_NOT_PROCESSED);
+    expect(ran).toBe(false);
     expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
-    // Only the initial creation — no retry session
+    // Not "one session and no retry" — NO session. The turn never reached one.
+    expect(mockState.instances).toHaveLength(0);
+  });
+
+  it("flushes a refused turn's block transcript so nothing delivered is lost", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    const events: string[] = [];
+
+    await manager.stop();
+    const response = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { events.push("flush"); return false; },
+    });
+
+    expect(events).toEqual(["flush"]);
+    expect(response).toBe(SHUTDOWN_NOT_PROCESSED);
+  });
+
+  it("closes a session built after stop() began instead of publishing it", async () => {
+    // The turn was admitted BEFORE stop() and is parked inside
+    // buildExternalMcpServers when shutdown sweeps the map. Without the
+    // post-await re-check it publishes a brand-new, ALIVE session into the map
+    // stop() has already cleared, and runs its turn past the daemon's exit.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => { await gate; return {}; },
+    }));
+    let ran = false;
+    let flushed = false;
+    mockState.sendImpl = async () => { ran = true; return "ran anyway"; };
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      flushOnShutdown: () => { flushed = true; return false; },
+    });
+    await flushMicrotasks();
+
+    const stopping = manager.stop();
+    release();
+    await stopping;
+
+    expect(await turn).toBe(SHUTDOWN_NOT_PROCESSED);
+    expect(ran).toBe(false);
     expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(true);
+    expect(manager.isAlive("telegram:1")).toBe(false);
+    expect(flushed).toBe(true);
   });
 
   it("flushes the turn's block transcript BEFORE converting a shutdown rejection to NO_REPLY", async () => {
@@ -632,18 +689,75 @@ describe("LiveSessionManager.runWithRetry", () => {
     // turn's outcome. Anything already delivered has to reach the transcript
     // first, or the shutdown reads back as silence.
     const manager = new LiveSessionManager(makeDeps());
-    mockState.sendImpl = async () => { throw new Error("Session is closed"); };
+    let release!: () => void;
+    const parked = new Promise<void>((r) => { release = r; });
+    mockState.sendImpl = async () => { await parked; throw new Error("Session is closed"); };
     const events: string[] = [];
 
-    await manager.stop();
-    const response = await manager.runWithRetry({
+    const turn = manager.runWithRetry({
       key: "telegram:1",
       prompt: "hi",
       flushOnShutdown: () => { events.push("flush"); return true; },
     });
-    events.push(`resolved:${response}`);
+    await flushMicrotasks();
+
+    const stopping = manager.stop();
+    release();
+    await stopping;
+    events.push(`resolved:${await turn}`);
 
     expect(events).toEqual(["flush", "resolved:NO_REPLY"]);
+  });
+
+  it("keeps draining turns that join the in-flight set after the first snapshot", async () => {
+    // Admission is closed, so a late arrival should now be unreachable — this
+    // is defence in depth, and it is injected directly for exactly that
+    // reason: the drain must not depend on the set being COMPLETE at snapshot
+    // time, so that a future path which finds a way in is still waited on
+    // rather than abandoned mid-flush.
+    const manager = new LiveSessionManager(makeDeps());
+    const inFlight = (manager as unknown as { inFlightTurns: Set<Promise<string>> }).inFlightTurns;
+
+    let releaseFirst!: () => void;
+    const first = new Promise<void>((r) => { releaseFirst = r; });
+    let releaseLate!: () => void;
+    const late = new Promise<void>((r) => { releaseLate = r; });
+    let lateFlushed = false;
+    mockState.sendImpl = async () => { await first; throw new Error("Session is closed"); };
+
+    const turn = manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      // Lands DURING the first turn's flush — after stop() took its snapshot.
+      flushOnShutdown: () => {
+        inFlight.add(late.then(() => { lateFlushed = true; return "NO_REPLY"; }));
+        return true;
+      },
+    });
+    await flushMicrotasks();
+
+    let stopped = false;
+    const stopping = manager.stop().then(() => { stopped = true; });
+    await flushMicrotasks();
+    expect(stopped).toBe(false);
+
+    releaseFirst();
+    expect(await turn).toBe("NO_REPLY");
+    // A real timer tick, not just microtasks: a snapshot-once drain resolves
+    // here, and only a macrotask yield is slow enough to catch it doing so.
+    await new Promise((r) => setTimeout(r, 5));
+    // The first turn is done; the late arrival is not, and stop() must still
+    // be waiting on it rather than having exited on the stale snapshot.
+    expect(lateFlushed).toBe(false);
+    expect(stopped).toBe(false);
+
+    releaseLate();
+    await stopping;
+    expect(lateFlushed).toBe(true);
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("Gave up waiting for in-flight turns"),
+    );
   });
 
   it("waits for an in-flight turn to settle before stop() resolves", async () => {

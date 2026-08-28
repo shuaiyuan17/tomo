@@ -5,7 +5,7 @@ import type { TurnSource } from "../watch/protocol.js";
 import { STEER_MERGED } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
-import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER } from "./block-transcript.js";
+import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -45,7 +45,7 @@ export interface RunWithRetryRequest {
   flushOnShutdown?: () => boolean;
 }
 
-export { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
+export { DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
 /**
  * Silent-reply checks. User and production send/deferred-send turns match the
@@ -321,6 +321,20 @@ export class TurnRunner {
     // rethrows), so this guard only ever bites on shutdown.
     if (spec.transcript === "always" && reply && !sink.recordedAny()) {
       this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
+    }
+
+    // SHUTDOWN REFUSED THIS TURN — the prompt never reached the model.
+    //
+    // The transcript append above has already recorded the refusal for turns
+    // whose policy is to record everything (user turns), which is the whole
+    // point of refusing with this marker rather than a bare NO_REPLY: the
+    // owner's message must not read back after the restart as one Tomo
+    // deliberately declined to answer. Nothing may be DELIVERED for it — the
+    // marker is a note to the transcript, not a reply, and the channels are
+    // about to stop anyway. `false`: the turn did not run.
+    if (response === SHUTDOWN_NOT_PROCESSED) {
+      await stopTyping({ clear: true });
+      return false;
     }
 
     if (isAgentErrorResponse(response)) {

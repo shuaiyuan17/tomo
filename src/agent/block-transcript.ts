@@ -34,6 +34,29 @@
  */
 export const DELIVERY_FAILED_MARKER = "[delivery failed] ";
 
+/**
+ * Transcript entry — and `runWithRetry` resolution — for a turn SHUTDOWN
+ * REFUSED: the prompt never reached the model at all.
+ *
+ * Resolved, not rejected. Rejecting routes the turn through TurnRunner's
+ * thrown-error path, which for a user turn queues a pending error note AND
+ * sends `[error] …` to the chat — over channels `Agent.stop()` is about to
+ * shut down, once per message that lands during the exit. A refusal is not a
+ * malfunction and must not page the owner like one.
+ *
+ * Not a bare `NO_REPLY` either. That is the manager's existing conversion for
+ * a turn that DID run and died mid-flight, and it reads back as "Tomo chose to
+ * stay silent". A message that was never processed is a different fact, and
+ * the owner re-reads this conversation after the restart: the transcript has
+ * to say his message was dropped, not that it was answered with silence.
+ *
+ * Lives here, with the other transcript markers, rather than in
+ * live-session-manager: turn-runner needs the value, the manager needs the
+ * value, and the manager already depends on turn-runner for its request type.
+ * This module imports nothing, so it cannot close that loop.
+ */
+export const SHUTDOWN_NOT_PROCESSED = "[not processed — shutting down]";
+
 /** One block's reserved place in the transcript. */
 export interface BlockTranscriptSlot {
   /**

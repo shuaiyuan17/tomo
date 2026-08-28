@@ -11,6 +11,7 @@ import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
+import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
@@ -42,6 +43,11 @@ function isRecoverableSessionError(errMsg: string): boolean {
  * and we lose the very entries this wait exists to write.
  */
 export const SHUTDOWN_FLUSH_TIMEOUT_MS = Math.min(DELIVERY_TIMEOUT_MS, 5_000);
+
+/** Re-exported so shutdown policy reads in one place; defined with the other
+ *  transcript markers (block-transcript.ts) to keep this module import-cycle
+ *  free. */
+export { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
 /**
  * The narrow surface the session lifecycle needs from the Agent: the durable
@@ -240,6 +246,19 @@ export class LiveSessionManager {
       timeoutMs: config.liveSessionTimeoutMs,
       showThinking: config.showThinking,
     });
+    // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
+    // yields — it can spend real time on OAuth — and stop() may have run its
+    // one-time sweep of `liveSessions` while we were in there. Publishing now
+    // would put an ALIVE session into a map shutdown has already emptied and
+    // will never look at again: it would outlive the sweep, keep an SDK child
+    // running, and be killed at process exit with its turn's transcript
+    // unflushed. Closing it here settles that turn synchronously instead, and
+    // dispatchTurn turns it into a refusal.
+    if (this.stopping) {
+      session.close();
+      log.info({ key }, "Discarding a live session that finished building after shutdown began");
+      return session;
+    }
     this.liveSessions.set(key, session);
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
     this.mcpServerConfigsBySession.set(key, {
@@ -342,6 +361,16 @@ export class LiveSessionManager {
    * flushing before the daemon exits.
    */
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
+    // ADMISSION CLOSES WITH stop(). Not a formality: `Agent.stop()` stops the
+    // CHANNELS only after this manager finishes, so inbound messages keep
+    // arriving throughout shutdown. Without this gate they built a brand-new
+    // LiveSession — a live SDK child — after stop() had already swept the map,
+    // and that session was invisible to the sweep that just ran. It would ship
+    // blocks to the owner and then die at process exit with its deferred block
+    // transcript unflushed: exactly the hole the previous commit closed for
+    // pre-existing sessions, reopened for late ones.
+    if (this.stopping) return this.refuseForShutdown(req, "admitted after stop()");
+
     const turn = this.dispatchTurn(req);
     this.inFlightTurns.add(turn);
     try {
@@ -351,11 +380,40 @@ export class LiveSessionManager {
     }
   }
 
+  /**
+   * Decline a turn shutdown will never process, without losing anything it
+   * managed to deliver first.
+   *
+   * The flush is not theatre even though a refused turn has usually shipped
+   * nothing: `refuseForShutdown` is also the landing point for a turn that was
+   * admitted before stop() and only got as far as session construction, and
+   * the sink is the one thing that knows whether a block escaped. Flushing an
+   * empty sink is a no-op; not flushing a non-empty one loses the record of a
+   * message the owner is already holding.
+   */
+  private refuseForShutdown(req: RunWithRetryRequest, reason: string): string {
+    const recorded = req.flushOnShutdown?.() ?? false;
+    log.info(
+      { key: req.key, reason, flushedBlocks: recorded },
+      "Turn refused during shutdown; it was never processed",
+    );
+    return SHUTDOWN_NOT_PROCESSED;
+  }
+
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
     const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped } = req;
 
     try {
       const session = await this.getOrCreateLiveSession(key);
+      // The session was built while we were parked in buildExternalMcpServers
+      // and shutdown began in the meantime, so createLiveSession closed it
+      // rather than publishing it (see there). Refuse rather than call send()
+      // on it: the "Session is closed" that would come back is
+      // indistinguishable from a session that ran and died mid-turn, and would
+      // record this never-processed prompt as a silent turn.
+      if (this.stopping && !session.isAlive()) {
+        return this.refuseForShutdown(req, "session built after stop() began");
+      }
       const response = steer
         ? await session.steer(prompt, images, documents, onBlock, onBlockAbandoned)
         : await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
@@ -525,7 +583,11 @@ export class LiveSessionManager {
   async stop(): Promise<void> {
     // Synchronous up to the await: `stopping` is set and every session is
     // closed (and its in-flight turn rejected) before anything yields, so no
-    // newly arriving turn can slip in and take the retry path.
+    // newly arriving turn can slip in and take the retry path. `stopping` is
+    // also the admission gate from here on (runWithRetry) and the
+    // don't-publish flag for a session still under construction
+    // (createLiveSession) — this sweep is one-time, so nothing may be added to
+    // the map behind it.
     this.stopping = true;
     // Prompt-stale sessions stay in the map until their idle-boundary
     // retirement, so this loop covers them too.
@@ -537,23 +599,45 @@ export class LiveSessionManager {
     await this.awaitInFlightFlush();
   }
 
-  /** Wait for in-flight turns to settle (and so to flush), bounded. */
+  /**
+   * Wait for in-flight turns to settle (and so to flush), bounded.
+   *
+   * Re-snapshots until nothing is left, rather than taking the set ONCE: a
+   * single snapshot silently abandons anything that joins while we wait, and
+   * an abandoned turn is precisely a turn whose delivered blocks never reach
+   * the transcript. Admission is closed by the time we get here, so a late
+   * arrival should be unreachable — this is the belt to that braces, and it
+   * costs one extra pass over an empty set.
+   *
+   * `awaited` makes termination structural: every pass must consume at least
+   * one promise never seen before, so the loop cannot spin on a settled-but-
+   * not-yet-removed entry and starve the timeout timer (a macrotask) in a
+   * microtask loop.
+   */
   private async awaitInFlightFlush(): Promise<void> {
-    const turns = [...this.inFlightTurns];
-    if (turns.length === 0) return;
+    if (this.inFlightTurns.size === 0) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), SHUTDOWN_FLUSH_TIMEOUT_MS);
+    });
+    const awaited = new Set<Promise<string>>();
     try {
-      const outcome = await Promise.race([
-        Promise.allSettled(turns).then(() => "flushed" as const),
-        new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => resolve("timeout"), SHUTDOWN_FLUSH_TIMEOUT_MS);
-        }),
-      ]);
-      if (outcome === "timeout") {
-        log.warn(
-          { turns: turns.length, timeoutMs: SHUTDOWN_FLUSH_TIMEOUT_MS },
-          "Gave up waiting for in-flight turns to flush their block transcripts",
-        );
+      for (;;) {
+        const pending = [...this.inFlightTurns].filter((turn) => !awaited.has(turn));
+        if (pending.length === 0) return;
+        for (const turn of pending) awaited.add(turn);
+
+        const outcome = await Promise.race([
+          Promise.allSettled(pending).then(() => "flushed" as const),
+          expiry,
+        ]);
+        if (outcome === "timeout") {
+          log.warn(
+            { turns: this.inFlightTurns.size, timeoutMs: SHUTDOWN_FLUSH_TIMEOUT_MS },
+            "Gave up waiting for in-flight turns to flush their block transcripts",
+          );
+          return;
+        }
       }
     } finally {
       if (timer) clearTimeout(timer);

@@ -102,7 +102,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, SHUTDOWN_NOT_PROCESSED } = await import("../src/agent/live-session-manager.js");
 const { TurnRunner } = await import("../src/agent/turn-runner.js");
 const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 const { isSilentReply } = await import("../src/agent/text-utils.js");
@@ -110,8 +110,9 @@ const { DELIVERY_FAILED_MARKER } = await import("../src/agent/block-transcript.j
 
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
-function makeManagerDeps(): Deps {
+function makeManagerDeps(buildExternalMcpServers?: Deps["buildExternalMcpServers"]): Deps {
   return {
+    buildExternalMcpServers: buildExternalMcpServers ?? (async () => ({})),
     buildSystemPrompt: () => "prompt-v1",
     getSdkSessionId: () => undefined,
     setSdkSessionId: vi.fn(),
@@ -121,7 +122,6 @@ function makeManagerDeps(): Deps {
     getSessionMessages: () => [],
     getModelOverride: () => undefined,
     createInternalMcpServer: () => ({} as ReturnType<Deps["createInternalMcpServer"]>),
-    buildExternalMcpServers: async () => ({}),
     buildGroupContext: () => undefined,
     handleMcpElicitation: async () => ({ action: "decline" as const }),
     createUnownedTurnRequest: () => undefined,
@@ -182,11 +182,11 @@ interface Rig {
 
 let rigs: Rig[] = [];
 
-function rig(): Rig {
+function rig(buildExternalMcpServers?: Deps["buildExternalMcpServers"]): Rig {
   const order: string[] = [];
   const channel = new TestChannel(order);
   const transcript: string[] = [];
-  const manager = new LiveSessionManager(makeManagerDeps());
+  const manager = new LiveSessionManager(makeManagerDeps(buildExternalMcpServers));
 
   const deps: TurnRunnerDeps = {
     drainPendingNotes: () => "",
@@ -296,5 +296,50 @@ describe("shutdown flushes the block transcript before converting a turn to NO_R
 
     expect(r.channel.sent).toEqual([]);
     expect(r.transcript).toEqual(["NO_REPLY"]);
+  });
+});
+
+describe("shutdown refuses work it can no longer process", () => {
+  it("refuses a turn that arrives after stop(), and says so in the transcript", async () => {
+    // Agent.stop() stops the CHANNELS only after the manager finishes, so a
+    // message really can land here mid-shutdown. Before, it built a fresh
+    // session and ran it past the daemon's exit; now it is refused. The
+    // refusal must not read back as silence either — the owner's message was
+    // never processed, and "NO_REPLY" would claim Tomo chose not to answer.
+    const r = rig();
+    await r.manager.stop();
+
+    const ok = await r.start();
+
+    expect(ok).toBe(false);
+    expect(r.channel.sent).toEqual([]);
+    expect(r.transcript).toEqual([SHUTDOWN_NOT_PROCESSED]);
+    expect(r.transcript).not.toContain("NO_REPLY");
+    // Refused at the door: no SDK child was ever started for it.
+    expect(harnessRef.current).toBeNull();
+  });
+
+  it("closes a session built after stop() instead of publishing it into the cleared map", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let building = false;
+    const r = rig(async () => { building = true; await gate; return {}; });
+
+    const turn = r.start();
+    await waitFor("session construction to be entered", () => building);
+
+    const stopping = r.manager.stop();
+    release();
+    await stopping;
+    const ok = await turn;
+
+    expect(ok).toBe(false);
+    expect(r.channel.sent).toEqual([]);
+    // The late-built session is closed, never published — the map stop()
+    // cleared must stay cleared.
+    expect(r.manager.isAlive("dm:owner")).toBe(false);
+    // The turn never reached the model, so it is "not processed", not silent.
+    expect(r.transcript).toEqual([SHUTDOWN_NOT_PROCESSED]);
+    expect(r.transcript).not.toContain("NO_REPLY");
   });
 });

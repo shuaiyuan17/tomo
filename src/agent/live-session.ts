@@ -18,10 +18,13 @@ export interface TurnRequest {
   reject: (err: Error) => void | Promise<void>;
   /**
    * Out-channel for ONE completed delivery unit, called the moment the SDK
-   * closes that content block — before the tool call the model is about to
-   * make, not after the turn ends. This is the whole point: a turn that spends
-   * twenty minutes in a subagent still answers the owner with the text it
-   * produced first.
+   * closes that content block — WHILE THE TURN IS STILL RUNNING, not after it
+   * ends. That is the whole point: a turn that spends twenty minutes in a
+   * subagent still answers the owner with the text it produced first, twenty
+   * minutes before the turn resolves.
+   *
+   * What this does NOT promise is that the block lands before the tool the
+   * model just announced starts running. It usually does not. See handleEvent.
    *
    * Awaited, so the event loop backpressures on delivery and blocks reach the
    * channel in the order the model produced them. Never rejects — a failed
@@ -48,6 +51,34 @@ export const STEER_MERGED = "";
 export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
+
+/**
+ * How long ONE block's delivery may take before we give up on it.
+ *
+ * Separate from the inactivity timeout on purpose, and much shorter. The
+ * inactivity timeout asks "is the MODEL still working?" and kills the session
+ * when the answer is no. This one asks "is the CHANNEL still taking bytes?"
+ * and answers only for this block — a wedged iMessage send loses its own
+ * message and nothing else. Sixty seconds is far beyond a healthy send (tens
+ * of milliseconds) and far below the ten-minute inactivity window, so it fires
+ * only on a genuine hang.
+ */
+export const DELIVERY_TIMEOUT_MS = 60 * 1000;
+
+/** Reject after `ms` unless `work` settles first. Always clears its timer. */
+async function withDeliveryTimeout(work: Promise<void>, ms: number, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export interface LiveSessionSettings {
   timeoutMs?: number;
@@ -332,6 +363,11 @@ export class LiveSession {
   /** Agent tool_use id → subagent_type, so a subagent's tool logs can name which agent ran them. */
   private subagentTypeById = new Map<string, string>();
   private activityTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Depth of in-flight `onBlock` delivery. While > 0 the inactivity timer is
+   * DISARMED and refreshes are ignored — see shipBlock for why.
+   */
+  private deliverySuspensions = 0;
 
   constructor(
     options: ReturnType<typeof sdkOptions>,
@@ -418,6 +454,11 @@ export class LiveSession {
   }
 
   private refreshActivityTimeout(): void {
+    // Inactivity accounting is SUSPENDED while a block is being delivered.
+    // Guarded here as well as at the suspend site because send()/steer() can
+    // refresh from another task while the event loop sits in `await onBlock`,
+    // which would silently re-arm the timer we just disarmed.
+    if (this.deliverySuspensions > 0) return;
     if (!this.alive || !this.isBusy()) {
       this.clearActivityTimeout();
       return;
@@ -462,7 +503,15 @@ export class LiveSession {
     }
     if (!this.unownedTurnDropLogged) {
       this.unownedTurnDropLogged = true;
-      log.warn({ session: this.sessionKey, reason }, "Unowned SDK turn has no default delivery target");
+      // ERROR, not warn: this is the one path on which a block the model
+      // actually wrote reaches nobody and is never retried. Silent loss of the
+      // owner's reply is the worst failure this subsystem has, so it must not
+      // sit at a level that routine log reading skips. Latched to once per
+      // turn so a chatty orphan turn cannot flood the log.
+      log.error(
+        { session: this.sessionKey, reason },
+        "Unowned SDK turn has no default delivery target; DROPPING the content block",
+      );
     }
     return null;
   }
@@ -474,6 +523,25 @@ export class LiveSession {
    * next SDK event is not pulled until this one has shipped. A send that fails
    * is logged and swallowed — a dead channel must not abort a turn that is
    * still doing useful work.
+   *
+   * INACTIVITY ACCOUNTING IS SUSPENDED FOR THE DURATION OF THE SEND.
+   *
+   * The inactivity timer exists to notice a MODEL that has stopped producing.
+   * A slow channel is not that, but it used to look exactly like it: the timer
+   * was refreshed on the event that carried this block and then we sat in
+   * `await onBlock`, unable to refresh again, because refreshes only happen
+   * when we consume an SDK event and we are no longer consuming any. Real
+   * events kept arriving and piling up in the SDK's own queue, invisible to
+   * the timer. A wedged iMessage send therefore ran the clock down on a
+   * perfectly healthy turn and killed the session — the owner got his late
+   * block AND a spurious timeout error.
+   *
+   * So the timer is disarmed before the await and re-armed after, and delivery
+   * gets its own, much shorter budget instead. A block that blows that budget
+   * is abandoned: logged, counted as failed, turn continues. The turn is never
+   * killed for it. (The abandoned promise is left running rather than
+   * cancelled — there is no cancellation to hand a channel — so if the send
+   * does eventually settle, the sink still records its true outcome then.)
    */
   private async shipBlock(block: ResponseBlock): Promise<void> {
     const onBlock = this.currentRequest?.onBlock;
@@ -484,10 +552,21 @@ export class LiveSession {
     const rendered = renderBlock(block, this.showThinking);
     if (rendered.kind !== "ship") return;
 
+    this.deliverySuspensions++;
+    this.clearActivityTimeout();
     try {
-      await onBlock(rendered.text);
+      await withDeliveryTimeout(
+        Promise.resolve(onBlock(rendered.text)),
+        DELIVERY_TIMEOUT_MS,
+        `Block delivery timed out after ${formatTimeout(DELIVERY_TIMEOUT_MS)}`,
+      );
     } catch (err) {
       log.error({ err, session: this.sessionKey }, "Per-block delivery failed");
+    } finally {
+      this.deliverySuspensions--;
+      // Back on the clock, with a FULL window: the turn has been making
+      // progress the whole time, it was only our accounting that was paused.
+      this.refreshActivityTimeout();
     }
   }
 
@@ -509,10 +588,21 @@ export class LiveSession {
     }
 
     // An `assistant` event carries COMPLETE content blocks. There are no
-    // deltas to reassemble (#292 removed streaming), and the SDK emits this
-    // event before it executes any tool_use it announces — so this is the
-    // exact moment a block is finished and can ship. Waiting for `result`
-    // instead is what left the owner unanswered for the length of a turn.
+    // deltas to reassemble (#292 removed streaming), so this is the earliest
+    // moment a block is finished and can ship. Waiting for `result` instead is
+    // what left the owner unanswered for the length of a turn.
+    //
+    // WHAT AWAITING shipBlock DOES AND DOES NOT BUY US. It orders our own
+    // sends: the next SDK event is not handled until this block has reached
+    // the channel, so blocks arrive in model order. It does NOT hold back the
+    // CLI. `Query.readMessages()` (SDK 0.3.246) drains the transport into an
+    // internal queue on its own schedule, independent of how fast we consume
+    // it — so by the time block A is on the owner's phone the CLI has very
+    // likely already started, and may already have finished, the tool_use that
+    // A precedes. Blocking the CLI is not something this layer can do and is
+    // not what the feature needs: the requirement is "my text reaches him
+    // while the turn is still running", which is exactly what awaiting here
+    // delivers.
     if (event.type === "assistant" && event.message?.content) {
       for (const block of event.message.content) {
         if (isTextBlock(block)) {

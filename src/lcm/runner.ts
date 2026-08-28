@@ -137,9 +137,18 @@ export class RollupRunner {
           { sessionKey, picking: `${next.level} ${next.period}`, deferred: fresh.length - 1 },
           "Rollup nudge (one level/tick)",
         );
+        // ALWAYS suppressed, in every session type. A rollup turn is internal
+        // housekeeping: it reads context, runs `tomo lcm`, and has nothing to
+        // say to anyone. It used to rely on the prompt's closing "reply
+        // NO_REPLY", which worked only while delivery happened at END of turn
+        // and the whole turn was suppressed by that trailing token. Per-block
+        // delivery ships an early narration block ("Rolling up 8/27…") the
+        // moment it completes — long before the NO_REPLY that was supposed to
+        // silence it. The prompt cannot retract a sent message, so silence
+        // here must not depend on the model's cooperation.
         await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
           showTyping: false,
-          suppressDelivery: isGroupSessionKey(sessionKey),
+          suppressDelivery: true,
         });
         this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
       } catch (err) {

@@ -22,14 +22,18 @@ interface FakeSession {
     removed: string[];
     errors: Record<string, string>;
   } | null>;
-  send(prompt: string): Promise<string>;
-  steer(prompt: string): Promise<string>;
+  send(prompt: string, images?: unknown, documents?: unknown, onBlock?: (b: string) => void | Promise<void>): Promise<string>;
+  steer(prompt: string, images?: unknown, documents?: unknown, onBlock?: (b: string) => void | Promise<void>): Promise<string>;
 }
 
 const { mockState } = vi.hoisted(() => ({
   mockState: {
     instances: [] as FakeSession[],
-    sendImpl: null as null | ((prompt: string, session: FakeSession) => Promise<string>),
+    sendImpl: null as null | ((
+      prompt: string,
+      session: FakeSession,
+      onBlock?: (b: string) => void | Promise<void>,
+    ) => Promise<string>),
     mcpSetCalls: [] as Array<{ session: FakeSession; servers: Record<string, unknown> }>,
     mcpSetImpl: null as null | ((servers: Record<string, unknown>, session: FakeSession) => Promise<{
       added: string[];
@@ -64,8 +68,12 @@ vi.mock("../src/agent/live-session.js", () => {
       if (mockState.mcpSetImpl) return mockState.mcpSetImpl(servers, this);
       return { added: Object.keys(servers), removed: [], errors: {} };
     }
-    async send(prompt: string) { return mockState.sendImpl ? mockState.sendImpl(prompt, this) : "ok"; }
-    async steer(prompt: string) { return mockState.sendImpl ? mockState.sendImpl(prompt, this) : "steered"; }
+    async send(prompt: string, _i?: unknown, _d?: unknown, onBlock?: (b: string) => void | Promise<void>) {
+      return mockState.sendImpl ? mockState.sendImpl(prompt, this, onBlock) : "ok";
+    }
+    async steer(prompt: string, _i?: unknown, _d?: unknown, onBlock?: (b: string) => void | Promise<void>) {
+      return mockState.sendImpl ? mockState.sendImpl(prompt, this, onBlock) : "steered";
+    }
   }
   return {
     LiveSession: FakeLiveSession,
@@ -477,6 +485,83 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.clearSdkSessionId).toHaveBeenCalledWith("telegram:1");
     expect(mockState.instances).toHaveLength(2);
     expect(mockState.instances[0].closed).toBe(true);
+  });
+
+  /**
+   * Delivery is IRREVERSIBLE, so the retry policy has to know about it.
+   *
+   * A recoverable session error re-runs the whole prompt. That was free while
+   * delivery happened at end of turn — nothing had left the machine, so the
+   * re-run produced the one message the owner ever saw. With per-block
+   * delivery a turn can die AFTER putting text on his phone, and the re-run
+   * regenerates that text. Asked the same question twice, the model says the
+   * same thing twice.
+   *
+   * Skipping the first N blocks of the retry by index was rejected: the retry
+   * is a fresh sampling, not a replay, so index is not identity. Refusing to
+   * retry cannot double-send by construction, which is the property that
+   * matters here.
+   */
+  it("refuses to retry once a block has shipped, so the owner receives it exactly once", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    const received: string[] = [];
+    let shipped = false;
+    let attempts = 0;
+
+    mockState.sendImpl = async (_prompt, _session, onBlock) => {
+      attempts++;
+      // Both attempts would produce the same first block — the whole hazard.
+      await onBlock?.("A");
+      if (attempts === 1) throw new Error("process exited");
+      return "A";
+    };
+
+    const outcome = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      // The real sink (TurnRunner.makeBlockSink) marks the turn shipped as it
+      // attempts each send; mirrored here.
+      onBlock: async (b) => { shipped = true; received.push(b); },
+      hasShipped: () => shipped,
+    } as never).then(() => "resolved", (e: Error) => `rejected: ${e.message}`);
+
+    // THE assertion: the owner has exactly one copy of A. Without the guard
+    // this reads ["A", "A"].
+    expect(received).toEqual(["A"]);
+    // Because there was no second attempt...
+    expect(attempts).toBe(1);
+    // ...and the failure is surfaced instead. He already has A, and an error
+    // note beats a duplicate he cannot tell apart from the original.
+    expect(outcome).toBe("rejected: process exited");
+  });
+
+  it("still retries a recoverable error that happens before anything shipped", async () => {
+    // The overwhelmingly common case: the child dies while starting or
+    // resuming, before any content block exists. Refusing to retry there would
+    // be a regression, so the guard must be about DELIVERY, not about failure.
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    const received: string[] = [];
+    let attempts = 0;
+
+    mockState.sendImpl = async (_prompt, _session, onBlock) => {
+      attempts++;
+      if (attempts === 1) throw new Error("Session is closed");
+      await onBlock?.("A");
+      return "A";
+    };
+
+    const response = await manager.runWithRetry({
+      key: "telegram:1",
+      prompt: "hi",
+      onBlock: async (b) => { received.push(b); },
+      hasShipped: () => received.length > 0,
+    } as never);
+
+    expect(response).toBe("A");
+    expect(attempts).toBe(2);
+    expect(received).toEqual(["A"]);
   });
 
   it("keeps the SDK session id on 'Session is closed' errors and retries once", async () => {

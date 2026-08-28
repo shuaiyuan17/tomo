@@ -317,7 +317,7 @@ export class LiveSessionManager {
   }
 
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
-    const { key, prompt, images, documents, steer = false, onBlock } = req;
+    const { key, prompt, images, documents, steer = false, onBlock, hasShipped } = req;
 
     try {
       const session = await this.getOrCreateLiveSession(key);
@@ -360,6 +360,39 @@ export class LiveSessionManager {
         // the resume id and silently start the user over on a blank session.
         if (this.stopping) throw err;
 
+        // NO RETRY ONCE ANYTHING HAS SHIPPED.
+        //
+        // Under end-of-turn delivery a retry was free: nothing had left the
+        // machine, so re-running the prompt could only produce the one message
+        // the owner ever saw. Per-block delivery breaks that. If block A
+        // reached the phone and the SDK child then died, resuming the same
+        // prompt regenerates the turn from the top — and the model, asked the
+        // same question again, says A again. The owner gets A twice.
+        //
+        // The alternative considered was a fresh sink that skips the first N
+        // blocks by index. Rejected: it is not sound. The retry is a NEW
+        // sampling of a resumed conversation, not a replay — it can produce
+        // different text, in a different order, in a different number of
+        // blocks. Skipping by index would silently swallow genuinely new
+        // content when the retry says less, and would still re-send A when the
+        // retry reorders. Index equality is not identity.
+        //
+        // So we refuse instead, and surface the failure. This cannot
+        // double-send by construction, which is the property that matters: the
+        // owner already has A, and an error note telling him the turn died is
+        // strictly better than a second copy of A with no way to tell which is
+        // real. Turns that have shipped nothing — every housekeeping turn with
+        // suppressDelivery, and every turn that fails while the child is still
+        // starting or resuming, which is where these errors overwhelmingly
+        // occur — still retry exactly as before.
+        if (hasShipped?.()) {
+          log.warn(
+            { err, key },
+            "Session error after a block already shipped; refusing to retry (a retry would re-send delivered blocks)",
+          );
+          throw err;
+        }
+
         log.warn({ err }, "Session error, resetting and retrying");
         this.closeLiveSession(key);
         // Only a true resume failure invalidates the persisted SDK session
@@ -371,12 +404,8 @@ export class LiveSessionManager {
         }
 
         const session = await this.getOrCreateLiveSession(key);
-        // The retry gets the same per-block sink. Blocks the failed attempt
-        // already shipped stay shipped — mid-turn delivery is committed the
-        // moment it reaches the channel, and there is no unsend. Recoverable
-        // session errors are raised while starting or resuming the child, i.e.
-        // before any content block exists, so in practice the retry ships the
-        // whole reply and nothing is duplicated.
+        // Safe to reuse the same sink: the guard above proved it has shipped
+        // nothing, so this retry is the first and only delivery of the turn.
         const response = await session.send(prompt, images, documents, onBlock);
         this.recordTurnCompletion(key, session);
         return response;

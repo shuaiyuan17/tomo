@@ -14,9 +14,16 @@ export interface RunWithRetryRequest {
   documents?: Array<{ data: string; mediaType: string; filename?: string }>;
   steer?: boolean;
   /** Receives ONE completed delivery unit the moment the SDK closes it —
-   *  before the tool call that follows it runs (LiveSession's
+   *  while the turn is still running, not after it ends (LiveSession's
    *  TurnRequest.onBlock). Awaited, so blocks ship in model order. */
   onBlock?: (block: string) => Promise<void>;
+  /**
+   * True once `onBlock` has ATTEMPTED a send. Delivery is irreversible: there
+   * is no unsend, so a turn that has already put a block on the owner's phone
+   * must not be re-run from the top on a recoverable session error. The host's
+   * retry consults this before resuming (see LiveSessionManager.runWithRetry).
+   */
+  hasShipped?: () => boolean;
 }
 
 /**
@@ -25,6 +32,13 @@ export interface RunWithRetryRequest {
  * before applying their matcher. The embedded matcher is retained for callers
  * that deliberately want legacy substring suppression.
  */
+/**
+ * Prefix for a transcript entry whose send threw. The block was composed and
+ * attempted but is not known to have reached the owner, so recall must not
+ * read it back as something he was told.
+ */
+export const DELIVERY_FAILED_MARKER = "[delivery failed] ";
+
 export const bareSilentMatcher = isSilentReply;
 export function embeddedSilentMatcher(response: string): boolean {
   return isSilentReply(response) || response.includes("NO_REPLY");
@@ -206,6 +220,7 @@ export class TurnRunner {
       key: spec.key,
       prompt,
       onBlock: sink.onBlock,
+      hasShipped: sink.hasShipped,
       ...(reply
         ? { images: reply.images, documents: reply.documents, steer: reply.steer }
         : {}),
@@ -327,7 +342,11 @@ export class TurnRunner {
    * silent whatever the model writes should use `suppressDelivery`, which is
    * honoured here and does not depend on the model's cooperation.
    */
-  private makeBlockSink(spec: TurnSpec): { onBlock: (block: string) => Promise<void>; handledAny: () => boolean } {
+  private makeBlockSink(spec: TurnSpec): {
+    onBlock: (block: string) => Promise<void>;
+    handledAny: () => boolean;
+    hasShipped: () => boolean;
+  } {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
     const suppressed = delivery.kind === "send" && delivery.suppressDelivery === true;
@@ -337,6 +356,10 @@ export class TurnRunner {
     // BEFORE the send so a channel failure cannot make the post-turn fallback
     // re-deliver the whole response on top of blocks that already landed.
     let handledAny = false;
+    // "A send was ATTEMPTED against the channel" — the irreversible bit. Once
+    // true the turn can never be retried from the top, because a retry would
+    // regenerate and re-send blocks the owner may already be holding.
+    let shipped = false;
     // Resolved lazily, on the first block that actually ships. Continuity
     // turns resolve their target only for a response that speaks, and an
     // unresolvable target must not be reported for a turn that stays silent.
@@ -363,22 +386,51 @@ export class TurnRunner {
         );
       }
 
-      // Every delivered message must be recorded, or it is invisible to
-      // recall_conversation (#203). "always" records the turn's literal
-      // response instead, once, after the turn.
-      if (spec.transcript === "on-delivery" && channelName) {
-        this.deps.appendAssistantTranscript(spec.key, block, channelName);
-      }
-
       handledAny = true;
+      // Set BEFORE the await, not after: an ambiguous send failure (timeout,
+      // bridge child death) may already have put this block on the owner's
+      // phone. Anything that keys off "did this turn ship" must treat an
+      // attempted send as shipped — see LiveSessionManager's no-retry-after-
+      // ship rule, where guessing wrong means a duplicate message.
+      shipped = true;
       try {
         await sender.deliver(block);
+        // Every delivered message must be recorded, or it is invisible to
+        // recall_conversation (#203). "always" records the turn's literal
+        // response instead, once, after the turn.
+        //
+        // Recorded AFTER the send resolves, never before. Writing on intent
+        // made the transcript claim deliveries that never happened: in an
+        // A-succeeds / B-throws turn the owner had only A on his phone while
+        // the transcript showed both, so recall_conversation would later
+        // "remember" telling him something he never received.
+        if (spec.transcript === "on-delivery" && channelName) {
+          this.deps.appendAssistantTranscript(spec.key, block, channelName);
+        }
       } catch (err) {
+        // KNOWN LIMITATION — ambiguous-failure reordering. A throw here is
+        // swallowed so a dead channel cannot abort a turn that is still doing
+        // useful work; the turn continues and the NEXT block ships normally.
+        // But an iMessage send that fails ambiguously (timeout, bridge child
+        // death — see channels/imessage-imsg.ts, the `ImsgRpcResponseError`
+        // discrimination around the rich-send fallback) may ALREADY have
+        // dispatched. If block A times out and block B then sends cleanly, a
+        // late-arriving A can land on the phone AFTER B — the owner reads them
+        // out of model order. Only the channel can fix this properly (an
+        // idempotent send with a dispatch receipt); until then we prefer a
+        // possibly-reordered pair over a turn that dies on one bad send.
         log.error({ err, sessionKey: spec.key }, "Block delivery failed");
+        // Still recorded, but MARKED. Dropping it would lose the fact that the
+        // turn composed this text at all; recording it clean would assert a
+        // delivery that did not happen. The marker is also the honest answer
+        // for an ambiguous failure, which may or may not have landed.
+        if (spec.transcript === "on-delivery" && channelName) {
+          this.deps.appendAssistantTranscript(spec.key, `${DELIVERY_FAILED_MARKER}${block}`, channelName);
+        }
       }
     };
 
-    return { onBlock, handledAny: () => handledAny };
+    return { onBlock, handledAny: () => handledAny, hasShipped: () => shipped };
   }
 
   private async handleThrownError(spec: TurnSpec, err: unknown, stopTyping: StopTyping): Promise<boolean> {

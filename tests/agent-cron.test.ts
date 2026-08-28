@@ -756,3 +756,64 @@ describe("compact nudges", () => {
     await agent.stop();
   });
 });
+
+/**
+ * Housekeeping turns are silent by CONSTRUCTION, not by cooperation.
+ *
+ * Every internal nudge prompt ends with "reply NO_REPLY so we don't send a
+ * user-facing message for this housekeeping turn". Under #292's end-of-turn
+ * delivery that instruction was load-bearing and sufficient: the whole turn
+ * was joined into one response, and a trailing bare NO_REPLY suppressed all of
+ * it, narration included.
+ *
+ * Per-block delivery makes the instruction arrive too late. A turn that writes
+ * "Compacting context…", then calls a tool, then answers NO_REPLY, has already
+ * put the narration on the owner's phone by the time the token is produced —
+ * and a sent message cannot be recalled. These turns therefore set
+ * `suppressDelivery` unconditionally, in every session type, so silence does
+ * not depend on the model saying the right word at the right moment.
+ */
+describe("internal housekeeping turns never speak", () => {
+  /** The leak shape: narration, then a tool, then the token. */
+  const narrateThenNoReply = [
+    "Compacting context now…",
+    { type: "tool_use" as const, id: "tu-lcm", name: "Bash", input: {} },
+    "NO_REPLY",
+  ];
+
+  it("sends nothing for a context-nudge turn that narrates before answering NO_REPLY (DM session)", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // A DM session — the case that used to LEAK, because suppressDelivery was
+    // set only for group keys.
+    mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    mockSdk.responseFn = (text) =>
+      text.includes("Context usage is at") ? narrateThenNoReply : "seeded reply";
+
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+
+    // The nudge turn ran...
+    await waitFor(() =>
+      expect(
+        mockSdk.userContents.some((blocks) =>
+          blocks.some((b) => (b.text ?? "").includes("Context usage is at")),
+        ),
+      ).toBe(true),
+    );
+    await drainQueue(agent);
+
+    // ...and said nothing. The owner sees his own turn's reply and nothing
+    // else: not the narration, not the token. NOTE: the delivery log is NOT
+    // cleared before this assertion on purpose — the nudge turn can complete
+    // before the clear would run, and clearing would hide exactly the leak
+    // this test exists to catch.
+    await expectNoChangeFor(() =>
+      expect(tg.delivered.map((d) => d.text)).toEqual(["seeded reply"]),
+    );
+
+    await agent.stop();
+  });
+});

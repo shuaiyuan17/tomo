@@ -7,9 +7,21 @@
  * subagent, text it already produced sits in a buffer.
  *
  * The contract pinned here is the third option: no streaming, but each `text`
- * content block ships as soon as the SDK closes it — i.e. before the tool call
- * that follows it runs. Newlines inside a block stay inside one message.
- * Nothing inspects the model's words to decide what ships; block TYPE decides.
+ * content block ships as soon as the SDK closes it — WHILE THE TURN IS STILL
+ * RUNNING, rather than after it ends. Newlines inside a block stay inside one
+ * message. Nothing inspects the model's words to decide what ships; block TYPE
+ * decides.
+ *
+ * SCOPE OF THE ORDERING CLAIM. These tests assert that a block reaches the
+ * channel before the turn ends, and that blocks reach it in model order. They
+ * deliberately do NOT assert that a block lands before the CLI runs the tool
+ * the model announced alongside it — that is not true and this layer cannot
+ * make it true. The SDK's `Query.readMessages()` (0.3.246) drains the
+ * transport into its own internal queue on its own schedule, so the CLI starts
+ * and finishes the announced tool regardless of how fast Tomo consumes events
+ * or how slow a channel send is. Awaiting delivery orders OUR sends; it does
+ * not throttle the CLI. The owner's requirement was "my text reaches him while
+ * the turn is still running", which is what is pinned here.
  *
  * These tests drive the REAL stack — LiveSession over a scripted mock SDK,
  * through TurnRunner, through DeliveryPipeline, into a fake channel — because
@@ -36,10 +48,16 @@ const harnessRef = vi.hoisted(() => ({ current: null as Harness | null }));
  * Scripted mock SDK.
  *
  * The queue is pulled ONE EVENT AT A TIME, only when LiveSession asks for the
- * next one — exactly like the real stream. That is what makes the ordering
- * assertions meaningful: a `__effect` step (standing in for the CLI actually
- * running a tool) cannot run until the consumer has finished handling every
- * event queued before it, delivery included.
+ * next one. A `__effect` step therefore runs at a known point in OUR
+ * consumption: after everything queued before it has been fully handled,
+ * delivery included.
+ *
+ * That is a statement about the consumer, not about the real CLI — the real
+ * `Query` pre-drains the transport (see the file header). So `__effect` is used
+ * here only to mark points in Tomo's own progress through a turn, such as "the
+ * turn is about to end". It is NOT used to stand in for the CLI executing a
+ * tool; a mock that only runs the tool when Tomo asks for the next event would
+ * prove ordering against the mock rather than against the SDK.
  */
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> } }> }) => {
@@ -100,6 +118,7 @@ const { LiveSession } = await import("../src/agent/live-session.js");
 const { TurnRunner } = await import("../src/agent/turn-runner.js");
 const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 const { isSilentReply } = await import("../src/agent/text-utils.js");
+const { log } = await import("../src/logger.js");
 
 // --- event builders -------------------------------------------------------
 
@@ -109,6 +128,13 @@ const toolUseBlock = (name: string, id: string) => ({ type: "tool_use", id, name
 const assistant = (content: unknown[]) => ({ type: "assistant", message: { content } });
 const toolResult = (id: string) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] } });
 const effect = (run: () => void) => ({ type: "__effect", run });
+/**
+ * Marks the last instant at which the turn is still running: placed
+ * immediately before `result()`, it runs once every earlier event has been
+ * fully handled and before the turn's result is consumed. Anything logged
+ * after this marker did NOT reach the channel mid-turn.
+ */
+const turnEnding = (order: string[]) => effect(() => order.push("TURN-ENDING"));
 const result = () => ({
   type: "result",
   subtype: "success",
@@ -125,12 +151,18 @@ const result = () => ({
 class OrderedChannel implements Channel {
   readonly name = "imessage";
   sent: OutgoingMessage[] = [];
+  /** Texts whose send must throw, for the partial-delivery tests. */
+  failTexts = new Set<string>();
 
   constructor(private readonly order: string[]) {}
 
   onMessage(): void {}
   onCommand(): void {}
   async send(message: OutgoingMessage): Promise<void> {
+    if (message.text !== undefined && this.failTexts.has(message.text)) {
+      this.order.push(`send-failed:${message.text}`);
+      throw new Error(`channel refused ${message.text}`);
+    }
     this.sent.push(message);
     this.order.push(message.photo ? `photo:${message.photo}` : `send:${message.text}`);
   }
@@ -186,7 +218,11 @@ function makeRig(settings: { showThinking?: boolean } = {}): Rig {
     // there the stream advances solely at the consumer's pace.
     while (harness.inputs.length === 0) await new Promise((r) => setTimeout(r, 1));
     harness.enqueue(events);
-    return await turn;
+    const done = await turn;
+    // The other end of the mid-turn claim: everything logged before this point
+    // reached the channel while TurnRunner had not yet returned.
+    order.push("TURN-RETURNED");
+    return done;
   };
 
   return { order, channel, transcript, run, close: () => session.close() };
@@ -211,25 +247,62 @@ afterEach(() => {
 
 // ---------------------------------------------------------------------------
 
-describe("a completed text block ships before the tool call that follows it", () => {
+describe("a completed text block reaches the channel while the turn is still running", () => {
   /**
-   * THE regression test for #292. The owner's complaint in one assertion: a
-   * reply produced before a 20-minute tool call must reach him before that
-   * tool call runs, not after the turn ends.
+   * THE regression test for #292. The owner's complaint, stated as something
+   * that is actually true: a reply written before a 20-minute tool call must
+   * reach him DURING the turn — not held in a buffer until the turn ends.
+   *
+   * Under #292 both sends landed after `result` was consumed, so both would
+   * fall on the far side of TURN-ENDING. That is exactly what this catches.
+   *
+   * NOT asserted, and not true: that A lands before the CLI executes `Bash`.
+   * By the time A is on the phone the CLI has very likely already started, and
+   * may already have finished, that tool — the SDK pre-drains the transport
+   * and nothing in Tomo throttles it. The tool_use/tool_result pair is in the
+   * script for realistic shape only; no assertion rests on where the CLI ran.
    */
-  it("delivers block A before the tool runs, then B after it", async () => {
+  it("delivers block A mid-turn, before the turn ends, and B after it in model order", async () => {
     const r = rig();
 
     await r.run([
       assistant([textBlock("A")]),
       assistant([toolUseBlock("Bash", "t1")]),
-      effect(() => r.order.push("tool:Bash")),
       toolResult("t1"),
       assistant([textBlock("B")]),
+      turnEnding(r.order),
       result(),
     ]);
 
-    expect(r.order).toEqual(["send:A", "tool:Bash", "send:B"]);
+    expect(r.order).toEqual(["send:A", "send:B", "TURN-ENDING", "TURN-RETURNED"]);
+  });
+
+  /**
+   * The block the owner is actually waiting on is the one written BEFORE the
+   * long tool. Pinned separately: A must be on the channel before the turn
+   * consumes that tool's result, so a tool that takes twenty minutes to come
+   * back cannot be what delays A.
+   */
+  it("delivers block A before the turn consumes the result of the tool that follows it", async () => {
+    const r = rig();
+
+    await r.run([
+      assistant([textBlock("A")]),
+      assistant([toolUseBlock("Bash", "t1")]),
+      effect(() => r.order.push("TOOL-RESULT-CONSUMED")),
+      toolResult("t1"),
+      assistant([textBlock("B")]),
+      turnEnding(r.order),
+      result(),
+    ]);
+
+    expect(r.order).toEqual([
+      "send:A",
+      "TOOL-RESULT-CONSUMED",
+      "send:B",
+      "TURN-ENDING",
+      "TURN-RETURNED",
+    ]);
   });
 
   it("delivers a block that arrives in the same event as the tool_use it precedes", async () => {
@@ -237,13 +310,13 @@ describe("a completed text block ships before the tool call that follows it", ()
 
     await r.run([
       assistant([textBlock("A"), toolUseBlock("Bash", "t1")]),
-      effect(() => r.order.push("tool:Bash")),
       toolResult("t1"),
       assistant([textBlock("B")]),
+      turnEnding(r.order),
       result(),
     ]);
 
-    expect(r.order).toEqual(["send:A", "tool:Bash", "send:B"]);
+    expect(r.order).toEqual(["send:A", "send:B", "TURN-ENDING", "TURN-RETURNED"]);
   });
 });
 
@@ -373,13 +446,18 @@ describe("thinking blocks", () => {
     await r.run([
       assistant([thinkingBlock("weighing the options")]),
       assistant([toolUseBlock("Bash", "t1")]),
-      effect(() => r.order.push("tool:Bash")),
       toolResult("t1"),
       assistant([textBlock("A")]),
+      turnEnding(r.order),
       result(),
     ]);
 
-    expect(r.order).toEqual(["send:💭 weighing the options", "tool:Bash", "send:A"]);
+    expect(r.order).toEqual([
+      "send:💭 weighing the options",
+      "send:A",
+      "TURN-ENDING",
+      "TURN-RETURNED",
+    ]);
   });
 });
 
@@ -407,7 +485,7 @@ describe("attachment placement across blocks", () => {
       result(),
     ]);
 
-    expect(r.order).toEqual(["send:A", `photo:${photoPath}`, "send:B"]);
+    expect(r.order).toEqual(["send:A", `photo:${photoPath}`, "send:B", "TURN-RETURNED"]);
     expect(r.channel.sent).toEqual([
       { chatId: "chat1", text: "A" },
       { chatId: "chat1", photo: photoPath, text: "" },
@@ -444,5 +522,286 @@ describe("the reply target is spent by the first block that ships", () => {
     );
 
     expect(r.channel.sent).toEqual([{ chatId: "chat1", text: "B", replyTo: "msg-42" }]);
+  });
+});
+
+/**
+ * Cross-turn contamination (repro 2026-08-28, daemon on ef69851 / #292).
+ *
+ * A DM turn produced a ~700-char text block at 08:33:33 and then sat in an MCP
+ * tool until 08:40:42. A continuity heartbeat was due at 08:33:50. When the
+ * dust settled the owner had received exactly one 31-char message and never
+ * the 700-char block — the log showed `Routing unowned SDK turn to default
+ * delivery target`, then the heartbeat's `Tomo: NO_REPLY`.
+ *
+ * Under #292's end-of-turn delivery this class of loss is expressible: blocks
+ * accumulate in ONE shared `parts` array on the session and are rendered and
+ * cleared by whichever request happens to own the session when `result`
+ * arrives — so a NO_REPLY turn completing at the wrong moment can render, and
+ * suppress, another turn's collected text.
+ *
+ * Per-block delivery removes the shared window that made it possible: a block
+ * is delivered through its OWN turn's sink at the instant it completes, so
+ * there is nothing left in a shared buffer for a later turn to consume. These
+ * tests pin the two properties that keep it that way.
+ */
+describe("a turn's blocks belong to that turn alone", () => {
+  it("a NO_REPLY turn queued mid-flight cannot capture or suppress the earlier turn's blocks", async () => {
+    const session = new LiveSession({} as never, "dm:owner", undefined, undefined, {});
+    const harness = harnessRef.current!;
+    const toA: string[] = [];
+    const toB: string[] = [];
+
+    try {
+      // Turn A starts and produces its first block, then stalls in a tool.
+      const turnA = session.send("A?", undefined, undefined, async (b) => { toA.push(b); });
+      while (harness.inputs.length === 0) await new Promise((r) => setTimeout(r, 1));
+      harness.enqueue([assistant([textBlock("A1")]), assistant([toolUseBlock("codex", "t1")])]);
+      await new Promise((r) => setTimeout(r, 5));
+
+      // A1 is already on the owner's phone — DURING the turn, with the tool
+      // still outstanding. #292 would still have it buffered here.
+      expect(toA).toEqual(["A1"]);
+
+      // The heartbeat turn is dispatched now, while A is still in flight. It
+      // must not be able to touch A: send() waits for genuine idleness, so B
+      // does not become the session's current request until A has resolved.
+      const turnB = session.send("heartbeat", undefined, undefined, async (b) => { toB.push(b); });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(harness.inputs).toHaveLength(1); // B has NOT been dispatched
+
+      // The tool returns, A finishes.
+      harness.enqueue([toolResult("t1"), assistant([textBlock("A2")]), result()]);
+      expect(await turnA).toBe("A1\nA2");
+
+      // Only now does B run, and it says nothing.
+      while (harness.inputs.length < 2) await new Promise((r) => setTimeout(r, 1));
+      harness.enqueue([assistant([textBlock("NO_REPLY")]), result()]);
+      expect(await turnB).toBe("NO_REPLY");
+
+      // The whole point: A got both of its blocks, B got none of them, and
+      // B's NO_REPLY suppressed only B.
+      expect(toA).toEqual(["A1", "A2"]);
+      expect(toB).toEqual([]);
+    } finally {
+      session.close();
+    }
+  });
+
+  it("delivers a block that arrives with no owning request to the session's default target", async () => {
+    const unowned: string[] = [];
+    const session = new LiveSession(
+      {} as never,
+      "dm:owner",
+      undefined,
+      // The default-target sink LiveSessionManager installs
+      // (Agent.createUnownedTurnRequest in production).
+      () => ({ resolve: () => {}, reject: () => {}, onBlock: (b) => { unowned.push(b); } }),
+      {},
+    );
+    const harness = harnessRef.current!;
+
+    try {
+      // No send() in flight: this turn was initiated by the SDK itself.
+      harness.enqueue([assistant([textBlock("orphan narration")]), result()]);
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Delivered, not dropped. Losing it silently is the failure mode the
+      // 2026-08-28 repro is suspected of.
+      expect(unowned).toEqual(["orphan narration"]);
+    } finally {
+      session.close();
+    }
+  });
+
+  it("logs at ERROR when an unowned block has no default target and must be dropped", async () => {
+    const session = new LiveSession({} as never, "dm:owner", undefined, () => undefined, {});
+    const harness = harnessRef.current!;
+
+    try {
+      harness.enqueue([assistant([textBlock("orphan narration")]), result()]);
+      await new Promise((r) => setTimeout(r, 10));
+
+      // A block the model wrote reached nobody. That is never an info-level
+      // event, however routine the cause.
+      expect(log.error).toHaveBeenCalledWith(
+        expect.objectContaining({ session: "dm:owner" }),
+        expect.stringContaining("DROPPING the content block"),
+      );
+    } finally {
+      session.close();
+    }
+  });
+});
+
+describe("the transcript records what was DELIVERED, not what was composed", () => {
+  /**
+   * The transcript is what `recall_conversation` reads back as "things I told
+   * him". Writing an entry before the send meant a turn whose second block
+   * failed still recorded both, so the agent would later act on a message the
+   * owner never received. Entries are therefore written after the send
+   * resolves, and a failed send is recorded with a marker instead.
+   */
+  it("marks a block whose send threw, and records the one that succeeded clean", async () => {
+    const r = rig();
+    r.channel.failTexts.add("B");
+
+    await r.run(
+      [
+        assistant([textBlock("A")]),
+        assistant([textBlock("B")]),
+        assistant([textBlock("C")]),
+        result(),
+      ],
+      { transcript: "on-delivery" },
+    );
+
+    // A and C reached the owner; B did not, and says so.
+    expect(r.transcript).toEqual(["A", "[delivery failed] B", "C"]);
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["A", "C"]);
+    // A failed send never aborts the turn — C still ships after B.
+    expect(r.order).toEqual([
+      "send:A",
+      "send-failed:B",
+      "send:C",
+      "TURN-RETURNED",
+    ]);
+  });
+});
+
+/**
+ * KNOWN BEHAVIOUR, NOT YET DECIDED (owner, 2026-08-28).
+ *
+ * Continuity turns (heartbeat / restart notice) may legitimately speak, so
+ * unlike LCM rollups and context nudges they do NOT set `suppressDelivery`.
+ * Their prompt (defaults/CONTINUITY.md) instead asks the model to end with
+ * NO_REPLY when it has nothing to say.
+ *
+ * Under per-block delivery that instruction no longer guarantees silence: a
+ * turn that narrates, calls a tool, and only then answers NO_REPLY has already
+ * shipped the narration. This test PINS THE LEAK rather than fixing it, so the
+ * behaviour is visible and a future change to it is deliberate.
+ *
+ * The owner is choosing between:
+ *   (A) make continuity default-silent and require `send_message` to speak;
+ *   (B) keep as is and accept mid-turn narration from these paths.
+ * Affected paths are listed in the PR description.
+ */
+describe("KNOWN LEAK (undecided): continuity-shaped turns ship narration written before NO_REPLY", () => {
+  it("delivers the narration block of a text -> tool -> NO_REPLY continuity turn", async () => {
+    const r = rig();
+
+    await r.run(
+      [
+        assistant([textBlock("Checking in on the morning routine…")]),
+        assistant([toolUseBlock("Bash", "t1")]),
+        toolResult("t1"),
+        assistant([textBlock("NO_REPLY")]),
+        result(),
+      ],
+      {
+        // The continuity turn's real shape: no suppressDelivery, target
+        // resolved only once something ships.
+        delivery: {
+          kind: "deferred-send",
+          resolveTarget: () => ({ channel: r.channel, chatId: "chat1" }),
+        },
+        transcript: "on-delivery",
+      },
+    );
+
+    // The trailing NO_REPLY suppresses only ITS OWN block. The narration was
+    // already gone by the time it was written.
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["Checking in on the morning routine…"]);
+    expect(r.transcript).toEqual(["Checking in on the morning routine…"]);
+  });
+});
+
+/**
+ * A slow channel must not look like a dead model.
+ *
+ * LiveSession kills a turn that goes quiet for `timeoutMs` — that timer exists
+ * to notice a MODEL that stopped producing. Before this fix it was refreshed
+ * on the event carrying a block and then never again for the whole duration of
+ * `await onBlock`, because refreshes only happen while we are consuming SDK
+ * events and during a send we are not. Real events piled up in the SDK's own
+ * queue where the timer could not see them. A wedged iMessage send therefore
+ * ran the clock down on a healthy turn and closed the session: the owner got
+ * his late message AND a spurious "Query timed out" error.
+ */
+describe("inactivity accounting is suspended while a block is being delivered", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("completes a turn whose send outlasts the whole inactivity window", async () => {
+    // Deliberately tiny: the send below takes five times this long.
+    const session = new LiveSession({} as never, "dm:owner", undefined, undefined, { timeoutMs: 1_000 });
+    const harness = harnessRef.current!;
+
+    let release!: () => void;
+    const wedged = new Promise<void>((r) => { release = r; });
+    const delivered: string[] = [];
+
+    try {
+      const turn = session.send("hi", undefined, undefined, async (b) => {
+        delivered.push(b);
+        await wedged;
+      });
+      await vi.advanceTimersByTimeAsync(5);
+
+      harness.enqueue([assistant([textBlock("A")])]);
+      await vi.advanceTimersByTimeAsync(5);
+      expect(delivered).toEqual(["A"]); // now parked inside `await onBlock`
+
+      // Five inactivity windows pass with the send still outstanding. Under
+      // the old code the timer fired here and closed the session.
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      release();
+      await vi.advanceTimersByTimeAsync(5);
+      harness.enqueue([assistant([textBlock("B")]), result()]);
+      await vi.advanceTimersByTimeAsync(5);
+
+      // The turn finished normally: no timeout error, both blocks intact.
+      await expect(turn).resolves.toBe("A\nB");
+    } finally {
+      release();
+      session.close();
+    }
+  });
+
+  it("abandons a block whose send never returns, without killing the turn", async () => {
+    // Inactivity window comfortably longer than the 60s delivery budget, as in
+    // production (10 minutes vs 60 seconds) — the delivery timeout must be the
+    // one that fires.
+    const session = new LiveSession({} as never, "dm:owner", undefined, undefined, { timeoutMs: 5 * 60_000 });
+    const harness = harnessRef.current!;
+    const delivered: string[] = [];
+
+    try {
+      // The send of block A never settles at all. B's send is normal, so the
+      // turn can still finish once A has been given up on.
+      const turn = session.send("hi", undefined, undefined, async (b) => {
+        delivered.push(b);
+        if (b === "A") await new Promise<void>(() => {});
+      });
+      await vi.advanceTimersByTimeAsync(5);
+
+      harness.enqueue([assistant([textBlock("A")])]);
+      await vi.advanceTimersByTimeAsync(5);
+      expect(delivered).toEqual(["A"]);
+
+      // Past the 60s delivery budget: the block is given up on...
+      await vi.advanceTimersByTimeAsync(60_100);
+
+      // ...and the turn carries on and completes. The session is NOT closed,
+      // and B still ships.
+      harness.enqueue([assistant([textBlock("B")]), result()]);
+      await vi.advanceTimersByTimeAsync(5);
+      await expect(turn).resolves.toBe("A\nB");
+      expect(delivered).toEqual(["A", "B"]);
+    } finally {
+      session.close();
+    }
   });
 });

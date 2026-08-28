@@ -29,7 +29,7 @@ import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { DELIVERY_FAILED_MARKER, TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
@@ -707,17 +707,27 @@ export class Agent {
         // reaches the chat prefixed and with a pending note queued.
         if (isAgentErrorResponse(block) || isSilentReply(block)) return;
         try {
+          await sender.deliver(block);
           // Recorded per shipped block — an unrecorded delivery is invisible
-          // to recall_conversation (#203).
+          // to recall_conversation (#203) — but recorded AFTER the send, never
+          // before. Writing on intent made the transcript claim deliveries
+          // that never happened (A sends, B throws, transcript shows both).
           this.sessions.append(key, {
             role: "assistant",
             content: block,
             channel: channel.name,
             timestamp: Date.now(),
           });
-          await sender.deliver(block);
         } catch (err) {
           log.error({ err, key }, "Background task block delivery failed");
+          // Still recorded, but MARKED: the turn composed this text, and it is
+          // not known to have reached the owner.
+          this.sessions.append(key, {
+            role: "assistant",
+            content: `${DELIVERY_FAILED_MARKER}${block}`,
+            channel: channel.name,
+            timestamp: Date.now(),
+          });
         }
       },
       resolve: async (response) => {
@@ -885,9 +895,18 @@ export class Agent {
       return;
     }
 
+    // ALWAYS suppressed, in every session type. A context nudge (compact /
+    // daily / prune-tools) is internal housekeeping: it runs an `lcm` command
+    // and has nothing to say to anyone. It used to rely on the prompt's
+    // closing "reply NO_REPLY", which only worked while delivery happened at
+    // END of turn and that trailing token suppressed the whole turn. Per-block
+    // delivery ships an early narration block ("Compacting context…") as soon
+    // as it completes, before the NO_REPLY that was meant to silence it — and
+    // a sent message cannot be recalled. Silence here must not depend on the
+    // model's cooperation.
     this.handleCronMessage(nudge, key, {
       showTyping: false,
-      suppressDelivery: isGroupSessionKey(key),
+      suppressDelivery: true,
     }).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });

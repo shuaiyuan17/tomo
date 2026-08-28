@@ -136,6 +136,18 @@ export interface TomoConfig {
    *  lost is the typewriter effect, which only Telegram renders — iMessage
    *  ships per completed block regardless. */
   streaming: boolean;
+  /** Show the model's thinking preamble in the chat instead of stripping it.
+   *  Default false (hidden).
+   *
+   *  The model sometimes leaks its internal thinking into the reply text — a
+   *  "思考:" / "Thinking:" preamble line, or bare tool-call debris. The
+   *  outbound scaffold filter strips those (see agent/scaffold-filter.ts).
+   *  Turning this on disables ONLY that part of the filter, so the switch and
+   *  the filter are one mechanism rather than two that can drift apart:
+   *  conversation-envelope scaffold (`<system-reminder>`, `_end_of_dialog_`,
+   *  the narrator paragraph) is never legitimate output and is stripped
+   *  regardless. */
+  showThinking: boolean;
   /** Inactivity timeout for one LiveSession send()/steer() turn. Default 10 minutes. */
   liveSessionTimeoutMs: number;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
@@ -555,6 +567,12 @@ function buildConfig(): TomoConfig {
     maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
     streaming: validated("streaming (TOMO_STREAMING)", boolLike, envVar("TOMO_STREAMING") ?? file.streaming, true),
+    showThinking: validated(
+      "showThinking (TOMO_SHOW_THINKING)",
+      boolLike,
+      envVar("TOMO_SHOW_THINKING") ?? file.showThinking,
+      false,
+    ),
     liveSessionTimeoutMs: validated(
       "liveSessionTimeoutMs (TOMO_LIVE_SESSION_TIMEOUT_MS)",
       positiveInt,

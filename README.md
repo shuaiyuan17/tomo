@@ -346,6 +346,7 @@ Environment variables override config file values:
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
+| `TOMO_SHOW_THINKING` | Show the model's thinking preamble in chat instead of stripping it. Defaults to `false` (hidden). |
 | `TOMO_CONTINUITY_INTERVAL_MINUTES` | Override scheduled continuity heartbeat interval (default: `55`, minimum: `1`) |
 | `TOMO_CONTINUITY_SCRIPT` | Override the optional continuity script path |
 | `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Override continuity script timeout (default: `30000`) |

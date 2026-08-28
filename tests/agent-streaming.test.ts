@@ -82,6 +82,47 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
+  // End-to-end proof for the outbound leak filter: a REAL leak shape observed
+  // in the transcripts (思考: preamble + reply glued on after the seam + a
+  // trailing bare `count` sentinel) must reach the channel as just the reply,
+  // as a single message. Exercises turn-runner -> scaffold-filter ->
+  // DeliveryPipeline.makeBlockHandler -> StreamingMessage -> channel.send.
+  it("strips a leaked thinking preamble and count sentinel before the channel sees it", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    mockSdk.responseFn = () =>
+      "思考:有意思——我已经发现过这个错误了。\n\n让我看看当时记了什么。 这个错我 8/24 凌晨就抓到过\n不是新发现\n\ncount";
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered.map((d) => d.text)).toEqual(["这个错我 8/24 凌晨就抓到过\n不是新发现"]);
+    expect(im.delivered.some((d) => d.text === "count")).toBe(false);
+    expect(im.delivered.some((d) => d.text.includes("思考:"))).toBe(false);
+
+    await agent.stop();
+  });
+
+  it("delivers a message that merely MENTIONS count and 思考 completely untouched", async () => {
+    const agent = new Agent();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+
+    // Near-miss guard at the delivery level: ordinary prose using both trigger
+    // words, plus a shell flag. Losing this text would be invisible.
+    const real = "`count` 和 `思考` 都是正常词 —— `git rev-list --count` 是真命令\n值得思考的是 the count was 136";
+    mockSdk.responseFn = () => real;
+
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
+    await drainQueue(agent);
+
+    expect(im.delivered.map((d) => d.text)).toEqual([real]);
+
+    await agent.stop();
+  });
+
   it("ships newline-delimited text within a block as ONE iMessage", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");

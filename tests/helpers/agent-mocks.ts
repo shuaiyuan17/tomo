@@ -320,6 +320,7 @@ export const mockConfig = {
   passiveGroups: {} as Record<string, string[]>,
   groupSecret: null as string | null,
   steering: true,
+  showThinking: false,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
   lcm: {

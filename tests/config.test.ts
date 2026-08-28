@@ -118,6 +118,7 @@ describe("config file validation", () => {
       model: "claude-sonnet-5",
       maxTurns: 75,
       steering: "false",
+      showThinking: "yes",
       channels: {
         telegram: { token: "tg-token", allowlist: [12345, "-100999"] },
       },
@@ -131,6 +132,7 @@ describe("config file validation", () => {
     expect(config.model).toBe("claude-sonnet-5");
     expect(config.maxTurns).toBe(75);
     expect(config.steering).toBe(false);
+    expect(config.showThinking).toBe(true);
     expect(config.telegramToken).toBe("tg-token");
     // Chat ids written as JSON numbers are normalized to strings.
     expect(config.channelAllowlists).toEqual({ telegram: ["12345", "-100999"] });
@@ -139,6 +141,26 @@ describe("config file validation", () => {
     ]);
     expect(config.lcm).toMatchObject({ nudgeAtPct: 85, nudgeResetPct: 60 });
     expect(config.groupSecret).toBe("open-sesame");
+  });
+
+  // Thinking is HIDDEN by default: the outbound scaffold filter strips a
+  // leaked "思考:" preamble unless this is turned on (see scaffold-filter.ts).
+  it("hides thinking by default and lets TOMO_SHOW_THINKING turn it on", async () => {
+    const { config } = await loadWithConfigFile(JSON.stringify({ channels: { telegram: { token: "t" } } }));
+    expect(config.showThinking).toBe(false);
+
+    vi.stubEnv("TOMO_SHOW_THINKING", "true");
+    const withEnv = await loadWithConfigFile(JSON.stringify({ channels: { telegram: { token: "t" } } }));
+    expect(withEnv.config.showThinking).toBe(true);
+    expect(withEnv.configIssues).toEqual([]);
+  });
+
+  it("records an issue for a non-boolean showThinking and falls back to hidden", async () => {
+    const { config, configIssues } = await loadWithConfigFile(
+      JSON.stringify({ showThinking: "maybe", channels: { telegram: { token: "t" } } }),
+    );
+    expect(config.showThinking).toBe(false);
+    expect(configIssues.some((i) => i.startsWith("showThinking (TOMO_SHOW_THINKING)"))).toBe(true);
   });
 
   it("reports invalid values, falls back to defaults, and refuses startup", async () => {

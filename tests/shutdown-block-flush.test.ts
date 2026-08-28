@@ -166,6 +166,9 @@ class TestChannel implements Channel {
   }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
+  closeIngestion(): void {}
+  async quiesce(): Promise<void> {}
+  async teardown(): Promise<void> {}
   async stop(): Promise<void> {}
 }
 
@@ -301,9 +304,10 @@ describe("shutdown flushes the block transcript before converting a turn to NO_R
 
 describe("shutdown refuses work it can no longer process", () => {
   it("refuses a turn that arrives after stop(), and says so in the transcript", async () => {
-    // Agent.stop() stops the CHANNELS only after the manager finishes, so a
-    // message really can land here mid-shutdown. Before, it built a fresh
-    // session and ran it past the daemon's exit; now it is refused. The
+    // Channel ingestion closes first, but the manager is not fed by channels
+    // alone (cron, continuity, proactive sends, and the batcher's own drain all
+    // land here), so a turn really can arrive mid-shutdown. Before, it built a
+    // fresh session and ran it past the daemon's exit; now it is refused. The
     // refusal must not read back as silence either — the owner's message was
     // never processed, and "NO_REPLY" would claim Tomo chose not to answer.
     const r = rig();

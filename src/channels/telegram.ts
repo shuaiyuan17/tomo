@@ -78,6 +78,16 @@ export class TelegramChannel implements Channel {
   // echo for bot messages, so send paths record explicitly), backing
   // substring-targeted reactions, threaded replies, and edit/unsend.
   private recentByChat = new Map<string, RecentChatMessage[]>();
+  /**
+   * Updates currently inside our middleware — the download/parse work plus the
+   * hand-off to the agent. grammY does not track this for us: `bot.stop()`
+   * documents that it "will not wait for the middleware stack to finish", and
+   * it confirms `lastTriedUpdateId + 1` regardless (bot.js sets
+   * `lastTriedUpdateId` BEFORE running middleware). So Telegram considers
+   * these updates delivered whatever we do with them, and this set is the only
+   * thing that lets `quiesce()` give them somewhere to land.
+   */
+  private inFlightUpdates = new Set<Promise<void>>();
 
   constructor(token: string, options: TelegramChannelOptions = {}) {
     this.bot = new Bot(token);
@@ -89,7 +99,7 @@ export class TelegramChannel implements Channel {
 
     // Slash commands
     for (const cmd of ["new", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]) {
-      this.bot.command(cmd, async (ctx) => {
+      this.bot.command(cmd, (ctx) => this.ingest(String(ctx.chat.id), String(ctx.msg?.message_id ?? ""), async () => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
         const senderId = ctx.from ? String(ctx.from.id) : undefined;
@@ -97,11 +107,11 @@ export class TelegramChannel implements Channel {
         for (const handler of this.commandHandlers) {
           await handler(cmd, chatId, senderName, args, senderId);
         }
-      });
+      }));
     }
 
     // Text messages (skip bot commands)
-    this.bot.on("message:text", async (ctx) => {
+    this.bot.on("message:text", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
       if (ctx.message.text.startsWith("/")) return;
 
       const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
@@ -118,10 +128,10 @@ export class TelegramChannel implements Channel {
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
-    });
+    }));
 
     // Photo messages
-    this.bot.on("message:photo", async (ctx) => {
+    this.bot.on("message:photo", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
       const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
       const isMentioned = this.checkMentioned(ctx);
       const photos = ctx.message.photo;
@@ -145,12 +155,12 @@ export class TelegramChannel implements Channel {
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
-    });
+    }));
 
     // Document messages (PDFs and other supported document types). Telegram
     // exposes generic file attachments under `message:document`; we ingest
     // only the MIME types Anthropic accepts as document content blocks.
-    this.bot.on("message:document", async (ctx) => {
+    this.bot.on("message:document", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
       const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
       const isMentioned = this.checkMentioned(ctx);
       const doc = ctx.message.document;
@@ -200,11 +210,11 @@ export class TelegramChannel implements Channel {
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
-    });
+    }));
 
     // Sticker messages. We do not download sticker artwork here; the file_id
     // is enough for Tomo to understand and resend it later via STICKER:<id>.
-    this.bot.on("message:sticker", async (ctx) => {
+    this.bot.on("message:sticker", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
       const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
       const isMentioned = this.checkMentioned(ctx);
       const sticker = ctx.message.sticker;
@@ -227,7 +237,30 @@ export class TelegramChannel implements Channel {
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
-    });
+    }));
+  }
+
+  /**
+   * Run one update's middleware under the entry guard and the in-flight
+   * ledger.
+   *
+   * The guard is checked ONCE, here, before any work starts: an update that
+   * arrives after `closeIngestion()` is declined outright. Once the work has
+   * begun it is never revoked — Telegram has already recorded the update as
+   * delivered, so abandoning it half-parsed loses it for good. It runs to
+   * completion instead, and `quiesce()` is what holds the shutdown open long
+   * enough for it to reach the batcher.
+   */
+  private ingest(chatId: string, updateId: string, work: () => Promise<void>): Promise<void> {
+    if (this.stopping) {
+      log.warn({ chatId, messageId: updateId }, "Telegram update refused: ingestion closed");
+      return Promise.resolve();
+    }
+    const done = work()
+      .catch((err) => log.error({ err: this.redactToken(err), chatId }, "Telegram update handling failed"))
+      .finally(() => { this.inFlightUpdates.delete(done); });
+    this.inFlightUpdates.add(done);
+    return done;
   }
 
   private getSenderName(ctx: Context): string {
@@ -373,21 +406,36 @@ export class TelegramChannel implements Channel {
       });
     }
 
-    // Refuse anything still in flight through grammy when stop() lands: the
-    // agent drains its batcher right after the channels stop, so a handoff
-    // after that point lands in a batcher nobody will drain again. Declining
-    // here also leaves the update un-acknowledged, so `getUpdates` redelivers
-    // it to the next process rather than losing it.
-    if (this.stopping) {
-      log.warn({ chatId: msg.chatId, messageId: msg.id }, "Telegram message refused: channel stopped");
-      return;
-    }
-
-    // Fire-and-forget: the agent's per-session queue handles ordering.
-    // Awaiting here would let grammy serialize updates against the SDK turn,
-    // preventing rapid messages from piling up for the queue to coalesce.
+    // No shutdown guard here. It lives at the entry to the update (`ingest`),
+    // and repeating it at the hand-off would be actively harmful: by this
+    // point the update has been through the middleware, and refusing it now
+    // would LOSE it. Telegram already counts it as delivered — grammY records
+    // `lastTriedUpdateId` before running middleware and `bot.stop()` confirms
+    // `lastTriedUpdateId + 1` without waiting for the middleware to finish —
+    // so there is no redelivery to fall back on. It goes to the batcher, and
+    // `quiesce()` is what keeps the batcher open until it gets there.
+    //
+    // Fire-and-forget for ORDERING (awaiting here would let grammy serialize
+    // updates against the SDK turn, preventing rapid messages from piling up
+    // for the queue to coalesce), but tracked, so shutdown can still wait for
+    // it. Untracked fire-and-forget is a message with no owner.
     for (const handler of this.handlers) {
-      handler(msg).catch((err) => log.error({ err }, "Telegram message handler failed"));
+      const done = handler(msg)
+        .then((accepted) => {
+          // The one case Telegram cannot recover from. Logged as an error, not
+          // a warning: the update is acknowledged upstream and refused here,
+          // so this is a genuine loss, and it should be unreachable — the
+          // entry guard plus quiesce exist precisely to make it so.
+          if (!accepted) {
+            log.error(
+              { chatId: msg.chatId, messageId: msg.id },
+              "Telegram message refused by the agent after Telegram already acknowledged the update; it is lost, not replayed",
+            );
+          }
+        })
+        .catch((err) => log.error({ err }, "Telegram message handler failed"))
+        .finally(() => { this.inFlightUpdates.delete(done); });
+      this.inFlightUpdates.add(done);
     }
   }
 
@@ -665,13 +713,54 @@ export class TelegramChannel implements Channel {
     this.bot.start().then(() => scheduleRestart(), (err) => scheduleRestart(err));
   }
 
-  async stop(): Promise<void> {
-    log.info("Telegram bot stopping");
+  /**
+   * Phase 1 — shut the inbound door. Synchronous and I/O-free.
+   *
+   * `stopping` also stops `startPolling` from rearming itself. It does NOT
+   * stop grammY's current `getUpdates` loop (that needs `bot.stop()`, which is
+   * network work and belongs in `teardown()`), so updates may still arrive
+   * after this — `ingest` declines them at the entry.
+   */
+  closeIngestion(): void {
+    log.info("Telegram bot: closing ingestion");
     this.stopping = true;
     if (this.pollingRestartTimer) {
       clearTimeout(this.pollingRestartTimer);
       this.pollingRestartTimer = null;
     }
+  }
+
+  /**
+   * Phase 2 — wait for updates already inside our middleware.
+   *
+   * grammY offers nothing for this: `bot.stop()` is explicit that it "will not
+   * wait for the middleware stack to finish", and it has already committed the
+   * offset past these updates. Re-snapshots until the ledger is empty, because
+   * an update mid-download can still add its hand-off promise while we wait.
+   * Errors are swallowed inside `ingest`/`dispatch`, so this settles.
+   */
+  async quiesce(): Promise<void> {
+    while (this.inFlightUpdates.size > 0) {
+      await Promise.allSettled([...this.inFlightUpdates]);
+    }
+  }
+
+  /**
+   * Phase 3 — physical teardown. `bot.stop()` ends the polling loop and makes
+   * one final `getUpdates` to confirm the offset; that request rides grammY's
+   * default 500 s client timeout, which is exactly why nothing durable is
+   * allowed to wait behind it.
+   */
+  async teardown(): Promise<void> {
+    log.info("Telegram bot stopping");
+    this.stopping = true;
     await this.bot.stop();
+  }
+
+  /** Full shutdown for a standalone caller. `Agent.stop()` drives the phases itself. */
+  async stop(): Promise<void> {
+    this.closeIngestion();
+    await this.quiesce();
+    await this.teardown();
   }
 }

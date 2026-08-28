@@ -78,6 +78,16 @@ interface CronTurnOptions {
   deliveryTarget?: ReplyTarget;
 }
 
+/**
+ * Deadlines for the two channel-side shutdown steps. Both exist because
+ * `start.ts` cannot call `process.exit()` until `stop()` resolves, so an
+ * unbounded await here is a daemon that will not die: `quiesce` waits on
+ * attachment IO and a network download, and `teardown` waits on grammY's final
+ * `getUpdates`, whose own client timeout defaults to 500 seconds.
+ */
+const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
+const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
+
 // Context-usage percentage at which the nudge escalates from a daily rollup
 // (config.lcm.nudgeAtPct) to a full lcm compact.
 const COMPACT_NUDGE_PCT = 80;
@@ -366,8 +376,14 @@ export class Agent {
    * coalesce rapid messages into one turn; mention-required groups process
    * per-message (mention filtering would be lost otherwise). Resolves once
    * queued, not when the turn completes.
+   *
+   * Resolves to whether the agent took CUSTODY of the message — see
+   * MessageHandler. `true` covers deliberate drops (allowlist, /pause) as well
+   * as queued work: the decision was made and recorded here, and the channel
+   * should acknowledge the message rather than replay it forever. Only a
+   * batcher already drained for shutdown answers `false`.
    */
-  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<void> {
+  private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<boolean> {
     const isGroup = message.isGroup ?? false;
 
     // Allowlist gate at receipt, BEFORE resolving: a disallowed chat must not
@@ -381,7 +397,7 @@ export class Agent {
       } else {
         log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked at receipt (not in allowlist)");
       }
-      return;
+      return true;
     }
 
     // A provider redirect opened on another device cannot reach this Mac's
@@ -391,7 +407,7 @@ export class Agent {
     // never reach the OAuth manager.
     if (!isGroup && message.senderId && this.router.identityForSender(channel.name, message.senderId)) {
       const consumed = await this.handlePastedMcpCallback(channel, message);
-      if (consumed) return;
+      if (consumed) return true;
     }
 
     // /pause gate, BEFORE resolving: a paused group's messages are dropped
@@ -400,7 +416,7 @@ export class Agent {
     // slash commands bypass this path, which is how /resume gets through.
     if (isGroup && this.pauses.isPaused(`${channel.name}:${message.chatId}`)) {
       log.debug({ channel: channel.name, chatId: message.chatId }, "Message dropped (group is paused via /pause)");
-      return;
+      return true;
     }
 
     // Resolve ONCE, at receipt — this decides both which queue the message
@@ -419,10 +435,10 @@ export class Agent {
       // task can wait behind an in-flight turn, and both can change meanwhile.
       this.enqueueForSession(sessionKey, () => this.processInboundItems([{ channel, message, resolution }]))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      return;
+      return true;
     }
 
-    this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
+    return this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
   }
 
   private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
@@ -1535,29 +1551,102 @@ export class Agent {
     }
   }
 
+  /**
+   * Shut down in five phases, ordered by what each one can lose.
+   *
+   * 1. `closeIngestion()` on every channel — synchronous, no I/O, so the whole
+   *    fleet's inbound door is shut within one turn of the event loop. This
+   *    bounds the set of messages we owe the user.
+   * 2. `quiesce()` — let work already INSIDE a channel's parse path finish
+   *    landing in the batcher. A row refused at this stage would be lost, not
+   *    replayed: imsg may be seconds into attachment loading, and Telegram has
+   *    already told the server it has the update.
+   * 3. Drain the batcher into the transcript. Durable, and now working against
+   *    a set that cannot grow.
+   * 4. Stop the manager: reject in-flight turns and let them flush the blocks
+   *    they delivered. Also durable.
+   * 5. Only now, physical channel teardown — the slow, fallible part.
+   *
+   * The order of 4 and 5 is the whole point of the split. Tearing a channel
+   * down first meant the manager drained into a dead channel, so blocks
+   * produced during shutdown were recorded `[delivery failed]` for messages
+   * that would otherwise have shipped. And awaiting teardown BEFORE the drain
+   * staked every durable write on grammY's final `getUpdates`, which carries a
+   * 500 s default client timeout — one stalled network call and nothing was
+   * recorded at all.
+   *
+   * Hence the nested `finally`s: the recording and the manager stop run even
+   * if quiesce fails, and teardown runs even if they do. Both awaits are
+   * bounded, because `start.ts` cannot exit until this resolves.
+   */
   async stop(): Promise<void> {
     log.info("Shutting down");
     this.commands.stop();
 
-    // Channels FIRST (#294). Stopping the manager first left the front door
-    // open while the house emptied: channels kept ingesting, each message
-    // landed in the in-memory batcher (and imsg committed its cursor on the
-    // way in), and the process exited before any of it ran — acknowledged,
-    // unprocessed, unrecorded, unreplayable. Closing ingestion first is what
-    // makes the set of messages we owe the user finite.
-    await Promise.all(this.channels.map((ch) => ch.stop()));
+    for (const ch of this.channels) {
+      try {
+        ch.closeIngestion();
+      } catch (err) {
+        // Contractually I/O-free, so this is a bug rather than a failure mode
+        // — but one channel must not keep the others ingesting.
+        log.error({ err, channel: ch.name }, "Channel closeIngestion threw");
+      }
+    }
 
-    // Then the batcher, which is now guaranteed not to grow again. These are
-    // messages the user has already sent and we are choosing not to answer;
-    // the transcript record is what keeps that a visible non-answer instead of
-    // a silent drop.
-    this.recordUnprocessedInbound();
+    try {
+      await this.boundedShutdownStep(
+        "channel quiesce",
+        CHANNEL_QUIESCE_TIMEOUT_MS,
+        () => Promise.all(this.channels.map((ch) => ch.quiesce())),
+      );
+    } finally {
+      try {
+        // The batcher is guaranteed not to grow again. These are messages the
+        // user has already sent and we are choosing not to answer; the
+        // transcript record is what keeps that a visible non-answer instead of
+        // a silent drop.
+        this.recordUnprocessedInbound();
 
-    // Manager last, and awaited: closing the live sessions rejects their
-    // in-flight turns, and those turns still have to flush the blocks they
-    // delivered into the transcript. `start.ts` calls process.exit() the
-    // moment this resolves.
-    await this.liveSessionManager.stop();
+        // Closing the live sessions rejects their in-flight turns, and those
+        // turns still have to flush the blocks they delivered into the
+        // transcript. Channels are still alive here, so a block produced
+        // during this drain still reaches the user.
+        await this.liveSessionManager.stop();
+      } finally {
+        await this.boundedShutdownStep(
+          "channel teardown",
+          CHANNEL_TEARDOWN_TIMEOUT_MS,
+          () => Promise.all(this.channels.map((ch) => ch.teardown())),
+        );
+      }
+    }
+  }
+
+  /**
+   * Run one shutdown step under a deadline, swallowing failures.
+   *
+   * Neither a rejection nor a stall may propagate: every caller is on the path
+   * to `process.exit()`, and a shutdown step that hangs is indistinguishable
+   * from a daemon that refuses to die. The timer is cleared on the fast path
+   * so it cannot hold the loop open, and the abandoned work is left running
+   * rather than cancelled — there is no cancellation to hand a channel.
+   */
+  private async boundedShutdownStep(label: string, timeoutMs: number, run: () => Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([
+        run().then(() => "done" as const, (err) => { log.error({ err, step: label }, "Shutdown step failed"); return "done" as const; }),
+        expiry,
+      ]);
+      if (outcome === "timeout") {
+        log.warn({ step: label, timeoutMs }, "Shutdown step timed out; continuing");
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1574,12 +1663,24 @@ export class Agent {
    * had died one stage later in `TurnRunner` (same marker, same shape) and the
    * user's words are not editorialised.
    *
-   * Cursors are untouched. For a channel that can replay (Telegram's offset is
-   * only committed for updates it has handed over), leaving the cursor alone
-   * is what lets a restart re-deliver. For imsg it is moot — the cursor was
-   * persisted at enqueue, before this message ever reached the batcher, so
-   * there is nothing left to un-acknowledge and the transcript record IS the
-   * durable trace.
+   * The transcript record is the ONLY durable trace for everything drained
+   * here, on both channels. Neither one replays what is already in the
+   * batcher:
+   *
+   * - imsg advanced its rowid cursor at the end of the dispatch that put the
+   *   message here, so there is nothing left to un-acknowledge.
+   * - Telegram acknowledged it too, whatever we do. grammY sets
+   *   `lastTriedUpdateId` BEFORE running middleware (bot.js) and `bot.stop()`
+   *   confirms `lastTriedUpdateId + 1` with a final `getUpdates` without
+   *   waiting for the middleware stack. An earlier version of this comment
+   *   claimed Telegram's offset was "only committed for updates it has handed
+   *   over" and that declining one made `getUpdates` redeliver it. That was
+   *   false: the update is confirmed either way, so a refusal here loses it.
+   *
+   * Replay is real only for a message refused BEFORE the channel started
+   * processing it, and only on imsg (`handleWatchMessage`'s entry guard leaves
+   * the cursor un-advanced). That is why the shutdown sequence lets in-flight
+   * parses finish into this batcher instead of refusing them late.
    */
   private recordUnprocessedInbound(): void {
     const pending = this.batcher.drainForShutdown();

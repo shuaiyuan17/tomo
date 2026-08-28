@@ -82,6 +82,13 @@ export class InboundBatcher {
    * SDK turn completes. If a caller (e.g. a channel adapter) awaits this,
    * that's fine — they don't block the next ingress on an in-flight turn,
    * which is what lets rapid messages pile up for the queue to coalesce.
+   *
+   * Returns whether the message was TAKEN. `false` (only past
+   * `drainForShutdown`) means nothing here will ever look at it again, and the
+   * answer has to travel back to the channel: a channel that reads a refusal
+   * as success records its dedupe GUID and commits its cursor for a message
+   * that no longer exists anywhere — acknowledged and gone at once, which is
+   * the precise failure this class was changed to stop.
    */
   enqueue(
     sessionKey: string,
@@ -89,17 +96,17 @@ export class InboundBatcher {
     message: IncomingMessage,
     canCoalesce: boolean,
     resolution: SessionResolution,
-  ): void {
+  ): boolean {
     // Past drainForShutdown nothing here will ever run again, so accepting an
-    // item would be the same silent drop this class just closed. Channels are
-    // stopped before the drain, so reaching this is already the exception —
-    // log it rather than swallow it.
+    // item would be the same silent drop this class just closed. Ingestion is
+    // closed and the channels are quiesced before the drain, so reaching this
+    // is already the exception — log it, and tell the caller.
     if (this.stopping) {
       log.warn(
         { sessionKey, messageId: message.id, channel: channel.name },
         "Inbound message refused: shutting down",
       );
-      return;
+      return false;
     }
 
     const receivedAt = Date.now();
@@ -108,7 +115,7 @@ export class InboundBatcher {
     if (!canCoalesce) {
       this.host.enqueueForSession(sessionKey, () => this.host.processInboundItems([item]))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
-      return;
+      return true;
     }
 
     const batch = this.pendingBatches.get(sessionKey) ?? [];
@@ -138,7 +145,7 @@ export class InboundBatcher {
     }
     if (settleMs <= 0) {
       dispatchDrain(() => this.drainPendingBatch(sessionKey, steerable));
-      return;
+      return true;
     }
 
     const settleStartedAt = this.pendingBatchSettleStartedAt.get(sessionKey) ?? receivedAt;
@@ -148,7 +155,7 @@ export class InboundBatcher {
       ? Math.min(uncappedSettleUntil, settleStartedAt + maxSettleMs)
       : uncappedSettleUntil;
     this.pendingBatchSettleUntil.set(sessionKey, cappedSettleUntil);
-    if (this.pendingBatchDrainScheduled.has(sessionKey)) return;
+    if (this.pendingBatchDrainScheduled.has(sessionKey)) return true;
 
     this.pendingBatchDrainScheduled.add(sessionKey);
     dispatchDrain(async () => {
@@ -158,6 +165,7 @@ export class InboundBatcher {
       this.pendingBatchDrainScheduled.delete(sessionKey);
       await this.drainPendingBatch(sessionKey, steerable);
     });
+    return true;
   }
 
   private settleMs(channelName: string): number {

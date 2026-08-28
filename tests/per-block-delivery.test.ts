@@ -194,6 +194,9 @@ class OrderedChannel implements Channel {
   }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
+  closeIngestion(): void {}
+  async quiesce(): Promise<void> {}
+  async teardown(): Promise<void> {}
   async stop(): Promise<void> {}
 }
 

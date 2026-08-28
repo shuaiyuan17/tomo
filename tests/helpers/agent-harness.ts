@@ -50,6 +50,12 @@ export class MockChannel implements Channel {
   onCommand(handler: CommandHandler) { this.commandHandler = handler; }
 
   async send(msg: OutgoingMessage) {
+    // A torn-down channel is a DEAD channel — imsg's rpc child is killed, and
+    // grammy's connection is closed. Throwing is what a send into that window
+    // really does, and it is what turns into `[delivery failed]` in the
+    // transcript, so tests that assert delivery during the shutdown drain are
+    // only meaningful if this refuses.
+    if (this.tornDown) throw new Error(`channel ${this.name} is torn down`);
     this.sent.push(msg);
     this.delivered.push({ chatId: msg.chatId, text: msg.text, photo: msg.photo, sticker: msg.sticker });
   }
@@ -68,26 +74,75 @@ export class MockChannel implements Channel {
       this.typingStops.push({ chatId, options });
     };
   }
-  /** Set by stop(); mirrors the real channels' `stopping` ingestion gate. */
+  /** Set by closeIngestion(); mirrors the real channels' ingestion gate. */
   stopped = false;
+  /** Set by teardown(); past this point the channel cannot send. */
+  tornDown = false;
+  /** Messages parked mid-parse by `beginSlowMessage` (what quiesce waits on). */
+  private inFlightParses = new Set<Promise<void>>();
 
   async start() {}
-  async stop() { this.stopped = true; }
+
+  closeIngestion(): void { this.stopped = true; }
+
+  async quiesce(): Promise<void> {
+    while (this.inFlightParses.size > 0) {
+      await Promise.allSettled([...this.inFlightParses]);
+    }
+  }
+
+  async teardown(): Promise<void> { this.tornDown = true; }
+
+  async stop() {
+    this.closeIngestion();
+    await this.quiesce();
+    await this.teardown();
+  }
 
   // Test helpers
 
   /**
-   * Deliver an inbound message, unless the channel has stopped — the real
-   * channels refuse at exactly this point (telegram `dispatch`, imsg
-   * `handleWatchMessage`), and a mock that kept accepting would hide the
-   * shutdown hole the agent's stop order exists to close.
+   * Deliver an inbound message, unless ingestion is closed — the real channels
+   * refuse at exactly this point (telegram's `ingest` entry guard, imsg's
+   * `handleWatchMessage` entry guard), and a mock that kept accepting would
+   * hide the shutdown hole the agent's stop order exists to close.
    *
-   * Returns whether the message was accepted.
+   * Returns whether the AGENT accepted custody (see MessageHandler), or false
+   * when the entry guard declined it before the handler ever ran.
    */
   async simulateMessage(msg: IncomingMessage): Promise<boolean> {
     if (this.stopped) return false;
-    await this.messageHandler?.(msg);
-    return true;
+    return (await this.messageHandler?.(msg)) ?? false;
+  }
+
+  /**
+   * Ingest a message and park it INSIDE the parse path — the state a real
+   * channel is in when a row is mid-attachment-load or an update is
+   * mid-download and shutdown lands.
+   *
+   * This is the case the entry guard cannot cover and `quiesce()` exists for.
+   * The message is already past the guard, so a later refusal would lose it
+   * outright; `quiesce()` must hold shutdown open until `release()` lets it
+   * reach the batcher. A mock that could only refuse at the boundary never
+   * exercises that path at all.
+   *
+   * `release()` resumes the parse; `accepted` resolves to the agent's answer.
+   */
+  beginSlowMessage(msg: IncomingMessage): { release: () => void; accepted: Promise<boolean> } {
+    if (this.stopped) return { release: () => {}, accepted: Promise.resolve(false) };
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let settle!: (accepted: boolean) => void;
+    const accepted = new Promise<boolean>((resolve) => { settle = resolve; });
+
+    const parse: Promise<void> = (async () => {
+      await gate;
+      settle((await this.messageHandler?.(msg)) ?? false);
+    })().finally(() => { this.inFlightParses.delete(parse); });
+    this.inFlightParses.add(parse);
+
+    return { release, accepted };
   }
   async simulateCommand(cmd: string, chatId: string, sender: string, args?: string, senderId?: string) {
     await this.commandHandler?.(cmd, chatId, sender, args, senderId);

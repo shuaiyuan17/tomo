@@ -27,6 +27,9 @@ class FakeChannel implements Channel {
   async send(message: OutgoingMessage): Promise<void> { this.sent.push(message); }
   startTyping(): () => void { return () => {}; }
   async start(): Promise<void> {}
+  closeIngestion(): void {}
+  async quiesce(): Promise<void> {}
+  async teardown(): Promise<void> {}
   async stop(): Promise<void> {}
 }
 

@@ -405,8 +405,22 @@ export class ImsgChannel implements Channel {
     log.info("iMessage channel (imsg) ready");
   }
 
-  async stop(): Promise<void> {
-    log.info("iMessage channel (imsg) stopping");
+  /**
+   * Phase 1 — shut the inbound door. Synchronous and I/O-free, so the whole
+   * fleet closes in one turn of the event loop.
+   *
+   * Deliberately does NOT bump `watchGeneration`. The generation counter means
+   * "a replay has superseded this row"; a row mid-parse at shutdown has no
+   * replay behind it, so bumping would make `isStaleGeneration` abandon it —
+   * dropping a row nobody will ever send again. It keeps its generation and
+   * runs to completion; `quiesce()` waits for it.
+   *
+   * The child stays alive: outbound sends still have to work while the agent
+   * drains its turns. Killing it here is what caused the shutdown-window
+   * `[delivery failed]` markers.
+   */
+  closeIngestion(): void {
+    log.info("iMessage channel (imsg): closing ingestion");
     this.stopping = true;
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
@@ -416,7 +430,31 @@ export class ImsgChannel implements Channel {
       clearTimeout(this.capabilityRetryTimer);
       this.capabilityRetryTimer = null;
     }
+  }
 
+  /**
+   * Phase 2 — wait for rows already past the entry guard.
+   *
+   * `watchChain` is the FIFO every notified row runs on, so awaiting it awaits
+   * exactly the rows that were mid-parse (attachment read, HEIC conversion,
+   * the dispatch hand-off) when ingestion closed. Each link swallows its own
+   * errors, so this settles rather than rejects.
+   *
+   * Awaiting the chain AS IT IS NOW is enough: `stopping` is already set, so
+   * `handleWatchMessage` refuses anything appended after this point and the
+   * chain cannot grow with new work.
+   */
+  async quiesce(): Promise<void> {
+    await this.watchChain;
+  }
+
+  /**
+   * Phase 3 — physical teardown. Slow and fallible; the agent runs it only
+   * after everything durable has been written, and bounds it.
+   */
+  async teardown(): Promise<void> {
+    log.info("iMessage channel (imsg) stopping");
+    this.stopping = true;
     if (this.child && this.subscriptionId !== null) {
       try {
         await this.request("watch.unsubscribe", { subscription: this.subscriptionId }, 3_000);
@@ -426,6 +464,13 @@ export class ImsgChannel implements Channel {
     }
     this.killChild();
     this.serviceLookup.close();
+  }
+
+  /** Full shutdown for a standalone caller. `Agent.stop()` drives the phases itself. */
+  async stop(): Promise<void> {
+    this.closeIngestion();
+    await this.quiesce();
+    await this.teardown();
   }
 
   async send(message: OutgoingMessage): Promise<SendResult | void> {
@@ -1085,12 +1130,19 @@ export class ImsgChannel implements Channel {
   private async handleWatchMessage(data: Record<string, unknown>, generation: number): Promise<void> {
     const rowId = typeof data.id === "number" ? data.id : 0;
 
-    // Refuse rows that arrive (or were already parsed and queued) once stop()
-    // has run. Returning BEFORE processWatchRow is what keeps this safe: the
-    // cursor is only advanced at the end of a successful dispatch, so
-    // declining here leaves it pointing at this row and the next process
-    // replays it from `since_rowid`. Dispatching instead would hand the agent
-    // a message for a batcher it has already drained.
+    // Entry guard: refuse rows that have not STARTED when ingestion closes.
+    // Returning BEFORE processWatchRow is what keeps this safe — the cursor is
+    // only advanced at the end of a successful dispatch, so declining here
+    // leaves it pointing at this row and the next process replays it from
+    // `since_rowid`.
+    //
+    // It deliberately does NOT cover a row already inside processWatchRow.
+    // That row may sit for seconds in attachment loading, and refusing it
+    // afterwards is not free: the guard is the only reason a refusal is
+    // recoverable, and once parsing has begun the honest move is to let it
+    // finish into the batcher (the agent awaits `quiesce()` before draining)
+    // rather than abandon it. Killing it mid-flight is how a row became
+    // un-dispatched AND un-replayable at the same time.
     if (this.stopping) {
       log.info({ rowId }, "imsg row refused: channel stopped (cursor left un-advanced, row replays on restart)");
       return;
@@ -1333,7 +1385,22 @@ export class ImsgChannel implements Channel {
     // AWAIT the enqueue so "dispatched" is real before we commit the cursor. A
     // throw here propagates to handleWatchMessage → recoverFromGap, which
     // leaves the cursor un-advanced so the row replays (never skipped).
-    await this.dispatch(message);
+    const accepted = await this.dispatch(message);
+
+    // A REFUSAL is not a throw and must not be read as success. The agent
+    // says no only when its batcher has already been drained for shutdown, so
+    // nothing downstream is holding this row: recording the GUID would make
+    // the replay a "duplicate" and dedupe it away, and advancing the cursor
+    // would skip it outright. Leave both alone and the next process replays
+    // the row from `since_rowid`. No recoverFromGap either — nothing failed,
+    // and the floor+resubscribe would be pointless work on a dying channel.
+    if (!accepted) {
+      log.warn(
+        { rowId, guid },
+        "imsg row refused by the agent (shutting down); cursor left un-advanced, row replays on restart",
+      );
+      return;
+    }
 
     // If a restart superseded us during the dispatch hand-off, we already
     // delivered — but let the replay own the cursor and the dedupe record, so
@@ -1402,11 +1469,19 @@ export class ImsgChannel implements Channel {
    * Hand a message to every registered handler and await the hand-off. The
    * handler promise resolves once the agent has queued/batched the message
    * (not when the turn completes), which is the right commit point for the
-   * at-least-once cursor. A rejection propagates so the caller skips the
-   * cursor advance and the row replays.
+   * at-least-once cursor.
+   *
+   * Two ways to not commit: a rejection propagates (the hand-off itself broke)
+   * so the caller skips the cursor advance and the row replays, and a `false`
+   * resolution means the agent declined custody — same outcome, no throw.
    */
-  private async dispatch(message: IncomingMessage): Promise<void> {
-    await Promise.all(this.handlers.map((handler) => handler(message)));
+  private async dispatch(message: IncomingMessage): Promise<boolean> {
+    const accepted = await Promise.all(this.handlers.map((handler) => handler(message)));
+    // Unanimity, not majority: one refusal means at least one handler has no
+    // memory of this row, and the cursor may only move for a row every handler
+    // took custody of. With a single registered handler (the Agent) this is
+    // just its own answer.
+    return accepted.every(Boolean);
   }
 
   private async handleInboundReaction(

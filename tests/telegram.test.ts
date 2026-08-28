@@ -277,6 +277,59 @@ describe("TelegramChannel.send photo captions", () => {
   });
 });
 
+/**
+ * Telegram's counterpart to the iMessage P2 (#292 review): unlike imsg, the
+ * Bot API threads every send kind with the same `reply_parameters`, and this
+ * channel already forwards them to sendPhoto and sendSticker. Pinned so the
+ * asymmetry stays deliberate — imsg reports a dropped target BECAUSE it must,
+ * and Telegram never has to.
+ */
+describe("TelegramChannel.send threads photos and stickers", () => {
+  function makeChannel() {
+    const channel = new TelegramChannel("000000:test-token");
+    type Opts = { caption?: string; reply_parameters?: { message_id: number } };
+    const calls: Array<{ kind: string; replyToId?: number; caption?: string }> = [];
+    let nextId = 100;
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendPhoto: async (_chatId: string | number, _file: unknown, opts?: Opts) => {
+        calls.push({ kind: "photo", replyToId: opts?.reply_parameters?.message_id, caption: opts?.caption });
+        return { message_id: nextId++ };
+      },
+      sendSticker: async (_chatId: string | number, _sticker: unknown, opts?: Opts) => {
+        calls.push({ kind: "sticker", replyToId: opts?.reply_parameters?.message_id });
+        return { message_id: nextId++ };
+      },
+      sendMessage: async (_chatId: string | number, _text: string, opts?: Opts) => {
+        calls.push({ kind: "text", replyToId: opts?.reply_parameters?.message_id });
+        return { message_id: nextId++ };
+      },
+    };
+    return { channel, calls };
+  }
+
+  it("forwards replyTo to sendPhoto and consumes the target", async () => {
+    const { channel, calls } = makeChannel();
+    const result = await channel.send({ chatId: "1", text: "cap", photo: "/tmp/pic.png", replyTo: "42" });
+    expect(calls).toEqual([{ kind: "photo", replyToId: 42, caption: "cap" }]);
+    // Nothing to report: the target really was applied.
+    expect(result?.threaded).not.toBe(false);
+  });
+
+  it("forwards replyTo to sendSticker", async () => {
+    const { channel, calls } = makeChannel();
+    const result = await channel.send({ chatId: "1", text: "", sticker: "CAACAgIAAxkBAAIBOWX1", replyTo: "42" });
+    expect(calls).toEqual([{ kind: "sticker", replyToId: 42 }]);
+    expect(result?.threaded).not.toBe(false);
+  });
+
+  it("threads the photo, not the overflow caption, when the caption is too long", async () => {
+    const { channel, calls } = makeChannel();
+    await channel.send({ chatId: "1", text: "x".repeat(2000), photo: "/tmp/pic.png", replyTo: "42" });
+    expect(calls[0]).toMatchObject({ kind: "photo", replyToId: 42 });
+    expect(calls.slice(1).every((c) => c.replyToId === undefined)).toBe(true);
+  });
+});
+
 // Recent-message tracking + edit/unsend of own messages. Outbound sends must
 // record their provider message ids (Telegram has no webhook echo for bot
 // messages) so edit_message/unsend_message can target them later.

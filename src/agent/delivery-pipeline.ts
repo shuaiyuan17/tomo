@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { log } from "../logger.js";
-import type { Channel } from "../channels/types.js";
+import type { Channel, OutgoingMessage, SendResult } from "../channels/types.js";
 import { deliverText } from "../channels/delivery.js";
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
 import { endsWithTrailingNoReply, extractAttachments, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
@@ -86,7 +86,9 @@ export class DeliveryPipeline {
    * ships A → photo → B, and a caption rides the media of its own block only.
    * Adjacent text-only blocks are merged into ONE send, so the common all-text
    * turn is still exactly one message with its newlines inside the bubble.
-   * Reply threading targets the first shipped message, whatever its kind.
+   * Reply threading targets the first message that actually SHIPS THREADED,
+   * whatever its kind — a step that sends nothing, or a channel that cannot
+   * thread that kind of message, leaves the target for the next one.
    */
   async deliverAssistantContent(
     channel: Channel,
@@ -95,11 +97,24 @@ export class DeliveryPipeline {
     options: DeliverOptions = {},
   ): Promise<void> {
     // Thread only the FIRST shipped message — one reply, not one per send.
+    //
+    // "Shipped" is the whole difficulty. A step can decline to send (an empty
+    // text run, a tag-only block whose MEDIA: path does not exist) and a
+    // channel can send without threading (imsg stickers). Either way the
+    // target must survive to the next send, so it is offered to each send and
+    // only retired once a send confirms it took it.
     let pendingReplyTo = options.replyTo;
-    const takeReplyTo = (): { replyTo?: string } => {
-      const target = pendingReplyTo;
-      pendingReplyTo = undefined;
-      return target ? { replyTo: target } : {};
+    const offerReplyTo = (): { replyTo?: string } => (pendingReplyTo ? { replyTo: pendingReplyTo } : {});
+    /**
+     * `null` = nothing shipped; `threaded: false` = shipped but the channel
+     * could not thread it. Both keep the target pending.
+     */
+    const settleReplyTo = (result: SendResult | null | void): void => {
+      if (result && result.threaded !== false) pendingReplyTo = undefined;
+    };
+    /** channel.send returns nothing on the happy path; that counts as taken. */
+    const send = async (message: OutgoingMessage): Promise<void> => {
+      settleReplyTo(await channel.send(message) ?? {});
     };
 
     let textRun: string[] = [];
@@ -107,7 +122,7 @@ export class DeliveryPipeline {
       if (textRun.length === 0) return;
       const merged = textRun.join("\n");
       textRun = [];
-      await deliverText(channel, chatId, merged, takeReplyTo());
+      settleReplyTo(await deliverText(channel, chatId, merged, offerReplyTo()));
     };
 
     for (const block of blocks) {
@@ -128,12 +143,12 @@ export class DeliveryPipeline {
       const caption = restoreLiteralNewlines(cleanText).trim();
       let captionSent = false;
       for (const [i, path] of validPaths.entries()) {
-        await channel.send({ chatId, photo: path, text: i === 0 ? caption : "", ...takeReplyTo() });
+        await send({ chatId, photo: path, text: i === 0 ? caption : "", ...offerReplyTo() });
         if (i === 0 && caption) captionSent = true;
       }
-      if (!captionSent) await deliverText(channel, chatId, cleanText, takeReplyTo());
+      if (!captionSent) settleReplyTo(await deliverText(channel, chatId, cleanText, offerReplyTo()));
       for (const stickerId of stickerIds) {
-        await channel.send({ chatId, text: "", sticker: stickerId, ...takeReplyTo() });
+        await send({ chatId, text: "", sticker: stickerId, ...offerReplyTo() });
       }
     }
 

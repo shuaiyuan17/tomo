@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Channel, OutgoingMessage } from "../src/channels/types.js";
+import type { Channel, OutgoingMessage, SendResult } from "../src/channels/types.js";
 import { splitText } from "../src/channels/text-utils.js";
 import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 
@@ -48,8 +48,19 @@ class FakeChannel implements Channel {
   async stop(): Promise<void> {}
 }
 
-function makePipeline() {
-  const channel = new FakeChannel();
+/**
+ * A channel with iMessage's real threading shape: text and photos can be
+ * threaded, stickers never can (imsg's `send.sticker` takes no `reply_to`).
+ * It reports the refusal instead of swallowing it.
+ */
+class NoStickerThreadChannel extends FakeChannel {
+  async send(message: OutgoingMessage): Promise<SendResult | void> {
+    await super.send(message);
+    return message.sticker && message.replyTo ? { threaded: false } : undefined;
+  }
+}
+
+function makePipeline(channel: FakeChannel = new FakeChannel()) {
   const notes: Array<{ sessionKey: string; visibleError: string }> = [];
   const pipeline = new DeliveryPipeline({
     queuePendingErrorNote: (sessionKey, visibleError) => { notes.push({ sessionKey, visibleError }); },
@@ -256,6 +267,65 @@ describe("block-ordered attachment delivery", () => {
     expect(channel.sent).toEqual([
       { chatId: "chat1", photo: photoPath, text: "above\nbelow" },
     ]);
+  });
+
+  /**
+   * The reply target is one-shot: it belongs to the first message of the turn
+   * that actually SHIPS THREADED. Two ways the rewrite lost it (#292 review):
+   * a step that sends nothing still consumed it, and a channel that cannot
+   * thread that kind of message consumed it too. Both leave the whole turn
+   * unthreaded, which is worse than not offering the target at all.
+   */
+  describe("the reply target survives steps that ship nothing", () => {
+    it("threads the sticker of a tag-only STICKER: block, not nothing at all", async () => {
+      const { channel, deliverBlocks } = makePipeline();
+
+      await deliverBlocks(["STICKER:sticker-id-1", "B"], { replyTo: "msg-42" });
+
+      // The block's clean text is empty, so the text send never happens — it
+      // must not eat the target on its way past.
+      expect(channel.sent).toEqual([
+        { chatId: "chat1", text: "", sticker: "sticker-id-1", replyTo: "msg-42" },
+        { chatId: "chat1", text: "B" },
+      ]);
+    });
+
+    it("hands the target to the next text when the channel cannot thread a sticker", async () => {
+      const { channel, deliverBlocks } = makePipeline(new NoStickerThreadChannel());
+
+      await deliverBlocks(["STICKER:sticker-id-1", "B"], { replyTo: "msg-42" });
+
+      expect(channel.sent).toHaveLength(2);
+      // Still OFFERED to the sticker — the channel, not the pipeline, decides
+      // what it can thread — but the refusal keeps it alive for B.
+      expect(channel.sent[0]).toMatchObject({ sticker: "sticker-id-1", replyTo: "msg-42" });
+      expect(channel.sent[1]).toEqual({ chatId: "chat1", text: "B", replyTo: "msg-42" });
+    });
+
+    it("threads B when a MEDIA: path does not exist and no photo ships", async () => {
+      const { channel, deliverBlocks } = makePipeline();
+
+      await deliverBlocks([`MEDIA:${join(dir, "gone.png")}`, "B"], { replyTo: "msg-42" });
+
+      expect(channel.sent).toEqual([{ chatId: "chat1", text: "B", replyTo: "msg-42" }]);
+    });
+
+    it("threads the photo of a MEDIA: block whose caption is empty", async () => {
+      const { channel, deliverBlocks } = makePipeline();
+
+      await deliverBlocks([`MEDIA:${photoPath}`, "B"], { replyTo: "msg-42" });
+
+      expect(channel.sent[0]).toEqual({ chatId: "chat1", photo: photoPath, text: "", replyTo: "msg-42" });
+      expect(channel.sent[1].replyTo).toBeUndefined();
+    });
+
+    it("skips a leading NO_REPLY block without spending the target", async () => {
+      const { channel, deliverBlocks } = makePipeline();
+
+      await deliverBlocks(["housekeeping\nNO_REPLY", "B"], { replyTo: "msg-42" });
+
+      expect(channel.sent).toEqual([{ chatId: "chat1", text: "B", replyTo: "msg-42" }]);
+    });
   });
 
   it("drops a mid-turn NO_REPLY block whole, attachments included", async () => {

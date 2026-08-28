@@ -158,31 +158,32 @@ describe("extractAttachments", () => {
   });
 });
 
+// One reply, one message (owner decision 2026-08-27). Newlines used to split
+// a reply into one bubble per line; they now stay inside a single message.
 describe("splitOutboundMessageText", () => {
-  it("splits newline-delimited text into separate trimmed messages", () => {
+  it("ships newline-delimited text as ONE message with newlines intact", () => {
     expect(splitOutboundMessageText(" line A \nline B\n  line C  ")).toEqual([
-      "line A",
-      "line B",
-      "line C",
+      "line A\nline B\n  line C",
     ]);
   });
 
-  it("drops blank lines instead of creating empty messages", () => {
-    expect(splitOutboundMessageText("first\n\n \nsecond")).toEqual(["first", "second"]);
+  it("keeps interior blank lines inside the single message", () => {
+    expect(splitOutboundMessageText("first\n\n \nsecond")).toEqual(["first\n\n\nsecond"]);
   });
 
-  it("keeps [[NL]] as a literal newline inside one message", () => {
-    expect(splitOutboundMessageText("intro[[NL]]detail\nnext")).toEqual([
-      "intro\ndetail",
-      "next",
-    ]);
+  it("sends nothing for empty or whitespace-only text", () => {
+    expect(splitOutboundMessageText("")).toEqual([]);
+    expect(splitOutboundMessageText("  \n \n\t")).toEqual([]);
   });
 
-  it("does not split when [[NL]] is followed by a source newline", () => {
-    expect(splitOutboundMessageText("intro[[NL]]\ndetail\nnext")).toEqual([
-      "intro\ndetail",
-      "next",
-    ]);
+  it("still converts a legacy [[NL]] token to a real newline, never a literal", () => {
+    const parts = splitOutboundMessageText("intro[[NL]]detail\nnext");
+    expect(parts).toEqual(["intro\ndetail\nnext"]);
+    expect(parts[0]).not.toContain("[[NL]]");
+  });
+
+  it("does not double the newline when [[NL]] is followed by a source newline", () => {
+    expect(splitOutboundMessageText("intro[[NL]]\ndetail\nnext")).toEqual(["intro\ndetail\nnext"]);
   });
 });
 

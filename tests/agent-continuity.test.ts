@@ -46,7 +46,7 @@ describe("continuity delivery", () => {
     await agent.stop();
   });
 
-  it("splits newline-delimited continuity responses and preserves literal newline escapes", async () => {
+  it("ships a multi-line continuity response as one message, [[NL]] included", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
     });
@@ -63,10 +63,10 @@ describe("continuity delivery", () => {
 
     await agent.handleContinuity("System: Free time.");
 
+    // One reply, one message (owner decision 2026-08-27) — newlines stay inside
+    // the single continuity message; [[NL]] is still rewritten to a newline.
     expect(tg.sent.map((msg) => msg.text)).toEqual([
-      "first thought",
-      "second\ndetail",
-      "third thought",
+      "first thought\nsecond\ndetail\n\n  third thought",
     ]);
 
     await agent.stop();

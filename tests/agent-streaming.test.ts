@@ -82,7 +82,7 @@ describe("per-block streaming delivery", () => {
     await agent.stop();
   });
 
-  it("splits newline-delimited text within a block into separate iMessages", async () => {
+  it("ships newline-delimited text within a block as ONE iMessage", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
@@ -92,12 +92,13 @@ describe("per-block streaming delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered.map((d) => d.text)).toEqual(["line A", "line B", "line C"]);
+    // One reply, one message (owner decision 2026-08-27).
+    expect(im.delivered.map((d) => d.text)).toEqual(["line A\nline B\nline C"]);
 
     await agent.stop();
   });
 
-  it("trims newline-split pieces and drops blank Telegram messages", async () => {
+  it("trims the outbound message and never sends a blank Telegram bubble", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -107,12 +108,14 @@ describe("per-block streaming delivery", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
     await drainQueue(agent);
 
-    expect(tg.delivered.map((d) => d.text)).toEqual(["first burst", "second burst"]);
+    // Leading indentation on interior lines survives (code blocks, nested
+    // lists); only per-line TRAILING whitespace and the outer edges are trimmed.
+    expect(tg.delivered.map((d) => d.text)).toEqual(["first burst\n\n\n  second burst"]);
 
     await agent.stop();
   });
 
-  it("keeps [[NL]] as a literal newline within one outbound message", async () => {
+  it("still rewrites a legacy [[NL]] to a real newline, never a literal token", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
@@ -122,7 +125,8 @@ describe("per-block streaming delivery", () => {
     await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
     await drainQueue(agent);
 
-    expect(im.delivered.map((d) => d.text)).toEqual(["intro\ndetail", "next"]);
+    expect(im.delivered.map((d) => d.text)).toEqual(["intro\ndetail\nnext"]);
+    expect(im.delivered.some((d) => d.text.includes("[[NL]]"))).toBe(false);
 
     await agent.stop();
   });

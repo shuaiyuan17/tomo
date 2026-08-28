@@ -73,7 +73,7 @@ describe("cron message delivery", () => {
     await agent.stop();
   });
 
-  it("splits newline-delimited cron responses and preserves literal newline escapes", async () => {
+  it("ships a multi-line cron response as one message, [[NL]] included", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -87,10 +87,10 @@ describe("cron message delivery", () => {
 
     await agent.handleCronMessage("Morning briefing", "telegram:12345");
 
+    // One reply, one message (owner decision 2026-08-27) — newlines stay inside
+    // the single cron message; [[NL]] is still rewritten to a newline.
     expect(tg.sent.map((msg) => msg.text)).toEqual([
-      "first brief",
-      "second\ndetail",
-      "third brief",
+      "first brief\nsecond\ndetail\n\n  third brief",
     ]);
 
     await agent.stop();

@@ -605,15 +605,19 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     expect(channel.recentMessages("1")).toHaveLength(0);
   });
 
-  it("still delivers real multi-line blocks through the multi-part path", async () => {
-    const { channel, sent } = makeChannel();
+  // One reply, one message (owner decision 2026-08-27): a multi-line block used
+  // to leave the streaming edit path and ship one bubble per line. It now stays
+  // in the edit path and lands as a single message with its newline intact.
+  it("delivers a real multi-line block as ONE message with newlines intact", async () => {
+    const { channel, sent, deleted } = makeChannel();
 
     const stream = channel.createStreamingMessage("1");
     stream.update("line one\nline two");
     await stream.finish();
 
-    expect(sent.map((s) => s.text)).toContain("line one");
-    expect(sent.map((s) => s.text)).toContain("line two");
+    expect(sent.map((s) => s.text)).toEqual(["line one\nline two"]);
+    expect(deleted).toHaveLength(0);
+    expect(channel.recentMessages("1").map((m) => m.text)).toEqual(["line one\nline two"]);
   });
 
   it("retracts finalized rollover heads too when the block ends in trailing NO_REPLY", async () => {
@@ -689,22 +693,26 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     expect(channel.recentMessages("1")).toHaveLength(0);
   });
 
-  it("multi-part final delivery after rollover retracts heads so content ships exactly once", async () => {
+  it("non-streamed final delivery after rollover retracts heads so content ships exactly once", async () => {
     const { channel, deleted } = makeChannel();
 
     const stream = channel.createStreamingMessage("1");
     // Rollover finalizes a head (100) and a tail (101)...
     stream.update("x".repeat(5000));
     await new Promise((r) => setTimeout(r, 0));
-    // ...then the block turns multi-line, so finalFlush re-delivers the FULL
-    // buffer via deliverTextParts. The streamed head/tail must be retracted
-    // or their content would appear on screen twice.
-    stream.update(`${"x".repeat(5000)}\nsecond line`);
+    // ...then a legacy [[NL]] token appears, which still routes finalFlush to
+    // deliverTextParts (the token has to be rewritten before anything ships,
+    // and the rollover offset is measured on the raw buffer). The streamed
+    // head/tail must be retracted or their content would appear twice.
+    stream.update(`${"x".repeat(5000)}[[NL]]second line`);
     await stream.finish();
 
     expect(deleted.map((d) => d.messageId).sort()).toEqual([100, 101]);
     const recent = channel.recentMessages("1");
-    expect(recent.map((m) => m.text)).toEqual(["second line", "x".repeat(904), "x".repeat(4096)]);
+    // One reply, one message — chunked only by Telegram's 4096-char cap, and
+    // the token is a real newline, never a literal "[[NL]]".
+    expect(recent.map((m) => m.text)).toEqual([`${"x".repeat(904)}\nsecond line`, "x".repeat(4096)]);
+    expect(recent.some((m) => m.text.includes("[[NL]]"))).toBe(false);
   });
 });
 

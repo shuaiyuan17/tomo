@@ -1,12 +1,16 @@
 /**
- * Placeholder the assistant can use when it wants a literal newline to remain
- * inside one outbound chat message instead of acting as a message separator.
+ * Legacy placeholder for a literal newline inside one outbound chat message.
+ *
+ * Newline-per-message splitting was removed 2026-08-27 (owner decision: one
+ * reply ships as one message, newlines intact), so the token no longer changes
+ * how text is chunked. It is still recognised and rewritten to a real newline
+ * on the way out: the prompt taught the model to emit it for years, and a
+ * stale habit must never surface as a literal "[[NL]]" in someone's chat.
  */
 export const LITERAL_NEWLINE_TOKEN = "[[NL]]";
 
-const LITERAL_NEWLINE_SENTINEL = "\0TOMO_LITERAL_NEWLINE\0";
 // Models often write the token at the end of a source line; that physical
-// newline is formatting, not an extra message separator.
+// newline is the token's own line break, not an extra one.
 const LITERAL_NEWLINE_TOKEN_RE = /\[\[NL\]\](?:[ \t]*(?:\r\n|\r|\n))?/g;
 
 export function restoreLiteralNewlines(text: string): string {
@@ -57,13 +61,29 @@ export function formatReplyContextMarker(originalText?: string): string {
   return `[replying to: "${excerpt}"]`;
 }
 
+/**
+ * Outbound chunking for one assistant reply.
+ *
+ * Until 2026-08-27 every newline started a NEW chat message ("texting
+ * rhythm"). That was reverted by owner decision: a reply now ships as a single
+ * message with its newlines intact, so this returns at most one part. The
+ * array shape is kept because callers iterate it, and because an empty /
+ * whitespace-only reply must still produce zero sends rather than one blank
+ * bubble.
+ *
+ * Per-channel length caps are NOT applied here — `splitText` still enforces
+ * those inside each channel's `send`, so an over-long reply is still split.
+ */
 export function splitOutboundMessageText(text: string): string[] {
   if (!text) return [];
-  const protectedText = text.replace(LITERAL_NEWLINE_TOKEN_RE, LITERAL_NEWLINE_SENTINEL);
-  return protectedText
+  // Trim each line's trailing whitespace so the old per-line trim's visible
+  // result is preserved, then trim the whole message.
+  const single = restoreLiteralNewlines(text)
     .split(/\r\n|\r|\n/g)
-    .map((part) => part.replaceAll(LITERAL_NEWLINE_SENTINEL, "\n").trim())
-    .filter((part) => part.length > 0);
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+  return single ? [single] : [];
 }
 
 /**

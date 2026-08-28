@@ -5,6 +5,7 @@ import type { TurnSource } from "../watch/protocol.js";
 import { STEER_MERGED } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
+import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER } from "./block-transcript.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -17,6 +18,10 @@ export interface RunWithRetryRequest {
    *  while the turn is still running, not after it ends (LiveSession's
    *  TurnRequest.onBlock). Awaited, so blocks ship in model order. */
   onBlock?: (block: string) => Promise<void>;
+  /** The block last handed to `onBlock` was given up on (LiveSession's
+   *  TurnRequest.onBlockAbandoned). Closes that block's transcript slot in
+   *  order, so a late-settling send cannot reorder the transcript. */
+  onBlockAbandoned?: () => void;
   /**
    * True once `onBlock` has ATTEMPTED a send. Delivery is irreversible: there
    * is no unsend, so a turn that has already put a block on the owner's phone
@@ -26,19 +31,14 @@ export interface RunWithRetryRequest {
   hasShipped?: () => boolean;
 }
 
+export { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
+
 /**
  * Silent-reply checks. User and production send/deferred-send turns match the
  * bare token only; send/deferred-send turns strip trailing bare NO_REPLY blocks
  * before applying their matcher. The embedded matcher is retained for callers
  * that deliberately want legacy substring suppression.
  */
-/**
- * Prefix for a transcript entry whose send threw. The block was composed and
- * attempted but is not known to have reached the owner, so recall must not
- * read it back as something he was told.
- */
-export const DELIVERY_FAILED_MARKER = "[delivery failed] ";
-
 export const bareSilentMatcher = isSilentReply;
 export function embeddedSilentMatcher(response: string): boolean {
   return isSilentReply(response) || response.includes("NO_REPLY");
@@ -76,9 +76,26 @@ export interface SendTurnDelivery {
 export interface DeferredSendTurnDelivery {
   kind: "deferred-send";
   resolveTarget(): { channel: Channel; chatId: string } | undefined;
+  /** The turn still runs but its model output never reaches the chat. */
+  suppressDelivery?: boolean;
+  /** log.info message when suppressed output is dropped. */
+  suppressedLog?: string;
 }
 
 export type TurnDelivery = ReplyTurnDelivery | SendTurnDelivery | DeferredSendTurnDelivery;
+
+/**
+ * Does this turn's own model output reach the chat at all?
+ *
+ * Independent of the model's cooperation, and of which target shape the turn
+ * uses — a turn that must stay silent whatever the model writes says so here,
+ * rather than relying on a trailing NO_REPLY that per-block delivery can no
+ * longer honour retroactively (earlier blocks have already shipped).
+ */
+function isSuppressed(delivery: TurnDelivery): delivery is SendTurnDelivery | DeferredSendTurnDelivery {
+  return (delivery.kind === "send" || delivery.kind === "deferred-send")
+    && delivery.suppressDelivery === true;
+}
 
 export interface TurnErrorPolicy {
   /** Prefix for pending error notes and user-visible error messages,
@@ -216,15 +233,33 @@ export class TurnRunner {
     const reply = delivery.kind === "reply" ? delivery : undefined;
 
     const sink = this.makeBlockSink(spec);
-    const rawResponse = await this.deps.runWithRetry({
-      key: spec.key,
-      prompt,
-      onBlock: sink.onBlock,
-      hasShipped: sink.hasShipped,
-      ...(reply
-        ? { images: reply.images, documents: reply.documents, steer: reply.steer }
-        : {}),
-    });
+    let rawResponse: string;
+    try {
+      rawResponse = await this.deps.runWithRetry({
+        key: spec.key,
+        prompt,
+        onBlock: sink.onBlock,
+        onBlockAbandoned: sink.onBlockAbandoned,
+        hasShipped: sink.hasShipped,
+        ...(reply
+          ? { images: reply.images, documents: reply.documents, steer: reply.steer }
+          : {}),
+      });
+    } catch (err) {
+      // THE TURN DIED WITH BLOCKS ALREADY ON THE OWNER'S PHONE.
+      //
+      // `transcript: "always"` records the turn's joined response, once, after
+      // runWithRetry SUCCEEDS — so on this path it records nothing at all,
+      // while the owner is holding text the transcript has never heard of. The
+      // no-retry-after-ship guard (LiveSessionManager) makes that reachable by
+      // design: it refuses to re-run a turn that already shipped, and throws.
+      // Anything the sink shipped is flushed here, in dispatch order, ahead of
+      // the `[error] …` entry the thrown-error path records for the failure
+      // itself. ("on-delivery" turns have already recorded theirs as they
+      // settled; this only closes out anything still in flight.)
+      sink.recordShippedTranscript();
+      throw err;
+    }
 
     if (reply?.steer && rawResponse === STEER_MERGED) {
       // Steered message merged into the in-flight turn — that turn's owner
@@ -280,7 +315,7 @@ export class TurnRunner {
       return false;
     }
 
-    if (delivery.kind === "send" && delivery.suppressDelivery) {
+    if (isSuppressed(delivery)) {
       if (delivery.suppressedLog) log.info({ sessionKey: spec.key }, delivery.suppressedLog);
       await stopTyping({ clear: true });
       return true;
@@ -299,17 +334,34 @@ export class TurnRunner {
     if (!sink.handledAny()) {
       const target = this.resolveSendTarget(delivery);
       if (target) {
-        if (spec.transcript === "on-delivery") {
-          this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+        // AFTER THE SEND, NEVER BEFORE — the same rule the per-block sink
+        // follows. This used to record the entry first and deliver second, so a
+        // channel throw left a CLEAN transcript entry for a message that never
+        // arrived, and recall would later read it back as something the owner
+        // was told. The error still propagates (the thrown-error path surfaces
+        // it); it just no longer leaves a lie behind it.
+        try {
+          await this.deps.delivery.deliverResponse(
+            spec.key,
+            target.channel,
+            target.chatId,
+            deliverText,
+            spec.silentMatcher,
+            reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+          );
+          if (spec.transcript === "on-delivery") {
+            this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+          }
+        } catch (err) {
+          if (spec.transcript === "on-delivery") {
+            this.deps.appendAssistantTranscript(
+              spec.key,
+              `${DELIVERY_FAILED_MARKER}${deliverText}`,
+              target.channel.name,
+            );
+          }
+          throw err;
         }
-        await this.deps.delivery.deliverResponse(
-          spec.key,
-          target.channel,
-          target.chatId,
-          deliverText,
-          spec.silentMatcher,
-          reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
-        );
       }
     }
     await stopTyping({ clear: true });
@@ -344,12 +396,14 @@ export class TurnRunner {
    */
   private makeBlockSink(spec: TurnSpec): {
     onBlock: (block: string) => Promise<void>;
+    onBlockAbandoned: () => void;
     handledAny: () => boolean;
     hasShipped: () => boolean;
+    recordShippedTranscript: () => void;
   } {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
-    const suppressed = delivery.kind === "send" && delivery.suppressDelivery === true;
+    const suppressed = isSuppressed(delivery);
 
     // "This turn's output was the sink's job", not "bytes left the machine" —
     // a block whose MEDIA: path is missing legitimately sends nothing. Set
@@ -365,6 +419,18 @@ export class TurnRunner {
     // unresolvable target must not be reported for a turn that stays silent.
     let sender: BlockSender | undefined;
     let channelName: string | undefined;
+
+    // Entries are appended in DISPATCH order, not settle order: a block takes
+    // its slot before its send is attempted and fills it when the send settles,
+    // is abandoned, or the turn dies. See block-transcript.ts. `always` turns
+    // hold their entries back — they record the joined response after a
+    // successful turn, and want these only on the path where that never runs.
+    const transcript = createOrderedBlockTranscript(
+      (entry) => {
+        if (channelName) this.deps.appendAssistantTranscript(spec.key, entry, channelName);
+      },
+      { defer: spec.transcript !== "on-delivery" },
+    );
 
     const onBlock = async (block: string): Promise<void> => {
       if (suppressed) return;
@@ -393,6 +459,11 @@ export class TurnRunner {
       // attempted send as shipped — see LiveSessionManager's no-retry-after-
       // ship rule, where guessing wrong means a duplicate message.
       shipped = true;
+      // The slot is taken HERE, before the send — this is the only moment
+      // guaranteed to be in model order. Filling it later, whenever the send
+      // happens to settle, is what let a fast block B overtake a wedged block A
+      // in the transcript.
+      const slot = transcript.reserve(block);
       try {
         await sender.deliver(block);
         // Every delivered message must be recorded, or it is invisible to
@@ -404,9 +475,7 @@ export class TurnRunner {
         // A-succeeds / B-throws turn the owner had only A on his phone while
         // the transcript showed both, so recall_conversation would later
         // "remember" telling him something he never received.
-        if (spec.transcript === "on-delivery" && channelName) {
-          this.deps.appendAssistantTranscript(spec.key, block, channelName);
-        }
+        slot.settle(block);
       } catch (err) {
         // KNOWN LIMITATION — ambiguous-failure reordering. A throw here is
         // swallowed so a dead channel cannot abort a turn that is still doing
@@ -423,14 +492,20 @@ export class TurnRunner {
         // Still recorded, but MARKED. Dropping it would lose the fact that the
         // turn composed this text at all; recording it clean would assert a
         // delivery that did not happen. The marker is also the honest answer
-        // for an ambiguous failure, which may or may not have landed.
-        if (spec.transcript === "on-delivery" && channelName) {
-          this.deps.appendAssistantTranscript(spec.key, `${DELIVERY_FAILED_MARKER}${block}`, channelName);
-        }
+        // for an ambiguous failure, which may or may not have landed. A no-op
+        // if the block was already abandoned for blowing its delivery budget —
+        // that outcome was recorded, in order, when we gave up on it.
+        slot.settle(`${DELIVERY_FAILED_MARKER}${block}`);
       }
     };
 
-    return { onBlock, handledAny: () => handledAny, hasShipped: () => shipped };
+    return {
+      onBlock,
+      onBlockAbandoned: () => transcript.abandonOldest(),
+      handledAny: () => handledAny,
+      hasShipped: () => shipped,
+      recordShippedTranscript: () => transcript.flushAll(),
+    };
   }
 
   private async handleThrownError(spec: TurnSpec, err: unknown, stopTyping: StopTyping): Promise<boolean> {
@@ -455,7 +530,14 @@ export class TurnRunner {
 
     const target = this.resolveSendTarget(spec.delivery);
     try {
-      if (target) await target.channel.send({ chatId: target.chatId, text: visibleError });
+      if (target) {
+        await target.channel.send({ chatId: target.chatId, text: visibleError });
+        // A delivered message must be recorded, whatever it says (#203). This
+        // is also the entry that follows the turn's already-shipped blocks on a
+        // turn that died mid-delivery, so recall reads back what the owner
+        // actually saw: the blocks, then the failure.
+        this.deps.appendAssistantTranscript(spec.key, visibleError, target.channel.name);
+      }
     } finally {
       await stopTyping({ clear: true });
     }

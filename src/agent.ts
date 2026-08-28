@@ -29,7 +29,8 @@ import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
-import { DELIVERY_FAILED_MARKER, TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
@@ -41,6 +42,7 @@ import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { writeJsonAtomicSync } from "./fs-utils.js";
+import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
 
@@ -692,6 +694,17 @@ export class Agent {
     // One sender for the whole background turn, so its blocks ship as they
     // complete — same path as every other ingress.
     const sender = this.delivery.createBlockSender(channel, chatId);
+    // Ordered per-block transcript, same rule as every owned turn: the slot is
+    // taken at dispatch and filled at settle, so an abandoned send cannot let a
+    // later block's entry overtake it (see agent/block-transcript.ts).
+    const transcript = createOrderedBlockTranscript((entry) => {
+      this.sessions.append(key, {
+        role: "assistant",
+        content: entry,
+        channel: channel.name,
+        timestamp: Date.now(),
+      });
+    });
 
     const stop = async () => {
       try {
@@ -706,30 +719,22 @@ export class Agent {
         // Error text is not a reply: it is handled once, at resolve, so it
         // reaches the chat prefixed and with a pending note queued.
         if (isAgentErrorResponse(block) || isSilentReply(block)) return;
+        const slot = transcript.reserve(block);
         try {
           await sender.deliver(block);
           // Recorded per shipped block — an unrecorded delivery is invisible
           // to recall_conversation (#203) — but recorded AFTER the send, never
           // before. Writing on intent made the transcript claim deliveries
           // that never happened (A sends, B throws, transcript shows both).
-          this.sessions.append(key, {
-            role: "assistant",
-            content: block,
-            channel: channel.name,
-            timestamp: Date.now(),
-          });
+          slot.settle(block);
         } catch (err) {
           log.error({ err, key }, "Background task block delivery failed");
           // Still recorded, but MARKED: the turn composed this text, and it is
           // not known to have reached the owner.
-          this.sessions.append(key, {
-            role: "assistant",
-            content: `${DELIVERY_FAILED_MARKER}${block}`,
-            channel: channel.name,
-            timestamp: Date.now(),
-          });
+          slot.settle(`${DELIVERY_FAILED_MARKER}${block}`);
         }
       },
+      onBlockAbandoned: () => transcript.abandonOldest(),
       resolve: async (response) => {
         if (settled) return;
         settled = true;
@@ -1301,12 +1306,26 @@ export class Agent {
       source: "continuity",
       prompt,
       // No timestamp stamp, no typing indicator — continuity turns are
-      // invisible unless the model chooses to speak. When it does speak, the
-      // delivered message must reach the transcript like any other assistant
-      // message (#203: heartbeat/restart deliveries were silently missing
-      // from recall history).
+      // invisible. A heartbeat speaks only through the explicit `send_message`
+      // tool, never through its own text blocks (owner decision 2026-08-28,
+      // option A).
+      //
+      // WHY THE PROMPT ALONE IS NOT ENOUGH ANY MORE. CONTINUITY.md asks for a
+      // closing NO_REPLY, and under end-of-turn delivery that trailing token
+      // suppressed the whole turn retroactively — narration included. Per-block
+      // delivery ships each block as it completes, so a heartbeat that narrates
+      // ("Checking the morning routine…"), calls a tool, and only then answers
+      // NO_REPLY has already put the narration on the owner's phone, and a sent
+      // message cannot be recalled. Silence for a turn nobody asked for must
+      // not depend on the model's cooperation.
+      //
+      // The target is still resolved (and still deferred) because the error
+      // policy and `send_message` need it; only the turn's own output is
+      // dropped.
       delivery: {
         kind: "deferred-send",
+        suppressDelivery: true,
+        suppressedLog: "Continuity output suppressed from chat delivery (heartbeats speak via send_message)",
         resolveTarget: () => {
           const identityName = dmIdentityFromSessionKey(key);
           // Final fallback covers raw keys only (dm: keys don't parse), so
@@ -1508,7 +1527,7 @@ export class Agent {
     if (restart) {
       const { reason, sessionKey } = restart;
       log.info({ reason, sessionKey }, "Restart reason found, notifying agent");
-      const prompt = formatTomoEvent("restart", `Restarted. Reason: ${reason}`);
+      const prompt = formatTomoEvent("restart", `Restarted. Reason: ${reason} ${CONTINUITY_DELIVERY_NOTE}`);
       const delivery = sessionKey
         ? this.handleRestartForSession(prompt, sessionKey)
         : this.handleContinuity(prompt);

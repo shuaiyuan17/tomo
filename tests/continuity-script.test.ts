@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ContinuityRunner } from "../src/continuity.js";
 import { runContinuityScript, type ContinuityScriptConfig } from "../src/continuity-script.js";
+import { CONTINUITY_DELIVERY_NOTE } from "../src/continuity-defaults.js";
 
 let tmpDir: string;
 
@@ -92,6 +93,27 @@ describe("ContinuityRunner", () => {
     expect(prompt).toContain("Read CONTINUITY.md");
     expect(prompt).toContain("Continuity script result:");
     expect(prompt).toContain("runner-output");
+  });
+
+  /**
+   * The heartbeat turn suppresses its own output (option A). The model is told
+   * so in the EVENT ITSELF, not only in CONTINUITY.md: a model that believes
+   * its reply will be read writes a reply instead of calling the tool that
+   * would actually deliver one, and CONTINUITY.md is a file it may or may not
+   * have read this turn.
+   */
+  it("tells the model in the heartbeat event that its reply text is not delivered", async () => {
+    const handleContinuity = vi.fn().mockResolvedValue(undefined);
+    const runner = new ContinuityRunner(
+      { handleContinuity } as unknown as ConstructorParameters<typeof ContinuityRunner>[0],
+      null,
+    );
+
+    await (runner as unknown as { fire(): Promise<void> }).fire();
+
+    const prompt = handleContinuity.mock.calls[0][0] as string;
+    expect(prompt).toContain(CONTINUITY_DELIVERY_NOTE);
+    expect(prompt).toContain("Your reply text is not delivered to the user; to send a message, use send_message.");
   });
 
   it("uses the configured interval for scheduled heartbeats", async () => {

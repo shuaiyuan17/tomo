@@ -135,6 +135,37 @@ describe("send_message direct mode", () => {
     await agent.stop();
   });
 
+  /**
+   * Option A suppresses a CONTINUITY turn's own text — but a delegated turn's
+   * output IS the message the caller asked for. Suppressing it would silently
+   * break every cross-session `send_message` in delegate mode, so pin the
+   * difference explicitly rather than leaving it implied.
+   */
+  it("keeps delivering a delegated turn's own text (option A does not touch it)", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    // The recipient session's Claude composes the message in its own voice —
+    // the turn's own text blocks are the delivery path here.
+    mockSdk.responseFn = () => "Happy birthday from all of us.";
+    const result = await agent.delegateToSession("shuai", "wish him a happy birthday");
+    await drainQueue(agent);
+
+    expect(result).toEqual({ ok: true });
+    expect(tg.sent.map((m) => m.text)).toEqual(["Happy birthday from all of us."]);
+
+    await agent.stop();
+  });
+
   it("attributes a summoned-group send to the summoning dm session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

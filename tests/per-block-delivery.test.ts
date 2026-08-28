@@ -119,6 +119,7 @@ const { TurnRunner } = await import("../src/agent/turn-runner.js");
 const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 const { isSilentReply } = await import("../src/agent/text-utils.js");
 const { log } = await import("../src/logger.js");
+const { DELIVERY_FAILED_MARKER } = await import("../src/agent/block-transcript.js");
 
 // --- event builders -------------------------------------------------------
 
@@ -153,8 +154,28 @@ class OrderedChannel implements Channel {
   sent: OutgoingMessage[] = [];
   /** Texts whose send must throw, for the partial-delivery tests. */
   failTexts = new Set<string>();
+  /**
+   * Texts whose send PARKS until the test releases it — a wedged channel, the
+   * shape the delivery budget exists for. The send is not cancelled when the
+   * budget expires (no channel offers cancellation), so on release it completes
+   * normally and late, which is exactly the ordering hazard under test.
+   */
+  hangs = new Map<string, () => void>();
+  private gates: Array<() => void> = [];
 
   constructor(private readonly order: string[]) {}
+
+  /** Park this text's send until `releaseHangs()`. */
+  hang(text: string): void {
+    this.hangs.set(text, () => {});
+  }
+
+  /** Let every parked send complete. */
+  releaseHangs(): void {
+    const gates = this.gates;
+    this.gates = [];
+    for (const open of gates) open();
+  }
 
   onMessage(): void {}
   onCommand(): void {}
@@ -162,6 +183,11 @@ class OrderedChannel implements Channel {
     if (message.text !== undefined && this.failTexts.has(message.text)) {
       this.order.push(`send-failed:${message.text}`);
       throw new Error(`channel refused ${message.text}`);
+    }
+    if (message.text !== undefined && this.hangs.has(message.text)) {
+      this.hangs.delete(message.text);
+      this.order.push(`send-parked:${message.text}`);
+      await new Promise<void>((resolve) => { this.gates.push(resolve); });
     }
     this.sent.push(message);
     this.order.push(message.photo ? `photo:${message.photo}` : `send:${message.text}`);
@@ -179,7 +205,12 @@ interface Rig {
   close: () => void;
 }
 
-function makeRig(settings: { showThinking?: boolean } = {}): Rig {
+function makeRig(settings: {
+  showThinking?: boolean;
+  /** Stand in for the host's runWithRetry — for responses that never had
+   *  content blocks (LiveSessionManager's fabricated fallbacks). */
+  runWithRetry?: TurnRunnerDeps["runWithRetry"];
+} = {}): Rig {
   const order: string[] = [];
   const channel = new OrderedChannel(order);
   const transcript: string[] = [];
@@ -188,7 +219,8 @@ function makeRig(settings: { showThinking?: boolean } = {}): Rig {
 
   const deps: TurnRunnerDeps = {
     drainPendingNotes: () => "",
-    runWithRetry: (req) => session.send(req.prompt, undefined, undefined, req.onBlock),
+    runWithRetry: settings.runWithRetry
+      ?? ((req) => session.send(req.prompt, undefined, undefined, req.onBlock, req.onBlockAbandoned)),
     appendAssistantTranscript: (_key, content) => { transcript.push(content); },
     queuePendingErrorNote: () => {},
     startTurnTyping: (): StopTyping => async () => {},
@@ -215,9 +247,13 @@ function makeRig(settings: { showThinking?: boolean } = {}): Rig {
     };
     const turn = runner.runTurn(spec);
     // Queue the whole script only once the turn is genuinely in flight; from
-    // there the stream advances solely at the consumer's pace.
-    while (harness.inputs.length === 0) await new Promise((r) => setTimeout(r, 1));
-    harness.enqueue(events);
+    // there the stream advances solely at the consumer's pace. An empty script
+    // means the turn never reaches the session at all (a stubbed runWithRetry),
+    // so there is nothing to wait for.
+    if (events.length > 0) {
+      while (harness.inputs.length === 0) await new Promise((r) => setTimeout(r, 1));
+      harness.enqueue(events);
+    }
     const done = await turn;
     // The other end of the mid-turn claim: everything logged before this point
     // reached the channel while TurnRunner had not yet returned.
@@ -526,24 +562,36 @@ describe("the reply target is spent by the first block that ships", () => {
 });
 
 /**
- * Cross-turn contamination (repro 2026-08-28, daemon on ef69851 / #292).
+ * The 2026-08-28 lost reply: what actually happened.
  *
- * A DM turn produced a ~700-char text block at 08:33:33 and then sat in an MCP
- * tool until 08:40:42. A continuity heartbeat was due at 08:33:50. When the
- * dust settled the owner had received exactly one 31-char message and never
- * the 700-char block — the log showed `Routing unowned SDK turn to default
- * delivery target`, then the heartbeat's `Tomo: NO_REPLY`.
+ * THE REPORT. A DM turn produced a ~700-char block at 08:33:33 and then sat in
+ * an MCP tool until 08:40:42. The owner received exactly one 31-char message
+ * and never the long one.
  *
- * Under #292's end-of-turn delivery this class of loss is expressible: blocks
- * accumulate in ONE shared `parts` array on the session and are rendered and
- * cleared by whichever request happens to own the session when `result`
- * arrives — so a NO_REPLY turn completing at the wrong moment can render, and
- * suppress, another turn's collected text.
+ * THE CAUSE, ESTABLISHED FROM THE LOG. `tomo.log` at 08:33:33 reads
+ * `Routing unowned SDK turn to default delivery target
+ * {"session":"dm:shuai","reason":"assistant_thinking"}`. The block the owner
+ * never saw was emitted by the model as a `thinking` block, not a `text` one,
+ * and with `showThinking` off `ef69851` dropped it BY DESIGN — renderBlock
+ * decides what ships from the block TYPE and nothing else. There was no
+ * interleaving between turns, and nothing was dropped on the unowned path.
+ * The delivery layer behaved exactly as specified; the model simply put its
+ * reply somewhere replies are not read from.
  *
- * Per-block delivery removes the shared window that made it possible: a block
- * is delivered through its OWN turn's sink at the instant it completes, so
- * there is nothing left in a shared buffer for a later turn to consume. These
- * tests pin the two properties that keep it that way.
+ * WHAT CHANGED AS A RESULT. Not the block-type rule — that rule is the whole
+ * point of #292 and inspecting a thinking block's prose to guess whether it is
+ * "really" a reply is precisely what it exists to prevent. What changed is
+ * VISIBILITY: an unowned turn that opens with a hidden thinking block now logs
+ * at warn with the block's length (LiveSession.claimFirstUnownedEvent), so the
+ * same shape is legible in the log instead of taking a forensics pass.
+ *
+ * THE TESTS BELOW ARE A GUARD, NOT AN EXPLANATION. They pin that a turn's
+ * blocks belong to that turn alone — cross-turn contamination was the leading
+ * hypothesis before the log settled it, and per-block delivery is what makes it
+ * structurally impossible (a block goes out through its OWN turn's sink the
+ * instant it completes, so no shared buffer survives for a later turn to
+ * consume). Keeping them costs little and forecloses a real failure mode; they
+ * are simply not the account of what went wrong that day.
  */
 describe("a turn's blocks belong to that turn alone", () => {
   it("a NO_REPLY turn queued mid-flight cannot capture or suppress the earlier turn's blocks", async () => {
@@ -583,6 +631,108 @@ describe("a turn's blocks belong to that turn alone", () => {
       // B's NO_REPLY suppressed only B.
       expect(toA).toEqual(["A1", "A2"]);
       expect(toB).toEqual([]);
+    } finally {
+      session.close();
+    }
+  });
+
+  it("an unowned turn that opens with a tool call still owns the session from its first event", async () => {
+    const unowned: string[] = [];
+    const session = new LiveSession(
+      {} as never,
+      "dm:owner",
+      undefined,
+      () => ({ resolve: () => {}, reject: () => {}, onBlock: (b) => { unowned.push(b); } }),
+      {},
+    );
+    const harness = harnessRef.current!;
+    const toB: string[] = [];
+
+    try {
+      // An autonomous / task-notification turn whose FIRST event carries no
+      // text at all — just a root tool_use. This is the common shape: the model
+      // reads a file or calls an MCP tool before it says anything.
+      harness.enqueue([assistant([toolUseBlock("Bash", "t1")])]);
+      await new Promise((r) => setTimeout(r, 5));
+
+      // The turn is in flight, and the session says so. Claiming only on
+      // text/thinking left isBusy() false right here, which is the whole bug.
+      expect(session.isBusy()).toBe(true);
+
+      // A heartbeat/cron/user send arrives mid-tool. It must QUEUE, not claim:
+      // claiming would take currentRequest and clear `parts` out from under the
+      // unowned turn, and the unowned turn's later text would then ship through
+      // B's sink — to B's target, in B's turn.
+      const turnB = session.send("heartbeat", undefined, undefined, async (b) => { toB.push(b); });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(harness.inputs).toHaveLength(0); // B has NOT been dispatched
+
+      // The tool returns and the unowned turn finally speaks.
+      harness.enqueue([toolResult("t1"), assistant([textBlock("autonomous answer")]), result()]);
+      await new Promise((r) => setTimeout(r, 5));
+
+      // Delivered to the session's DEFAULT target, through the unowned turn's
+      // own sink — not into B's.
+      expect(unowned).toEqual(["autonomous answer"]);
+      expect(toB).toEqual([]);
+
+      // Only now does B run, and it gets its own reply and nothing else.
+      while (harness.inputs.length < 1) await new Promise((r) => setTimeout(r, 1));
+      harness.enqueue([assistant([textBlock("B reply")]), result()]);
+      expect(await turnB).toBe("B reply");
+      expect(toB).toEqual(["B reply"]);
+      expect(unowned).toEqual(["autonomous answer"]);
+    } finally {
+      session.close();
+    }
+  });
+
+  it("lets only one of two simultaneous sends claim the idle session", async () => {
+    const session = new LiveSession({} as never, "dm:owner", undefined, undefined, {});
+    const harness = harnessRef.current!;
+
+    try {
+      // Both callers find the session idle in the same tick. "await
+      // waitForIdle(); this.currentRequest = req;" let both through — the
+      // second silently replacing the first's request and clearing its parts.
+      const first = session.send("first");
+      const second = session.send("second");
+      await new Promise((r) => setTimeout(r, 5));
+
+      expect(harness.inputs).toEqual(["first"]);
+
+      harness.enqueue([assistant([textBlock("one")]), result()]);
+      expect(await first).toBe("one");
+
+      while (harness.inputs.length < 2) await new Promise((r) => setTimeout(r, 1));
+      harness.enqueue([assistant([textBlock("two")]), result()]);
+      expect(await second).toBe("two");
+    } finally {
+      session.close();
+    }
+  });
+
+  it("warns when an unowned turn opens with a thinking block nobody will see", async () => {
+    const session = new LiveSession(
+      {} as never,
+      "dm:owner",
+      undefined,
+      () => ({ resolve: () => {}, reject: () => {}, onBlock: () => {} }),
+      { showThinking: false },
+    );
+    const harness = harnessRef.current!;
+
+    try {
+      // The 2026-08-28 shape: the reply written inside a thinking block, on an
+      // unowned turn, with showThinking off. Dropping it is correct; being
+      // silent about it is what cost a forensics pass.
+      harness.enqueue([assistant([thinkingBlock("x".repeat(700))]), assistant([toolUseBlock("Bash", "t1")])]);
+      await new Promise((r) => setTimeout(r, 5));
+
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ session: "dm:owner", chars: 700 }),
+        expect.stringContaining("hidden thinking block"),
+      );
     } finally {
       session.close();
     }
@@ -670,25 +820,152 @@ describe("the transcript records what was DELIVERED, not what was composed", () 
 });
 
 /**
- * KNOWN BEHAVIOUR, NOT YET DECIDED (owner, 2026-08-28).
+ * THE TRANSCRIPT IS ORDERED BY DISPATCH, NOT BY SETTLEMENT.
  *
- * Continuity turns (heartbeat / restart notice) may legitimately speak, so
- * unlike LCM rollups and context nudges they do NOT set `suppressDelivery`.
- * Their prompt (defaults/CONTINUITY.md) instead asks the model to end with
- * NO_REPLY when it has nothing to say.
+ * A block's transcript entry can only be written once its send has settled —
+ * writing on intent claims deliveries that never happened. But settle order is
+ * not model order: a block that blows the 60s delivery budget is abandoned and
+ * the turn moves on, while its promise keeps running. Appending at settle time
+ * therefore produced `B, A`, or `B, [delivery failed] A`, or — when the wedged
+ * send never settled at all — no entry for A whatsoever, all while the PR
+ * claimed an ordered `[delivery failed] A, B`.
  *
- * Under per-block delivery that instruction no longer guarantees silence: a
- * turn that narrates, calls a tool, and only then answers NO_REPLY has already
- * shipped the narration. This test PINS THE LEAK rather than fixing it, so the
- * behaviour is visible and a future change to it is deliberate.
- *
- * The owner is choosing between:
- *   (A) make continuity default-silent and require `send_message` to speak;
- *   (B) keep as is and accept mid-turn narration from these paths.
- * Affected paths are listed in the PR description.
+ * The fix is slot reservation: a block takes its place in the transcript when
+ * its send is ATTEMPTED (which LiveSession serializes, so it is model order)
+ * and fills that slot when the send settles or is given up on. A slot is filled
+ * exactly once, so a late-settling send changes nothing.
  */
-describe("KNOWN LEAK (undecided): continuity-shaped turns ship narration written before NO_REPLY", () => {
-  it("delivers the narration block of a text -> tool -> NO_REPLY continuity turn", async () => {
+describe("a wedged block keeps its place in the transcript", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("records the abandoned block IN ORDER, and ignores its late completion", async () => {
+    const r = rig();
+    r.channel.hang("A");
+
+    const turn = r.run(
+      [assistant([textBlock("A")]), assistant([textBlock("B")]), result()],
+      { transcript: "on-delivery" },
+    );
+
+    // A is dispatched and parks in the channel. Nothing is recorded yet: the
+    // slot is reserved but open, and an open slot holds back everything behind
+    // it rather than letting it overtake.
+    await vi.advanceTimersByTimeAsync(20);
+    expect(r.transcript).toEqual([]);
+
+    // Past the 60s delivery budget: A is given up on and closed out in its own
+    // place, before B is ever handed over — so A's entry is FIRST even though
+    // B's send is the one that settled first.
+    await vi.advanceTimersByTimeAsync(60_100);
+    expect(r.transcript[0]).toBe("[delivery failed] A");
+
+    await turn;
+    expect(r.transcript).toEqual(["[delivery failed] A", "B"]);
+    // B is on the owner's phone; A is not known to be.
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["B"]);
+
+    // A's send finally completes, long after the turn gave up on it. It may
+    // well have reached the owner — that is unavoidable and is exactly what the
+    // marker's ambiguity means — but it must not rewrite history.
+    r.channel.releaseHangs();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(r.transcript).toEqual(["[delivery failed] A", "B"]);
+  });
+});
+
+/**
+ * A turn that dies after shipping must still say what it shipped.
+ *
+ * Ordinary user turns record `transcript: "always"` — the turn's joined
+ * response, once, AFTER runWithRetry succeeds. The no-retry-after-ship guard
+ * makes "it never succeeds" routine: a turn that has already put a block on the
+ * owner's phone is refused a retry (a retry would re-send it) and throws
+ * instead. So the owner held text the transcript had never heard of, and recall
+ * would later contradict what he was actually told.
+ */
+describe("blocks that shipped before the turn died reach the transcript", () => {
+  it("records the shipped block, then the error, in that order", async () => {
+    const r = rig();
+
+    // A ships; then the session dies mid-turn, exactly as a killed SDK child
+    // does. `transcript: "always"` is the ordinary user-turn policy.
+    const ok = await r.run(
+      [assistant([textBlock("A")]), effect(() => { r.close(); })],
+      { transcript: "always" },
+    );
+
+    expect(ok).toBe(false);
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["A", "[error] Session is closed"]);
+    expect(r.transcript).toEqual(["A", "[error] Session is closed"]);
+  });
+});
+
+/**
+ * The fabricated fallback follows the same rule as every other send.
+ *
+ * LiveSessionManager's max-turn and shutdown responses ("I ran out of steps
+ * trying to complete that.") never produced content blocks, so they never
+ * reached the per-block sink and are delivered once, after the turn. That path
+ * used to append its transcript entry and THEN send, so a channel throw left a
+ * clean entry for a message that never arrived.
+ */
+describe("the fabricated-response fallback transcribes after it sends", () => {
+  const FABRICATED = "I ran out of steps trying to complete that. Can you try a simpler request?";
+
+  it("records it clean when the send succeeds", async () => {
+    const r = rig({ runWithRetry: async () => FABRICATED });
+
+    const ok = await r.run([], { transcript: "on-delivery" });
+
+    expect(ok).toBe(true);
+    expect(r.channel.sent.map((m) => m.text)).toEqual([FABRICATED]);
+    expect(r.transcript).toEqual([FABRICATED]);
+  });
+
+  it("marks it when the send throws, instead of claiming a delivery that never happened", async () => {
+    const r = rig({ runWithRetry: async () => FABRICATED });
+    r.channel.failTexts.add(FABRICATED);
+
+    const ok = await r.run([], { transcript: "on-delivery" });
+
+    expect(ok).toBe(false);
+    // Never delivered...
+    expect(r.channel.sent.map((m) => m.text)).toEqual([`[error] channel refused ${FABRICATED}`]);
+    // ...and the transcript says so, rather than reading back as told.
+    expect(r.transcript).toEqual([
+      `${DELIVERY_FAILED_MARKER}${FABRICATED}`,
+      `[error] channel refused ${FABRICATED}`,
+    ]);
+  });
+});
+
+/**
+ * DECIDED (owner, 2026-08-28): OPTION A.
+ *
+ * Continuity turns (heartbeat, post-restart notice) are unbidden — nobody asked
+ * a question — so their own text blocks are never delivered. To speak from one,
+ * the model calls `send_message`. Turns the user DID ask for, and delegated
+ * proactive turns (whose whole purpose is to produce a message), are unaffected.
+ *
+ * The alternative was to keep relying on the prompt's closing `NO_REPLY`, which
+ * per-block delivery can no longer honour: a turn that narrates, calls a tool
+ * and only then answers NO_REPLY has already shipped the narration, and a sent
+ * message cannot be recalled. Silence for a turn nobody asked for must not
+ * depend on the model's cooperation, so it is enforced by the delivery policy.
+ */
+describe("continuity-shaped turns ship nothing of their own (option A)", () => {
+  /** The continuity turn's real shape, as processContinuity builds it. */
+  const continuityDelivery = (r: Rig): Partial<TurnSpec> => ({
+    delivery: {
+      kind: "deferred-send",
+      suppressDelivery: true,
+      resolveTarget: () => ({ channel: r.channel, chatId: "chat1" }),
+    },
+    transcript: "on-delivery",
+  });
+
+  it("drops the narration block of a text -> tool -> NO_REPLY heartbeat", async () => {
     const r = rig();
 
     await r.run(
@@ -699,21 +976,44 @@ describe("KNOWN LEAK (undecided): continuity-shaped turns ship narration written
         assistant([textBlock("NO_REPLY")]),
         result(),
       ],
+      continuityDelivery(r),
+    );
+
+    // Under the old contract the narration was already gone by the time the
+    // NO_REPLY that was meant to silence it was written. Now it never ships.
+    expect(r.channel.sent).toEqual([]);
+    expect(r.transcript).toEqual([]);
+  });
+
+  it("drops even a heartbeat that says something genuinely useful", async () => {
+    const r = rig();
+
+    // Suppression is not a judgement about the content — it is a property of
+    // the turn. A heartbeat with real news must route it through send_message.
+    await r.run(
+      [assistant([textBlock("Your flight check-in opens in an hour.")]), result()],
+      continuityDelivery(r),
+    );
+
+    expect(r.channel.sent).toEqual([]);
+    expect(r.transcript).toEqual([]);
+  });
+
+  it("still delivers a turn that was actually asked for", async () => {
+    const r = rig();
+
+    // The delegated-proactive / cron shape: a turn whose output IS the message.
+    // Option A must not touch it.
+    await r.run(
+      [assistant([textBlock("the brief")]), result()],
       {
-        // The continuity turn's real shape: no suppressDelivery, target
-        // resolved only once something ships.
-        delivery: {
-          kind: "deferred-send",
-          resolveTarget: () => ({ channel: r.channel, chatId: "chat1" }),
-        },
+        delivery: { kind: "send", channel: r.channel, chatId: "chat1" },
         transcript: "on-delivery",
       },
     );
 
-    // The trailing NO_REPLY suppresses only ITS OWN block. The narration was
-    // already gone by the time it was written.
-    expect(r.channel.sent.map((m) => m.text)).toEqual(["Checking in on the morning routine…"]);
-    expect(r.transcript).toEqual(["Checking in on the morning routine…"]);
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["the brief"]);
+    expect(r.transcript).toEqual(["the brief"]);
   });
 });
 

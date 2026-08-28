@@ -31,6 +31,22 @@ export interface TurnRequest {
    * send is logged by the sink, not allowed to kill the turn.
    */
   onBlock?: (block: string) => void | Promise<void>;
+  /**
+   * The block most recently handed to `onBlock` has been GIVEN UP ON: its
+   * delivery blew the budget (or the sink threw), the turn is moving on, and
+   * the still-running promise must no longer be treated as this block's
+   * outcome.
+   *
+   * Called synchronously, before the next block is handed over, so a sink that
+   * keeps ordered transcript slots can close this one out IN ORDER. The
+   * abandoned send may still complete — there is no cancellation to hand a
+   * channel — but by then its slot is closed and it changes nothing.
+   *
+   * Unambiguous because delivery is serialized: `handleEvent` does not pull the
+   * next SDK event until the current `shipBlock` has returned, so exactly one
+   * block is outstanding when this fires.
+   */
+  onBlockAbandoned?: () => void;
 }
 
 export interface MessageRequest extends TurnRequest {
@@ -491,29 +507,71 @@ export class LiveSession {
     return this.currentRequest !== null || this.mergedRequests.length > 0 || this.pendingSteers.length > 0;
   }
 
+  /**
+   * Claim an SDK-initiated (unowned) turn for the session's default delivery
+   * target, synchronously.
+   *
+   * SYNCHRONOUS IS THE POINT. The check and the assignment happen in one step
+   * with no await between them, so this can never interleave with the
+   * check-and-claim in `acquireTurn` — whichever runs first wins and the other
+   * observes a busy session. That is half of "wait for idle then claim is
+   * atomic"; the other half is the loop in `acquireTurn`.
+   *
+   * Called on the FIRST event of an unowned turn whatever that event carries —
+   * a root `tool_use` claims exactly like text does. It used to claim only on
+   * `text`/`thinking`, which left a tool-first autonomous turn invisible to
+   * `isBusy()`: a heartbeat, cron or user `send()` sailed through
+   * `waitForIdle()`, took `currentRequest` for itself and cleared `parts`, and
+   * the unowned turn's later text then flowed out through the WRONG turn's
+   * sink.
+   */
   private claimUnownedTurn(reason: string): TurnRequest | null {
     if (this.currentRequest) return this.currentRequest;
     const req = this.unownedTurnFactory?.();
-    if (req) {
-      this.currentRequest = req;
-      this.unownedTurnDropLogged = false;
-      this.refreshActivityTimeout();
-      log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
-      return req;
+    if (!req) return null;
+    this.currentRequest = req;
+    this.unownedTurnDropLogged = false;
+    this.refreshActivityTimeout();
+    log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
+    return req;
+  }
+
+  /**
+   * Claim an unowned turn from its first assistant event, labelling the claim
+   * with the kind of block that opened it.
+   *
+   * The label is not decoration. On 2026-08-28 a DM reply the owner never
+   * received was traced to `reason: "assistant_thinking"` in the log: the model
+   * had written its answer inside a `thinking` block, and with `showThinking`
+   * off that block is dropped by design (renderBlock decides from the TYPE).
+   * Nothing was broken and nothing was logged above info — the reply simply did
+   * not exist as far as delivery was concerned, and it took a log forensics
+   * pass to establish that. So an unowned turn that OPENS with a hidden
+   * thinking block is now a warn, with the length that made it worth noticing.
+   */
+  private claimFirstUnownedEvent(content: unknown[]): void {
+    let reason = "assistant_event";
+    let openedWithHiddenThinking = false;
+    let chars = 0;
+    for (const block of content) {
+      if (isTextBlock(block)) { reason = "assistant_text"; break; }
+      if (isThinkingBlock(block)) {
+        reason = "assistant_thinking";
+        openedWithHiddenThinking = !this.showThinking;
+        chars = block.thinking.length;
+        break;
+      }
+      if (isToolUseBlock(block)) { reason = "assistant_tool_use"; break; }
     }
-    if (!this.unownedTurnDropLogged) {
-      this.unownedTurnDropLogged = true;
-      // ERROR, not warn: this is the one path on which a block the model
-      // actually wrote reaches nobody and is never retried. Silent loss of the
-      // owner's reply is the worst failure this subsystem has, so it must not
-      // sit at a level that routine log reading skips. Latched to once per
-      // turn so a chatty orphan turn cannot flood the log.
-      log.error(
-        { session: this.sessionKey, reason },
-        "Unowned SDK turn has no default delivery target; DROPPING the content block",
+
+    this.claimUnownedTurn(reason);
+
+    if (openedWithHiddenThinking) {
+      log.warn(
+        { session: this.sessionKey, chars },
+        "Unowned SDK turn opened with a hidden thinking block (showThinking off); nothing from it will be delivered",
       );
     }
-    return null;
   }
 
   /**
@@ -538,19 +596,42 @@ export class LiveSession {
    *
    * So the timer is disarmed before the await and re-armed after, and delivery
    * gets its own, much shorter budget instead. A block that blows that budget
-   * is abandoned: logged, counted as failed, turn continues. The turn is never
-   * killed for it. (The abandoned promise is left running rather than
-   * cancelled — there is no cancellation to hand a channel — so if the send
-   * does eventually settle, the sink still records its true outcome then.)
+   * is abandoned: logged, reported to the sink as abandoned, turn continues.
+   * The turn is never killed for it.
+   *
+   * ABANDONMENT IS DECIDED HERE, NOT DEFERRED TO THE LATE PROMISE. The promise
+   * is left running because there is no cancellation to hand a channel, but the
+   * block's OUTCOME OF RECORD is settled the moment we give up on it — the sink
+   * is told (`onBlockAbandoned`) before the next block is handed over. Letting
+   * the late promise write the outcome instead is what let block B's transcript
+   * entry overtake block A's, or made A's vanish entirely when its send never
+   * settled at all.
    */
   private async shipBlock(block: ResponseBlock): Promise<void> {
-    const onBlock = this.currentRequest?.onBlock;
-    if (!onBlock) return;
-
     // A scaffold leak is reported once per turn at `result`, over the same
     // per-block filter — not logged again here.
     const rendered = renderBlock(block, this.showThinking);
     if (rendered.kind !== "ship") return;
+
+    const req = this.currentRequest;
+    const onBlock = req?.onBlock;
+    if (!req || !onBlock) {
+      if (!this.unownedTurnDropLogged) {
+        this.unownedTurnDropLogged = true;
+        // ERROR, not warn: this is the one path on which a block the model
+        // actually wrote reaches nobody and is never retried. Silent loss of
+        // the owner's reply is the worst failure this subsystem has, so it must
+        // not sit at a level that routine log reading skips. Latched to once
+        // per turn so a chatty orphan turn cannot flood the log. Logged HERE,
+        // at the drop, rather than at claim time: a turn that claims nothing
+        // because it opened with a tool call has lost no content yet.
+        log.error(
+          { session: this.sessionKey },
+          "Unowned SDK turn has no default delivery target; DROPPING the content block",
+        );
+      }
+      return;
+    }
 
     this.deliverySuspensions++;
     this.clearActivityTimeout();
@@ -562,6 +643,7 @@ export class LiveSession {
       );
     } catch (err) {
       log.error({ err, session: this.sessionKey }, "Per-block delivery failed");
+      req.onBlockAbandoned?.();
     } finally {
       this.deliverySuspensions--;
       // Back on the clock, with a FULL window: the turn has been making
@@ -604,18 +686,25 @@ export class LiveSession {
     // while the turn is still running", which is exactly what awaiting here
     // delivers.
     if (event.type === "assistant" && event.message?.content) {
+      // CLAIM ON THE FIRST EVENT OF THE TURN, WHATEVER IT CARRIES.
+      //
+      // An assistant event with no owner is an SDK-initiated (autonomous /
+      // task-notification) turn, and it is in flight from this instant — even
+      // when its first event is only a root `tool_use` and the text comes
+      // minutes later. Claiming here is what makes `isBusy()` true for the
+      // whole of such a turn, so a heartbeat, cron or user `send()` queues
+      // behind it instead of stealing `currentRequest` (and clearing `parts`)
+      // out from under it and receiving its text in the wrong sink.
+      if (!this.currentRequest) this.claimFirstUnownedEvent(event.message.content);
+
       for (const block of event.message.content) {
         if (isTextBlock(block)) {
-          // Claim the turn so an SDK-initiated (unowned) turn has a request to
-          // deliver through.
-          if (!this.currentRequest) this.claimUnownedTurn("assistant_text");
           this.parts.push({ type: "text", text: block.text });
           await this.shipBlock({ type: "text", text: block.text });
         } else if (isThinkingBlock(block)) {
           // Kept as a typed block; whether it reaches the channel is decided
           // by renderBlock from the TYPE, never from the text.
           // `redacted_thinking` carries no readable text and never gets here.
-          if (!this.currentRequest) this.claimUnownedTurn("assistant_thinking");
           this.parts.push({ type: "thinking", text: block.thinking });
           await this.shipBlock({ type: "thinking", text: block.thinking });
         } else if (isToolUseBlock(block)) {
@@ -885,22 +974,73 @@ export class LiveSession {
     );
   }
 
+  /**
+   * Serialize the whole "wait for idle, then claim" sequence.
+   *
+   * Held only until the claim is made, never for the length of the turn, so a
+   * second caller enters the section and starts its own wait as soon as the
+   * first has dispatched. Nothing on the event-loop side takes this lock —
+   * `claimUnownedTurn` is synchronous — so the section can never be waiting on
+   * a turn that is waiting on it.
+   */
+  private claimLock: Promise<void> = Promise.resolve();
+
+  private async withClaimLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.claimLock;
+    let release!: () => void;
+    this.claimLock = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Take ownership of the next turn for `req` and dispatch it.
+   *
+   * ATOMIC CHECK-AND-CLAIM. `await waitForIdle(); this.currentRequest = req;`
+   * was not: two woken waiters both observed an idle session and both claimed
+   * (the second silently clearing the first's `parts`), and an unowned turn
+   * could claim in the window between the wait resolving and the assignment,
+   * after which the turn's text left through the wrong sink. Here the busy
+   * check and the assignment are in ONE synchronous step with no await between
+   * them, re-tested after every wake, so exactly one claimant can win — against
+   * another `send()` and against `claimUnownedTurn` alike. The lock around it
+   * keeps waiters in arrival order rather than letting them race on wake.
+   */
+  private async acquireTurn(req: MessageRequest): Promise<void> {
+    await this.withClaimLock(async () => {
+      for (;;) {
+        if (!this.alive) throw new Error("Session is closed");
+        if (!this.isBusy()) {
+          // Fresh maxTurns budget per user message — warnings fire once per
+          // send(), and it is reset when the turn actually starts rather than
+          // when the caller began waiting for it.
+          if (this.turnBudget) resetTurnBudget(this.turnBudget);
+          this.currentRequest = req;
+          this.parts = [];
+          this.refreshActivityTimeout();
+          this.pushInput(req.message);
+          return;
+        }
+        // Steered messages can keep the session busy past the turn that the
+        // agent-level queue serialized against (they may run as a follow-up
+        // turn), so wait for true idleness before dispatching.
+        await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+      }
+    });
+  }
+
   async send(
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
     onBlock?: (block: string) => void | Promise<void>,
+    onBlockAbandoned?: () => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-
-    // Steered messages can keep the session busy past the turn that the
-    // agent-level queue serialized against (they may run as a follow-up
-    // turn), so wait for true idleness before dispatching.
-    await this.waitForIdle();
-    if (!this.alive) throw new Error("Session is closed");
-
-    // Fresh maxTurns budget per user message — warnings fire once per send().
-    if (this.turnBudget) resetTurnBudget(this.turnBudget);
 
     const content = buildContentBlocks(text, images, documents);
 
@@ -910,11 +1050,11 @@ export class LiveSession {
         resolve,
         reject,
         ...(onBlock ? { onBlock } : {}),
+        ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
       };
-      this.currentRequest = req;
-      this.parts = [];
-      this.refreshActivityTimeout();
-      this.pushInput(req.message);
+      // Rejects only if the session dies before the claim; once claimed, the
+      // turn's own resolve/reject settle this promise.
+      this.acquireTurn(req).catch(reject);
     });
   }
 
@@ -933,9 +1073,10 @@ export class LiveSession {
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
     onBlock?: (block: string) => void | Promise<void>,
+    onBlockAbandoned?: () => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, images, documents, onBlock);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -951,6 +1092,7 @@ export class LiveSession {
         resolve,
         reject,
         ...(onBlock ? { onBlock } : {}),
+        ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
       };
       this.pendingSteers.push({ req, text });
       this.pushInput(req.message);

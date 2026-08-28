@@ -317,13 +317,13 @@ export class LiveSessionManager {
   }
 
   async runWithRetry(req: RunWithRetryRequest): Promise<string> {
-    const { key, prompt, images, documents, steer = false, onBlock, hasShipped } = req;
+    const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped } = req;
 
     try {
       const session = await this.getOrCreateLiveSession(key);
       const response = steer
-        ? await session.steer(prompt, images, documents, onBlock)
-        : await session.send(prompt, images, documents, onBlock);
+        ? await session.steer(prompt, images, documents, onBlock, onBlockAbandoned)
+        : await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
 
       // Merged into another request's in-flight turn — that turn's owner
       // does the per-turn bookkeeping (stats, compact triggers) when it
@@ -406,7 +406,7 @@ export class LiveSessionManager {
         const session = await this.getOrCreateLiveSession(key);
         // Safe to reuse the same sink: the guard above proved it has shipped
         // nothing, so this retry is the first and only delivery of the turn.
-        const response = await session.send(prompt, images, documents, onBlock);
+        const response = await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
         this.recordTurnCompletion(key, session);
         return response;
       }

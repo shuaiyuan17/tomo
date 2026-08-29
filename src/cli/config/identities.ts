@@ -199,7 +199,7 @@ function restoreCronJobsFromIdentity(identity: {
   // `imessage:<handle>`, or the restored jobs and the next inbound turn would
   // run on different sessions.
   const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
-  const fallbackKey = rawSessionKeyForBinding(ch, chatId, store.listAllSessions());
+  const fallbackKey = rawSessionKeyForBinding(ch, chatId, store.listAllSessions(), `dm:${identity.name.toLowerCase()}`);
   const cronStore = new CronStore();
   const count = cronStore.rewriteSessionKey(
     `dm:${identity.name.toLowerCase()}`,

@@ -93,30 +93,46 @@ export interface BindingEvidence {
  * uses. For Telegram that is the literal `<channel>:<binding>`; for iMessage
  * it is GUID-shaped and cannot be rebuilt from the configured handle (the
  * service prefix varies), so it is recovered from what the registry
- * remembers, in order of trust:
+ * remembers. Evidence belonging to the identity's OWN entries (`ownerKey`,
+ * its `dm:` key — active entry and retired copies alike) is trusted first: a
+ * binding removed from one identity and reused under another leaves the old
+ * `dm:` entry in the registry, and its GUID may not be the one the newer
+ * session has been replying to. In order:
  *
- * 1. `migratedFrom` on an entry — the raw key the unified session was
- *    re-keyed from (the common one-candidate migration leaves no raw entry
- *    behind, only this).
- * 2. A persisted `replyTarget` for that channel whose chatId matches the
+ * 1. The owner entries' `migratedFrom` — the raw key the unified session
+ *    was re-keyed from (the common one-candidate migration leaves no raw
+ *    entry behind, only this).
+ * 2. The owner entries' persisted `replyTarget` for that channel matching the
  *    binding — the live GUID the router last routed a reply to.
- * 3. A raw entry still in the registry matching the binding (linked or not).
- * 4. The literal `<channel>:<binding>` form, when no conversation with that
+ * 3. The same two, from any other entry in the registry.
+ * 4. A raw entry still in the registry matching the binding (linked or not).
+ * 5. The literal `<channel>:<binding>` form, when no conversation with that
  *    binding was ever seen.
  */
-export function rawSessionKeyForBinding(channelName: string, bound: string, entries: Iterable<BindingEvidence>): string {
+export function rawSessionKeyForBinding(
+  channelName: string,
+  bound: string,
+  entries: Iterable<BindingEvidence>,
+  ownerKey?: string,
+): string {
   const all = [...entries];
-  const migrated = all
-    .map((e) => e.migratedFrom)
-    .filter((k): k is string => typeof k === "string");
-  const fromMigration = legacySessionKeysForBinding(migrated, channelName, bound)[0];
-  if (fromMigration) return fromMigration;
+  const owned = ownerKey ? all.filter((e) => e.channelKey === ownerKey) : [];
+  const others = ownerKey ? all.filter((e) => e.channelKey !== ownerKey) : all;
 
-  for (const e of all) {
-    const t = e.replyTarget;
-    if (!t || t.channelName !== channelName) continue;
-    const key = `${channelName}:${t.chatId}`;
-    if (!isGroupSessionKey(key) && matchesChannelBinding(channelName, t.chatId, bound)) return key;
+  for (const group of [owned, others]) {
+    const fromMigration = legacySessionKeysForBinding(
+      group.map((e) => e.migratedFrom).filter((k): k is string => typeof k === "string"),
+      channelName,
+      bound,
+    )[0];
+    if (fromMigration) return fromMigration;
+
+    for (const e of group) {
+      const t = e.replyTarget;
+      if (!t || t.channelName !== channelName) continue;
+      const key = `${channelName}:${t.chatId}`;
+      if (!isGroupSessionKey(key) && matchesChannelBinding(channelName, t.chatId, bound)) return key;
+    }
   }
 
   return legacySessionKeysForBinding(all.map((e) => e.channelKey), channelName, bound)[0]

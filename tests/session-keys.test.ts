@@ -79,4 +79,26 @@ describe("identity binding matchers", () => {
     // No conversation seen yet: a chat GUID cannot be synthesised from a handle.
     expect(rawSessionKeyForBinding("imessage", "+15550000000", entries)).toBe("imessage:+15550000000");
   });
+
+  it("trusts the removed identity's own entries before another identity's leftovers", () => {
+    // The binding once belonged to "old" (migrated from any;-;), was removed,
+    // and was reused under "cur", whose unified session has been replying to
+    // the GUID iMessage now reports for the same handle. Removing "cur" must
+    // restore to cur's GUID, not old's.
+    const entries = [
+      { channelKey: "dm:old", migratedFrom: "imessage:any;-;+15551234567" },
+      { channelKey: "dm:cur", replyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" } },
+    ];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:cur")).toBe("imessage:iMessage;-;+15551234567");
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:old")).toBe("imessage:any;-;+15551234567");
+    // An owner with no evidence of its own still falls through to the rest.
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:new")).toBe("imessage:any;-;+15551234567");
+    // Retired copies of the owner key count as the owner's evidence too.
+    const withRetired = [
+      { channelKey: "dm:old", migratedFrom: "imessage:any;-;+15551234567" },
+      { channelKey: "dm:cur" },
+      { channelKey: "dm:cur", migratedFrom: "imessage:SMS;-;+15551234567" },
+    ];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", withRetired, "dm:cur")).toBe("imessage:SMS;-;+15551234567");
+  });
 });

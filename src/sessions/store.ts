@@ -484,6 +484,10 @@ export class SessionStore {
       ...(entry.chatTitle ? { chatTitle: entry.chatTitle } : {}),
       ...(entry.participants ? { participants: [...entry.participants] } : {}),
       ...(entry.participantIds ? { participantIds: structuredClone(entry.participantIds) } : {}),
+      // Routing provenance outlives the retired transcript: once the retired
+      // copy expires, this stub is all that remembers the raw key an
+      // identity's removal must restore cron jobs to.
+      ...(entry.migratedFrom ? { migratedFrom: entry.migratedFrom } : {}),
     });
 
     this.saveRegistry();

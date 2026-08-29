@@ -270,6 +270,20 @@ describe("SessionStore", () => {
     expect(store.getEntry("dm:alicia")?.migratedFrom).toBe("imessage:any;-;+15551234567");
   });
 
+  it("keeps migratedFrom on the stub when a unified session is retired", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.setSdkSessionId("imessage:any;-;+15551234567", "session-old");
+    store.migrateSessionKey("imessage:any;-;+15551234567", "dm:alice");
+
+    store.retireSdkSessionId("dm:alice");
+
+    // Active stub (no SDK session yet) still carries the provenance, so the
+    // restore key survives the retired copy's 30-day expiry.
+    expect(store.getEntry("dm:alice")?.sdkSessionId).toBe("");
+    expect(store.getEntry("dm:alice")?.migratedFrom).toBe("imessage:any;-;+15551234567");
+    expect(store.listAllSessions().filter((e) => e.channelKey === "dm:alice").every((e) => e.migratedFrom === "imessage:any;-;+15551234567")).toBe(true);
+  });
+
   it("touches session lastActiveAt", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setSdkSessionId("key1", "session-abc");

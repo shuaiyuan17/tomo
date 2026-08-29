@@ -4,6 +4,7 @@ import type {
   ElicitationResult,
   McpSdkServerConfigWithInstance,
   McpServerConfig,
+  McpSetServersResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config.js";
 import { log } from "../logger.js";
@@ -24,6 +25,23 @@ import type { RunWithRetryRequest } from "./turn-runner.js";
  * mentioning "session", e.g. from an MCP tool or the API) would duplicate
  * side effects the turn's first attempt already performed.
  */
+/**
+ * Structural equality for two MCP server configs. Only used to recognize a
+ * redundant hot-mount, so JSON is enough: these are plain config records
+ * (url/headers/args), and an SDK server carries a non-serializable `instance`
+ * that stringifies to the same shape only when it is literally the same
+ * object — which the identity check below already covers.
+ */
+function sameServerConfig(a: McpServerConfig | undefined, b: McpServerConfig): boolean {
+  if (a === b) return true;
+  if (!a) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
 function isRecoverableSessionError(errMsg: string): boolean {
   return errMsg.includes("No conversation found")
     || /session (?:is )?closed/i.test(errMsg)
@@ -77,6 +95,12 @@ export interface LiveSessionManagerDeps {
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
   maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
+  /**
+   * A mounted external MCP server rejected a tool call for authorization
+   * reasons: refresh its OAuth token (non-interactively) so the refreshed
+   * config comes back through hotMountExternalMcpServer.
+   */
+  refreshExternalMcpToken(serverName: string): void;
 }
 
 /**
@@ -123,9 +147,11 @@ export class LiveSessionManager {
 
   /**
    * Add an authenticated external server to every live session that missed it
-   * at spawn time. Calls are serialized because setMcpServers replaces the
-   * complete dynamic set: two simultaneous token completions must compose,
-   * rather than racing and removing one another.
+   * at spawn time, AND replace it in sessions that are already serving it with
+   * a stale token — a completed `/mcp login` or a background refresh reaches a
+   * running session only through here. Calls are serialized because
+   * setMcpServers replaces the complete dynamic set: two simultaneous token
+   * completions must compose, rather than racing and removing one another.
    */
   hotMountExternalMcpServer(serverName: string, server: McpServerConfig): Promise<void> {
     const operation = this.hotMountQueue.then(() => this.applyExternalMcpHotMount(serverName, server));
@@ -245,6 +271,7 @@ export class LiveSessionManager {
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {
       timeoutMs: config.liveSessionTimeoutMs,
       showThinking: config.showThinking,
+      onMcpAuthError: (serverName) => this.deps.refreshExternalMcpToken(serverName),
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
     // yields — it can spend real time on OAuth — and stop() may have run its
@@ -301,34 +328,48 @@ export class LiveSessionManager {
     const failures: Array<{ key: string; error: string }> = [];
 
     for (const [key, session] of [...this.liveSessions]) {
-      if (!session.isAlive() || this.externalMcpServersBySession.get(key)?.has(serverName)) continue;
+      if (!session.isAlive()) continue;
       const current = this.mcpServerConfigsBySession.get(key);
       if (!current) continue;
-      const desired = { ...current, [serverName]: server };
+      const mountedHere = this.externalMcpServersBySession.get(key)?.has(serverName) ?? false;
+      // Already serving this exact config — a duplicate notification, not a
+      // new credential. Anything else (in particular a re-authenticated
+      // server whose only change is its Authorization header) MUST go
+      // through, or the session keeps using the token that just expired.
+      if (mountedHere && sameServerConfig(current[serverName], server)) continue;
 
       try {
-        const result = await session.setMcpServers(desired);
-        if (this.liveSessions.get(key) !== session) continue;
-        if (!result) {
+        // The SDK's setMcpServers only creates a client for a name it does
+        // not already have, so a changed config for a live name has to be
+        // delivered as a removal followed by an add. Both halves are inside
+        // the serialized hot-mount queue, so nothing observes the gap.
+        if (mountedHere) {
+          const without = { ...current };
+          delete without[serverName];
+          const removal = await this.pushMcpServers(key, session, without);
+          if (removal === "replaced") continue;
+          if (removal === "unsupported") {
+            unsupported++;
+            continue;
+          }
+        }
+
+        const base = this.mcpServerConfigsBySession.get(key) ?? current;
+        const result = await this.pushMcpServers(key, session, { ...base, [serverName]: server });
+        if (result === "replaced") continue;
+        if (result === "unsupported") {
           unsupported++;
           continue;
         }
 
-        this.mcpServerConfigsBySession.set(key, desired);
-        const mountedNames = new Set(this.externalMcpServersBySession.get(key) ?? []);
-        for (const name of result.removed) mountedNames.delete(name);
-        for (const name of result.added) {
-          if (name !== TOMO_INTERNAL_MCP_NAME && !result.errors[name]) mountedNames.add(name);
-        }
-        for (const name of Object.keys(result.errors)) mountedNames.delete(name);
-
         if (!result.errors[serverName] && !result.removed.includes(serverName)) {
+          const mountedNames = new Set(this.externalMcpServersBySession.get(key) ?? []);
           mountedNames.add(serverName);
+          this.externalMcpServersBySession.set(key, mountedNames);
           mounted++;
         } else {
           failures.push({ key, error: result.errors[serverName] ?? "server was removed" });
         }
-        this.externalMcpServersBySession.set(key, mountedNames);
       } catch (err) {
         failures.push({ key, error: err instanceof Error ? err.message : String(err) });
       }
@@ -349,6 +390,35 @@ export class LiveSessionManager {
         "External MCP hot-mount failed for live sessions; a later session will retry",
       );
     }
+  }
+
+  /**
+   * Push a COMPLETE MCP map to one live session and reconcile the mounted-name
+   * bookkeeping from what the runtime reports. `"unsupported"` means the SDK
+   * has no live-update capability; `"replaced"` means the session was swapped
+   * out while the call was in flight, so its result must be discarded.
+   */
+  private async pushMcpServers(
+    key: string,
+    session: LiveSession,
+    desired: Record<string, McpServerConfig>,
+  ): Promise<McpSetServersResult | "unsupported" | "replaced"> {
+    const result = await session.setMcpServers(desired);
+    if (this.liveSessions.get(key) !== session) return "replaced";
+    if (!result) return "unsupported";
+
+    this.mcpServerConfigsBySession.set(key, desired);
+    const mountedNames = new Set(this.externalMcpServersBySession.get(key) ?? []);
+    // Dropped by omission: a name absent from the pushed map is gone whether
+    // or not the runtime bothered to list it under `removed`.
+    for (const name of mountedNames) if (!(name in desired)) mountedNames.delete(name);
+    for (const name of result.removed) mountedNames.delete(name);
+    for (const name of result.added) {
+      if (name !== TOMO_INTERNAL_MCP_NAME && !result.errors[name]) mountedNames.add(name);
+    }
+    for (const name of Object.keys(result.errors)) mountedNames.delete(name);
+    this.externalMcpServersBySession.set(key, mountedNames);
+    return result;
   }
 
   private hashString(s: string): string {

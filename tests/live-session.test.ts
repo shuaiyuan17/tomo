@@ -92,7 +92,11 @@ const { LiveSession, STEER_MERGED, SdkResultError } = await import("../src/agent
 const { log } = await import("../src/logger.js");
 const TIMEOUT_MS = 10 * 60 * 1000;
 
-function makeSession(settings?: { timeoutMs?: number; showThinking?: boolean }) {
+function makeSession(settings?: {
+  timeoutMs?: number;
+  showThinking?: boolean;
+  onMcpAuthError?: (serverName: string) => void;
+}) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
   return { session, harness };
@@ -146,6 +150,57 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+// Issue #299 defect 1: a live session's Bearer header is minted once, at
+// session build time. When the mounted server rejects a call because that
+// token expired, the host has to hear about it or the session stays broken
+// until a restart.
+describe("LiveSession MCP authorization errors", () => {
+  const errorResult = (id: string, content: string) => ({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: id, content, is_error: true }] },
+  });
+
+  it("reports an expired-token tool failure to the host once per server", async () => {
+    const onMcpAuthError = vi.fn();
+    const { session, harness } = makeSession({ onMcpAuthError });
+
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t1"));
+    harness.pushEvent(errorResult("t1", 'MCP server "cloudflare-api" requires re-authorization (token expired)'));
+    await waitFor(() => onMcpAuthError.mock.calls.length > 0);
+    expect(onMcpAuthError).toHaveBeenCalledWith("cloudflare-api");
+
+    // Latched: the refresh re-mounts the server, so reporting again would let
+    // a misclassified error loop refresh -> re-mount -> same error.
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__search", "t2"));
+    harness.pushEvent(errorResult("t2", "HTTP 401 Unauthorized"));
+    await flushMicrotasks(10);
+    expect(onMcpAuthError).toHaveBeenCalledTimes(1);
+
+    // A different server is still reported.
+    harness.pushEvent(assistantToolEvent("mcp__docs__search", "t3"));
+    harness.pushEvent(errorResult("t3", "HTTP 401 Unauthorized"));
+    await waitFor(() => onMcpAuthError.mock.calls.length > 1);
+    expect(onMcpAuthError).toHaveBeenNthCalledWith(2, "docs");
+    session.close();
+  });
+
+  it("ignores tool failures that are not MCP authorization errors", async () => {
+    const onMcpAuthError = vi.fn();
+    const { session, harness } = makeSession({ onMcpAuthError });
+
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t1"));
+    harness.pushEvent(errorResult("t1", "zone not found"));
+    harness.pushEvent(assistantToolEvent("Bash", "t2"));
+    harness.pushEvent(errorResult("t2", "401 Unauthorized"));
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t3"));
+    harness.pushEvent(toolResultEvent("t3", "401 Unauthorized"));
+    await flushMicrotasks(20);
+
+    expect(onMcpAuthError).not.toHaveBeenCalled();
+    session.close();
+  });
 });
 
 describe("LiveSession runtime MCP management", () => {

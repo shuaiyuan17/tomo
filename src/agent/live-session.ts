@@ -193,6 +193,31 @@ export interface LiveSessionSettings {
   timeoutMs?: number;
   /** Include `thinking` content blocks in the turn response (config.showThinking). */
   showThinking?: boolean;
+  /**
+   * A tool from mounted external MCP server `serverName` failed with an
+   * authorization error. The host uses this to refresh that server's OAuth
+   * token and re-mount it, so the NEXT call in this same session works
+   * without the owner re-running `/mcp login`.
+   */
+  onMcpAuthError?: (serverName: string) => void;
+}
+
+/**
+ * Does a failed MCP tool result look like an expired/rejected access token?
+ * Matched on the strings the CLI and MCP servers actually emit for 401s.
+ * Kept narrow: a false positive spends one pointless token refresh.
+ */
+export function isMcpAuthErrorText(text: string): boolean {
+  return /\b401\b|unauthoriz(?:ed|ation)|re-?authoriz|invalid_token|token (?:has )?expired/i.test(text);
+}
+
+/** `mcp__<server>__<tool>` → `<server>`, or null for a non-MCP tool name. */
+export function mcpServerFromToolName(name: string | undefined): string | null {
+  if (!name?.startsWith("mcp__")) return null;
+  const rest = name.slice("mcp__".length);
+  const sep = rest.indexOf("__");
+  const server = sep === -1 ? rest : rest.slice(0, sep);
+  return server.length > 0 ? server : null;
 }
 
 /**
@@ -493,6 +518,16 @@ export class LiveSession {
   private unownedTurnFactory: UnownedTurnFactory | undefined;
   private timeoutMs: number;
   private showThinking: boolean;
+  private onMcpAuthError: ((serverName: string) => void) | undefined;
+  /**
+   * MCP servers already reported this session. Never cleared: the refresh it
+   * triggers re-mounts the server, which would make a misclassified error
+   * (some unrelated tool output that mentions "unauthorized") loop
+   * refresh → re-mount → same error forever. One shot per session is enough
+   * to recover a live session; keeping tokens fresh from then on is the
+   * periodic sweep's job, not this path's.
+   */
+  private mcpAuthErrorsReported = new Set<string>();
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -528,6 +563,7 @@ export class LiveSession {
     this.unownedTurnFactory = unownedTurnFactory;
     this.timeoutMs = normalizeTimeoutMs(settings.timeoutMs);
     this.showThinking = settings.showThinking ?? false;
+    this.onMcpAuthError = settings.onMcpAuthError;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -1069,10 +1105,12 @@ export class LiveSession {
           this.pendingToolStarts.delete(tr.tool_use_id);
           this.subagentTypeById.delete(tr.tool_use_id);
         }
+        const summary = summarizeToolResult(tr.content);
         log.info(
           { tool: name ?? "?", ...(tr.is_error ? { is_error: true } : {}), ...(agent ? { agent } : {}) },
-          `${tr.is_error ? "[ERR] " : ""}${name ?? "?"} result: ${summarizeToolResult(tr.content)}`,
+          `${tr.is_error ? "[ERR] " : ""}${name ?? "?"} result: ${summary}`,
         );
+        if (tr.is_error) this.reportMcpAuthError(name, summary);
         watchBus.publish({
           type: "tool.end",
           ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
@@ -1082,6 +1120,27 @@ export class LiveSession {
           ...(agent ? { agent } : {}),
         });
       }
+    }
+  }
+
+  /**
+   * A mounted MCP server just rejected a tool call for authorization reasons —
+   * with harness-managed OAuth that means the Bearer token baked into this
+   * session at build time has expired. Tell the host once per server so it can
+   * refresh and re-mount; a repeat inside the same session would only queue
+   * duplicate refreshes behind the first one.
+   */
+  private reportMcpAuthError(toolName: string | undefined, resultText: string): void {
+    if (!this.onMcpAuthError) return;
+    const serverName = mcpServerFromToolName(toolName);
+    if (!serverName || this.mcpAuthErrorsReported.has(serverName)) return;
+    if (!isMcpAuthErrorText(resultText)) return;
+    this.mcpAuthErrorsReported.add(serverName);
+    log.info({ serverName, tool: toolName }, "MCP tool rejected for authorization; requesting a token refresh");
+    try {
+      this.onMcpAuthError(serverName);
+    } catch (err) {
+      log.warn({ serverName, err }, "MCP auth-error notification threw");
     }
   }
 

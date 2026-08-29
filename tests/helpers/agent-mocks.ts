@@ -335,6 +335,11 @@ export const mockConfig = {
   steering: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
+  /** External MCP servers (src/mcp/external-config.ts shape); undefined = none configured. */
+  mcpServers: undefined as undefined | Record<string, {
+    server: { type: "http"; url: string };
+    oauth?: { clientId?: string; scopes: string[]; tokenStoreKey: string };
+  }>,
   lcm: {
     nudgeAtPct: 70,
     nudgeResetPct: 60,

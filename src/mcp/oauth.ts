@@ -8,6 +8,14 @@ import type { ExternalMcpServerConfig, McpOAuthConfig } from "./external-config.
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * How often the host should sweep stored tokens for imminent expiry. A live
+ * session's Authorization header is minted once, at session build time, so
+ * without this sweep a token that expires mid-session is never replaced —
+ * with an issuer handing out one-hour tokens that is a broken server every
+ * hour. Well under TOKEN_REFRESH_SKEW_MS so the skew window is never missed.
+ */
+export const TOKEN_REFRESH_SWEEP_INTERVAL_MS = 60 * 1000;
 const MCP_INITIALIZE_PROBE = {
   jsonrpc: "2.0",
   id: 1,
@@ -135,6 +143,8 @@ export class McpOAuthManager {
   private completedCallbackStates = new Map<string, { serverName: string; completedAt: number }>();
   private serverFailures = new Map<string, { error: string; at: number }>();
   private chatCallbackCompletions = new Set<string>();
+  /** One non-interactive refresh per server: the sweep and a 401 can collide. */
+  private tokenRefreshes = new Map<string, Promise<boolean>>();
 
   constructor(options: McpOAuthManagerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -372,13 +382,71 @@ export class McpOAuthManager {
     if (!entry.oauth || !supportsHeaders(entry.server)) return entry.server;
 
     const token = await this.getFreshToken(serverName, entry.server, entry.oauth, sendAuthorizeUrl, forceInteractive);
-    return {
-      ...entry.server,
-      headers: {
-        ...(entry.server.headers ?? {}),
-        Authorization: `Bearer ${token.accessToken}`,
-      },
-    };
+    return withBearer(entry.server, token.accessToken);
+  }
+
+  /**
+   * Non-interactive sweep over every OAuth server whose stored access token is
+   * at or inside the refresh skew window. Each success re-mints the header and
+   * hands it to `onServerAuthReady`, which is what gets the new token into
+   * sessions that are ALREADY RUNNING — `buildServersWithAuth` only ever runs
+   * at session creation, so nothing else re-reads the token store.
+   *
+   * Deliberately never escalates to the browser flow: a background timer must
+   * not push a login link at the owner unprompted. A rejected refresh is
+   * recorded as a server failure and left for the next session build or an
+   * explicit `/mcp login`.
+   *
+   * Returns the names actually refreshed.
+   */
+  async refreshExpiringTokens(servers: Record<string, ExternalMcpServerConfig>): Promise<string[]> {
+    const refreshed: string[] = [];
+    for (const name of Object.keys(servers)) {
+      if (await this.refreshServerToken(name, servers, { onlyIfExpiring: true })) refreshed.push(name);
+    }
+    return refreshed;
+  }
+
+  /**
+   * Refresh one server's stored token with its refresh token, no browser flow.
+   * `onlyIfExpiring` is the timer's mode; the 401 path passes it false so a
+   * token the issuer revoked early is still retried once.
+   */
+  async refreshServerToken(
+    serverName: string,
+    servers: Record<string, ExternalMcpServerConfig>,
+    options: { onlyIfExpiring?: boolean } = {},
+  ): Promise<boolean> {
+    const entry = servers[serverName];
+    const oauth = entry?.oauth;
+    if (!entry || !oauth || !supportsHeaders(entry.server)) return false;
+    const server = entry.server;
+    // An interactive build already owns this server's token; joining in would
+    // race a browser flow against a refresh for the same store key.
+    if (this.serverAuthBuilds.has(serverName)) return false;
+    const inFlight = this.tokenRefreshes.get(serverName);
+    if (inFlight) return inFlight;
+
+    const existing = this.readStore().mcpOAuth?.[oauth.tokenStoreKey];
+    if (!existing?.refreshToken) return false;
+    if (options.onlyIfExpiring && !this.isExpiring(existing)) return false;
+
+    const run = (async () => {
+      try {
+        const refreshed = await this.refreshToken(existing, oauth);
+        this.writeToken(oauth.tokenStoreKey, refreshed);
+        this.serverFailures.delete(serverName);
+        await this.onServerAuthReady?.(serverName, withBearer(server, refreshed.accessToken));
+        return true;
+      } catch (err) {
+        this.serverFailures.set(serverName, { error: errorMessage(err), at: this.now() });
+        return false;
+      } finally {
+        this.tokenRefreshes.delete(serverName);
+      }
+    })();
+    this.tokenRefreshes.set(serverName, run);
+    return run;
   }
 
   async getFreshToken(
@@ -388,6 +456,12 @@ export class McpOAuthManager {
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
     forceInteractive = false,
   ): Promise<OAuthTokenRecord> {
+    // A background sweep may already be spending this server's refresh token.
+    // Issuers that rotate refresh tokens invalidate the old one on use, so a
+    // second concurrent exchange would throw away the credential we just got.
+    const sweeping = this.tokenRefreshes.get(serverName);
+    if (sweeping) await sweeping;
+
     const store = this.readStore();
     const existing = store.mcpOAuth?.[oauth.tokenStoreKey];
     if (!forceInteractive && existing && !this.isExpiring(existing)) return existing;
@@ -676,6 +750,16 @@ function normalizeToken(
 
 function supportsHeaders(server: McpServerConfig): server is Extract<McpServerConfig, { type: "http" | "sse" }> {
   return server.type === "http" || server.type === "sse";
+}
+
+function withBearer(
+  server: Extract<McpServerConfig, { type: "http" | "sse" }>,
+  accessToken: string,
+): McpServerConfig {
+  return {
+    ...server,
+    headers: { ...(server.headers ?? {}), Authorization: `Bearer ${accessToken}` },
+  };
 }
 
 function parseResourceMetadataUrl(header: string): string | null {

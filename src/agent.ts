@@ -17,7 +17,7 @@ import { annotateSenderName, autoBindHandle, loadPeople, renderParticipantLabels
 import { SummonStore } from "./sessions/summon-store.js";
 import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
-import { McpOAuthManager } from "./mcp/oauth.js";
+import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js";
 import { log } from "./logger.js";
 import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
@@ -86,6 +86,12 @@ interface CronTurnOptions {
  * `getUpdates`, whose own client timeout defaults to 500 seconds.
  */
 const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
+/**
+ * How long shutdown waits for an in-flight OAuth refresh sweep. A token
+ * exchange is one HTTP round-trip; anything slower is a hung endpoint we
+ * should not hold the daemon open for.
+ */
+const MCP_SWEEP_SHUTDOWN_TIMEOUT_MS = 3_000;
 const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
 
 // Context-usage percentage at which the nudge escalates from a daily rollup
@@ -126,6 +132,10 @@ export class Agent {
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
   private readonly mcpOAuthManager: McpOAuthManager;
+  /** Background sweep that refreshes OAuth tokens before they expire (start/stop). */
+  private mcpTokenRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
+  private mcpSweepInFlight: Promise<void> | undefined;
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir);
@@ -212,6 +222,12 @@ export class Agent {
       handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       maybeNudgeCompact: (key, ctx) => this.maybeNudgeCompact(key, ctx),
+      refreshExternalMcpToken: (serverName) => this.mcpOAuthManager
+        .refreshServerToken(serverName, config.mcpServers ?? {})
+        .catch((err) => {
+          log.warn({ serverName, err }, "MCP token refresh after an auth error failed");
+          return "failed" as const;
+        }),
     });
     this.proactive = new ProactiveSendService({
       getChannel: (name) => this.getChannel(name),
@@ -1573,6 +1589,7 @@ export class Agent {
   async start(): Promise<void> {
     log.info({ channels: this.channels.length }, "Starting Tomo");
     await Promise.all(this.channels.map((ch) => ch.start()));
+    this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
     // Check for restart reason and notify via continuity-style message.
@@ -1624,8 +1641,40 @@ export class Agent {
    * if quiesce fails, and teardown runs even if they do. Both awaits are
    * bounded, because `start.ts` cannot exit until this resolves.
    */
+  /**
+   * Keep harness-managed OAuth tokens alive while sessions are running. A
+   * live session's Authorization header is minted once, when the session is
+   * built, so nothing else re-reads the token store — without this sweep an
+   * issuer handing out one-hour tokens breaks the server one hour after every
+   * login. Each refresh notifies onServerAuthReady, which hot-mounts the new
+   * header into the sessions already serving that server.
+   */
+  private startMcpTokenRefreshSweep(): void {
+    const servers = config.mcpServers ?? {};
+    if (!Object.values(servers).some((entry) => entry.oauth)) return;
+    const sweep = () => {
+      // Held (not cleared on completion) so stop() can wait for an exchange
+      // that is still in flight: abandoning one mid-write leaves the token
+      // store to a callback racing process exit, and its hot-mounts land on
+      // sessions shutdown has already closed. Awaiting a settled promise is
+      // free, so there is nothing to gain from clearing it.
+      this.mcpSweepInFlight = this.mcpOAuthManager.refreshExpiringTokens(servers)
+        .then((names) => {
+          if (names.length > 0) log.info({ servers: names }, "Refreshed expiring MCP OAuth tokens");
+        })
+        .catch((err) => log.warn({ err }, "MCP OAuth refresh sweep failed"));
+    };
+    sweep();
+    this.mcpTokenRefreshTimer = setInterval(sweep, TOKEN_REFRESH_SWEEP_INTERVAL_MS);
+    this.mcpTokenRefreshTimer.unref();
+  }
+
   async stop(): Promise<void> {
     log.info("Shutting down");
+    if (this.mcpTokenRefreshTimer) {
+      clearInterval(this.mcpTokenRefreshTimer);
+      this.mcpTokenRefreshTimer = undefined;
+    }
     this.commands.stop();
 
     for (const ch of this.channels) {
@@ -1636,6 +1685,14 @@ export class Agent {
         // — but one channel must not keep the others ingesting.
         log.error({ err, channel: ch.name }, "Channel closeIngestion threw");
       }
+    }
+
+    // Before the live sessions are torn down, so a refresh that is mid-flight
+    // finishes its store write and its hot-mount against sessions that are
+    // still alive, rather than against ones stop() has just closed.
+    if (this.mcpSweepInFlight) {
+      const sweep = this.mcpSweepInFlight;
+      await this.boundedShutdownStep("mcp token sweep", MCP_SWEEP_SHUTDOWN_TIMEOUT_MS, () => sweep);
     }
 
     try {

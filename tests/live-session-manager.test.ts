@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 interface FakeSession {
   key: string;
+  settings: Record<string, unknown>;
   closed: boolean;
   busy: boolean;
   lastResult: unknown;
@@ -53,8 +54,11 @@ vi.mock("../src/agent/live-session.js", () => {
     sessionId: string | null = "sdk-1";
     private idleResolvers: Array<() => void> = [];
 
-    constructor(_opts: unknown, key: string) {
+    settings: Record<string, unknown>;
+
+    constructor(_opts: unknown, key: string, _b?: unknown, _f?: unknown, settings: Record<string, unknown> = {}) {
       this.key = key;
+      this.settings = settings;
       mockState.instances.push(this);
     }
     releaseIdle() { for (const r of this.idleResolvers.splice(0)) r(); }
@@ -65,8 +69,13 @@ vi.mock("../src/agent/live-session.js", () => {
     getSessionId() { return this.sessionId; }
     async setMcpServers(servers: Record<string, unknown>) {
       mockState.mcpSetCalls.push({ session: this, servers });
-      if (mockState.mcpSetImpl) return mockState.mcpSetImpl(servers, this);
-      return { added: Object.keys(servers), removed: [], errors: {} };
+      const result = mockState.mcpSetImpl
+        ? await mockState.mcpSetImpl(servers, this)
+        : { added: Object.keys(servers), removed: [], errors: {} };
+      // The real control request dies with its session: closing the query
+      // while a request is outstanding never delivers a response.
+      if (this.closed) throw new Error("Session is closed");
+      return result;
     }
     async send(prompt: string, _i?: unknown, _d?: unknown, onBlock?: (b: string) => void | Promise<void>) {
       return mockState.sendImpl ? mockState.sendImpl(prompt, this, onBlock) : "ok";
@@ -131,6 +140,7 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
     handleMcpElicitation: async () => ({ action: "decline" as const }),
     createUnownedTurnRequest: () => undefined,
     maybeNudgeCompact: vi.fn(),
+    refreshExternalMcpToken: vi.fn(async () => "refreshed" as const),
     ...overrides,
   };
 }
@@ -315,11 +325,71 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["existing", "docs"]));
   });
 
-  it("does not remount a server already present in the live session", async () => {
+  it("routes a live session's MCP auth error to the host token refresh", async () => {
+    const refreshExternalMcpToken = vi.fn();
+    const manager = new LiveSessionManager(makeDeps({ refreshExternalMcpToken }));
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    const onMcpAuthError = mockState.instances[0].settings.onMcpAuthError as (name: string) => void;
+    expect(onMcpAuthError).toBeTypeOf("function");
+    onMcpAuthError("cloudflare-api");
+
+    expect(refreshExternalMcpToken).toHaveBeenCalledWith("cloudflare-api");
+  });
+
+  it("does not remount a server whose live config is unchanged", async () => {
     const docs = {
       type: "http" as const,
       url: "https://docs.example/mcp",
       headers: { Authorization: "Bearer existing" },
+    };
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => ({ docs }),
+    }));
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    await manager.hotMountExternalMcpServer("docs", { ...docs });
+
+    expect(mockState.mcpSetCalls).toHaveLength(0);
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["docs"]));
+  });
+
+  // Issue #299 defect 2: after `/mcp login`, the server is already in the
+  // session's mounted set, so the hot-mount used to be skipped outright and
+  // the session kept the expired Bearer token until a daemon restart.
+  it("re-mounts an already-mounted server when its OAuth header changed", async () => {
+    const docs = {
+      type: "http" as const,
+      url: "https://docs.example/mcp",
+      headers: { Authorization: "Bearer expired" },
+    };
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => ({ docs }),
+    }));
+    await manager.getOrCreateLiveSession("telegram:1");
+    const refreshed = { ...docs, headers: { Authorization: "Bearer refreshed" } };
+
+    await manager.hotMountExternalMcpServer("docs", refreshed);
+
+    // Codex review, objection 2: ONE call, so there is no window in which an
+    // in-flight tool call finds the server missing. Verified against the CLI
+    // bundle (2.1.251): a name present in both maps whose config fingerprint
+    // changed goes on the reconcile's "will replace" list, and the
+    // fingerprint covers `headers`.
+    expect(mockState.mcpSetCalls).toHaveLength(1);
+    expect(mockState.mcpSetCalls[0].servers).toMatchObject({ docs: refreshed });
+    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["docs"]));
+    expect(vi.mocked(log.info)).toHaveBeenCalledWith(
+      { serverName: "docs", sessions: 1 },
+      "External MCP server hot-mounted into live sessions",
+    );
+  });
+
+  it("never drops the server from any pushed map while re-authenticating", async () => {
+    const docs = {
+      type: "http" as const,
+      url: "https://docs.example/mcp",
+      headers: { Authorization: "Bearer expired" },
     };
     const manager = new LiveSessionManager(makeDeps({
       buildExternalMcpServers: async () => ({ docs }),
@@ -331,8 +401,92 @@ describe("LiveSessionManager session lifecycle", () => {
       headers: { Authorization: "Bearer refreshed" },
     });
 
+    // The invariant the outage window would have broken.
+    for (const call of mockState.mcpSetCalls) {
+      expect(call.servers).toHaveProperty("docs");
+    }
+  });
+
+  it("leaves bookkeeping alone when the session is replaced during a re-mount", async () => {
+    const docs = {
+      type: "http" as const,
+      url: "https://docs.example/mcp",
+      headers: { Authorization: "Bearer expired" },
+    };
+    let releaseSet!: () => void;
+    const setGate = new Promise<void>((resolve) => { releaseSet = resolve; });
+    const manager = new LiveSessionManager(makeDeps({
+      buildExternalMcpServers: async () => ({ docs }),
+    }));
+    const original = await manager.getOrCreateLiveSession("telegram:1");
+    mockState.mcpSetImpl = async () => {
+      await setGate;
+      return { added: ["docs"], removed: [], errors: {} };
+    };
+
+    const mounting = manager.hotMountExternalMcpServer("docs", {
+      ...docs,
+      headers: { Authorization: "Bearer refreshed" },
+    });
+    await flushMicrotasks();
+    manager.closeLiveSession("telegram:1");
+    releaseSet();
+    await mounting;
+
+    expect(manager.isAlive("telegram:1")).toBe(false);
+    expect(original.isAlive()).toBe(false);
+  });
+
+  // Codex review, objection 4.
+  it("refuses new hot-mounts once shutdown has started", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    await manager.stop();
+    mockState.mcpSetCalls = [];
+
+    await manager.hotMountExternalMcpServer("docs", { type: "http", url: "https://docs.example/mcp" });
+
     expect(mockState.mcpSetCalls).toHaveLength(0);
-    expect(manager.mountedExternalMcpServers("telegram:1")).toEqual(new Set(["docs"]));
+    expect(vi.mocked(log.info)).toHaveBeenCalledWith(
+      { serverName: "docs" },
+      "Ignoring an external MCP hot-mount during shutdown",
+    );
+  });
+
+  it("drains an in-flight hot-mount before stop() closes its session", async () => {
+    let releaseSet!: () => void;
+    const setGate = new Promise<void>((resolve) => { releaseSet = resolve; });
+    const order: string[] = [];
+    mockState.mcpSetImpl = async () => {
+      await setGate;
+      order.push("hot-mount");
+      return { added: ["docs"], removed: [], errors: {} };
+    };
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+
+    const mounting = manager.hotMountExternalMcpServer("docs", {
+      type: "http",
+      url: "https://docs.example/mcp",
+    });
+    await flushMicrotasks();
+
+    const stopping = manager.stop().then(() => order.push("stop"));
+    // A stop() that does not drain first resolves inside this window, and —
+    // because the fake's close() invalidates the outstanding control request,
+    // as the real one does — the hot-mount then fails instead of completing.
+    await flushMicrotasks(50);
+    releaseSet();
+    await stopping;
+    await mounting;
+
+    expect(order).toEqual(["hot-mount", "stop"]);
+    // The mount completed against a live session, so it was never recorded
+    // as a failure.
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: "docs" }),
+      "External MCP hot-mount failed for live sessions; a later session will retry",
+    );
   });
 
   it("discards a hot-mount result when its session was replaced in flight", async () => {

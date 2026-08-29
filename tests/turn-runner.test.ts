@@ -2,11 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import type { Channel, OutgoingMessage, StopTypingOptions } from "../src/channels/types.js";
 import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 import { isSilentReply } from "../src/agent/text-utils.js";
-import { STEER_MERGED } from "../src/agent/live-session.js";
+import { STEER_MERGED, SdkResultError } from "../src/agent/live-session.js";
 import {
   TurnRunner,
   embeddedSilentMatcher,
   injectTimestamp,
+  originForSource,
   type RunWithRetryRequest,
   type TurnRunnerDeps,
   type TurnSpec,
@@ -119,6 +120,89 @@ describe("injectTimestamp", () => {
 
   it("omits the channel label when none is given", () => {
     expect(injectTimestamp("hi")).toMatch(/^\[[^·]+\] hi$/);
+  });
+});
+
+// SDK error results reach TurnRunner as a rejected turn (SdkResultError), so
+// the spec's `thrown` policy — not the block sink — decides what the chat
+// sees, and the boolean CronScheduler.markRun reads says the turn failed.
+describe("SDK error results through the turn pipeline", () => {
+  const maxTurns = () => new SdkResultError(
+    "I ran out of steps trying to complete that. Can you try a simpler request?",
+    "error_max_turns",
+    ["too many turns"],
+  );
+
+  it("user turn: reports failure, delivers the visible error after the blocks that shipped, records both", async () => {
+    const h = makeHarness(async (req) => {
+      await req.onBlock?.("partial progress");
+      throw maxTurns();
+    });
+
+    const ok = await h.runner.runTurn(replySpec(h));
+
+    expect(ok).toBe(false);
+    expect(h.channel.sent.map((m) => m.text)).toEqual([
+      "partial progress",
+      "[error] I ran out of steps trying to complete that. Can you try a simpler request?",
+    ]);
+    expect(h.transcript.map((t) => t.content)).toEqual([
+      "partial progress",
+      "[error] I ran out of steps trying to complete that. Can you try a simpler request?",
+    ]);
+    expect(h.errorNotes).toHaveLength(1);
+    expect(h.typingStops).toEqual([{ clear: true }]);
+  });
+
+  it("group cron (note-only): nothing reaches the chat, the failure is queued for the next turn, run reported failed", async () => {
+    const h = makeHarness(async () => { throw maxTurns(); });
+
+    const ok = await h.runner.runTurn(sendSpec(h, {
+      key: "telegram:-100group",
+      delivery: { kind: "send", channel: h.channel, chatId: "-100group" },
+      errors: {
+        visiblePrefix: "[error] cron failed: ",
+        response: "note-only",
+        thrown: "note-only",
+        thrownLogMessage: "Cron message handling failed",
+      },
+    }));
+
+    expect(ok).toBe(false);
+    expect(h.channel.sent).toEqual([]);
+    expect(h.errorNotes).toEqual([{
+      sessionKey: "telegram:-100group",
+      visibleError: "[error] cron failed: I ran out of steps trying to complete that. Can you try a simpler request?",
+    }]);
+  });
+
+  it("continuity (ignore): stays silent and reports failure", async () => {
+    const h = makeHarness(async () => { throw new SdkResultError("API Error: 529 overloaded", "success", []); });
+
+    const ok = await h.runner.runTurn(sendSpec(h, {
+      delivery: { kind: "deferred-send", resolveTarget: () => ({ channel: h.channel, chatId: "123" }) },
+      errors: {
+        visiblePrefix: "[error] continuity failed: ",
+        response: "note-only",
+        thrown: "ignore",
+        thrownLogMessage: "Continuity failed",
+      },
+    }));
+
+    expect(ok).toBe(false);
+    expect(h.channel.sent).toEqual([]);
+    expect(h.errorNotes).toEqual([]);
+  });
+});
+
+describe("originForSource", () => {
+  it("stamps channel-relayed user turns as human and harness turns as unclassified", () => {
+    // The SDK fails closed at its strict isHuman() gates when origin is
+    // absent, so a person's message must say so; cron/continuity are not a
+    // person typing and none of the other SDK kinds describes them.
+    expect(originForSource("user")).toEqual({ kind: "human" });
+    expect(originForSource("cron")).toEqual({ kind: "unclassified" });
+    expect(originForSource("continuity")).toEqual({ kind: "unclassified" });
   });
 });
 

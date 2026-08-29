@@ -5,6 +5,7 @@ import {
   type Query,
   type SDKUserMessage,
   type SDKMessage,
+  type SDKMessageOrigin,
 } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
@@ -75,6 +76,88 @@ export type UnownedTurnFactory = () => TurnRequest | undefined;
  */
 export const STEER_MERGED = "";
 export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
+
+/** Fabricated reply for a turn the CLI cut short at the max-turns limit. */
+export const MAX_TURNS_RESPONSE = "I ran out of steps trying to complete that. Can you try a simpler request?";
+/** Fabricated reply for a turn the CLI cut short at the per-query budget. */
+export const MAX_BUDGET_RESPONSE = "I hit the spending limit for this turn before finishing.";
+/** Fabricated reply for a turn that died inside the CLI (`error_during_execution` and friends). */
+export const EXECUTION_ERROR_RESPONSE = "Something went wrong while I was working on that and the turn stopped early.";
+
+/**
+ * The slice of `SDKResultMessage` the result handler reads. Typed by hand
+ * rather than imported so an SDK release that adds result subtypes keeps
+ * compiling — `subtype` is compared as a string and unknown values fall into
+ * the generic execution-error branch.
+ */
+interface SdkResultLike {
+  subtype: string;
+  is_error?: boolean;
+  /** Error subtypes: why the turn stopped. */
+  errors?: string[];
+  /** `success` subtype: the final assistant text — or, with `is_error`, the API error text. */
+  result?: string;
+  num_turns?: number;
+  duration_ms?: number;
+  total_cost_usd?: number;
+  usage?: Record<string, unknown>;
+  modelUsage?: Record<string, {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+  }>;
+  session_id?: string;
+}
+
+interface TokenTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreated: number;
+}
+
+/**
+ * A turn the CLI ended on a non-success result. Thrown (rejected) from
+ * send()/steer() so the failure travels the same path as any other turn
+ * error and TurnRunner's `TurnErrorPolicy` decides what the chat sees —
+ * delivered to a DM, note-only for a group cron, ignored for continuity —
+ * and CronScheduler records the run as failed. `message` is owner-facing
+ * (or, for an API-error result, the API error text, which the delivery
+ * pipeline's `isAgentErrorResponse` already classifies).
+ */
+export class SdkResultError extends Error {
+  constructor(message: string, readonly subtype: string, readonly errors: string[] = []) {
+    super(message);
+    this.name = "SdkResultError";
+  }
+}
+
+/**
+ * Classify a turn-ending result. `null` for a clean success; otherwise the
+ * typed error the turn should reject with.
+ *
+ * The SDK's result union (`SDKResultSuccess | SDKResultError`) is closed
+ * today, but new error subtypes have been added before; every one so far is
+ * `error_*`, so an unrecognised `error_*` subtype is treated as an execution
+ * error rather than as success.
+ */
+export function describeResultFailure(result: SdkResultLike): SdkResultError | null {
+  const errors = result.errors ?? [];
+  switch (result.subtype) {
+    case "success":
+      if (!result.is_error) return null;
+      return new SdkResultError(result.result?.trim() || "API Error: the turn ended on an API error", result.subtype, errors);
+    case "error_max_turns":
+      return new SdkResultError(MAX_TURNS_RESPONSE, result.subtype, errors);
+    case "error_max_budget_usd":
+      return new SdkResultError(MAX_BUDGET_RESPONSE, result.subtype, errors);
+    default:
+      return result.subtype.startsWith("error") || result.is_error
+        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors)
+        : null;
+  }
+}
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
 
@@ -401,6 +484,8 @@ export class LiveSession {
   private alive = true;
   lastResult: QueryResult | null = null;
   private prevTotalCost = 0;
+  /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
+  private prevModelTokens: TokenTotals | null = null;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
   private turnBudget: TurnBudget | undefined;
@@ -840,29 +925,42 @@ export class LiveSession {
     }
 
     if (event.type === "result") {
-      const result = event as unknown as {
-        subtype: string;
-        num_turns?: number;
-        duration_ms?: number;
-        total_cost_usd?: number;
-        usage?: Record<string, unknown>;
-        session_id?: string;
-      };
+      const result = event as unknown as SdkResultLike;
 
       if (result.session_id) {
         this.sessionId = result.session_id;
       }
 
-      const u = result.usage as Record<string, number> | undefined;
-      const input = u?.input_tokens ?? 0;
-      const output = u?.output_tokens ?? 0;
-      const cacheRead = u?.cache_read_input_tokens ?? 0;
-      const cacheCreated = u?.cache_creation_input_tokens ?? 0;
+      // Token accounting. `usage` is the MAIN AGENT LOOP ONLY (per the SDK's
+      // own doc comment) — a turn that fans out to subagents undercounts by
+      // everything they consumed. `modelUsage` covers the whole query
+      // pipeline but is cumulative across turns in a streaming-input session,
+      // so it is differenced against the previous result, like the cost.
+      const { input, output, cacheRead, cacheCreated } = this.turnTokenUsage(result);
 
-      // Compute per-turn cost as delta from cumulative total
+      // Per-turn cost as the delta from the cumulative total. A total that
+      // went BACKWARDS is a reset, not a refund — crash results carry zeroed
+      // totals and a mid-session /clear restarts the running sum — so the
+      // cumulative value is then this turn's own; never persist a negative.
       const totalCost = result.total_cost_usd ?? 0;
-      const turnCost = totalCost - this.prevTotalCost;
+      const turnCost = totalCost >= this.prevTotalCost ? totalCost - this.prevTotalCost : totalCost;
       this.prevTotalCost = totalCost;
+
+      // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
+      // successful one. `subtype` names why the CLI stopped early (max turns,
+      // budget, an execution error); `is_error` on a `success` result marks a
+      // turn that ended on an API error, with the error text in `result`.
+      // Neither throws: the SDK yields these like any other result, so
+      // without this branch they resolved as ordinary turns — the owner got
+      // partial text or the generic "I'm not sure how to respond to that.",
+      // cron recorded a clean run, and nothing was logged.
+      const failure = describeResultFailure(result);
+      if (failure) {
+        log.warn(
+          { session: this.sessionKey, subtype: result.subtype, errors: result.errors, turns: result.num_turns },
+          "SDK turn ended on an error result",
+        );
+      }
 
       // Store result stats, get context usage, then resolve
       this.lastResult = {
@@ -890,7 +988,13 @@ export class LiveSession {
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;
       if (this.pendingSteers.length === 0) this.clearActivityTimeout();
-      await req?.resolve(response);
+      // A failed turn REJECTS its owner (blocks already shipped stay shipped;
+      // the sink flushes their transcript slots on the rejection path) rather
+      // than resolving with a note the block sink would deliver as if the
+      // model had said it — bypassing the turn's error policy and reporting
+      // a clean run to cron.
+      if (failure) await req?.reject(failure);
+      else await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
       this.mergedRequests = [];
       this.currentRequest = null;
@@ -1023,6 +1127,44 @@ export class LiveSession {
     }
   }
 
+  /**
+   * Per-turn token counts for this result. Prefers `modelUsage` (whole query
+   * pipeline, cumulative — differenced against the previous result) and
+   * falls back to `usage` (main loop only, already per-turn) when a result
+   * carries no `modelUsage` (older CLIs, crash results with zeroed totals).
+   */
+  private turnTokenUsage(result: SdkResultLike): TokenTotals {
+    const models = result.modelUsage ? Object.values(result.modelUsage) : [];
+    if (models.length > 0) {
+      const cumulative = models.reduce<TokenTotals>((acc, m) => ({
+        input: acc.input + (m.inputTokens ?? 0),
+        output: acc.output + (m.outputTokens ?? 0),
+        cacheRead: acc.cacheRead + (m.cacheReadInputTokens ?? 0),
+        cacheCreated: acc.cacheCreated + (m.cacheCreationInputTokens ?? 0),
+      }), { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 });
+      const prev = this.prevModelTokens;
+      this.prevModelTokens = cumulative;
+      // A counter that went backwards means the CLI reset its totals (a
+      // resume, a /clear); the cumulative value is then this turn's own.
+      const delta = (now: number, before: number) => (now >= before ? now - before : now);
+      return prev
+        ? {
+          input: delta(cumulative.input, prev.input),
+          output: delta(cumulative.output, prev.output),
+          cacheRead: delta(cumulative.cacheRead, prev.cacheRead),
+          cacheCreated: delta(cumulative.cacheCreated, prev.cacheCreated),
+        }
+        : cumulative;
+    }
+    const u = result.usage as Record<string, number> | undefined;
+    return {
+      input: u?.input_tokens ?? 0,
+      output: u?.output_tokens ?? 0,
+      cacheRead: u?.cache_read_input_tokens ?? 0,
+      cacheCreated: u?.cache_creation_input_tokens ?? 0,
+    };
+  }
+
   private async logContextUsage(
     result: { subtype: string; num_turns?: number; duration_ms?: number },
     turnCost: number, totalCost: number,
@@ -1133,6 +1275,7 @@ export class LiveSession {
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
     onBlock?: (block: string) => void | Promise<void>,
     onBlockAbandoned?: () => void,
+    origin?: SDKMessageOrigin,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -1140,7 +1283,17 @@ export class LiveSession {
 
     return new Promise<string>((resolve, reject) => {
       const req: MessageRequest = {
-        message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null },
+        message: {
+          type: "user",
+          message: { role: "user", content: content as never },
+          parent_tool_use_id: null,
+          // Provenance. The SDK treats an absent origin as unattributed and
+          // fails closed at its strict isHuman() gates, so a host relaying a
+          // person's message must stamp {kind:"human"} explicitly; harness
+          // turns (cron, continuity) carry their own kind. Omitted when the
+          // caller gives none, which keeps the unattributed behaviour.
+          ...(origin ? { origin } : {}),
+        },
         resolve,
         reject,
         ...(onBlock ? { onBlock } : {}),
@@ -1168,9 +1321,10 @@ export class LiveSession {
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
     onBlock?: (block: string) => void | Promise<void>,
     onBlockAbandoned?: () => void,
+    origin?: SDKMessageOrigin,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -1182,7 +1336,13 @@ export class LiveSession {
         // priority "next" is the CLI's default for queued commands; set it
         // explicitly so mid-turn injection (drained at tool boundaries via
         // getCommandsByMaxPriority("next")) doesn't depend on the default.
-        message: { type: "user", message: { role: "user", content: content as never }, parent_tool_use_id: null, priority: "next" },
+        message: {
+          type: "user",
+          message: { role: "user", content: content as never },
+          parent_tool_use_id: null,
+          priority: "next",
+          ...(origin ? { origin } : {}),
+        },
         resolve,
         reject,
         ...(onBlock ? { onBlock } : {}),

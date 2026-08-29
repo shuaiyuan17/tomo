@@ -64,6 +64,10 @@ export const mockSdk = {
    *  message (one-shot) — simulates SDK session errors like "No conversation
    *  found" that trip runWithRetry's reset-and-retry branch. */
   failNextQuery: null as string | null,
+  /** Merged into the next turn's `result` event (one-shot) — e.g.
+   *  `{ subtype: "error_max_turns", is_error: true, errors: [...] }` to
+   *  simulate the CLI ending a turn on an error result. */
+  nextResult: null as Record<string, unknown> | null,
   queryControllers: [] as MockQueryController[],
   mcpServerSets: [] as Array<Record<string, unknown>>,
   /** Every prompt the mock received, tagged with the session it ran on
@@ -80,6 +84,7 @@ export function resetMockSdk(): void {
   mockSdk.steerEcho = false;
   mockSdk.contextUsage = { totalTokens: 5000, maxTokens: 200000 };
   mockSdk.failNextQuery = null;
+  mockSdk.nextResult = null;
   mockSdk.queryControllers = [];
   mockSdk.mcpServerSets = [];
   mockSdk.promptsBySession = [];
@@ -148,9 +153,11 @@ function enqueueAssistantTurnEvents(
     });
   }
 
+  const resultOverride = mockSdk.nextResult;
+  mockSdk.nextResult = null;
   eventQueue.push({
     type: "result",
-    subtype: "end_turn",
+    subtype: "success",
     session_id: "mock-sdk-session-123",
     total_cost_usd: 0.001,
     num_turns: 1,
@@ -161,6 +168,7 @@ function enqueueAssistantTurnEvents(
       cache_read_input_tokens: 0,
       cache_creation_input_tokens: 0,
     },
+    ...(resultOverride ?? {}),
   });
 
   wakeConsumer();

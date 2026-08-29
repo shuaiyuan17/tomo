@@ -4212,3 +4212,111 @@ describe("imsg shutdown quiesces rows that are mid-parse", () => {
     }
   });
 });
+
+// --- Bare-handle targets ------------------------------------------------------
+//
+// imsg's `send` takes EITHER `chat_guid` (a chat selector) OR `to` (a phone
+// number / email) — never both, and no bridge op accepts `to` at all. The
+// identity config binds the bare handle, and that form reaches the adapter
+// for fixed iMessage reply policies, cron/proactive sends before any inbound
+// iMessage, and raw `imessage:+1…` targets. Sending it as `chat_guid` was a
+// guaranteed "chat not found".
+
+describe("imsg bare-handle targets", () => {
+  const HANDLE = "+15551234567";
+
+  it("sends plain text to a bare handle via `to`, never `chat_guid`", async () => {
+    const { channel, requests } = makeChannel();
+    await channel.start();
+
+    await channel.send({ chatId: HANDLE, text: "hello" });
+
+    const sends = requests().filter((r) => r.method === "send");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].params).toEqual({ to: HANDLE, text: "hello" });
+    await channel.stop();
+  });
+
+  it("degrades a threaded/effect send to a plain `to` send when no chat GUID is known", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const result = await channel.send({ chatId: HANDLE, text: "threaded?", replyTo: "guid-target", effect: "confetti" });
+
+    const methods = requests().map((r) => r.method);
+    expect(methods).not.toContain("send.rich");
+    expect(requests().find((r) => r.method === "send")?.params).toEqual({ to: HANDLE, text: "threaded?" });
+    // The reply target did not go with it — report the drop.
+    expect(result).toEqual({ threaded: false });
+    await channel.stop();
+  });
+
+  it("resolves a bare handle to the conversation GUID once one has been seen, so rich sends work", async () => {
+    const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    channel.onMessage(vi.fn(async () => true));
+
+    children[0].notifyMessage(inboundMessage({ chat_guid: DM_GUID, sender: HANDLE }));
+    await settle();
+
+    await channel.send({ chatId: HANDLE, text: "threaded!", replyTo: "guid-target" });
+
+    const rich = requests().find((r) => r.method === "send.rich");
+    expect(rich?.params).toMatchObject({ chat_guid: DM_GUID, reply_to: "guid-target" });
+    expect(requests().some((r) => r.method === "send" && "to" in r.params)).toBe(false);
+    await channel.stop();
+  });
+
+  it("sends a plain attachment to a bare handle via `to`", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-handle-"));
+    const file = join(dir, "pic.png");
+    writeFileSync(file, "png");
+    try {
+      await channel.send({ chatId: HANDLE, text: "", photo: file, replyTo: "guid-target" });
+      const methods = requests().map((r) => r.method);
+      expect(methods).not.toContain("send.attachment");
+      expect(requests().find((r) => r.method === "send")?.params).toEqual({ to: HANDLE, file });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      await channel.stop();
+    }
+  });
+
+  it("degrades typing to a no-op for a bare handle with no known conversation", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    const stopTyping = channel.startTyping(HANDLE);
+    await settle();
+    await stopTyping();
+
+    expect(requests().map((r) => r.method)).not.toContain("typing");
+    await channel.stop();
+  });
+
+  it("refuses bridge-only ops for a bare handle with no known conversation, with a clear error", async () => {
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+
+    await expect(channel.reactToMessage(HANDLE, "msg-guid", "love")).rejects.toThrow(/bare handle/);
+    await expect(channel.unsendMessage(HANDLE, "msg-guid")).rejects.toThrow(/bare handle/);
+    expect(requests().map((r) => r.method)).not.toContain("tapback");
+    expect(requests().map((r) => r.method)).not.toContain("message.unsend");
+    await channel.stop();
+  });
+
+  it("routes bridge-only ops for a bare handle through the resolved conversation GUID", async () => {
+    const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    channel.onMessage(vi.fn(async () => true));
+
+    children[0].notifyMessage(inboundMessage({ chat_guid: DM_GUID, sender: HANDLE }));
+    await settle();
+
+    await channel.reactToMessage(HANDLE, "msg-guid", "love");
+    expect(requests().find((r) => r.method === "tapback")?.params).toMatchObject({ chat_guid: DM_GUID });
+    await channel.stop();
+  });
+});

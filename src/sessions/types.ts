@@ -69,6 +69,14 @@ export interface SessionEntry {
   stats: SessionStats;
   /** Reply routing target for unified multi-channel sessions */
   replyTarget?: ReplyTarget;
+  /**
+   * The raw `<channel>:<chatId>` key this entry lived under before it was
+   * re-keyed to a `dm:` identity key (kept across chained migrations). The
+   * identity's removal hands cron jobs back to this key — for iMessage it is
+   * the GUID-shaped key inbound traffic uses, which cannot be rebuilt from
+   * the configured handle.
+   */
+  migratedFrom?: string;
   /** Display title for groups (or any session that has a friendly name). */
   chatTitle?: string;
   /** Known participants (sender names seen) — used to disambiguate groups. */

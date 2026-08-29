@@ -12,7 +12,7 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-import { DELIVERY_TIMEOUT_MS, LiveSession, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -401,10 +401,11 @@ export class LiveSessionManager {
   }
 
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
-    const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped } = req;
+    const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped, origin } = req;
 
+    let session: LiveSession | undefined;
     try {
-      const session = await this.getOrCreateLiveSession(key);
+      session = await this.getOrCreateLiveSession(key);
       // The session was built while we were parked in buildExternalMcpServers
       // and shutdown began in the meantime, so createLiveSession closed it
       // rather than publishing it (see there). Refuse rather than call send()
@@ -414,18 +415,16 @@ export class LiveSessionManager {
       if (this.stopping && !session.isAlive()) {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
-      const response = steer
-        ? await session.steer(prompt, images, documents, onBlock, onBlockAbandoned)
-        : await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
-
-      // Merged into another request's in-flight turn — that turn's owner
-      // does the per-turn bookkeeping (stats, compact triggers) when it
-      // resolves; nothing to record for this caller.
-      if (steer && response === STEER_MERGED) return response;
-
-      this.recordTurnCompletion(key, session);
-      return response;
+      return await this.runTurnOnSession(key, session, steer, () => (steer
+        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin)
+        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin)));
     } catch (err) {
+      // A turn the CLI ended on an error result is NOT a session error:
+      // runTurnOnSession already recorded it; let it through to TurnRunner's
+      // error policy untouched. Never retried — the conversation is intact,
+      // and a re-run would re-send any blocks that already shipped.
+      if (err instanceof SdkResultError) throw err;
+
       const errMsg = err instanceof Error ? err.message : "";
 
       if (this.stopping && errMsg.includes("closed")) {
@@ -446,9 +445,11 @@ export class LiveSessionManager {
         return "NO_REPLY";
       }
 
+      // Legacy: older CLIs threw on the max-turns limit. Current ones yield
+      // an `error_max_turns` result instead, which LiveSession handles.
       if (errMsg.includes("maximum number of turns")) {
         log.warn("Hit max turns, returning partial response");
-        return "I ran out of steps trying to complete that. Can you try a simpler request?";
+        return MAX_TURNS_RESPONSE;
       }
 
       if (errMsg.includes(QUERY_TIMEOUT_ERROR_PREFIX)) {
@@ -509,12 +510,13 @@ export class LiveSessionManager {
           this.deps.clearSdkSessionId(key);
         }
 
-        const session = await this.getOrCreateLiveSession(key);
+        const retrySession = await this.getOrCreateLiveSession(key);
         // Safe to reuse the same sink: the guard above proved it has shipped
         // nothing, so this retry is the first and only delivery of the turn.
-        const response = await session.send(prompt, images, documents, onBlock, onBlockAbandoned);
-        this.recordTurnCompletion(key, session);
-        return response;
+        // Same bookkeeping as the first attempt — a retry that ends on an SDK
+        // error result still ran, and its (new) session id must be kept.
+        return await this.runTurnOnSession(key, retrySession, false, () =>
+          retrySession.send(prompt, images, documents, onBlock, onBlockAbandoned, origin));
       }
 
       throw err;
@@ -526,6 +528,34 @@ export class LiveSessionManager {
    * session-error retry: capture a new SDK session id, persist stats,
    * reload after an external compact, and run the context-pressure check.
    */
+  /**
+   * Run one attempt of a turn on a session and do its completion bookkeeping
+   * on EVERY outcome that means the turn happened: a response, or an SDK
+   * error result (max turns, budget, an execution or API error — the session
+   * is intact, the turn is over, and its session id and stats must be kept,
+   * a first turn that fails included, or it could never be resumed). A
+   * steered message that merged into another request's turn records nothing;
+   * that turn's owner does the bookkeeping. Every other rejection is a
+   * session error and propagates untouched for the caller's retry logic.
+   */
+  private async runTurnOnSession(
+    key: string,
+    session: LiveSession,
+    steer: boolean,
+    attempt: () => Promise<string>,
+  ): Promise<string> {
+    let response: string;
+    try {
+      response = await attempt();
+    } catch (err) {
+      if (err instanceof SdkResultError) this.recordTurnCompletion(key, session);
+      throw err;
+    }
+    if (steer && response === STEER_MERGED) return response;
+    this.recordTurnCompletion(key, session);
+    return response;
+  }
+
   private recordTurnCompletion(key: string, session: LiveSession): void {
     // Capture session ID if new
     const sid = session.getSessionId();

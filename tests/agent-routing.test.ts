@@ -23,6 +23,66 @@ installAgentTestHooks();
 // ===== DM message routing =====
 
 describe("DM message routing", () => {
+  it("falls back to the inbound chat as a unit when the fixed reply channel is not registered", async () => {
+    // Identity pins replies to iMessage, but only Telegram is running (provider
+    // disabled, say). The fallback must move channel AND chat id together —
+    // the old code kept the iMessage handle and handed it to the Telegram bot.
+    resetConfig({
+      identities: [{
+        name: "shuai",
+        channels: { telegram: "12345", imessage: "+15551234567" },
+        replyPolicy: "imessage",
+      }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "Hi there!";
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toHaveLength(1);
+    expect(tg.delivered[0].chatId).toBe("12345");
+    expect(tg.delivered[0].text).toBe("Hi there!");
+
+    await agent.stop();
+  });
+
+  it("refuses to answer a summoned group when the private reply channel is not registered", async () => {
+    // The summon runs the group's messages on the owner's private dm: session
+    // and promises its plain output stays private. With the private channel
+    // (iMessage) down there is nowhere private to reply — the turn must not
+    // run into the group. Before, it did.
+    resetConfig({
+      identities: [{ name: "shuai", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+    };
+    internals.router.summonGroup("telegram", "-100270", "shuai");
+
+    mockSdk.responseFn = () => "private side-note for the owner";
+
+    await tg.simulateMessage(makeMsg({
+      chatId: "-100270",
+      text: "@tomo what did we say in private?",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+    }));
+    await drainQueue(agent);
+
+    expect(tg.delivered).toEqual([]);
+    expect(mockSdk.promptsBySession).toEqual([]);
+
+    await agent.stop();
+  });
+
   it("routes DM and replies on the same channel", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

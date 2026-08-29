@@ -96,8 +96,8 @@ With config `steering` (default on), user messages that arrive mid-turn bypass t
 
 1. Channel receives message → `agent.enqueueMessage()` (serialized per session key)
 2. `handleMessage()` — allowlist check, identity resolution, timestamp injection
-3. `runWithRetry()` → `LiveSession.send()` → SDK query → streamed response
-4. Response sent back through channel (with streaming updates via `createStreamingMessage`)
+3. `runWithRetry()` → `LiveSession.send()` → SDK query; each completed assistant content block ships to the channel as the SDK closes it (no partial-token streaming — `includePartialMessages` stays off)
+4. After the `result` event the joined response drives only the transcript, logging, and silence/error policy (`src/agent/turn-runner.ts`, `src/agent/delivery-pipeline.ts`)
 
 ### Harness Message Envelope
 

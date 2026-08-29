@@ -51,6 +51,64 @@ describe("cron message delivery", () => {
     await agent.stop();
   });
 
+  it("reports a turn the SDK ended on an error result as failed, and delivers the error to a DM", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => "got as far as this";
+    mockSdk.nextResult = { subtype: "error_max_turns", is_error: true, errors: ["too many turns"] };
+
+    const ok = await agent.handleCronMessage("Big task", "telegram:12345");
+
+    // CronScheduler.markRun sees a failed run — not the clean success the
+    // partial text used to report.
+    expect(ok).toBe(false);
+    expect(tg.delivered.map((d) => d.text)).toEqual([
+      "got as far as this",
+      "[error] cron failed: I ran out of steps trying to complete that. Can you try a simpler request?",
+    ]);
+
+    await agent.stop();
+  });
+
+  it("keeps an SDK error result out of a group cron's chat (note-only) while still reporting failure", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.responseFn = () => "seeded";
+    await tg.simulateMessage(makeMsg({ chatId: "-100group", text: "@tomo hi", isGroup: true, isMentioned: true }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    // No text at all this time: the CLI died before the model said anything.
+    mockSdk.responseFn = () => [];
+    mockSdk.nextResult = { subtype: "error_during_execution", is_error: true, errors: ["boom"] };
+
+    const ok = await agent.handleCronMessage("Group digest", "telegram:-100group");
+
+    expect(ok).toBe(false);
+    // Scheduled infrastructure failures must never be posted into a group.
+    expect(tg.delivered).toEqual([]);
+
+    // The failure is briefed to the next turn on that session instead.
+    mockSdk.responseFn = () => "next";
+    mockSdk.userContents = [];
+    await tg.simulateMessage(makeMsg({ chatId: "-100group", text: "@tomo again", isGroup: true, isMentioned: true }));
+    await drainQueue(agent);
+    const nextPrompt = mockSdk.userContents.map((c) => c.map((b) => b.text ?? "").join("")).join("\n");
+    expect(nextPrompt).toContain("cron failed");
+    expect(nextPrompt).toContain("stopped early");
+
+    await agent.stop();
+  });
+
   it("delivers cron response to channel: session", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

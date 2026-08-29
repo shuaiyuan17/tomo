@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { IdentityRouter } from "../src/router.js";
+import { rawSessionKeyForBinding } from "../src/sessions/keys.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { SummonStore } from "../src/sessions/summon-store.js";
 import { mkdirSync, rmSync } from "node:fs";
@@ -370,6 +371,78 @@ describe("IdentityRouter", () => {
       // Old key should be unlinked, new key should have the session
       expect(sessions.getSdkSessionId("dm:frank")).toBe("session-old");
       expect(sessions.getSdkSessionId("telegram:111")).toBeUndefined();
+    });
+
+    it("migrates a GUID-keyed iMessage session bound by bare handle", () => {
+      // Inbound iMessage sessions are keyed by chat GUID, while the identity
+      // binds the bare handle — the two never compare equal as strings.
+      sessions.setSdkSessionId("imessage:any;-;+15551234567", "session-imsg");
+      sessions.setSdkSessionId("imessage:any;+;groupguid", "session-group");
+
+      const router = new IdentityRouter(
+        [{ name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+
+      const result = router.resolve("imessage", "any;-;+15551234567", false);
+      expect(result.sessionKey).toBe("dm:ivy");
+      expect(sessions.getSdkSessionId("dm:ivy")).toBe("session-imsg");
+      expect(sessions.getSdkSessionId("imessage:any;-;+15551234567")).toBeUndefined();
+      // Groups are never migration candidates.
+      expect(sessions.getSdkSessionId("imessage:any;+;groupguid")).toBe("session-group");
+    });
+
+    it("can hand cron jobs back to the GUID-keyed iMessage session after the raw GUID → dm: lifecycle", () => {
+      // Raw GUID-keyed session → identity added → one-candidate migration
+      // re-keys it in place (no raw entry survives) → identity removed. The
+      // restore key must be the GUID the next inbound iMessage turn will use.
+      sessions.setSdkSessionId("imessage:any;-;+15551234567", "session-imsg");
+      const identity = { name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
+      const router = new IdentityRouter([identity], sessions, {});
+      router.resolve("imessage", "any;-;+15551234567", false);
+      expect(sessions.getEntry("imessage:any;-;+15551234567")).toBeUndefined();
+
+      expect(rawSessionKeyForBinding("imessage", "+15551234567", sessions.listAllSessions()))
+        .toBe("imessage:any;-;+15551234567");
+    });
+
+    it("follows the conversation to its current GUID when it moved after migration (SMS → iMessage)", () => {
+      sessions.setSdkSessionId("imessage:SMS;-;+15551234567", "session-sms");
+      const identity = { name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
+      const router = new IdentityRouter([identity], sessions, {});
+      router.resolve("imessage", "SMS;-;+15551234567", false);
+      // The contact turned on iMessage; the same handle now arrives under a
+      // different chat GUID and the router keeps the reply target current.
+      router.resolve("imessage", "iMessage;-;+15551234567", false);
+
+      expect(sessions.getEntry("dm:ivy")?.migratedFrom).toBe("imessage:SMS;-;+15551234567");
+      expect(rawSessionKeyForBinding("imessage", "+15551234567", sessions.listAllSessions(), "dm:ivy"))
+        .toBe("imessage:iMessage;-;+15551234567");
+    });
+
+    it("recovers the iMessage restore key from the persisted reply target when nothing was migrated", () => {
+      // The dm: session was born unified (identity configured before the
+      // first message): no migratedFrom, but resolve() persisted the GUID the
+      // router last replied to.
+      const identity = { name: "Jo", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
+      const router = new IdentityRouter([identity], sessions, {});
+      router.resolve("imessage", "iMessage;-;+15551234567", false);
+      sessions.setSdkSessionId("dm:jo", "session-jo");
+
+      expect(rawSessionKeyForBinding("imessage", "+15551234567", sessions.listAllSessions()))
+        .toBe("imessage:iMessage;-;+15551234567");
+    });
+
+    it("prefers the migrated-from key over an unchosen, unlinked raw candidate", () => {
+      sessions.setSdkSessionId("imessage:any;-;+15551234567", "session-chosen");
+      sessions.setSdkSessionId("imessage:SMS;-;+15551234567", "session-other");
+      // `tomo config` picked the first and unlinked the second.
+      sessions.migrateSessionKey("imessage:any;-;+15551234567", "dm:kim");
+      sessions.clearSdkSessionId("imessage:SMS;-;+15551234567");
+
+      expect(rawSessionKeyForBinding("imessage", "+15551234567", sessions.listAllSessions()))
+        .toBe("imessage:any;-;+15551234567");
     });
 
     it("does not migrate if unified key already has a session", () => {

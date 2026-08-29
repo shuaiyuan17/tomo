@@ -70,6 +70,22 @@ const KNOWN_COMMANDS = new Set(["new", "model", "restore", "login", "mcp", "stat
  * else — the only shape eligible for a rich link preview send (send.rich's
  * url mode carries no accompanying text).
  */
+/**
+ * imsg addresses a conversation two ways, and the params are mutually
+ * exclusive: `chat_guid` (a chat selector — what inbound events carry and what
+ * sessions are keyed by, e.g. "any;-;+15551234567") or, for the plain `send`
+ * only, `to` (a bare phone number or email). The bare form is the identity
+ * config's binding and reaches this adapter for fixed iMessage reply
+ * policies, cron/proactive sends before any inbound iMessage, and raw
+ * `imessage:+1…` targets. Every bridge op (send.rich, send.attachment,
+ * send.sticker, typing, tapback, edit, unsend, rename) takes only a chat
+ * selector, so a handle must first be resolved to a known GUID or the op
+ * degraded. A handle is anything without the GUID's `;` separators.
+ */
+export function isImsgChatGuid(chatId: string): boolean {
+  return chatId.includes(";");
+}
+
 function isBareHttpUrl(part: string): boolean {
   const trimmed = part.trim();
   return /^https?:\/\/\S+$/i.test(trimmed);
@@ -495,6 +511,19 @@ export class ImsgChannel implements Channel {
     // report the drop rather than let the caller retire it on a no-op.
     if (!text) return message.replyTo ? { threaded: false } : undefined;
 
+    // A bare handle can only take the plain `send` (`to`). Resolve it to the
+    // conversation's GUID when one is known so rich sends still work; else
+    // every bridge route below is skipped and the text goes out plain.
+    const chatGuid = this.resolveChatGuid(message.chatId);
+    const bridgeAddressable = chatGuid !== null;
+    const chatId = chatGuid ?? message.chatId;
+    if (!bridgeAddressable && (message.replyTo || message.effect)) {
+      log.info(
+        { chatId: message.chatId },
+        "imsg target is a bare handle with no known chat GUID; sending plain (reply target/effect dropped)",
+      );
+    }
+
     // Only a `send.rich` that actually carried `reply_to` threads anything.
     // Every other route out of this loop — bridge down, a rich refusal, a
     // continuation chunk — lands on the plain `send` below, which has no
@@ -513,15 +542,15 @@ export class ImsgChannel implements Channel {
           ...(message.effect ? { effect: message.effect } : {}),
         }
         : null;
-      if (richParams && this.capabilities.advancedFeatures) {
+      if (richParams && this.capabilities.advancedFeatures && bridgeAddressable) {
         try {
           const result = await this.request("send.rich", {
-            chat_guid: message.chatId,
+            chat_guid: chatId,
             text: chunk,
             ...richParams,
             part_index: 0,
           });
-          this.recordOwnSend(message.chatId, result, chunk);
+          this.recordOwnSend(chatId, result, chunk);
           if (message.replyTo) threaded = true;
           continue;
         } catch (err) {
@@ -531,16 +560,16 @@ export class ImsgChannel implements Channel {
           // dying; resending the text plain would double-deliver, so
           // propagate instead: prefer a missing message over a duplicate.
           if (!(err instanceof ImsgRpcResponseError)) throw err;
-          log.warn({ err, chatId: message.chatId }, "imsg rich send refused; falling back to plain send");
+          log.warn({ err, chatId }, "imsg rich send refused; falling back to plain send");
         }
-      } else if (richParams) {
+      } else if (richParams && bridgeAddressable) {
         // Bridge down per the cached snapshot → this goes out plain, as
         // before (the effect is silently dropped — a structured field, so
         // nothing can leak into the visible text). Kick a rate-limited
         // background re-probe so a bridge that has since come up (#258)
         // restores rich sends for the next send.
         this.maybeReprobeCapabilities();
-      } else if (isBareHttpUrl(chunk)) {
+      } else if (isBareHttpUrl(chunk) && bridgeAddressable) {
         // A part that is exactly one URL: send it as an Apple rich link
         // preview when the injected bridge supports it (the balloon iMessage
         // renders when a human shares a link), else leave it a plain text
@@ -548,7 +577,7 @@ export class ImsgChannel implements Channel {
         // (no text/reply_to/effect), which is why this branch is mutually
         // exclusive with the rich-text branch above.
         if (this.richLinksSupported()) {
-          if (await this.trySendRichLink(message.chatId, chunk.trim())) continue;
+          if (await this.trySendRichLink(chatId, chunk.trim())) continue;
         } else {
           // Snapshot lacks the rich-link selectors. Unlike a missing edit
           // selector (an OS limit), this state heals: a Messages relaunch
@@ -560,16 +589,16 @@ export class ImsgChannel implements Channel {
           // still answers ping — Messages must actually quit first.)
           this.maybeReprobeCapabilities({ evenIfBridged: true });
           log.info(
-            { chatId: message.chatId, ...this.capabilityGateDiagnosis(null, ["urlPreviewMessage", "sendRichLinkAction"]) },
+            { chatId, ...this.capabilityGateDiagnosis(null, ["urlPreviewMessage", "sendRichLinkAction"]) },
             "imsg rich link preview unavailable; sending the URL as plain text",
           );
         }
       }
       const result = await this.request("send", {
-        chat_guid: message.chatId,
+        ...this.imsgTarget(chatId),
         text: chunk,
       });
-      this.recordOwnSend(message.chatId, result, chunk);
+      this.recordOwnSend(chatId, result, chunk);
     }
     // The text shipped, but if it shipped PLAIN the reply target did not go
     // with it: the AppleScript `send` has no reply_to. Returning nothing here
@@ -612,24 +641,54 @@ export class ImsgChannel implements Channel {
   }
 
   recentMessages(chatId: string): RecentChatMessage[] {
+    // Own sends to a bare handle are recorded under the handle itself (no
+    // GUID was known to key them by), so look for an exact ring first.
     const exact = this.recentByChat.get(chatId);
     if (exact) return [...exact];
-    if (chatId.includes(";")) return [];
-    // Callers may address a DM by bare handle (the config identity form,
-    // e.g. "+15551234567") while the ring is keyed by chat GUID
-    // ("any;-;+15551234567") — match on the GUID's identifier part.
+    const guid = this.resolveChatGuid(chatId);
+    return guid ? [...(this.recentByChat.get(guid) ?? [])] : [];
+  }
+
+  /**
+   * The chat GUID for a target: the target itself when it already is one,
+   * else the GUID of the DM conversation with that handle, if this process
+   * has seen one (inbound events and own sends both key the recent-message
+   * ring by GUID). `null` when the handle has no known conversation yet —
+   * the plain `send` still reaches it via `to`, bridge ops cannot.
+   */
+  private resolveChatGuid(chatId: string): string | null {
+    if (isImsgChatGuid(chatId)) return chatId;
     const want = this.normalizeAddress(chatId);
-    for (const [key, ring] of this.recentByChat) {
+    for (const key of this.recentByChat.keys()) {
       const parts = key.split(";");
       if (parts.length < 3 || parts[1] === "+") continue; // groups are GUID-addressed
-      if (this.normalizeAddress(parts.slice(2).join(";")) === want) return [...ring];
+      if (this.normalizeAddress(parts.slice(2).join(";")) === want) return key;
     }
-    return [];
+    return null;
+  }
+
+  /** The `send` RPC's target params for a GUID or a bare handle (see isImsgChatGuid). */
+  private imsgTarget(chatId: string): { chat_guid: string } | { to: string } {
+    return isImsgChatGuid(chatId) ? { chat_guid: chatId } : { to: chatId };
+  }
+
+  /**
+   * The chat GUID a bridge-only op needs, or a clear refusal: with only a bare
+   * handle and no conversation seen yet, there is no `chat_guid` to pass and
+   * `to` is not accepted by any bridge method.
+   */
+  private requireChatGuid(chatId: string, op: string): string {
+    const guid = this.resolveChatGuid(chatId);
+    if (guid) return guid;
+    throw new Error(
+      `iMessage ${op} needs an existing conversation: "${chatId}" is a bare handle and no chat with it `
+      + "has been seen yet. It becomes addressable once a message is exchanged with that contact.",
+    );
   }
 
   async setChatTitle(chatId: string, title: string): Promise<void> {
     // Requires the IMCore bridge (imsg launch).
-    await this.request("group.rename", { chat_guid: chatId, name: title });
+    await this.request("group.rename", { chat_guid: this.requireChatGuid(chatId, "rename"), name: title });
   }
 
   async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove = false): Promise<void> {
@@ -640,7 +699,7 @@ export class ImsgChannel implements Channel {
     // ignored and defaulted every tapback to 👍 — confirmed on-device.) Our
     // MessageReaction enum values map 1:1 to imsg's --kind values.
     await this.request("tapback", {
-      chat_guid: chatId,
+      chat_guid: this.requireChatGuid(chatId, "tapback"),
       message_guid: messageId,
       kind: reaction,
       remove,
@@ -683,7 +742,7 @@ export class ImsgChannel implements Channel {
       );
     }
     await this.request("message.edit", {
-      chat_guid: chatId,
+      chat_guid: this.requireChatGuid(chatId, "edit"),
       message_guid: messageId,
       text,
       // Shown as a follow-up bubble on recipients too old to render edits.
@@ -706,7 +765,7 @@ export class ImsgChannel implements Channel {
     // unsend within 2 minutes of sending; recipients see a "message was
     // unsent" notice. Bridge/selector failures surface as RPC errors.
     await this.request("message.unsend", {
-      chat_guid: chatId,
+      chat_guid: this.requireChatGuid(chatId, "unsend"),
       message_guid: messageId,
       part_index: 0,
     });
@@ -728,6 +787,14 @@ export class ImsgChannel implements Channel {
       this.maybeReprobeCapabilities();
       return () => {};
     }
+    // The `typing` RPC takes only a chat selector; a bare handle with no
+    // conversation seen yet has none, so the indicator degrades to a no-op.
+    const typingGuid = this.resolveChatGuid(chatId);
+    if (!typingGuid) {
+      log.debug({ chatId }, "imsg typing skipped: bare handle with no known chat GUID");
+      return () => {};
+    }
+    chatId = typingGuid;
 
     let sealed = false;
     let tickInFlight: Promise<void> | null = null;
@@ -1851,8 +1918,12 @@ export class ImsgChannel implements Channel {
       return replyTo ? { threaded: false } : undefined;
     }
 
+    // send.attachment is bridge-only (chat selector); the plain `send` file
+    // param also accepts a bare handle via `to`.
+    const resolvedGuid = this.resolveChatGuid(chatGuid);
+    if (resolvedGuid) chatGuid = resolvedGuid;
     let threaded = false;
-    if (replyTo && this.attachmentReplyToSupported()) {
+    if (replyTo && resolvedGuid && this.attachmentReplyToSupported()) {
       try {
         await this.request("send.attachment", { chat_guid: chatGuid, file: filePath, reply_to: replyTo });
         threaded = true;
@@ -1864,6 +1935,8 @@ export class ImsgChannel implements Channel {
         if (!(err instanceof ImsgRpcResponseError)) throw err;
         log.warn({ err, chatId: chatGuid }, "imsg threaded attachment send refused; falling back to an unthreaded send");
       }
+    } else if (replyTo && !resolvedGuid) {
+      log.info({ chatId: chatGuid }, "imsg target is a bare handle with no known chat GUID; sending the attachment unthreaded");
     } else if (replyTo) {
       // Bridge down (or an imsg too old for send.attachment): the picture
       // still ships, unthreaded. Kick a rate-limited re-probe so a bridge that
@@ -1878,7 +1951,7 @@ export class ImsgChannel implements Channel {
     if (!threaded) {
       // The plain `send` file param works on the AppleScript transport — no
       // bridge required (send.attachment is bridge-only).
-      await this.request("send", { chat_guid: chatGuid, file: filePath });
+      await this.request("send", { ...this.imsgTarget(chatGuid), file: filePath });
     }
 
     if (caption) {
@@ -1971,7 +2044,11 @@ export class ImsgChannel implements Channel {
       return;
     }
 
-    if (this.stickerSendSupported()) {
+    // send.sticker is bridge-only; a bare handle with no known conversation
+    // takes the plain attachment route below via `to`.
+    const resolvedGuid = this.resolveChatGuid(chatGuid);
+    if (resolvedGuid) chatGuid = resolvedGuid;
+    if (this.stickerSendSupported() && resolvedGuid) {
       try {
         const result = await this.request("send.sticker", { chat_guid: chatGuid, file: filePath });
         this.recordOwnSend(chatGuid, result, `[sticker: ${basename(filePath)}]`);
@@ -1999,6 +2076,8 @@ export class ImsgChannel implements Channel {
           log.warn({ err, chatId: chatGuid }, "imsg sticker send refused; falling back to a plain image attachment");
         }
       }
+    } else if (!resolvedGuid) {
+      log.info({ chatId: chatGuid }, "imsg target is a bare handle with no known chat GUID; sending the sticker as a plain image attachment");
     } else {
       // Snapshot lacks the sticker surface. When the bridge itself is down
       // this is the usual stale-snapshot case (#258); when the bridge is up
@@ -2016,7 +2095,7 @@ export class ImsgChannel implements Channel {
         "imsg native sticker send unavailable; sending as a plain image attachment",
       );
     }
-    const result = await this.request("send", { chat_guid: chatGuid, file: filePath });
+    const result = await this.request("send", { ...this.imsgTarget(chatGuid), file: filePath });
     this.recordOwnSend(chatGuid, result, `[sticker: ${basename(filePath)}]`);
   }
 

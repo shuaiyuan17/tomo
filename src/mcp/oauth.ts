@@ -102,6 +102,12 @@ export interface ExternalMcpServerStatus {
  */
 export type TokenRefreshOutcome = "refreshed" | "failed" | "skipped" | "superseded";
 
+/** Internal result of one refresh-token exchange (see refreshStoredToken). */
+type TokenRefreshResult =
+  | { outcome: "refreshed"; token: OAuthTokenRecord }
+  | { outcome: "superseded"; token: OAuthTokenRecord | undefined }
+  | { outcome: "failed"; error: unknown };
+
 export interface McpLoginStart {
   url: string;
   reused: boolean;
@@ -151,13 +157,16 @@ export class McpOAuthManager {
   private serverFailures = new Map<string, { error: string; at: number }>();
   private chatCallbackCompletions = new Set<string>();
   /**
-   * One non-interactive refresh per TOKEN STORE KEY (not per server): several
-   * configured servers may share one `oauth.tokenStoreKey`, and an issuer that
-   * rotates refresh tokens invalidates the old one on first use — so two
-   * servers refreshing "their own" token would spend the same rotating
-   * credential twice and lose it.
+   * One refresh-token exchange per TOKEN STORE KEY (not per server), covering
+   * EVERY path that can spend one: the background sweep, the 401 backstop and
+   * the session-build path inside getFreshToken. Several configured servers
+   * may share one `oauth.tokenStoreKey`, and an issuer that rotates refresh
+   * tokens invalidates the old one on first use — so two servers refreshing
+   * "their own" token would spend the same rotating credential twice and lose
+   * it. Single-flighting only the sweep would leave two concurrent
+   * `/mcp login`s (or two sibling session builds) racing exactly that way.
    */
-  private tokenRefreshes = new Map<string, Promise<TokenRefreshOutcome>>();
+  private tokenRefreshes = new Map<string, Promise<TokenRefreshResult>>();
 
   constructor(options: McpOAuthManagerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -179,7 +188,7 @@ export class McpOAuthManager {
         continue;
       }
 
-      const build = this.getOrStartServerAuthBuild(name, entry, sendAuthorizeUrl);
+      const build = this.getOrStartServerAuthBuild(name, entry, servers, sendAuthorizeUrl);
       const outcome = options.authorizationWaitMs === undefined
         ? await this.waitForAuthBuild(build.promise)
         : await this.waitForAuthBuild(build.promise, options.authorizationWaitMs);
@@ -248,7 +257,7 @@ export class McpOAuthManager {
       }
     }
 
-    const build = this.getOrStartServerAuthBuild(serverName, entry, async () => {}, true);
+    const build = this.getOrStartServerAuthBuild(serverName, entry, servers, async () => {}, true);
     const url = build.authorizeUrl ?? await build.authorizeUrlReady;
     if (!url) {
       await build.promise;
@@ -305,6 +314,7 @@ export class McpOAuthManager {
   private getOrStartServerAuthBuild(
     serverName: string,
     entry: ExternalMcpServerConfig,
+    servers: Record<string, ExternalMcpServerConfig>,
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
     forceInteractive = false,
   ): ServerAuthBuild {
@@ -338,7 +348,7 @@ export class McpOAuthManager {
         // failure must never turn a successfully stored token into an OAuth
         // failure. The host owns logging and next-session fallback behavior.
         void Promise.resolve()
-          .then(() => this.onServerAuthReady?.(serverName, server))
+          .then(() => this.notifyAuthReady(serverName, server, entry, servers))
           .catch(() => {});
         return server;
       })
@@ -452,41 +462,102 @@ export class McpOAuthManager {
     // An interactive build for ANY server sharing this store key owns the
     // credential; joining in would race a browser flow against a refresh.
     if (this.hasAuthBuildForStoreKey(servers, storeKey)) return "skipped";
-    const inFlight = this.tokenRefreshes.get(storeKey);
-    if (inFlight) return inFlight;
 
-    const existing = this.readStore().mcpOAuth?.[storeKey];
-    if (!existing?.refreshToken) return "skipped";
-    if (options.onlyIfExpiring && !this.isExpiring(existing)) return "skipped";
+    // ADOPT an exchange already in flight for this key rather than spending
+    // the refresh token a second time: two sibling servers hitting 401
+    // together, or a 401 landing on top of the sweep, must produce ONE
+    // exchange between them and both be told its outcome.
+    const joined = this.tokenRefreshes.get(storeKey);
+    let result: TokenRefreshResult;
+    if (joined) {
+      result = await joined;
+    } else {
+      const existing = this.readStore().mcpOAuth?.[storeKey];
+      if (!existing?.refreshToken) return "skipped";
+      if (options.onlyIfExpiring && !this.isExpiring(existing)) return "skipped";
+      result = await this.refreshStoredToken(storeKey, existing, oauth);
+    }
 
     // Every server bound to this key gets the new header, not just the one
     // whose 401 (or sweep slot) triggered the exchange.
     const targets = serversSharingStoreKey(servers, storeKey);
-    const run = (async (): Promise<TokenRefreshOutcome> => {
+    if (result.outcome === "refreshed") {
+      for (const target of targets) {
+        this.serverFailures.delete(target.name);
+        await this.onServerAuthReady?.(target.name, withBearer(target.server, result.token.accessToken));
+      }
+      return "refreshed";
+    }
+    if (result.outcome === "failed") {
+      const message = errorMessage(result.error);
+      for (const target of targets) this.serverFailures.set(target.name, { error: message, at: this.now() });
+      return "failed";
+    }
+    return "superseded";
+  }
+
+  /**
+   * THE ONLY PLACE a stored refresh token is spent. Single-flighted per store
+   * key and written compare-and-set, so concurrent callers — sweep, 401
+   * backstop, two sibling session builds, two `/mcp login`s on one key —
+   * perform exactly one exchange between them and none of them can overwrite
+   * a record that moved underneath.
+   */
+  private refreshStoredToken(
+    storeKey: string,
+    existing: OAuthTokenRecord,
+    oauth: McpOAuthConfig,
+  ): Promise<TokenRefreshResult> {
+    const inFlight = this.tokenRefreshes.get(storeKey);
+    if (inFlight) return inFlight;
+
+    const run = (async (): Promise<TokenRefreshResult> => {
       try {
         const refreshed = await this.refreshToken(existing, oauth);
         // COMPARE-AND-SET. A `/mcp login` (or another writer) may have stored
         // a newer record for this key while our exchange was in flight.
         // Overwriting it would replace a known-good credential with one
         // derived from a refresh token that login very likely just rotated
-        // away. Discard our result instead — the writer that won already
-        // notified its own listeners.
-        if (!this.writeTokenIfUnchanged(storeKey, refreshed, existing.updatedAt)) return "superseded";
-        for (const target of targets) {
-          this.serverFailures.delete(target.name);
-          await this.onServerAuthReady?.(target.name, withBearer(target.server, refreshed.accessToken));
+        // away. Discard our result instead and report the record that won.
+        if (!this.writeTokenIfUnchanged(storeKey, refreshed, existing.updatedAt)) {
+          return { outcome: "superseded", token: this.readStore().mcpOAuth?.[storeKey] };
         }
-        return "refreshed";
-      } catch (err) {
-        const message = errorMessage(err);
-        for (const target of targets) this.serverFailures.set(target.name, { error: message, at: this.now() });
-        return "failed";
+        return { outcome: "refreshed", token: refreshed };
+      } catch (error) {
+        return { outcome: "failed", error };
       } finally {
         this.tokenRefreshes.delete(storeKey);
       }
     })();
     this.tokenRefreshes.set(storeKey, run);
     return run;
+  }
+
+  /**
+   * Announce a freshly authenticated server, then every SIBLING bound to the
+   * same `tokenStoreKey`. One interactive login stores one record that all of
+   * them authenticate with, so notifying only the server whose build ran
+   * leaves the siblings holding the header they were mounted with. They
+   * cannot self-heal from that: the sweep sees a fresh record and skips the
+   * key, and an authorization-code grant need not even return a refresh
+   * token, so the 401 backstop may have nothing to spend.
+   */
+  private async notifyAuthReady(
+    serverName: string,
+    server: McpServerConfig,
+    entry: ExternalMcpServerConfig,
+    servers: Record<string, ExternalMcpServerConfig>,
+  ): Promise<void> {
+    await this.onServerAuthReady?.(serverName, server);
+
+    const storeKey = entry.oauth?.tokenStoreKey;
+    if (!storeKey || !this.onServerAuthReady) return;
+    const token = this.readStore().mcpOAuth?.[storeKey];
+    if (!token) return;
+    for (const target of serversSharingStoreKey(servers, storeKey)) {
+      if (target.name === serverName) continue;
+      await this.onServerAuthReady(target.name, withBearer(target.server, token.accessToken));
+    }
   }
 
   /** Is an interactive/refresh build running for any server on this store key? */
@@ -507,29 +578,33 @@ export class McpOAuthManager {
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
     forceInteractive = false,
   ): Promise<OAuthTokenRecord> {
-    // A background sweep may already be spending this key's refresh token.
-    // Issuers that rotate refresh tokens invalidate the old one on use, so a
-    // second concurrent exchange would throw away the credential we just got.
-    // Keyed by store key: a sibling server sharing the key is the same race.
-    const sweeping = this.tokenRefreshes.get(oauth.tokenStoreKey);
-    if (sweeping) await sweeping;
+    const storeKey = oauth.tokenStoreKey;
+    // Another path may already be spending this key's refresh token. Join it
+    // rather than starting a second exchange: issuers that rotate refresh
+    // tokens invalidate the old one on use. Keyed by store key, so a sibling
+    // server sharing the key is recognised as the same race.
+    const inFlight = this.tokenRefreshes.get(storeKey);
+    if (inFlight) await inFlight;
 
     const store = this.readStore();
-    const existing = store.mcpOAuth?.[oauth.tokenStoreKey];
+    const existing = store.mcpOAuth?.[storeKey];
     if (!forceInteractive && existing && !this.isExpiring(existing)) return existing;
 
     if (!forceInteractive && existing?.refreshToken) {
-      try {
-        const refreshed = await this.refreshToken(existing, oauth);
-        this.writeToken(oauth.tokenStoreKey, refreshed);
-        return refreshed;
-      } catch {
-        // Fall through to a full browser auth flow when refresh is rejected.
-      }
+      const result = await this.refreshStoredToken(storeKey, existing, oauth);
+      if (result.outcome === "refreshed") return result.token;
+      // Someone else's record won the compare-and-set: theirs is the live
+      // credential, so use it instead of re-authorizing behind their back.
+      if (result.outcome === "superseded" && result.token) return result.token;
+      // Refresh rejected — fall through to a full browser auth flow.
     }
 
     const authorized = await this.runAuthorizationCodeFlow(serverName, server, oauth, existing, sendAuthorizeUrl);
-    this.writeToken(oauth.tokenStoreKey, authorized);
+    // An authorization-code grant is a brand-new credential, not a derivative
+    // of the stored one, so it overwrites unconditionally. Any refresh still
+    // in flight for this key is thereby superseded: its compare-and-set is
+    // against the pre-login `updatedAt` and can no longer match.
+    this.writeToken(storeKey, authorized);
     return authorized;
   }
 

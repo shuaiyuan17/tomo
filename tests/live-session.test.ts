@@ -88,7 +88,13 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSession, MAX_MCP_AUTH_REFRESHES_PER_SESSION, STEER_MERGED, SdkResultError } = await import("../src/agent/live-session.js");
+const {
+  LiveSession,
+  MAX_MCP_AUTH_REFRESHES_PER_WINDOW,
+  MCP_AUTH_REFRESH_WINDOW_MS,
+  STEER_MERGED,
+  SdkResultError,
+} = await import("../src/agent/live-session.js");
 const { log } = await import("../src/logger.js");
 const TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -96,6 +102,7 @@ function makeSession(settings?: {
   timeoutMs?: number;
   showThinking?: boolean;
   onMcpAuthError?: (serverName: string) => Promise<string> | string;
+  now?: () => number;
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
@@ -208,22 +215,48 @@ describe("LiveSession MCP authorization errors", () => {
     session.close();
   });
 
-  it("bounds refreshes per server so a misread error cannot loop", async () => {
+  it("bounds refreshes per server inside the rate window", async () => {
     const onMcpAuthError = vi.fn(async () => "refreshed");
-    const { session, harness } = makeSession({ onMcpAuthError });
+    const { session, harness } = makeSession({ onMcpAuthError, now: () => 1_000_000 });
 
-    for (let i = 0; i < MAX_MCP_AUTH_REFRESHES_PER_SESSION + 3; i++) {
+    for (let i = 0; i < MAX_MCP_AUTH_REFRESHES_PER_WINDOW + 3; i++) {
       harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", `t${i}`));
       harness.pushEvent(errorResult(`t${i}`, "unauthorized"));
       await flushMicrotasks(10);
     }
     await flushMicrotasks(20);
 
-    expect(onMcpAuthError).toHaveBeenCalledTimes(MAX_MCP_AUTH_REFRESHES_PER_SESSION);
+    expect(onMcpAuthError).toHaveBeenCalledTimes(MAX_MCP_AUTH_REFRESHES_PER_WINDOW);
     // A different server keeps its own budget.
     harness.pushEvent(assistantToolEvent("mcp__docs__search", "d1"));
     harness.pushEvent(errorResult("d1", "unauthorized"));
     await waitFor(() => onMcpAuthError.mock.calls.some((c) => c[0] === "docs"));
+    session.close();
+  });
+
+  // Codex round 3, finding 3: a lifetime quota would strand a long-lived
+  // session forever — a token stored without `expiresAt` is invisible to the
+  // proactive sweep, so this backstop is the only thing that can renew it.
+  it("allows refreshes again once the rate window has rolled over", async () => {
+    let clock = 1_000_000;
+    const onMcpAuthError = vi.fn(async () => "refreshed");
+    const { session, harness } = makeSession({ onMcpAuthError, now: () => clock });
+
+    for (let i = 0; i < MAX_MCP_AUTH_REFRESHES_PER_WINDOW + 2; i++) {
+      harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", `t${i}`));
+      harness.pushEvent(errorResult(`t${i}`, "unauthorized"));
+      await flushMicrotasks(10);
+    }
+    await flushMicrotasks(20);
+    expect(onMcpAuthError).toHaveBeenCalledTimes(MAX_MCP_AUTH_REFRESHES_PER_WINDOW);
+
+    // Hours later, the same session hits an expired token again.
+    clock += MCP_AUTH_REFRESH_WINDOW_MS + 1;
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "later"));
+    harness.pushEvent(errorResult("later", "unauthorized"));
+    await waitFor(() => onMcpAuthError.mock.calls.length === MAX_MCP_AUTH_REFRESHES_PER_WINDOW + 1);
+
+    expect(onMcpAuthError).toHaveBeenCalledTimes(MAX_MCP_AUTH_REFRESHES_PER_WINDOW + 1);
     session.close();
   });
 

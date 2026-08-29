@@ -69,8 +69,13 @@ vi.mock("../src/agent/live-session.js", () => {
     getSessionId() { return this.sessionId; }
     async setMcpServers(servers: Record<string, unknown>) {
       mockState.mcpSetCalls.push({ session: this, servers });
-      if (mockState.mcpSetImpl) return mockState.mcpSetImpl(servers, this);
-      return { added: Object.keys(servers), removed: [], errors: {} };
+      const result = mockState.mcpSetImpl
+        ? await mockState.mcpSetImpl(servers, this)
+        : { added: Object.keys(servers), removed: [], errors: {} };
+      // The real control request dies with its session: closing the query
+      // while a request is outstanding never delivers a response.
+      if (this.closed) throw new Error("Session is closed");
+      return result;
     }
     async send(prompt: string, _i?: unknown, _d?: unknown, onBlock?: (b: string) => void | Promise<void>) {
       return mockState.sendImpl ? mockState.sendImpl(prompt, this, onBlock) : "ok";
@@ -448,7 +453,7 @@ describe("LiveSessionManager session lifecycle", () => {
     );
   });
 
-  it("drains an in-flight hot-mount before stop() returns", async () => {
+  it("drains an in-flight hot-mount before stop() closes its session", async () => {
     let releaseSet!: () => void;
     const setGate = new Promise<void>((resolve) => { releaseSet = resolve; });
     const order: string[] = [];
@@ -467,14 +472,21 @@ describe("LiveSessionManager session lifecycle", () => {
     await flushMicrotasks();
 
     const stopping = manager.stop().then(() => order.push("stop"));
-    // A stop() that does not drain the queue resolves during this window;
-    // one that does cannot resolve until releaseSet() runs.
+    // A stop() that does not drain first resolves inside this window, and —
+    // because the fake's close() invalidates the outstanding control request,
+    // as the real one does — the hot-mount then fails instead of completing.
     await flushMicrotasks(50);
     releaseSet();
     await stopping;
     await mounting;
 
     expect(order).toEqual(["hot-mount", "stop"]);
+    // The mount completed against a live session, so it was never recorded
+    // as a failure.
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: "docs" }),
+      "External MCP hot-mount failed for live sessions; a later session will retry",
+    );
   });
 
   it("discards a hot-mount result when its session was replaced in flight", async () => {

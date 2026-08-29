@@ -206,6 +206,8 @@ export interface LiveSessionSettings {
    * does not burn the session's ability to recover afterwards.
    */
   onMcpAuthError?: (serverName: string) => Promise<McpAuthRefreshOutcome> | McpAuthRefreshOutcome;
+  /** Clock for the MCP auth-refresh rate window. Injected by tests. */
+  now?: () => number;
 }
 
 /** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
@@ -213,13 +215,19 @@ export type McpAuthRefreshOutcome = "refreshed" | "failed" | "skipped" | "supers
 
 /**
  * How many token exchanges one session may trigger from tool errors, per
- * server. A genuine expiry needs one per token lifetime and the periodic
- * sweep handles the steady state, so this only has to cover a burst; its real
- * job is to bound the damage when `isMcpAuthErrorText` misreads an unrelated
- * upstream error, since each refresh re-mounts the server and a self-feeding
- * loop would otherwise exchange a token per failing tool call.
+ * server, within MCP_AUTH_REFRESH_WINDOW_MS.
+ *
+ * A RATE, not a lifetime quota. Its job is to bound the damage when
+ * `isMcpAuthErrorText` misreads an unrelated upstream error — each refresh
+ * re-mounts the server, so an unbounded path would exchange a token per
+ * failing tool call. A lifetime quota would do that too, but it would also
+ * strand a long-lived session permanently: a token stored without `expiresAt`
+ * is invisible to the proactive sweep (`isExpiring` is false for it), so this
+ * backstop is the ONLY thing that can renew it, and a session outliving the
+ * quota would never recover.
  */
-export const MAX_MCP_AUTH_REFRESHES_PER_SESSION = 3;
+export const MAX_MCP_AUTH_REFRESHES_PER_WINDOW = 3;
+export const MCP_AUTH_REFRESH_WINDOW_MS = 60 * 60 * 1000;
 
 /**
  * Does a failed MCP tool result look like an expired/rejected access token?
@@ -540,8 +548,9 @@ export class LiveSession {
   private onMcpAuthError: LiveSessionSettings["onMcpAuthError"];
   /** Servers with a refresh attempt in flight — no duplicate concurrent asks. */
   private mcpAuthRefreshInFlight = new Set<string>();
-  /** Per-server count of exchanges this session has actually triggered. */
-  private mcpAuthRefreshAttempts = new Map<string, number>();
+  /** Per-server timestamps of exchanges actually triggered, pruned to the window. */
+  private mcpAuthRefreshAttempts = new Map<string, number[]>();
+  private now: () => number;
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -578,6 +587,7 @@ export class LiveSession {
     this.timeoutMs = normalizeTimeoutMs(settings.timeoutMs);
     this.showThinking = settings.showThinking ?? false;
     this.onMcpAuthError = settings.onMcpAuthError;
+    this.now = settings.now ?? Date.now;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -1150,8 +1160,7 @@ export class LiveSession {
     const serverName = mcpServerFromToolName(toolName);
     if (!serverName || !isMcpAuthErrorText(resultText)) return;
     if (this.mcpAuthRefreshInFlight.has(serverName)) return;
-    const attempts = this.mcpAuthRefreshAttempts.get(serverName) ?? 0;
-    if (attempts >= MAX_MCP_AUTH_REFRESHES_PER_SESSION) return;
+    if (this.recentMcpAuthRefreshes(serverName).length >= MAX_MCP_AUTH_REFRESHES_PER_WINDOW) return;
 
     this.mcpAuthRefreshInFlight.add(serverName);
     log.info({ serverName, tool: toolName }, "MCP tool rejected for authorization; requesting a token refresh");
@@ -1164,17 +1173,27 @@ export class LiveSession {
         // already re-mounted) leave the budget untouched, so a transient
         // token-endpoint failure or a 401 during /mcp login does not cost
         // this session its ability to recover later.
-        if (outcome === "refreshed" || outcome === "failed") {
-          this.mcpAuthRefreshAttempts.set(serverName, attempts + 1);
-        }
+        if (outcome === "refreshed" || outcome === "failed") this.chargeMcpAuthRefresh(serverName);
         log.info({ serverName, outcome }, "MCP token refresh after an auth error settled");
       } catch (err) {
-        this.mcpAuthRefreshAttempts.set(serverName, attempts + 1);
+        this.chargeMcpAuthRefresh(serverName);
         log.warn({ serverName, err }, "MCP auth-error notification threw");
       } finally {
         this.mcpAuthRefreshInFlight.delete(serverName);
       }
     })();
+  }
+
+  /** This server's exchanges inside the rate window, pruning older ones. */
+  private recentMcpAuthRefreshes(serverName: string): number[] {
+    const cutoff = this.now() - MCP_AUTH_REFRESH_WINDOW_MS;
+    const recent = (this.mcpAuthRefreshAttempts.get(serverName) ?? []).filter((at) => at > cutoff);
+    this.mcpAuthRefreshAttempts.set(serverName, recent);
+    return recent;
+  }
+
+  private chargeMcpAuthRefresh(serverName: string): void {
+    this.recentMcpAuthRefreshes(serverName).push(this.now());
   }
 
   /**

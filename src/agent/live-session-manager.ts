@@ -684,14 +684,24 @@ export class LiveSessionManager {
    * record of messages the owner is already holding.
    */
   async stop(): Promise<void> {
-    // Synchronous up to the await: `stopping` is set and every session is
-    // closed (and its in-flight turn rejected) before anything yields, so no
-    // newly arriving turn can slip in and take the retry path. `stopping` is
-    // also the admission gate from here on (runWithRetry) and the
-    // don't-publish flag for a session still under construction
-    // (createLiveSession) — this sweep is one-time, so nothing may be added to
-    // the map behind it.
+    // `stopping` is set synchronously, before ANY await: it is the admission
+    // gate from here on (runWithRetry), the don't-publish flag for a session
+    // still under construction (createLiveSession) and the refusal gate for
+    // new hot-mounts — so nothing may be added behind this one-time sweep,
+    // even though the hot-mount drain below yields before the sessions are
+    // closed.
     this.stopping = true;
+
+    // BEFORE the sessions are closed. `stopping` is already the admission
+    // gate, so nothing new joins the queue and anything queued-but-unstarted
+    // bails at the top of applyExternalMcpHotMount — this waits only on an
+    // operation that is already inside `setMcpServers`. Closing its session
+    // first would invalidate that in-flight control request and leave the
+    // call hanging until the drain budget expired. Bounded by the same budget
+    // as the turn flush; the queue never rejects (hotMountExternalMcpServer
+    // installs a catch), so this cannot throw.
+    await this.awaitHotMountQueue();
+
     // Prompt-stale sessions stay in the map until their idle-boundary
     // retirement, so this loop covers them too.
     for (const [, s] of this.liveSessions) s.close();
@@ -699,12 +709,6 @@ export class LiveSessionManager {
     this.externalMcpServersBySession.clear();
     this.mcpServerConfigsBySession.clear();
     this.promptStale.clear();
-    // Let a hot-mount that was already in flight finish before the daemon
-    // exits, so it cannot run its setMcpServers against a torn-down session
-    // while later shutdown steps are draining. Bounded by the same budget as
-    // the turn flush; the queue never rejects (hotMountExternalMcpServer
-    // installs a catch), so this cannot throw.
-    await this.awaitHotMountQueue();
     await this.awaitInFlightFlush();
   }
 

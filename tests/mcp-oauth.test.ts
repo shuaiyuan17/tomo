@@ -1021,6 +1021,139 @@ describe("McpOAuthManager", () => {
       expect(stored.refreshToken).toBe("login-refresh");
     });
 
+    // Codex round 3, finding 1: the build path (getFreshToken) never
+    // registered its own exchange, so two sibling session builds could spend
+    // the same rotating refresh token concurrently.
+    it("performs one exchange when two servers sharing a key are built concurrently", async () => {
+      const tokenStorePath = seedStore({
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      const alpha: Record<string, ExternalMcpServerConfig> = {
+        alpha: {
+          server: { type: "http", url: "https://alpha.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+      };
+      const beta: Record<string, ExternalMcpServerConfig> = {
+        beta: {
+          server: { type: "http", url: "https://beta.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+      };
+      let releaseToken!: () => void;
+      const tokenGate = new Promise<void>((resolve) => { releaseToken = resolve; });
+      const refreshTokensSent: string[] = [];
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async (_input, init) => {
+          refreshTokensSent.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
+          await tokenGate;
+          return new Response(JSON.stringify({
+            access_token: "fresh-access",
+            refresh_token: "rotated-refresh",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+      });
+
+      // Two sessions building sibling servers at the same instant.
+      const building = Promise.all([
+        manager.buildServersWithAuth(alpha, async () => { throw new Error("no browser flow expected"); }),
+        manager.buildServersWithAuth(beta, async () => { throw new Error("no browser flow expected"); }),
+      ]);
+      releaseToken();
+      const [alphaServers, betaServers] = await building;
+
+      expect(refreshTokensSent).toEqual(["refresh-1"]);
+      expect(alphaServers.alpha).toMatchObject({ headers: { Authorization: "Bearer fresh-access" } });
+      expect(betaServers.beta).toMatchObject({ headers: { Authorization: "Bearer fresh-access" } });
+      expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.cloudflare.refreshToken)
+        .toBe("rotated-refresh");
+    });
+
+    // Codex round 3, finding 2.
+    it("hot-mounts every server sharing the key when one of them completes a login", async () => {
+      resetDir();
+      const secretsDir = join(TEST_DIR, "secrets");
+      mkdirSync(secretsDir, { recursive: true });
+      const tokenStorePath = join(secretsDir, "mcp-oauth.json");
+      const shared: Record<string, ExternalMcpServerConfig> = {
+        alpha: {
+          server: { type: "http", url: "https://alpha.example/mcp" },
+          oauth: {
+            authorizationServer: "https://auth.example",
+            clientId: "client-123",
+            scopes: [],
+            tokenStoreKey: "cloudflare",
+          },
+        },
+        beta: {
+          server: { type: "http", url: "https://beta.example/mcp", headers: { "X-Static": "yes" } },
+          oauth: {
+            authorizationServer: "https://auth.example",
+            clientId: "client-123",
+            scopes: [],
+            tokenStoreKey: "cloudflare",
+          },
+        },
+      };
+      const ready: Array<{ name: string; auth: string }> = [];
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async (input) => {
+          if (String(input).includes(".well-known/oauth-authorization-server")) {
+            return new Response(JSON.stringify({
+              authorization_endpoint: "https://auth.example/authorize",
+              token_endpoint: "https://auth.example/token",
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          if (String(input) === "https://auth.example/token") {
+            // An authorization-code grant need not return a refresh token —
+            // which is exactly why beta cannot self-heal from a 401 later.
+            return new Response(JSON.stringify({
+              access_token: "login-access",
+              token_type: "Bearer",
+              expires_in: 3600,
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          throw new Error(`unexpected fetch ${String(input)}`);
+        },
+        onServerAuthReady: (name, server) => {
+          ready.push({
+            name,
+            auth: (server as { headers?: Record<string, string> }).headers?.Authorization ?? "",
+          });
+        },
+      });
+
+      await manager.startLogin("alpha", shared);
+      await expect(manager.completeAuthorizationFromChat("code=login-code")).resolves.toMatchObject({
+        status: "completed",
+        serverName: "alpha",
+      });
+      // The notification is detached from the build promise.
+      await vi.waitFor(() => expect(ready).toHaveLength(2));
+
+      expect(ready).toEqual([
+        { name: "alpha", auth: "Bearer login-access" },
+        { name: "beta", auth: "Bearer login-access" },
+      ]);
+      // Sibling keeps its own static headers alongside the new bearer.
+      const betaReady = ready.find((r) => r.name === "beta");
+      expect(betaReady).toBeDefined();
+    });
+
     it("coalesces a concurrent sweep and 401 into a single token exchange", async () => {
       const tokenStorePath = seedStore({
         accessToken: "old-access",

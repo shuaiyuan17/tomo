@@ -20,6 +20,7 @@ import {
   recordFabricatedMarkers,
   type FabricatedMarker,
 } from "./inbound-markers.js";
+import { silentTurnSteerNote } from "../continuity-defaults.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
@@ -63,6 +64,16 @@ export interface TurnRequest {
    * block is outstanding when this fires.
    */
   onBlockAbandoned?: () => void;
+  /**
+   * This turn's own reply text never reaches a chat (the host ran it with
+   * `suppressDelivery` — a heartbeat, an LCM rollup, a context nudge).
+   *
+   * Read by `steer()`: a user message injected into a turn like this is
+   * answered in reply text that is about to be dropped, so the injected text
+   * carries a note telling the model to answer with `send_message` instead.
+   * Nothing else in the session behaves differently.
+   */
+  silentDelivery?: boolean;
 }
 
 export interface MessageRequest extends TurnRequest {
@@ -1451,6 +1462,8 @@ export class LiveSession {
     onBlock?: (block: string, outgoing?: string) => void | Promise<void>,
     onBlockAbandoned?: () => void,
     origin?: SDKMessageOrigin,
+    /** This turn's reply text will not be delivered (see TurnRequest). */
+    silentDelivery?: boolean,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -1473,6 +1486,7 @@ export class LiveSession {
         reject,
         ...(onBlock ? { onBlock } : {}),
         ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
+        ...(silentDelivery ? { silentDelivery } : {}),
       };
       // Rejects only if the session dies before the claim; once claimed, the
       // turn's own resolve/reject settle this promise.
@@ -1497,6 +1511,11 @@ export class LiveSession {
     onBlock?: (block: string, outgoing?: string) => void | Promise<void>,
     onBlockAbandoned?: () => void,
     origin?: SDKMessageOrigin,
+    /** Where this message must be ANSWERED when the turn it joins is silent —
+     *  the GROUP key for a summoned-group message, whose turn runs on the
+     *  owner's dm: session. One entry per item, in the batch's own numbering
+     *  order, for a coalesced batch. Defaults to this session's own key. */
+    audience?: string[],
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
     if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin);
@@ -1504,7 +1523,33 @@ export class LiveSession {
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
 
-    const content = buildContentBlocks(text, images, documents);
+    // THE TURN THIS IS JOINING MAY BE SILENT. A steered message is answered in
+    // the in-flight turn's reply text, and a turn started with
+    // `suppressDelivery` (heartbeat, LCM rollup, context nudge) never puts its
+    // reply text on the owner's phone — so the answer to a question asked
+    // mid-heartbeat used to vanish, with only "Cron output suppressed from
+    // chat delivery" in the log. The note travels with the message because
+    // that is the only place the model reliably reads it (owner's suggestion,
+    // 2026-08-28).
+    //
+    // Best-effort by construction: if the CLI finds no tool boundary left it
+    // queues this message and runs it as its OWN turn instead, whose reply
+    // text does ship. The note is then merely redundant — the model answers
+    // via send_message and stays silent in reply text — which is the cheap
+    // side of the trade against an answer nobody ever sees.
+    //
+    // WHOSE QUESTION IT IS decides the target, not whose session is running:
+    // a summoned-group message runs on the owner's dm: session behind a summon
+    // reminder that says "reply in the group", and this note lands after it.
+    // Naming the session key here would win by position and answer the group
+    // privately to the owner, leaving the asker with nothing — the same
+    // silence this change exists to fix, one audience over.
+    const targets = audience?.length ? audience : (this.sessionKey ? [this.sessionKey] : []);
+    const injected = this.currentRequest?.silentDelivery === true && targets.length > 0
+      ? `${text}\n${silentTurnSteerNote(targets)}`
+      : text;
+
+    const content = buildContentBlocks(injected, images, documents);
 
     return new Promise<string>((resolve, reject) => {
       const req: MessageRequest = {
@@ -1523,7 +1568,9 @@ export class LiveSession {
         ...(onBlock ? { onBlock } : {}),
         ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
       };
-      this.pendingSteers.push({ req, text });
+      // Keyed on the text the CLI actually received (note included) — that is
+      // what it echoes back, and matchSteerEchoes compares verbatim.
+      this.pendingSteers.push({ req, text: injected });
       this.pushInput(req.message);
     });
   }

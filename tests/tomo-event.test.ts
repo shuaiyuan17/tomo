@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  appendToTomoEventBody,
   formatTomoEvent,
   parseTomoEvent,
   stripLeadingTomoEvents,
@@ -166,5 +167,84 @@ describe("isHarnessEventText — tolerant dual-format reader", () => {
     expect(isHarnessEventText("hey what's up")).toBe(false);
     expect(isHarnessEventText("the System: prefix is legacy now")).toBe(false);
     expect(isHarnessEventText("[via satellite +1555] hello")).toBe(false);
+  });
+});
+
+/**
+ * `appendToTomoEventBody` exists so a sentence added to an already-wrapped
+ * harness event lands INSIDE the envelope. Everything downstream keys off that:
+ * LCM's `isWarmTailCandidate` strips leading envelopes and classifies what is
+ * left, so a line outside the closing tag turns a silent housekeeping nudge
+ * into "conversation" and burns a fresh-tail slot — and persists in the SDK
+ * JSONL as if the user had typed it.
+ */
+describe("appendToTomoEventBody", () => {
+  const NOTE = "Your reply text is not delivered to the user; to send a message, use send_message.";
+
+  it("writes into the body, preserving attributes and the original ts", () => {
+    const event = formatTomoEvent("lcm-rollup", "An LCM rollup is due.", { name: "daily 2026-08-28" });
+    const ts = parseTomoEvent(event)!.ts;
+
+    const out = appendToTomoEventBody(event, NOTE);
+
+    expect(out.endsWith("</tomo-event>")).toBe(true);
+    const parsed = parseTomoEvent(out)!;
+    expect(parsed.type).toBe("lcm-rollup");
+    expect(parsed.name).toBe("daily 2026-08-28");
+    expect(parsed.ts).toBe(ts);
+    expect(parsed.body).toBe(`An LCM rollup is due.\n${NOTE}`);
+    // Nothing survives the strip — the message is still, entirely, a harness event.
+    expect(stripLeadingTomoEvents(out)).toBe("");
+  });
+
+  it("tolerates leading whitespace instead of falling out of the envelope", () => {
+    const event = `\n  ${formatTomoEvent("cron", "Scheduled task fired.", { name: "job" })}`;
+
+    const out = appendToTomoEventBody(event, NOTE);
+
+    expect(out.startsWith("\n  <tomo-event")).toBe(true);
+    expect(out.trimEnd().endsWith("</tomo-event>")).toBe(true);
+    expect(parseTomoEvent(out.trimStart())!.body).toBe(`Scheduled task fired.\n${NOTE}`);
+    expect(stripLeadingTomoEvents(out.trimStart())).toBe("");
+  });
+
+  it("leaves anything after the envelope where it is", () => {
+    const event = formatTomoEvent("cron", "Scheduled task fired.", { name: "job" });
+    const reminder = formatTomoEvent("summon-reminder", "Reply in the group.");
+
+    const out = appendToTomoEventBody(`${event}\n${reminder}`, NOTE);
+
+    expect(parseTomoEvent(out)!.body).toBe(`Scheduled task fired.\n${NOTE}`);
+    expect(out.endsWith(`\n${reminder}`)).toBe(true);
+    expect(stripLeadingTomoEvents(out)).toBe("");
+  });
+
+  it("wraps the line in its own envelope when there is nothing to append into", () => {
+    // Plain text and a malformed (unterminated) envelope both land here. Bare
+    // text would reinstate the misclassification this function exists to
+    // prevent, so the fallback is an envelope of its own, not a naked line.
+    for (const input of ["Scheduled task fired.", "<tomo-event type=\"cron\">\nunterminated"]) {
+      const out = appendToTomoEventBody(input, NOTE);
+      expect(out).toContain('<tomo-event type="note"');
+      expect(out.endsWith("</tomo-event>")).toBe(true);
+      expect(out.endsWith(`\n${NOTE}`)).toBe(false);
+      // The added line contributes nothing conversational: strip the envelopes
+      // and only the caller's own (already-classified) text remains.
+      expect(stripLeadingTomoEvents(out.slice(input.length).trimStart())).toBe("");
+    }
+  });
+
+  it("is idempotent — a second pass adds nothing", () => {
+    const event = formatTomoEvent("lcm-rollup", "An LCM rollup is due.", { name: "daily" });
+
+    const once = appendToTomoEventBody(event, NOTE);
+    expect(appendToTomoEventBody(once, NOTE)).toBe(once);
+
+    // Same for a producer that already composed the sentence into its own body
+    // (heartbeats do exactly this), and for the no-envelope fallback.
+    const composed = formatTomoEvent("heartbeat", `It is Fri. ${NOTE}`);
+    expect(appendToTomoEventBody(composed, NOTE)).toBe(composed);
+    const plain = `Scheduled task fired. ${NOTE}`;
+    expect(appendToTomoEventBody(plain, NOTE)).toBe(plain);
   });
 });

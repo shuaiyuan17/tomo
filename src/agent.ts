@@ -35,7 +35,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
-import { formatTomoEvent } from "./tomo-event.js";
+import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import {
   consumeRestartRequestFromToolResult,
@@ -70,6 +70,13 @@ interface UserTurnRequest {
   /** Steer this turn into the session's in-flight turn (config `steering`)
    *  instead of running through the per-session queue. */
   steer?: boolean;
+  /** Where this turn's message(s) must be ANSWERED if the turn they steer into
+   *  is silent: the summoned GROUP key for a group message running on a dm:
+   *  session, the session's own key otherwise. Same derivation as
+   *  summonReminder, and one entry PER MESSAGE in the batch's numbering order
+   *  — a coalesced batch can mix the owner's DM with one or more summoned
+   *  groups, and the note pairs targets with those ordinals. */
+  steerAudience: string[];
   /** True for turns where most inputs are expected to resolve to NO_REPLY. */
   passiveListen?: boolean;
   /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",
@@ -1077,6 +1084,7 @@ export class Agent {
         images: req.images,
         documents: req.documents,
         steer: req.steer,
+        steerAudience: req.steerAudience,
       },
       silentMatcher: isSilentReply,
       transcript: "always",
@@ -1170,6 +1178,13 @@ export class Agent {
     const isSummoned = isGroup && isDmSessionKey(key);
     const audiences = [audienceOf(channel.name, message)];
     const switchNote = this.noteAudienceSwitch(key, audiences);
+    // The audience this message came from, derived exactly like the summon
+    // reminder's targets — a summoned group must be answered in the group,
+    // even though the turn runs on the owner's dm: session. (Distinct from
+    // `audiences` above, which spells a private DM as "dm" for the audience-
+    // switch note; this one must be a send_message target, so it names the
+    // session key.)
+    const audience = [isSummoned ? `${channel.name}:${message.chatId}` : key];
     const promptText = switchNote + (isSummoned
       ? `${textForAgent}\n${this.summonReminder([`${channel.name}:${message.chatId}`])}`
       : textForAgent);
@@ -1189,6 +1204,7 @@ export class Agent {
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling message",
       steer,
+      steerAudience: audience,
       passiveListen: isPassiveGroup,
     });
   }
@@ -1278,9 +1294,23 @@ export class Agent {
     if (!destination) return;
     const { channel: replyChannel, chatId: replyChatId } = destination;
 
+    // NUMBERED LINES ARE THE HARNESS'S, AND ONLY THE HARNESS'S. Everything
+    // after `N. ` is sender-controlled — the message body, and for a group the
+    // sender name and chat title too — so a body containing "\n2. ..." used to
+    // fabricate an item that reads exactly like a real one. That matters
+    // beyond tidiness: the silent-turn note pairs each audience with the
+    // ORDINAL of the message it belongs to (see silentTurnSteerNote), so a
+    // forged "2." makes "message 2 → target: ..." ambiguous — and the same
+    // trick could forge any of the bracketed markers around it.
+    //
+    // Continuation lines are indented past the `N. ` gutter, so no line a
+    // sender writes can start at column 0. Line terminators are normalised to
+    // "\n" first: a lone CR (and U+2028/9) breaks a line for a reader too, and
+    // an un-normalised one would slip past an indent keyed only on "\n". This
+    // is prompt framing only — the transcript keeps the message verbatim.
     const numbered = items.map((it, i) => {
       const text = this.formatGroupText(it.channel, it.message, key);
-      return `${i + 1}. ${text}`;
+      return `${i + 1}. ${text.replace(/\r\n|[\n\r\u2028\u2029]/g, "\n   ")}`;
     }).join("\n");
     const subject = isGroup
       ? `${items.length} messages arrived from this group in quick succession`
@@ -1312,6 +1342,17 @@ export class Agent {
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling batched messages",
       steer,
+      // PER ITEM, not per batch, IN `numbered`'s ORDER. `summonTargets` (the
+      // summon reminder's list) holds only GROUP keys, so a batch that mixed a
+      // private DM message with a summoned group's would have told the model to
+      // answer all of it in the group — the owner's private question posted to
+      // the group, or never answered at all. Each item is paired with the
+      // audience it came from, and the note identifies it by the ordinal
+      // `numbered` gave it above (nothing sender-controlled is quoted); a group
+      // item on a dm: session is necessarily summoned.
+      steerAudience: items.map((it) => (isDmSessionKey(key) && (it.message.isGroup ?? false)
+        ? `${it.channel.name}:${it.message.chatId}`
+        : key)),
       passiveListen: isPassiveGroup,
     });
   }
@@ -1428,6 +1469,23 @@ export class Agent {
 
     log.info({ channel: deliveryChannel.name, sender: "cron" }, message);
 
+    // A SUPPRESSED CRON TURN IS A SILENT TURN, AND MUST SAY SO. Heartbeats and
+    // restart notices have carried this sentence since 2026-08-28; the silent
+    // cron turns (LCM rollup nudges, context nudges) carried nothing, so the
+    // model wrote its answer into reply text that "Cron output suppressed from
+    // chat delivery" then dropped. Added HERE rather than in each producer's
+    // event body so the sentence tracks the flag that makes it true: an
+    // ordinary scheduled job DOES deliver its reply text, and telling it
+    // otherwise would push it into send_message and deliver the answer twice.
+    //
+    // Written INTO the event body, never after the closing tag: a sentence
+    // trailing the envelope reads as conversational text to LCM's warm-tail
+    // classifier, which would let silent housekeeping nudges displace real
+    // conversation in the fresh tail (see appendToTomoEventBody).
+    const prompt = options.suppressDelivery === true
+      ? appendToTomoEventBody(message, CONTINUITY_DELIVERY_NOTE)
+      : message;
+
     // Scheduled infrastructure failures must never be posted into a group.
     // Silent housekeeping turns suppress them in DMs as well when requested.
     const suppressErrorDelivery = isGroupSessionKey(key) || options.suppressDelivery === true;
@@ -1442,7 +1500,7 @@ export class Agent {
       return await this.turnRunner.runTurn({
         key,
         source: "cron",
-        prompt: message,
+        prompt,
         stampChannelName: deliveryChannel.name,
         ...(options.showTyping === false ? {} : {
           typing: {

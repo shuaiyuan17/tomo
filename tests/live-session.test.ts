@@ -468,6 +468,58 @@ describe("LiveSession steering", () => {
     expect(harness.priorities[1]).toBe("next");
   });
 
+  /**
+   * A user message steered into a turn whose OWN output is suppressed
+   * (heartbeat, LCM rollup, context nudge) is answered in that turn's reply
+   * text — which the host drops before it reaches the chat ("Cron output
+   * suppressed from chat delivery"). The model has to be told, on the message
+   * itself, that send_message is the only way to answer it.
+   */
+  it("tells a steered message it landed in a silent turn", async () => {
+    const { session, harness } = makeSession();
+
+    const p1 = session.send("heartbeat", undefined, undefined, undefined, undefined, undefined, true);
+    await waitFor(() => harness.inputs.length === 1);
+
+    const p2 = session.steer("what's on my calendar?");
+    await waitFor(() => harness.inputs.length === 2);
+
+    expect(harness.inputs[1]).toBe(
+      "what's on my calendar?\n[harness: this message arrived during a silent turn — "
+      + "your reply text will NOT be delivered. Answer it with send_message "
+      + "(target: test:session, mode: direct).]",
+    );
+
+    // The CLI echoes back what it received — note included — so merge
+    // detection still recognises it.
+    harness.pushEvent(userEcho(harness.inputs[1]));
+    harness.pushEvent(assistantEvent("done"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("done");
+    await expect(p2).resolves.toBe(STEER_MERGED);
+  });
+
+  it("leaves a steered message alone when the in-flight turn does deliver", async () => {
+    const { session, harness } = makeSession();
+
+    // No silentDelivery: an ordinary user (or plain cron) turn ships its
+    // reply text, so the steered question is answered in the chat as before.
+    const p1 = session.send("first");
+    await waitFor(() => harness.inputs.length === 1);
+
+    const p2 = session.steer("what's on my calendar?");
+    await waitFor(() => harness.inputs.length === 2);
+
+    expect(harness.inputs[1]).toBe("what's on my calendar?");
+    expect(harness.inputs[1]).not.toContain("[harness:");
+
+    harness.pushEvent(userEcho("what's on my calendar?"));
+    harness.pushEvent(assistantEvent("nothing until 3pm"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("nothing until 3pm");
+    await expect(p2).resolves.toBe(STEER_MERGED);
+  });
+
   it("ignores non-replay user events for merge detection", async () => {
     const { session, harness } = makeSession();
 

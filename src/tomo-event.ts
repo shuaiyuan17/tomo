@@ -42,7 +42,9 @@ export type TomoEventType =
   | "audience"         // audience switch/check on a dm session (name = switch|check)
   | "errors"           // recent harness errors surfaced as operational context
   | "direct-send"      // echo of an earlier direct send into this conversation
-  | "delegate";        // compose-and-send request from another session
+  | "delegate"         // compose-and-send request from another session
+  | "note";            // bare harness aside with no producer of its own
+                       //   (appendToTomoEventBody's fallback wrapper)
 
 export interface TomoEventOptions {
   /** Optional discriminator, e.g. the cron job name. Omit when meaningless. */
@@ -160,6 +162,45 @@ export function parseTomoEvent(text: string): ParsedTomoEvent | null {
     ...(attrs.has("ts") ? { ts: attrs.get("ts") } : {}),
     body: unescapeBody(m[2]),
   };
+}
+
+/**
+ * Append a line to the body of the envelope at the START of `text`, in place.
+ *
+ * INSIDE THE ENVELOPE, NOT AFTER IT. A sentence appended after `</tomo-event>`
+ * is, to every reader downstream, ordinary conversational text: LCM's
+ * `isWarmTailCandidate` strips the leading envelopes and classifies whatever
+ * is left, so a silent housekeeping nudge with a trailing note would consume a
+ * warm-tail slot meant for something the owner actually said — and the
+ * sentence would persist in the SDK JSONL as if the user had typed it.
+ * Heartbeats never had this problem because they compose the sentence into
+ * their body BEFORE wrapping (see continuity.ts); this is the same thing for
+ * producers that hand over an already-wrapped event.
+ *
+ * The envelope's attributes (including its original `ts`) are preserved
+ * byte-for-byte, leading whitespace is kept, and anything AFTER the envelope —
+ * a second envelope such as the summon reminder — is left where it is.
+ *
+ * NO ENVELOPE TO APPEND INTO (plain text, or a malformed/unterminated one):
+ * the line is wrapped in its own minimal `note` envelope rather than added as
+ * bare text. Bare text would reinstate exactly the warm-tail misclassification
+ * this function exists to prevent, and "the input was not what we expected" is
+ * not a reason to write conversation into the model's context.
+ *
+ * IDEMPOTENT: text that already carries `extra` is returned untouched, so a
+ * prompt that passes through twice (a summoned background turn re-entering
+ * processCronMessage, a producer that already composed the sentence into its
+ * own body) does not accumulate duplicate lines.
+ */
+export function appendToTomoEventBody(text: string, extra: string): string {
+  const prefix = text.slice(0, text.length - text.trimStart().length);
+  const rest = text.slice(prefix.length);
+  const m = LEADING_ENVELOPE_RE.exec(rest);
+  if (!m) return text.includes(extra) ? text : `${text}\n${formatTomoEvent("note", extra)}`;
+  const tail = rest.slice(m[0].length);
+  const body = unescapeBody(m[2]);
+  if (body.includes(extra)) return text;
+  return `${prefix}<tomo-event${m[1]}>\n${escapeBody(`${body}\n${extra}`)}\n</tomo-event>${tail}`;
 }
 
 /**

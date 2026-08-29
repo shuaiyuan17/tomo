@@ -17,8 +17,18 @@ export interface RunWithRetryRequest {
   images?: Array<{ data: string; mediaType: string }>;
   documents?: Array<{ data: string; mediaType: string; filename?: string }>;
   steer?: boolean;
+  /** Audience for the silent-turn note on a steered message (see
+   *  ReplyTurnDelivery.steerAudience). */
+  steerAudience?: string[];
   /** Provenance stamped on the SDK user message (see `originForSource`). */
   origin?: SDKMessageOrigin;
+  /**
+   * This turn's own reply text will never reach the chat (`suppressDelivery`).
+   * Carried down to the LiveSession so a user message steered INTO this turn
+   * can be told that answering in reply text delivers nothing — see
+   * LiveSession.steer.
+   */
+  silentDelivery?: boolean;
   /** Receives ONE completed delivery unit the moment the SDK closes it —
    *  while the turn is still running, not after it ends (LiveSession's
    *  TurnRequest.onBlock). Awaited, so blocks ship in model order. */
@@ -76,6 +86,15 @@ export interface ReplyTurnDelivery {
   documents?: IncomingMessage["documents"];
   /** Steer into the session's in-flight turn instead of queueing one. */
   steer?: boolean;
+  /**
+   * Where the steered message(s) must be ANSWERED if the turn they join turns
+   * out to be silent — the GROUP key for a summoned-group message (which runs
+   * on the owner's dm: session), this session's key otherwise. ONE ENTRY PER
+   * MESSAGE, in the same order the batch numbers them, because the note refers
+   * to them by ordinal. Steer-only; nothing else reads it. See
+   * LiveSession.steer.
+   */
+  steerAudience?: string[];
 }
 
 /** Delivery to a target resolved before the turn (cron turns). */
@@ -269,12 +288,18 @@ export class TurnRunner {
         key: spec.key,
         prompt,
         origin: originForSource(spec.source),
+        silentDelivery: isSuppressed(delivery),
         onBlock: sink.onBlock,
         onBlockAbandoned: sink.onBlockAbandoned,
         hasShipped: sink.hasShipped,
         flushOnShutdown: sink.flushBlockTranscript,
         ...(reply
-          ? { images: reply.images, documents: reply.documents, steer: reply.steer }
+          ? {
+            images: reply.images,
+            documents: reply.documents,
+            steer: reply.steer,
+            steerAudience: reply.steerAudience,
+          }
           : {}),
       });
     } catch (err) {

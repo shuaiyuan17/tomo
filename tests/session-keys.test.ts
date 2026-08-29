@@ -69,10 +69,14 @@ describe("identity binding matchers", () => {
   });
 
   it("hands cron jobs back to the key inbound traffic actually uses, else the literal binding", () => {
-    const known = ["imessage:any;-;+15551234567", "telegram:111", "dm:shuai"];
-    expect(rawSessionKeyForBinding("imessage", "+15551234567", known)).toBe("imessage:any;-;+15551234567");
-    expect(rawSessionKeyForBinding("telegram", "111", known)).toBe("telegram:111");
+    const entries = [
+      { channelKey: "dm:shuai", migratedFrom: "imessage:any;-;+15551234567", replyTarget: { channelName: "imessage", chatId: "any;-;+15551234567" } },
+      { channelKey: "telegram:111" },
+      { channelKey: "imessage:any;+;groupguid", replyTarget: { channelName: "imessage", chatId: "any;+;groupguid" } },
+    ];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries)).toBe("imessage:any;-;+15551234567");
+    expect(rawSessionKeyForBinding("telegram", "111", entries)).toBe("telegram:111");
     // No conversation seen yet: a chat GUID cannot be synthesised from a handle.
-    expect(rawSessionKeyForBinding("imessage", "+15550000000", known)).toBe("imessage:+15550000000");
+    expect(rawSessionKeyForBinding("imessage", "+15550000000", entries)).toBe("imessage:+15550000000");
   });
 });

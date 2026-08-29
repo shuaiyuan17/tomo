@@ -80,15 +80,47 @@ export function legacySessionKeysForBinding(keys: Iterable<string>, channelName:
   return out;
 }
 
+/** The slice of a registry entry `rawSessionKeyForBinding` reads. */
+export interface BindingEvidence {
+  channelKey: string;
+  migratedFrom?: string;
+  replyTarget?: ReplyTarget;
+}
+
 /**
  * The raw session key to hand a `dm:` session's cron jobs back to when the
- * identity is removed: the actual key inbound traffic for that binding uses
- * when one is known (an iMessage binding's real key is GUID-shaped — a chat
- * GUID cannot be synthesised from a handle, the service prefix varies), else
- * the literal `<channel>:<binding>` form.
+ * identity is removed — the key inbound traffic for that binding actually
+ * uses. For Telegram that is the literal `<channel>:<binding>`; for iMessage
+ * it is GUID-shaped and cannot be rebuilt from the configured handle (the
+ * service prefix varies), so it is recovered from what the registry
+ * remembers, in order of trust:
+ *
+ * 1. `migratedFrom` on an entry — the raw key the unified session was
+ *    re-keyed from (the common one-candidate migration leaves no raw entry
+ *    behind, only this).
+ * 2. A persisted `replyTarget` for that channel whose chatId matches the
+ *    binding — the live GUID the router last routed a reply to.
+ * 3. A raw entry still in the registry matching the binding (linked or not).
+ * 4. The literal `<channel>:<binding>` form, when no conversation with that
+ *    binding was ever seen.
  */
-export function rawSessionKeyForBinding(channelName: string, bound: string, knownKeys: Iterable<string>): string {
-  return legacySessionKeysForBinding(knownKeys, channelName, bound)[0] ?? `${channelName}:${bound}`;
+export function rawSessionKeyForBinding(channelName: string, bound: string, entries: Iterable<BindingEvidence>): string {
+  const all = [...entries];
+  const migrated = all
+    .map((e) => e.migratedFrom)
+    .filter((k): k is string => typeof k === "string");
+  const fromMigration = legacySessionKeysForBinding(migrated, channelName, bound)[0];
+  if (fromMigration) return fromMigration;
+
+  for (const e of all) {
+    const t = e.replyTarget;
+    if (!t || t.channelName !== channelName) continue;
+    const key = `${channelName}:${t.chatId}`;
+    if (!isGroupSessionKey(key) && matchesChannelBinding(channelName, t.chatId, bound)) return key;
+  }
+
+  return legacySessionKeysForBinding(all.map((e) => e.channelKey), channelName, bound)[0]
+    ?? `${channelName}:${bound}`;
 }
 
 /** Extract the identifier from an iMessage chat GUID (e.g. "any;-;+15551234567" → "+15551234567") */

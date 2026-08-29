@@ -834,6 +834,28 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.updateStats).toHaveBeenCalledWith("telegram:1", expect.objectContaining({ costUsd: 0.2 }));
   });
 
+  it("records a retry attempt that ends on an SDK error result", async () => {
+    const { SdkResultError } = await import("../src/agent/live-session.js");
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    let attempt = 0;
+    mockState.sendImpl = async (_prompt, session) => {
+      attempt++;
+      if (attempt === 1) throw new Error("Session is closed");
+      session.sessionId = "sdk-retry";
+      session.lastResult = { costUsd: 0.3, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 0, contextMax: 0 };
+      throw new SdkResultError("I ran out of steps trying to complete that. Can you try a simpler request?", "error_max_turns");
+    };
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toMatchObject({ subtype: "error_max_turns" });
+
+    // One reset-and-retry, then the typed error propagates — and the retry's
+    // NEW session id and stats are kept, exactly as on the first attempt.
+    expect(mockState.instances).toHaveLength(2);
+    expect(deps.setSdkSessionId).toHaveBeenCalledWith("telegram:1", "sdk-retry");
+    expect(deps.updateStats).toHaveBeenCalledWith("telegram:1", expect.objectContaining({ costUsd: 0.3 }));
+  });
+
   it("returns the max-turns fallback message without retrying", async () => {
     const manager = new LiveSessionManager(makeDeps());
     mockState.sendImpl = async () => { throw new Error("Reached maximum number of turns"); };

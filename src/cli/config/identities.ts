@@ -194,13 +194,12 @@ function restoreCronJobsFromIdentity(identity: {
 
   const [ch, chatId] = entries[0];
   // Prefer the key inbound traffic for this binding actually uses — for
-  // iMessage that is the GUID-shaped key (found among all registry entries,
-  // the unified migration having unlinked it), never `imessage:<handle>`,
-  // or the restored jobs and the next inbound turn would run on different
-  // sessions.
+  // iMessage that is the GUID-shaped key the registry remembers (the raw
+  // entry itself was re-keyed to dm: by the unified migration), never
+  // `imessage:<handle>`, or the restored jobs and the next inbound turn would
+  // run on different sessions.
   const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
-  const knownKeys = store.listAllSessions().map((e) => e.channelKey);
-  const fallbackKey = rawSessionKeyForBinding(ch, chatId, knownKeys);
+  const fallbackKey = rawSessionKeyForBinding(ch, chatId, store.listAllSessions());
   const cronStore = new CronStore();
   const count = cronStore.rewriteSessionKey(
     `dm:${identity.name.toLowerCase()}`,

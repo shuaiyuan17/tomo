@@ -258,6 +258,18 @@ describe("SessionStore", () => {
     expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
   });
 
+  it("remembers the raw key a unified session was migrated from, across chained migrations", () => {
+    const store = new SessionStore(TEST_DIR, 20);
+    store.setSdkSessionId("imessage:any;-;+15551234567", "session-old");
+
+    store.migrateSessionKey("imessage:any;-;+15551234567", "dm:alice");
+    expect(store.getEntry("dm:alice")?.migratedFrom).toBe("imessage:any;-;+15551234567");
+
+    // A rename of the identity keeps the ORIGINAL raw key.
+    store.migrateSessionKey("dm:alice", "dm:alicia");
+    expect(store.getEntry("dm:alicia")?.migratedFrom).toBe("imessage:any;-;+15551234567");
+  });
+
   it("touches session lastActiveAt", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setSdkSessionId("key1", "session-abc");

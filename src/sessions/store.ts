@@ -1,6 +1,7 @@
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
+import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
 import { readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
@@ -637,6 +638,11 @@ export class SessionStore {
       ...entry,
       channelKey: newKey,
       lastActiveAt: now,
+      // Remember where the entry came from: the raw key is gone from the
+      // registry after this, and it is what identity removal restores to.
+      ...(isDmSessionKey(newKey) && !isDmSessionKey(oldKey)
+        ? { migratedFrom: entry.migratedFrom ?? oldKey }
+        : {}),
     };
 
     // Rename transcript file

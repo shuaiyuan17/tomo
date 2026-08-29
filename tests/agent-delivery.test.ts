@@ -214,6 +214,11 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
+  // NOTE on the fixture: "the user probably wants X" is a synthetic block SHAPE —
+  // a thinking block that still carries text. Under real `display: "omitted"`
+  // actual reasoning arrives EMPTY (signature only) and is dropped; the only
+  // non-empty thinking blocks observed in practice were misplaced replies. This
+  // test does not assert that reasoning should ever be delivered.
   // The whole mechanism is the block-TYPE gate in renderBlock: the same turn,
   // the same two blocks, only the flag differs. The flag decides the MARKER,
   // not whether non-empty thinking is delivered — with the flag off the SDK

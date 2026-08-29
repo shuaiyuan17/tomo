@@ -629,8 +629,8 @@ export class LiveSession {
       log.warn(
         { session: this.sessionKey, chars },
         chars > 0
-          ? "Unowned SDK turn opened with a thinking block (showThinking off); it will be delivered as text"
-          : "Unowned SDK turn opened with an empty thinking block (showThinking off); nothing from it will be delivered",
+          ? "Unowned SDK turn opened with a thinking block (showThinking off); routing it as text"
+          : "Unowned SDK turn opened with an empty thinking block (showThinking off); nothing to route",
       );
     }
   }
@@ -708,7 +708,7 @@ export class LiveSession {
       // suppression is a property of the TURN and is decided there.
       log.warn(
         { session: this.sessionKey, chars: rendered.text.length },
-        "thinking block delivered as text (showThinking off)",
+        "thinking block routed as text (showThinking off)",
       );
     }
 

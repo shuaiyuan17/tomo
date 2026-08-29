@@ -466,17 +466,118 @@ describe("NO_REPLY is enforced per block", () => {
   });
 });
 
+/**
+ * A `thinking` block that HAS TEXT IN IT, with showThinking off, is a
+ * misplaced message — and is delivered as one.
+ *
+ * WHY, EMPIRICALLY. showThinking off starts the SDK with thinking
+ * `display: "omitted"`, which strips the reasoning and leaves a
+ * signature-only block whose `thinking` string is EMPTY. One session's
+ * transcript for 2026-08-28 (since the 01:13 restart, flag off) held 173 such
+ * blocks — all empty, which is what real reasoning looks like under
+ * `omitted` — and 21 `thinking` blocks with non-empty text. Every one of the
+ * 21 was prose the model addressed to the owner: a reply written after a tool
+ * result, a progress line after a steered message. Six were answers he was
+ * waiting for and never received. None was reasoning that leaked past
+ * `omitted`.
+ *
+ * The rule that follows is still TYPE + LENGTH ONLY, never content. Nothing
+ * below reads the prose to judge whether it is "really" a reply — that is the
+ * inspection #292 exists to prevent. Empty (or whitespace-only) thinking is
+ * dropped exactly as before; non-empty thinking with the flag off renders
+ * exactly like a `text` block, with NO 💭 marker, because it is not being
+ * shown as reasoning: it IS the message.
+ */
 describe("thinking blocks", () => {
-  it("never ships a thinking block when showThinking is off", async () => {
+  it("delivers a non-empty thinking block as text, in order, unmarked, when showThinking is off", async () => {
     const r = rig({ showThinking: false });
 
     await r.run([
-      assistant([thinkingBlock("weighing the options")]),
+      assistant([thinkingBlock("hello there")]),
+      assistant([toolUseBlock("Bash", "t1")]),
+      toolResult("t1"),
+      assistant([textBlock("B")]),
+      turnEnding(r.order),
+      result(),
+    ]);
+
+    // Its own message, before the tool call, and with no 💭 — the marker says
+    // "this is reasoning", which is the one thing this block is not.
+    expect(r.order).toEqual([
+      "send:hello there",
+      "send:B",
+      "TURN-ENDING",
+      "TURN-RETURNED",
+    ]);
+  });
+
+  it("warns, with the delivered length, only for the block it actually delivered", async () => {
+    const r = rig({ showThinking: false });
+
+    await r.run([
+      assistant([thinkingBlock("hello there")]),
+      assistant([thinkingBlock("   ")]),
+      result(),
+    ]);
+
+    const thinkingWarns = vi.mocked(log.warn).mock.calls.filter(
+      ([, msg]) => typeof msg === "string" && msg.includes("thinking block delivered as text"),
+    );
+    expect(thinkingWarns).toHaveLength(1);
+    expect(thinkingWarns[0]![0]).toMatchObject({ session: "test:session", chars: 11 });
+  });
+
+  it.each([
+    { label: "empty", thinking: "" },
+    { label: "whitespace-only", thinking: "   " },
+  ])("drops a $label thinking block silently — that is what `omitted` produces", async ({ thinking }) => {
+    const r = rig({ showThinking: false });
+
+    await r.run([
+      assistant([thinkingBlock(thinking)]),
       assistant([textBlock("A")]),
       result(),
     ]);
 
     expect(r.channel.sent.map((m) => m.text)).toEqual(["A"]);
+    // Silent: 173 of these in one day would drown the log, and none of them
+    // means anything is wrong.
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("drops a non-empty thinking block whose trailing line is bare NO_REPLY", async () => {
+    const r = rig({ showThinking: false });
+
+    // The per-block rules apply to it exactly as they apply to a text block —
+    // rendering it as text means ALL of the text path, not just the send.
+    await r.run([
+      assistant([thinkingBlock("housekeeping done\nNO_REPLY")]),
+      assistant([textBlock("B")]),
+      result(),
+    ]);
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["B"]);
+  });
+
+  it("ships nothing from a non-empty thinking block on a suppressed turn", async () => {
+    const r = rig({ showThinking: false });
+
+    // suppressDelivery is a policy about the TURN; rendering a thinking block
+    // as text changes what a block would say, not whether this turn may speak.
+    await r.run(
+      [assistant([thinkingBlock("checking the morning routine…")]), result()],
+      {
+        delivery: {
+          kind: "deferred-send",
+          suppressDelivery: true,
+          resolveTarget: () => ({ channel: r.channel, chatId: "chat1" }),
+        },
+        transcript: "on-delivery",
+      },
+    );
+
+    expect(r.channel.sent).toEqual([]);
+    expect(r.transcript).toEqual([]);
   });
 
   it("ships a thinking block as its own marked message before the text that follows", async () => {
@@ -581,12 +682,15 @@ describe("the reply target is spent by the first block that ships", () => {
  * The delivery layer behaved exactly as specified; the model simply put its
  * reply somewhere replies are not read from.
  *
- * WHAT CHANGED AS A RESULT. Not the block-type rule — that rule is the whole
- * point of #292 and inspecting a thinking block's prose to guess whether it is
- * "really" a reply is precisely what it exists to prevent. What changed is
- * VISIBILITY: an unowned turn that opens with a hidden thinking block now logs
- * at warn with the block's length (LiveSession.claimFirstUnownedEvent), so the
- * same shape is legible in the log instead of taking a forensics pass.
+ * WHAT CHANGED AS A RESULT, IN TWO STEPS. First, VISIBILITY: an unowned turn
+ * opening with a hidden thinking block logs at warn with the block's length
+ * (LiveSession.claimFirstUnownedEvent), so the shape is legible in the log
+ * instead of taking a forensics pass. Then, once a day of transcript showed
+ * that a NON-EMPTY thinking block under `display: "omitted"` is always a
+ * misplaced message and never leaked reasoning (173 empty vs 21 non-empty, all
+ * 21 messages), DELIVERY: such a block is now rendered exactly like a `text`
+ * block. See the "thinking blocks" describe above. The rule is still decided
+ * from the block's type and length alone — its prose is never inspected.
  *
  * THE TESTS BELOW ARE A GUARD, NOT AN EXPLANATION. They pin that a turn's
  * blocks belong to that turn alone — cross-turn contamination was the leading
@@ -715,26 +819,32 @@ describe("a turn's blocks belong to that turn alone", () => {
     }
   });
 
-  it("warns when an unowned turn opens with a thinking block nobody will see", async () => {
+  it("delivers, and warns about, an unowned turn that opens with a non-empty thinking block", async () => {
+    const unowned: string[] = [];
     const session = new LiveSession(
       {} as never,
       "dm:owner",
       undefined,
-      () => ({ resolve: () => {}, reject: () => {}, onBlock: () => {} }),
+      () => ({ resolve: () => {}, reject: () => {}, onBlock: (b) => { unowned.push(b); } }),
       { showThinking: false },
     );
     const harness = harnessRef.current!;
 
     try {
-      // The 2026-08-28 shape: the reply written inside a thinking block, on an
-      // unowned turn, with showThinking off. Dropping it is correct; being
-      // silent about it is what cost a forensics pass.
+      // THE EXACT 2026-08-28 08:33 SHAPE: a ~700-char reply written inside a
+      // thinking block, on an unowned turn, with showThinking off, followed by
+      // a seven-minute tool call. It used to be dropped by design and the owner
+      // simply never got his answer. It now goes to the session's default
+      // target, unmarked, as the message it is.
       harness.enqueue([assistant([thinkingBlock("x".repeat(700))]), assistant([toolUseBlock("Bash", "t1")])]);
       await new Promise((r) => setTimeout(r, 5));
 
+      expect(unowned).toEqual(["x".repeat(700)]);
+      // The claim-time warn from #293 stays: this shape is worth seeing in the
+      // log whatever we now do with it.
       expect(log.warn).toHaveBeenCalledWith(
         expect.objectContaining({ session: "dm:owner", chars: 700 }),
-        expect.stringContaining("hidden thinking block"),
+        expect.stringContaining("thinking block"),
       );
     } finally {
       session.close();

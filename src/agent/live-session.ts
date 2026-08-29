@@ -116,6 +116,10 @@ export interface LiveSessionSettings {
  * Marker prefixed to a thinking block when showThinking is on, so the reader
  * can tell the model's reasoning from its reply. Chosen over a fenced block
  * because chat channels render neither Markdown nor code fences.
+ *
+ * Only ever applied with the flag ON. With it off, a thinking block that
+ * survives to delivery is not being shown as reasoning — it IS the message
+ * (see renderBlock) — so it ships plain.
  */
 export const THINKING_MARKER = "💭 ";
 
@@ -148,15 +152,38 @@ export type BlockRender =
   | { kind: "empty"; scaffoldFiltered: boolean };
 
 /**
- * Decide what ONE completed content block ships, from its `type` alone.
+ * Decide what ONE completed content block ships, from its `type` and its
+ * LENGTH alone.
  *
- * This is the ONLY place that decides what reaches a channel, and it decides
- * purely on the SDK block `type` — never by inspecting the text to judge
- * whether it is "really" a reply. A `text` block is the model's chosen words
- * and always ships, even when it happens to read like reasoning (`思考: ...`)
- * or like tool debris (`count`). A `thinking` block ships only when
- * showThinking is on, marked so it is distinguishable. `redacted_thinking`
- * carries no readable text and is dropped at collection time.
+ * This is the ONLY place that decides what reaches a channel, and it never
+ * inspects the text to judge whether it is "really" a reply. A `text` block is
+ * the model's chosen words and always ships, even when it happens to read like
+ * reasoning (`思考: ...`) or like tool debris (`count`).
+ * `redacted_thinking` carries no readable text and is dropped at collection
+ * time.
+ *
+ * A `thinking` block:
+ *   - showThinking ON  → ships prefixed with THINKING_MARKER, so the reader can
+ *     tell reasoning from reply.
+ *   - showThinking OFF → the SDK is running thinking `display: "omitted"`,
+ *     which strips the reasoning and leaves a signature-only block whose text
+ *     is EMPTY. An empty one is therefore the normal case and is dropped
+ *     silently. A NON-EMPTY one under `omitted` is not reasoning that leaked;
+ *     it is the model having written a message in the wrong block type, and it
+ *     ships EXACTLY LIKE A `text` BLOCK — unmarked, through the same scaffold
+ *     filter, the same bare-NO_REPLY rule and the same downstream attachment
+ *     and `[[NL]]` handling.
+ *
+ * WHERE THAT LAST RULE COMES FROM (owner decision, 2026-08-28). One session's
+ * SDK transcript for the day, flag off, held 173 thinking blocks with a 0-char
+ * `thinking` string — what `omitted` produces for real reasoning — and 21 with
+ * non-empty text. Every one of the 21 was prose aimed at the owner (a reply
+ * after a tool result, a progress line after a steer); six were answers he was
+ * waiting for and never received, because dropping the block was the specified
+ * behaviour. None was leaked reasoning. So the correct reading of a non-empty
+ * thinking block under `omitted` is "misplaced message", and it is delivered
+ * on that basis — deterministically, from type and length, with no round trip
+ * and no look at what the prose says.
  *
  * The two remaining rules are per block by design (#292) and now also per
  * block in TIME — they run as the block completes, because that is when it
@@ -168,8 +195,6 @@ export type BlockRender =
  *      narration and its attachments never leak out of a mid-turn slip.
  */
 export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockRender {
-  if (block.type === "thinking" && !showThinking) return { kind: "empty", scaffoldFiltered: false };
-
   const scaffold = filterScaffoldLeak(block.text);
   const scaffoldFiltered = scaffold.filtered;
   const text = scaffold.text.trim();
@@ -178,7 +203,9 @@ export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockR
 
   return {
     kind: "ship",
-    text: block.type === "thinking" ? `${THINKING_MARKER}${text}` : text,
+    // Marked only when thinking is being shown AS thinking. With the flag off
+    // this block is a message, and a message does not get a 💭 on it.
+    text: block.type === "thinking" && showThinking ? `${THINKING_MARKER}${text}` : text,
     scaffoldFiltered,
   };
 }
@@ -566,11 +593,17 @@ export class LiveSession {
    * The label is not decoration. On 2026-08-28 a DM reply the owner never
    * received was traced to `reason: "assistant_thinking"` in the log: the model
    * had written its answer inside a `thinking` block, and with `showThinking`
-   * off that block is dropped by design (renderBlock decides from the TYPE).
-   * Nothing was broken and nothing was logged above info — the reply simply did
-   * not exist as far as delivery was concerned, and it took a log forensics
-   * pass to establish that. So an unowned turn that OPENS with a hidden
-   * thinking block is now a warn, with the length that made it worth noticing.
+   * off that block was dropped. Nothing was broken and nothing was logged above
+   * info — the reply simply did not exist as far as delivery was concerned, and
+   * it took a log forensics pass to establish that. So an unowned turn that
+   * opens with a thinking block the flag would hide is a warn, with the length
+   * that made it worth noticing.
+   *
+   * The warn stays now that a NON-EMPTY such block is delivered as text
+   * (renderBlock): this is still a shape worth seeing in the log, and the
+   * message says which of the two outcomes happened. Nothing about the claim
+   * itself depends on the block's content — `shipBlock` decides delivery, as
+   * it does for every other block.
    */
   private claimFirstUnownedEvent(content: unknown[]): void {
     let reason = "assistant_event";
@@ -581,7 +614,10 @@ export class LiveSession {
       if (isThinkingBlock(block)) {
         reason = "assistant_thinking";
         openedWithHiddenThinking = !this.showThinking;
-        chars = block.thinking.length;
+        // TRIMMED, because that is the length the delivery rule reads: a
+        // whitespace-only block is the `omitted` residue and delivers nothing,
+        // and the warn must not claim otherwise.
+        chars = block.thinking.trim().length;
         break;
       }
       if (isToolUseBlock(block)) { reason = "assistant_tool_use"; break; }
@@ -592,7 +628,9 @@ export class LiveSession {
     if (openedWithHiddenThinking) {
       log.warn(
         { session: this.sessionKey, chars },
-        "Unowned SDK turn opened with a hidden thinking block (showThinking off); nothing from it will be delivered",
+        chars > 0
+          ? "Unowned SDK turn opened with a thinking block (showThinking off); it will be delivered as text"
+          : "Unowned SDK turn opened with an empty thinking block (showThinking off); nothing from it will be delivered",
       );
     }
   }
@@ -654,6 +692,24 @@ export class LiveSession {
         );
       }
       return;
+    }
+
+    if (block.type === "thinking" && !this.showThinking) {
+      // WARN, once per block, and only once we have a sink to hand it to —
+      // the drop path above logs its own error and must not be preceded by a
+      // line claiming delivery. Nothing is broken here; this is the specified
+      // handling. But the model put a message where messages are not supposed
+      // to be, and the rate at which that happens is the only signal that
+      // would tell us this rule has stopped being the right one. Empty
+      // thinking blocks (the overwhelming majority under `omitted`) never
+      // reach this point, so it cannot flood the log. `chars` is the rendered
+      // length, so it matches the message as the transcript records it.
+      // Caveat: a suppressed turn's sink drops the block after this line —
+      // suppression is a property of the TURN and is decided there.
+      log.warn(
+        { session: this.sessionKey, chars: rendered.text.length },
+        "thinking block delivered as text (showThinking off)",
+      );
     }
 
     const outstanding: OutstandingDelivery = { req, abandoned: false };

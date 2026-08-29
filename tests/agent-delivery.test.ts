@@ -215,12 +215,16 @@ describe("outbound delivery", () => {
   });
 
   // The whole mechanism is the block-TYPE gate in renderBlock: the same turn,
-  // the same two blocks, only the flag differs. Delete the gate and the
-  // showThinking:false row ships the reasoning and fails; delete the marker
-  // and the showThinking:true row fails. Each block is its own message, so
-  // the reasoning arrives BEFORE the answer rather than glued to it.
+  // the same two blocks, only the flag differs. The flag decides the MARKER,
+  // not whether non-empty thinking is delivered — with the flag off the SDK
+  // runs `display: "omitted"`, under which a thinking block that still has
+  // text in it has only ever been a misplaced message, so it ships as one,
+  // plain. Delete the marker and the showThinking:true row fails; ship it
+  // unconditionally and the showThinking:false row fails. Each block is its
+  // own message, so the earlier block arrives BEFORE the answer rather than
+  // glued to it.
   it.each([
-    { showThinking: false, expected: ["public answer"] },
+    { showThinking: false, expected: ["the user probably wants X", "public answer"] },
     { showThinking: true, expected: ["💭 the user probably wants X", "public answer"] },
   ])("renders a thinking + text turn by block type (showThinking=$showThinking)", async ({ showThinking, expected }) => {
     resetConfig({ showThinking });
@@ -237,9 +241,10 @@ describe("outbound delivery", () => {
     await drainQueue(agent);
 
     expect(tg.delivered.map((d) => d.text)).toEqual(expected);
-    // Spelled out both ways so the assertion cannot pass by coincidence.
+    // Spelled out both ways so the assertion cannot pass by coincidence: the
+    // words arrive either way, the marker only with the flag on.
     const all = tg.delivered.map((d) => d.text).join("\n");
-    expect(all.includes("the user probably wants X")).toBe(showThinking);
+    expect(all.includes("the user probably wants X")).toBe(true);
     expect(all.includes("💭 ")).toBe(showThinking);
 
     await agent.stop();

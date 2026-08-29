@@ -599,7 +599,7 @@ export class LiveSession {
    * opens with a thinking block the flag would hide is a warn, with the length
    * that made it worth noticing.
    *
-   * The warn stays now that a NON-EMPTY such block is delivered as text
+   * The warn stays now that a NON-EMPTY such block is routed as text
    * (renderBlock): this is still a shape worth seeing in the log, and the
    * message says which of the two outcomes happened. Nothing about the claim
    * itself depends on the block's content — `shipBlock` decides delivery, as

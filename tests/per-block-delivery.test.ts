@@ -521,7 +521,7 @@ describe("thinking blocks", () => {
     ]);
 
     const thinkingWarns = vi.mocked(log.warn).mock.calls.filter(
-      ([, msg]) => typeof msg === "string" && msg.includes("thinking block delivered as text"),
+      ([, msg]) => typeof msg === "string" && msg.includes("thinking block routed as text"),
     );
     expect(thinkingWarns).toHaveLength(1);
     expect(thinkingWarns[0]![0]).toMatchObject({ session: "test:session", chars: 11 });

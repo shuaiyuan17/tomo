@@ -546,13 +546,30 @@ describe("LiveSession subagent events", () => {
 // Thinking blocks
 //
 // Delivery is decided by SDK content-block TYPE, never by inspecting text.
-// `thinking` blocks are dropped from the turn response unless showThinking is
-// on; `text` blocks always ship, even when their text happens to look like
-// thinking (`思考:`) or like tool debris (`count`).
+// `text` blocks always ship, even when their text happens to look like
+// thinking (`思考:`) or like tool debris (`count`). A `thinking` block with the
+// flag OFF is judged by its length, still never by its prose: empty is the
+// signature-only residue of `display: "omitted"` and is dropped; non-empty
+// under `omitted` has only ever been a misplaced message, so it is kept as
+// one, unmarked. With the flag ON, thinking is kept and marked.
 // ---------------------------------------------------------------------------
 
 describe("LiveSession thinking blocks", () => {
-  it("drops thinking blocks by default, keeping only the text block", async () => {
+  it("drops an empty thinking block, keeping only the text block", async () => {
+    const { session, harness } = makeSession();
+
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent({
+      type: "assistant",
+      message: { content: [thinkingBlock(""), textBlock("Sure — here's X.")] },
+    });
+    harness.pushEvent(resultEvent());
+
+    await expect(p).resolves.toBe("Sure — here's X.");
+  });
+
+  it("keeps a non-empty thinking block in the response, unmarked, when showThinking is off", async () => {
     const { session, harness } = makeSession();
 
     const p = session.send("hi");
@@ -563,7 +580,10 @@ describe("LiveSession thinking blocks", () => {
     });
     harness.pushEvent(resultEvent());
 
-    await expect(p).resolves.toBe("Sure — here's X.");
+    // It was DELIVERED as a message, so it must also be in the turn response
+    // the transcript and the silence checks read — otherwise recall would not
+    // hold a message the owner is looking at.
+    await expect(p).resolves.toBe("the user probably wants X\nSure — here's X.");
   });
 
   it("includes thinking blocks, marked, when showThinking is on", async () => {

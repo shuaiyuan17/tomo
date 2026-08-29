@@ -127,8 +127,10 @@ export function sdkOptions(
     sessionKey: sessionContext?.sessionKey,
   });
   // Thinking DISPLAY is the model-side half of config.showThinking: with
-  // `display: "omitted"` the SDK never emits `thinking` content blocks at all,
-  // so no downstream flag could surface them. Resolved at session spawn — a
+  // `display: "omitted"` the SDK strips the *reasoning* out of `thinking` blocks
+  // (they arrive with empty text and a signature). A thinking block that still
+  // carries text under "omitted" is prose the model misplaced, and LiveSession
+  // routes it as a message (see renderBlock). Resolved at session spawn — a
   // mid-session config change only takes effect on the next session (restart).
   const thinking = adaptiveThinkingForModel(effectiveModel, config.showThinking);
 
@@ -208,10 +210,12 @@ export function sdkOptions(
  *
  * `display` is the only knob the SDK exposes (`ThinkingAdaptive` in
  * @anthropic-ai/claude-agent-sdk `sdk.d.ts` — `display?: 'summarized' |
- * 'omitted'`; there is no `'full'`). `"omitted"` suppresses the `thinking`
- * content blocks entirely, so it is the mechanism that hides reasoning by
- * default; `"summarized"` is what makes the SDK emit them, which is what
- * `showThinking` needs before LiveSession has anything to render.
+ * 'omitted'`; there is no `'full'`). `"omitted"` empties the reasoning out of
+ * `thinking` blocks (signature only), so it is the mechanism that hides
+ * reasoning by default; `"summarized"` is what makes the SDK emit readable
+ * summaries, which is what `showThinking` needs before LiveSession has
+ * anything to mark with 💭. Either way a non-empty thinking block is routed
+ * by LiveSession like text — see renderBlock.
  */
 function adaptiveThinkingForModel(
   model: string,

@@ -83,6 +83,8 @@ export function legacySessionKeysForBinding(keys: Iterable<string>, channelName:
 /** The slice of a registry entry `rawSessionKeyForBinding` reads. */
 export interface BindingEvidence {
   channelKey: string;
+  /** `null` (or absent) for the active entry; retired copies carry a timestamp. */
+  unlinkedAt?: number | null;
   migratedFrom?: string;
   replyTarget?: ReplyTarget;
 }
@@ -94,19 +96,25 @@ export interface BindingEvidence {
  * it is GUID-shaped and cannot be rebuilt from the configured handle (the
  * service prefix varies), so it is recovered from what the registry
  * remembers. Evidence belonging to the identity's OWN entries (`ownerKey`,
- * its `dm:` key — active entry and retired copies alike) is trusted first: a
- * binding removed from one identity and reused under another leaves the old
- * `dm:` entry in the registry, and its GUID may not be the one the newer
- * session has been replying to. In order:
+ * its `dm:` key) is trusted first: a binding removed from one identity and
+ * reused under another leaves the old `dm:` entry in the registry, and its
+ * GUID may not be the one the newer session has been replying to. Within
+ * the owner, the LIVE routing state outranks history: the conversation can
+ * move between GUIDs for the same handle (SMS ↔ iMessage), and the router
+ * keeps `replyTarget` current while `migratedFrom` only says where the
+ * session came from. In order:
  *
- * 1. The owner entries' `migratedFrom` — the raw key the unified session
- *    was re-keyed from (the common one-candidate migration leaves no raw
- *    entry behind, only this).
- * 2. The owner entries' persisted `replyTarget` for that channel matching the
- *    binding — the live GUID the router last routed a reply to.
- * 3. The same two, from any other entry in the registry.
- * 4. A raw entry still in the registry matching the binding (linked or not).
- * 5. The literal `<channel>:<binding>` form, when no conversation with that
+ * 1. The owner's ACTIVE entry's persisted `replyTarget` for that channel when
+ *    it is a concrete chat id (GUID-shaped, not the bare configured handle)
+ *    matching the binding — the GUID the router last routed a reply to.
+ * 2. The owner entries' `migratedFrom` — the raw key the unified session was
+ *    re-keyed from (the common one-candidate migration leaves no raw entry
+ *    behind, only this). Active entry first, then retired copies.
+ * 3. Retired owner copies' concrete `replyTarget`, when the active entry
+ *    has none.
+ * 4. The same, from any other entry in the registry.
+ * 5. A raw entry still in the registry matching the binding (linked or not).
+ * 6. The literal `<channel>:<binding>` form, when no conversation with that
  *    binding was ever seen.
  */
 export function rawSessionKeyForBinding(
@@ -118,21 +126,37 @@ export function rawSessionKeyForBinding(
   const all = [...entries];
   const owned = ownerKey ? all.filter((e) => e.channelKey === ownerKey) : [];
   const others = ownerKey ? all.filter((e) => e.channelKey !== ownerKey) : all;
+  const isActive = (e: BindingEvidence) => e.unlinkedAt === null || e.unlinkedAt === undefined;
+
+  // A reply target that names a real conversation (not the bare handle the
+  // config binds — that is only ever the literal fallback) for this binding.
+  const concreteReplyKey = (e: BindingEvidence): string | undefined => {
+    const t = e.replyTarget;
+    if (!t || t.channelName !== channelName || t.chatId === bound) return undefined;
+    const key = `${channelName}:${t.chatId}`;
+    return !isGroupSessionKey(key) && matchesChannelBinding(channelName, t.chatId, bound) ? key : undefined;
+  };
+  const migratedKey = (group: BindingEvidence[]): string | undefined => legacySessionKeysForBinding(
+    group.map((e) => e.migratedFrom).filter((k): k is string => typeof k === "string"),
+    channelName,
+    bound,
+  )[0];
+  const firstReplyKey = (group: BindingEvidence[]): string | undefined => {
+    for (const e of group) {
+      const key = concreteReplyKey(e);
+      if (key) return key;
+    }
+    return undefined;
+  };
 
   for (const group of [owned, others]) {
-    const fromMigration = legacySessionKeysForBinding(
-      group.map((e) => e.migratedFrom).filter((k): k is string => typeof k === "string"),
-      channelName,
-      bound,
-    )[0];
-    if (fromMigration) return fromMigration;
-
-    for (const e of group) {
-      const t = e.replyTarget;
-      if (!t || t.channelName !== channelName) continue;
-      const key = `${channelName}:${t.chatId}`;
-      if (!isGroupSessionKey(key) && matchesChannelBinding(channelName, t.chatId, bound)) return key;
-    }
+    const active = group.filter(isActive);
+    const retired = group.filter((e) => !isActive(e));
+    const found = firstReplyKey(active)
+      ?? migratedKey(active)
+      ?? migratedKey(retired)
+      ?? firstReplyKey(retired);
+    if (found) return found;
   }
 
   return legacySessionKeysForBinding(all.map((e) => e.channelKey), channelName, bound)[0]

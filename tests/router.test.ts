@@ -407,6 +407,20 @@ describe("IdentityRouter", () => {
         .toBe("imessage:any;-;+15551234567");
     });
 
+    it("follows the conversation to its current GUID when it moved after migration (SMS → iMessage)", () => {
+      sessions.setSdkSessionId("imessage:SMS;-;+15551234567", "session-sms");
+      const identity = { name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
+      const router = new IdentityRouter([identity], sessions, {});
+      router.resolve("imessage", "SMS;-;+15551234567", false);
+      // The contact turned on iMessage; the same handle now arrives under a
+      // different chat GUID and the router keeps the reply target current.
+      router.resolve("imessage", "iMessage;-;+15551234567", false);
+
+      expect(sessions.getEntry("dm:ivy")?.migratedFrom).toBe("imessage:SMS;-;+15551234567");
+      expect(rawSessionKeyForBinding("imessage", "+15551234567", sessions.listAllSessions(), "dm:ivy"))
+        .toBe("imessage:iMessage;-;+15551234567");
+    });
+
     it("recovers the iMessage restore key from the persisted reply target when nothing was migrated", () => {
       // The dm: session was born unified (identity configured before the
       // first message): no migratedFrom, but resolve() persisted the GUID the

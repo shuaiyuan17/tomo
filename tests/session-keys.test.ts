@@ -91,14 +91,53 @@ describe("identity binding matchers", () => {
     ];
     expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:cur")).toBe("imessage:iMessage;-;+15551234567");
     expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:old")).toBe("imessage:any;-;+15551234567");
-    // An owner with no evidence of its own still falls through to the rest.
-    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:new")).toBe("imessage:any;-;+15551234567");
+    // An owner with no evidence of its own still falls through to the rest —
+    // where, as within the owner, a live reply target outranks provenance.
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:new")).toBe("imessage:iMessage;-;+15551234567");
     // Retired copies of the owner key count as the owner's evidence too.
     const withRetired = [
       { channelKey: "dm:old", migratedFrom: "imessage:any;-;+15551234567" },
-      { channelKey: "dm:cur" },
-      { channelKey: "dm:cur", migratedFrom: "imessage:SMS;-;+15551234567" },
+      { channelKey: "dm:cur", unlinkedAt: null },
+      { channelKey: "dm:cur", unlinkedAt: 1, migratedFrom: "imessage:SMS;-;+15551234567" },
     ];
     expect(rawSessionKeyForBinding("imessage", "+15551234567", withRetired, "dm:cur")).toBe("imessage:SMS;-;+15551234567");
+  });
+
+  it("prefers the owner's live GUID-shaped reply target over where the session was migrated from", () => {
+    // The session came in over SMS, was unified, and the conversation later
+    // moved to iMessage: the router kept replyTarget current. Restoring to
+    // the historical SMS GUID would split cron from the next inbound turn.
+    const entries = [
+      {
+        channelKey: "dm:ivy",
+        unlinkedAt: null,
+        migratedFrom: "imessage:SMS;-;+15551234567",
+        replyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" },
+      },
+    ];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", entries, "dm:ivy")).toBe("imessage:iMessage;-;+15551234567");
+
+    // The bare configured handle as reply target (a fixed iMessage policy)
+    // is not a conversation and must not outrank provenance.
+    const bareHandle = [{
+      channelKey: "dm:ivy",
+      unlinkedAt: null,
+      migratedFrom: "imessage:SMS;-;+15551234567",
+      replyTarget: { channelName: "imessage", chatId: "+15551234567" },
+    }];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", bareHandle, "dm:ivy")).toBe("imessage:SMS;-;+15551234567");
+
+    // Active entry with no evidence: provenance, then a retired copy's live
+    // target, in that order.
+    const retiredOnly = [
+      { channelKey: "dm:ivy", unlinkedAt: null },
+      { channelKey: "dm:ivy", unlinkedAt: 1, replyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" } },
+    ];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", retiredOnly, "dm:ivy")).toBe("imessage:iMessage;-;+15551234567");
+    const retiredBoth = [
+      { channelKey: "dm:ivy", unlinkedAt: null },
+      { channelKey: "dm:ivy", unlinkedAt: 1, migratedFrom: "imessage:SMS;-;+15551234567", replyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" } },
+    ];
+    expect(rawSessionKeyForBinding("imessage", "+15551234567", retiredBoth, "dm:ivy")).toBe("imessage:SMS;-;+15551234567");
   });
 });

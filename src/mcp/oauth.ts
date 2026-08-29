@@ -28,6 +28,14 @@ const MCP_INITIALIZE_PROBE = {
 };
 
 export interface OAuthTokenRecord {
+  /**
+   * Monotonic write counter for this store key, bumped on EVERY write. The
+   * compare-and-set token: `updatedAt` is a millisecond clock reading and two
+   * writes in the same millisecond are indistinguishable by it, so it is kept
+   * for display only. Optional for migration — records written before this
+   * field existed read as revision 0 and get a real one on their next write.
+   */
+  revision?: number;
   accessToken: string;
   refreshToken?: string;
   tokenType: string;
@@ -459,19 +467,21 @@ export class McpOAuthManager {
     if (!entry || !oauth || !supportsHeaders(entry.server)) return "skipped";
     const storeKey = oauth.tokenStoreKey;
 
-    // An interactive build for ANY server sharing this store key owns the
-    // credential; joining in would race a browser flow against a refresh.
-    if (this.hasAuthBuildForStoreKey(servers, storeKey)) return "skipped";
-
     // ADOPT an exchange already in flight for this key rather than spending
     // the refresh token a second time: two sibling servers hitting 401
-    // together, or a 401 landing on top of the sweep, must produce ONE
-    // exchange between them and both be told its outcome.
+    // together, a 401 landing on top of the sweep, or a 401 landing on top of
+    // a BUILD-driven refresh must produce ONE exchange between them and all
+    // be told its outcome. Checked before the build guard below, because a
+    // build that is merely refreshing is exactly such an exchange.
     const joined = this.tokenRefreshes.get(storeKey);
     let result: TokenRefreshResult;
     if (joined) {
       result = await joined;
     } else {
+      // Only an INTERACTIVE flow owns the credential exclusively: it will end
+      // in an authorization-code grant that overwrites the key outright, so
+      // spending the refresh token alongside it is wasted at best.
+      if (this.hasInteractiveAuthBuildForStoreKey(servers, storeKey)) return "skipped";
       const existing = this.readStore().mcpOAuth?.[storeKey];
       if (!existing?.refreshToken) return "skipped";
       if (options.onlyIfExpiring && !this.isExpiring(existing)) return "skipped";
@@ -519,7 +529,7 @@ export class McpOAuthManager {
         // Overwriting it would replace a known-good credential with one
         // derived from a refresh token that login very likely just rotated
         // away. Discard our result instead and report the record that won.
-        if (!this.writeTokenIfUnchanged(storeKey, refreshed, existing.updatedAt)) {
+        if (!this.writeTokenIfUnchanged(storeKey, refreshed, revisionOf(existing))) {
           return { outcome: "superseded", token: this.readStore().mcpOAuth?.[storeKey] };
         }
         return { outcome: "refreshed", token: refreshed };
@@ -560,13 +570,20 @@ export class McpOAuthManager {
     }
   }
 
-  /** Is an interactive/refresh build running for any server on this store key? */
-  private hasAuthBuildForStoreKey(
+  /**
+   * Is a BROWSER flow running for any server on this store key? A build that
+   * is only refreshing does not count — that exchange is joinable, and is
+   * adopted rather than skipped.
+   */
+  private hasInteractiveAuthBuildForStoreKey(
     servers: Record<string, ExternalMcpServerConfig>,
     storeKey: string,
   ): boolean {
-    for (const name of this.serverAuthBuilds.keys()) {
-      if (servers[name]?.oauth?.tokenStoreKey === storeKey) return true;
+    for (const [name, build] of this.serverAuthBuilds) {
+      if (servers[name]?.oauth?.tokenStoreKey !== storeKey) continue;
+      // `forceInteractive` is an explicit /mcp login; `authorizeUrl` means an
+      // ordinary build has already fallen through to the browser flow.
+      if (build.forceInteractive || build.authorizeUrl !== undefined) return true;
     }
     return false;
   }
@@ -583,7 +600,11 @@ export class McpOAuthManager {
     // rather than starting a second exchange: issuers that rotate refresh
     // tokens invalidate the old one on use. Keyed by store key, so a sibling
     // server sharing the key is recognised as the same race.
-    const inFlight = this.tokenRefreshes.get(storeKey);
+    //
+    // NOT for an explicit `/mcp login`: the owner asked for a browser flow,
+    // and its result supersedes whatever the refresh produces, so making the
+    // login queue behind a slow (or stalled) exchange only delays it.
+    const inFlight = forceInteractive ? undefined : this.tokenRefreshes.get(storeKey);
     if (inFlight) await inFlight;
 
     const store = this.readStore();
@@ -591,21 +612,46 @@ export class McpOAuthManager {
     if (!forceInteractive && existing && !this.isExpiring(existing)) return existing;
 
     if (!forceInteractive && existing?.refreshToken) {
-      const result = await this.refreshStoredToken(storeKey, existing, oauth);
-      if (result.outcome === "refreshed") return result.token;
-      // Someone else's record won the compare-and-set: theirs is the live
-      // credential, so use it instead of re-authorizing behind their back.
-      if (result.outcome === "superseded" && result.token) return result.token;
-      // Refresh rejected — fall through to a full browser auth flow.
+      const usable = await this.refreshOrAdopt(storeKey, existing, oauth);
+      if (usable) return usable;
+      // Refresh rejected (or produced nothing usable) — fall through to a
+      // full browser auth flow.
     }
 
     const authorized = await this.runAuthorizationCodeFlow(serverName, server, oauth, existing, sendAuthorizeUrl);
     // An authorization-code grant is a brand-new credential, not a derivative
     // of the stored one, so it overwrites unconditionally. Any refresh still
     // in flight for this key is thereby superseded: its compare-and-set is
-    // against the pre-login `updatedAt` and can no longer match.
+    // pinned to the pre-login revision and can no longer match.
     this.writeToken(storeKey, authorized);
     return authorized;
+  }
+
+  /**
+   * Refresh `existing`, or adopt whatever record beat us to the store — but
+   * only if what we end up holding is actually usable.
+   *
+   * The subtlety is the adoption case. Our exchange can be stalled for
+   * minutes; the record that supersedes it may be short-lived, and may even
+   * have expired while we were blocked. Returning it unchecked would mount a
+   * token we already know is expiring, so the freshness decision is re-run on
+   * the winner and one further exchange is allowed to rescue it. Bounded to
+   * one retry: two failures mean the browser flow is the honest answer.
+   */
+  private async refreshOrAdopt(
+    storeKey: string,
+    existing: OAuthTokenRecord,
+    oauth: McpOAuthConfig,
+    allowRetry = true,
+  ): Promise<OAuthTokenRecord | undefined> {
+    const result = await this.refreshStoredToken(storeKey, existing, oauth);
+    if (result.outcome === "refreshed") return result.token;
+    if (result.outcome !== "superseded" || !result.token) return undefined;
+
+    const winner = result.token;
+    if (!this.isExpiring(winner)) return winner;
+    if (!allowRetry || !winner.refreshToken) return undefined;
+    return this.refreshOrAdopt(storeKey, winner, oauth, false);
   }
 
   isExpiring(token: Pick<OAuthTokenRecord, "expiresAt">): boolean {
@@ -818,9 +864,12 @@ export class McpOAuthManager {
    * in one synchronous block, so nothing can interleave between them.
    * Returns false when another writer won the race.
    */
-  private writeTokenIfUnchanged(key: string, token: OAuthTokenRecord, expectedUpdatedAt: number): boolean {
+  private writeTokenIfUnchanged(key: string, token: OAuthTokenRecord, expectedRevision: number): boolean {
     const current = this.readStore().mcpOAuth?.[key];
-    if (current && current.updatedAt !== expectedUpdatedAt) return false;
+    // A record that VANISHED (revoked, cleared, hand-edited out) must not be
+    // resurrected by an exchange that started while it still existed.
+    if (!current) return false;
+    if (revisionOf(current) !== expectedRevision) return false;
     this.writeToken(key, token);
     return true;
   }
@@ -832,7 +881,9 @@ export class McpOAuthManager {
     // write would otherwise silently discard all stored credentials).
     const store = this.readStore();
     store.mcpOAuth = store.mcpOAuth ?? {};
-    store.mcpOAuth[key] = token;
+    // Stamped here rather than by callers so EVERY path — refresh, interactive
+    // grant, migration of a pre-revision record — advances it exactly once.
+    store.mcpOAuth[key] = { ...token, revision: revisionOf(store.mcpOAuth[key]) + 1 };
 
     mkdirSync(dirname(this.tokenStorePath), { recursive: true, mode: 0o700 });
     writeFileAtomicSync(this.tokenStorePath, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
@@ -897,6 +948,11 @@ function supportsHeaders(server: McpServerConfig): server is Extract<McpServerCo
  * several server entries (same upstream, different tool surfaces), and all of
  * them need the refreshed header.
  */
+/** Stored revision, treating a missing/pre-migration field as 0. */
+function revisionOf(record: OAuthTokenRecord | undefined): number {
+  return typeof record?.revision === "number" ? record.revision : 0;
+}
+
 function serversSharingStoreKey(
   servers: Record<string, ExternalMcpServerConfig>,
   storeKey: string,

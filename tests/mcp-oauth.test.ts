@@ -7,6 +7,10 @@ import type { ExternalMcpServerConfig } from "../src/mcp/external-config.js";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-mcp-oauth");
 
+async function flushMicrotasks(times = 5): Promise<void> {
+  for (let i = 0; i < times; i++) await Promise.resolve();
+}
+
 function resetDir() {
   rmSync(TEST_DIR, { recursive: true, force: true });
   mkdirSync(TEST_DIR, { recursive: true });
@@ -973,6 +977,7 @@ describe("McpOAuthManager", () => {
     // record written for the same key while it was in flight.
     it("discards a refresh whose store record moved under it", async () => {
       const tokenStorePath = seedStore({
+        revision: 3,
         accessToken: "old-access",
         refreshToken: "refresh-1",
         tokenType: "Bearer",
@@ -999,10 +1004,12 @@ describe("McpOAuthManager", () => {
       });
 
       const inFlight = manager.refreshServerToken("cloudflare-api", servers);
-      // A /mcp login lands while the exchange is out.
+      // A /mcp login lands while the exchange is out. Any real writer goes
+      // through writeToken, so it advances the revision.
       writeFileSync(tokenStorePath, JSON.stringify({
         mcpOAuth: {
           cloudflare: {
+            revision: 4,
             accessToken: "login-access",
             refreshToken: "login-refresh",
             tokenType: "Bearer",
@@ -1152,6 +1159,250 @@ describe("McpOAuthManager", () => {
       // Sibling keeps its own static headers alongside the new bearer.
       const betaReady = ready.find((r) => r.name === "beta");
       expect(betaReady).toBeDefined();
+    });
+
+    // Codex round 4, finding 1: `updatedAt` is a millisecond clock reading, so
+    // a login written in the same millisecond as the refresh's expectation was
+    // indistinguishable from no write at all.
+    it("discards a refresh superseded by a login written in the same millisecond", async () => {
+      resetDir();
+      const secretsDir = join(TEST_DIR, "secrets");
+      mkdirSync(secretsDir, { recursive: true });
+      const tokenStorePath = join(secretsDir, "mcp-oauth.json");
+      // updatedAt === NOW, and the manager's clock is pinned to NOW, so every
+      // write in this test carries the identical timestamp.
+      writeFileSync(tokenStorePath, JSON.stringify({
+        mcpOAuth: {
+          cloudflare: {
+            revision: 1,
+            accessToken: "old-access",
+            refreshToken: "refresh-1",
+            tokenType: "Bearer",
+            expiresAt: NOW - 1_000,
+            clientId: "client-123",
+            tokenEndpoint: "https://auth.example/token",
+            updatedAt: NOW,
+          },
+        },
+      }));
+      const loginServers: Record<string, ExternalMcpServerConfig> = {
+        "cloudflare-api": {
+          server: { type: "http", url: "https://api.example/mcp" },
+          oauth: {
+            authorizationServer: "https://auth.example",
+            clientId: "client-123",
+            scopes: [],
+            tokenStoreKey: "cloudflare",
+          },
+        },
+      };
+      let releaseRefresh!: () => void;
+      const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async (input, init) => {
+          if (String(input).includes(".well-known/oauth-authorization-server")) {
+            return new Response(JSON.stringify({
+              authorization_endpoint: "https://auth.example/authorize",
+              token_endpoint: "https://auth.example/token",
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          const grant = new URLSearchParams(String(init?.body)).get("grant_type");
+          if (grant === "refresh_token") {
+            await refreshGate;
+            return new Response(JSON.stringify({
+              access_token: "stale-refresh-result",
+              token_type: "Bearer",
+              expires_in: 3600,
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          return new Response(JSON.stringify({
+            access_token: "login-access",
+            refresh_token: "login-refresh",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+      });
+
+      const refreshing = manager.refreshServerToken("cloudflare-api", loginServers);
+      // A real /mcp login completes while the refresh exchange is stalled.
+      await manager.startLogin("cloudflare-api", loginServers);
+      await expect(manager.completeAuthorizationFromChat("code=login-code")).resolves.toMatchObject({
+        status: "completed",
+      });
+      releaseRefresh();
+
+      await expect(refreshing).resolves.toBe("superseded");
+      const stored = JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.cloudflare;
+      expect(stored.accessToken).toBe("login-access");
+      expect(stored.updatedAt).toBe(NOW);
+    });
+
+    it("does not resurrect a token record deleted while its refresh was in flight", async () => {
+      const tokenStorePath = seedStore({
+        revision: 2,
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      let releaseToken!: () => void;
+      const tokenGate = new Promise<void>((resolve) => { releaseToken = resolve; });
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async () => {
+          await tokenGate;
+          return new Response(JSON.stringify({
+            access_token: "resurrected",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+        onServerAuthReady: () => { throw new Error("a discarded refresh must not re-mount") },
+      });
+
+      const inFlight = manager.refreshServerToken("cloudflare-api", servers);
+      // The credential is revoked/cleared while the exchange is out.
+      writeFileSync(tokenStorePath, JSON.stringify({ mcpOAuth: {} }));
+      releaseToken();
+
+      await expect(inFlight).resolves.toBe("superseded");
+      expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.cloudflare).toBeUndefined();
+    });
+
+    // Codex round 4, finding 2.
+    it("does not adopt a superseding record that is itself expiring", async () => {
+      let clock = NOW;
+      const tokenStorePath = seedStore({
+        revision: 1,
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const accessTokensIssued: string[] = [];
+      let exchanges = 0;
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => clock,
+        fetchImpl: async () => {
+          exchanges++;
+          if (exchanges === 1) await firstGate;
+          const access = `rescued-${exchanges}`;
+          accessTokensIssued.push(access);
+          return new Response(JSON.stringify({
+            access_token: access,
+            refresh_token: `rotated-${exchanges}`,
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+      });
+
+      // A session build starts a refresh, which stalls.
+      const building = manager.buildServersWithAuth(servers, async () => {
+        throw new Error("no browser flow expected");
+      });
+      // Let it read the store and reach the gated exchange before anything
+      // else touches the record — otherwise it never races at all.
+      await flushMicrotasks(20);
+      expect(exchanges).toBe(1);
+      // Meanwhile a short-lived record (60 s) wins the store...
+      writeFileSync(tokenStorePath, JSON.stringify({
+        mcpOAuth: {
+          cloudflare: {
+            revision: 9,
+            accessToken: "short-lived-winner",
+            refreshToken: "winner-refresh",
+            tokenType: "Bearer",
+            expiresAt: NOW + 60_000,
+            clientId: "client-123",
+            tokenEndpoint: "https://auth.example/token",
+            updatedAt: NOW,
+          },
+        },
+      }));
+      // ...and by the time the stalled exchange returns, it has expired.
+      clock = NOW + 120_000;
+      releaseFirst();
+      const built = await building;
+
+      // The winner is expiring, so it is refreshed rather than mounted.
+      expect(built["cloudflare-api"]).toMatchObject({
+        headers: { Authorization: "Bearer rescued-2" },
+      });
+      expect(exchanges).toBe(2);
+    });
+
+    // Codex round 4, finding 3.
+    it("lets a sibling 401 adopt a build-driven refresh instead of skipping", async () => {
+      const tokenStorePath = seedStore({
+        revision: 1,
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      const shared: Record<string, ExternalMcpServerConfig> = {
+        alpha: {
+          server: { type: "http", url: "https://alpha.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+        beta: {
+          server: { type: "http", url: "https://beta.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+      };
+      let releaseToken!: () => void;
+      const tokenGate = new Promise<void>((resolve) => { releaseToken = resolve; });
+      let exchanges = 0;
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async () => {
+          exchanges++;
+          await tokenGate;
+          return new Response(JSON.stringify({
+            access_token: "fresh-access",
+            refresh_token: "rotated-refresh",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+      });
+
+      // alpha's session build owns an in-flight refresh...
+      const building = manager.buildServersWithAuth(
+        { alpha: shared.alpha! },
+        async () => { throw new Error("no browser flow expected"); },
+      );
+      await flushMicrotasks();
+      // ...and beta's live session hits a 401 while it is out.
+      const sibling = manager.refreshServerToken("beta", shared);
+      releaseToken();
+
+      // The sibling learns the outcome instead of being told "skipped".
+      await expect(sibling).resolves.toBe("refreshed");
+      await building;
+      expect(exchanges).toBe(1);
     });
 
     it("coalesces a concurrent sweep and 401 into a single token exchange", async () => {

@@ -13,7 +13,7 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -98,9 +98,10 @@ export interface LiveSessionManagerDeps {
   /**
    * A mounted external MCP server rejected a tool call for authorization
    * reasons: refresh its OAuth token (non-interactively) so the refreshed
-   * config comes back through hotMountExternalMcpServer.
+   * config comes back through hotMountExternalMcpServer. The outcome feeds
+   * the reporting session's retry budget.
    */
-  refreshExternalMcpToken(serverName: string): void;
+  refreshExternalMcpToken(serverName: string): Promise<McpAuthRefreshOutcome>;
 }
 
 /**
@@ -154,6 +155,13 @@ export class LiveSessionManager {
    * completions must compose, rather than racing and removing one another.
    */
   hotMountExternalMcpServer(serverName: string, server: McpServerConfig): Promise<void> {
+    // Shutdown has already closed every session and cleared the maps; a mount
+    // enqueued now would run against a dead session and could only add work
+    // to a process on its way out.
+    if (this.stopping) {
+      log.info({ serverName }, "Ignoring an external MCP hot-mount during shutdown");
+      return Promise.resolve();
+    }
     const operation = this.hotMountQueue.then(() => this.applyExternalMcpHotMount(serverName, server));
     this.hotMountQueue = operation.catch((err) => {
       log.warn({ serverName, err }, "External MCP hot-mount failed; a later session will retry");
@@ -316,6 +324,9 @@ export class LiveSessionManager {
   }
 
   private async applyExternalMcpHotMount(serverName: string, server: McpServerConfig): Promise<void> {
+    // Re-checked here as well as at admission: a mount queued before shutdown
+    // can reach the front of the queue after it.
+    if (this.stopping) return;
     // If auth won the race just after a zero-wait build omitted the server,
     // allow those already-started creations to publish their LiveSession
     // before taking the target snapshot. The OAuth notification is detached
@@ -339,23 +350,15 @@ export class LiveSessionManager {
       if (mountedHere && sameServerConfig(current[serverName], server)) continue;
 
       try {
-        // The SDK's setMcpServers only creates a client for a name it does
-        // not already have, so a changed config for a live name has to be
-        // delivered as a removal followed by an add. Both halves are inside
-        // the serialized hot-mount queue, so nothing observes the gap.
-        if (mountedHere) {
-          const without = { ...current };
-          delete without[serverName];
-          const removal = await this.pushMcpServers(key, session, without);
-          if (removal === "replaced") continue;
-          if (removal === "unsupported") {
-            unsupported++;
-            continue;
-          }
-        }
-
-        const base = this.mcpServerConfigsBySession.get(key) ?? current;
-        const result = await this.pushMcpServers(key, session, { ...base, [serverName]: server });
+        // ONE call, whether this is a first mount or a re-authentication.
+        // The CLI's reconcile (2.1.251) diffs the pushed map against the live
+        // one by name AND by config fingerprint: a name present in both whose
+        // config hash changed goes on its "will replace" list, where the old
+        // client is cleaned up and reconnected inside this same call. The
+        // fingerprint covers `headers`, so a new Bearer token is a real
+        // reconnect — no remove-then-add, and therefore no window in which an
+        // active turn's tool call finds the server missing.
+        const result = await this.pushMcpServers(key, session, { ...current, [serverName]: server });
         if (result === "replaced") continue;
         if (result === "unsupported") {
           unsupported++;
@@ -696,7 +699,29 @@ export class LiveSessionManager {
     this.externalMcpServersBySession.clear();
     this.mcpServerConfigsBySession.clear();
     this.promptStale.clear();
+    // Let a hot-mount that was already in flight finish before the daemon
+    // exits, so it cannot run its setMcpServers against a torn-down session
+    // while later shutdown steps are draining. Bounded by the same budget as
+    // the turn flush; the queue never rejects (hotMountExternalMcpServer
+    // installs a catch), so this cannot throw.
+    await this.awaitHotMountQueue();
     await this.awaitInFlightFlush();
+  }
+
+  /** Drain whatever is already on the hot-mount queue, bounded. */
+  private async awaitHotMountQueue(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expiry = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        log.warn("Timed out draining the external MCP hot-mount queue during shutdown");
+        resolve();
+      }, SHUTDOWN_FLUSH_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([this.hotMountQueue, expiry]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**

@@ -195,12 +195,31 @@ export interface LiveSessionSettings {
   showThinking?: boolean;
   /**
    * A tool from mounted external MCP server `serverName` failed with an
-   * authorization error. The host uses this to refresh that server's OAuth
-   * token and re-mount it, so the NEXT call in this same session works
-   * without the owner re-running `/mcp login`.
+   * authorization error. The host refreshes that server's OAuth token and
+   * re-mounts it, so the NEXT call in this same session works without the
+   * owner re-running `/mcp login`.
+   *
+   * The reported outcome drives this session's retry budget: only an actually
+   * attempted exchange (`refreshed` / `failed`) is charged against it. A
+   * `skipped` result — nothing to refresh, or an interactive `/mcp login`
+   * already owns the credential — costs nothing, so a 401 arriving mid-login
+   * does not burn the session's ability to recover afterwards.
    */
-  onMcpAuthError?: (serverName: string) => void;
+  onMcpAuthError?: (serverName: string) => Promise<McpAuthRefreshOutcome> | McpAuthRefreshOutcome;
 }
+
+/** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
+export type McpAuthRefreshOutcome = "refreshed" | "failed" | "skipped" | "superseded";
+
+/**
+ * How many token exchanges one session may trigger from tool errors, per
+ * server. A genuine expiry needs one per token lifetime and the periodic
+ * sweep handles the steady state, so this only has to cover a burst; its real
+ * job is to bound the damage when `isMcpAuthErrorText` misreads an unrelated
+ * upstream error, since each refresh re-mounts the server and a self-feeding
+ * loop would otherwise exchange a token per failing tool call.
+ */
+export const MAX_MCP_AUTH_REFRESHES_PER_SESSION = 3;
 
 /**
  * Does a failed MCP tool result look like an expired/rejected access token?
@@ -518,16 +537,11 @@ export class LiveSession {
   private unownedTurnFactory: UnownedTurnFactory | undefined;
   private timeoutMs: number;
   private showThinking: boolean;
-  private onMcpAuthError: ((serverName: string) => void) | undefined;
-  /**
-   * MCP servers already reported this session. Never cleared: the refresh it
-   * triggers re-mounts the server, which would make a misclassified error
-   * (some unrelated tool output that mentions "unauthorized") loop
-   * refresh → re-mount → same error forever. One shot per session is enough
-   * to recover a live session; keeping tokens fresh from then on is the
-   * periodic sweep's job, not this path's.
-   */
-  private mcpAuthErrorsReported = new Set<string>();
+  private onMcpAuthError: LiveSessionSettings["onMcpAuthError"];
+  /** Servers with a refresh attempt in flight — no duplicate concurrent asks. */
+  private mcpAuthRefreshInFlight = new Set<string>();
+  /** Per-server count of exchanges this session has actually triggered. */
+  private mcpAuthRefreshAttempts = new Map<string, number>();
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -1131,17 +1145,36 @@ export class LiveSession {
    * duplicate refreshes behind the first one.
    */
   private reportMcpAuthError(toolName: string | undefined, resultText: string): void {
-    if (!this.onMcpAuthError) return;
+    const notify = this.onMcpAuthError;
+    if (!notify) return;
     const serverName = mcpServerFromToolName(toolName);
-    if (!serverName || this.mcpAuthErrorsReported.has(serverName)) return;
-    if (!isMcpAuthErrorText(resultText)) return;
-    this.mcpAuthErrorsReported.add(serverName);
+    if (!serverName || !isMcpAuthErrorText(resultText)) return;
+    if (this.mcpAuthRefreshInFlight.has(serverName)) return;
+    const attempts = this.mcpAuthRefreshAttempts.get(serverName) ?? 0;
+    if (attempts >= MAX_MCP_AUTH_REFRESHES_PER_SESSION) return;
+
+    this.mcpAuthRefreshInFlight.add(serverName);
     log.info({ serverName, tool: toolName }, "MCP tool rejected for authorization; requesting a token refresh");
-    try {
-      this.onMcpAuthError(serverName);
-    } catch (err) {
-      log.warn({ serverName, err }, "MCP auth-error notification threw");
-    }
+    void (async () => {
+      try {
+        const outcome = await notify(serverName);
+        // Charged only for an exchange that actually happened. `skipped`
+        // (a login owns the credential, or there is nothing to refresh) and
+        // `superseded` (a newer record landed first, and its own writer
+        // already re-mounted) leave the budget untouched, so a transient
+        // token-endpoint failure or a 401 during /mcp login does not cost
+        // this session its ability to recover later.
+        if (outcome === "refreshed" || outcome === "failed") {
+          this.mcpAuthRefreshAttempts.set(serverName, attempts + 1);
+        }
+        log.info({ serverName, outcome }, "MCP token refresh after an auth error settled");
+      } catch (err) {
+        this.mcpAuthRefreshAttempts.set(serverName, attempts + 1);
+        log.warn({ serverName, err }, "MCP auth-error notification threw");
+      } finally {
+        this.mcpAuthRefreshInFlight.delete(serverName);
+      }
+    })();
   }
 
   /**

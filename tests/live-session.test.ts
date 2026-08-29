@@ -88,14 +88,14 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSession, STEER_MERGED, SdkResultError } = await import("../src/agent/live-session.js");
+const { LiveSession, MAX_MCP_AUTH_REFRESHES_PER_SESSION, STEER_MERGED, SdkResultError } = await import("../src/agent/live-session.js");
 const { log } = await import("../src/logger.js");
 const TIMEOUT_MS = 10 * 60 * 1000;
 
 function makeSession(settings?: {
   timeoutMs?: number;
   showThinking?: boolean;
-  onMcpAuthError?: (serverName: string) => void;
+  onMcpAuthError?: (serverName: string) => Promise<string> | string;
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
@@ -162,27 +162,86 @@ describe("LiveSession MCP authorization errors", () => {
     message: { content: [{ type: "tool_result", tool_use_id: id, content, is_error: true }] },
   });
 
-  it("reports an expired-token tool failure to the host once per server", async () => {
-    const onMcpAuthError = vi.fn();
+  it("reports an expired-token tool failure to the host and re-mounts", async () => {
+    const onMcpAuthError = vi.fn(async () => "refreshed");
     const { session, harness } = makeSession({ onMcpAuthError });
 
     harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t1"));
     harness.pushEvent(errorResult("t1", 'MCP server "cloudflare-api" requires re-authorization (token expired)'));
     await waitFor(() => onMcpAuthError.mock.calls.length > 0);
     expect(onMcpAuthError).toHaveBeenCalledWith("cloudflare-api");
+    session.close();
+  });
 
-    // Latched: the refresh re-mounts the server, so reporting again would let
-    // a misclassified error loop refresh -> re-mount -> same error.
-    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__search", "t2"));
+  // Codex review, objection 3: the latch used to be set before the outcome
+  // was known, so a 401 arriving during /mcp login (or a transient token
+  // endpoint failure) permanently consumed the session's only attempt.
+  it("does not charge the retry budget when the host skips the refresh", async () => {
+    const onMcpAuthError = vi.fn(async () => "skipped");
+    const { session, harness } = makeSession({ onMcpAuthError });
+
+    for (const id of ["t1", "t2", "t3", "t4", "t5"]) {
+      harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", id));
+      harness.pushEvent(errorResult(id, "HTTP 401 Unauthorized"));
+      await waitFor(() => onMcpAuthError.mock.calls.length >= Number(id.slice(1)));
+    }
+
+    // Every one of them got through: `skipped` costs nothing.
+    expect(onMcpAuthError).toHaveBeenCalledTimes(5);
+    session.close();
+  });
+
+  it("recovers after a transient refresh failure instead of latching forever", async () => {
+    const outcomes = ["failed", "refreshed"];
+    const onMcpAuthError = vi.fn(async () => outcomes.shift() ?? "refreshed");
+    const { session, harness } = makeSession({ onMcpAuthError });
+
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t1"));
+    harness.pushEvent(errorResult("t1", "HTTP 401 Unauthorized"));
+    await waitFor(() => onMcpAuthError.mock.calls.length === 1);
+
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t2"));
     harness.pushEvent(errorResult("t2", "HTTP 401 Unauthorized"));
-    await flushMicrotasks(10);
-    expect(onMcpAuthError).toHaveBeenCalledTimes(1);
+    await waitFor(() => onMcpAuthError.mock.calls.length === 2);
 
-    // A different server is still reported.
-    harness.pushEvent(assistantToolEvent("mcp__docs__search", "t3"));
-    harness.pushEvent(errorResult("t3", "HTTP 401 Unauthorized"));
-    await waitFor(() => onMcpAuthError.mock.calls.length > 1);
-    expect(onMcpAuthError).toHaveBeenNthCalledWith(2, "docs");
+    expect(onMcpAuthError).toHaveBeenCalledTimes(2);
+    session.close();
+  });
+
+  it("bounds refreshes per server so a misread error cannot loop", async () => {
+    const onMcpAuthError = vi.fn(async () => "refreshed");
+    const { session, harness } = makeSession({ onMcpAuthError });
+
+    for (let i = 0; i < MAX_MCP_AUTH_REFRESHES_PER_SESSION + 3; i++) {
+      harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", `t${i}`));
+      harness.pushEvent(errorResult(`t${i}`, "unauthorized"));
+      await flushMicrotasks(10);
+    }
+    await flushMicrotasks(20);
+
+    expect(onMcpAuthError).toHaveBeenCalledTimes(MAX_MCP_AUTH_REFRESHES_PER_SESSION);
+    // A different server keeps its own budget.
+    harness.pushEvent(assistantToolEvent("mcp__docs__search", "d1"));
+    harness.pushEvent(errorResult("d1", "unauthorized"));
+    await waitFor(() => onMcpAuthError.mock.calls.some((c) => c[0] === "docs"));
+    session.close();
+  });
+
+  it("does not ask twice while a refresh is still in flight", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const onMcpAuthError = vi.fn(async () => { await gate; return "refreshed"; });
+    const { session, harness } = makeSession({ onMcpAuthError });
+
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t1"));
+    harness.pushEvent(errorResult("t1", "HTTP 401 Unauthorized"));
+    await waitFor(() => onMcpAuthError.mock.calls.length === 1);
+    harness.pushEvent(assistantToolEvent("mcp__cloudflare-api__docs", "t2"));
+    harness.pushEvent(errorResult("t2", "HTTP 401 Unauthorized"));
+    await flushMicrotasks(20);
+
+    expect(onMcpAuthError).toHaveBeenCalledTimes(1);
+    release();
     session.close();
   });
 

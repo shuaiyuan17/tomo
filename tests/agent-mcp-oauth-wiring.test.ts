@@ -4,6 +4,7 @@ const oauthCalls = vi.hoisted(() => ({
   options: [] as unknown[],
   managerOptions: undefined as undefined | Record<string, unknown>,
   refreshSweeps: [] as unknown[],
+  sweepGate: null as null | Promise<void>,
 }));
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -23,7 +24,9 @@ vi.mock("../src/mcp/oauth.js", () => ({
 
     refreshExpiringTokens(servers: unknown): Promise<string[]> {
       oauthCalls.refreshSweeps.push(servers);
-      return Promise.resolve([]);
+      return oauthCalls.sweepGate
+        ? oauthCalls.sweepGate.then(() => [])
+        : Promise.resolve([]);
     }
   },
   TOKEN_REFRESH_SWEEP_INTERVAL_MS: 60_000,
@@ -45,6 +48,7 @@ describe("Agent external MCP OAuth wiring", () => {
     oauthCalls.options = [];
     oauthCalls.refreshSweeps = [];
     oauthCalls.managerOptions = undefined;
+    oauthCalls.sweepGate = null;
   });
 
   it("starts OAuth non-blocking and hot-mounts a ready server into the live query", async () => {
@@ -107,5 +111,57 @@ describe("Agent external MCP OAuth wiring", () => {
 
     expect(oauthCalls.refreshSweeps).toEqual([]);
     await agent.stop();
+  });
+
+  // Codex review, objection 4: clearing the interval is not enough on its own
+  // — the timer must actually stop firing, and a sweep already in flight must
+  // not be abandoned mid-write.
+  it("stops sweeping after stop() even as time advances", async () => {
+    vi.useFakeTimers();
+    try {
+      mockConfig.mcpServers = {
+        "cloudflare-api": {
+          server: { type: "http", url: "https://api.example/mcp" },
+          oauth: { scopes: [], tokenStoreKey: "cloudflare" },
+        },
+      };
+      const agent = new Agent();
+      await agent.start();
+      expect(oauthCalls.refreshSweeps).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(oauthCalls.refreshSweeps).toHaveLength(2);
+
+      await agent.stop();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(oauthCalls.refreshSweeps).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for an in-flight sweep before tearing sessions down", async () => {
+    let releaseSweep!: () => void;
+    const order: string[] = [];
+    oauthCalls.sweepGate = new Promise<void>((resolve) => {
+      releaseSweep = () => { order.push("sweep"); resolve(); };
+    });
+    mockConfig.mcpServers = {
+      "cloudflare-api": {
+        server: { type: "http", url: "https://api.example/mcp" },
+        oauth: { scopes: [], tokenStoreKey: "cloudflare" },
+      },
+    };
+    const agent = new Agent();
+    await agent.start();
+    expect(oauthCalls.refreshSweeps).toHaveLength(1);
+
+    const stopping = agent.stop().then(() => order.push("stop"));
+    // A stop() that abandons the sweep resolves inside this window.
+    await new Promise((r) => setTimeout(r, 50));
+    releaseSweep();
+    await stopping;
+
+    expect(order).toEqual(["sweep", "stop"]);
   });
 });

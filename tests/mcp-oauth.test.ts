@@ -801,7 +801,7 @@ describe("McpOAuthManager", () => {
         onServerAuthReady: (name) => { ready.push(name); },
       });
 
-      await expect(manager.refreshServerToken("cloudflare-api", servers)).resolves.toBe(true);
+      await expect(manager.refreshServerToken("cloudflare-api", servers)).resolves.toBe("refreshed");
       expect(ready).toEqual(["cloudflare-api"]);
       expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.cloudflare.accessToken)
         .toBe("fresh-access");
@@ -858,7 +858,167 @@ describe("McpOAuthManager", () => {
       });
 
       await expect(manager.refreshExpiringTokens(servers)).resolves.toEqual([]);
-      await expect(manager.refreshServerToken("cloudflare-api", servers)).resolves.toBe(false);
+      await expect(manager.refreshServerToken("cloudflare-api", servers)).resolves.toBe("skipped");
+    });
+
+    // Codex review, objection 1: serialization was keyed by server name, so
+    // two servers sharing one tokenStoreKey could each spend the same
+    // rotating refresh token.
+    it("spends one refresh token once for two servers sharing a tokenStoreKey", async () => {
+      const tokenStorePath = seedStore({
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      const shared: Record<string, ExternalMcpServerConfig> = {
+        "cloudflare-api": {
+          server: { type: "http", url: "https://api.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+        "cloudflare-docs": {
+          server: { type: "http", url: "https://docs.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+      };
+      const refreshTokensSent: string[] = [];
+      const ready: Array<{ name: string; auth: string }> = [];
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async (_input, init) => {
+          refreshTokensSent.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
+          return new Response(JSON.stringify({
+            access_token: "fresh-access",
+            refresh_token: "rotated-refresh",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+        onServerAuthReady: (name, server) => {
+          ready.push({
+            name,
+            auth: (server as { headers?: Record<string, string> }).headers?.Authorization ?? "",
+          });
+        },
+      });
+
+      const names = await manager.refreshExpiringTokens(shared);
+
+      // ONE exchange for the shared credential...
+      expect(refreshTokensSent).toEqual(["refresh-1"]);
+      // ...but BOTH servers are re-mounted with the new header.
+      expect(names.sort()).toEqual(["cloudflare-api", "cloudflare-docs"]);
+      expect(ready).toEqual([
+        { name: "cloudflare-api", auth: "Bearer fresh-access" },
+        { name: "cloudflare-docs", auth: "Bearer fresh-access" },
+      ]);
+    });
+
+    it("serializes a concurrent refresh across two servers on the same tokenStoreKey", async () => {
+      const tokenStorePath = seedStore({
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      const shared: Record<string, ExternalMcpServerConfig> = {
+        alpha: {
+          server: { type: "http", url: "https://alpha.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+        beta: {
+          server: { type: "http", url: "https://beta.example/mcp" },
+          oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "cloudflare" },
+        },
+      };
+      let releaseToken!: () => void;
+      const tokenGate = new Promise<void>((resolve) => { releaseToken = resolve; });
+      let exchanges = 0;
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async () => {
+          exchanges++;
+          await tokenGate;
+          return new Response(JSON.stringify({
+            access_token: "fresh-access",
+            refresh_token: "rotated-refresh",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+      });
+
+      const first = manager.refreshServerToken("alpha", shared);
+      const second = manager.refreshServerToken("beta", shared);
+      releaseToken();
+
+      await expect(first).resolves.toBe("refreshed");
+      await expect(second).resolves.toBe("refreshed");
+      expect(exchanges).toBe(1);
+      expect(JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.cloudflare.refreshToken)
+        .toBe("rotated-refresh");
+    });
+
+    // Codex review, objection 1: a slow refresh must not clobber a fresher
+    // record written for the same key while it was in flight.
+    it("discards a refresh whose store record moved under it", async () => {
+      const tokenStorePath = seedStore({
+        accessToken: "old-access",
+        refreshToken: "refresh-1",
+        tokenType: "Bearer",
+        expiresAt: NOW - 1_000,
+        clientId: "client-123",
+        tokenEndpoint: "https://auth.example/token",
+        updatedAt: NOW - 3_600_000,
+      });
+      let releaseToken!: () => void;
+      const tokenGate = new Promise<void>((resolve) => { releaseToken = resolve; });
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        tokenStorePath,
+        now: () => NOW,
+        fetchImpl: async () => {
+          await tokenGate;
+          return new Response(JSON.stringify({
+            access_token: "stale-refresh-result",
+            token_type: "Bearer",
+            expires_in: 3600,
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+        onServerAuthReady: () => { throw new Error("a superseded refresh must not re-mount"); },
+      });
+
+      const inFlight = manager.refreshServerToken("cloudflare-api", servers);
+      // A /mcp login lands while the exchange is out.
+      writeFileSync(tokenStorePath, JSON.stringify({
+        mcpOAuth: {
+          cloudflare: {
+            accessToken: "login-access",
+            refreshToken: "login-refresh",
+            tokenType: "Bearer",
+            expiresAt: NOW + 3_600_000,
+            clientId: "client-123",
+            tokenEndpoint: "https://auth.example/token",
+            updatedAt: NOW,
+          },
+        },
+      }));
+      releaseToken();
+
+      await expect(inFlight).resolves.toBe("superseded");
+      const stored = JSON.parse(readFileSync(tokenStorePath, "utf-8")).mcpOAuth.cloudflare;
+      expect(stored.accessToken).toBe("login-access");
+      expect(stored.refreshToken).toBe("login-refresh");
     });
 
     it("coalesces a concurrent sweep and 401 into a single token exchange", async () => {
@@ -893,7 +1053,7 @@ describe("McpOAuthManager", () => {
       const onDemand = manager.refreshServerToken("cloudflare-api", servers);
       releaseToken();
       await expect(sweep).resolves.toEqual(["cloudflare-api"]);
-      await expect(onDemand).resolves.toBe(true);
+      await expect(onDemand).resolves.toBe("refreshed");
       expect(exchanges).toBe(1);
     });
   });

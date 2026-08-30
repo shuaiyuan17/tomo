@@ -13,6 +13,7 @@ import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } 
 import { parseAnthropicAuthConfig, type AnthropicAuthConfig } from "./auth.js";
 import { defaultRuntimePaths } from "./runtime-paths.js";
 import { DEFAULT_MODEL } from "./models.js";
+import { redactSecrets } from "./redact.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -187,12 +188,34 @@ interface Validator<T> {
   safeParse(value: unknown): { success: true; data: T } | { success: false; error: z.ZodError };
 }
 
-function describeValue(value: unknown): string {
+/**
+ * Render a config value for a `configIssues` entry.
+ *
+ * `configIssues` is printed by `tomo status`, the `tomo config` banner, and
+ * `assertConfigValid()`'s throw (which lands in `~/.tomo/logs/launchd.err.log`
+ * under launchd), so anything it stringifies is effectively published. The
+ * validators run against whole objects — `parseChannels` checks a channel
+ * entry in one go — so a mistyped `allowlist` used to print its sibling
+ * `token` alongside it.
+ *
+ * Secret-named fields are therefore reduced to `***` + their last four
+ * characters before stringifying. That is still an actionable message: the
+ * failing field is named by `label` and by the zod path, and the operator can
+ * tell which token is on disk without the message handing it out. `label` also
+ * covers the case where the whole value is the secret (`groupSecret: 42`).
+ */
+function describeValue(value: unknown, label?: string): string {
+  const safe = redactSecrets(value, label === undefined ? undefined : fieldNameOf(label));
   try {
-    return JSON.stringify(value) ?? String(value);
+    return JSON.stringify(safe) ?? String(safe);
   } catch {
-    return String(value);
+    return String(safe);
   }
+}
+
+/** Last path segment of an issue label: `litellm.apiKey (TOMO_…)` → `apiKey`. */
+function fieldNameOf(label: string): string {
+  return label.split(" ")[0].split(".").pop()!.replace(/\[\d+\]$/, "");
 }
 
 /** Validate one value. Absent (undefined/null) → default, no issue. Invalid →
@@ -206,8 +229,8 @@ function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallbac
     .join("; ");
   const fallbackNote = typeof fallback === "object" && fallback !== null
     ? "using defaults"
-    : `using ${describeValue(fallback)}`;
-  issues.push(`${label}: ${detail} (got ${describeValue(raw)}; ${fallbackNote})`);
+    : `using ${describeValue(fallback, label)}`;
+  issues.push(`${label}: ${detail} (got ${describeValue(raw, label)}; ${fallbackNote})`);
   return fallback;
 }
 

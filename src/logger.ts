@@ -2,6 +2,7 @@ import pino from "pino";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { watchBus } from "./watch/bus.js";
+import { LOG_REDACT_PATHS } from "./redact.js";
 
 const logFile = process.env.TOMO_LOG_FILE;
 
@@ -44,6 +45,14 @@ function issueMessage(args: unknown[]): string {
 export const log = pino({
   level: process.env.LOG_LEVEL ?? "debug",
   transport,
+  // Second line of defence for credentials. `configIssues` is the surface that
+  // actually leaked one (a bad `allowlist` stringified the whole channel entry
+  // into `tomo status` and the launchd error log), and that is fixed at the
+  // source in config.ts — but nothing stopped a `log.info({ channel }, …)`
+  // from putting a bot token in ~/.tomo/logs/tomo.log, and a log file is
+  // copied into bug reports. Paths are generated from the same field-name
+  // rule; the censor is pino's default `[Redacted]`.
+  redact: { paths: LOG_REDACT_PATHS },
   hooks: {
     // Tap warn/error so the watch TUI's "last issue" pane works without
     // parsing the log file. The watch bus never logs, so this cannot recurse.

@@ -72,10 +72,13 @@ export async function configSessions(): Promise<void> {
     if (action === "clear-session") {
       const confirm = await p.confirm({ message: `Clear session "${key}"? This will start a new conversation.` });
       if (p.isCancel(confirm) || !confirm) continue;
-      store.clearSdkSessionId(key);
+      // Save first. saveConfig refuses when config.json cannot be parsed, and
+      // clearing the SDK session is not undoable — doing it first would retire
+      // the conversation and then abort, leaving the override behind.
       delete overrides[key];
       cfg.sessionModelOverrides = overrides;
       saveConfig(cfg);
+      store.clearSdkSessionId(key);
       p.log.success(`Session "${key}" cleared`);
     }
   }

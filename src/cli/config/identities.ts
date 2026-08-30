@@ -144,11 +144,13 @@ export async function configIdentities(): Promise<void> {
         const confirm = await p.confirm({ message: `Remove identity "${id.name}"?` });
         if (p.isCancel(confirm) || !confirm) continue;
 
-        const restored = restoreCronJobsFromIdentity(id);
-
+        // Save first: saveConfig refuses when config.json cannot be parsed,
+        // and rewriting cron jobs' session keys is not undoable. Doing it
+        // first would move every job off an identity that then stayed.
         identities.splice(idx, 1);
         cfg.identities = identities;
         saveConfig(cfg);
+        const restored = restoreCronJobsFromIdentity(id);
         p.log.success(`Identity "${id.name}" removed`);
         if (restored.count > 0) {
           p.log.success(`Moved ${restored.count} cron job(s) back to ${restored.fallbackKey}`);

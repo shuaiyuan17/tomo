@@ -6,7 +6,7 @@ import { isAutostartEnabled, isMacOS } from "../service.js";
 import { getDaemonStatus } from "../status-info.js";
 import { formatDuration } from "../../cron/format.js";
 import { configIssues } from "../../config.js";
-import { CONFIG_PATH, ConfigReadError, loadConfig } from "./shared.js";
+import { CONFIG_BACKUP_PATH, CONFIG_PATH, ConfigReadError, loadConfig } from "./shared.js";
 import { configModel } from "./model.js";
 import { configAutostart } from "./autostart.js";
 import { configChannels } from "./channels.js";
@@ -25,25 +25,33 @@ export const configCommand = new Command("config")
       await runConfig();
     } catch (err) {
       if (!(err instanceof ConfigReadError)) throw err;
-      // The config was hand-edited into something we cannot parse while this
-      // session was open. Every save is a read-modify-write, so continuing
-      // would publish a config missing every key we failed to read. Nothing
-      // has been written; say what to fix and fail loudly.
-      reportUnreadableConfig(err);
+      // The config became unparseable while this session was open (a hand-edit
+      // in another window), and a save was refused as a result.
+      //
+      // Deliberately NOT "nothing was written": earlier submenus in this same
+      // run may have saved successfully before the file went bad. Only *this*
+      // save was refused.
+      p.log.error(
+        `${describeReadFailure(err)}\n` +
+        "This save was refused — config.json is unchanged by it. Any earlier " +
+        "changes you made in this session were already saved.\n" +
+        `${fixHint()}`,
+      );
+      p.outro("");
+      process.exitCode = 1;
     }
   });
 
-/** Print the parse failure and mark the process as failed. Never writes. */
-function reportUnreadableConfig(err: ConfigReadError): void {
+function describeReadFailure(err: ConfigReadError): string {
   const detail = err.cause instanceof Error ? err.cause.message : String(err.cause);
-  p.log.error(
-    `Config at ${err.path} could not be read, so it cannot be edited safely:\n` +
-    `  ${detail}\n` +
-    "Nothing was written. Fix the file by hand (or restore it from " +
-    `${CONFIG_PATH}.bak) and run \`tomo config\` again.`,
-  );
-  p.outro("");
-  process.exitCode = 1;
+  return `Config at ${err.path} could not be read:\n  ${detail}`;
+}
+
+function fixHint(): string {
+  return existsSync(CONFIG_BACKUP_PATH)
+    ? `Fix it by hand, or restore the backup at ${CONFIG_BACKUP_PATH}.`
+    : "Fix it by hand. (There is no backup to restore — Tomo only writes one " +
+      "when it saves a config it could parse.)";
 }
 
 async function runConfig(): Promise<void> {
@@ -56,10 +64,26 @@ async function runConfig(): Promise<void> {
       return;
     }
 
-    // Gate the whole menu on a readable config: every submenu is
-    // loadConfig() -> mutate one key -> saveConfig(). Throws ConfigReadError,
-    // handled by the caller.
-    loadConfig();
+    // Read the config once, up front. A parse failure does not end the
+    // command — the submenus that never touch config.json are still useful,
+    // and refusing to show cron status because of a trailing comma is its own
+    // small outage. It does take every read-modify-write submenu off the menu,
+    // because each of those is loadConfig() -> mutate one key -> saveConfig()
+    // and would publish a config missing everything we could not read.
+    let readError: ConfigReadError | null = null;
+    try {
+      loadConfig();
+    } catch (err) {
+      if (!(err instanceof ConfigReadError)) throw err;
+      readError = err;
+      p.log.error(
+        `${describeReadFailure(err)}\n` +
+        "Nothing has been written. Editing is disabled until this is fixed; " +
+        "only the views that do not read config.json are available.\n" +
+        `${fixHint()}`,
+      );
+      process.exitCode = 1;
+    }
 
     const daemon = getDaemonStatus();
     if (daemon.pid) {
@@ -77,7 +101,12 @@ async function runConfig(): Promise<void> {
     }
 
     for (;;) {
-      const options: Array<{ value: string; label: string; hint?: string }> = [
+      // Everything that calls loadConfig()/saveConfig() is unavailable while
+      // the file cannot be read. `sessions` is in this list rather than the
+      // one below because it is not a view: it renders config-derived model
+      // overrides and all three of its actions save. `tomo sessions` is the
+      // read-only surface for that data and still works.
+      const options: Array<{ value: string; label: string; hint?: string }> = readError ? [] : [
         { value: "auth", label: "Anthropic authentication", hint: "Claude subscription or API key" },
         { value: "model", label: "Model", hint: "set default model" },
         { value: "litellm", label: "LiteLLM gateway", hint: "ChatGPT subscription or custom proxy" },
@@ -85,9 +114,13 @@ async function runConfig(): Promise<void> {
         { value: "identities", label: "Identities", hint: "bind DMs across channels" },
         { value: "groups", label: "Group chats", hint: "activation secret" },
         { value: "sessions", label: "Sessions", hint: "view and configure sessions" },
+      ];
+      // These read no config at all, so an unparseable config.json cannot
+      // affect them and they stay available.
+      options.push(
         { value: "cron", label: "Scheduled tasks", hint: "cron job status" },
         { value: "costs", label: "Cost analysis", hint: "usage and spending breakdown" },
-      ];
+      );
       if (isMacOS()) {
         options.push({
           value: "autostart",
@@ -116,5 +149,7 @@ async function runConfig(): Promise<void> {
       if (choice === "autostart") await configAutostart();
     }
 
-    p.outro("Restart tomo for changes to take effect.");
+    p.outro(readError
+      ? "Config was not modified. Fix the parse error, then run `tomo config` again."
+      : "Restart tomo for changes to take effect.");
 }

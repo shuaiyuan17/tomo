@@ -449,14 +449,33 @@ export class LiveSessionManager {
     // blocks to the owner and then die at process exit with its deferred block
     // transcript unflushed: exactly the hole the previous commit closed for
     // pre-existing sessions, reopened for late ones.
-    if (this.stopping) return this.refuseForShutdown(req, "admitted after stop()");
-
-    const turn = this.dispatchTurn(req);
-    this.inFlightTurns.add(turn);
+    // EVERY EXIT FROM A TURN SIGNALS COMPLETION, which is why this is a
+    // `finally` around the whole dispatch rather than a call inside
+    // `recordTurnCompletion`. That hook only runs on the two paths that end
+    // with a usable response; a turn can also leave via a shutdown refusal, a
+    // session closed during shutdown, the legacy max-turns throw, a query
+    // timeout, or an unrecoverable session error — and a deferred restart
+    // waiting on the end of the turn must not be stranded by whichever exit
+    // the turn happened to take.
+    let merged = false;
     try {
-      return await turn;
+      if (this.stopping) return this.refuseForShutdown(req, "admitted after stop()");
+
+      const turn = this.dispatchTurn(req);
+      this.inFlightTurns.add(turn);
+      try {
+        const response = await turn;
+        // A steered message that MERGED into a running turn is the one exit
+        // that is not a turn ending: the owning turn is still going, and
+        // firing the signal here would let a restart claim its request and
+        // kill it mid-flight. The owner's own exit reports for both.
+        merged = req.steer === true && response === STEER_MERGED;
+        return response;
+      } finally {
+        this.inFlightTurns.delete(turn);
+      }
     } finally {
-      this.inFlightTurns.delete(turn);
+      if (!merged) this.deps.handleTurnComplete?.(req.key);
     }
   }
 
@@ -637,12 +656,6 @@ export class LiveSessionManager {
   }
 
   private recordTurnCompletion(key: string, session: LiveSession): void {
-    // BEFORE the compact early-return below: a deferred restart that was never
-    // acknowledged mid-turn has to be honoured on every path out of a turn,
-    // and a turn that happened to compact is not a turn the owner asked to
-    // wait longer for.
-    this.deps.handleTurnComplete?.(key);
-
     // Capture session ID if new
     const sid = session.getSessionId();
     if (sid && !this.deps.getSdkSessionId(key)) {

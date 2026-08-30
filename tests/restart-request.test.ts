@@ -137,11 +137,60 @@ describe("end-of-turn restart fallback", () => {
     expect(readdirSync(requestDir)).toEqual([]);
   });
 
-  it("never claims an expired request", () => {
+  it("still restarts after a turn that ran far longer than the TTL", () => {
+    // The regression this exists to prevent: a 12-minute tool loop between the
+    // `tomo restart` call and the end of the turn. The CLI already printed
+    // "restart scheduled"; wall-clock age is not evidence the owner stopped
+    // waiting, and the turn ending IS evidence the request is current.
+    const request = createRestartRequest("dm:shuai", "after a long turn", requestDir);
+    writeFileSync(
+      join(requestDir, `${request.id}.json`),
+      JSON.stringify({ ...request, requestedAt: new Date(Date.now() - 12 * 60 * 1000).toISOString() }) + "\n",
+    );
+
+    expect(takePendingRestartRequest("dm:shuai", requestDir)?.reason).toBe("after a long turn");
+    expect(readdirSync(requestDir)).toEqual([]);
+  });
+
+  it("reports every discard so a restart never goes missing silently", () => {
+    const discards: string[] = [];
+    const first = createRestartRequest("dm:shuai", "first", requestDir);
+    const second = createRestartRequest("dm:shuai", "second", requestDir);
+    writeFileSync(
+      join(requestDir, `${second.id}.json`),
+      JSON.stringify({ ...second, requestedAt: new Date(Date.parse(first.requestedAt) + 1000).toISOString() }) + "\n",
+    );
+    writeFileSync(join(requestDir, "not-json.json"), "{ nope");
+
+    const claimed = takePendingRestartRequest("dm:shuai", requestDir, (d) => discards.push(d.reason));
+
+    expect(claimed?.reason).toBe("first");
+    // The malformed file, and the second request the claimed one supersedes.
+    expect(discards.sort()).toEqual(["malformed", "superseded"]);
+  });
+
+  it("reports an expired marker discard rather than dropping it quietly", () => {
+    const discards: string[] = [];
     const request = createRestartRequest("dm:shuai", undefined, requestDir);
+    const result = formatRestartRequestResult(request);
     const expired = Date.parse(request.requestedAt) + RESTART_REQUEST_TTL_MS;
 
-    expect(takePendingRestartRequest("dm:shuai", requestDir, expired)).toBeNull();
-    expect(readdirSync(requestDir)).toEqual([]);
+    expect(
+      consumeRestartRequestFromToolResult(result, "dm:shuai", requestDir, expired, (d) => discards.push(d.reason)),
+    ).toBeNull();
+    expect(discards).toEqual(["expired"]);
+  });
+
+  it("reports what the startup sweep threw away", () => {
+    const discards: string[] = [];
+    const stale = createRestartRequest("dm:shuai", "stale", requestDir);
+    writeFileSync(
+      join(requestDir, `${stale.id}.json`),
+      JSON.stringify({ ...stale, requestedAt: new Date(Date.now() - RESTART_REQUEST_TTL_MS - 1).toISOString() }) + "\n",
+    );
+    writeFileSync(join(requestDir, "not-json.json"), "{ nope");
+
+    expect(sweepStaleRestartRequests(requestDir, Date.now(), (d) => discards.push(d.reason))).toBe(2);
+    expect(discards.sort()).toEqual(["expired", "malformed"]);
   });
 });

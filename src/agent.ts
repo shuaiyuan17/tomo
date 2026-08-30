@@ -41,6 +41,7 @@ import {
   restartWorkerInvocation,
   takePendingRestartRequest,
   type RestartRequest,
+  type RestartRequestDiscard,
 } from "./restart-request.js";
 import { pruneTools } from "./lcm/index.js";
 import { watchBus } from "./watch/bus.js";
@@ -1524,15 +1525,54 @@ export class Agent {
     isError: boolean,
   ): void {
     if (toolName !== "Bash" || isError) return;
-    const request = consumeRestartRequestFromToolResult(content, sessionKey);
+    const request = consumeRestartRequestFromToolResult(
+      content,
+      sessionKey,
+      undefined,
+      undefined,
+      (discarded) => this.logRestartRequestDiscard(sessionKey, discarded),
+    );
     if (!request) return;
 
     if (this.restartInFlight) {
+      // DRAIN, don't just return. This marker's own file is already consumed,
+      // but a second `tomo restart` in the same turn leaves a second file, and
+      // returning here left it on disk: the restart completes, and within the
+      // TTL the next turn's fallback claims the straggler and restarts AGAIN,
+      // announcing the older reason.
+      this.dropSupersededRestartRequests(sessionKey);
       this.queuePendingErrorNote(sessionKey, "A Tomo restart was already in progress; the duplicate restart request was ignored.");
       return;
     }
     this.restartInFlight = true;
     this.launchAcknowledgedRestart(request);
+  }
+
+  /**
+   * Throw away restart requests for a session that has one already going.
+   *
+   * A restart is not a queue: once one is in flight, every other request for
+   * that session is answered by it. Leaving a file behind means the daemon
+   * comes back up and restarts a second time off a request nobody is waiting
+   * on any more.
+   */
+  private dropSupersededRestartRequests(sessionKey: string): void {
+    takePendingRestartRequest(
+      sessionKey,
+      undefined,
+      (discarded) => this.logRestartRequestDiscard(sessionKey, discarded),
+    );
+  }
+
+  private logRestartRequestDiscard(sessionKey: string, discarded: RestartRequestDiscard): void {
+    log.warn(
+      {
+        sessionKey,
+        reason: discarded.reason,
+        ...("request" in discarded ? { requestId: discarded.request.id, requestedAt: discarded.request.requestedAt } : {}),
+      },
+      "Discarded a restart request without restarting",
+    );
   }
 
   /**
@@ -1549,8 +1589,17 @@ export class Agent {
    * settled on a redirecting invocation and the happy path has gone dark.
    */
   private handleTurnComplete(sessionKey: string): void {
-    if (this.restartInFlight) return;
-    const request = takePendingRestartRequest(sessionKey);
+    if (this.restartInFlight) {
+      // Same reason as the marker path: claim and drop rather than leave the
+      // file for the post-restart daemon to act on.
+      this.dropSupersededRestartRequests(sessionKey);
+      return;
+    }
+    const request = takePendingRestartRequest(
+      sessionKey,
+      undefined,
+      (discarded) => this.logRestartRequestDiscard(sessionKey, discarded),
+    );
     if (!request) return;
     log.warn(
       { sessionKey, requestId: request.id },

@@ -34,6 +34,23 @@ import { dirname } from "node:path";
  *  is running — the restart CLI reads it to attribute the initiator. */
 export const TOMO_SESSION_KEY_ENV = "TOMO_SESSION_KEY";
 
+/**
+ * Env var carrying the PID of the daemon that spawned the session.
+ *
+ * Attribution (TOMO_SESSION_KEY) and liveness are different questions, and
+ * the deferred-restart path needs the second one. An env var is inherited by
+ * everything downstream and outlives its daemon: a `tomo restart` typed into
+ * a terminal that once inherited a session's environment, or run by a script
+ * that captured it, still carries a plausible session key. Deferring there
+ * means writing a request file that no live daemon is watching, printing
+ * "restart scheduled", and never restarting.
+ *
+ * Pairing the key with the spawning daemon's PID makes the claim checkable
+ * against the pidfile: same PID and still running means a daemon that can
+ * actually observe the request is the one that stamped this environment.
+ */
+export const TOMO_DAEMON_PID_ENV = "TOMO_DAEMON_PID";
+
 export interface RestartReason {
   reason: string;
   /** Session key of the initiating session, when attributable. */

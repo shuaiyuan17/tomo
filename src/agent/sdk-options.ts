@@ -8,7 +8,7 @@ import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.
 import { litellmRoutesModel } from "../litellm.js";
 import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
 import { resolvePlugins } from "./plugins.js";
-import { TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
+import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -283,6 +283,10 @@ function buildSdkEnv(args: {
   // default session. See src/restart-reason.ts.
   if (args.sessionKey) {
     env[TOMO_SESSION_KEY_ENV] = args.sessionKey;
+    // Pair it with our own PID so a `tomo restart` run from this session can
+    // prove the daemon that stamped it is the one still running, rather than
+    // trusting an env var that any descendant shell inherits forever.
+    env[TOMO_DAEMON_PID_ENV] = String(process.pid);
   }
   // Preserve the 1-hour prompt-cache TTL under api-key/gateway auth — without
   // this flag it silently drops to the 5-minute default, so idle-but-alive

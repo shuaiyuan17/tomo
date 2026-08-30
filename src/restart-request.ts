@@ -9,18 +9,40 @@ const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const DEFAULT_REQUEST_DIR = join(dirname(defaultRuntimePaths.restartReasonFile), "restart-requests");
 
 /**
- * How long a written-but-unacknowledged restart request stays actionable.
+ * How long a request survives ACROSS turns.
  *
- * The handshake is best-effort by construction: it depends on the marker line
- * surviving into the Bash tool result, and the model controls the command, so
- * `tomo restart >/dev/null` or a pipe that keeps only the last line drops it.
- * The end-of-turn fallback catches those within the same turn; this bound
- * catches everything else (the daemon died before the turn ended, the session
- * was torn down, the process was killed). Past it a request is stale evidence
- * of an intent nobody is waiting on any more, and acting on it would restart
- * Tomo out of nowhere — so it is swept, not honoured.
+ * Deliberately NOT applied to the end-of-turn fallback. A turn ending is
+ * positive evidence that its own request is current, however long the turn
+ * ran: a tool loop can legitimately spend half an hour between the
+ * `tomo restart` call and the end of the turn, and wall-clock age says
+ * nothing about whether the owner is still waiting. Gating the fallback on
+ * age meant a long turn silently broke the promise the CLI had already
+ * printed — the exact failure this whole path exists to prevent.
+ *
+ * What the TTL is for is a request that outlived the turn that made it: the
+ * daemon died before the turn ended, the session was torn down, the process
+ * was killed. Those are swept at startup, and a marker surfacing that late
+ * (necessarily in some LATER turn) is refused. There, age is the only signal
+ * available, and restarting Tomo out of nowhere is worse than missing one.
  */
 export const RESTART_REQUEST_TTL_MS = 10 * 60 * 1000;
+
+/** Why a request file was thrown away. Surfaced so callers can log it. */
+export type RestartRequestDiscardDetail =
+  | { reason: "expired"; request: RestartRequest }
+  | { reason: "malformed" }
+  | { reason: "superseded"; request: RestartRequest };
+
+export type RestartRequestDiscard = RestartRequestDiscardDetail & { path: string };
+
+/**
+ * Discard notifications. Deliberately a callback rather than a logger import:
+ * this module is loaded by `tomo restart` on the CLI side, and nothing under
+ * src/cli/ imports the logger — pulling pino (and the watch bus with it) into
+ * every CLI invocation to report an event only the daemon can act on is a bad
+ * trade. The daemon passes a callback that logs at warn.
+ */
+export type OnRestartRequestDiscard = (discard: RestartRequestDiscard) => void;
 
 function isExpired(request: RestartRequest, now: number): boolean {
   const requestedAt = Date.parse(request.requestedAt);
@@ -46,12 +68,20 @@ function readRequest(path: string): RestartRequest | null {
   return request;
 }
 
-function discard(path: string): void {
+function discard(
+  path: string,
+  detail: RestartRequestDiscardDetail,
+  onDiscard?: OnRestartRequestDiscard,
+): void {
   try {
     unlinkSync(path);
   } catch {
     // Already gone, or not ours to remove — either way there is nothing to do.
+    return;
   }
+  // Only report what we actually removed, so the count a caller logs matches
+  // the number of restarts that will not happen.
+  onDiscard?.({ path, ...detail });
 }
 
 function listRequestFiles(requestDir: string): string[] {
@@ -73,48 +103,70 @@ function listRequestFiles(requestDir: string): string[] {
 export function sweepStaleRestartRequests(
   requestDir: string = DEFAULT_REQUEST_DIR,
   now: number = Date.now(),
+  onDiscard?: OnRestartRequestDiscard,
 ): number {
   let removed = 0;
   for (const name of listRequestFiles(requestDir)) {
     const path = join(requestDir, name);
     const request = readRequest(path);
-    if (request && !isExpired(request, now)) continue;
-    discard(path);
+    if (!request) {
+      discard(path, { reason: "malformed" }, onDiscard);
+      removed += 1;
+      continue;
+    }
+    if (!isExpired(request, now)) continue;
+    discard(path, { reason: "expired", request }, onDiscard);
     removed += 1;
   }
   return removed;
 }
 
 /**
- * Claim any still-actionable request belonging to `sessionKey`.
+ * Claim every request belonging to `sessionKey`, returning the one to act on.
  *
  * The end-of-turn fallback. `consumeRestartRequestFromToolResult` is the happy
  * path and fires mid-turn; this is what makes the CLI's "Tomo will restart"
- * true even when the marker never reached a tool result. EVERY live request
- * for the session is claimed, not just the returned one — two `tomo restart`
- * calls in one turn are one restart, and leaving the second file behind would
- * fire it again after the daemon came back.
+ * true even when the marker never reached a tool result.
+ *
+ * NO TTL HERE, deliberately — see RESTART_REQUEST_TTL_MS. The turn ending is
+ * the evidence that its request is current, and a turn is allowed to take as
+ * long as it takes. Applying the TTL here made a >10-minute tool loop end with
+ * the request silently deleted and no restart, after the CLI had already told
+ * the owner one was scheduled.
+ *
+ * EVERY live request for the session is claimed, not just the returned one —
+ * two `tomo restart` calls in one turn are one restart, and leaving the second
+ * file behind would fire it again after the daemon came back. Callers that are
+ * dropping rather than acting (a restart already in flight) pass
+ * `reason: "superseded"` so the discard is reported that way.
  */
 export function takePendingRestartRequest(
   sessionKey: string,
   requestDir: string = DEFAULT_REQUEST_DIR,
-  now: number = Date.now(),
+  onDiscard?: OnRestartRequestDiscard,
 ): RestartRequest | null {
   const live: RestartRequest[] = [];
   for (const name of listRequestFiles(requestDir)) {
     const path = join(requestDir, name);
     const request = readRequest(path);
-    if (!request || isExpired(request, now)) {
-      discard(path);
+    if (!request) {
+      discard(path, { reason: "malformed" }, onDiscard);
       continue;
     }
+    // Another session's request is none of this turn's business, whatever its
+    // age — its own session's turn end (or the startup sweep) will deal with it.
     if (request.sessionKey !== sessionKey) continue;
     live.push(request);
-    discard(path);
+    // Claimed, so remove the file; the caller decides what to do with it. The
+    // extras are reported as superseded — only `live[0]` is acted on.
+    discard(path, { reason: "superseded", request }, undefined);
   }
   if (live.length === 0) return null;
   // Oldest first: it carries the reason the owner is actually waiting on.
   live.sort((a, b) => Date.parse(a.requestedAt) - Date.parse(b.requestedAt));
+  for (const superseded of live.slice(1)) {
+    onDiscard?.({ path: requestPath(superseded.id, requestDir), reason: "superseded", request: superseded });
+  }
   return live[0];
 }
 
@@ -200,6 +252,7 @@ export function consumeRestartRequestFromToolResult(
   sessionKey: string,
   requestDir: string = DEFAULT_REQUEST_DIR,
   now: number = Date.now(),
+  onDiscard?: OnRestartRequestDiscard,
 ): RestartRequest | null {
   const text = toolResultText(content);
   const markerIndex = text.indexOf(RESTART_REQUEST_MARKER);
@@ -216,7 +269,7 @@ export function consumeRestartRequestFromToolResult(
   // A marker that surfaces this late is not an acknowledgement of anything the
   // owner is still waiting on — drop the request rather than restart on it.
   if (isExpired(request, now)) {
-    discard(path);
+    discard(path, { reason: "expired", request }, onDiscard);
     return null;
   }
   try {

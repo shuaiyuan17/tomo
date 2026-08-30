@@ -39,61 +39,180 @@ function isAfterMessage(msg: SessionMessage, last: SessionMessage): boolean {
 const ROTATE_LOCK_STALE_MS = 60_000;
 
 /**
- * Take the exclusive right to rotate `file`, or return null if someone else
- * holds it.
+ * How far into the future a lock's mtime may sit before it is read as wrong
+ * rather than merely imprecise.
  *
- * `wx` is the whole mechanism: the create-or-fail decision happens in the
- * kernel, so two processes cannot both believe they won. A stale lock (see
- * ROTATE_LOCK_STALE_MS) is removed and the create is retried exactly once —
- * bounded, because the alternative to giving up is spinning, and rotation is
- * always safe to postpone.
+ * A lock created microseconds ago can time-stamp a hair AHEAD of `Date.now()`
+ * — filesystem timestamp granularity and clock reads are not the same source —
+ * so "any negative age" is not a usable definition of "dated in the future".
+ * Five seconds is far outside that noise and far inside ROTATE_LOCK_STALE_MS.
+ */
+const ROTATE_LOCK_FUTURE_SKEW_MS = 5_000;
+
+interface RotationLock {
+  release: () => void;
+}
+
+/**
+ * Take the exclusive right to rotate `file`, or return null to skip this pass.
+ *
+ * `wx` is the core of it: the create-or-fail decision happens in the kernel,
+ * so two processes cannot both believe they created the file.
+ *
+ * NEVER THROWS. `get()` is on the inbound message path, and rotation is an
+ * optimization on top of it — an unwritable sessions directory (EACCES), a
+ * read-only mount, ENOSPC or EMFILE must degrade to "don't rotate", never to
+ * "don't receive the message". Everything here is inside one try/catch for
+ * that reason.
  *
  * Deliberately NOT a liveness check on a recorded pid: pids are recycled, the
- * lock can be written by a different user's process, and "is that pid alive"
- * answers a question about *a* process rather than about this one.
+ * lock can be written by another user's process, and "is that pid alive"
+ * answers a question about *a* process rather than about this one. Staleness
+ * is judged by age, and the lock's identity by a token.
  */
-function acquireRotationLock(file: string): { release: () => void } | null {
+function acquireRotationLock(file: string, key: string): RotationLock | null {
   const lockPath = `${file}.rotate-lock`;
-  const create = (): number | null => {
-    try {
-      return openSync(lockPath, "wx");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      return null;
-    }
-  };
-
-  let fd = create();
-  if (fd === null) {
-    let age: number;
-    try {
-      age = Date.now() - statSync(lockPath).mtimeMs;
-    } catch {
-      // Released between the failed create and the stat — just retry.
-      age = ROTATE_LOCK_STALE_MS + 1;
-    }
-    if (age <= ROTATE_LOCK_STALE_MS) return null;
-    log.warn({ lockPath, ageMs: age }, "Removing a stale transcript rotation lock");
-    try { unlinkSync(lockPath); } catch { /* someone else got there first */ }
-    fd = create();
-    if (fd === null) return null;
-  }
+  // Identifies this ACQUISITION, not this process. A pid cannot distinguish
+  // our lock from one the same pid took and lost a moment earlier, and the
+  // question being asked later is "is the file on disk still the one we
+  // created", which only a fresh random value can answer.
+  const token = `${process.pid}.${randomUUID()}`;
 
   try {
-    writeFileSync(fd, `${process.pid} ${new Date().toISOString()}\n`);
-  } catch {
-    // The contents are diagnostic only; the existence of the file is the lock.
+    if (!createLockFile(lockPath, token) && !takeOverStaleLock(lockPath, token, key)) {
+      return null;
+    }
+    // VERIFY WHAT WE HOLD. `wx` proves nobody else created this file; it does
+    // not prove nobody has since removed it and created their own. Reading the
+    // token back does not make that impossible either — it narrows it to the
+    // gap between our write and our read — but combined with the rename-based
+    // claim below it means the only way to lose the lock unnoticed is for
+    // another rotator to judge a lock less than ROTATE_LOCK_STALE_MS old to be
+    // stale, which it never does.
+    if (!lockHoldsToken(lockPath, token)) {
+      log.warn({ key, lockPath }, "Transcript rotation lock was replaced by another rotator; skipping this pass");
+      return null;
+    }
+  } catch (err) {
+    log.warn({ err, key }, "Could not take the transcript rotation lock; skipping rotation this pass");
+    return null;
   }
-  closeSync(fd);
 
   let released = false;
   return {
     release: () => {
       if (released) return;
       released = true;
-      try { unlinkSync(lockPath); } catch { /* already gone */ }
+      try {
+        // Only if it is still ours. Removing a lock we no longer hold would
+        // hand a third rotator a free run alongside whoever took it from us.
+        if (lockHoldsToken(lockPath, token)) unlinkSync(lockPath);
+      } catch { /* already gone, or unreadable — either way not ours to clear */ }
     },
   };
+}
+
+/** Create the lock with our token. False on EEXIST; other errors propagate. */
+function createLockFile(lockPath: string, token: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(lockPath, "wx");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  try {
+    writeFileSync(fd, `${token}\n${new Date().toISOString()}\n`);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
+/** Is the lock file on disk the one we created? */
+function lockHoldsToken(lockPath: string, token: string): boolean {
+  try {
+    return readFileSync(lockPath, "utf-8").split("\n")[0] === token;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Replace an abandoned lock with ours, or return false to step aside.
+ *
+ * CLAIMED WITH A RENAME, NOT AN UNLINK. Two rotators can both judge the same
+ * lock stale. If both unlink and then create, the second unlink destroys the
+ * first rotator's *fresh* lock and both proceed — which is worse than no lock
+ * at all: duplicate archive records, and the loser's post-rename drain
+ * appending old-inode bytes onto the winner's rewritten file. Renaming the
+ * stale lock aside is atomic and has exactly one winner; the loser gets ENOENT
+ * and gives up for this pass.
+ */
+function takeOverStaleLock(lockPath: string, token: string, key: string): boolean {
+  let judged: { age: number; dev: number; ino: number } | null;
+  try {
+    const st = statSync(lockPath);
+    judged = { age: Date.now() - st.mtimeMs, dev: st.dev, ino: st.ino };
+  } catch {
+    // Released between the failed create and the stat — nothing to take over.
+    judged = null;
+  }
+
+  if (judged !== null) {
+    const age = judged.age;
+    // Fresh and not ours — including the sub-millisecond "negative" ages that
+    // come from timestamp granularity rather than from a wrong clock.
+    if (age >= -ROTATE_LOCK_FUTURE_SKEW_MS && age <= ROTATE_LOCK_STALE_MS) return false;
+    if (age < 0) {
+      // A lock dated in the FUTURE: clock skew, a restored backup, a file
+      // copied with its timestamps. Without this branch its age is never
+      // greater than the threshold, so it is never stale, and rotation for
+      // that key is disabled forever — silently, which is how a transcript
+      // grows past every bound this code exists to enforce.
+      log.warn({ lockPath, ageMs: age, key }, "Transcript rotation lock is dated in the future; treating it as abandoned");
+    } else {
+      log.warn({ lockPath, ageMs: age, key }, "Taking over an abandoned transcript rotation lock");
+    }
+
+    const claim = `${lockPath}.claimed-${token}`;
+    try {
+      renameSync(lockPath, claim);
+    } catch {
+      // Someone else claimed it in the same instant; theirs, not ours.
+      return false;
+    }
+
+    // AND CHECK WE CLAIMED THE FILE WE JUDGED. The staleness verdict was
+    // formed a few syscalls ago and describes one specific file; between then
+    // and the rename, the rotator that abandoned it may have been replaced by
+    // a live one taking the lock legitimately. Renaming by path would then
+    // have stolen a FRESH lock, and both rotators would proceed — the exact
+    // damage the lock exists to prevent. dev+ino is what distinguishes "the
+    // lock I decided was dead" from "whatever is sitting at that name now".
+    let claimed: { dev: number; ino: number } | null = null;
+    try {
+      const st = statSync(claim);
+      claimed = { dev: st.dev, ino: st.ino };
+    } catch { /* treated as a mismatch below */ }
+
+    if (!claimed || claimed.dev !== judged.dev || claimed.ino !== judged.ino) {
+      log.warn({ lockPath, key }, "Rotation lock was replaced while being taken over; putting it back");
+      try {
+        renameSync(claim, lockPath);
+      } catch (err) {
+        // Leave the claim file rather than unlink it: it still holds the other
+        // rotator's token, and its release checks that token before removing
+        // anything, so nothing here can make it delete a lock it lost.
+        log.error({ err, claim, lockPath }, "Could not restore a rotation lock taken over in error");
+      }
+      return false;
+    }
+
+    try { unlinkSync(claim); } catch { /* best-effort; leaves one stray file */ }
+  }
+
+  return createLockFile(lockPath, token);
 }
 
 /**
@@ -121,31 +240,39 @@ function readCompleteLinesFromFd(fd: number, offset: number): { text: string; by
 
 /**
  * Copy any complete lines appended to `fd` past `cursor` onto `target`, and
- * return the new cursor.
+ * report the new cursor plus whether everything readable was carried across.
  *
  * This is what makes rotation safe against a concurrent APPENDER (the lock only
  * excludes other rotators). The daemon appending an inbound message while the
  * CLI rotates is the ordinary case, and on the old code that message was
  * erased by the rename.
  */
-function spliceAppendsSince(fd: number, cursor: number, target: string, key: string): number {
+function spliceAppendsSince(
+  fd: number,
+  cursor: number,
+  target: string,
+  key: string,
+): { cursor: number; ok: boolean } {
   let text: string;
   let bytesRead: number;
   try {
     ({ text, bytesRead } = readCompleteLinesFromFd(fd, cursor));
   } catch (err) {
     log.warn({ err, key }, "Could not re-read the transcript tail during rotation");
-    return cursor;
+    return { cursor, ok: false };
   }
-  if (!text) return cursor;
+  if (!text) return { cursor, ok: true };
   try {
     appendFileSync(target, text);
   } catch (err) {
-    log.error({ err, key, target }, "Could not splice concurrent transcript appends; they remain in the pre-rotation file");
-    return cursor;
+    // The caller decides what that means: before the rename it can still
+    // abandon the rotation and lose nothing, after it the bytes are gone with
+    // the unlinked inode. Saying either here would be wrong half the time.
+    log.error({ err, key, target }, "Could not carry concurrent transcript appends across");
+    return { cursor, ok: false };
   }
-  log.info({ key, bytes: text.length }, "Spliced messages appended during transcript rotation");
-  return bytesRead;
+  log.info({ key, bytes: text.length }, "Carried messages appended during transcript rotation across");
+  return { cursor: bytesRead, ok: true };
 }
 
 interface PendingNotesFile {
@@ -990,9 +1117,13 @@ export class SessionStore {
     // it over the original, so the later rename either loses the earlier
     // rotator's work or, with the old FIXED temp name, fails with ENOENT
     // because the other process already renamed that exact path away.
-    const lock = acquireRotationLock(file);
+    //
+    // acquireRotationLock never throws: a lock that cannot be taken (a
+    // read-only sessions directory, EACCES, EMFILE) must skip the rotation,
+    // not propagate out of `get()` — which every inbound message goes through.
+    const lock = acquireRotationLock(file, key);
     if (!lock) {
-      log.debug({ key }, "Transcript rotation already in progress elsewhere; skipping this pass");
+      log.debug({ key }, "Transcript rotation not started this pass (lock held elsewhere or unavailable)");
       return;
     }
     try {
@@ -1089,12 +1220,22 @@ export class SessionStore {
     const tmp = `${file}.rotate-tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
     writeFileSync(tmp, keep.length > 0 ? keep.map((m) => JSON.stringify(m)).join("\n") + "\n" : "");
 
-    // SPLICE LATE APPENDS. Everything between our read and this line was
-    // appended by someone else — on the old code the rename below erased it,
+    // SPLICE LATE APPENDS. Everything appended between our read and this line
+    // is not in `tmp` — on the old code the rename below erased it,
     // permanently and with no log line, and `getLastSeq` then re-derived seq
     // from the surviving tail so the next message reused a seq that was
     // already taken. Copy those bytes onto the replacement first.
     const spliced = spliceAppendsSince(fd, bytesRead, tmp, key);
+    if (!spliced.ok) {
+      // We could not carry the concurrent appends across, so installing the
+      // rewrite would destroy them. Abandon this pass instead: the original
+      // file still holds every message, and the already-written archive
+      // entries are skipped next time by the isAfterMessage check.
+      log.warn({ key }, "Abandoning transcript rotation: concurrent appends could not be carried over");
+      try { unlinkSync(tmp); } catch { /* best-effort */ }
+      return;
+    }
+
     try {
       renameSync(tmp, file);
     } catch (err) {
@@ -1102,9 +1243,23 @@ export class SessionStore {
       try { unlinkSync(tmp); } catch { /* best-effort */ }
       return;
     }
-    // A writer that opened the path before the rename still holds the old
-    // inode; drain anything it wrote in that window onto the new file.
-    spliceAppendsSince(fd, spliced, file, key);
+
+    // NARROWED, NOT CLOSED. A writer that opened the path just before the
+    // rename holds the old inode and its append lands there, where no path
+    // points any more. Draining it here recovers those bytes, but the window
+    // is only bounded by how long that writer holds its descriptor: an append
+    // that arrives after this read is unrecoverable, because the inode is
+    // unlinked once we close our own fd. In practice appendFileSync opens,
+    // writes and closes in one call, so the exposure is microseconds — but it
+    // is a narrowing, not an elimination, and a lock the APPENDER also took
+    // would be the only way to close it.
+    const drained = spliceAppendsSince(fd, spliced.cursor, file, key);
+    if (!drained.ok) {
+      log.error(
+        { key, file },
+        "Messages appended during rotation could not be recovered from the replaced file; they are lost",
+      );
+    }
     log.info(
       { key, months: [...byMonth.keys()].sort(), archived: all.length - keep.length, kept: keep.length },
       "Transcript rotated: prior months moved to archive files",

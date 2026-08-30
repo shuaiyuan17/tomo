@@ -109,8 +109,15 @@ export class TurnAudienceRegistry {
       turns = new Map();
       this.live.set(sessionKey, turns);
     }
-    // A live turn whose audience is unknown must not read as "nothing is
+    // A REGISTERED turn whose audience is unknown must not read as "nothing is
     // running" — that is the fail-OPEN case. Record it as unattributable.
+    //
+    // Only `runUserTurn` registers, so a background turn (cron, continuity,
+    // watch chat) contributes nothing and, when it runs alone, resolves to the
+    // session key — which is right, it is the owner's. When one overlaps a
+    // live summoned-group turn it inherits that group's scope instead. That is
+    // narrower than its due, never wider, so it fails safe; `Agent
+    // .scopedCallerKey` logs it at debug so the effect is visible.
     turns.set(id, audiences?.length ? [...audiences] : [MIXED_AUDIENCE_KEY]);
     return id;
   }

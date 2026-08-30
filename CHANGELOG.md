@@ -119,7 +119,7 @@
 
   `buildCronTools()` with no caller stays unscoped, which is what the tests and any non-session caller want. `tomo cron` remains the unrestricted human audit surface and is not built from these tools.
 
-  Not addressed: `buildPeopleTools` and `buildRecallTools` have the **same** summon exposure — `isGroupSessionKey("dm:owner")` is false, so a summoned group turn gets `includePrivate: true` and recall over the owner's private transcript. That is a wider change than this one and is filed separately.
+  Two related gaps are deliberately left, and filed together: `send_message(mode: "delegate")` does not pass a caller key at all (`internal-server.ts` -> `delegateToSession`), and the turn it starts on the target session is a `source: "cron"` turn that registers no audience — so it resolves to full owner scope. And `buildPeopleTools` and `buildRecallTools` have the **same** summon exposure — `isGroupSessionKey("dm:owner")` is false, so a summoned group turn gets `includePrivate: true` and recall over the owner's private transcript. That is a wider change than this one and is filed separately.
 
 ## 0.8.14 (2026-08-14)
 

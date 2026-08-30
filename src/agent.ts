@@ -1010,9 +1010,18 @@ export class Agent {
    *  the turn in flight. See TurnAudienceRegistry for why this is not simply
    *  `sessionKey`. */
   scopedCallerKey(sessionKey: string): string {
-    return this.turnAudiences.scopedCallerKey(sessionKey);
+    const scoped = this.turnAudiences.scopedCallerKey(sessionKey);
+    if (scoped !== sessionKey) {
+      // Also fires for a background turn (cron, continuity, watch chat) that
+      // happens to overlap a live summoned-group turn on this session: those
+      // do not run through runUserTurn and so register no audience of their
+      // own, and pick up the group's. Narrower than they would otherwise get,
+      // never wider — but worth being able to see when a scheduled job
+      // reports that it could not touch its own scheduled task.
+      log.debug({ sessionKey, scopedTo: scoped }, "Session-scoped tool call narrowed to the turn's audience");
+    }
+    return scoped;
   }
-
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {
     await this.turnRunner.runTurn({

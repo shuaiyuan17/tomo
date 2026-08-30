@@ -41,7 +41,7 @@ export interface RecallToolDeps {
  * retrying with a different query.
  */
 export const RECALL_FOREIGN_AUDIENCE_REFUSAL =
-  "recall is unavailable while a group is summoned into this session. This turn's messages come from a summoned group (or span several audiences), and the transcript here is the owner's private DM history — it is not readable from a group-steered turn. Ask again in the owner's own DM, or `/dismiss` the summon first.";
+  "recall is unavailable while a group is summoned into this session. This turn's messages come from a summoned group (or span several audiences), and the transcript here is the owner's private DM history — not something to surface into a group-steered turn. Ask again in the owner's own DM, or `/dismiss` the summon first.";
 
 function parseTimeBound(value: string | undefined, label: string): number | undefined {
   if (value === undefined) return undefined;

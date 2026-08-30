@@ -259,7 +259,7 @@ describe("private tools during a summoned-group turn", () => {
     await agent.stop();
   });
 
-  it("tells the model, in the summon reminder, that the private surfaces are off", async () => {
+  it("tells the model, in the summon reminder, that private context is off limits", async () => {
     resetConfig({ identities: [OWNER] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -279,8 +279,14 @@ describe("private tools during a summoned-group turn", () => {
 
     const prompt = mockSdk.promptsBySession.find((p) => p.sessionKey === OWNER_DM)?.text ?? "";
     expect(prompt).toContain("Summoned-group message");
-    expect(prompt).toContain("private people records are hidden");
-    expect(prompt).toContain("recall_conversation refuses");
+    expect(prompt).toContain("The owner's private context is off limits for this turn");
+    expect(prompt).toContain("by any route");
+    // Stated as a norm: naming the blocked tools would tell a refused model
+    // where else to look, and the enforcement is not total (see the residuals
+    // in CHANGELOG.md — the system prompt already carries private people
+    // names, and Read/Grep over memory/private are not guarded here).
+    expect(prompt).not.toContain("list_people");
+    expect(prompt).not.toContain("recall_conversation");
 
     await agent.stop();
   });

@@ -634,12 +634,21 @@ export class Agent {
    * inversion (text → private DM, group → explicit tool call) is the part the
    * model must not get wrong, and pending notes only fire once — this rides
    * along with every summoned message.
+   *
+   * The privacy half is stated as a NORM, not as a list of which tools are
+   * disabled. Naming the blocked tools would tell a model that has just been
+   * refused where else to look — and the enforcement is not total: the
+   * system prompt for a dm: session is built once per live session and
+   * already carries private people names, and the PreToolUse private-memory
+   * guard is keyed on the session key, so Read/Grep over memory/private are
+   * not blocked on a summoned turn (a separate fix). "Off limits, by any
+   * route" is both the instruction we want and the honest description.
    */
   private summonReminder(targets: string[]): string {
     const list = targets.map((t) => `"${t}"`).join(", ");
     return formatTomoEvent(
       "summon-reminder",
-      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. This session's private surfaces are disabled for this turn: private people records are hidden from list_people/upsert_person, and recall_conversation refuses — the group is steering the turn, so the owner's private DM history is not readable from it.`,
+      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. The owner's private context is off limits for this turn: private people records and private DM history are not yours to look up, quote or summarise here, by any route — the group is steering this turn.`,
     );
   }
 

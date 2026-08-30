@@ -59,6 +59,12 @@
 
 - **`tomo config` no longer prints the Telegram bot token to the terminal.** Channels → Telegram → Bot token used `p.text` with the full token pre-filled as `initialValue`, rendering it on screen and into shell scrollback, and the menu hint showed its first eight characters. It is now `p.password` displaying `(set)`, with a blank answer keeping the existing value — the same shape `config/auth.ts` and `config/litellm.ts` already used.
 
+- **A blank environment variable no longer overrides the config file.** `config.ts` has always had `envVar()` to treat `FOO=` as unset, but seven overrides bypassed it and read `process.env.FOO ?? file.foo`, which only falls through on undefined — and `FOO=`, `FOO=""` and `FOO=$TYPO` all arrive as an empty string. `TELEGRAM_BOT_TOKEN=` blanked a configured token, so the channel was never constructed while the startup error pointed at the variable that *is* set; `TOMO_LITELLM_BASE_URL=` silently disabled a configured gateway with no config issue at all, and `TOMO_LITELLM_MODE=` re-inferred the mode from the model, routing a chatgpt-subscription gateway as a generic proxy; `TOMO_CONTINUITY_SCRIPT=` (or whitespace) disabled a configured script. `CLAUDE_MODEL`, `TOMO_CITY` and the remaining LiteLLM variables are covered too. **Behaviour change:** `CLAUDE_MODEL=""` used to be a startup-blocking config issue ("expected a non-empty model name") and now boots on the configured or default model instead — a blank variable is treated as absent everywhere, consistently, rather than fatal in one place and silent in six.
+
+  `src/runtime-paths.ts` had the same gap with worse consequences, and is fixed the same way: `resolve("")` is the current working directory, so `TOMO_WORKSPACE=` made whatever directory the daemon was launched from the workspace — taking `sdkSessionsDir`, which is derived from the workspace path, with it. Same for `SESSIONS_DIR=`.
+
+  Because the fallback is otherwise invisible — no surface prints the *effective* model, token or gateway, so a mistyped override looks exactly like a working one — the ignored variables are recorded and the daemon logs them once at startup: `Ignoring blank environment overrides; using the config file or default value`.
+
 ## 0.8.14 (2026-08-14)
 
 ### Features

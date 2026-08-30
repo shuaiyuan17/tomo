@@ -24,12 +24,13 @@ async function loadConfigWith(
   writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(file));
   vi.resetModules();
   vi.stubEnv("HOME", home);
-  vi.stubEnv("TOMO_WORKSPACE", join(home, "workspace"));
-  // Neutralize anything the ambient environment happens to set.
+  // Neutralize anything the ambient environment happens to set, so the test is
+  // hermetic under any shell. TOMO_WORKSPACE/SESSIONS_DIR are cleared rather
+  // than pointed somewhere: these tests assert the ~/.tomo defaults.
   for (const name of [
     "TELEGRAM_BOT_TOKEN", "CLAUDE_MODEL", "TOMO_CITY",
     "TOMO_LITELLM_BASE_URL", "TOMO_LITELLM_API_KEY", "TOMO_LITELLM_MODE",
-    "TOMO_CONTINUITY_SCRIPT",
+    "TOMO_CONTINUITY_SCRIPT", "TOMO_WORKSPACE", "SESSIONS_DIR",
   ]) {
     vi.stubEnv(name, undefined as unknown as string);
   }
@@ -93,5 +94,67 @@ describe("empty-string env overrides", () => {
       { TOMO_CONTINUITY_SCRIPT: "" },
     );
     expect(config.continuityScript?.path).toBe("/tmp/continuity.sh");
+  });
+
+  it("treats a whitespace-only TOMO_CONTINUITY_SCRIPT as unset too", async () => {
+    // `FOO=" "` reaches the process as a non-empty string, but there is no
+    // path in it — the old code trimmed it to "" and returned null, disabling
+    // a configured script.
+    const { config } = await loadConfigWith(
+      { continuityScript: { path: "/tmp/continuity.sh" } },
+      { TOMO_CONTINUITY_SCRIPT: "   " },
+    );
+    expect(config.continuityScript?.path).toBe("/tmp/continuity.sh");
+  });
+
+  it("keeps the configured LiteLLM mode when TOMO_LITELLM_MODE is empty", async () => {
+    const { config } = await loadConfigWith(
+      {
+        model: "claude-sonnet-5",
+        litellm: { baseUrl: "http://127.0.0.1:4000", mode: "chatgpt-subscription" },
+      },
+      { TOMO_LITELLM_MODE: "" },
+    );
+    // An empty mode used to fall through inferLiteLlmMode's "no explicit
+    // value" branch, which infers from the model — silently routing a
+    // chatgpt-subscription gateway as a generic anthropic-compatible proxy.
+    expect(config.litellm?.mode).toBe("chatgpt-subscription");
+  });
+
+  it("records every blank override it ignored, for the startup log line", async () => {
+    // Read defensively so a build without the export fails on the CONTENTS
+    // (nothing was recorded) rather than on the destructuring.
+    const ignoredEnvOverrideNames = (await loadConfigWith(
+      { model: "claude-sonnet-5", city: "Brooklyn" },
+      { CLAUDE_MODEL: "", TOMO_CITY: "   " },
+    )).ignoredEnvOverrideNames ?? [];
+    // The fallback is right, but it is invisible: no surface prints the
+    // effective model, so the daemon logs these once at startup.
+    expect([...ignoredEnvOverrideNames].sort()).toEqual(["CLAUDE_MODEL", "TOMO_CITY"]);
+  });
+
+  it("records nothing when the overrides are absent or genuinely set", async () => {
+    const ignoredEnvOverrideNames = (await loadConfigWith(
+      { model: "claude-sonnet-5" },
+      { CLAUDE_MODEL: "claude-opus-5" },
+    )).ignoredEnvOverrideNames ?? [];
+    expect([...ignoredEnvOverrideNames]).toEqual([]);
+    // ...and the override itself still applies.
+  });
+});
+
+describe("empty-string env overrides for runtime paths", () => {
+  it("keeps the default workspace when TOMO_WORKSPACE is empty", async () => {
+    // resolve("") is the CURRENT WORKING DIRECTORY: a blank TOMO_WORKSPACE
+    // used to make whatever directory the daemon was launched from the
+    // workspace, and sdkSessionsDir is derived from that path.
+    const { config } = await loadConfigWith({}, { TOMO_WORKSPACE: "" });
+    expect(config.workspaceDir).toBe(join(home, ".tomo", "workspace"));
+    expect(config.workspaceDir).not.toBe(process.cwd());
+  });
+
+  it("keeps the default sessions dir when SESSIONS_DIR is empty", async () => {
+    const { config } = await loadConfigWith({}, { SESSIONS_DIR: "" });
+    expect(config.sessionsDir).toBe(join(home, ".tomo", "data", "sessions"));
   });
 });

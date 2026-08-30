@@ -60,6 +60,18 @@ async function startForeground(): Promise<void> {
 
   const { Agent } = await import("../agent.js");
   const { log } = await import("../logger.js");
+
+  // An env override that is set but blank is ignored in favour of the config
+  // file (config.ts envVar). Say so once: nothing else prints the effective
+  // model/token/gateway, so a mistyped `CLAUDE_MODEL=$UNSET` is otherwise
+  // indistinguishable from a working override.
+  const { ignoredEnvOverrideNames } = await import("../config.js");
+  if (ignoredEnvOverrideNames.length > 0) {
+    log.info(
+      { vars: [...ignoredEnvOverrideNames] },
+      "Ignoring blank environment overrides; using the config file or default value",
+    );
+  }
   const { TelegramChannel } = await import("../channels/index.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
   const { PetScheduler } = await import("../mcp/pet-scheduler.js");

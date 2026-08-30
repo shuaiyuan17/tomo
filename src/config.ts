@@ -238,17 +238,38 @@ function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallbac
 }
 
 /**
+ * Environment overrides that were SET but blank, and so were ignored.
+ *
+ * Unlike `configIssues` this is not a startup blocker — falling back to the
+ * config file is the right outcome. It is recorded because the fallback is
+ * otherwise completely silent: nothing (`tomo status`, `tomo config`) prints
+ * the *effective* model, token or gateway, so `CLAUDE_MODEL=$TYPO` looks
+ * exactly like a working override. The daemon logs it once at startup.
+ */
+const ignoredEnvOverrides: string[] = [];
+export const ignoredEnvOverrideNames: readonly string[] = ignoredEnvOverrides;
+
+/**
  * Env var for a setting; empty string counts as unset.
  *
  * `FOO=` (and `export FOO=""`) is the ordinary way to blank a variable out in
- * a shell or a launchd plist, and it is what a `.env` line with nothing after
- * the `=` produces. Reading `process.env.FOO ?? file.foo` would let that empty
- * string win over the config file, because `??` only falls through on
- * null/undefined — so every env override goes through here.
+ * a shell or a launchd plist, it is what a `.env` line with nothing after the
+ * `=` produces, and it is what `FOO=$UNSET` expands to. Reading
+ * `process.env.FOO ?? file.foo` would let that empty string win over the
+ * config file, because `??` only falls through on null/undefined — so every
+ * env override parsed in this file goes through here.
+ *
+ * (`src/runtime-paths.ts` cannot import this — config.ts imports IT — and
+ * keeps its own copy of the same rule.)
  */
 function envVar(name: string): string | undefined {
   const value = process.env[name];
-  return value === undefined || value.trim() === "" ? undefined : value;
+  if (value === undefined) return undefined;
+  if (value.trim() === "") {
+    if (!ignoredEnvOverrides.includes(name)) ignoredEnvOverrides.push(name);
+    return undefined;
+  }
+  return value;
 }
 
 // Coercing schemas: config.json values arrive typed, env overrides arrive as

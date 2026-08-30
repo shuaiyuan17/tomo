@@ -34,15 +34,29 @@ export function sdkSessionsDirForWorkspace(workspaceDir: string, homeDir = homed
   return join(homeDir, ".claude", "projects", encodedWorkspace);
 }
 
+/**
+ * An env override that is set but blank is not an override.
+ *
+ * Same rule as `envVar()` in config.ts, duplicated because config.ts imports
+ * this module and the dependency cannot go the other way. It matters more
+ * here than anywhere else: `resolve("")` is the *current working directory*,
+ * so `TOMO_WORKSPACE=` (or `TOMO_WORKSPACE=$TYPO`) would silently make
+ * whatever directory the daemon happened to be launched from the workspace —
+ * and with it `sdkSessionsDir`, which is derived from the workspace path.
+ */
+function envOverride(value: string | undefined): string | undefined {
+  return value === undefined || value.trim() === "" ? undefined : value;
+}
+
 export function createRuntimePaths(options: RuntimePathOptions = {}): RuntimePaths {
   const env = options.env ?? process.env;
   const homeDir = resolve(options.homeDir ?? homedir());
   const tomoHome = resolve(options.tomoHome ?? join(homeDir, ".tomo"));
   const workspaceDir = resolve(
-    options.workspaceDir ?? env.TOMO_WORKSPACE ?? join(tomoHome, "workspace"),
+    options.workspaceDir ?? envOverride(env.TOMO_WORKSPACE) ?? join(tomoHome, "workspace"),
   );
   const sessionsDir = resolve(
-    options.sessionsDir ?? env.SESSIONS_DIR ?? join(tomoHome, "data", "sessions"),
+    options.sessionsDir ?? envOverride(env.SESSIONS_DIR) ?? join(tomoHome, "data", "sessions"),
   );
   const logsDir = resolve(options.logsDir ?? join(tomoHome, "logs"));
 

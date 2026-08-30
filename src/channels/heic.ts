@@ -53,8 +53,11 @@ const SIPS_KILL_GRACE_MS = 2_000;
  * A process wedged where signals cannot reach it would otherwise leave the
  * promise pending forever, which is precisely the failure being fixed.
  *
- * Both timers are `unref`'d so a conversion in flight never holds the daemon
- * open through shutdown.
+ * Both timers are `unref`'d, so the DEADLINE never holds the daemon open by
+ * itself. That is not the same as "nothing holds it": the `ChildProcess`
+ * handle is ref'd and keeps the event loop alive until the child exits, which
+ * is precisely why the SIGTERM/SIGKILL escalation matters. The bound on how
+ * long a `sips` can hold the daemon open is `timeoutMs + SIPS_KILL_GRACE_MS`.
  */
 function armSipsDeadline(child: ChildProcess, timeoutMs: number, onTimeout: () => void): () => void {
   let fired = false;
@@ -143,7 +146,10 @@ export type HeicTargetFormat = "jpeg" | "png";
  * PNG for exactly those files without paying PNG's size cost on ordinary
  * photos.
  */
-export function heicHasAlpha(srcPath: string): Promise<boolean | null> {
+export function heicHasAlpha(
+  srcPath: string,
+  timeoutMs: number = SIPS_PROBE_TIMEOUT_MS,
+): Promise<boolean | null> {
   return new Promise((resolve) => {
     let stdout = "";
     let settled = false;
@@ -158,8 +164,8 @@ export function heicHasAlpha(srcPath: string): Promise<boolean | null> {
     const child = spawn("sips", ["-g", "hasAlpha", srcPath], {
       stdio: ["ignore", "pipe", "ignore"],
     });
-    disarm = armSipsDeadline(child, SIPS_PROBE_TIMEOUT_MS, () => {
-      log.error({ srcPath, timeoutMs: SIPS_PROBE_TIMEOUT_MS }, "sips hasAlpha probe timed out; killing it and assuming no alpha");
+    disarm = armSipsDeadline(child, timeoutMs, () => {
+      log.error({ srcPath, timeoutMs }, "sips hasAlpha probe timed out; killing it and assuming no alpha");
       done(null);
     });
     child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
@@ -210,10 +216,17 @@ export function convertHeicImage(
     };
     // On any failure the caller only receives `null` and can't clean up, so a
     // partial/corrupt tomo-heic-*.jpg left behind by a non-zero sips exit (or a
-    // spawn error) would leak. Unlink it here (best-effort; ENOENT is fine)
-    // before resolving null.
+    // spawn error) would leak. Unlink it here, best-effort; ENOENT is fine.
+    //
+    // ORDER MATTERS: settle FIRST, then unlink. `unlink` is an unbounded async
+    // fs call, and this function is what the timeout path calls — resolving
+    // behind it would put an fs operation on the critical path of the very
+    // deadline that exists to keep the inbound FIFO moving. The unlink is
+    // fire-and-forget.
+    const scrubOutput = () => { void unlink(outPath).catch(() => undefined); };
     const failWithCleanup = () => {
-      unlink(outPath).catch(() => undefined).finally(() => done(null));
+      done(null);
+      scrubOutput();
     };
 
     const child = spawn("sips", ["-s", "format", format, srcPath, "--out", outPath], {
@@ -235,6 +248,15 @@ export function convertHeicImage(
       failWithCleanup();
     });
     child.on("exit", (code) => {
+      // A child killed at the deadline exits LATER than the scrub above, and
+      // may have created or rewritten outPath in between (it had up to
+      // SIPS_KILL_GRACE_MS still running). `settled` makes `done` a no-op by
+      // then, so scrub again unconditionally — otherwise every timed-out
+      // conversion can leak a tomo-heic-*.jpg into the temp dir.
+      if (settled) {
+        scrubOutput();
+        return;
+      }
       if (code === 0) {
         log.info({ srcPath, outPath, format }, "Converted HEIC attachment");
         done(outPath);

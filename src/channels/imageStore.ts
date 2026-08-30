@@ -95,7 +95,7 @@ export function formatImageMarker(intendedCount: number, savedPaths: string[], u
   const head = savedPaths.length === 0
     ? `[Sent ${noun}`
     : `[Sent ${noun}, saved to: ${savedPaths.join(", ")}`;
-  return `${head}${formatUnconvertedNote(unconvertedCount)}]`;
+  return `${head}${formatUnconvertedNote(unconvertedCount, intendedCount)}]`;
 }
 
 /**
@@ -108,7 +108,12 @@ export function formatImageMarker(intendedCount: number, savedPaths: string[], u
  * this the agent receives an image it cannot see and no reason why. The
  * alternative — waiting for the conversion — is what wedged the inbound FIFO.
  */
-function formatUnconvertedNote(unconvertedCount: number): string {
+function formatUnconvertedNote(unconvertedCount: number, intendedCount: number): string {
+  // Never claim more failures than the marker just said were sent. The caller
+  // counts over the same partition so this cannot currently trip, but a marker
+  // reading "[Sent an image; 2 attachments could not be converted]" would be
+  // worse than useless and the clamp is one line.
+  unconvertedCount = Math.min(unconvertedCount, intendedCount);
   if (unconvertedCount <= 0) return "";
   const subject = unconvertedCount === 1
     ? "1 attachment could not be converted"
@@ -128,7 +133,7 @@ function formatUnconvertedNote(unconvertedCount: number): string {
 export function formatStickerMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0): string {
   if (intendedCount <= 0) return "";
   const noun = intendedCount === 1 ? "a sticker" : `${intendedCount} stickers`;
-  const note = formatUnconvertedNote(unconvertedCount);
+  const note = formatUnconvertedNote(unconvertedCount, intendedCount);
   if (savedPaths.length === 0) return `[Sent ${noun}${note}]`;
   return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}${note}; resend with STICKER:<saved path>]`;
 }

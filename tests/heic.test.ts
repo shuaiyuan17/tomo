@@ -11,7 +11,23 @@ const spawnMock = vi.fn();
 // The mock replaces `spawn` for this whole module graph — including this test
 // file — so stash the real one for the integration test at the bottom, which
 // needs an actual child process.
-const hoisted = vi.hoisted(() => ({ realSpawn: null as unknown as typeof import("node:child_process").spawn }));
+const hoisted = vi.hoisted(() => ({
+  realSpawn: null as unknown as typeof import("node:child_process").spawn,
+  /** When set, every `unlink` inside heic.ts blocks on it. */
+  blockUnlink: null as null | Promise<void>,
+}));
+// heic.ts unlinks its temp output through fs/promises. Gating it is how the
+// "settles without waiting for the unlink" test below holds the fs call open.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    unlink: async (path: string) => {
+      if (hoisted.blockUnlink) await hoisted.blockUnlink;
+      return actual.unlink(path);
+    },
+  };
+});
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   hoisted.realSpawn = actual.spawn;
@@ -111,7 +127,8 @@ describe("convertHeicImage temp-file cleanup", () => {
 
     expect(result).toBeNull();
     expect(capturedOut).not.toBe("");
-    expect(existsSync(capturedOut)).toBe(false);
+    // Fire-and-forget by design (see scrubOutput) — assert eventually, not now.
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
   it("unlinks the temp output on a spawn error and returns null", async () => {
@@ -127,7 +144,7 @@ describe("convertHeicImage temp-file cleanup", () => {
     const result = await convertHeicImage("/tmp/input.heic", "jpeg");
 
     expect(result).toBeNull();
-    expect(existsSync(capturedOut)).toBe(false);
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
   it("returns null without throwing when no temp file was written (ENOENT tolerated)", async () => {
@@ -142,7 +159,7 @@ describe("convertHeicImage temp-file cleanup", () => {
     const result = await convertHeicImage("/tmp/input.heic", "jpeg");
 
     expect(result).toBeNull();
-    expect(existsSync(capturedOut)).toBe(false);
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
   it("returns the output path on a successful (code 0) conversion", async () => {
@@ -267,7 +284,7 @@ describe("sips deadlines (the inbound-FIFO wedge)", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
 
-    expect(existsSync(capturedOut)).toBe(false); // partial output cleaned up
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false)); // partial output cleaned up
   });
 
   it("does not signal a conversion that finishes inside the deadline", async () => {
@@ -355,4 +372,61 @@ describe("convertHeicImage against a real un-SIGTERM-able child", () => {
     await new Promise((r) => setTimeout(r, 3_000));
     expect(alive(pid)).toBe(false);
   }, 20_000);
+});
+
+
+describe("settling is never behind an fs call", () => {
+  afterEach(() => { hoisted.blockUnlink = null; });
+
+  it("resolves without waiting for the temp-file unlink", async () => {
+    // The deadline exists to keep the inbound FIFO moving, so nothing
+    // unbounded may sit between "deadline reached" and "promise settled".
+    // `unlink` is unbounded (it is a syscall on a possibly-wedged filesystem),
+    // so it must run AFTER the resolve, not before it.
+    let release!: () => void;
+    hoisted.blockUnlink = new Promise<void>((r) => { release = r; });
+
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      writeFileSync(capturedOut, Buffer.from("partial"));
+      const child = new FakeChild();
+      queueMicrotask(() => child.emit("exit", 1));
+      return child;
+    });
+
+    // Before the fix this awaited the blocked unlink and timed out.
+    await expect(convertHeicImage("/tmp/input.heic", "jpeg")).resolves.toBeNull();
+
+    release();
+    hoisted.blockUnlink = null;
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
+  }, 5_000);
+
+  it("scrubs the output again when a killed child exits after the deadline", async () => {
+    // The child has up to SIPS_KILL_GRACE_MS still running after we settle, so
+    // it can create (or re-create) outPath behind the first scrub.
+    vi.useFakeTimers();
+    try {
+      let child!: FakeChild;
+      let capturedOut = "";
+      spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+        capturedOut = outPathFromArgs(args);
+        child = new FakeChild();
+        return child;
+      });
+
+      const promise = convertHeicImage("/tmp/hostile.heic", "jpeg");
+      await vi.advanceTimersByTimeAsync(SIPS_TIMEOUT_MS);
+      await expect(promise).resolves.toBeNull();
+
+      // sips writes its partial output only now, after the first scrub ran.
+      writeFileSync(capturedOut, Buffer.from("partial written during the grace"));
+      child.emit("exit", null);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

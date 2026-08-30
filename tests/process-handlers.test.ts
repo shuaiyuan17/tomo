@@ -205,21 +205,46 @@ describe("rejection log rate limiting", () => {
     expect(scheduled).toHaveLength(2);
   });
 
-  it("a timer that fires early, or after uninstall, reports nothing", () => {
+  it("a timer that fires early re-arms for the remainder instead of giving up", () => {
+    const scheduled: Array<{ fn: () => void; ms: number }> = [];
+    uninstall();
+    uninstall = installProcessErrorHandlers({
+      target, logger, exit: vi.fn(), writeStderr: vi.fn(), now: () => clock,
+      schedule: (fn, ms) => scheduled.push({ fn, ms }),
+    });
+    reject(500);
+    logger.error.mockClear();
+    clock += REJECTION_LOG_WINDOW_MS - 1_000;
+    scheduled[0].fn();                               // 1s early
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(scheduled).toHaveLength(2);
+    expect(scheduled[1].ms).toBe(1_000);
+    clock += 1_000;
+    scheduled[1].fn();
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0].suppressed).toBe(500 - REJECTION_LOG_BURST);
+  });
+
+  it("replacing the install (bootstrap → pino) reports the bootstrap window's count first", () => {
+    // Six rejections during bootstrap, then the daemon upgrades to the pino
+    // logger: the bootstrap handler's summary must not vanish with it.
     const scheduled: Array<() => void> = [];
     uninstall();
     uninstall = installProcessErrorHandlers({
       target, logger, exit: vi.fn(), writeStderr: vi.fn(), now: () => clock,
       schedule: (fn) => scheduled.push(fn),
     });
-    reject(500);
+    reject(REJECTION_LOG_BURST + 1);
     logger.error.mockClear();
-    scheduled[0]();                                  // clock has not advanced
-    expect(logger.error).not.toHaveBeenCalled();
-    uninstall();
+    const pino = { error: vi.fn(), fatal: vi.fn() };
+    uninstall = installProcessErrorHandlers({ target, logger: pino, exit: vi.fn(), writeStderr: vi.fn(), now: () => clock });
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0].suppressed).toBe(1);
+    // The old timer is dead: it must not log a second summary.
     clock += REJECTION_LOG_WINDOW_MS;
-    scheduled[0]();
-    expect(logger.error).not.toHaveBeenCalled();
+    for (const fn of scheduled) fn();
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(pino.error).not.toHaveBeenCalled();
   });
 
   it("emits no summary when the window was never exceeded", () => {

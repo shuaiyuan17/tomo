@@ -22,9 +22,18 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** A pid that is guaranteed dead: spawn a process that exits immediately. */
+/**
+ * A pid that is guaranteed dead: spawn a process that exits immediately.
+ * Checked, not `.pid!`: under a loaded full-suite run a spawn can fail
+ * (EAGAIN), and an `undefined` pid slips past `isPidAlive` (false) only to
+ * fail a later `toEqual` as an inexplicable flake.
+ */
 function deadPid(): number {
-  return spawnSync(process.execPath, ["-e", ""]).pid!;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const res = spawnSync(process.execPath, ["-e", ""]);
+    if (!res.error && typeof res.pid === "number" && res.pid > 0) return res.pid;
+  }
+  throw new Error("could not spawn a throwaway process to obtain a dead pid");
 }
 
 describe("acquirePidFile", () => {

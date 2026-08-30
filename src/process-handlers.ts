@@ -177,6 +177,18 @@ export function installProcessErrorHandlers(options: ProcessErrorHandlerOptions 
     windowCount = 0;
   };
 
+  // Arm a flush for the window opened at `openedAt`. A timer that fires early
+  // (a coarse clock) re-arms for the remainder rather than giving up; one that
+  // finds a different window, or an uninstalled handler, does nothing.
+  const armFlush = (openedAt: number) => {
+    schedule(() => {
+      if (!installed || windowStart !== openedAt) return;
+      const remaining = openedAt + REJECTION_LOG_WINDOW_MS - now();
+      if (remaining > 0) armFlush(openedAt);
+      else closeWindow();
+    }, Math.max(0, openedAt + REJECTION_LOG_WINDOW_MS - now()));
+  };
+
   const onRejection = (reason: unknown) => {
     if (now() - windowStart >= REJECTION_LOG_WINDOW_MS) closeWindow();
 
@@ -184,12 +196,7 @@ export function installProcessErrorHandlers(options: ProcessErrorHandlerOptions 
     if (windowCount > REJECTION_LOG_BURST) {
       // First suppressed rejection of this window: make sure the window is
       // closed — and its count logged — even if no further rejection arrives.
-      if (windowCount === REJECTION_LOG_BURST + 1) {
-        const openedAt = windowStart;
-        schedule(() => {
-          if (installed && windowStart === openedAt && now() - windowStart >= REJECTION_LOG_WINDOW_MS) closeWindow();
-        }, Math.max(0, windowStart + REJECTION_LOG_WINDOW_MS - now()));
-      }
+      if (windowCount === REJECTION_LOG_BURST + 1) armFlush(windowStart);
       return;
     }
 
@@ -259,6 +266,10 @@ export function installProcessErrorHandlers(options: ProcessErrorHandlerOptions 
   target.on("uncaughtException", onException);
 
   const uninstall = () => {
+    // Do not abandon a count on the way out: the daemon replaces the
+    // bootstrap install with the pino one a few lines into startup, and six
+    // rejections during bootstrap would otherwise lose their summary.
+    if (installed && windowCount > REJECTION_LOG_BURST) closeWindow();
     installed = false;
     target.off("unhandledRejection", onRejection);
     target.off("uncaughtException", onException);
@@ -284,8 +295,8 @@ function describeReason(reason: unknown): string {
   try {
     return inspect(reason, { depth: 3, breakLength: Infinity });
   } catch {
-    let ctor = "";
-    try { ctor = (reason as { constructor?: { name?: string } })?.constructor?.name ?? ""; } catch { /* hostile getter */ }
-    return `<unrenderable ${typeof reason}${ctor ? ` ${ctor}` : ""}: inspect() threw>`;
+    // Nothing from the value itself — a hostile `constructor.name` getter or
+    // `toString` would just be the next trap. `typeof` cannot throw.
+    return `<unrenderable ${typeof reason}: inspect() threw>`;
   }
 }

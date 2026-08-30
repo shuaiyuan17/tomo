@@ -339,57 +339,138 @@ describe("skillsCanUseTool — narrow .claude/skills/ re-allow", () => {
 
 describe("the Bash arm of the re-allow", () => {
   // Driven through skillsCanUseTool, the real entry point, so every case below
-  // exercises the same code path the SDK calls — and so each one demonstrates
-  // the defect against the previous implementation rather than merely noting
-  // that a new helper did not exist yet.
+  // exercises the code path the SDK calls.
   const allows = async (command: string): Promise<boolean> =>
     (await skillsCanUseTool("Bash", { command })).behavior === "allow";
 
-  it("allows ordinary skill management", async () => {
-    expect(await allows(`mkdir -p ${SKILLS}/my-skill`)).toBe(true);
-    expect(await allows(`touch ${SKILLS}/my-skill/SKILL.md`)).toBe(true);
-    expect(await allows(`rm -rf ${SKILLS}/old-skill`)).toBe(true);
-    expect(await allows(`mv ${SKILLS}/a ${SKILLS}/b`)).toBe(true);
+  describe("auto-allowed: one simple command, every path inside the tree", () => {
+    it("allows ordinary skill management", async () => {
+      expect(await allows(`mkdir -p ${SKILLS}/my-skill`)).toBe(true);
+      expect(await allows(`touch ${SKILLS}/my-skill/SKILL.md`)).toBe(true);
+      expect(await allows(`rm -rf ${SKILLS}/old-skill`)).toBe(true);
+      expect(await allows(`mv ${SKILLS}/a ${SKILLS}/b`)).toBe(true);
+      expect(await allows(`cat ${SKILLS}/real-skill/SKILL.md`)).toBe(true);
+    });
+
+    it("allows a quoted path with spaces INSIDE the tree", async () => {
+      expect(await allows(`touch "${SKILLS}/my skill/SKILL.md"`)).toBe(true);
+      expect(await allows(`touch '${SKILLS}/my skill/SKILL.md'`)).toBe(true);
+    });
+
+    it("allows the skills directory itself", async () => {
+      expect(await allows(`ls ${SKILLS}`)).toBe(true);
+    });
   });
 
-  it("denies the traversal the substring check used to wave through", async () => {
-    // The headline: the SAME escape the file_path arm rejects, reachable
-    // through the arm that checked no paths at all.
-    expect(await allows(`touch ${SKILLS}/../../.claude/settings.json`)).toBe(false);
+  describe("the escapes this replaces", () => {
+    it("denies the traversal the substring check used to wave through", async () => {
+      expect(await allows(`touch ${SKILLS}/../../.claude/settings.json`)).toBe(false);
+    });
+
+    it("denies a quoted SIBLING that whitespace-splitting used to hide", async () => {
+      // "skills dir" is a sibling of "skills". Splitting on whitespace turned
+      // this into two words, neither of which looked like the sibling it names.
+      expect(await allows(`touch "${WS}/.claude/skills dir/x"`)).toBe(false);
+    });
+
+    it("denies quotes embedded mid-path", async () => {
+      // A raw split leaves `/workspace/".claude"/settings.json` glued together
+      // and unrecognisable; the tokenizer resolves it to the protected file.
+      expect(await allows(`touch ${SKILLS}/ok ${WS}/".claude"/settings.json`)).toBe(false);
+      expect(await allows(`touch ${SKILLS}/ok ${WS}/'.claude'/settings.json`)).toBe(false);
+    });
+
+    it("denies a relative path reached through cd", async () => {
+      // The shell's cwd is not knowable from here, so `escape/loot/x` cannot be
+      // resolved. Refused twice over: `&&`, and the non-absolute argument.
+      expect(await allows(`cd ${SKILLS} && touch escape/loot/x`)).toBe(false);
+      expect(await allows(`touch escape/loot/x`)).toBe(false);
+    });
+
+    it("denies an outside destination that is not under .claude or .git", async () => {
+      // Previously only the protected siblings were checked, so any other
+      // outside path rode along.
+      expect(await allows(`cp ${SKILLS}/a /etc/x`)).toBe(false);
+      expect(await allows(`mv ${SKILLS}/a /tmp/anywhere`)).toBe(false);
+    });
+
+    it("denies a flag whose value escapes the tree", async () => {
+      expect(await allows(`grep --file=${SKILLS}/../x ${SKILLS}/y`)).toBe(false);
+      expect(await allows(`grep --file=${WS}/.claude/settings.json ${SKILLS}/y`)).toBe(false);
+    });
+
+    it("denies redirection, even into the tree", async () => {
+      // Refused rather than parsed: a redirection target is a path the command
+      // writes without naming it as an argument.
+      expect(await allows(`echo foo > ${SKILLS}/../x`)).toBe(false);
+      expect(await allows(`cat ${SKILLS}/a > ${SKILLS}/b`)).toBe(false);
+    });
+
+    it("denies a leading environment assignment", async () => {
+      expect(await allows(`FOO=bar touch ${SKILLS}/x`)).toBe(false);
+      expect(await allows(`LD_PRELOAD=/tmp/evil.so cat ${SKILLS}/x`)).toBe(false);
+    });
+
+    it("denies a write through a symlink planted inside the skills tree", async () => {
+      expect(await allows(`touch ${SKILLS}/escape/loot/x.md`)).toBe(false);
+    });
+
+    it("denies a protected sibling", async () => {
+      expect(await allows(`cat ${WS}/.claude/settings.json`)).toBe(false);
+      expect(await allows(`cp ${WS}/.claude/settings.json ${SKILLS}/x`)).toBe(false);
+    });
   });
 
-  it("denies a command that reads a protected sibling and merely mentions skills", async () => {
-    expect(await allows(`cp ${WS}/.claude/settings.json /tmp/x; echo ${SKILLS}/`)).toBe(false);
-    expect(await allows(`cat ${WS}/.git/config && ls ${SKILLS}/`)).toBe(false);
+  describe("refused because they cannot be read unambiguously", () => {
+    it("denies anything that hides its paths from a static read", async () => {
+      expect(await allows(`touch ${SKILLS}/$(whoami).md`)).toBe(false);
+      expect(await allows("touch `echo " + SKILLS + "`/x.md")).toBe(false);
+      expect(await allows(`touch $HOME/.claude/settings.json`)).toBe(false);
+      expect(await allows(`touch ${SKILLS}/\${DIR}/x`)).toBe(false);
+    });
+
+    it("denies command chaining and pipes", async () => {
+      expect(await allows(`touch ${SKILLS}/a; cat ${WS}/.claude/settings.json`)).toBe(false);
+      expect(await allows(`touch ${SKILLS}/a || cat ${WS}/.claude/settings.json`)).toBe(false);
+      expect(await allows(`cat ${SKILLS}/a | tee ${WS}/.claude/settings.json`)).toBe(false);
+      expect(await allows(`touch ${SKILLS}/a &`)).toBe(false);
+      expect(await allows(`touch ${SKILLS}/a\ntouch ${WS}/.claude/settings.json`)).toBe(false);
+    });
+
+    it("denies a backslash escape and an unterminated quote", async () => {
+      expect(await allows(`touch ${SKILLS}/my\\ skill/x`)).toBe(false);
+      expect(await allows(`touch "${SKILLS}/x`)).toBe(false);
+    });
+
+    it("denies a program outside the allowlist", async () => {
+      expect(await allows(`sudo touch ${SKILLS}/x.md`)).toBe(false);
+      expect(await allows(`sh -c "touch ${SKILLS}/x"`)).toBe(false);
+      expect(await allows(`xargs touch ${SKILLS}/x`)).toBe(false);
+      expect(await allows(`/bin/touch ${SKILLS}/x`)).toBe(false);
+    });
+
+    it("denies a home-relative word it cannot resolve", async () => {
+      expect(await allows(`cp ${SKILLS}/x.md ~/.claude/settings.json`)).toBe(false);
+      expect(await allows(`touch ~/x`)).toBe(false);
+    });
+
+    it("denies a command that names no path in the tree", async () => {
+      expect(await allows("rm -rf /")).toBe(false);
+      expect(await allows("ls")).toBe(false);
+      expect(await allows("")).toBe(false);
+    });
   });
 
-  it("denies redirection that lands outside the skills tree", async () => {
-    expect(await allows(`echo pwned > ${WS}/.claude/settings.json && ls ${SKILLS}/`)).toBe(false);
-    expect(await allows(`ls ${SKILLS}/ >> ${WS}/.claude/settings.json`)).toBe(false);
-  });
+  describe("the accepted residual", () => {
+    // These are legitimate skill management that now goes through the SDK's
+    // ordinary permission handling instead of being auto-allowed. Asserted so
+    // the trade is recorded rather than discovered.
+    it("does not auto-allow a grep pattern, which is not a path", async () => {
+      expect(await allows(`grep -r pattern ${SKILLS}`)).toBe(false);
+    });
 
-  it("allows redirection into the skills tree", async () => {
-    expect(await allows(`echo hi > ${SKILLS}/my-skill/SKILL.md`)).toBe(true);
-  });
-
-  it("denies a write through a symlink planted inside the skills tree", async () => {
-    expect(await allows(`touch ${SKILLS}/escape/loot/x.md`)).toBe(false);
-  });
-
-  it("denies anything that hides its paths from a static read", async () => {
-    expect(await allows(`touch ${SKILLS}/$(whoami).md`)).toBe(false);
-    expect(await allows("touch `echo " + SKILLS + "`/x.md")).toBe(false);
-    expect(await allows(`touch $HOME/.claude/settings.json; ls ${SKILLS}/`)).toBe(false);
-    expect(await allows(`sudo touch ${SKILLS}/x.md`)).toBe(false);
-  });
-
-  it("denies a home-relative word it cannot resolve", async () => {
-    expect(await allows(`cp ${SKILLS}/x.md ~/.claude/settings.json`)).toBe(false);
-  });
-
-  it("denies a command that never lands in the skills tree", async () => {
-    expect(await allows("rm -rf /")).toBe(false);
-    expect(await allows(`cat ${WS}/.claude/settings.json`)).toBe(false);
-    expect(await allows("echo hello")).toBe(false);
+    it("does not auto-allow chmod's symbolic mode", async () => {
+      expect(await allows(`chmod +x ${SKILLS}/x.sh`)).toBe(false);
+    });
   });
 });

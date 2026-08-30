@@ -20,9 +20,11 @@ import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../worksp
  */
 const SKILLS_ROOT = pathResolve(config.workspaceDir, ".claude", "skills");
 const SKILLS_DIR = `${SKILLS_ROOT}/`;
-/** Protected siblings the SDK defers to this callback and we never re-allow. */
-const CLAUDE_DIR = pathResolve(config.workspaceDir, ".claude");
-const GIT_DIR = pathResolve(config.workspaceDir, ".git");
+// No separate `.claude` / `.git` constants any more: the Bash arm requires
+// every path to be INSIDE the skills tree, which excludes both by
+// construction. Enumerating protected siblings was a symptom of the old
+// deny-the-bad-shapes approach — it only caught the outside paths someone had
+// thought to list, and let `cp <skills>/a /etc/x` through.
 
 /**
  * Resolve to a REAL path, tolerating a target that does not exist yet.
@@ -105,11 +107,18 @@ export async function skillsCanUseTool(
   if (filePath && !hasTraversalSegment(filePath) && landsInSkills(filePath)) {
     return { behavior: "allow", updatedInput: input };
   }
-  // Bash mkdir / mv / cp / touch — allow only when every path it names that
-  // could reach a protected location lands inside the skills tree.
+  // Bash — a strict allowlist of simple, fully-pathed commands inside the
+  // skills tree. See bashStaysInSkills for why this is an allowlist and not a
+  // parser.
   if (toolName === "Bash" && typeof input.command === "string" && bashStaysInSkills(input.command)) {
     return { behavior: "allow", updatedInput: input };
   }
+  // DENY, NOT `null`. There is no "no opinion" return: `PermissionResult` is
+  // `allow | deny`, and the SDK reserves `null` for a consumer that has
+  // already sent the control_response out of band — returning it here would
+  // send no response at all and, in the SDK's own words, leave "the tool
+  // blocked indefinitely" with no park deadline. A deny hands the model a
+  // message it can act on; a null would wedge the turn.
   return {
     behavior: "deny",
     message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
@@ -117,107 +126,168 @@ export async function skillsCanUseTool(
 }
 
 /**
- * Anything that hides a path from a static reading of the command.
+ * Programs the Bash arm will auto-allow.
  *
- * Command substitution, backticks and variable expansion all produce their
- * paths after this hook has run, so a command containing them cannot be
- * cleared by inspecting its text. `sudo` is refused for the same reason in
- * spirit — nothing about managing a skill library needs it.
+ * Bounded on purpose. Everything here either reads or manipulates files whose
+ * paths are given as arguments, so the containment check below can see every
+ * path the command will touch. Notably absent: `sh`, `bash`, `env`, `xargs`,
+ * `find -exec`'s cousins, and anything that takes a program to run — those
+ * make the reachable set unbounded again. `cd` and `sudo` are absent for the
+ * same reason and are therefore refused by this list alone.
  */
-const OPAQUE_EXPANSION_RE = /\$\(|`|\$\{|\$[A-Za-z_]|\bsudo\b/;
-
-/** Split on whitespace and the shell operators that separate words. */
-const SHELL_SEPARATORS_RE = /[\s;|&()<>]+/;
+const SKILLS_BASH_ALLOWED_PROGRAMS = new Set([
+  "ls", "cat", "head", "tail", "wc",
+  "mkdir", "cp", "mv", "rm", "rmdir", "touch", "chmod", "stat",
+  "find", "grep",
+]);
 
 /**
- * Redirection targets, which are the words a command writes to without ever
- * naming them as an argument: `echo x > <path>`.
+ * Shell syntax that makes the command more than ONE simple command, or that
+ * produces text this cannot see.
+ *
+ * `$` is rejected wholesale rather than just `$(` and `${`: `$VAR` expands at
+ * run time too, and a filename containing a literal `$` is not worth the
+ * carve-out. Backslash escapes are rejected by the tokenizer.
  */
-const REDIRECTION_RE = /(?:>>|>|<)\s*("[^"]*"|'[^']*'|[^\s;|&()<>]+)/g;
+const SHELL_CONTROL_RE = /\|\||&&|[;|&<>\n\r`$]/;
 
-function stripQuotes(token: string): string {
-  return token.replace(/^['"]+/, "").replace(/['"]+$/, "");
+/** A leading `FOO=bar` assignment, which changes the command's environment. */
+const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Split one simple command into words, honouring single and double quotes.
+ *
+ * Returns null — meaning "no auto-allow" — for anything it cannot read
+ * unambiguously: an unterminated quote, or a backslash escape. Quoting is the
+ * whole reason this exists rather than a `split(/\s+/)`: splitting on
+ * whitespace made `touch "<workspace>/.claude/skills dir/x"` look like two
+ * words, neither of which resembled the sibling directory it actually names,
+ * and `touch /workspace/".claude"/settings.json` hid a protected path inside
+ * quotes that a raw split left glued to its neighbours.
+ */
+function tokenizeSimpleCommand(command: string): string[] | null {
+  const tokens: string[] = [];
+  let current = "";
+  let started = false;
+  let quote: '"' | "'" | null = null;
+
+  for (const ch of command) {
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      // Escapes inside double quotes have their own rules; refuse rather than
+      // reimplement them.
+      if (ch === "\\") return null;
+      if (ch === '"') quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === "\\") return null;
+    if (ch === " " || ch === "\t") {
+      if (started) {
+        tokens.push(current);
+        current = "";
+        started = false;
+      }
+      continue;
+    }
+    current += ch;
+    started = true;
+  }
+
+  if (quote !== null) return null;
+  if (started) tokens.push(current);
+  return tokens;
 }
 
-/** Drop a `--flag=` / `-o=` prefix so `--dir=<path>` is checked as a path. */
-function stripFlagPrefix(token: string): string {
-  const eq = token.indexOf("=");
-  return eq > 0 && token.startsWith("-") ? token.slice(eq + 1) : token;
-}
-
-/** Worth resolving: anything with a path separator, or a home-relative path. */
-function looksLikePath(token: string): boolean {
-  return token.includes("/") || token.includes("\\") || token.startsWith("~");
+/**
+ * One argument: an absolute path that really lands inside the skills tree.
+ *
+ * Absolute is required because a relative path is resolved against the SHELL's
+ * working directory, which this hook does not know and cannot bound — `cd` is
+ * refused, but so is any other way the cwd could differ from the workspace.
+ */
+function skillsPathArgument(token: string): boolean {
+  if (!token) return false;
+  // `~` is expanded by the shell, after this hook runs.
+  if (token.includes("~")) return false;
+  if (!isAbsolute(token)) return false;
+  if (hasTraversalSegment(token)) return false;
+  return isInside(realResolve(token), realSkillsRoot());
 }
 
 /**
  * Decide whether a Bash command may ride the skills re-allow.
  *
- * THE BUG THIS REPLACES: `input.command.includes(SKILLS_DIR)`. A substring
- * ANYWHERE in the command approved the whole thing, so
- * `touch <skills>/../../.claude/settings.json` was allowed — the same traversal
- * the file_path branch had, reachable through the branch that did not check
- * paths at all. So was
- * `cp <workspace>/.claude/settings.json /tmp/x; echo <skills>/`.
+ * A STRICT ALLOWLIST, NOT A PARSER. The previous two attempts tried to read an
+ * arbitrary command and rule out the dangerous shapes; that does not converge.
+ * `input.command.includes(SKILLS_DIR)` approved anything containing the path
+ * as a substring. Tightening it to per-word containment still let through
+ * quoted words with spaces, quotes embedded mid-path
+ * (`/workspace/".claude"/settings.json`), relative paths after
+ * `cd <skills> &&`, and any unclaimed outside path that was not under
+ * `.claude`/`.git` (`cp <skills>/a /etc/x`). Each fix revealed the next gap,
+ * because the question "what will this shell command touch" cannot be answered
+ * from outside the shell.
  *
- * The rule now: at least one path must genuinely land in the skills tree, and
- * NO path may claim the skills tree while landing outside it, contain a `..`
- * segment, redirect anywhere but into the skills tree, or touch the protected
- * siblings (`.claude/`, `.git/`) this callback exists to keep denied.
+ * So the question is inverted. A command is auto-allowed only if it is
+ * unambiguously simple AND every path it names is unambiguously inside the
+ * skills tree:
  *
- * LIMITATIONS, deliberately accepted. This is a static read of a shell command
- * and cannot be complete — a shell's word splitting is not reproducible from
- * outside it. Commands carrying `$(...)`, backticks, `${...}`, `$VAR` or
- * `sudo` are therefore denied outright rather than guessed at, and so is any
- * `~`-relative word, which this cannot resolve. What remains reachable is a
- * command that writes to a path outside the workspace entirely while also
- * naming the skills dir; that is not one of the paths the SDK protects, so it
- * would have been auto-approved before reaching this callback anyway. A deny
- * here is not a failure — it returns the call to the SDK's normal permission
- * flow.
+ *   - one simple command: no `&&`, `||`, `;`, `|`, `&`, newline, redirection,
+ *     backtick, `$`, backslash escape, or leading `FOO=bar` assignment;
+ *   - the program is one of {@link SKILLS_BASH_ALLOWED_PROGRAMS} (which
+ *     excludes `cd`, `sudo`, and every program that runs another program);
+ *   - every non-flag word is an ABSOLUTE path, free of `..` and `~`, whose
+ *     realpath lands at or inside the resolved skills root;
+ *   - a flag containing `/` must be `--name=<path>` and its value must pass
+ *     the same check;
+ *   - at least one path actually lands in the tree, so a command that names
+ *     none of it is not auto-allowed by default.
+ *
+ * THE RESIDUAL, ACCEPTED DELIBERATELY. This refuses plenty of legitimate skill
+ * management: `grep pattern <skills>/x` (the pattern is not a path),
+ * `chmod +x <skills>/x` (`+x` is neither), anything with a pipe, and every
+ * relative path. Those now go through the SDK's ordinary permission handling
+ * instead of being waved through, which is the intended trade — this callback
+ * exists to widen a deliberately narrow hole, and a hole that cannot be
+ * described precisely should not be widened at all.
  */
 function bashStaysInSkills(command: string): boolean {
-  if (OPAQUE_EXPANSION_RE.test(command)) return false;
+  if (SHELL_CONTROL_RE.test(command)) return false;
 
-  const skillsRoot = realSkillsRoot();
-  // Realpath'd too: `/tmp` is a symlink to `/private/tmp` on macOS, so a
-  // lexical CLAUDE_DIR would not contain a realpath'd target and the
-  // protected-sibling check would silently never fire.
-  const claudeDir = realResolve(CLAUDE_DIR);
-  const gitDir = realResolve(GIT_DIR);
-  const claimsSkills = (token: string): boolean =>
-    token.includes(SKILLS_ROOT) || token.includes(skillsRoot);
+  const tokens = tokenizeSimpleCommand(command);
+  if (!tokens || tokens.length === 0) return false;
 
-  let landsSomewhereInSkills = false;
+  const [program, ...args] = tokens;
+  if (ENV_ASSIGNMENT_RE.test(program)) return false;
+  if (!SKILLS_BASH_ALLOWED_PROGRAMS.has(program)) return false;
 
-  const check = (raw: string, mustBeInSkills: boolean): boolean => {
-    const token = stripFlagPrefix(stripQuotes(raw));
-    if (!token) return true;
-    if (hasTraversalSegment(token)) return false;
-    if (!looksLikePath(token)) return !mustBeInSkills;
-    // `~` is expanded by the shell, after this hook — unresolvable here.
-    if (token.startsWith("~")) return false;
-    const real = realResolve(token);
-    const inSkills = isInside(real, skillsRoot);
-    if (inSkills) {
-      landsSomewhereInSkills = true;
-      return true;
+  let landsInSkills = false;
+  for (const arg of args) {
+    if (arg.startsWith("-")) {
+      // A bare flag names no path. One carrying a `/` does, and is only
+      // readable in the `--name=<value>` form.
+      if (!arg.includes("/")) continue;
+      const eq = arg.indexOf("=");
+      if (eq < 0) return false;
+      if (!skillsPathArgument(arg.slice(eq + 1))) return false;
+      landsInSkills = true;
+      continue;
     }
-    if (mustBeInSkills) return false;
-    // A word that claims the skills dir but resolves elsewhere is the escape.
-    if (claimsSkills(token)) return false;
-    // A protected sibling must never ride along on a skills command.
-    return !isInside(real, claudeDir) && !isInside(real, gitDir);
-  };
-
-  for (const match of command.matchAll(REDIRECTION_RE)) {
-    if (!check(match[1], true)) return false;
-  }
-  for (const raw of command.split(SHELL_SEPARATORS_RE)) {
-    if (!check(raw, false)) return false;
+    if (!skillsPathArgument(arg)) return false;
+    landsInSkills = true;
   }
 
-  return landsSomewhereInSkills;
+  return landsInSkills;
 }
 
 // ---------------------------------------------------------------------------

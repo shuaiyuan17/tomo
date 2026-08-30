@@ -38,3 +38,41 @@ export function audienceSwitchNote(
     { name: "switch" },
   );
 }
+
+/**
+ * Stand-in caller key for a turn whose inbound messages span more than one
+ * audience (a coalesced batch mixing the owner's DM with a summoned group, or
+ * two summoned groups). It matches no session and no job, so every
+ * session-scoped tool refuses rather than picking one of the audiences and
+ * granting the widest scope on the riskiest turn.
+ *
+ * Not a valid session key by construction — the leading NUL cannot occur in a
+ * channel name or a chat id.
+ */
+export const MIXED_AUDIENCE_KEY = "\u0000mixed-audience";
+
+/**
+ * The session key a session-scoped tool should be judged against, given the
+ * session a turn runs on and that turn's inbound audiences.
+ *
+ * Normally the session key. NOT for a summoned group: its messages run on the
+ * owner's `dm:` session, so every participant is steering a session whose key
+ * says "the owner's private DM", and handing that key to a scoped tool gives
+ * the group the owner's own scope.
+ *
+ * - non-`dm:` session → itself, unchanged.
+ * - no audiences → the session. A cron, LCM or other background turn the
+ *   owner owns outright.
+ * - one audience → `dm` means the owner; a group key means that group.
+ * - more than one → fail closed. A coalesced batch can mix the owner's DM
+ *   with several summoned groups, and no single key is right for all of them;
+ *   picking one would grant the WIDEST scope on exactly the turn where a
+ *   group's text is in the prompt.
+ */
+export function scopedCallerKeyFor(sessionKey: string, audiences: readonly string[] | undefined): string {
+  if (!sessionKey.startsWith("dm:")) return sessionKey;
+  if (!audiences || audiences.length === 0) return sessionKey;
+  const distinct = [...new Set(audiences)];
+  if (distinct.length > 1) return MIXED_AUDIENCE_KEY;
+  return distinct[0] === "dm" ? sessionKey : distinct[0];
+}

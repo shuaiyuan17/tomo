@@ -23,7 +23,7 @@ import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
 import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote } from "./agent/audience.js";
+import { audienceOf, audienceSwitchNote, scopedCallerKeyFor } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
@@ -72,6 +72,10 @@ interface UserTurnRequest {
   steer?: boolean;
   /** True for turns where most inputs are expected to resolve to NO_REPLY. */
   passiveListen?: boolean;
+  /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",
+   *  or a raw group key for a summoned group's messages. Session-scoped MCP
+   *  tools resolve against these, not against the session key. */
+  audiences?: string[];
 }
 
 interface CronTurnOptions {
@@ -157,6 +161,9 @@ export class Agent {
   // summoning, one session interleaves private and group traffic — this is
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
+  /** Inbound audiences of the turn currently running on each dm: session.
+   *  Read by `scopedCallerKey` while a tool call is in flight. */
+  private turnAudiences = new Map<string, string[]>();
   private readonly mcpOAuthManager: McpOAuthManager;
   /** Background sweep that refreshes OAuth tokens before they expire (start/stop). */
   private mcpTokenRefreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -985,6 +992,42 @@ export class Agent {
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
+    // Published for the duration of the turn so session-scoped MCP tools can
+    // see where this turn's input actually came from. Cleared afterwards: a
+    // later cron or background turn on the same session is the owner's, and
+    // must not inherit a summoned group's narrower scope.
+    if (req.audiences?.length) this.turnAudiences.set(req.key, req.audiences);
+    try {
+      await this.runUserTurnInner(req);
+    } finally {
+      this.turnAudiences.delete(req.key);
+    }
+  }
+
+  /**
+   * The session key a session-scoped tool should be judged against for the
+   * turn in flight.
+   *
+   * Normally this is just the session key. It is NOT for a summoned group: a
+   * summoned group's messages run on the owner's `dm:` session (router
+   * `summonGroup`), so every participant of that group is steering a session
+   * whose key says "the owner's private DM". Handing that key to a scoped tool
+   * gives the group the owner's own scope — which for the cron tools means
+   * listing, removing and re-aiming the owner's private reminders.
+   *
+   * Mixed batches fail CLOSED. A coalesced batch can carry DM messages and
+   * messages from several summoned groups at once (see `handleBatch`), and
+   * there is no single key that is correct for all of them; picking the last,
+   * or the session, would pick the *widest* scope on exactly the turn where a
+   * group's text is in the prompt. A sentinel that owns nothing is returned
+   * instead, so every scoped tool refuses and the model tells the user to use
+   * `tomo cron`.
+   */
+  scopedCallerKey(sessionKey: string): string {
+    return scopedCallerKeyFor(sessionKey, this.turnAudiences.get(sessionKey));
+  }
+
+  private async runUserTurnInner(req: UserTurnRequest): Promise<void> {
     await this.turnRunner.runTurn({
       key: req.key,
       source: "user",
@@ -1090,7 +1133,8 @@ export class Agent {
     // reply routing works this turn, and flag audience hops (DM ↔ group).
     // Prompt-only — the transcript keeps the clean tagged message.
     const isSummoned = isGroup && isDmSessionKey(key);
-    const switchNote = this.noteAudienceSwitch(key, [audienceOf(channel.name, message)]);
+    const audiences = [audienceOf(channel.name, message)];
+    const switchNote = this.noteAudienceSwitch(key, audiences);
     const promptText = switchNote + (isSummoned
       ? `${textForAgent}\n${this.summonReminder([`${channel.name}:${message.chatId}`])}`
       : textForAgent);
@@ -1106,6 +1150,7 @@ export class Agent {
       replyChatId,
       images: message.images,
       documents: message.documents,
+      audiences,
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling message",
       steer,
@@ -1213,7 +1258,8 @@ export class Agent {
       ? [...new Set(items.filter((it) => it.message.isGroup).map((it) => `${it.channel.name}:${it.message.chatId}`))]
       : [];
     const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
-    const switchNote = this.noteAudienceSwitch(key, items.map((it) => audienceOf(it.channel.name, it.message)));
+    const audiences = items.map((it) => audienceOf(it.channel.name, it.message));
+    const switchNote = this.noteAudienceSwitch(key, audiences);
     const combined = `${switchNote}[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}${reminder}`;
     const allImages = items.flatMap((it) => it.message.images ?? []);
     const allDocuments = items.flatMap((it) => it.message.documents ?? []);
@@ -1227,6 +1273,7 @@ export class Agent {
       replyToMessageId: isGroup && replyChatId === lastMessage.chatId ? lastMessage.id : undefined,
       images: allImages.length > 0 ? allImages : undefined,
       documents: allDocuments.length > 0 ? allDocuments : undefined,
+      audiences,
       suppressErrors: isPassiveGroup,
       errorLogMessage: "Error handling batched messages",
       steer,

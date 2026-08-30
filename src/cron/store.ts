@@ -169,15 +169,28 @@ export class CronStore {
     return job;
   }
 
-  remove(id: string): boolean {
+  /**
+   * Remove a job.
+   *
+   * `guard` is checked against the job as it exists AFTER the reload, inside
+   * the same load-modify-save. Checking ownership against a snapshot taken
+   * when the store was constructed is not enough: `load()` here replaces it,
+   * so a job written to disk by another process in between was absent from
+   * the caller's snapshot, skipped their ownership check, and was then deleted
+   * by the filter below. The guard has to run against the state the delete
+   * actually applies to.
+   *
+   * Returns `"refused"` when the guard rejects, distinct from `false`
+   * (not found) so the caller can say which happened.
+   */
+  remove(id: string, guard?: (job: CronJob) => boolean): boolean | "refused" {
     this.load();
-    const before = this.jobs.length;
+    const existing = this.jobs.find((j) => j.id === id);
+    if (!existing) return false;
+    if (guard && !guard(existing)) return "refused";
     this.jobs = this.jobs.filter((j) => j.id !== id);
-    if (this.jobs.length < before) {
-      this.save();
-      return true;
-    }
-    return false;
+    this.save();
+    return true;
   }
 
   /**

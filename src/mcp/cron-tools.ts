@@ -21,14 +21,45 @@ import type { CronJob, CronRunStatus } from "../cron/types.js";
  */
 /**
  * @param storePath  Override the jobs file (tests).
- * @param callerSessionKey  The session this MCP server instance belongs to.
- *   When set, `schedule_enable` is scoped by `canManageJob` (src/cron/scope.ts):
- *   re-enabling is the one cron operation here that makes a *dormant* job run
- *   again, so a group chat must not be able to restart a job that fires into
- *   the owner's DM. Scoping of `schedule_list` / `schedule_create` /
- *   `schedule_remove` is #319, which should adopt the same predicate.
+ * @param caller  The session these tools act on behalf of — a key, or a
+ *   getter resolved at call time.
+ *
+ *   Every tool here is scoped by `canManageJob` (src/cron/scope.ts). The cron
+ *   store is one flat file shared by every session, so unscoped a group chat —
+ *   where any participant can steer the model — could list the full text of
+ *   every reminder the owner scheduled from their private DM, remove any of
+ *   them, re-enable a dormant one, or create a job that fires a crafted
+ *   message into the owner's DM. Scoping puts these tools on the same footing
+ *   as the two factories below them in `internal-server.ts`, which already
+ *   bound `buildPeopleTools` and `buildRecallTools` to the caller.
+ *
+ *   A GETTER, not just a key, because the live session a turn runs on is not
+ *   always the audience it came from: a summoned group's messages run on the
+ *   owner's `dm:` session, so a fixed key would hand every participant of that
+ *   group the owner's own DM scope. The getter returns the audience of the
+ *   turn in flight — see `Agent.scopedCallerKey`.
+ *
+ *   Left undefined the tools are unscoped, which is what the tests and any
+ *   non-session caller want. `tomo cron` remains the unrestricted human audit
+ *   surface — it is not built from these tools.
  */
-export function buildCronTools(storePath?: string, callerSessionKey?: string) {
+export function buildCronTools(
+  storePath?: string,
+  caller?: string | (() => string | undefined),
+) {
+  /** Resolved per call: a summoned-group turn changes the answer mid-session. */
+  const callerKey = (): string | undefined => (typeof caller === "function" ? caller() : caller);
+  const manageable = (job: Pick<CronJob, "sessionKey">): boolean => canManageJob(job, callerKey());
+  /**
+   * May this caller aim a job at `session`? A group may only ever target
+   * itself. An identity DM may still schedule into another session —
+   * "remind the family group every Sunday" is a normal request, and a DM is
+   * the owner's own private surface. The asymmetry is the point: a group is
+   * steerable by anyone in it.
+   */
+  const canTarget = (session: string): boolean => canManageJob({ sessionKey: session }, callerKey());
+  /** Every refusal names the way round it, so the model can tell the user. */
+  const ELSEWHERE = "this session can only manage scheduled tasks that fire into this conversation — use `tomo cron` on the Mac to see or change the rest.";
   return [
     tool(
       "schedule_create",
@@ -45,7 +76,7 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         "",
         "One-shot trap: a cron expression with a specific day-of-month + month (e.g. `0 19 1 5 *`) re-fires every year. For a single fire on a calendar date, prefer the ISO date form, or pass `once: true` with the cron expression.",
         "",
-        "The `session` field is the routing target (the **Session key** in the agent system prompt). Use the current session key unless the user explicitly addresses someone else.",
+        "The `session` field is the routing target (the **Session key** in the agent system prompt). Omit it to schedule into the current conversation; pass it only when the user explicitly addresses someone else. A group chat can only schedule into itself.",
         "",
         "Returns the created job (id, schedule, lifecycle, nextRunAt).",
       ].join("\n"),
@@ -59,14 +90,40 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         message: z.string().min(1).max(4000).describe(
           "The text the user (or scheduler) will receive when the job fires. Written as a system message into the target session.",
         ),
-        session: z.string().min(1).describe(
-          'Session key to deliver to. Identity DM ("dm:alice"), iMessage chat key ("imessage:any;+;<guid>"), Telegram chat key ("telegram:-100…"), etc.',
+        session: z.string().min(1).optional().describe(
+          'Session key to deliver to. Defaults to the current session, which is almost always what you want. Identity DM ("dm:alice"), iMessage chat key ("imessage:any;+;<guid>"), Telegram chat key ("telegram:-100…"), etc.',
         ),
         once: z.boolean().optional().describe(
           "Override lifecycle. Defaults to true for one-time `at` schedules and false for recurring (`every`/cron). Pass `true` to make a cron expression fire once and auto-delete; pass `false` to keep an `at` job around as a disabled record after firing.",
         ),
       },
       async ({ name, schedule, message, session, once }) => {
+        const target = session ?? callerKey();
+        if (target === undefined) {
+          return {
+            content: [{ type: "text" as const, text: "schedule_create failed: no session to deliver to." }],
+            isError: true,
+          };
+        }
+        // A session key is a channel name and a chat id; a control character
+        // cannot occur in either. This is also what makes the mixed-audience
+        // sentinel unrepresentable as a target, so a turn that may manage
+        // nothing cannot create a job "owned" by the sentinel and aimed at no
+        // real conversation.
+        // eslint-disable-next-line no-control-regex
+        if (/[\u0000-\u001F]/.test(target)) {
+          return {
+            content: [{ type: "text" as const, text: `schedule_create failed: ${ELSEWHERE}` }],
+            isError: true,
+          };
+        }
+        if (!canTarget(target)) {
+          // Deliberately does not confirm whether the target session exists.
+          return {
+            content: [{ type: "text" as const, text: `schedule_create failed: ${ELSEWHERE}` }],
+            isError: true,
+          };
+        }
         // Validate the schedule on its own. parseScheduleString accepts any
         // unrecognized string as `kind: "cron"` (catch-all) and croner only
         // throws when the expression is actually evaluated, so the validation
@@ -100,7 +157,7 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
             name,
             schedule: parsed,
             message,
-            sessionKey: session,
+            sessionKey: target,
             deleteAfterRun: once,
           });
           return {
@@ -130,13 +187,30 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
         "",
         "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. Such a job is left disabled rather than re-fired; use `schedule_enable` to run it again, and only after checking whether the task actually completed.",
+        "",
+        "Scoped to this session: only tasks this conversation may manage are listed. If others exist, a trailing line says how many — nothing else about them. A task with an empty `sessionKey` is an orphan that fires into no conversation; it shows up here for the owner's DM so it can be cleaned up rather than staying invisible and still running.",
       ].join("\n"),
       {},
       async () => {
         const store = new CronStore(storePath);
-        const jobs = store.list().map(summarizeJob);
+        const all = store.list();
+        const visible = all.filter(manageable);
+        const hidden = all.length - visible.length;
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(jobs, null, 2) }],
+          content: [
+            { type: "text" as const, text: JSON.stringify(visible.map(summarizeJob), null, 2) },
+            // A bare count, not a summary: the message text of a reminder the
+            // owner scheduled from their DM is the thing being protected, and
+            // so is which sessions exist. Reported at all because "no tasks"
+            // and "no tasks you can see" are different facts, and the model
+            // will otherwise tell the user there are none.
+            ...(hidden > 0
+              ? [{
+                type: "text" as const,
+                text: `${hidden} further scheduled task${hidden === 1 ? " belongs" : "s belong"} to other sessions and cannot be listed here — use \`tomo cron\` on the Mac to audit every session's tasks.`,
+              }]
+              : []),
+          ],
         };
       },
       {
@@ -166,7 +240,7 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         if (!existing) {
           return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
         }
-        if (!canManageJob(existing, callerSessionKey)) {
+        if (!manageable(existing)) {
           // Deliberately does not name the owning session.
           return {
             content: [{
@@ -194,13 +268,27 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         "Remove a scheduled task by id. Use when a reminder is no longer needed, or to clean up a one-shot left disabled by an older code path.",
         "",
         "Returns `removed` or `not_found`.",
+        "",
+        "Scoped to this session: only tasks this conversation may manage can be removed here.",
       ].join("\n"),
       {
         id: z.string().min(1).describe("The job id from `schedule_list` (e.g. `f43d8a93`)."),
       },
       async ({ id }) => {
         const store = new CronStore(storePath);
-        const removed = store.remove(id);
+        // The guard runs inside remove()'s own load-modify-save, against the
+        // job as it exists on disk at that moment. Checking `store.get(id)`
+        // here instead would consult the constructor's snapshot, which
+        // remove() then replaces — a job written by another process in between
+        // would skip the check entirely and be deleted.
+        const removed = store.remove(id, manageable);
+        if (removed === "refused") {
+          // Deliberately does not name the owning session.
+          return {
+            content: [{ type: "text" as const, text: `Job ${id} belongs to a different session; ${ELSEWHERE}` }],
+            isError: true,
+          };
+        }
         // Not-found is an expected outcome of a list → pick → remove flow,
         // not an error worth flagging. The text conveys the result; isError
         // would push the agent toward retry/escalate semantics.

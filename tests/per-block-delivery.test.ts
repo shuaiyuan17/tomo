@@ -389,6 +389,16 @@ describe("one block, one message", () => {
     expect(r.channel.sent).toHaveLength(1);
     expect(r.channel.sent[0].text).toBe("intro\ndetail");
   });
+
+  it("absorbs the spaces around a legacy [[NL]] so the block ships as one clean multi-line message", async () => {
+    const r = rig();
+
+    await r.run([assistant([textBlock("☕ 早报\n\nAI [[NL]] · item one [[NL]] · item two")]), result()]);
+
+    expect(r.channel.sent).toHaveLength(1);
+    expect(r.channel.sent[0].text).toBe("☕ 早报\n\nAI\n· item one\n· item two");
+    expect(r.channel.sent[0].text).not.toContain("[[NL]]");
+  });
 });
 
 describe("NO_REPLY is enforced per block", () => {

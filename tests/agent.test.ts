@@ -166,6 +166,19 @@ describe("restoreLiteralNewlines", () => {
   it("leaves text without the token untouched", () => {
     expect(restoreLiteralNewlines(" line A \nline B ")).toBe(" line A \nline B ");
   });
+
+  // The 2026-08-30 shape: `AI[[NL]]· item`, and its spaced siblings. The
+  // spaces belong to the marker, so the result is one clean newline.
+  it("absorbs spaces and tabs hugging the token into the single newline", () => {
+    expect(restoreLiteralNewlines("AI [[NL]] · item")).toBe("AI\n· item");
+    expect(restoreLiteralNewlines("AI\t[[NL]]\t\n· item")).toBe("AI\n· item");
+    expect(restoreLiteralNewlines("AI[[NL]] · item")).toBe("AI\n· item");
+  });
+
+  it("turns two adjacent tokens into a blank line", () => {
+    expect(restoreLiteralNewlines("para one[[NL]][[NL]]para two")).toBe("para one\n\npara two");
+    expect(restoreLiteralNewlines("para one [[NL]] [[NL]] para two")).toBe("para one\n\npara two");
+  });
 });
 
 // Test tool input summarization (extracted logic from agent.ts)

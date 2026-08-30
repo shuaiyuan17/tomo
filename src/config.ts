@@ -237,7 +237,15 @@ function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallbac
   return fallback;
 }
 
-/** Env var for a numeric/boolean setting; empty string counts as unset. */
+/**
+ * Env var for a setting; empty string counts as unset.
+ *
+ * `FOO=` (and `export FOO=""`) is the ordinary way to blank a variable out in
+ * a shell or a launchd plist, and it is what a `.env` line with nothing after
+ * the `=` produces. Reading `process.env.FOO ?? file.foo` would let that empty
+ * string win over the config file, because `??` only falls through on
+ * null/undefined — so every env override goes through here.
+ */
 function envVar(name: string): string | undefined {
   const value = process.env[name];
   return value === undefined || value.trim() === "" ? undefined : value;
@@ -394,13 +402,13 @@ const litellmEntrySchema = z.looseObject({
 
 function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
   const entry = validated("litellm", litellmEntrySchema, raw, {});
-  const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? entry.baseUrl ?? "").trim();
+  const baseUrl = String(envVar("TOMO_LITELLM_BASE_URL") ?? entry.baseUrl ?? "").trim();
   if (!baseUrl) return null;
 
   return {
-    mode: inferLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? entry.mode, defaultModel),
+    mode: inferLiteLlmMode(envVar("TOMO_LITELLM_MODE") ?? entry.mode, defaultModel),
     baseUrl,
-    apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? entry.apiKey ?? "").trim(),
+    apiKey: String(envVar("TOMO_LITELLM_API_KEY") ?? entry.apiKey ?? "").trim(),
   };
 }
 
@@ -417,7 +425,7 @@ function expandConfigPath(rawPath: string): string {
 
 function parseContinuityScriptConfig(raw: unknown): ContinuityScriptConfig | null {
   const entry = validated("continuityScript", continuityScriptEntrySchema, raw, {});
-  const rawPath = String(process.env.TOMO_CONTINUITY_SCRIPT ?? entry.path ?? "").trim();
+  const rawPath = String(envVar("TOMO_CONTINUITY_SCRIPT") ?? entry.path ?? "").trim();
 
   if (!rawPath) return null;
 
@@ -585,7 +593,7 @@ function buildConfig(): TomoConfig {
   const model = validated(
     "model (CLAUDE_MODEL)",
     z.string().min(1, "expected a non-empty model name"),
-    process.env.CLAUDE_MODEL ?? file.model,
+    envVar("CLAUDE_MODEL") ?? file.model,
     DEFAULT_MODEL,
   );
 
@@ -601,7 +609,7 @@ function buildConfig(): TomoConfig {
 
   return {
     auth: parseAnthropicAuthConfig(file.auth),
-    telegramToken: process.env.TELEGRAM_BOT_TOKEN ?? channels.telegram?.token ?? "",
+    telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",
     model,
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
@@ -612,7 +620,7 @@ function buildConfig(): TomoConfig {
     continuity: validated("continuity (TOMO_CONTINUITY)", boolLike, envVar("TOMO_CONTINUITY") ?? file.continuity, false),
     continuityIntervalMs: Math.round(Math.max(continuityIntervalMinutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
-    city: validated("city (TOMO_CITY)", z.string().nullable(), process.env.TOMO_CITY ?? file.city, null),
+    city: validated("city (TOMO_CITY)", z.string().nullable(), envVar("TOMO_CITY") ?? file.city, null),
     identities: parseIdentities(file.identities),
     imessageProvider: validated(
       "channels.imessage.provider (IMESSAGE_PROVIDER)",

@@ -5,6 +5,7 @@ import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
+import { restoreLiteralNewlines } from "../channels/text-utils.js";
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
@@ -303,7 +304,15 @@ export class TurnRunner {
     // The scaffold-leak filter already ran PER BLOCK in renderBlock, as each
     // block shipped — running it here over the joined response would cut every
     // later block at the first leaked marker.
-    const response = rawResponse;
+    //
+    // The legacy `[[NL]]` marker IS rewritten here, once, so that everything
+    // downstream — the `always` transcript append, the response log, the
+    // fallback delivery of a block-less response — holds the text the owner
+    // actually received (`AI\n· item`), never the marker form. The per-block
+    // sink does the same for its own entries (see onBlock); a transcript that
+    // remembers `AI [[NL]] · item` while the phone shows `AI\n· item` is a
+    // recall_conversation lie.
+    const response = restoreLiteralNewlines(rawResponse);
     // One response log per turn, whatever the ingress and whether or not the
     // response ships (silent and suppressed turns still get a line). The
     // channel label comes from the delivery spec, never from resolveTarget —
@@ -496,8 +505,13 @@ export class TurnRunner {
       { defer: spec.transcript !== "on-delivery" },
     );
 
-    const onBlock = async (block: string): Promise<void> => {
+    const onBlock = async (rawBlock: string): Promise<void> => {
       if (suppressed) return;
+      // Normalised ONCE, up front, so the transcript slot below settles with
+      // exactly the text the channel was handed. deliverText repeats the
+      // rewrite (idempotent, defence in depth for callers that bypass this
+      // sink), but the transcript must not record the pre-rewrite form.
+      const block = restoreLiteralNewlines(rawBlock);
       // Classified on the model's literal words, then handled once, after the
       // turn, by the spec's error policy — never shipped as if it were a reply.
       if (isAgentErrorResponse(block)) return;

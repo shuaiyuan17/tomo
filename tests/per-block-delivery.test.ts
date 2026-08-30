@@ -389,6 +389,34 @@ describe("one block, one message", () => {
     expect(r.channel.sent).toHaveLength(1);
     expect(r.channel.sent[0].text).toBe("intro\ndetail");
   });
+
+  it("absorbs the spaces around a legacy [[NL]] so the block ships as one clean multi-line message", async () => {
+    const r = rig();
+
+    await r.run([assistant([textBlock("☕ 早报\n\nAI [[NL]] · item one [[NL]] · item two")]), result()]);
+
+    expect(r.channel.sent).toHaveLength(1);
+    expect(r.channel.sent[0].text).toBe("☕ 早报\n\nAI\n· item one\n· item two");
+    expect(r.channel.sent[0].text).not.toContain("[[NL]]");
+    // `always` policy: the joined response is recorded after the turn — in
+    // the form that was delivered, not the form the model composed.
+    expect(r.transcript).toEqual(["☕ 早报\n\nAI\n· item one\n· item two"]);
+  });
+
+  it("records the rewritten text in the on-delivery transcript, not the [[NL]] form", async () => {
+    // recall_conversation reads the transcript back as "things I told him".
+    // Before this the slot settled with the pre-rewrite block, so recall held
+    // `AI [[NL]] · item` while the phone showed `AI\n· item`.
+    const r = rig();
+
+    await r.run(
+      [assistant([textBlock("AI [[NL]] · item one")]), assistant([textBlock("plain\nlines")]), result()],
+      { delivery: { kind: "send", channel: r.channel, chatId: "chat1" }, transcript: "on-delivery" },
+    );
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["AI\n· item one", "plain\nlines"]);
+    expect(r.transcript).toEqual(["AI\n· item one", "plain\nlines"]);
+  });
 });
 
 describe("NO_REPLY is enforced per block", () => {

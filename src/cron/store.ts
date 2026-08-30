@@ -54,6 +54,8 @@ export class CronStore {
       nextRunAt: computeNextRun(opts.schedule, now),
       lastRunAt: null,
       lastStatus: null,
+      lastStartedAt: null,
+      lastRunId: null,
     };
     this.jobs.push(job);
     this.save();
@@ -108,6 +110,76 @@ export class CronStore {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Record — durably, BEFORE the agent turn is dispatched — that a run has
+   * started. `nextRunAt` only advances once a run completes (markRun), and the
+   * scheduler's in-flight guard lives in memory, so without this a daemon that
+   * restarts mid-run comes back up, sees a due job on disk, and fires it a
+   * second time. `lastStartedAt > lastRunAt` is the durable "a run was
+   * dispatched and never reported back" flag that recoverInterrupted reads.
+   *
+   * Returns the new run id, or undefined when the job vanished (removed by a
+   * concurrent CLI call between the due-scan and dispatch).
+   */
+  markStarted(id: string): string | undefined {
+    // Reload before mutating, like markRun/add: another process may have
+    // changed the file since this instance's last read.
+    this.load();
+    const job = this.get(id);
+    if (!job) return undefined;
+    const runId = randomUUID().slice(0, 8);
+    job.lastStartedAt = Date.now();
+    job.lastRunId = runId;
+    // This dispatch supersedes any earlier interrupted run: whatever marker
+    // recovery left is being delivered right now.
+    job.interruptedAt = null;
+    this.save();
+    return runId;
+  }
+
+  /**
+   * Settle runs that were dispatched but never completed — the daemon was
+   * restarted or killed mid-turn. Called once per scheduler start, BEFORE the
+   * first due-scan, so the normal path never sees these jobs in a half state.
+   *
+   * The interrupted run is closed out (lastRunAt/lastStatus written, so the
+   * job is not re-flagged on every subsequent restart) and the job is sorted
+   * into one of two buckets:
+   *
+   * - `skipped`: one-shot (`deleteAfterRun`) jobs. Their whole point is a
+   *   single fire, and that fire already happened; whether it finished is
+   *   unknowable. They are disabled with `lastStatus: "interrupted"` so a
+   *   human/agent can inspect and re-enable, and can never fire twice.
+   * - `resumed`: recurring jobs. Still due on disk, so they will fire on the
+   *   next tick — but `interruptedAt` is left set so the scheduler can mark
+   *   that fire as a resume in the event body, telling the model to check
+   *   state before repeating anything with side effects.
+   */
+  recoverInterrupted(): { resumed: CronJob[]; skipped: CronJob[] } {
+    this.load();
+    const now = Date.now();
+    const resumed: CronJob[] = [];
+    const skipped: CronJob[] = [];
+    for (const job of this.jobs) {
+      if (!isInterrupted(job)) continue;
+      job.interruptedAt = job.lastStartedAt ?? now;
+      job.lastRunAt = now;
+      job.lastStatus = "interrupted";
+      if (job.deleteAfterRun) {
+        job.enabled = false;
+        job.nextRunAt = null;
+        // Nothing left to deliver, so drop the marker with the job's chance
+        // to fire — it stays visible via lastStatus.
+        job.interruptedAt = null;
+        skipped.push({ ...job });
+      } else {
+        resumed.push({ ...job });
+      }
+    }
+    if (resumed.length > 0 || skipped.length > 0) this.save();
+    return { resumed, skipped };
   }
 
   markRun(id: string, status: "ok" | "error"): void {
@@ -181,6 +253,20 @@ export class CronStore {
     mkdirSync(dir, { recursive: true });
     writeJsonAtomicSync(this.path, { version: 1, jobs: this.jobs });
   }
+}
+
+/**
+ * A run was dispatched (markStarted) and never reported completion (markRun).
+ * Within a live daemon that just means "in flight"; read at scheduler start it
+ * means the previous daemon died mid-run.
+ *
+ * Jobs written before this field existed have no `lastStartedAt`, so they read
+ * as never-interrupted — the pre-upgrade backlog is not retro-flagged.
+ */
+export function isInterrupted(job: CronJob): boolean {
+  const started = job.lastStartedAt;
+  if (started == null) return false;
+  return job.lastRunAt == null || started > job.lastRunAt;
 }
 
 export function computeNextRun(schedule: CronSchedule, fromMs: number): number | null {

@@ -186,6 +186,178 @@ describe("CronScheduler", () => {
     expect(jobs.find((j) => j.name === "job-fail")?.nextRunAt).toBeGreaterThan(Date.now());
   });
 
+  // --- restart / interrupted-run recovery -------------------------------
+  //
+  // A cron run can outlive the daemon: `tomo restart` during a run, a crash,
+  // a kill. nextRunAt only advances on completion and the in-flight guard is
+  // memory-only, so the fresh process finds a job that is still "due".
+
+  /** An agent whose cron turns never settle — stands in for a killed daemon. */
+  function hangingAgent(): { agent: Agent; calls: string[] } {
+    const calls: string[] = [];
+    const agent = {
+      handleCronMessage: vi.fn((msg: string) => {
+        calls.push(msg);
+        return new Promise<boolean>(() => {});
+      }),
+    } as unknown as Agent;
+    return { agent, calls };
+  }
+
+  /** Bodies delivered to a recording agent, envelope stripped. */
+  function bodies(calls: string[]): string[] {
+    return calls.map((msg) => parseTomoEvent(msg)!.body);
+  }
+
+  it("does not silently re-fire a recurring job interrupted by a restart", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    storeA.add({
+      name: "quiet-hours",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "Do the upgrade.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    // Daemon 1: fires, then dies mid-turn (the turn never resolves).
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // The dispatch is on disk BEFORE completion — that record is the only
+    // thing the next process can use to tell "was running" from "never ran".
+    const onDisk = new CronStore(TEST_PATH).list()[0];
+    expect(onDisk.lastStartedAt).toBeGreaterThan(0);
+    expect(onDisk.lastRunAt).toBeNull();
+
+    // Daemon 2: fresh process, fresh store instance, same file.
+    const second = hangingAgent();
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
+    schedulerB.start();
+    await waitFor(() => expect(second.calls).toHaveLength(1));
+    schedulerB.stop();
+
+    // Exactly one fire, and it announces itself as a resume so the model
+    // checks state instead of blindly redoing non-idempotent work.
+    expect(second.calls).toHaveLength(1);
+    const [body] = bodies(second.calls);
+    expect(body).toContain("[resumed]");
+    expect(body).toContain("never reported completion");
+    expect(body).toContain("Do the upgrade.");
+  });
+
+  it("marks the resumed fire only once — a later normal fire is unmarked", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    storeA.add({
+      name: "quiet-hours",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "Do the upgrade.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // Daemon 2 delivers the resumed fire and completes it normally.
+    const calls: string[] = [];
+    const agentB = {
+      handleCronMessage: vi.fn((msg: string) => {
+        calls.push(msg);
+        return Promise.resolve(true);
+      }),
+    } as unknown as Agent;
+    const storeB = new CronStore(TEST_PATH);
+    const schedulerB = new CronScheduler(agentB, storeB);
+    schedulerB.start();
+    await waitFor(() => expect(calls).toHaveLength(1));
+    schedulerB.stop();
+    await waitFor(() => expect(storeB.list()[0].lastStatus).toBe("ok"));
+    expect(bodies(calls)[0]).toContain("[resumed]");
+
+    // Next cadence tick: an ordinary run again.
+    makeJobsDue();
+    await tick(schedulerB);
+    expect(calls).toHaveLength(2);
+    expect(bodies(calls)[1]).not.toContain("[resumed]");
+    expect(storeB.list()[0].lastStatus).toBe("ok");
+  });
+
+  it("never fires a once job twice across a restart", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    storeA.add({
+      name: "send-the-order",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "Place the order.",
+      sessionKey: "dm:alice",
+    });
+    expect(storeA.list()[0].deleteAfterRun).toBe(true);
+    makeJobsDue();
+
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // Daemon 2 must not place the order a second time: the one fire this job
+    // was entitled to already happened, and it may well have succeeded.
+    const second = hangingAgent();
+    const storeB = new CronStore(TEST_PATH);
+    const schedulerB = new CronScheduler(second.agent, storeB);
+    schedulerB.start();
+    await new Promise((r) => setTimeout(r, 50));
+    await tick(schedulerB);
+    schedulerB.stop();
+
+    expect(second.calls).toHaveLength(0);
+    const job = storeB.list()[0];
+    expect(job.enabled).toBe(false);
+    expect(job.nextRunAt).toBeNull();
+    expect(job.lastStatus).toBe("interrupted");
+  });
+
+  it("leaves the normal cadence alone across a restart with no interrupted run", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "hourly",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const calls: string[] = [];
+    const agent = {
+      handleCronMessage: vi.fn((msg: string) => {
+        calls.push(msg);
+        return Promise.resolve(true);
+      }),
+    } as unknown as Agent;
+
+    // A complete run, then a restart before the next slot is due.
+    await tick(new CronScheduler(agent, store));
+    expect(calls).toHaveLength(1);
+    expect(bodies(calls)[0]).toBe('Scheduled task "hourly" triggered. tick');
+
+    const storeB = new CronStore(TEST_PATH);
+    const schedulerB = new CronScheduler(agent, storeB);
+    schedulerB.start();
+    await new Promise((r) => setTimeout(r, 50));
+    schedulerB.stop();
+
+    // Not due yet, nothing interrupted: no extra fire, cadence untouched.
+    expect(calls).toHaveLength(1);
+    const job = storeB.list()[0];
+    expect(job.lastStatus).toBe("ok");
+    expect(job.nextRunAt).toBeGreaterThan(Date.now());
+
+    // And the next due slot fires normally, unmarked.
+    makeJobsDue();
+    await tick(schedulerB);
+    expect(calls).toHaveLength(2);
+    expect(bodies(calls)[1]).toBe('Scheduled task "hourly" triggered. tick');
+  });
+
   it("delivers the trigger as a cron tomo-event envelope (round-trip)", async () => {
     const store = new CronStore(TEST_PATH);
     store.add({

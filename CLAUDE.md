@@ -140,7 +140,7 @@ Changes to workspace files take effect on next message (no restart needed) — t
 
 ### Cron System
 
-Users ask Tomo to schedule things via chat. The agent CRUDs jobs with the `schedule_create` / `schedule_list` / `schedule_remove` MCP tools (`src/mcp/cron-tools.ts`), backed by `~/.tomo/data/cron/jobs.json` (the `tomo cron` CLI is a parallel surface on the same store). The `CronScheduler` polls every 30s and fires due jobs via `agent.handleCronMessage()`, which delivers the response through the appropriate channel.
+Users ask Tomo to schedule things via chat. The agent CRUDs jobs with the `schedule_create` / `schedule_list` / `schedule_remove` MCP tools (`src/mcp/cron-tools.ts`), backed by `~/.tomo/data/cron/jobs.json` (the `tomo cron` CLI is a parallel surface on the same store). The `CronScheduler` polls every 30s and fires due jobs via `agent.handleCronMessage()`, which delivers the response through the appropriate channel. A run is recorded on disk *before* it is dispatched (`markStarted`), so a daemon that restarts mid-run can tell "was running" from "never ran": on start, `recoverInterrupted()` settles those runs — a recurring job fires once with a `[resumed]` note in the event body, a one-shot is disabled rather than fired a second time.
 
 ### LCM (Lifecycle Management)
 

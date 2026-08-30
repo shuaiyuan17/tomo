@@ -1,7 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { CronStore, parseScheduleString } from "../cron/store.js";
-import type { CronJob } from "../cron/types.js";
+import type { CronJob, CronRunStatus } from "../cron/types.js";
 
 /**
  * MCP tool factories for the cron store. Registered onto the
@@ -92,7 +92,9 @@ export function buildCronTools(storePath?: string) {
       [
         "List every scheduled task in the store. Use to audit what reminders/recurring jobs exist before adding more, or to find a job's id for removal.",
         "",
-        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
+        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
+        "",
+        "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. A `once` job in that state is left disabled rather than re-fired; re-enable it only after checking whether the task actually completed.",
       ].join("\n"),
       {},
       async () => {
@@ -146,7 +148,8 @@ interface JobSummary {
   sessionKey: string;
   nextRunAt: string | null;
   lastRunAt: string | null;
-  lastStatus: "ok" | "error" | null;
+  lastStartedAt: string | null;
+  lastStatus: CronRunStatus | null;
 }
 
 function summarizeJob(job: CronJob): JobSummary {
@@ -160,6 +163,7 @@ function summarizeJob(job: CronJob): JobSummary {
     sessionKey: job.sessionKey,
     nextRunAt: job.nextRunAt ? new Date(job.nextRunAt).toISOString() : null,
     lastRunAt: job.lastRunAt ? new Date(job.lastRunAt).toISOString() : null,
+    lastStartedAt: job.lastStartedAt ? new Date(job.lastStartedAt).toISOString() : null,
     lastStatus: job.lastStatus,
   };
 }

@@ -87,10 +87,45 @@ function isHighSurrogate(unit: number): boolean {
 }
 
 /**
- * Split text into chunks of at most `limit` characters, preferring to break
- * at a newline, then a space, falling back to a hard cut. Shared by channels
- * whose APIs cap message length (Telegram: 4096, iMessage: 4000).
+ * Grapheme segmenter for the hard-cut fallback, or null on a build without it.
+ *
+ * Present in every Node this project supports (>= 22.12; `Intl.Segmenter`
+ * landed in 16), so the null branch is only reached on an ICU-less build
+ * (`--with-intl=none`). Constructed once — instantiating a segmenter per chunk
+ * is the expensive part, segmenting a short probe is not.
  */
+const graphemeSegmenter: Intl.Segmenter | null =
+  typeof Intl !== "undefined" && "Segmenter" in Intl
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
+
+/**
+ * How far past `limit` to segment.
+ *
+ * Only boundaries at or before `limit` are used, and a boundary's position is
+ * fixed by the text BEFORE it, so truncating the probe cannot move one — the
+ * slack only has to be enough that the cluster straddling `limit` is present
+ * for the boundary that opens it to be enumerated.
+ */
+const GRAPHEME_PROBE_SLACK = 4;
+
+/**
+ * Largest grapheme-cluster boundary at or before `limit`, or 0 if there is
+ * none usable (no segmenter, or a single cluster longer than the whole window).
+ *
+ * Segmenting only the head rather than all of `text` keeps this O(limit) per
+ * chunk instead of O(remaining), which matters because the caller loops.
+ */
+function lastGraphemeBoundary(text: string, limit: number): number {
+  if (!graphemeSegmenter) return 0;
+  let boundary = 0;
+  for (const { index } of graphemeSegmenter.segment(text.slice(0, limit + GRAPHEME_PROBE_SLACK))) {
+    if (index > limit) break;
+    boundary = index;
+  }
+  return boundary;
+}
+
 export function splitText(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -103,19 +138,40 @@ export function splitText(text: string, limit: number): string[] {
     // Try to split at a newline or space
     let splitAt = remaining.lastIndexOf("\n", limit);
     if (splitAt < limit * 0.5) splitAt = remaining.lastIndexOf(" ", limit);
-    if (splitAt < limit * 0.5) splitAt = limit;
-    // A hard cut at `limit` is an index into UTF-16 CODE UNITS, so it can land
-    // between the two halves of an astral character (emoji, most CJK
-    // extensions, mathematical alphanumerics) and leave a lone high surrogate
-    // ending one chunk and a lone low surrogate opening the next. Telegram
-    // rejects a lone surrogate in the request body with a 400 that is not a
-    // Markdown-parse error, so telegram.ts rethrows and the whole reply is
-    // lost; iMessage renders both halves as U+FFFD. Back off one unit — never
-    // to 0, which would push an empty chunk and never shorten `remaining`.
-    // The newline/space branches above cannot land mid-pair (their split
-    // character is itself a single BMP unit), so this only ever bites the
-    // fallback.
-    if (splitAt > 1 && isHighSurrogate(remaining.charCodeAt(splitAt - 1))) splitAt -= 1;
+    if (splitAt < limit * 0.5) {
+      // HARD CUT. `limit` is an index into UTF-16 CODE UNITS, so cutting there
+      // blindly lands wherever it lands: between the two halves of an astral
+      // character (emoji, most CJK extensions, mathematical alphanumerics),
+      // leaving a lone high surrogate ending one chunk and a lone low
+      // surrogate opening the next — Telegram rejects a lone surrogate in the
+      // request body with a 400 that is NOT a Markdown-parse error, so
+      // telegram.ts rethrows and the whole reply is lost rather than
+      // degrading, and iMessage renders both halves as U+FFFD. Or between a
+      // base character and its combining mark, which detaches the accent onto
+      // the next bubble.
+      //
+      // So: cut at the last grapheme-cluster boundary that fits. That is
+      // strictly stronger than code-point safety — it keeps `é` (e + U+0301),
+      // flag pairs and ZWJ emoji sequences whole, not just surrogate pairs.
+      const boundary = lastGraphemeBoundary(remaining, limit);
+      splitAt = boundary > 0 ? boundary : limit;
+    }
+    // Belt and braces for the two ways the boundary search yields nothing: an
+    // ICU-less build with no segmenter, and a single cluster longer than the
+    // whole window. Both fall back to `limit`, which can still be mid-pair.
+    //
+    // Backing off keeps the pair in the NEXT chunk; at splitAt === 1 there is
+    // nothing to back off to, so take the pair instead. A 2-unit chunk that
+    // overruns a limit of 1 is the lesser evil against emitting the lone
+    // surrogates this function exists to prevent — and no real channel limit
+    // is anywhere near 1 (iMessage 4000, Telegram 4096). Never 0, which would
+    // push an empty chunk and never shorten `remaining`.
+    //
+    // The newline/space branches cannot land mid-pair (their split character
+    // is itself a single BMP unit), so this only ever bites the fallback.
+    if (isHighSurrogate(remaining.charCodeAt(splitAt - 1))) {
+      splitAt = splitAt > 1 ? splitAt - 1 : splitAt + 1;
+    }
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
   }

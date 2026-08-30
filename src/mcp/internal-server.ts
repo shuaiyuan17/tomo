@@ -276,8 +276,13 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           searchHint: "unsend delete retract undo sent message telegram imessage imsg",
         },
       ),
-      // Scoped: schedule_enable can only act on this session's own jobs.
-      ...buildCronTools(undefined, callerSessionKey),
+      // Scoped to the caller, like buildPeopleTools/buildRecallTools below:
+      // the cron store is one flat file shared by every session, and a group
+      // chat must not be able to read, remove, aim, or re-enable the owner's
+      // DM jobs.
+      // A getter, not the key: a summoned group's turns run on the owner's
+      // dm: session, so the key alone would give the group the owner's scope.
+      ...buildCronTools(undefined, () => agent.scopedCallerKey(callerSessionKey)),
       ...buildPetTools(),
       // Group sessions never see private people records through these tools —
       // same boundary as the private memory subtree they live in.

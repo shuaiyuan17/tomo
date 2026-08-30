@@ -129,10 +129,22 @@ export class CronStore {
    * ("at") job whose time already passed fires on the next poll, with its
    * retry budget reset — re-enabling a failed reminder is a manual retry.
    */
-  setEnabled(id: string, enabled: boolean): CronJob | undefined {
+  /**
+   * Enable or disable a job.
+   *
+   * `guard` runs against the job as it exists AFTER the reload, for the same
+   * reason `remove`'s does: checking ownership against a snapshot taken when
+   * the store was constructed misses anything another process wrote in
+   * between, and `load()` here replaces that snapshot anyway. Returns
+   * `"refused"` when the guard rejects, distinct from `undefined` (not found).
+   */
+  setEnabled(id: string, enabled: boolean): CronJob | undefined;
+  setEnabled(id: string, enabled: boolean, guard: (job: CronJob) => boolean): CronJob | undefined | "refused";
+  setEnabled(id: string, enabled: boolean, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" {
     this.load();
     const job = this.get(id);
     if (!job) return undefined;
+    if (guard && !guard(job)) return "refused";
     if (job.enabled === enabled) return job;
     job.enabled = enabled;
     if (enabled) {
@@ -169,15 +181,30 @@ export class CronStore {
     return job;
   }
 
-  remove(id: string): boolean {
+  /**
+   * Remove a job.
+   *
+   * `guard` is checked against the job as it exists AFTER the reload, inside
+   * the same load-modify-save. Checking ownership against a snapshot taken
+   * when the store was constructed is not enough: `load()` here replaces it,
+   * so a job written to disk by another process in between was absent from
+   * the caller's snapshot, skipped their ownership check, and was then deleted
+   * by the filter below. The guard has to run against the state the delete
+   * actually applies to.
+   *
+   * Returns `"refused"` when the guard rejects, distinct from `false`
+   * (not found) so the caller can say which happened.
+   */
+  remove(id: string): boolean;
+  remove(id: string, guard: (job: CronJob) => boolean): boolean | "refused";
+  remove(id: string, guard?: (job: CronJob) => boolean): boolean | "refused" {
     this.load();
-    const before = this.jobs.length;
+    const existing = this.jobs.find((j) => j.id === id);
+    if (!existing) return false;
+    if (guard && !guard(existing)) return "refused";
     this.jobs = this.jobs.filter((j) => j.id !== id);
-    if (this.jobs.length < before) {
-      this.save();
-      return true;
-    }
-    return false;
+    this.save();
+    return true;
   }
 
   /**

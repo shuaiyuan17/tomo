@@ -179,7 +179,17 @@ export class SessionStore {
       for (const msg of iterateJsonlBackwardsSync<SessionMessage>(file)) {
         // Scanning newest→oldest: once past the window's lower bound,
         // nothing older can match.
-        if (opts.fromSeq != null && (msg.seq ?? 0) < opts.fromSeq) break outer;
+        if (opts.fromSeq != null) {
+          // `seq` is optional and legacy/hand-edited records may carry none
+          // (getLastSeq at :261 acknowledges the same). Coercing a missing seq
+          // to 0 made such a record older than every lower bound, and
+          // `break outer` then abandoned the rest of this file AND every
+          // archive behind it — recall_conversation would report the handful
+          // of matches newer than that one record as the whole answer. Skip
+          // the record instead, exactly as the toSeq/toTime filters do.
+          if (msg.seq == null) continue;
+          if (msg.seq < opts.fromSeq) break outer;
+        }
         if (opts.fromTime != null && msg.timestamp < opts.fromTime) break outer;
         if (opts.toSeq != null && (msg.seq ?? 0) > opts.toSeq) continue;
         if (opts.toTime != null && msg.timestamp > opts.toTime) continue;

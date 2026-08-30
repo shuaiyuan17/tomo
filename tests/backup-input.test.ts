@@ -1,12 +1,37 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { DEFAULT_RETENTION_DAYS, isBackupName, resolveRetentionDays } from "../src/cli/backup.js";
+import { DEFAULT_RETENTION_DAYS, MAX_RETENTION_DAYS, isBackupName, resolveRetentionDays } from "../src/cli/backup.js";
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("resolveRetentionDays", () => {
-  it("uses the default when unset or empty", () => {
+  it("uses the default silently when the variable is unset", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(resolveRetentionDays(undefined)).toBe(DEFAULT_RETENTION_DAYS);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns when the variable is SET but empty", () => {
+    // `export TOMO_BACKUP_RETENTION_DAYS=` is how a shell profile most often
+    // "unsets" a variable, and it is worth distinguishing from never setting
+    // it: someone meant to configure this and did not.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(resolveRetentionDays("")).toBe(DEFAULT_RETENTION_DAYS);
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it("falls back on a value far past any plausible policy", () => {
+    // An upper bound matters for the same reason the lower one does: a units
+    // mix-up (ms, seconds) or a stray zero disables pruning just as silently
+    // and just as completely as NaN did.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(resolveRetentionDays(String(MAX_RETENTION_DAYS + 1))).toBe(DEFAULT_RETENTION_DAYS);
+    expect(resolveRetentionDays("604800000")).toBe(DEFAULT_RETENTION_DAYS);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it("accepts the boundary values", () => {
+    expect(resolveRetentionDays("1")).toBe(1);
+    expect(resolveRetentionDays(String(MAX_RETENTION_DAYS))).toBe(MAX_RETENTION_DAYS);
   });
 
   it("accepts a plain day count", () => {

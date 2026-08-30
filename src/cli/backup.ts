@@ -27,6 +27,8 @@ const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
 // free. Seven days of local history plus the other two legs is the trade we
 // picked (2026-08-16). Override with TOMO_BACKUP_RETENTION_DAYS.
 export const DEFAULT_RETENTION_DAYS = 7;
+/** Ten years. Past this a value is a typo or a units mix-up, not a policy. */
+export const MAX_RETENTION_DAYS = 3650;
 
 /**
  * Resolve the retention window from `TOMO_BACKUP_RETENTION_DAYS`.
@@ -41,14 +43,22 @@ export const DEFAULT_RETENTION_DAYS = 7;
  * and the command then prints `Backup complete: 0 B` because the size is read
  * after the prune.
  *
- * Anything not a finite value >= 1 falls back to the default and says so.
+ * Anything not a finite value in [1, MAX_RETENTION_DAYS] falls back to the
+ * default and says so — including an empty string, which is how a shell
+ * profile most often 'unsets' a variable.
  */
 export function resolveRetentionDays(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === "") return DEFAULT_RETENTION_DAYS;
+  if (raw === undefined) return DEFAULT_RETENTION_DAYS;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1) {
+  // An UPPER bound as well as a lower one. A retention of a million days is
+  // not a policy, it is a typo or a units mix-up (milliseconds, seconds), and
+  // it disables pruning exactly as thoroughly as NaN did — silently, and with
+  // the same unbounded-growth consequence the comment above describes. Ten
+  // years is far past any plausible intent.
+  if (raw.trim() === "" || !Number.isFinite(parsed) || parsed < 1 || parsed > MAX_RETENTION_DAYS) {
     console.warn(
-      `Ignoring TOMO_BACKUP_RETENTION_DAYS=${JSON.stringify(raw)} (expected a number of days >= 1); using ${DEFAULT_RETENTION_DAYS}.`,
+      `Ignoring TOMO_BACKUP_RETENTION_DAYS=${JSON.stringify(raw)} `
+      + `(expected a number of days between 1 and ${MAX_RETENTION_DAYS}); using ${DEFAULT_RETENTION_DAYS}.`,
     );
     return DEFAULT_RETENTION_DAYS;
   }
@@ -216,6 +226,12 @@ export function resolveBackupPath(date: string): ResolvedBackup | null {
   }
 }
 
+/**
+ * The top-level entries `restore` copies. Checked as a set before any of them
+ * is acted on, so an aborted restore has not already half-overwritten.
+ */
+const RESTORE_LEGS = ["config.json", "workspace", "data", "sdk-sessions"] as const;
+
 /** Same directory, not merely the same name. */
 function sameBackup(a: ResolvedBackup, b: ResolvedBackup | null): boolean {
   return b !== null && a.path === b.path && a.dev === b.dev && a.ino === b.ino;
@@ -375,19 +391,39 @@ backupCommand
     // and both resolutions return the identical string. `dev`+`ino` is what
     // separates "the same directory" from "something else wearing its name".
     //
-    // This collapses the window to the gap between this line and the first
-    // copy, which contains no `await` — nothing below yields, so nothing else
-    // gets to run in between.
-    //
-    // RESIDUAL: this is not descriptor pinning. A swap landing inside that
-    // gap is still not detected, and closing it properly means holding an
-    // `open()` handle on the directory and copying through `openat`-relative
-    // operations, which Node's `fs` does not expose. Out of scope here; the
-    // re-check turns an indefinite window into an instantaneous one.
+    // WHAT THIS DOES AND DOES NOT GUARANTEE. It establishes the identity of
+    // the backup DIRECTORY ONLY. Its contents are not validated and are not
+    // frozen: a child of the backup can be a symlink pointing anywhere
+    // (`<backup>/data -> /tmp/outside/data`), and a file inside it can be
+    // rewritten at any moment. Neither needs a race to exploit — a backup
+    // directory that was already hostile when it was written stays hostile.
+    // The `lstat` sweep below closes the top-level symlink case, which is the
+    // cheap half; deep content is out of scope, and `~/Backups/tomo` is
+    // trusted to the extent that anything under the invoking user's home is.
     if (!sameBackup(backup, resolveBackupPath(date))) {
       console.error(`Backup ${date} changed while waiting for confirmation; aborting without restoring.`);
       process.exit(1);
       return;
+    }
+
+    // Each restore leg is read with `existsSync`, which FOLLOWS a symlink and
+    // answers about the target. So a `data` symlink inside an otherwise
+    // genuine backup redirects that whole leg out of the tree while the
+    // matching `rmSync` still deletes the live one. Refused here rather than
+    // per leg, so the command aborts before it has overwritten anything.
+    for (const leg of RESTORE_LEGS) {
+      const legPath = join(backup.path, leg);
+      let entry;
+      try {
+        entry = lstatSync(legPath);
+      } catch {
+        continue; // absent legs are legitimate; each copy is already gated.
+      }
+      if (entry.isSymbolicLink()) {
+        console.error(`Backup ${date} has a symlink at ${leg}; aborting without restoring.`);
+        process.exit(1);
+        return;
+      }
     }
 
     console.log();

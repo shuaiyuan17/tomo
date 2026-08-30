@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterAll, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { join } from "node:path";
 
@@ -50,13 +50,26 @@ const liveMarker = join(paths.tomoHome, "data", "live.txt");
 /** A file only present in the backup, so a real restore is observable. */
 const restoredMarker = join(paths.tomoHome, "data", "restored.txt");
 
+/**
+ * Where `../../<VALID>` lands from the backups root: two levels up is the fake
+ * home, which is outside the root but inside our own temp tree.
+ */
+const traversalTarget = join(paths.home, VALID);
+
 /** Rebuilt per test: several cases mutate the tree on purpose. */
 function buildFixture(): void {
   rmSync(paths.home, { recursive: true, force: true });
   rmSync(paths.outside, { recursive: true, force: true });
 
+  // A genuine backup with ALL FOUR legs, so the positive control proves every
+  // one of them is restored rather than just `data`.
   mkdirSync(join(validDir, "data"), { recursive: true });
   writeFileSync(join(validDir, "data", "restored.txt"), "from backup");
+  mkdirSync(join(validDir, "workspace"), { recursive: true });
+  writeFileSync(join(validDir, "workspace", "SOUL.md"), "backup soul");
+  mkdirSync(join(validDir, "sdk-sessions"), { recursive: true });
+  writeFileSync(join(validDir, "sdk-sessions", "s.jsonl"), "backup session");
+  writeFileSync(join(validDir, "config.json"), '{"from":"backup"}');
 
   // Somewhere outside the backups root for a link to point at.
   mkdirSync(join(paths.outside, "data"), { recursive: true });
@@ -69,9 +82,21 @@ function buildFixture(): void {
   // A correctly-named regular file, which is not restorable either.
   writeFileSync(join(paths.backups, "2026-08-30_0300"), "not a directory");
 
+  // DECOYS so the rejection tests discriminate. Without these, `../../../X`
+  // and `/etc` are refused on main merely because nothing is there — the test
+  // would pass without the validation it claims to exercise. With them, only
+  // shape/containment can do the rejecting.
+  mkdirSync(join(traversalTarget, "data"), { recursive: true });
+  writeFileSync(join(traversalTarget, "data", "loot.txt"), "attacker payload");
+  mkdirSync(join(paths.backups, "etc", "data"), { recursive: true });
+  writeFileSync(join(paths.backups, "etc", "data", "loot.txt"), "attacker payload");
+
   // Live data the restore would overwrite.
   mkdirSync(join(paths.tomoHome, "data"), { recursive: true });
   writeFileSync(liveMarker, "live");
+  mkdirSync(join(paths.tomoHome, "workspace"), { recursive: true });
+  mkdirSync(join(paths.tomoHome, "sdk-sessions"), { recursive: true });
+  writeFileSync(join(paths.tomoHome, "config.json"), '{"from":"live"}');
 }
 
 afterAll(() => {
@@ -138,12 +163,18 @@ describe("tomo backup restore — argument guard", () => {
   });
 
   it("rejects a traversal that still ends in a valid-looking name", async () => {
-    const { logs, exitCodes } = await runRestore(`../../../${VALID}`);
+    // The decoy at `traversalTarget` exists and holds a `data/` leg, so this
+    // is rejected by containment rather than by nothing being there.
+    expect(existsSync(join(traversalTarget, "data"))).toBe(true);
+    const { logs, exitCodes } = await runRestore(`../../${VALID}`);
     expect(logs.join("\n")).not.toContain(ACCEPTED);
     expect(exitCodes).toContain(1);
   });
 
   it("rejects an absolute path", async () => {
+    // `join(BACKUPS_DIR, "/etc")` is `<backups>/etc`, which the decoy makes
+    // real — so only the shape check can reject this.
+    expect(existsSync(join(paths.backups, "etc", "data"))).toBe(true);
     const { logs, exitCodes } = await runRestore("/etc");
     expect(logs.join("\n")).not.toContain(ACCEPTED);
     expect(exitCodes).toContain(1);
@@ -163,6 +194,8 @@ describe("tomo backup restore — argument guard", () => {
     expect(exitCodes).toContain(1);
   });
 
+  // Regression guard, not a discriminator: non-existence rejects this on every
+  // version, including main. Kept so the plain missing-backup path stays covered.
   it("rejects a well-formed name that does not exist", async () => {
     const { logs, exitCodes } = await runRestore("2020-01-01_0000");
     expect(logs.join("\n")).not.toContain(ACCEPTED);
@@ -249,12 +282,45 @@ describe("tomo backup restore — swapped between validation and copy", () => {
   });
 
   it("still restores normally when nothing is swapped", async () => {
-    // Positive control: the re-check must not break the path it guards.
+    // Positive control across ALL FOUR legs: the guards must not break the
+    // path they exist to protect, and a control that only checked `data`
+    // would not notice if they had broken the other three.
     const { logs, exitCodes } = await runRestore(VALID, ["y\n"]);
 
     expect(logs.join("\n")).toContain("Restore complete.");
     expect(exitCodes).not.toContain(1);
     expect(existsSync(restoredMarker)).toBe(true);
     expect(existsSync(liveMarker)).toBe(false);
+    expect(readFileSync(join(paths.tomoHome, "config.json"), "utf-8")).toContain("backup");
+    expect(existsSync(join(paths.tomoHome, "workspace", "SOUL.md"))).toBe(true);
+    expect(existsSync(join(paths.tomoHome, "sdk-sessions", "s.jsonl"))).toBe(true);
+  });
+});
+
+describe("tomo backup restore — a leg of the backup is a symlink", () => {
+  it("refuses a backup whose data/ leg redirects outside the tree", async () => {
+    // dev+ino identifies the backup DIRECTORY; its children are not covered by
+    // it, and this needs no race at all — the link can predate the command.
+    // `existsSync` follows it, so the leg would be read from the link target
+    // while the matching rmSync still deleted the live one.
+    rmSync(join(validDir, "data"), { recursive: true, force: true });
+    symlinkSync(join(paths.outside, "data"), join(validDir, "data"), "dir");
+
+    const { errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("symlink at data");
+    expect(exitCodes).toContain(1);
+  });
+
+  it("leaves the live destinations untouched when it refuses a symlinked leg", async () => {
+    rmSync(join(validDir, "data"), { recursive: true, force: true });
+    symlinkSync(join(paths.outside, "data"), join(validDir, "data"), "dir");
+
+    await runRestore(VALID, ["y\n"]);
+
+    // Refused before ANY leg was acted on, so config.json is untouched too.
+    expect(existsSync(liveMarker)).toBe(true);
+    expect(existsSync(join(paths.tomoHome, "data", "loot.txt"))).toBe(false);
+    expect(readFileSync(join(paths.tomoHome, "config.json"), "utf-8")).toContain("live");
   });
 });

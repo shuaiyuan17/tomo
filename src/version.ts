@@ -58,12 +58,32 @@ function isNewer(latest: string, current: string): boolean {
   return false;
 }
 
+/**
+ * A registry `version` we are willing to act on: semver, optionally with a
+ * prerelease/build tail.
+ *
+ * The registry response is remote input and was previously returned with no
+ * shape check at all, then interpolated into a command line and compared by
+ * `isNewer` (which coerces each dot-segment with `Number`, so a non-numeric
+ * segment silently becomes NaN and every comparison is false). Refusing
+ * anything that is not a version keeps a malformed or hostile response from
+ * reaching either.
+ */
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
 export async function fetchLatestVersion(): Promise<string | null> {
   try {
     const res = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return null;
     const data = (await res.json()) as { version?: string };
-    return data.version ?? null;
+    const version = data.version;
+    if (typeof version !== "string" || !SEMVER_RE.test(version)) {
+      if (version !== undefined) {
+        log.warn({ version: String(version).slice(0, 100) }, "Ignoring malformed version from npm registry");
+      }
+      return null;
+    }
+    return version;
   } catch {
     return null;
   }

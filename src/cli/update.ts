@@ -40,9 +40,33 @@ export const updateCommand = new Command("update")
 
     console.log(`Updated to v${latest}. Restarting...`);
 
-    const child = spawn("tomo", ["restart", "--reason", `Updated from v${current} to v${latest}`], {
-      stdio: "inherit",
-      shell: true,
-    });
+    const child = spawnPostUpdateRestart(current, latest);
     child.on("exit", (code) => process.exit(code ?? 0));
   });
+
+/**
+ * Re-exec the CLI to restart the daemon, passing the update reason as ONE argv
+ * entry.
+ *
+ * This used to run `spawn("tomo", [...], { shell: true })`. With `shell: true`
+ * Node joins the file and every argument with spaces and hands the result to
+ * `sh -c` UNQUOTED, so the reason was word-split by the shell: commander saw
+ * `--reason Updated` plus four stray positionals (which it accepts silently),
+ * and every post-update restart told the agent the reason was `Updated`. It
+ * also made the registry-supplied `latest` a shell metacharacter sink.
+ *
+ * `process.execPath` + `process.argv[1]` is how `daemon.ts` already re-execs
+ * the CLI; the PATH lookup is only a fallback for the case where argv[1] is
+ * missing.
+ */
+export function spawnPostUpdateRestart(
+  current: string,
+  latest: string,
+  spawnFn: typeof spawn = spawn,
+): ReturnType<typeof spawn> {
+  const reason = `Updated from v${current} to v${latest}`;
+  const cli = process.argv[1];
+  return cli
+    ? spawnFn(process.execPath, [cli, "restart", "--reason", reason], { stdio: "inherit" })
+    : spawnFn("tomo", ["restart", "--reason", reason], { stdio: "inherit" });
+}

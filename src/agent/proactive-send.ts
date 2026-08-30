@@ -11,6 +11,7 @@ import {
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
+import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
 import { normalizeSendTarget } from "./send-target.js";
 import { formatTomoEvent } from "../tomo-event.js";
 
@@ -77,6 +78,23 @@ export class ProactiveSendService {
       return { ok: false, error: `Channel "${replyTarget.channelName}" is not connected` };
     }
 
+    // The outlet guard, same as for a reply block (inbound-markers.ts): a line
+    // that starts with one of Tomo's own inbound marker shapes is the model
+    // writing a "message" nobody sent. Direct mode was the one outlet that
+    // shipped model text without it. Same policy — MARK, DON'T TRUNCATE: the
+    // advisory is prepended to the copy that goes on the wire only. The
+    // transcript and the pending note below record the model's words
+    // verbatim, exactly as the block path keeps its transcript clean, and the
+    // tool result says what happened so the caller learns. Counted here, at
+    // detection, with the TARGET session as attribution — that is the
+    // conversation the fabricated line would have misled.
+    const fabricated = detectFabricatedMarkers(text);
+    recordFabricatedMarkers(sessionKey, fabricated);
+    const guard = (wire: string): string => (fabricated.length > 0 ? markFabricatedText(wire) : wire);
+    const fabricatedNote = fabricated.length > 0
+      ? `Note: the text contained ${fabricated.length === 1 ? "a line" : `${fabricated.length} lines`} that look like a fabricated inbound marker (${[...new Set(fabricated.map((m) => m.shape))].join(", ")}); it was delivered whole, with a harness advisory prepended so the reader does not take the quoted "message" as real.`
+      : undefined;
+
     // Expressive-send effect: a delivery property of the send. The failure
     // model is uniform with the channel layer's (degraded bridge, send.rich
     // refusal): THE TEXT ALWAYS DELIVERS, THE EFFECT SILENTLY VANISHES — and
@@ -114,7 +132,7 @@ export class ProactiveSendService {
       // Send text first (matches assistant response ordering). The effect
       // rides the text send — it modifies delivery of text, not attachments.
       if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: cleanText, ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+        await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
       } else if (effect) {
         effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
       }
@@ -134,8 +152,9 @@ export class ProactiveSendService {
         });
       }
     } else {
-      // No attachments: preserve verbatim text (direct-mode contract)
-      await channel.send({ chatId: replyTarget.chatId, text, ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+      // No attachments: verbatim text (direct-mode contract), behind the
+      // advisory only when the guard fired.
+      await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
     }
 
     // Attribute the send in the target session's record. Only claim it came
@@ -162,8 +181,9 @@ export class ProactiveSendService {
         ? `You sent the following message to this conversation earlier as a direct send: "${text}"`
         : `Tomo from another session sent the following message to this conversation earlier: "${text}"`));
 
-    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect }, "Message sent (direct)");
-    return { ok: true, ...(effectNote ? { note: effectNote } : {}) };
+    log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
+    const note = [fabricatedNote, effectNote].filter((n): n is string => n !== undefined).join(" ");
+    return { ok: true, ...(note ? { note } : {}) };
   }
 
   /**

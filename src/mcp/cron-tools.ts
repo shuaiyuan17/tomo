@@ -2,6 +2,7 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { CronStore, CronStoreReadError, computeNextRun, parseScheduleString } from "../cron/store.js";
 import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
+import { MIXED_AUDIENCE_KEY } from "../agent/audience.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
 
 /**
@@ -105,15 +106,27 @@ export function buildCronTools(
             isError: true,
           };
         }
-        // A session key is a channel name and a chat id; a control character
-        // cannot occur in either. This is also what makes the mixed-audience
-        // sentinel unrepresentable as a target, so a turn that may manage
-        // nothing cannot create a job "owned" by the sentinel and aimed at no
-        // real conversation.
-        // eslint-disable-next-line no-control-regex
-        if (/[\u0000-\u001F]/.test(target)) {
+        // A mixed-audience turn resolves to a sentinel that owns nothing. It
+        // must not be reported as a malformed key (that message coaches the
+        // model on key shape, which is not the problem) nor reach canTarget:
+        // it is refused as "elsewhere", the same as any foreign session.
+        if (target === MIXED_AUDIENCE_KEY) {
           return {
             content: [{ type: "text" as const, text: `schedule_create failed: ${ELSEWHERE}` }],
+            isError: true,
+          };
+        }
+        // Shape before scope: a malformed target is a usage error and gets a
+        // corrective message; the scope check below answers only for real
+        // keys, so it cannot swallow this one.
+        if (!isStorableSessionKey(target)) {
+          // Persisting a malformed target buys a job that can never deliver,
+          // found out days later when the reminder does not arrive.
+          return {
+            content: [{
+              type: "text" as const,
+              text: `schedule_create failed: "${target}" is not a session key. Use the session key from the system prompt — "dm:<identity>", or "<channel>:<chatId>" such as "telegram:-1001234567".`,
+            }],
             isError: true,
           };
         }
@@ -129,17 +142,6 @@ export function buildCronTools(
         // throws when the expression is actually evaluated, so the validation
         // is the trial computeNextRun — not `store.add`, whose failures are
         // about the STORE and must not be reported as a bad schedule.
-        if (!isStorableSessionKey(session)) {
-          // Persisting a malformed target buys a job that can never deliver,
-          // found out days later when the reminder does not arrive.
-          return {
-            content: [{
-              type: "text" as const,
-              text: `schedule_create failed: "${session}" is not a session key. Use the session key from the system prompt — "dm:<identity>", or "<channel>:<chatId>" such as "telegram:-1001234567".`,
-            }],
-            isError: true,
-          };
-        }
         let parsed;
         try {
           parsed = parseScheduleString(schedule);

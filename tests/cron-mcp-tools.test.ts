@@ -576,6 +576,37 @@ describe("cron MCP tools — session scoping", () => {
     expect(new CronStore(TEST_PATH).list()).toHaveLength(0);
   });
 
+  it("schedule_create — a malformed target is reported as malformed even from a scoped caller", async () => {
+    // Stack reconciliation (#313 round 5 x #319): the shape check must run
+    // BEFORE the scope check, or a group caller who mistypes the key gets
+    // "belongs elsewhere" and is coached to try `tomo cron` instead of being
+    // told the key is wrong. And it must check the resolved target, so a
+    // caller that omits `session` is validated on its own key, not on
+    // `undefined`.
+    const result = await findTool("schedule_create", GROUP).handler({
+      name: "typo", schedule: "in 1m", message: "ping", session: "telegram-1001234567",
+    }, {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("is not a session key");
+    expect(result.content[0].text).not.toContain("tomo cron");
+
+    const defaulted = await findTool("schedule_create", GROUP).handler({
+      name: "own", schedule: "in 1m", message: "ping",
+    }, {});
+    expect(defaulted.isError).toBeUndefined();
+    expect(JSON.parse(defaulted.content[0].text).sessionKey).toBe(GROUP);
+
+    // The mixed-audience sentinel is not a malformed key the model should
+    // "fix"; it is refused the same way as any foreign session.
+    const mixed = await findTool("schedule_create", () => MIXED_AUDIENCE_KEY).handler({
+      name: "x", schedule: "in 1m", message: "y",
+    }, {});
+    expect(mixed.isError).toBe(true);
+    expect(mixed.content[0].text).not.toContain("is not a session key");
+    expect(mixed.content[0].text).toContain("tomo cron");
+    expect(new CronStore(TEST_PATH).list().map((j) => j.name)).toEqual(["own"]);
+  });
+
   it("schedule_create — the owner's DM may still schedule into a group", async () => {
     // "remind the family group every Sunday" is a normal request, and a DM is
     // the owner's own private surface. Only groups are locked to themselves.

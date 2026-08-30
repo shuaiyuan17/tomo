@@ -4,9 +4,11 @@ import { homedir } from "node:os";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -153,6 +155,46 @@ async function confirm(prompt: string): Promise<boolean> {
   });
 }
 
+/**
+ * Resolve `date` to the directory `restore` may read, or null to refuse.
+ *
+ * Restore is the most destructive command here: for each of four components it
+ * `rmSync`s the live tree and copies the backup's over it. So the argument has
+ * to survive three separate questions, not one.
+ *
+ * 1. SHAPE. `YYYY-MM-DD_HHMM`, the same predicate `listBackups` applies. Alone
+ *    this stops `restore ../../..`.
+ * 2. KIND. `lstatSync`, NOT `statSync` or `existsSync`, both of which follow
+ *    the link and answer about the target. A symlink at
+ *    `~/Backups/tomo/2026-08-30_0142` pointing anywhere passes a shape check
+ *    and an existence check while being a redirect, so the entry must be a
+ *    real directory.
+ * 3. CONTAINMENT, ON REAL PATHS. `realpathSync` both sides and require the
+ *    candidate to sit directly inside the backups root. Lexical containment is
+ *    not enough once any ancestor can be a link, and the root itself is under
+ *    `homedir()`, which is a symlink on plenty of setups.
+ *
+ * Returns the REAL path, so what is validated is what is then read.
+ */
+export function resolveBackupPath(date: string): string | null {
+  if (!isBackupName(date)) return null;
+  const candidate = join(BACKUPS_DIR, date);
+  try {
+    // Refuses a symlink, a file, a socket — anything that is not a directory
+    // in its own right.
+    if (!lstatSync(candidate).isDirectory()) return null;
+    const realRoot = realpathSync(BACKUPS_DIR);
+    const realCandidate = realpathSync(candidate);
+    // Directly inside, not merely underneath: a backup is always one level
+    // down, so there is nothing to gain from accepting deeper paths.
+    if (realCandidate !== join(realRoot, date)) return null;
+    return realCandidate;
+  } catch {
+    // Missing, unreadable, or a broken link — all equally not restorable.
+    return null;
+  }
+}
+
 export const backupCommand = new Command("backup")
   .description("Backup and restore tomo data");
 
@@ -276,17 +318,13 @@ backupCommand
       }
     }
 
-    if (!isBackupName(date)) {
-      console.error(`Not a backup name: ${date} (expected YYYY-MM-DD_HHMM).`);
+    const backupPath = resolveBackupPath(date);
+    if (!backupPath) {
+      console.error(`Not a restorable backup: ${date}`);
+      console.error("Expected YYYY-MM-DD_HHMM naming a real directory directly inside " + BACKUPS_DIR + ".");
       console.error("Run 'tomo backup list' to see available backups.");
       process.exit(1);
-    }
-
-    const backupPath = join(BACKUPS_DIR, date);
-    if (!existsSync(backupPath)) {
-      console.error(`Backup not found: ${backupPath}`);
-      console.error("Run 'tomo backup list' to see available backups.");
-      process.exit(1);
+      return;
     }
 
     console.log(`Restore from: ${backupPath}`);

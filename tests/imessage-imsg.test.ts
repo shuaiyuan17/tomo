@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
+import { AttachmentUnreadableError } from "../src/channels/types.js";
 import { NULL_SERVICE_LOOKUP, type ServiceLookup } from "../src/channels/imsg-satellite.js";
 import { log } from "../src/logger.js";
 import { SATELLITE_MARKER } from "../src/channels/text-utils.js";
@@ -2211,14 +2212,18 @@ describe("imsg threaded photo and sticker sends", () => {
     });
   });
 
-  it("reports the drop when the attachment file is missing, so nothing shipped spends the target", async () => {
+  it("throws a definite pre-flight error when the attachment file is missing, so nothing shipped spends the target", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
     await channel.start();
 
-    const result = await channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text: "", replyTo: "guid-target" });
+    // Thrown, not swallowed: a `{ threaded: false }` return read as "shipped,
+    // unthreaded" to the delivery pipeline, which then recorded the block as
+    // delivered. The pipeline owns the caption fallback on this error.
+    await expect(
+      channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text: "", replyTo: "guid-target" }),
+    ).rejects.toBeInstanceOf(AttachmentUnreadableError);
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.attachment")).toHaveLength(0);
-    expect(result).toEqual({ threaded: false });
     await channel.stop();
   });
 

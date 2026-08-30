@@ -1,6 +1,8 @@
 import { Bot, GrammyError, type Context } from "grammy";
+import { existsSync } from "node:fs";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
+import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
 import {
@@ -569,12 +571,33 @@ export class TelegramChannel implements Channel {
   }
 
   async send(message: OutgoingMessage): Promise<void> {
+    try {
+      await this.sendUnmarked(message);
+    } catch (err) {
+      // A GrammyError is the Bot API answering `ok: false` — the server saw
+      // the request and refused it, so nothing was sent: DEFINITE, and the
+      // delivery pipeline may re-send a caption by another route. Marked
+      // here, at the one exit, so every kind of send (photo, sticker, text —
+      // including the over-limit caption follow-up, which comes back through
+      // this method) carries it. An HttpError (timeout, dropped connection)
+      // is ambiguous and stays unmarked.
+      throw err instanceof GrammyError ? markDefiniteFailure(err) : err;
+    }
+  }
+
+  private async sendUnmarked(message: OutgoingMessage): Promise<void> {
     const replyParams = message.replyTo
       ? { reply_parameters: { message_id: Number(message.replyTo) } }
       : {};
 
     // Send photo if provided
     if (message.photo) {
+      // A file that is already gone is a DEFINITE failure — nothing has gone
+      // out — and the delivery pipeline relies on it being reported as one so
+      // it can ship the caption by other means without risking a duplicate.
+      // grammY would fail too (InputFile reads at request time), but wrapped
+      // in an HttpError whose shape is not this channel's to promise.
+      if (!existsSync(message.photo)) throw new AttachmentUnreadableError(message.photo);
       const { InputFile } = await import("grammy");
       const caption = message.text || undefined;
       // Telegram rejects captions over 1024 chars outright, which would lose
@@ -592,7 +615,12 @@ export class TelegramChannel implements Channel {
         this.recordOwnMessage(message.chatId, sent.message_id, caption);
       }
       if (!fitsCaption) {
-        await this.send({ chatId: message.chatId, text: message.text });
+        try {
+          await this.send({ chatId: message.chatId, text: message.text });
+        } catch (err) {
+          // The picture is on the phone; only the text is in doubt.
+          throw new PartialSendError(err, { photo: true });
+        }
       }
       return;
     }

@@ -112,6 +112,66 @@ export const IMESSAGE_SEND_EFFECTS = [
  * because the delivery pipeline attaches it to exactly one message and would
  * consider it spent.
  */
+/**
+ * PROVABLY UNDELIVERED. A send can fail in two very different ways, and the
+ * difference decides whether the caller may try again by another route.
+ *
+ *  - DEFINITE: the channel can prove nothing reached the owner — the file
+ *    could not even be read, or the provider answered and the answer was no
+ *    (a Bot API error response, an imsg RPC error response). Retrying the
+ *    text by another route is safe.
+ *  - AMBIGUOUS: a timeout, a dead child, a dropped connection. The message
+ *    may already be on the phone; a retry is the duplicate both channels
+ *    already refuse to risk on their own fallbacks.
+ *
+ * Channels attach this marker to the errors they can vouch for; the delivery
+ * pipeline (`provablyUndelivered`) reads it to decide whether a caption whose
+ * picture failed may go out as text. Anything unmarked is ambiguous. A
+ * registered symbol, so the marker survives a module-graph reset (tests) and
+ * never depends on `instanceof` across bundles.
+ */
+const DEFINITE_FAILURE = Symbol.for("tomo.channel.definiteSendFailure");
+
+/** Mark `err` as a failure the channel can prove delivered nothing. */
+export function markDefiniteFailure<T>(err: T): T {
+  if (err !== null && typeof err === "object") {
+    Object.defineProperty(err, DEFINITE_FAILURE, { value: true, enumerable: false });
+  }
+  return err;
+}
+
+/** Was `err` marked by a channel as provably undelivered? (Does not walk causes.) */
+export function isDefiniteFailure(err: unknown): boolean {
+  return err !== null && typeof err === "object" && (err as Record<symbol, unknown>)[DEFINITE_FAILURE] === true;
+}
+
+/**
+ * Thrown by a channel that found an attachment file unreadable BEFORE any
+ * request went out. Definite by construction (see `markDefiniteFailure`).
+ */
+export class AttachmentUnreadableError extends Error {
+  readonly code = "ENOENT";
+  constructor(readonly path: string) {
+    super(`Attachment file not found: ${path}`);
+    this.name = "AttachmentUnreadableError";
+    markDefiniteFailure(this);
+  }
+}
+
+/**
+ * Thrown by a channel whose captioned-picture send is TWO provider calls
+ * (imsg: the attachment, then its caption; Telegram: a photo, then an
+ * over-limit caption as text) and failed on the second after the first had
+ * resolved. `shipped` says what is known delivered; `failure` is the second
+ * call's error, with its own definite/ambiguous character intact.
+ */
+export class PartialSendError extends Error {
+  constructor(readonly failure: unknown, readonly shipped: { photo: boolean }) {
+    super(`Send partly delivered: ${failure instanceof Error ? failure.message : String(failure)}`, { cause: failure });
+    this.name = "PartialSendError";
+  }
+}
+
 export interface SendResult {
   /**
    * Whether the requested `replyTo` was actually applied to a message that

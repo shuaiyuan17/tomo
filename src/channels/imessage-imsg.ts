@@ -4,6 +4,7 @@ import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { Channel, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
+import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure } from "./types.js";
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
@@ -109,7 +110,19 @@ function isBareHttpUrl(part: string): boolean {
  * fallback there risks the recipient seeing the text twice. A missing message
  * is the recoverable failure; a duplicate is the visible one.
  */
-class ImsgRpcResponseError extends Error {}
+/**
+ * The imsg child answered the RPC with an error. Definite by construction: the
+ * request was processed and refused, so nothing was sent — which is what lets
+ * this module fall back to a plain send on a refusal, and what lets the
+ * delivery pipeline re-send a caption whose picture was refused. A timeout or
+ * a dead child is a plain Error and stays ambiguous.
+ */
+class ImsgRpcResponseError extends Error {
+  constructor(message?: string) {
+    super(message);
+    markDefiniteFailure(this);
+  }
+}
 
 export interface ImsgCapabilities {
   /**
@@ -1963,8 +1976,20 @@ export class ImsgChannel implements Channel {
     replyTo?: string,
   ): Promise<SendResult | void> {
     if (!existsSync(filePath)) {
+      // A DEFINITE pre-flight failure, thrown rather than swallowed. This used
+      // to log and return normally, which told the caller "delivered" about a
+      // picture that never left the machine — and took the caption with it,
+      // because the caller ships `caption + photo` as one send. The pipeline
+      // (delivery-pipeline.ts) owns the fallback: on this error it delivers
+      // the caption as text and records the picture as failed. Not sending
+      // the caption from HERE is what keeps that a single owner — a
+      // channel-side caption send is invisible to the pipeline, which would
+      // then either count the block delivered (picture included) or send the
+      // caption a second time. The file can disappear between the pipeline's
+      // existsSync and this one, so this branch is reachable with a caption
+      // in hand.
       log.warn({ path: filePath }, "Attachment file not found");
-      return replyTo ? { threaded: false } : undefined;
+      throw new AttachmentUnreadableError(filePath);
     }
 
     // send.attachment is bridge-only (chat selector); the plain `send` file
@@ -2012,11 +2037,18 @@ export class ImsgChannel implements Channel {
       // attachment send — it threads when only send.attachment was missing,
       // and reports `{ threaded: false }` when the bridge is genuinely down.
       const offerTarget = Boolean(replyTo) && !threaded;
-      const captionResult = await this.send({
-        chatId: chatGuid,
-        text: caption,
-        ...(offerTarget ? { replyTo } : {}),
-      });
+      let captionResult: SendResult | void;
+      try {
+        captionResult = await this.send({
+          chatId: chatGuid,
+          text: caption,
+          ...(offerTarget ? { replyTo } : {}),
+        });
+      } catch (err) {
+        // The picture is on the phone; only the caption is in doubt. Said so,
+        // rather than letting the caller conclude the whole send failed.
+        throw new PartialSendError(err, { photo: true });
+      }
       if (offerTarget) return captionResult ?? undefined;
     }
     return replyTo && !threaded ? { threaded: false } : undefined;

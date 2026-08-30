@@ -1,5 +1,8 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterAll, describe, it, expect, vi } from "vitest";
 import { GrammyError } from "grammy";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   isMarkdownParseError,
   POLLING_HEALTHY_RUN_MS,
@@ -10,6 +13,14 @@ import {
   mentionRegex,
   nextPollingBackoff,
 } from "../src/channels/telegram.js";
+
+// A REAL file for the photo sends: the channel refuses a path that does not
+// exist before it ever reaches grammY (a definite pre-flight failure the
+// delivery pipeline relies on), so a made-up path would throw here.
+const PIC_DIR = mkdtempSync(join(tmpdir(), "tomo-telegram-test-"));
+const PIC = join(PIC_DIR, "pic.png");
+writeFileSync(PIC, "not really a png");
+afterAll(() => rmSync(PIC_DIR, { recursive: true, force: true }));
 
 describe("cleanMention", () => {
   it("strips bot mention from text", () => {
@@ -245,7 +256,7 @@ describe("TelegramChannel.send photo captions", () => {
 
   it("keeps short captions on the photo", async () => {
     const { channel, photos, messages } = makeChannel();
-    await channel.send({ chatId: "1", text: "short caption", photo: "/tmp/pic.png" });
+    await channel.send({ chatId: "1", text: "short caption", photo: PIC });
     expect(photos).toEqual([{ chatId: "1", caption: "short caption" }]);
     expect(messages).toHaveLength(0);
   });
@@ -253,7 +264,7 @@ describe("TelegramChannel.send photo captions", () => {
   it("ships over-limit captions as a separate text message", async () => {
     const { channel, photos, messages } = makeChannel();
     const longText = "x".repeat(2000);
-    await channel.send({ chatId: "1", text: longText, photo: "/tmp/pic.png" });
+    await channel.send({ chatId: "1", text: longText, photo: PIC });
     expect(photos).toEqual([{ chatId: "1", caption: undefined }]);
     expect(messages.map((m) => m.text).join("")).toBe(longText);
   });
@@ -261,7 +272,7 @@ describe("TelegramChannel.send photo captions", () => {
   it("records a captioned photo as an own message so edit/unsend can target it", async () => {
     const { channel } = makeChannel();
     await channel.send({ chatId: "1", text: "earlier text" });
-    await channel.send({ chatId: "1", text: "look at this", photo: "/tmp/pic.png" });
+    await channel.send({ chatId: "1", text: "look at this", photo: PIC });
 
     // The captioned photo — not the earlier text — is the newest own message,
     // so a no-match unsend targets what the user actually just saw.
@@ -274,7 +285,7 @@ describe("TelegramChannel.send photo captions", () => {
 
   it("does not record captionless photos (no text to match on)", async () => {
     const { channel } = makeChannel();
-    await channel.send({ chatId: "1", text: "", photo: "/tmp/pic.png" });
+    await channel.send({ chatId: "1", text: "", photo: PIC });
     expect(channel.recentMessages("1")).toHaveLength(0);
   });
 });
@@ -311,7 +322,7 @@ describe("TelegramChannel.send threads photos and stickers", () => {
 
   it("forwards replyTo to sendPhoto and consumes the target", async () => {
     const { channel, calls } = makeChannel();
-    const result = await channel.send({ chatId: "1", text: "cap", photo: "/tmp/pic.png", replyTo: "42" });
+    const result = await channel.send({ chatId: "1", text: "cap", photo: PIC, replyTo: "42" });
     expect(calls).toEqual([{ kind: "photo", replyToId: 42, caption: "cap" }]);
     // Nothing to report: the target really was applied.
     expect(result?.threaded).not.toBe(false);
@@ -326,7 +337,7 @@ describe("TelegramChannel.send threads photos and stickers", () => {
 
   it("threads the photo, not the overflow caption, when the caption is too long", async () => {
     const { channel, calls } = makeChannel();
-    await channel.send({ chatId: "1", text: "x".repeat(2000), photo: "/tmp/pic.png", replyTo: "42" });
+    await channel.send({ chatId: "1", text: "x".repeat(2000), photo: PIC, replyTo: "42" });
     expect(calls[0]).toMatchObject({ kind: "photo", replyToId: 42 });
     expect(calls.slice(1).every((c) => c.replyToId === undefined)).toBe(true);
   });
@@ -485,7 +496,7 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
 
   it("falls back to editMessageCaption for captioned photos and updates the recorded text", async () => {
     const { channel, api, editedCaptions } = makeChannel();
-    await channel.send({ chatId: "1", text: "old caption", photo: "/tmp/pic.png" });
+    await channel.send({ chatId: "1", text: "old caption", photo: PIC });
 
     api.editMessageText = async () => {
       throw new Error("Bad Request: there is no text in the message to edit");

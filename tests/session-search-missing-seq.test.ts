@@ -7,10 +7,16 @@ import type { SessionStore as SessionStoreType } from "../src/sessions/store.js"
 
 // ---------------------------------------------------------------------------
 // searchTranscript scans newest→oldest and stops at the first record older
-// than the window. `seq` is optional, so a legacy or hand-edited record
-// without one must not be read as "older than everything" — that ends the
-// scan of this file and of every rotation archive behind it, and
-// recall_conversation reports the truncated result as the whole answer.
+// than the window's lower bound. Only a record whose position is KNOWN may end
+// that scan: `break outer` abandons the rest of the file AND every rotation
+// archive behind it, so one corrupt or legacy record truncates the whole
+// answer while the search still reports success.
+//
+// Two bounds do this. `fromTime` is the live one — recall_conversation's
+// `after` argument is the only lower bound any caller passes
+// (recall-tools.ts, Agent.searchSessionTranscript), and a legacy record with
+// `timestamp: 0` sits below every `after`. `fromSeq` has the same shape for
+// direct callers of the store API.
 //
 // The store is handed an explicit scratch directory, and HOME/TOMO_WORKSPACE
 // are stubbed before the module is imported so nothing resolves against the
@@ -55,7 +61,7 @@ afterEach(() => {
   dir = "";
 });
 
-describe("searchTranscript with records that have no seq", () => {
+describe("searchTranscript with records that cannot be placed in the window", () => {
   it("skips a seq-less record instead of ending the scan of the file", () => {
     // A hand-edited/legacy record sits between seq 3 and seq 4.
     writeJsonl(join(dir, "test.jsonl"), [
@@ -83,6 +89,65 @@ describe("searchTranscript with records that have no seq", () => {
 
     const results = makeStore().searchTranscript("test", { fromSeq: 1, limit: 50 });
     expect(results.map((r) => r.content)).toEqual(["archived one", "archived two", "recent"]);
+  });
+
+  // --- fromTime: the bound recall_conversation actually passes ------------
+
+  it("skips a record with a corrupt timestamp instead of ending the scan", () => {
+    const day = (n: number) => Date.UTC(2026, 7, n);
+    // A legacy record carrying `timestamp: 0` (the epoch) sits between two
+    // real days. Under `after: 2026-08-10` it used to end the scan.
+    writeJsonl(join(dir, "test.jsonl"), [
+      msg({ content: "aug 11", seq: 1, timestamp: day(11) }),
+      msg({ content: "legacy", seq: 2, timestamp: 0 }),
+      msg({ content: "aug 13", seq: 3, timestamp: day(13) }),
+    ]);
+
+    const results = makeStore().searchTranscript("test", { fromTime: day(10), limit: 50 });
+    expect(results.map((r) => r.content)).toEqual(["aug 11", "aug 13"]);
+  });
+
+  it("still reaches the rotation archives behind a corrupt timestamp", () => {
+    const day = (n: number) => Date.UTC(2026, 7, n);
+    writeJsonl(join(dir, "_archive_test_2026-07.jsonl"), [
+      msg({ content: "archived", seq: 1, timestamp: Date.UTC(2026, 6, 20) }),
+    ]);
+    writeJsonl(join(dir, "test.jsonl"), [
+      msg({ content: "legacy", seq: 2, timestamp: 0 }),
+      msg({ content: "recent", seq: 3, timestamp: day(13) }),
+    ]);
+
+    // `after: 2026-07-01` covers both real records; the archive was dropped.
+    const results = makeStore().searchTranscript("test", { fromTime: Date.UTC(2026, 6, 1), limit: 50 });
+    expect(results.map((r) => r.content)).toEqual(["archived", "recent"]);
+  });
+
+  it("treats a seconds-precision timestamp as unusable rather than ancient", () => {
+    const day = (n: number) => Date.UTC(2026, 7, n);
+    writeJsonl(join(dir, "test.jsonl"), [
+      msg({ content: "aug 11", seq: 1, timestamp: day(11) }),
+      // Seconds where milliseconds were expected: 1970-01-20, not 2023.
+      msg({ content: "seconds", seq: 2, timestamp: 1_700_000_000 }),
+      msg({ content: "aug 13", seq: 3, timestamp: day(13) }),
+    ]);
+
+    const results = makeStore().searchTranscript("test", { fromTime: day(10), limit: 50 });
+    expect(results.map((r) => r.content)).toEqual(["aug 11", "aug 13"]);
+  });
+
+  // --- upper bounds stay consistent with the lower ones -------------------
+
+  it("excludes a seq-less record from a toSeq-bounded search", () => {
+    writeJsonl(join(dir, "test.jsonl"), [
+      msg({ content: "one", seq: 1 }),
+      msg({ content: "legacy" }),
+      msg({ content: "three", seq: 3 }),
+    ]);
+
+    // It used to be coerced to seq 0 and silently included in every upper
+    // bound; a record that cannot be placed in the window is not in it.
+    const results = makeStore().searchTranscript("test", { toSeq: 2, limit: 50 });
+    expect(results.map((r) => r.content)).toEqual(["one"]);
   });
 
   it("still stops early at a record genuinely older than the window", () => {

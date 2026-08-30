@@ -42,6 +42,31 @@ export function getSdkSessionPath(
   return join(sdkSessionsDir, `${sessionId}.jsonl`);
 }
 
+/**
+ * The oldest timestamp a real transcript record can carry. Tomo did not exist
+ * before this, so anything at or below it is corrupt rather than ancient: a
+ * `timestamp: 0` legacy record, a negative value, or a seconds-precision epoch
+ * written where milliseconds were expected (1_700_000_000 is 1970-01-20).
+ *
+ * This matters because searchTranscript's lower bounds END the scan, so
+ * reading such a value as "older than everything" truncates an entire recall.
+ */
+const MIN_PLAUSIBLE_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
+
+/** A record's seq, or null when it has none we can order by. */
+function usableSeq(msg: SessionMessage): number | null {
+  return typeof msg.seq === "number" && Number.isFinite(msg.seq) ? msg.seq : null;
+}
+
+/** A record's timestamp, or null when it has none we can order by. */
+function usableTimestamp(msg: SessionMessage): number | null {
+  return typeof msg.timestamp === "number"
+    && Number.isFinite(msg.timestamp)
+    && msg.timestamp >= MIN_PLAUSIBLE_TIMESTAMP_MS
+    ? msg.timestamp
+    : null;
+}
+
 export class SessionStore {
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
@@ -177,22 +202,30 @@ export class SessionStore {
 
     outer: for (const file of files) {
       for (const msg of iterateJsonlBackwardsSync<SessionMessage>(file)) {
-        // Scanning newest→oldest: once past the window's lower bound,
-        // nothing older can match.
+        // Scanning newest→oldest: once past the window's lower bound, nothing
+        // older can match — but only a record whose position is KNOWN may end
+        // the scan. `break outer` abandons the rest of this file AND every
+        // rotation archive behind it, so a record that cannot be placed in the
+        // window (no seq, no timestamp, a `timestamp: 0` legacy record) is
+        // skipped instead, exactly like the non-string-content guard below.
+        // `fromTime` is the live path: recall_conversation's `after` is the
+        // only lower bound any caller passes, and one epoch-0 record used to
+        // end the search while it still reported success.
+        const seq = usableSeq(msg);
+        const time = usableTimestamp(msg);
+
         if (opts.fromSeq != null) {
-          // `seq` is optional and legacy/hand-edited records may carry none
-          // (getLastSeq at :261 acknowledges the same). Coercing a missing seq
-          // to 0 made such a record older than every lower bound, and
-          // `break outer` then abandoned the rest of this file AND every
-          // archive behind it — recall_conversation would report the handful
-          // of matches newer than that one record as the whole answer. Skip
-          // the record instead, exactly as the toSeq/toTime filters do.
-          if (msg.seq == null) continue;
-          if (msg.seq < opts.fromSeq) break outer;
+          if (seq == null) continue;
+          if (seq < opts.fromSeq) break outer;
         }
-        if (opts.fromTime != null && msg.timestamp < opts.fromTime) break outer;
-        if (opts.toSeq != null && (msg.seq ?? 0) > opts.toSeq) continue;
-        if (opts.toTime != null && msg.timestamp > opts.toTime) continue;
+        if (opts.fromTime != null) {
+          if (time == null) continue;
+          if (time < opts.fromTime) break outer;
+        }
+        // Upper bounds exclude an unplaceable record rather than coercing it
+        // to 0 and silently accepting it into every bounded result.
+        if (opts.toSeq != null && (seq == null || seq > opts.toSeq)) continue;
+        if (opts.toTime != null && (time == null || time > opts.toTime)) continue;
         // Legacy/hand-edited records may lack a string content — skip rather
         // than throw out of the whole search (this backs an agent tool call).
         if (typeof msg.content !== "string") continue;

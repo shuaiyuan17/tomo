@@ -24,6 +24,7 @@ vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
 }));
 
 const { RollupRunner } = await import("../src/lcm/runner.js");
+const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js");
 
 interface Nudge { sessionKey: string; options: { suppressDelivery?: boolean } }
 
@@ -36,7 +37,9 @@ function runnerFor(sessionKey: string): { runner: InstanceType<typeof RollupRunn
       return true;
     },
   };
-  return { runner: new RollupRunner(agent as never), nudges };
+  // In-memory cooldown (null path): these two cases nudge the same period, and
+  // a shared file would let the first one's cooldown suppress the second.
+  return { runner: new RollupRunner(agent as never, new NudgeCooldownStore(null)), nudges };
 }
 
 /** `checkAll` is private; the scheduler is the only production caller. */

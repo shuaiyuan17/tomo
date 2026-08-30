@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { log } from "../logger.js";
+import { SIPS_TIMEOUT_MS } from "./heic.js";
 
 const execFileP = promisify(execFile);
 
@@ -88,11 +89,31 @@ export function buildImagePath(
  * `savedPaths` lists absolute disk paths for images that were also persisted
  * locally. Returns `""` when `intendedCount === 0`.
  */
-export function formatImageMarker(intendedCount: number, savedPaths: string[]): string {
+export function formatImageMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0): string {
   if (intendedCount <= 0) return "";
   const noun = intendedCount === 1 ? "an image" : `${intendedCount} images`;
-  if (savedPaths.length === 0) return `[Sent ${noun}]`;
-  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}]`;
+  const head = savedPaths.length === 0
+    ? `[Sent ${noun}`
+    : `[Sent ${noun}, saved to: ${savedPaths.join(", ")}`;
+  return `${head}${formatUnconvertedNote(unconvertedCount)}]`;
+}
+
+/**
+ * Trailing clause for images whose HEIC→JPEG/PNG conversion failed (sips
+ * missing, non-zero exit, or — the case this was added for — a `sips` that
+ * hung and was killed at its deadline).
+ *
+ * Say it out loud rather than delivering silence: the fallback attaches the
+ * ORIGINAL bytes, and the harness image reader cannot display HEIC, so without
+ * this the agent receives an image it cannot see and no reason why. The
+ * alternative — waiting for the conversion — is what wedged the inbound FIFO.
+ */
+function formatUnconvertedNote(unconvertedCount: number): string {
+  if (unconvertedCount <= 0) return "";
+  const subject = unconvertedCount === 1
+    ? "1 attachment could not be converted"
+    : `${unconvertedCount} attachments could not be converted`;
+  return `; ${subject} from HEIC — the original bytes are attached and may not be readable`;
 }
 
 /**
@@ -104,11 +125,12 @@ export function formatImageMarker(intendedCount: number, savedPaths: string[]): 
  * (`STICKER:<path>` accepts a local image path on the iMessage channel).
  * The hint is only offered when a copy was actually persisted.
  */
-export function formatStickerMarker(intendedCount: number, savedPaths: string[]): string {
+export function formatStickerMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0): string {
   if (intendedCount <= 0) return "";
   const noun = intendedCount === 1 ? "a sticker" : `${intendedCount} stickers`;
-  if (savedPaths.length === 0) return `[Sent ${noun}]`;
-  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}; resend with STICKER:<saved path>]`;
+  const note = formatUnconvertedNote(unconvertedCount);
+  if (savedPaths.length === 0) return `[Sent ${noun}${note}]`;
+  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}${note}; resend with STICKER:<saved path>]`;
 }
 
 /**
@@ -249,9 +271,24 @@ export async function normalizeJpegBuffer(buffer: Buffer, mimeType: string): Pro
   }
 
   const tmpPath = join(tmpdir(), `tomo-norm-${randomUUID()}.jpg`);
+  let deadline: NodeJS.Timeout | undefined;
   try {
     await writeFile(tmpPath, buffer);
-    await execFileP("sips", [...sipsArgs, tmpPath]);
+    // This runs on the inbound FIFO too, so an unbounded `sips` here stalls
+    // every subsequent message and hangs `quiesce()`. `timeout` makes Node
+    // kill the child; the racing deadline makes the AWAIT bounded even if the
+    // child cannot be killed, which is the part that actually protects the
+    // FIFO. Either way the catch below returns the original bytes.
+    await Promise.race([
+      execFileP("sips", [...sipsArgs, tmpPath], { timeout: SIPS_TIMEOUT_MS, killSignal: "SIGKILL" }),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(
+          () => reject(new Error(`sips orientation normalize did not exit within ${SIPS_TIMEOUT_MS + 5_000}ms`)),
+          SIPS_TIMEOUT_MS + 5_000,
+        );
+        deadline.unref?.();
+      }),
+    ]);
     const rotated = await readFile(tmpPath);
     patchOrientationToOne(rotated);
     log.info({ fromOrientation: found.orientation, bytes: rotated.length }, "Normalized JPEG buffer orientation");
@@ -260,6 +297,7 @@ export async function normalizeJpegBuffer(buffer: Buffer, mimeType: string): Pro
     log.error({ err, orientation: found.orientation }, "Failed to normalize JPEG buffer; returning original");
     return buffer;
   } finally {
+    if (deadline) clearTimeout(deadline);
     await unlink(tmpPath).catch(() => undefined);
   }
 }

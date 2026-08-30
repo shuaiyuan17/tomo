@@ -12,6 +12,13 @@ export interface ImageAttachment {
    * instead of seeing an indistinguishable "image".
    */
   isSticker?: boolean;
+  /**
+   * True when this image arrived as HEIC and the `sips` conversion failed —
+   * including the case it was killed at its deadline. `data` then holds the
+   * ORIGINAL (probably undisplayable) bytes, so the channel appends a note to
+   * the inline marker rather than handing the agent an invisible image.
+   */
+  conversionFailed?: boolean;
 }
 
 export interface DocumentAttachment {

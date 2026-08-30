@@ -1367,8 +1367,10 @@ export class ImsgChannel implements Channel {
     const imageSavedPaths = images.filter((i) => !i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
     const stickerSavedPaths = images.filter((i) => i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
     const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
-    const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths);
-    const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
+    const unconvertedImages = images.filter((i) => !i.isSticker && i.conversionFailed).length;
+    const unconvertedStickers = images.filter((i) => i.isSticker && i.conversionFailed).length;
+    const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths, unconvertedStickers);
+    const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths, unconvertedImages);
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
     // Path-only marker: unlike the image/document markers this is the ONLY
     // representation of the file the agent gets — no bytes are attached.
@@ -1707,9 +1709,10 @@ export class ImsgChannel implements Channel {
           // transparency into a solid background), to JPEG otherwise.
           // Failure keeps the original bytes — never drop the attachment.
           const isSticker = att.is_sticker === true;
-          const { buffer: imageBuffer, mimeType: imageMime } = await this.normalizeHeicImage(buffer, mimeType, filePath, isSticker);
+          const { buffer: imageBuffer, mimeType: imageMime, conversionFailed } = await this.normalizeHeicImage(buffer, mimeType, filePath, isSticker);
           const image = await buildImageAttachment(imageBuffer, imageMime, meta, this.imageStoreBaseDir);
           if (isSticker) image.isSticker = true;
+          if (conversionFailed) image.conversionFailed = true;
           images.push(image);
         } else {
           const filename = (typeof att.transfer_name === "string" && att.transfer_name) || basename(filePath);
@@ -1839,7 +1842,7 @@ export class ImsgChannel implements Channel {
     mimeType: string,
     filePath: string,
     isSticker = false,
-  ): Promise<{ buffer: Buffer; mimeType: string }> {
+  ): Promise<{ buffer: Buffer; mimeType: string; conversionFailed?: boolean }> {
     if (!looksLikeHeic(mimeType, filePath, buffer)) return { buffer, mimeType };
 
     let format: HeicTargetFormat;
@@ -1854,14 +1857,18 @@ export class ImsgChannel implements Channel {
       log.error({ err, path: filePath, format }, "HEIC conversion threw; keeping original attachment");
       return null;
     });
-    if (!outPath) return { buffer, mimeType };
+    // `conversionFailed` covers every way this can go wrong — sips missing, a
+    // non-zero exit, a throw, and (the case this flag was added for) a sips
+    // that hung and was killed at its deadline. In all of them the agent gets
+    // HEIC bytes it cannot display, so it is told so.
+    if (!outPath) return { buffer, mimeType, conversionFailed: true };
 
     try {
       const converted = await readFile(outPath);
       return { buffer: converted, mimeType: format === "png" ? "image/png" : "image/jpeg" };
     } catch (err) {
       log.error({ err, path: filePath, outPath }, "Failed to read converted image; keeping original attachment");
-      return { buffer, mimeType };
+      return { buffer, mimeType, conversionFailed: true };
     } finally {
       await unlink(outPath).catch(() => undefined);
     }

@@ -559,6 +559,74 @@ describe("imsg inbound message mapping", () => {
     }
   });
 
+  it("tells the agent the attachment could not be converted (rather than handing it invisible HEIC)", async () => {
+    // A `sips` killed at its deadline (see heic.ts) resolves null, exactly
+    // like any other conversion failure. The message must still be delivered —
+    // blocking on it stalls the whole inbound FIFO — but the agent is holding
+    // HEIC bytes the harness image reader cannot display, so the marker says so.
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const heicPath = join(dir, "wedged.heic");
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => null); // timed out / failed
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-timeout",
+        chat_guid: DM_GUID,
+        text: "look at this",
+        attachments: [{
+          filename: "wedged.heic",
+          mime_type: "image/heic",
+          original_path: heicPath,
+          missing: false,
+        }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images).toHaveLength(1);
+      expect(msg.text).toContain("1 attachment could not be converted from HEIC");
+      expect(msg.text).toContain("look at this");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says nothing extra when the conversion succeeds", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const heicPath = join(dir, "ok.heic");
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+    const jpegPath = join(dir, "ok.jpg");
+    writeFileSync(jpegPath, Buffer.from("ffd8ffe000104a464946", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => jpegPath);
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-ok",
+        chat_guid: DM_GUID,
+        text: "",
+        attachments: [{ filename: "ok.heic", mime_type: "image/heic", original_path: heicPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(handler.mock.calls[0][0].text).not.toContain("could not be converted");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("passes non-HEIC images through untouched (no conversion attempted)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
     const pngPath = join(dir, "photo.png");

@@ -316,3 +316,56 @@ describe("shutdown records non-coalescing group messages parked in sessionQueue 
     expect(channel.delivered).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The other half of #295: the sweep of `queuedInbound` is ONE-TIME, so a
+// mention accepted after it runs is parked in a map nothing will look at
+// again — acknowledged and gone, the drop this whole path exists to close.
+// Reachable on both exits: `quiesce` is deadline-bounded and
+// `boundedShutdownStep` leaves an over-deadline parse RUNNING rather than
+// cancelling it, and on the crash path `salvageInbound` records from
+// `uncaughtException` with the channels still ingesting until the process
+// actually goes. The batcher answers this window by REFUSING (`stopping`);
+// the non-coalescing path reports custody unconditionally, so it has to
+// record instead.
+// ---------------------------------------------------------------------------
+
+describe("inbound accepted after the drain is recorded, not parked (#295)", () => {
+  it("records a mention that arrives once the sweep has already run", async () => {
+    resetConfig();
+    const agent = new Agent();
+    const channel = new MockChannel("telegram");
+    agent.addChannel(channel);
+    await agent.start();
+
+    // The crash-path entry point: sweeps and returns with the channel still
+    // ingesting, exactly as `uncaughtException` leaves it.
+    agent.recordUnprocessedInboundOnCrash();
+
+    const sessionKey = "telegram:late-group";
+    const queue = (agent as unknown as {
+      sessionQueue: { enqueue<T>(key: string, task: () => Promise<T>): Promise<T> };
+    }).sessionQueue;
+    let releaseBlocker!: () => void;
+    const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+    queue.enqueue(sessionKey, () => blockerGate);
+
+    const accepted = await channel.simulateMessage(makeMsg({
+      chatId: "late-group",
+      text: "arrived after the drain",
+      senderName: "Alice",
+      isGroup: true,
+      isMentioned: true,
+    }));
+    // Custody reported, so the channel commits its cursor and never replays
+    // this one. The transcript is the only trace there can be, and it has to
+    // be there NOW — the process is on its way to exit.
+    expect(accepted).toBe(true);
+
+    const text = sessionTranscript(sessionKey);
+    expect(text).toContain("arrived after the drain");
+    expect(text).toContain(NOT_PROCESSED);
+
+    releaseBlocker();
+  });
+});

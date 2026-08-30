@@ -159,6 +159,8 @@ export class Agent {
    * waiting for an arbitrary queued model turn.
    */
   private queuedInbound = new Map<symbol, QueuedInboundWork>();
+  /** Set once `recordUnprocessedInbound` has swept `queuedInbound`. */
+  private inboundDrained = false;
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
@@ -620,6 +622,21 @@ export class Agent {
     steer = false,
     action = "message queue",
   ): void {
+    // Past the shutdown drain nothing will look at `queuedInbound` again, so
+    // parking here would acknowledge the message and lose it — the failure
+    // this method exists to close. Reachable: `quiesce` is bounded, and
+    // `boundedShutdownStep` leaves an over-deadline parse running, so its
+    // message can arrive after the sweep. Record it rather than refuse it;
+    // the channel has already committed to this one (see
+    // recordUnprocessedInbound's note on both providers).
+    if (this.inboundDrained) {
+      log.warn(
+        { sessionKey, count: items.length },
+        "Inbound arrived after the shutdown drain; recording without processing",
+      );
+      this.recordInboundItems(new Map([[sessionKey, items]]));
+      return;
+    }
     const token = Symbol(sessionKey);
     this.queuedInbound.set(token, { sessionKey, items, steer });
     this.enqueueForSession(sessionKey, async () => {
@@ -2257,13 +2274,31 @@ export class Agent {
   }
 
   private recordUnprocessedInbound(): void {
-    const pending = this.batcher.drainForShutdown();
+    const batched = this.batcher.drainForShutdown();
+    // Set with the batcher's own `stopping`, and like it: one-time. From here
+    // `queuedInbound` is never swept again, so a record parked there after
+    // this point would be exactly the acknowledged-and-gone drop #295 is
+    // about — `enqueueInboundForSession` records instead of parking.
+    this.inboundDrained = true;
+
+    // Queued-inbound first: an item here is already waiting on a session task,
+    // so it was accepted before anything still parked in the batcher for the
+    // same key (a dm: session summoned to a group holds both). Ordering only
+    // decides how the transcript reads; every entry carries its own
+    // provider timestamp either way.
+    const pending = new Map<string, InboundItem[]>();
     for (const [token, work] of this.queuedInbound) {
-      const items = pending.get(work.sessionKey) ?? [];
-      items.push(...work.items);
-      pending.set(work.sessionKey, items);
+      pending.set(work.sessionKey, [...(pending.get(work.sessionKey) ?? []), ...work.items]);
       this.queuedInbound.delete(token);
     }
+    for (const [key, items] of batched) {
+      pending.set(key, [...(pending.get(key) ?? []), ...items]);
+    }
+    this.recordInboundItems(pending);
+  }
+
+  /** Append `<user message>` + the not-processed marker for each item. */
+  private recordInboundItems(pending: Map<string, InboundItem[]>): void {
     for (const [key, items] of pending) {
       for (const { channel, message } of items) {
         this.sessions.append(key, {

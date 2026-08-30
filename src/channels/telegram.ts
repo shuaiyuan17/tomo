@@ -96,8 +96,12 @@ export interface TelegramChannelOptions {
  * sanitise sender-supplied attachment metadata the same way. The "unnamed" /
  * "no mime" wording is preserved for the genuinely-absent case, so only hostile
  * input changes shape.
+ *
+ * Not exported: the tests drive the real `message:document` handler through
+ * `bot.handleUpdate`, so they exercise the shipped path rather than a helper
+ * lifted out for their benefit.
  */
-export function formatUnsupportedDocumentNotice(
+function formatUnsupportedDocumentNotice(
   fileName: string | undefined,
   mimeType: string | undefined,
 ): string {

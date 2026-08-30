@@ -198,6 +198,8 @@ export function formatBytes(bytes: number | undefined): string {
  * Keeping the sender's name matters: `dmit-207121-id_rsa.zip` tells you what
  * you are looking at; `220446_imessage_….bin` does not.
  */
+export const MAX_ATTACHMENT_NAME_LENGTH = 120;
+
 export function sanitizeAttachmentFilename(
   filename: string | undefined,
   mimeType: string | undefined,
@@ -211,8 +213,16 @@ export function sanitizeAttachmentFilename(
   const cleaned = base
     .replace(/[^A-Za-z0-9._-]/g, "_")
     .replace(/^[.]+/, "")
-    .slice(0, 120);
-  if (!cleaned || /^[._-]*$/.test(cleaned)) return fallback;
+    .slice(0, MAX_ATTACHMENT_NAME_LENGTH);
+  // Capped on the way OUT, not just on the `cleaned` branch. The length limit
+  // used to sit on `cleaned` only, so the fallback bypassed it entirely: a
+  // filename of "." reduces to nothing and returns
+  // `file.${documentMimeToExt(mimeType)}` — and the MIME is as
+  // sender-controlled as the name. `text/` + 100 KB of letters produced a
+  // 100,005-character "filename", which is what then goes into the notice.
+  // Both halves are now bounded (see MAX_MIME_EXT_LENGTH), and this is the
+  // backstop that holds whatever else the fallback is ever built from.
+  if (!cleaned || /^[._-]*$/.test(cleaned)) return fallback.slice(0, MAX_ATTACHMENT_NAME_LENGTH);
   return cleaned;
 }
 

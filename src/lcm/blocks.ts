@@ -212,11 +212,19 @@ function monthForIsoWeekTag(weekTag: string): string | null {
   return localMonthTag(isoWeekThursday(Number(m[1]), Number(m[2])));
 }
 
-function warmSuffixParentPeriods(events: SdkEvent[], tailStart: number): {
+/**
+ * Periods that still own raw events inside the global warm suffix — i.e. periods
+ * that are only *partially* eligible for promotion right now. `days` is the
+ * period itself (a day with warm raw cannot be rolled up completely); weeks /
+ * months / years are the parent periods that inherit that partialness.
+ */
+function warmSuffixPeriods(events: SdkEvent[], tailStart: number): {
+  days: Set<string>;
   weeks: Set<string>;
   months: Set<string>;
   years: Set<string>;
 } {
+  const days = new Set<string>();
   const weeks = new Set<string>();
   const months = new Set<string>();
   const years = new Set<string>();
@@ -228,6 +236,7 @@ function warmSuffixParentPeriods(events: SdkEvent[], tailStart: number): {
     if (!e.timestamp) continue;
 
     const day = localDateTag(new Date(e.timestamp));
+    days.add(day);
     const week = isoWeekTag(new Date(day + "T12:00:00"));
     weeks.add(week);
 
@@ -238,7 +247,7 @@ function warmSuffixParentPeriods(events: SdkEvent[], tailStart: number): {
     }
   }
 
-  return { weeks, months, years };
+  return { days, weeks, months, years };
 }
 
 /**
@@ -270,7 +279,7 @@ export function resolveBlockRange(
 
   if (config.lcm.globalFreshTail && level !== "daily") {
     const tailStart = globalFreshTailStartIdx(events, dailyFreshTail());
-    const warmPeriods = warmSuffixParentPeriods(events, tailStart);
+    const warmPeriods = warmSuffixPeriods(events, tailStart);
     if (
       (level === "weekly" && warmPeriods.weeks.has(resolvedPeriod)) ||
       (level === "monthly" && warmPeriods.months.has(resolvedPeriod)) ||
@@ -484,7 +493,7 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
   // tolerated (weekly promotes a near-complete block) exactly as in the
   // today-only path. Under flag-off, tailStart=length → this set is empty →
   // default behavior fully preserved.
-  const warmPeriods = warmSuffixParentPeriods(events, tailStart);
+  const warmPeriods = warmSuffixPeriods(events, tailStart);
 
   // Candidate periods: for each source block, derive its parent period.
   const weeklyChildrenByWeek = new Map<string, number>();
@@ -581,6 +590,24 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
   }
   for (const [day, counts] of rawDays) {
     const hasBlock = haveTags.has(`daily ${day}`);
+    // A day that ALREADY has a block but still owns raw inside the warm suffix
+    // is only partially eligible: a rollup now absorbs the aged-out slice and
+    // leaves the warm slice behind, so the next tick — with the boundary a
+    // little further along — finds a fresh slice and nudges again. That is a
+    // re-nudge loop, and every lap makes the model rewrite the WHOLE day
+    // (`tomo lcm daily --summary` overrides, it does not append). Observed
+    // 2026-08-29: four nudges in one day for `daily 2026-08-28` (193 / 46 / 44
+    // / 71 leftover events), four identical ~1.4k-token summaries.
+    //
+    // So: once a block exists, wait until the day's raw has aged out of the
+    // suffix ENTIRELY. Then one sweep absorbs all of it, the day is left with
+    // zero raw events, and it can never come due again (a past day's event set
+    // is closed). Nudges per day are bounded at two — the first one that
+    // creates the block (which still runs immediately, keeping the bulk of the
+    // day out of the hot context) and the final sweep.
+    //
+    // Flag-off: warmPeriods is empty by construction → guard inert.
+    if (hasBlock && warmPeriods.days.has(day)) continue;
     const isDue = hasBlock
       ? counts.total >= FLOOR_WITH_BLOCK
       : counts.conversational >= CONV_FLOOR_WITHOUT_BLOCK || counts.total >= MACHINERY_ONLY_FLOOR;

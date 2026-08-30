@@ -15,10 +15,11 @@ import {
   summaryBudgetCheck,
   type BlockLevel,
 } from "../src/lcm/blocks.js";
+import { compactSession } from "../src/lcm/compact.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { config as mockedConfig } from "../src/config.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
-import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -583,6 +584,127 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
 
     const due = findDuePromotions(sessionId);
     expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeDefined();
+  });
+
+  it("does NOT re-nudge a day that already has a block while some of its raw is still warm", () => {
+    // The re-nudge loop (observed 2026-08-29, four nudges for `daily 2026-08-28`):
+    // the day has a block plus 12 leftover raw events, 8 of which have aged out
+    // of the newest-4 window and 4 of which are still warm. Rolling up now would
+    // absorb the 8 and leave the 4 — and the next tick, with the boundary a
+    // little further along, would find a fresh slice and nudge AGAIN, making the
+    // model rewrite the whole day each time. Wait for the day to age out fully.
+    const day = "2026-04-08";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly` },
+    }];
+    for (let i = 0; i < 12; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    // 8 leftovers are outside the warm window — over FLOOR_WITH_BLOCK — but the
+    // day is not finished aging out, so it is NOT due yet.
+    expect(due.find((d) => d.level === "daily" && d.period === day)).toBeUndefined();
+  });
+
+  it("sweeps such a day in ONE nudge once all of its raw has aged out", () => {
+    // Same shape as above plus 4 newer candidates, which push every one of the
+    // day's leftovers out of the warm window. Now the rollup can absorb the day
+    // whole, so it is due — exactly once.
+    const day = "2026-04-08";
+    const laterDay = "2026-04-18";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly` },
+    }];
+    for (let i = 0; i < 12; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent(laterDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    const dailyDue = due.find((d) => d.level === "daily" && d.period === day);
+    expect(dailyDue).toBeDefined();
+    expect(dailyDue!.childCount).toBe(12);
+  });
+
+  it("the sweep absorbs the day for good — no residue, chain intact, never due again", () => {
+    // End-to-end proof of the bound: the deferred sweep goes through the normal
+    // rebuild compaction (existing block + all remaining raw → one block). After
+    // it, the day owns zero raw events, every parentUuid still resolves, and
+    // findDuePromotions can never flag the day again.
+    const day = "2026-04-08";
+    const laterDay = "2026-04-18";
+    const events: any[] = [];
+    let parent: string | null = null;
+    const chain = (e: any) => { e.parentUuid = parent; parent = e.uuid; events.push(e); return e; };
+
+    chain({
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly` },
+    });
+    for (let i = 0; i < 12; i++) {
+      chain(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    for (let i = 0; i < 4; i++) {
+      chain(mkTextEvent(laterDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const range = resolveBlockRange(sessionId, "daily", day);
+    expect(range).not.toBeNull();
+    const transcriptPath = join(SDK_SESSIONS_DIR, `_archive_${sessionId}.jsonl`);
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir: SDK_SESSIONS_DIR,
+      fromIdx: range!.fromIdx,
+      toIdx: range!.toIdx,
+      expectedFirstUuid: range!.firstUuid,
+      expectedLastUuid: range!.lastUuid,
+      summary: "swept 4/8",
+      transcriptPath,
+      blockTag: range!.blockTag,
+    });
+    expect(result.success).toBe(true);
+
+    const after = readFileSync(archivePath, "utf-8")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+    // One block for the day, and none of the day's raw events survive.
+    expect(after.filter((e) => e.blockTag === `daily ${day}`)).toHaveLength(1);
+    const dayRaw = after.filter(
+      (e) => !e.isCompactSummary && (e.type === "user" || e.type === "assistant") &&
+        e.timestamp && new Date(e.timestamp).getDate() === 8 && new Date(e.timestamp).getMonth() === 3,
+    );
+    expect(dayRaw).toHaveLength(0);
+
+    // Chain intact: every parentUuid points at an event still in the file.
+    const uuids = new Set(after.map((e) => e.uuid));
+    for (const e of after.slice(1)) {
+      expect(uuids.has(e.parentUuid)).toBe(true);
+    }
+
+    // And the day can never come due again.
+    expect(findDuePromotions(sessionId).find((d) => d.level === "daily" && d.period === day))
+      .toBeUndefined();
+    if (existsSync(transcriptPath)) unlinkSync(transcriptPath);
   });
 
   it("does NOT deadlock: aged-out sub-floor leftover still lets the week promote", () => {

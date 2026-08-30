@@ -148,14 +148,35 @@ export class DeliveryPipeline {
         const validPaths = mediaPaths.filter((path) => existsSync(path));
         const caption = restoreLiteralNewlines(cleanText).trim();
         let captionSent = false;
+        // The FIRST attachment failure, re-thrown once the rest of the block
+        // has had its chance. Losing the picture must not also lose the text.
+        let attachmentError: unknown;
         for (const [i, path] of validPaths.entries()) {
-          await send({ chatId, photo: path, text: i === 0 ? caption : "", ...offerReplyTo() });
-          if (i === 0 && caption) captionSent = true;
+          try {
+            await send({ chatId, photo: path, text: i === 0 ? caption : "", ...offerReplyTo() });
+            // Set only on a send that RESOLVED. Setting it on having called
+            // send is what lost the caption: the existsSync above and the
+            // channel's own open are different instants, and a file that
+            // vanishes in between takes the whole send down — grammY's
+            // InputFile ENOENTs at request time, and ImsgChannel re-checks the
+            // path. The caption is independently deliverable; it now falls
+            // through to deliverText below like any other captionless media.
+            if (i === 0 && caption) captionSent = true;
+          } catch (err) {
+            attachmentError ??= err;
+            log.warn({ err, path, chatId }, "Attachment send failed; delivering the rest of the block");
+          }
         }
         if (!captionSent) settleReplyTo(await deliverText(channel, chatId, cleanText, offerReplyTo()));
         for (const stickerId of stickerIds) {
           await send({ chatId, text: "", sticker: stickerId, ...offerReplyTo() });
         }
+        // Surfaced, not swallowed: the caller marks the block with the
+        // delivery-failed marker (turn-runner.ts, agent.ts) precisely so the
+        // transcript never claims a delivery that did not happen. The picture
+        // genuinely did not ship, so the block is still a failure — the change
+        // is only that everything shippable shipped first.
+        if (attachmentError !== undefined) throw attachmentError;
       },
     };
   }

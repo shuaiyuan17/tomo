@@ -336,6 +336,28 @@ backupCommand
       return;
     }
 
+    // RE-CHECK AFTER THE PROMPT. What survived the checks above is a STRING,
+    // and `confirm()` is an unbounded wait — the prompt sits there until a
+    // human answers. That window belongs to whoever can write to
+    // `~/Backups/tomo`: rename the validated directory away and drop a symlink
+    // in its place, and every `existsSync`/`cpSync` below follows the
+    // replacement, while the `rmSync`s still delete the live destinations.
+    //
+    // Re-resolving and requiring the SAME real path collapses the window to
+    // the gap between this line and the first copy, which contains no `await`
+    // — nothing below yields, so nothing else gets to run in between.
+    //
+    // RESIDUAL: this is not descriptor pinning. A swap landing inside that
+    // gap is still not detected, and closing it properly means holding an
+    // `open()` handle on the directory and copying through `openat`-relative
+    // operations, which Node's `fs` does not expose. Out of scope here; the
+    // re-check turns an indefinite window into an instantaneous one.
+    if (resolveBackupPath(date) !== backupPath) {
+      console.error(`Backup ${date} changed while waiting for confirmation; aborting without restoring.`);
+      process.exit(1);
+      return;
+    }
+
     console.log();
 
     // 1. config.json

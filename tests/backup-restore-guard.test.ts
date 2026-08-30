@@ -1,7 +1,6 @@
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { describe, it, expect, vi, afterAll, beforeEach, afterEach } from "vitest";
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // A fake home. Computed from literals so it is available inside the hoisted
@@ -10,7 +9,12 @@ import { join } from "node:path";
 // this it would resolve into the reviewer's real home.
 const paths = vi.hoisted(() => {
   const home = `/tmp/tomo-backup-guard-${process.pid}`;
-  return { home, backups: `${home}/Backups/tomo`, tomoHome: `${home}/.tomo` };
+  return {
+    home,
+    backups: `${home}/Backups/tomo`,
+    tomoHome: `${home}/.tomo`,
+    outside: `/tmp/tomo-backup-outside-${process.pid}`,
+  };
 });
 
 vi.mock("node:os", async (orig) => {
@@ -39,49 +43,70 @@ vi.mock("../src/runtime-paths.js", () => ({
 
 const { backupCommand } = await import("../src/cli/backup.js");
 
-/** Somewhere outside the backups root for a link to point at. */
-let outside: string;
+const VALID = "2026-08-30_0142";
+const validDir = join(paths.backups, VALID);
+/** A live file that a restore would delete, and an abort must not. */
+const liveMarker = join(paths.tomoHome, "data", "live.txt");
+/** A file only present in the backup, so a real restore is observable. */
+const restoredMarker = join(paths.tomoHome, "data", "restored.txt");
 
-beforeAll(() => {
-  mkdirSync(paths.backups, { recursive: true });
-  mkdirSync(paths.tomoHome, { recursive: true });
+/** Rebuilt per test: several cases mutate the tree on purpose. */
+function buildFixture(): void {
+  rmSync(paths.home, { recursive: true, force: true });
+  rmSync(paths.outside, { recursive: true, force: true });
 
-  // A genuine backup.
-  mkdirSync(join(paths.backups, "2026-08-30_0142", "data"), { recursive: true });
+  mkdirSync(join(validDir, "data"), { recursive: true });
+  writeFileSync(join(validDir, "data", "restored.txt"), "from backup");
+
+  // Somewhere outside the backups root for a link to point at.
+  mkdirSync(join(paths.outside, "data"), { recursive: true });
+  writeFileSync(join(paths.outside, "data", "loot.txt"), "attacker payload");
 
   // A correctly-named SYMLINK to a directory outside the root. Shape check
   // passes, existsSync passes (it follows the link), and restore would then
   // read from there while deleting the live destinations.
-  outside = mkdtempSync(join(tmpdir(), "tomo-backup-outside-"));
-  mkdirSync(join(outside, "data"), { recursive: true });
-  try { symlinkSync(outside, join(paths.backups, "2026-08-30_0200"), "dir"); } catch { /* exists */ }
-
+  symlinkSync(paths.outside, join(paths.backups, "2026-08-30_0200"), "dir");
   // A correctly-named regular file, which is not restorable either.
   writeFileSync(join(paths.backups, "2026-08-30_0300"), "not a directory");
-});
+
+  // Live data the restore would overwrite.
+  mkdirSync(join(paths.tomoHome, "data"), { recursive: true });
+  writeFileSync(liveMarker, "live");
+}
 
 afterAll(() => {
   rmSync(paths.home, { recursive: true, force: true });
-  rmSync(outside, { recursive: true, force: true });
+  rmSync(paths.outside, { recursive: true, force: true });
 });
-
-interface RunResult { logs: string[]; errors: string[]; exitCodes: number[] }
 
 let restoreStdin: (() => void) | undefined;
 
 beforeEach(() => {
-  const original = process.stdin;
-  // `confirm()` opens a readline on stdin. Feed it a decline so a command that
-  // wrongly REACHES the prompt aborts cleanly instead of hanging the suite —
-  // the assertion is that the prompt is never reached at all.
-  const fake = Readable.from(["n\n"]) as unknown as NodeJS.ReadStream;
-  Object.defineProperty(process, "stdin", { value: fake, configurable: true });
-  restoreStdin = () => Object.defineProperty(process, "stdin", { value: original, configurable: true });
+  buildFixture();
+  restoreStdin = undefined;
 });
 
 afterEach(() => { restoreStdin?.(); vi.restoreAllMocks(); });
 
-async function runRestore(arg: string): Promise<RunResult> {
+interface RunResult { logs: string[]; errors: string[]; exitCodes: number[] }
+
+/**
+ * Run the real `restore` action.
+ *
+ * `answer` becomes stdin for `confirm()`. It may be an async generator, which
+ * is how the swap-during-prompt case runs its mutation at the one moment that
+ * matters: `Readable.from` pulls lazily, so the generator body does not run
+ * until readline actually reads — i.e. after the prompt is pending.
+ */
+async function runRestore(
+  arg: string,
+  answer: Iterable<string> | AsyncIterable<string> = ["n\n"],
+): Promise<RunResult> {
+  const original = process.stdin;
+  const fake = Readable.from(answer) as unknown as NodeJS.ReadStream;
+  Object.defineProperty(process, "stdin", { value: fake, configurable: true });
+  restoreStdin = () => Object.defineProperty(process, "stdin", { value: original, configurable: true });
+
   const logs: string[] = [];
   const errors: string[] = [];
   const exitCodes: number[] = [];
@@ -113,7 +138,7 @@ describe("tomo backup restore — argument guard", () => {
   });
 
   it("rejects a traversal that still ends in a valid-looking name", async () => {
-    const { logs, exitCodes } = await runRestore("../../../2026-08-30_0142");
+    const { logs, exitCodes } = await runRestore(`../../../${VALID}`);
     expect(logs.join("\n")).not.toContain(ACCEPTED);
     expect(exitCodes).toContain(1);
   });
@@ -145,10 +170,53 @@ describe("tomo backup restore — argument guard", () => {
   });
 
   it("still accepts a genuine backup directory", async () => {
-    // Declines at the prompt, so nothing is actually restored — reaching the
-    // prompt is the assertion.
-    const { logs, exitCodes } = await runRestore("2026-08-30_0142");
+    // Declines at the prompt, so nothing is restored — reaching the prompt is
+    // the assertion.
+    const { logs, exitCodes } = await runRestore(VALID);
     expect(logs.join("\n")).toContain(ACCEPTED);
     expect(exitCodes).not.toContain(1);
+  });
+});
+
+describe("tomo backup restore — swapped between validation and copy", () => {
+  /** Replace the validated directory with a symlink pointing outside. */
+  const swapForSymlink = (): void => {
+    rmSync(validDir, { recursive: true, force: true });
+    symlinkSync(paths.outside, validDir, "dir");
+  };
+
+  it("aborts when the validated directory is swapped while the prompt is pending", async () => {
+    const { errors, exitCodes } = await runRestore(VALID, (async function* () {
+      // The prompt is up and the command is parked on it. This is the window
+      // the string-based check could not see: the name still resolves, but no
+      // longer to what was validated.
+      swapForSymlink();
+      yield "y\n";
+    })());
+
+    expect(errors.join("\n")).toContain("changed while waiting for confirmation");
+    expect(exitCodes).toContain(1);
+  });
+
+  it("leaves the live destinations untouched when it aborts", async () => {
+    await runRestore(VALID, (async function* () {
+      swapForSymlink();
+      yield "y\n";
+    })());
+
+    // The rmSync that would have deleted this never ran...
+    expect(existsSync(liveMarker)).toBe(true);
+    // ...and nothing from the attacker's tree was copied in.
+    expect(existsSync(join(paths.tomoHome, "data", "loot.txt"))).toBe(false);
+  });
+
+  it("still restores normally when nothing is swapped", async () => {
+    // Positive control: the re-check must not break the path it guards.
+    const { logs, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(logs.join("\n")).toContain("Restore complete.");
+    expect(exitCodes).not.toContain(1);
+    expect(existsSync(restoredMarker)).toBe(true);
+    expect(existsSync(liveMarker)).toBe(false);
   });
 });

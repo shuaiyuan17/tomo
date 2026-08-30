@@ -37,6 +37,8 @@
 
 - The `showThinking` config reference pointed at a `/reset` command that does not exist; it says `tomo restart`.
 
+- **A failed pet-state write no longer takes the daemon down.** `PetScheduler.tick()` calls `PetStore.save()` (`mkdirSync` + an atomic write), which throws on `ENOSPC`, `EACCES` and `EROFS`. It ran unguarded both synchronously from `start()` — killing daemon startup — and from its hourly `setInterval`, where a throw has nothing above it to catch it and ends the process: every channel, live session and the `imsg rpc` child would die because a toy pet could not write its state file. The tick is now wrapped and logged, so a failed write is a skipped tick and the next hour still runs. The interval is also `unref`'d, matching every other background timer, so it can no longer hold the process open during shutdown.
+
 ## 0.8.14 (2026-08-14)
 
 ### Features

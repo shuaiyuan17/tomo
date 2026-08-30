@@ -136,7 +136,93 @@ describe("redactLogRecord", () => {
   });
 });
 
+// The deep pass runs in pino's `formatters.log` hook, which is OUTSIDE its
+// guarded serialization: anything thrown here kills the log call, and the
+// daemon has no uncaughtException handler. Main survived all three of these
+// because it never walked the record at all.
+describe("redactLogRecord survives hostile records", () => {
+  it("does not let a throwing getter take the log call with it", () => {
+    const record = {
+      a: {
+        get boom(): string { throw new Error("getter blew up"); },
+        token: "sk-ant-abcdefghij123456",
+      },
+    };
+    // The bad property costs itself and nothing else — the sibling secret is
+    // still redacted.
+    expect(redactLogRecord(record)).toEqual({
+      a: { boom: "[Unreadable]", token: "[Redacted]" },
+    });
+  });
+
+  it("does not throw on an object that cannot be enumerated", () => {
+    const { proxy, revoke } = Proxy.revocable({ x: 1 }, {});
+    revoke();
+    // Even classifying it throws (getPrototypeOf on a revoked proxy), so this
+    // must not reach the last-resort catch either.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(() => redactLogRecord({ p: proxy })).not.toThrow();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("caps depth instead of overflowing the stack", () => {
+    const root: Record<string, unknown> = {};
+    let cursor = root;
+    for (let i = 0; i < 60_000; i++) {
+      const next: Record<string, unknown> = {};
+      cursor.n = next;
+      cursor = next;
+    }
+    cursor.token = "sk-ant-abcdefghij123456";
+
+    let out: unknown;
+    expect(() => { out = redactLogRecord(root); }).not.toThrow();
+    // Everything below the cap is replaced by a marker, so nothing deep goes
+    // out unredacted either.
+    let node = out as Record<string, unknown>;
+    for (let i = 0; i < 31; i++) node = node.n as Record<string, unknown>;
+    expect(node.n).toBe("[Depth limit]");
+  });
+});
+
+// A credential under a field name no rule could match. imessage-imsg.ts logs
+// child-process RPC params, which is exactly this shape.
+describe("redactLogRecord scrubs string values", () => {
+  it("takes the password out of a connection string, keeping scheme and user", () => {
+    expect(redactLogRecord({ dbUrl: "postgres://admin:S3cretPass99@host/db" }))
+      .toEqual({ dbUrl: "postgres://admin:***@host/db" });
+  });
+
+  it("takes the credential out of a header carried as a value", () => {
+    expect(redactLogRecord({ header: "Authorization: Bearer sk-ant-abcdefghij1234567890" }))
+      .toEqual({ header: "Authorization: Bearer ***" });
+  });
+
+  it("leaves a URL with no userinfo alone", () => {
+    const record = { url: "https://api.example.com:443/v1", note: "see https://example.com/a:b" };
+    expect(redactLogRecord(record)).toBe(record);
+  });
+});
+
 describe("redactSerializedError", () => {
+  it("keeps Date and Buffer intact while still scrubbing strings", () => {
+    // The error walker predated the opaque guard and flattened both to {}.
+    const when = new Date("2020-01-01T00:00:00.000Z");
+    const buf = Buffer.from("hi");
+    const out = redactSerializedError({
+      when,
+      buf,
+      message: `failed for ${TOKEN}`,
+    }) as Record<string, unknown>;
+    expect(out.when).toBe(when);
+    expect(Buffer.isBuffer(out.buf)).toBe(true);
+    expect(out.message).not.toContain(TOKEN);
+  });
+
   it("reaches into a serialized error tree that a plain-object walker rejects", () => {
     // pino.stdSerializers.err output has a non-Object prototype, and
     // formatters.log runs before serializers, so this is the only pass that
@@ -253,6 +339,15 @@ describe("scrubSecretValues", () => {
     // ...and does not eat the sentence's full stop.
     expect(scrubSecretValues("sent Bearer abc123def456ghi789jkl."))
       .toBe("sent Bearer ***.");
+  });
+
+  // The bot-token rule used to be `\d{6,}:`, which backtracks quadratically:
+  // 32k digits took ~910ms, and tool output is attacker-influenced.
+  it("does not backtrack quadratically on a long digit run", () => {
+    const digits = "9".repeat(32_000);
+    const started = Date.now();
+    expect(scrubSecretValues(digits)).toBe(digits);
+    expect(Date.now() - started).toBeLessThan(20);
   });
 
   // grammY reports failures by echoing the request URL, where the token is

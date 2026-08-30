@@ -145,15 +145,49 @@ export function redactSecretValue(value: unknown): string {
  * whole value rather than a property of it (`groupSecret: 42`).
  */
 export function redactSecrets(value: unknown, fieldName?: string): unknown {
-  return redact(value, fieldName, redactSecretValue, new Set());
+  return walk(value, fieldName, { censor: redactSecretValue, scrubStrings: false }, new Set(), 0);
 }
 
 /** What a censored field is replaced with. */
 type Censor = (value: unknown) => unknown;
 
+interface WalkOptions {
+  censor: Censor;
+  /**
+   * Also run the value-shaped rules over string leaves. On for log records and
+   * error trees; off for config values, where the operator is being shown what
+   * they typed and `configIssues` has its own name-based rule.
+   */
+  scrubStrings: boolean;
+}
+
+/**
+ * How deep the walk goes before it stops and substitutes a marker.
+ *
+ * Without a cap, recursion depth is attacker-controlled: a 60k-deep object
+ * (a parsed JSON payload, a linked structure in a tool result) overflowed the
+ * stack with a RangeError. That throw escaped into pino's `formatters.log`
+ * hook, which is OUTSIDE its guarded serialization — so it killed the log
+ * call, and with no `uncaughtException` handler in the daemon (issue #312,
+ * finding 14) that is a process-level risk. Nothing the daemon legitimately
+ * logs is anywhere near 32 deep.
+ */
+const MAX_WALK_DEPTH = 32;
+
+/**
+ * Longest string leaf scanned by the value-shaped rules. Beyond this the tail
+ * is passed through unscanned rather than paying an unbounded regex cost on
+ * every log line; a 500-character tool summary, which is the case that
+ * matters, is far below it.
+ */
+const MAX_SCRUBBED_STRING = 8192;
+
+const TOO_DEEP = "[Depth limit]";
+const UNREADABLE = "[Unreadable]";
+
 /**
  * Values whose structure lives somewhere other than own enumerable properties.
- * Rebuilding one from `Object.entries` would flatten it to `{}` and silently
+ * Rebuilding one from its entries would flatten it to `{}` and silently
  * destroy the value it was logged for, so they pass through untouched.
  *
  * Everything else IS walked, including class instances. An earlier version
@@ -174,35 +208,116 @@ function isOpaque(value: object): boolean {
     || value instanceof ArrayBuffer;
 }
 
-function redact(
+/**
+ * Own enumerable entries, tolerating an object that fights back.
+ *
+ * `Object.entries` reads every property, which INVOKES GETTERS — so one
+ * throwing getter anywhere in a log record used to take the whole log call
+ * with it. Keys are listed first (cheap, no getter invocation) and each
+ * property is then read on its own, so a hostile property costs that property
+ * and nothing else. Returns null when the object cannot even be enumerated
+ * (a revoked Proxy), in which case the caller passes it through and lets
+ * pino's own guarded serialization deal with it, exactly as before this
+ * redaction existed.
+ */
+function safeEntries(value: object): Array<[string, unknown]> | null {
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return null;
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    try {
+      entries.push([key, (value as Record<string, unknown>)[key]]);
+    } catch {
+      entries.push([key, UNREADABLE]);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Shortest string any rule here can match. The issuer prefixes are all longer
+ * than this and `CREDENTIAL_SHAPE` requires 8, so anything shorter cannot
+ * contain a credential and is skipped without running a single regex — which
+ * covers most of what a log record actually holds ("1200ms", "$0.0123").
+ */
+const MIN_SCRUBBABLE_LENGTH = 8;
+
+function scrubLeaf(value: string): string {
+  if (value.length < MIN_SCRUBBABLE_LENGTH) return value;
+  if (value.length <= MAX_SCRUBBED_STRING) return scrubSecretValues(value);
+  const head = value.slice(0, MAX_SCRUBBED_STRING);
+  const scrubbed = scrubSecretValues(head);
+  return scrubbed === head ? value : scrubbed + value.slice(MAX_SCRUBBED_STRING);
+}
+
+/**
+ * The one walker behind every redaction surface.
+ *
+ * Returns the ORIGINAL value, by identity, when nothing changed — so a log
+ * record with nothing to redact is not cloned, and a class instance is not
+ * silently flattened into a plain object for no reason.
+ */
+function walk(
   value: unknown,
   fieldName: string | undefined,
-  censor: Censor,
+  opts: WalkOptions,
   ancestors: Set<object>,
+  depth: number,
 ): unknown {
-  if (fieldName !== undefined && isSecretFieldName(fieldName)) return censor(value);
+  if (fieldName !== undefined && isSecretFieldName(fieldName)) return opts.censor(value);
+  if (typeof value === "string") return opts.scrubStrings ? scrubLeaf(value) : value;
   if (value === null || typeof value !== "object") return value;
-  // An Error is left alone: pino's `err` serializer turns it into a plain
-  // object (and that serializer is wrapped in logger.ts), and copying one here
-  // would strip the prototype the serializer keys off, losing the stack.
-  if (value instanceof Error) return value;
-  if (!Array.isArray(value) && isOpaque(value)) return value;
+  // Classifying the value is itself fallible: `instanceof` and `Array.isArray`
+  // both perform getPrototypeOf, which THROWS on a revoked Proxy. Anything we
+  // cannot classify is treated as opaque and passed through for pino's own
+  // guarded serialization to deal with.
+  let kind: "error" | "opaque" | "array" | "object";
+  try {
+    // A raw Error is left alone: pino's `err` serializer turns it into a plain
+    // object (and that serializer is wrapped in logger.ts, which routes it
+    // back through here), and copying one now would strip the prototype the
+    // serializer keys off, losing the stack.
+    kind = value instanceof Error
+      ? "error"
+      : Array.isArray(value)
+        ? "array"
+        : isOpaque(value) ? "opaque" : "object";
+  } catch {
+    kind = "opaque";
+  }
+  if (kind === "error" || kind === "opaque") return value;
   // ANCESTORS, not "everything visited". A `seen` set that is never unwound
   // reports the second sighting of a shared-but-acyclic node as a cycle — and
   // config and log objects are full of shared references (the same identity
   // object under two channels, one options object passed twice). Only a node
   // that is its own ancestor is actually a cycle.
   if (ancestors.has(value)) return "[Circular]";
+  if (depth >= MAX_WALK_DEPTH) return TOO_DEEP;
   ancestors.add(value);
   try {
-    if (Array.isArray(value)) {
-      return value.map((item) => redact(item, undefined, censor, ancestors));
+    if (kind === "array") {
+      let changed = false;
+      const items = (value as unknown[]).map((item) => {
+        const next = walk(item, undefined, opts, ancestors, depth + 1);
+        if (next !== item) changed = true;
+        return next;
+      });
+      return changed ? items : value;
     }
+    const entries = safeEntries(value);
+    if (entries === null) return value;
+    let changed = false;
     const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = redact(item, key, censor, ancestors);
+    for (const [key, item] of entries) {
+      const next = walk(item, key, opts, ancestors, depth + 1);
+      if (next !== item) changed = true;
+      result[key] = next;
     }
-    return result;
+    return changed ? result : value;
   } finally {
     ancestors.delete(value);
   }
@@ -212,8 +327,19 @@ function redact(
  *  `formatters.log` hook) redaction are indistinguishable in the output. */
 export const LOG_CENSOR = "[Redacted]";
 
+const LOG_WALK: WalkOptions = { censor: () => LOG_CENSOR, scrubStrings: true };
+
+let warnedRedactionFailure = false;
+
 /**
- * Deep-redact a log record by the same name rule, at any depth.
+ * Deep-redact a log record: censor secret-named fields at any depth, and run
+ * the value-shaped rules over string leaves.
+ *
+ * String leaves matter as much as field names here. `imessage-imsg.ts` logs
+ * child-process RPC params, and a value like
+ * `{ dbUrl: "postgres://admin:S3cret@host" }` or
+ * `{ header: "Authorization: Bearer sk-ant-…" }` carries the credential under
+ * a field name no rule could match.
  *
  * `redact.paths` is a fixed ladder of literal paths, so it can only ever cover
  * the depths someone thought to enumerate. Real leaks are deeper than the
@@ -221,13 +347,27 @@ export const LOG_CENSOR = "[Redacted]";
  * an axios-shaped error carries `err.config.headers.Authorization`, and an MCP
  * server entry nests `mcpServers.<name>.headers.Authorization`. This closes
  * the general case.
- *
- * Returns the ORIGINAL object when there is nothing to redact, which is the
- * overwhelmingly common case — the daemon logs at `debug` by default, so
- * cloning every record would be a real cost for nothing. The scan still walks
- * the record (via `Object.entries`, which allocates), but it does not rebuild
- * it, and it stops at the first secret-named key it finds.
  */
+export function redactLogRecord<T>(record: T): T {
+  try {
+    return walk(record, undefined, LOG_WALK, new Set(), 0) as T;
+  } catch (err) {
+    // The walk is defensive about getters, un-enumerable objects, cycles and
+    // depth, so reaching here means something genuinely unforeseen. Losing
+    // every subsequent log line to a redaction bug would be worse than the
+    // record going out with only pino's own `redact.paths` in front of it,
+    // which is what protected it before this hook existed.
+    //
+    // console, not `log` — importing the logger here would be a cycle, and
+    // this fires at most once per process.
+    if (!warnedRedactionFailure) {
+      warnedRedactionFailure = true;
+      console.warn("[tomo] log redaction failed; records pass through with path-based redaction only:", err);
+    }
+    return record;
+  }
+}
+
 /**
  * Redact a *serialized* error object: censor secret-named fields at any depth,
  * and scrub every string by value.
@@ -242,60 +382,14 @@ export const LOG_CENSOR = "[Redacted]";
  *    .Authorization` (depth 6) exposed;
  *  - the credential is often in `message` or `stack`, under no key that any
  *    name rule could match, and `AggregateError`'s sub-errors carry their own.
- *
- * So this walks ANY object, and scrubs strings as well as censoring names.
- * Error trees are small and rare, so the extra work is bounded.
  */
 export function redactSerializedError(value: unknown): unknown {
-  return redactErrorNode(value, undefined, new Set());
-}
-
-function redactErrorNode(value: unknown, fieldName: string | undefined, ancestors: Set<object>): unknown {
-  if (fieldName !== undefined && isSecretFieldName(fieldName)) return LOG_CENSOR;
-  if (typeof value === "string") return scrubSecretValues(value);
-  if (value === null || typeof value !== "object") return value;
-  if (ancestors.has(value)) return "[Circular]";
-  ancestors.add(value);
   try {
-    if (Array.isArray(value)) {
-      return value.map((item) => redactErrorNode(item, undefined, ancestors));
-    }
-    // Own enumerable properties only — exactly what JSON.stringify would have
-    // emitted, so nothing visible in the output is lost by rebuilding as a
-    // plain object.
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = redactErrorNode(item, key, ancestors);
-    }
-    return result;
-  } finally {
-    ancestors.delete(value);
+    return walk(value, undefined, LOG_WALK, new Set(), 0);
+  } catch {
+    return value;
   }
 }
-
-export function redactLogRecord<T>(record: T): T {
-  if (!containsSecret(record, new Set())) return record;
-  return redact(record, undefined, () => LOG_CENSOR, new Set()) as T;
-}
-
-function containsSecret(value: unknown, ancestors: Set<object>): boolean {
-  if (value === null || typeof value !== "object") return false;
-  if (value instanceof Error) return false;
-  if (!Array.isArray(value) && isOpaque(value)) return false;
-  if (ancestors.has(value)) return false;
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) return value.some((item) => containsSecret(item, ancestors));
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (isSecretFieldName(key)) return true;
-      if (containsSecret(item, ancestors)) return true;
-    }
-    return false;
-  } finally {
-    ancestors.delete(value);
-  }
-}
-
 
 /**
  * A deliberately SHORT ladder for pino's `redact.paths`.
@@ -373,10 +467,12 @@ const SECRET_KEY_NAMES = "access[_-]?token|refresh[_-]?token|id[_-]?token|client
  */
 const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
   // Telegram bot token: <numeric bot id>:<35-char secret>. NO leading \b —
-  // the form that actually leaks is grammY echoing the request URL,
+  // bounded at 20 digits: an unbounded \d{6,} made this quadratic (32k digits
+  // took 910ms of backtracking looking for the colon). Real bot ids are ~10.
+  // No leading \\b — the form that actually leaks is grammY echoing the URL,
   // `https://api.telegram.org/bot8123456:AAH…/getUpdates`, where the token is
   // glued to `bot` and there is no word boundary in front of the digits.
-  [/\d{6,}:[A-Za-z0-9_-]{25,}\b/g, "***"],
+  [/\d{6,20}:[A-Za-z0-9_-]{25,}\b/g, "***"],
   // Anthropic / OpenAI style. sk-ant- first so the longer prefix wins.
   [/\bsk-ant-[A-Za-z0-9_-]{16,}/g, "***"],
   [/\bsk-[A-Za-z0-9_-]{16,}/g, "***"],
@@ -391,6 +487,11 @@ const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\bAIza[A-Za-z0-9_-]{35}\b/g, "***"],
   // JWTs (three base64url segments).
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "***"],
+  // A credential in a URL's userinfo: `postgres://admin:S3cret@host`. Keeps
+  // the scheme and the username — which are what make the line diagnostic —
+  // and drops the password. Connection strings reach the log through
+  // ordinary-looking field names (`dbUrl`), which no name rule can catch.
+  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+):[^\s:/@]+@/gi, "$1:***@"],
   // `Authorization: <scheme> <credential>` / `Cookie: <value>`, quoted form.
   // Inside quotes the key is unambiguous, so the whole value goes whatever it
   // looks like.
@@ -425,7 +526,7 @@ const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
     new RegExp(`\\b(${SECRET_KEY_NAMES})(["']?\\s*[:=]\\s*)(["'])${NOT_A_SECRET}[^"']*\\3`, "gi"),
     "$1$2$3***$3",
   ],
-  // `client_secret=hunter2hunter2`, `--token abc123def456`. Unquoted, so the
+  // `client_secret=hunter2hunter2`, `token=abc123def456`. Unquoted, so the
   // value has to look like a credential — otherwise "secret: the meeting is
   // at 3" and "authentication token: expired" lose their first word.
   [

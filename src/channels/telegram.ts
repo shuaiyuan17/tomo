@@ -10,6 +10,7 @@ import {
   readDocumentResponseWithCap,
 } from "./attachments.js";
 import { log } from "../logger.js";
+import { scrubSecretValues } from "../redact.js";
 import { splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
 
@@ -141,7 +142,8 @@ export class TelegramChannel implements Channel {
     this.imageStoreBaseDir = options.imageStoreBaseDir;
 
     this.bot.catch((err) => {
-      log.error({ err: err.error }, "Telegram bot error");
+      // grammY echoes the failing request URL, which carries the bot token.
+      log.error({ err: this.redactToken(err.error) }, "Telegram bot error");
     });
 
     // Slash commands
@@ -351,7 +353,11 @@ export class TelegramChannel implements Channel {
   /** Error detail safe to log — file-download URLs embed the bot token. */
   private redactToken(err: unknown): string {
     const detail = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
-    return this.bot.token ? detail.replaceAll(this.bot.token, "<bot-token>") : detail;
+    const withoutToken = this.bot.token ? detail.replaceAll(this.bot.token, "<bot-token>") : detail;
+    // Our own token is only the token we know about: an error can echo a
+    // request carrying someone else's credential (a webhook secret, an
+    // Authorization header on a proxied call).
+    return scrubSecretValues(withoutToken);
   }
 
   private describeSticker(sticker: {
@@ -480,7 +486,7 @@ export class TelegramChannel implements Channel {
             );
           }
         })
-        .catch((err) => log.error({ err }, "Telegram message handler failed"))
+        .catch((err) => log.error({ err: this.redactToken(err) }, "Telegram message handler failed"))
         .finally(() => { this.inFlightUpdates.delete(done); });
       this.inFlightUpdates.add(done);
     }
@@ -616,7 +622,7 @@ export class TelegramChannel implements Channel {
         // not found / blocked bot would fail identically the second time
         // while burying the real error under the fallback's.
         if (!isMarkdownParseError(err)) throw err;
-        log.debug({ chatId: message.chatId, err }, "Telegram rejected Markdown; resending as plain text");
+        log.debug({ chatId: message.chatId, err: this.redactToken(err) }, "Telegram rejected Markdown; resending as plain text");
         sent = await this.bot.api.sendMessage(message.chatId, chunk, params);
       }
       this.recordOwnMessage(message.chatId, sent.message_id, chunk);
@@ -754,7 +760,7 @@ export class TelegramChannel implements Channel {
       const { delayMs, nextDelayMs } = nextPollingBackoff(this.pollingRestartDelayMs, Date.now() - startedAt);
       this.pollingRestartDelayMs = nextDelayMs;
       if (err) {
-        log.error({ err, delayMs }, "Telegram polling failed, restarting in %ds", Math.round(delayMs / 1000));
+        log.error({ err: this.redactToken(err), delayMs }, "Telegram polling failed, restarting in %ds", Math.round(delayMs / 1000));
       } else {
         log.warn({ delayMs }, "Telegram polling ended unexpectedly, restarting in %ds", Math.round(delayMs / 1000));
       }

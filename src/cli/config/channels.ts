@@ -36,7 +36,7 @@ export async function configChannels(): Promise<void> {
       const action = await p.select({
         message: "Telegram",
         options: [
-          { value: "token", label: "Bot token", hint: tgToken ? `${(tgToken).slice(0, 8)}...` : "not set" },
+          { value: "token", label: "Bot token", hint: tgToken ? "(set)" : "not set" },
           { value: "allowlist", label: "Allowlist", hint: `${tgAllow.length} user(s)` },
           { value: "back", label: "Back" },
         ],
@@ -44,14 +44,25 @@ export async function configChannels(): Promise<void> {
       if (p.isCancel(action) || action === "back") continue;
 
       if (action === "token") {
-        const token = await p.text({
-          message: "Telegram bot token",
-          placeholder: "123456:ABC-DEF...",
-          initialValue: (channels.telegram?.token as string) ?? "",
+        // p.password, not p.text, and no initialValue: pre-filling rendered
+        // the whole token on screen and into terminal scrollback, where
+        // anyone who can read it can impersonate the bot. auth.ts and
+        // litellm.ts already do it this way — display "(set)", never the
+        // value, and treat a blank answer as "keep what's there".
+        const token = await p.password({
+          message: tgToken
+            ? "Telegram bot token (set — leave blank to keep existing)"
+            : "Telegram bot token",
         });
         if (p.isCancel(token)) continue;
+        const entered = String(token ?? "").trim();
+        if (!entered && !tgToken) {
+          p.log.warn("No token entered; leaving Telegram unconfigured.");
+          continue;
+        }
+        if (!entered) continue;
         if (!channels.telegram) channels.telegram = {};
-        channels.telegram.token = (token as string).trim();
+        channels.telegram.token = entered;
         cfg.channels = channels;
         saveConfig(cfg);
         p.log.success("Telegram token saved");

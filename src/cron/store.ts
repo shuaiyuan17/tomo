@@ -57,8 +57,8 @@ export class CronStore {
     this.path = path;
     try {
       this.load();
-    } catch (err) {
-      this.loadError = err;
+    } catch {
+      // Recorded by load(); every read and write refuses until a reload succeeds.
     }
   }
 
@@ -363,7 +363,18 @@ export class CronStore {
   }
 
   private load(): void {
-    const disk = readStore(this.path);
+    let disk: { jobs: CronJob[]; revision: number };
+    try {
+      disk = readStore(this.path);
+    } catch (err) {
+      // A reload that fails AFTER a successful one must not leave the old
+      // snapshot serviceable: `list()` would keep reporting the jobs that
+      // were there before the file went bad, and the surfaces that degrade on
+      // `CronStoreReadError` (watch snapshot, metrics scrape, `tomo status`)
+      // would see a healthy store. Record the failure so they degrade too.
+      this.loadError = err;
+      throw err;
+    }
     this.jobs = disk.jobs;
     this.baseline = snapshot(this.jobs);
     this.loadError = null;
@@ -459,12 +470,51 @@ function readStore(path: string): { jobs: CronJob[]; revision: number } {
   if (data === null || typeof data !== "object" || !Array.isArray(data.jobs)) {
     throw new CronStoreReadError(path, new Error("missing or malformed `jobs` array"));
   }
+  // Each entry has to be a job record, not merely present: a `null` or a
+  // truncated object would otherwise surface later as a TypeError from the
+  // first `job.id` / `job.schedule.kind` access — in the scheduler's due-scan,
+  // not here — and would never be recognised as the read failure it is.
+  const bad = data.jobs.findIndex((entry) => !isJobRecord(entry));
+  if (bad !== -1) {
+    throw new CronStoreReadError(path, new Error(`jobs[${bad}] is not a job record`));
+  }
   return {
     jobs: data.jobs as CronJob[],
     // Files written before revisions existed start at 0 and get 1 on the next
     // save; the counter only ever has to be monotonic within one file.
     revision: typeof data.revision === "number" ? data.revision : 0,
   };
+}
+
+const SCHEDULE_KINDS: ReadonlySet<string> = new Set(["at", "every", "cron"]);
+
+/**
+ * Shape check for one persisted job: every field `CronJob` declares as
+ * required, with the type the store and scheduler dereference without
+ * checking. Optional fields (the run-token and resume bookkeeping) are left
+ * alone — records written before they existed have none, and every reader
+ * already tolerates their absence.
+ */
+function isJobRecord(entry: unknown): entry is CronJob {
+  if (entry === null || typeof entry !== "object") return false;
+  const j = entry as Record<string, unknown>;
+  const schedule = j.schedule as Record<string, unknown> | null | undefined;
+  return (
+    typeof j.id === "string" &&
+    typeof j.name === "string" &&
+    typeof j.enabled === "boolean" &&
+    schedule !== null && typeof schedule === "object" &&
+    typeof schedule.kind === "string" && SCHEDULE_KINDS.has(schedule.kind) &&
+    typeof j.message === "string" &&
+    // Absent is a real state (`canManageJob` assigns such orphans to the
+    // owner); a non-string is not.
+    (j.sessionKey === undefined || typeof j.sessionKey === "string") &&
+    typeof j.deleteAfterRun === "boolean" &&
+    typeof j.createdAt === "number" &&
+    (j.nextRunAt === null || typeof j.nextRunAt === "number") &&
+    (j.lastRunAt === null || typeof j.lastRunAt === "number") &&
+    (j.lastStatus === null || typeof j.lastStatus === "string")
+  );
 }
 
 function snapshot(jobs: CronJob[]): Map<string, CronJob> {

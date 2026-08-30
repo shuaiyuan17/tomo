@@ -902,6 +902,55 @@ describe("CronStore unreadable file", () => {
     expect(() => new CronStore(TEST_PATH).list()).toThrow(CronStoreReadError);
   });
 
+  it("rejects a jobs array whose entries are not job records", () => {
+    // `{"jobs":[null]}` used to pass the array check and then blow up as a
+    // TypeError on the first `job.id` — in the scheduler's due-scan, not at
+    // load — so nothing recognised it as the unreadable store it is.
+    for (const jobs of [[null], ["water"], [{ id: "abc12345" }], [{
+      id: "abc12345",
+      name: "x",
+      enabled: true,
+      schedule: { kind: "weekly" },
+      message: "x",
+      sessionKey: "dm:alice",
+      deleteAfterRun: false,
+      createdAt: 1,
+      nextRunAt: null,
+      lastRunAt: null,
+      lastStatus: null,
+    }]]) {
+      writeFileSync(TEST_PATH, JSON.stringify({ version: 1, jobs }));
+      const store = new CronStore(TEST_PATH);
+      expect(() => store.list()).toThrow(CronStoreReadError);
+      expect(() => store.getDueJobs()).toThrow(CronStoreReadError);
+      expect(readCronJobsSafely(store).unreadablePath).toBe(TEST_PATH);
+    }
+  });
+
+  it("refuses every read once a reload fails, not only a failed first load", () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "x",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+    const contents = readFileSync(TEST_PATH, "utf-8");
+    expect(store.list()).toHaveLength(1);
+
+    writeFileSync(TEST_PATH, "{ not json");
+    expect(() => store.getDueJobs()).toThrow(CronStoreReadError);
+    // The pre-fix behaviour: the failed reload left the earlier snapshot in
+    // place, so `list()` — and through it the watch snapshot, the metrics
+    // scrape and `tomo status` — kept reporting a healthy store.
+    expect(() => store.list()).toThrow(CronStoreReadError);
+    expect(readCronJobsSafely(store)).toEqual({ jobs: [], unreadablePath: TEST_PATH });
+
+    writeFileSync(TEST_PATH, contents);
+    expect(store.getDueJobs()).toEqual([]);
+    expect(store.list()).toHaveLength(1);
+  });
+
   it("recovers once the file is readable again", () => {
     const good = new CronStore(TEST_PATH);
     good.add({

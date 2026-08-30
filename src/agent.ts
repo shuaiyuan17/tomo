@@ -1784,6 +1784,18 @@ export class Agent {
    * the cursor un-advanced). That is why the shutdown sequence lets in-flight
    * parses finish into this batcher instead of refusing them late.
    */
+  /**
+   * Crash-path entry point for {@link recordUnprocessedInbound}.
+   *
+   * Called from the `uncaughtException` handler, where nothing may be awaited
+   * and no channel may be trusted. This one step is worth taking anyway: it is
+   * a synchronous append to the local transcript, and it is what stops a crash
+   * turning an already-received message into a silent non-answer (#294).
+   */
+  recordUnprocessedInboundOnCrash(): void {
+    this.recordUnprocessedInbound();
+  }
+
   private recordUnprocessedInbound(): void {
     const pending = this.batcher.drainForShutdown();
     for (const [key, items] of pending) {

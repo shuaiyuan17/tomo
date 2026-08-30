@@ -6,6 +6,8 @@ import {
   installProcessErrorHandlers,
   UNHANDLED_REJECTION_MARKER,
   UNCAUGHT_EXCEPTION_MARKER,
+  REJECTION_LOG_BURST,
+  REJECTION_LOG_WINDOW_MS,
 } from "../src/process-handlers.js";
 
 describe("installProcessErrorHandlers", () => {
@@ -45,9 +47,25 @@ describe("installProcessErrorHandlers", () => {
   });
 
   it("survives repeated rejections", () => {
-    for (let i = 0; i < 5; i++) target.emit("unhandledRejection", new Error(`r${i}`), Promise.resolve());
-    expect(logger.error).toHaveBeenCalledTimes(5);
+    for (let i = 0; i < REJECTION_LOG_BURST; i++) {
+      target.emit("unhandledRejection", new Error(`r${i}`), Promise.resolve());
+    }
+    expect(logger.error).toHaveBeenCalledTimes(REJECTION_LOG_BURST);
     expect(exit).not.toHaveBeenCalled();
+  });
+
+  it("keeps a non-Error reason inspectable instead of \"[object Object]\"", () => {
+    const reason = { code: "ECONNRESET", detail: { host: "api.telegram.org", attempt: 3 } };
+    target.emit("unhandledRejection", reason, Promise.resolve());
+
+    const [obj, ] = logger.error.mock.calls[0];
+    // The raw value survives for anything reading the structured JSON…
+    expect(obj.reason).toBe(reason);
+    // …and the rendered message is diagnostic, not "[object Object]".
+    const message = (obj.err as Error).message;
+    expect(message).not.toContain("[object Object]");
+    expect(message).toContain("ECONNRESET");
+    expect(message).toContain("api.telegram.org");
   });
 
   it("logs an uncaught exception and exits non-zero", () => {
@@ -86,10 +104,148 @@ describe("installProcessErrorHandlers", () => {
     expect(exit).toHaveBeenCalledWith(1);
   });
 
+  it("installing twice replaces rather than stacks", () => {
+    // The daemon installs bare handlers at the top of startup and upgrades
+    // them to pino a few lines later. Stacking would double-log and, worse,
+    // call `exit` twice.
+    const second = { error: vi.fn(), fatal: vi.fn() };
+    const secondUninstall = installProcessErrorHandlers({ target, logger: second, exit, writeStderr: stderr });
+    try {
+      expect(target.listenerCount("unhandledRejection")).toBe(1);
+      expect(target.listenerCount("uncaughtException")).toBe(1);
+
+      target.emit("unhandledRejection", new Error("boom"), Promise.resolve());
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(second.error).toHaveBeenCalledTimes(1);
+    } finally {
+      secondUninstall();
+    }
+  });
+
   it("uninstall removes both listeners", () => {
     uninstall();
     expect(target.listenerCount("unhandledRejection")).toBe(0);
     expect(target.listenerCount("uncaughtException")).toBe(0);
+  });
+});
+
+describe("rejection log rate limiting", () => {
+  // A rejecting promise inside a hot loop fires as fast as the loop runs, and
+  // every log.error fans out to a watch event for every connected `tomo watch`
+  // client plus a metric increment. Surviving the rejection must not mean
+  // replacing it with a log-and-socket storm.
+  let target: EventEmitter;
+  let logger: { error: ReturnType<typeof vi.fn>; fatal: ReturnType<typeof vi.fn> };
+  let clock: number;
+  let uninstall: () => void;
+
+  beforeEach(() => {
+    target = new EventEmitter();
+    logger = { error: vi.fn(), fatal: vi.fn() };
+    clock = 1_000_000;
+    uninstall = installProcessErrorHandlers({
+      target, logger, exit: vi.fn(), writeStderr: vi.fn(), now: () => clock,
+    });
+  });
+  afterEach(() => uninstall());
+
+  const reject = (n: number) => {
+    for (let i = 0; i < n; i++) target.emit("unhandledRejection", new Error(`r${i}`), Promise.resolve());
+  };
+
+  it("logs the first burst in full and then stops", () => {
+    reject(500);
+    expect(logger.error).toHaveBeenCalledTimes(REJECTION_LOG_BURST);
+  });
+
+  it("reports how many it suppressed, once the window rolls over", () => {
+    reject(500);
+    logger.error.mockClear();
+
+    clock += REJECTION_LOG_WINDOW_MS;
+    reject(1);
+
+    // One summary line naming the exact count, then the new window's first
+    // full line. Nothing is silently lost.
+    expect(logger.error).toHaveBeenCalledTimes(2);
+    const [summary, summaryMsg] = logger.error.mock.calls[0];
+    expect(summary.suppressed).toBe(500 - REJECTION_LOG_BURST);
+    expect(summaryMsg).toContain(UNHANDLED_REJECTION_MARKER);
+    expect(summaryMsg).toContain(String(500 - REJECTION_LOG_BURST));
+  });
+
+  it("emits no summary when the window was never exceeded", () => {
+    reject(REJECTION_LOG_BURST);
+    logger.error.mockClear();
+    clock += REJECTION_LOG_WINDOW_MS;
+    reject(1);
+    expect(logger.error).toHaveBeenCalledTimes(1);      // just the new one
+    expect(logger.error.mock.calls[0][0].suppressed).toBeUndefined();
+  });
+
+  it("never rate-limits the exception path", () => {
+    // One exception is all there can be; the latch handles the rest.
+    target.emit("uncaughtException", new Error("boom"), "uncaughtException");
+    expect(logger.fatal).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("crash-path inbound salvage", () => {
+  let target: EventEmitter;
+  let exit: ReturnType<typeof vi.fn>;
+  let stderr: ReturnType<typeof vi.fn>;
+  let uninstall: (() => void) | null = null;
+
+  beforeEach(() => {
+    target = new EventEmitter();
+    exit = vi.fn();
+    stderr = vi.fn();
+  });
+  afterEach(() => uninstall?.());
+
+  const install = (beforeExit: () => void, now?: () => number) => {
+    uninstall = installProcessErrorHandlers({
+      target, exit, writeStderr: stderr, now,
+      logger: { error: vi.fn(), fatal: vi.fn() },
+      beforeExit,
+    });
+  };
+
+  it("runs the salvage hook before exiting", () => {
+    const order: string[] = [];
+    install(() => order.push("salvage"));
+    exit.mockImplementation(() => order.push("exit"));
+
+    target.emit("uncaughtException", new Error("boom"), "uncaughtException");
+    // #294: a crash must not turn an already-received message into a silent
+    // non-answer, so the transcript append happens before we go.
+    expect(order).toEqual(["salvage", "exit"]);
+  });
+
+  it("exits anyway when the salvage hook throws", () => {
+    install(() => { throw new Error("registry is unwritable"); });
+    target.emit("uncaughtException", new Error("boom"), "uncaughtException");
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(stderr.mock.calls.some(([l]) => String(l).includes("salvage failed"))).toBe(true);
+  });
+
+  it("reports a salvage hook that overruns its 1s expectation", () => {
+    let clock = 0;
+    install(() => { clock += 2_500; }, () => clock);
+    target.emit("uncaughtException", new Error("boom"), "uncaughtException");
+    // Synchronous work cannot be preempted, so this is a report rather than a
+    // cap — it exists to catch the hook growing something that belongs in the
+    // ordinary shutdown path.
+    expect(stderr.mock.calls.some(([l]) => String(l).includes("salvage took 2500ms"))).toBe(true);
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("is optional — no hook, still exits", () => {
+    uninstall = installProcessErrorHandlers({
+      target, exit, writeStderr: stderr, logger: { error: vi.fn(), fatal: vi.fn() },
+    });
+    target.emit("uncaughtException", new Error("boom"), "uncaughtException");
+    expect(exit).toHaveBeenCalledWith(1);
   });
 });
 
@@ -127,6 +283,14 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(stdout).toContain("ALIVE");   // the daemon is still serving
     expect(code).toBe(0);
   });
+
+  it("survives a non-Error rejection reason and still says something useful", async () => {
+    const { code, stdout } = await runChild("rejection-object");
+    expect(code).toBe(0);
+    expect(stdout).toContain("ALIVE");
+    expect(stdout).toContain("ECONNRESET");
+    expect(stdout).not.toContain("[object Object]");
+  }, 60_000);
 
   it("exits non-zero on a synthetic uncaught exception, with the marker on stderr", { timeout: 60_000 }, async () => {
     const { code, stdout, stderr } = await runChild("exception");

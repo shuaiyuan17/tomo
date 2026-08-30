@@ -47,6 +47,16 @@ async function startForeground(): Promise<void> {
   // daemon that never started.
   process.on("exit", () => releasePidFile(PID_FILE));
 
+  // Before the config and agent imports, but AFTER the synchronous pid-file
+  // claim above (an await in front of the exclusion gate would re-open the
+  // double-start window): a module-level throw or a rejected top-level import
+  // in the block below happens before pino exists, and Node's default output
+  // carries no marker. Upgraded to the real logger (and given the
+  // inbound-salvage hook) a few lines down; installing twice is idempotent by
+  // replacement.
+  const { installBootstrapErrorHandlers, installProcessErrorHandlers } = await import("../process-handlers.js");
+  installBootstrapErrorHandlers();
+
   // Validate config before loading the heavy daemon modules so a fresh
   // install fails with a clear message instead of a module-load crash.
   const {
@@ -74,15 +84,14 @@ async function startForeground(): Promise<void> {
   const { log } = await import("../logger.js");
   if (envNotice) log.info({ vars: [...ignoredEnvOverrideNames] }, envNotice);
 
-  // Last-resort handlers, installed as soon as there is a logger to use them.
-  // Node >= 15 terminates on an unhandled rejection, and `shutdown()` is wired
-  // only to SIGINT/SIGTERM — so before this, a single stray rejection took the
-  // daemon down with none of the cleanup, leaving a stale pid file, an orphaned
-  // `imsg rpc` child, and the metrics port and watch socket held until the OS
-  // reaped them. See src/process-handlers.ts for why a rejection is survived
-  // and an uncaught exception is not.
-  const { installProcessErrorHandlers } = await import("../process-handlers.js");
-  installProcessErrorHandlers({ logger: log });
+  // Upgrade the bootstrap handlers to pino, and give the exception path its
+  // one salvage step. The hook is read through a mutable holder because the
+  // handlers are installed before `agent` exists — a crash between here and
+  // the assignment below simply has nothing to salvage yet.
+  // See src/process-handlers.ts for why a rejection is survived and an
+  // uncaught exception is not.
+  let salvageInbound: (() => void) | null = null;
+  installProcessErrorHandlers({ logger: log, beforeExit: () => salvageInbound?.() });
   const { TelegramChannel } = await import("../channels/index.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
   const { PetScheduler } = await import("../mcp/pet-scheduler.js");
@@ -140,6 +149,9 @@ async function startForeground(): Promise<void> {
   }
 
   const agent = new Agent();
+  // The messages this daemon accepted and would now never answer are recorded
+  // in the transcript even on the crash path (#294).
+  salvageInbound = () => agent.recordUnprocessedInboundOnCrash();
 
   const imageStoreBaseDir = config.saveInboundImages ? config.workspaceDir : undefined;
   // Separate gate from images: the any-MIME store is path-only — the bytes are

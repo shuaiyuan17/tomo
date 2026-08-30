@@ -8,6 +8,7 @@ import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
+import { formatInboundStamp } from "./inbound-markers.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -21,7 +22,7 @@ export interface RunWithRetryRequest {
   /** Receives ONE completed delivery unit the moment the SDK closes it —
    *  while the turn is still running, not after it ends (LiveSession's
    *  TurnRequest.onBlock). Awaited, so blocks ship in model order. */
-  onBlock?: (block: string) => Promise<void>;
+  onBlock?: (block: string, outgoing?: string) => Promise<void>;
   /** The block last handed to `onBlock` was given up on (LiveSession's
    *  TurnRequest.onBlockAbandoned). Closes that block's transcript slot in
    *  order, so a late-settling send cannot reorder the transcript. */
@@ -188,17 +189,15 @@ export function originForSource(source: TurnSource): SDKMessageOrigin {
   return source === "user" ? { kind: "human" } : { kind: "unclassified" };
 }
 
-/** Prefix `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]` onto a prompt. */
+/**
+ * Prefix `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]` onto a prompt.
+ *
+ * The stamp itself is built by `formatInboundStamp` — one formatter shared
+ * with the outlet-side guard that spots the model FABRICATING this shape (see
+ * src/agent/inbound-markers.ts), so the two cannot drift apart.
+ */
 export function injectTimestamp(text: string, channelName?: string): string {
-  const now = new Date();
-  const weekday = now.toLocaleDateString("en-US", { weekday: "short" });
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  const date = `${mm}/${dd}`;
-  const time = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
-  const tz = now.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
-  const prefix = channelName ? `${channelName} · ` : "";
-  return `[${prefix}${weekday} ${date} ${time} ${tz}] ${text}`;
+  return `${formatInboundStamp(channelName)} ${text}`;
 }
 
 /**
@@ -459,7 +458,7 @@ export class TurnRunner {
    * honoured here and does not depend on the model's cooperation.
    */
   private makeBlockSink(spec: TurnSpec): {
-    onBlock: (block: string) => Promise<void>;
+    onBlock: (block: string, outgoing?: string) => Promise<void>;
     onBlockAbandoned: () => void;
     handledAny: () => boolean;
     hasShipped: () => boolean;
@@ -505,13 +504,18 @@ export class TurnRunner {
       { defer: spec.transcript !== "on-delivery" },
     );
 
-    const onBlock = async (rawBlock: string): Promise<void> => {
+    // `block` is the model's words and drives every decision below; `outgoing`
+    // is the copy that goes on the wire, which the outlet guard may have
+    // prefixed with an advisory. Only `sender.deliver` sees the difference —
+    // classification, silence policy and the transcript stay verbatim.
+    const onBlock = async (rawBlock: string, rawOutgoing: string = rawBlock): Promise<void> => {
       if (suppressed) return;
       // Normalised ONCE, up front, so the transcript slot below settles with
       // exactly the text the channel was handed. deliverText repeats the
       // rewrite (idempotent, defence in depth for callers that bypass this
       // sink), but the transcript must not record the pre-rewrite form.
       const block = restoreLiteralNewlines(rawBlock);
+      const outgoing = restoreLiteralNewlines(rawOutgoing);
       // Classified on the model's literal words, then handled once, after the
       // turn, by the spec's error policy — never shipped as if it were a reply.
       if (isAgentErrorResponse(block)) return;
@@ -543,7 +547,7 @@ export class TurnRunner {
       // in the transcript.
       const slot = transcript.reserve(block);
       try {
-        await sender.deliver(block);
+        await sender.deliver(outgoing);
         // Every delivered message must be recorded, or it is invisible to
         // recall_conversation (#203). "always" records the turn's literal
         // response instead, once, after the turn.

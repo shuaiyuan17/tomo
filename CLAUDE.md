@@ -30,6 +30,7 @@ src/
     delivery-pipeline.ts    # Streams + finalizes outbound messages to channels
     commands.ts             # Chat slash commands (/new, /model, /summon, /login, ...)
     scaffold-filter.ts      # Strips training-scaffold leaks from outbound text
+    inbound-markers.ts      # Inbound marker formatters + outlet guard for fabricated ones
     context-nudge.ts        # Pure decision logic for context-usage nudges
     sdk-options.ts          # Builds SDK query options (model, MCP servers, auto-compact policy)
     audience.ts             # DM-session audience tracking (private DM vs summoned group)
@@ -101,7 +102,7 @@ With config `steering` (default on), user messages that arrive mid-turn bypass t
 
 ### Harness Message Envelope
 
-All harness-composed messages (cron, heartbeats, nudges, summons, delegate requests) are wrapped in a `<tomo-event type=... name=... ts=...>` envelope by `formatTomoEvent()` (`src/tomo-event.ts`) — the single composer; never hand-roll `System:` strings. Bodies are injection-escaped so user-controlled text can't close the envelope early. Consumers must tolerate BOTH the envelope and the legacy `System:` / `[System: ...]` formats — old transcripts are never migrated. Outbound, `src/agent/scaffold-filter.ts` strips training-scaffold leaks before text reaches a channel.
+All harness-composed messages (cron, heartbeats, nudges, summons, delegate requests) are wrapped in a `<tomo-event type=... name=... ts=...>` envelope by `formatTomoEvent()` (`src/tomo-event.ts`) — the single composer; never hand-roll `System:` strings. Bodies are injection-escaped so user-controlled text can't close the envelope early. Consumers must tolerate BOTH the envelope and the legacy `System:` / `[System: ...]` formats — old transcripts are never migrated. Outbound, `src/agent/scaffold-filter.ts` strips training-scaffold leaks before text reaches a channel, and `src/agent/inbound-markers.ts` catches the mirror-image failure: the model WRITING one of the harness's own inbound markers (`[imessage · …]`, `[group "X"] Sender:`, `<tomo-event …>`, `System: …`) into its reply and then answering it as if a person had typed it. That one is **marked, not truncated** — the block ships whole with `FABRICATED_MARKER_NOTICE` prepended to the DELIVERED copy only; the transcript and every classification keep the model's verbatim words. Only lines that *start* with a shape and sit outside a ``` / ~~~ code fence count (fences matched per CommonMark on both ends; any line-break convention; leading invisibles count as indentation), so discussing or pasting these markers is safe. Both outlets for model-authored text run it — reply blocks (`LiveSession.shipBlock`) and `send_message` direct mode (`ProactiveSendService.sendToSession`); delegate mode goes through a real turn and needs nothing extra. It also owns `formatInboundStamp` / `formatGroupTag`, the formatters the ingress path uses to build those markers in the first place, so detector and producer cannot drift.
 
 ### Sending Notifications (No Agent Query)
 

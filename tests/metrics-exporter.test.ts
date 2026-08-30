@@ -88,6 +88,44 @@ describe("MetricsExporter", () => {
     expect(await metricValue(exporter, "tomo_heartbeats_total")).toBe(1);
   });
 
+  /**
+   * The outlet guard (src/agent/inbound-markers.ts) delivers a fabricated
+   * inbound marker rather than cutting it, so the ONLY way to notice the rate
+   * at which the model does this is a counter. `tomo status` runs in a
+   * different process from the daemon and could never read an in-memory one;
+   * the exporter is where daemon counters live.
+   */
+  it("counts fabricated inbound markers in outgoing text, by shape", async () => {
+    bus.publish({ type: "fabricated-marker", sessionKey: "dm:me", shape: "stamp", marker: "[imessage · Sat 08/29 08:25 PDT] hi" });
+    bus.publish({ type: "fabricated-marker", sessionKey: "dm:me", shape: "stamp", marker: "[telegram · Sat 08/29 09:00 PDT] yo" });
+    bus.publish({ type: "fabricated-marker", sessionKey: "telegram:-100", shape: "tomo-event", marker: "<tomo-event type=\"cron\">" });
+    // A block from an unowned SDK turn has no session key; it must still count.
+    bus.publish({ type: "fabricated-marker", shape: "legacy-system", marker: "System: heartbeat" });
+
+    expect(await metricValue(exporter, "tomo_fabricated_markers_total", { shape: "stamp" })).toBe(2);
+    expect(await metricValue(exporter, "tomo_fabricated_markers_total", { shape: "tomo-event" })).toBe(1);
+    expect(await metricValue(exporter, "tomo_fabricated_markers_total", { shape: "legacy-system" })).toBe(1);
+  });
+
+  /**
+   * prom-client retains every label combination for the life of the daemon and
+   * session keys are open-ended — one series per chat that ever talks to Tomo,
+   * forever. The session belongs in the log line and the watch event, not in a
+   * metric label: three different sessions must fold into ONE `stamp` series.
+   */
+  it("does not label the fabricated-marker counter with the session key", async () => {
+    for (const sessionKey of ["dm:me", "telegram:-100", "telegram:-200"]) {
+      bus.publish({ type: "fabricated-marker", sessionKey, shape: "stamp", marker: "[imessage · Sat 08/29 08:25 PDT] hi" });
+    }
+
+    const metric = (await exporter.registry.getMetricsAsJSON())
+      .find((m) => m.name === "tomo_fabricated_markers_total");
+    const values = (metric?.values ?? []) as Array<{ value: number; labels: Record<string, string> }>;
+    expect(values).toHaveLength(1);
+    expect(values[0]!.labels).toEqual({ shape: "stamp" });
+    expect(values[0]!.value).toBe(3);
+  });
+
   it("exports upcoming cron runs and heartbeat schedule from collectors", async () => {
     exporter.stop();
     let nextHeartbeat: number | null = 1_800_000_000_000;

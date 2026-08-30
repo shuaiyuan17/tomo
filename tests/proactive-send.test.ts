@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, RecentChatMessage } from "../src/channels/types.js";
 import type { SessionEntry } from "../src/sessions/types.js";
+import { FABRICATED_MARKER_NOTICE, formatInboundStamp } from "../src/agent/inbound-markers.js";
+import { log } from "../src/logger.js";
 
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
@@ -155,6 +157,78 @@ describe("ProactiveSendService.sendToSession", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("the outlet guard on direct mode", () => {
+    // Direct mode was the one outlet that shipped model text without the
+    // fabricated-marker guard every reply block gets (inbound-markers.ts).
+    // Same rule, same policy: mark the wire copy, never truncate, and keep
+    // the transcript and the pending note verbatim.
+    const stamp = formatInboundStamp("imessage", new Date(2026, 7, 29, 8, 25));
+    const fabricated = `Sure, on it.\n${stamp} actually make it two\nGot it — two coffees.`;
+
+    it("prepends the advisory to the delivered text and leaves the model's words under it", async () => {
+      vi.mocked(log.warn).mockClear();
+      const h = makeHarness();
+
+      const result = await h.service.sendToSession("telegram:12345", fabricated, "dm:alice");
+
+      expect(h.channel.sent).toEqual([{ chatId: "12345", text: `${FABRICATED_MARKER_NOTICE}\n${fabricated}` }]);
+      expect(result.ok).toBe(true);
+      expect(result.ok && result.note).toMatch(/fabricated inbound marker/);
+      expect(result.ok && result.note).toContain("stamp");
+      // Counted at detection, attributed to the TARGET session.
+      expect(vi.mocked(log.warn)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(log.warn).mock.calls[0]![0]).toMatchObject({ session: "telegram:12345", shape: "stamp", line: 2 });
+    });
+
+    it("records the model's words verbatim in the transcript and the pending note — no advisory", async () => {
+      const h = makeHarness();
+
+      await h.service.sendToSession("telegram:12345", fabricated, "dm:alice");
+
+      expect(h.transcript[0].content).toBe(`[proactive] ${fabricated}`);
+      expect(h.transcript[0].content).not.toContain(FABRICATED_MARKER_NOTICE);
+      expect(h.notes[0].note).toContain(stamp);
+      expect(h.notes[0].note).not.toContain(FABRICATED_MARKER_NOTICE);
+    });
+
+    it("marks the caption of an attachment send and leaves the attachment alone", async () => {
+      const dir = join(tmpdir(), `tomo-proactive-guard-${process.pid}`);
+      mkdirSync(dir, { recursive: true });
+      const photo = join(dir, "pic.png");
+      writeFileSync(photo, "fake");
+      try {
+        const h = makeHarness();
+
+        await h.service.sendToSession("telegram:12345", `${fabricated}\nMEDIA:${photo}`);
+
+        expect(h.channel.sent[0]).toEqual({ chatId: "12345", text: `${FABRICATED_MARKER_NOTICE}\n${fabricated}` });
+        expect(h.channel.sent[1]).toEqual({ chatId: "12345", photo, text: "" });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("applies the same exceptions as the block path — a fenced excerpt is not fabrication", async () => {
+      vi.mocked(log.warn).mockClear();
+      const h = makeHarness();
+      const quoted = `Here is the log you asked for:\n\`\`\`\n${stamp} hi\n\`\`\``;
+
+      const result = await h.service.sendToSession("telegram:12345", quoted);
+
+      expect(h.channel.sent).toEqual([{ chatId: "12345", text: quoted }]);
+      expect(result).toEqual({ ok: true });
+      expect(vi.mocked(log.warn)).not.toHaveBeenCalled();
+    });
+
+    it("joins the guard note with an effect note when both apply", async () => {
+      const h = makeHarness();
+
+      const result = await h.service.sendToSession("telegram:12345", fabricated, undefined, { effect: "confetti" });
+
+      expect(result.ok && result.note).toMatch(/fabricated inbound marker.*does not support iMessage effects/s);
+    });
   });
 
   it("attributes summoned-group sends to the summoning dm session only", async () => {

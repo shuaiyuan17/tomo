@@ -14,6 +14,12 @@ import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options
 import { endsWithTrailingNoReply } from "./text-utils.js";
 import { filterScaffoldLeak } from "./scaffold-filter.js";
 import { scrubSecretValues } from "../redact.js";
+import {
+  detectFabricatedMarkers,
+  markFabricatedText,
+  recordFabricatedMarkers,
+  type FabricatedMarker,
+} from "./inbound-markers.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
@@ -31,8 +37,16 @@ export interface TurnRequest {
    * Awaited, so the event loop backpressures on delivery and blocks reach the
    * channel in the order the model produced them. Never rejects — a failed
    * send is logged by the sink, not allowed to kill the turn.
+   *
+   * TWO ARGUMENTS, TWO JOBS. `block` is the model's words, verbatim — sinks
+   * classify (agent error, silent reply) and TRANSCRIBE from it, so neither
+   * the transcript nor the silence policy ever sees harness commentary.
+   * `outgoing` is what must actually go on the wire: the same text, possibly
+   * with the fabricated-inbound-marker advisory prepended (see
+   * ./inbound-markers.ts). It is omitted when the two are identical, which is
+   * the overwhelmingly common case.
    */
-  onBlock?: (block: string) => void | Promise<void>;
+  onBlock?: (block: string, outgoing?: string) => void | Promise<void>;
   /**
    * The block most recently handed to `onBlock` has been GIVEN UP ON: its
    * delivery blew the budget (or the sink threw), the turn is moving on, and
@@ -281,8 +295,15 @@ export interface RenderedTurn {
 
 /** What one content block turns into once the per-block rules have run. */
 export type BlockRender =
-  /** Ships as one channel message. */
-  | { kind: "ship"; text: string; scaffoldFiltered: boolean }
+  /**
+   * Ships as one channel message.
+   *
+   * `text` is the model's words, NEVER the harness's advisory: the
+   * fabricated-marker notice is prepended on the delivery path (shipBlock) so
+   * that the transcript — built from this same field via
+   * renderResponseBlocks — stays exactly what the model wrote.
+   */
+  | { kind: "ship"; text: string; scaffoldFiltered: boolean; fabricatedMarkers: FabricatedMarker[] }
   /** Trailing line(s) were the bare control token — the block ships nothing. */
   | { kind: "no-reply"; scaffoldFiltered: boolean }
   /** Wrong type for this session, or nothing left after filtering. */
@@ -329,7 +350,11 @@ export type BlockRender =
  *      blocks after a `<system-reminder>` slip still ship;
  *   2. bare-NO_REPLY drop — a block whose trailing line(s) are only the token
  *      is dropped WHOLE (text, MEDIA: and STICKER: alike), so housekeeping
- *      narration and its attachments never leak out of a mid-turn slip.
+ *      narration and its attachments never leak out of a mid-turn slip;
+ *   3. fabricated-inbound-marker DETECTION — a line shaped like one of the
+ *      harness's own inbound markers is reported on the result, and shipBlock
+ *      prepends an advisory to the DELIVERED copy. Nothing is cut and the
+ *      transcript is untouched (src/agent/inbound-markers.ts).
  */
 export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockRender {
   const scaffold = filterScaffoldLeak(block.text);
@@ -344,6 +369,10 @@ export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockR
     // this block is a message, and a message does not get a 💭 on it.
     text: block.type === "thinking" && showThinking ? `${THINKING_MARKER}${text}` : text,
     scaffoldFiltered,
+    // Reported, not acted on, here: this is what the block WILL ship, and the
+    // guard's whole point is that the words stay. The advisory goes on in
+    // shipBlock, where "delivered" and "recorded in the transcript" part ways.
+    fabricatedMarkers: detectFabricatedMarkers(text),
   };
 }
 
@@ -834,6 +863,25 @@ export class LiveSession {
     const rendered = renderBlock(block, this.showThinking);
     if (rendered.kind !== "ship") return;
 
+    // MARK, DON'T TRUNCATE. The model wrote a line shaped like a fresh inbound
+    // message (`[imessage · …]`, `[group "X"] Sender:`, `<tomo-event …>`,
+    // `System: …`) and, left alone, tends to answer it as if a person had.
+    // The surrounding words are usually a real reply, so the block ships whole
+    // with an advisory on top. Applied HERE and not in renderBlock because
+    // renderBlock also builds the transcript, which must stay verbatim.
+    //
+    // COUNTED AT DETECTION, WHICH IS WHY IT IS RECORDED HERE. This block may
+    // still never reach anybody: there may be no delivery sink (the unowned
+    // -turn drop below), the sink may refuse it as agent-error/silent/NO_REPLY
+    // text, or a suppressed turn may throw it away. The question the counter
+    // answers is "how often does the model fabricate a marker", not "how often
+    // did a marked message land", so it fires on the model's output and the
+    // log line says "detected", not "delivered".
+    recordFabricatedMarkers(this.sessionKey, rendered.fabricatedMarkers);
+    const outgoing = rendered.fabricatedMarkers.length > 0
+      ? markFabricatedText(rendered.text)
+      : rendered.text;
+
     const req = this.currentRequest;
     const onBlock = req?.onBlock;
     if (!req || !onBlock) {
@@ -878,7 +926,7 @@ export class LiveSession {
     this.clearActivityTimeout();
     try {
       await withDeliveryTimeout(
-        Promise.resolve(onBlock(rendered.text)),
+        Promise.resolve(onBlock(rendered.text, outgoing)),
         DELIVERY_TIMEOUT_MS,
         `Block delivery timed out after ${formatTimeout(DELIVERY_TIMEOUT_MS)}`,
       );
@@ -1400,7 +1448,7 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    onBlock?: (block: string) => void | Promise<void>,
+    onBlock?: (block: string, outgoing?: string) => void | Promise<void>,
     onBlockAbandoned?: () => void,
     origin?: SDKMessageOrigin,
   ): Promise<string> {
@@ -1446,7 +1494,7 @@ export class LiveSession {
     text: string,
     images?: Array<{ data: string; mediaType: string }>,
     documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-    onBlock?: (block: string) => void | Promise<void>,
+    onBlock?: (block: string, outgoing?: string) => void | Promise<void>,
     onBlockAbandoned?: () => void,
     origin?: SDKMessageOrigin,
   ): Promise<string> {

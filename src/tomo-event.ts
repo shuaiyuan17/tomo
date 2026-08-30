@@ -16,6 +16,19 @@
  * are never migrated.
  */
 
+/**
+ * Opening tag of the envelope. Exported because two places need the literal:
+ * the composer below, and the outlet-side guard that notices when the MODEL
+ * writes one into its own reply (src/agent/inbound-markers.ts).
+ */
+export const TOMO_EVENT_OPEN_TAG = "<tomo-event";
+
+/** Legacy bare harness prefix, pre-envelope. Still found in old transcripts. */
+export const LEGACY_SYSTEM_PREFIX = "System:";
+
+/** Legacy bracketed harness note, pre-envelope. Still found in old transcripts. */
+export const LEGACY_BRACKETED_SYSTEM_PREFIX = "[System:";
+
 export type TomoEventType =
   | "heartbeat"        // continuity tick (free-time beat)
   | "restart"          // daemon restarted with a recorded reason
@@ -106,7 +119,7 @@ export function isoTimestampWithOffset(d: Date = new Date()): string {
 export function formatTomoEvent(type: TomoEventType, body: string, opts: TomoEventOptions = {}): string {
   const name = opts.name !== undefined ? ` name="${escapeAttr(opts.name)}"` : "";
   const ts = isoTimestampWithOffset(opts.ts);
-  return `<tomo-event type="${type}"${name} ts="${ts}">\n${escapeBody(body)}\n</tomo-event>`;
+  return `${TOMO_EVENT_OPEN_TAG} type="${type}"${name} ts="${ts}">\n${escapeBody(body)}\n</tomo-event>`;
 }
 
 export interface ParsedTomoEvent {
@@ -172,5 +185,7 @@ export function stripLeadingTomoEvents(text: string): string {
  */
 export function isHarnessEventText(text: string): boolean {
   const t = text.trimStart();
-  return t.startsWith("<tomo-event") || t.startsWith("System:") || t.startsWith("[System:");
+  return t.startsWith(TOMO_EVENT_OPEN_TAG)
+    || t.startsWith(LEGACY_SYSTEM_PREFIX)
+    || t.startsWith(LEGACY_BRACKETED_SYSTEM_PREFIX);
 }

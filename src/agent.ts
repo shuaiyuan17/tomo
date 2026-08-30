@@ -30,6 +30,7 @@ import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
 import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { formatGroupTag } from "./agent/inbound-markers.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
@@ -770,13 +771,16 @@ export class Agent {
     };
 
     return {
-      onBlock: async (block) => {
+      // `block` is the model's words (classification + transcript); `outgoing`
+      // is the wire copy, which the outlet guard may have prefixed with an
+      // advisory. Same split as TurnRunner's sink.
+      onBlock: async (block, outgoing = block) => {
         // Error text is not a reply: it is handled once, at resolve, so it
         // reaches the chat prefixed and with a pending note queued.
         if (isAgentErrorResponse(block) || isSilentReply(block)) return;
         const slot = transcript.reserve(block);
         try {
-          await sender.deliver(block);
+          await sender.deliver(outgoing);
           // Recorded per shipped block — an unrecorded delivery is invisible
           // to recall_conversation (#203) — but recorded AFTER the send, never
           // before. Writing on intent made the transcript claim deliveries
@@ -1248,7 +1252,7 @@ export class Agent {
     const prefixed = `${sender}: ${message.text}`;
     if (!isDmSessionKey(sessionKey)) return prefixed;
     const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
-    return `[group${label ? ` "${label}"` : ""}] ${prefixed}`;
+    return `${formatGroupTag(label)} ${prefixed}`;
   }
 
   /** Track participants and chat title for a group session. The actual rules

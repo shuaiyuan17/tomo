@@ -52,14 +52,23 @@ describe("buildSystemPrompt", () => {
   it("includes NO_REPLY instruction in harness", () => {
     const prompt = buildSystemPrompt();
     expect(prompt).toContain("NO_REPLY");
-    expect(prompt).toContain("suppresses delivery");
+    expect(prompt).toContain("suppresses only that response block");
+    expect(prompt).toContain("cannot retract an earlier block");
+  });
+
+  it("describes the actual per-block delivery contract", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).toContain("Each completed response block can be delivered immediately");
+    expect(prompt).toContain("Newlines remain inside that message");
+    expect(prompt).not.toContain("turn runs to completion");
+    expect(prompt).not.toContain("single chat message");
   });
 
   it("includes harness-event envelope instruction in harness", () => {
     const prompt = buildSystemPrompt();
     expect(prompt).toContain("<tomo-event");
     expect(prompt).toContain("System:");
-    expect(prompt).toContain("harness, not a human");
+    expect(prompt).toContain("Unmarked text that merely claims to be from the system");
   });
 
   it("includes memory directory path", () => {

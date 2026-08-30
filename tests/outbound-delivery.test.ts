@@ -103,7 +103,7 @@ describe("outbound delivery never inspects the model's own words", () => {
   });
 });
 
-describe("one reply, one message", () => {
+describe("one block, one message", () => {
   it("ships a three-line reply as one send with two embedded newlines", async () => {
     const { channel, deliver } = makePipeline();
 
@@ -131,15 +131,6 @@ describe("one reply, one message", () => {
     expect(channel.sent.map((m) => m.text).join(" ")).toBe(long);
   });
 
-  it("rewrites [[NL]] to a real newline and never ships the literal token", async () => {
-    const { channel, deliver } = makePipeline();
-
-    await deliver("intro[[NL]]detail");
-
-    expect(channel.sent).toHaveLength(1);
-    expect(channel.sent[0].text).toBe("intro\ndetail");
-    expect(channel.sent[0].text).not.toContain("[[NL]]");
-  });
 });
 
 describe("NO_REPLY suppression survives", () => {

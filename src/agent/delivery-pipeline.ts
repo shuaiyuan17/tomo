@@ -9,7 +9,6 @@ import {
   type SendResult,
 } from "../channels/types.js";
 import { deliverText } from "../channels/delivery.js";
-import { restoreLiteralNewlines } from "../channels/text-utils.js";
 import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
 import {
   endsWithTrailingNoReply,
@@ -281,7 +280,7 @@ export class DeliveryPipeline {
           return;
         }
 
-        const caption = restoreLiteralNewlines(cleanText).trim();
+        const caption = cleanText.trim();
         // Outcome per independently deliverable piece, for the transcript
         // should anything fail. A path that no longer exists at this instant
         // is never attempted (that silence is finding #35, out of scope here)

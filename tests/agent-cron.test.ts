@@ -134,7 +134,7 @@ describe("cron message delivery", () => {
     await agent.stop();
   });
 
-  it("delivers a multi-line cron response as one message, [[NL]] restored", async () => {
+  it("delivers a multi-line cron response as one message", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -144,12 +144,12 @@ describe("cron message delivery", () => {
     await drainQueue(agent);
     tg.clearDelivered();
 
-    mockSdk.responseFn = () => "  first brief  \nsecond[[NL]]detail\n\n  third brief  ";
+    mockSdk.responseFn = () => "  first brief  \nsecond detail\n\n  third brief  ";
 
     await agent.handleCronMessage("Morning briefing", "telegram:12345");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("first brief  \nsecond\ndetail\n\n  third brief");
+    expect(tg.sent[0].text).toBe("first brief  \nsecond detail\n\n  third brief");
 
     await agent.stop();
   });

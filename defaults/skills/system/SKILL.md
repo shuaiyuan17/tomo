@@ -69,13 +69,11 @@ Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tom
 
 ## Harness Features
 
-### One reply, one message
-Replies are not streamed. The turn runs to completion and its `text` content blocks are delivered as a **single** chat message, newlines included — a line break is formatting, not a message boundary. Replies longer than the channel's per-message cap (iMessage 4000, Telegram 4096) are chunked at a word boundary; nothing is truncated. Caption text before a `MEDIA:` tag rides with the media as one captioned message.
-
-Write real newlines. The legacy `[[NL]]` marker is **deprecated** — it was an escape hatch from when a line break split a reply into separate messages, and that behaviour is gone. It is still tolerated for back-compat: `[[NL]]`, with or without spaces around it, is rewritten to a single newline on every outlet (reply blocks, `send_message` direct mode, `edit_message`), so it never ships literally. Do not use it in new text.
+### Delivery
+Each completed content block is delivered as soon as it finishes and may become its own chat message. Newlines stay inside that message. Blocks longer than the channel cap (iMessage 4000, Telegram 4096) are chunked without truncation. Caption text near a `MEDIA:` tag rides with the media.
 
 ### Thinking blocks
-Your `thinking` content blocks are normally dropped before delivery: with the default `showThinking: false` the SDK strips them, so they arrive empty. If one arrives with text in it anyway, it is delivered as though it were a `text` block — unprefixed — because in practice that only ever happens when a reply was written in the wrong block type. Nothing inspects your reply text to guess what is reasoning: whatever you put in a `text` block ships verbatim, even a single word like `count`. Set `showThinking: true` (or `TOMO_SHOW_THINKING=true`) to have thinking delivered too, prefixed with `💭`. The setting is read when a session starts — flipping it mid-session takes effect after a restart.
+Your `thinking` content blocks are normally dropped before delivery: with the default `showThinking: false` the SDK strips them, so they arrive empty. If one arrives with text in it anyway, it is delivered as though it were a `text` block — unprefixed — because in practice that only ever happens when a reply was written in the wrong block type. Nothing inspects your reply text to guess what is reasoning: whatever you put in a `text` block ships verbatim. Set `showThinking: true` (or `TOMO_SHOW_THINKING=true`) to have thinking delivered too, prefixed with `💭`. The setting is read when a session starts — flipping it mid-session takes effect after a restart.
 
 ### Message steering
 By default, user messages that arrive during a long tool-using turn are injected into the in-flight turn at the next tool-call boundary instead of waiting behind it. Use this to treat mid-task corrections like "stop", "wait", or added context as immediately relevant. If there is no remaining tool boundary, the message runs as the next follow-up turn. Cron, continuity, and other system-originated turns still queue normally. Set `steering: false` in `~/.tomo/config.json` to keep mid-turn user messages queued.
@@ -87,7 +85,7 @@ To send an image/file to the user, include `MEDIA:/path/to/file.png` in your res
 To send a sticker, include `STICKER:<value>` in your response — the harness strips it from text and sends the sticker. The value is channel-bound: on Telegram, a `file_id` you have seen or been given; on iMessage, a local image path (e.g. from `~/.tomo/workspace/stickers/`), sent as a native sticker balloon with a plain image attachment as fallback. Pick the shape that matches the conversation's channel.
 
 ### NO_REPLY
-Reply with exactly `NO_REPLY` to suppress delivery to the channel. Use for background tasks that found nothing to report.
+Reply with exactly `NO_REPLY` when no visible response is needed. It suppresses that block only and cannot retract blocks already delivered earlier in the turn.
 
 ### Timestamps
 Every message includes a timestamp prefix like `[Mon 04/07 14:30 PDT]` so you always know the current time.

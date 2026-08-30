@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatReplyContextMarker, isSatelliteService } from "../src/channels/text-utils.js";
+import { formatReplyContextMarker, isSatelliteService, splitText } from "../src/channels/text-utils.js";
 
 // These helpers are shared channel plumbing, not transport-specific: they were
 // first exercised through the BlueBubbles backend (tests/imessage.test.ts,
@@ -61,5 +61,50 @@ describe("formatReplyContextMarker", () => {
   it("truncates by code points without splitting surrogate pairs", () => {
     const marker = formatReplyContextMarker("😀".repeat(70));
     expect(marker).toBe(`[replying to: "${"😀".repeat(60)}…"]`);
+  });
+});
+
+describe("splitText", () => {
+  /** Any lone surrogate left after stripping every well-formed pair. */
+  const hasLoneSurrogate = (s: string): boolean =>
+    /[\uD800-\uDFFF]/.test(s.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ""));
+
+  it("never cuts an astral character in half on the hard-cut fallback", () => {
+    // One ASCII char then an unbroken run of emoji: no newline and no space, so
+    // every split takes the `splitAt = limit` fallback, and the odd leading
+    // char puts the cut squarely between the two units of a pair.
+    const text = "x" + "😀".repeat(200);
+    const chunks = splitText(text, 100);
+    for (const chunk of chunks) {
+      expect(hasLoneSurrogate(chunk)).toBe(false);
+    }
+  });
+
+  it("loses no characters while avoiding the split", () => {
+    const text = "x" + "😀".repeat(200);
+    expect(splitText(text, 100).join("")).toBe(text);
+  });
+
+  it("still respects the limit when it backs off a unit", () => {
+    const text = "x" + "😀".repeat(200);
+    for (const chunk of splitText(text, 100)) {
+      expect(chunk.length).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it("makes progress on a pathological limit rather than looping forever", () => {
+    // limit 1 cannot hold an astral character at all; the split must still
+    // terminate and still cover the input.
+    const chunks = splitText("😀😀😀", 1);
+    expect(chunks.join("")).toBe("😀😀😀");
+  });
+
+  it("still prefers a newline, then a space, over a hard cut", () => {
+    expect(splitText("aaaa\nbbbb", 6)).toEqual(["aaaa", "bbbb"]);
+    expect(splitText("aaaa bbbb", 6)).toEqual(["aaaa", "bbbb"]);
+  });
+
+  it("returns the text unchanged when it fits", () => {
+    expect(splitText("hello", 4000)).toEqual(["hello"]);
   });
 });

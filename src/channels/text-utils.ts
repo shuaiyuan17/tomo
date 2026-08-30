@@ -81,6 +81,11 @@ export function formatReplyContextMarker(originalText?: string): string {
   return `[replying to: "${excerpt}"]`;
 }
 
+/** Leading half of a UTF-16 surrogate pair; slicing after one splits a character. */
+function isHighSurrogate(unit: number): boolean {
+  return unit >= 0xd800 && unit <= 0xdbff;
+}
+
 /**
  * Split text into chunks of at most `limit` characters, preferring to break
  * at a newline, then a space, falling back to a hard cut. Shared by channels
@@ -99,6 +104,18 @@ export function splitText(text: string, limit: number): string[] {
     let splitAt = remaining.lastIndexOf("\n", limit);
     if (splitAt < limit * 0.5) splitAt = remaining.lastIndexOf(" ", limit);
     if (splitAt < limit * 0.5) splitAt = limit;
+    // A hard cut at `limit` is an index into UTF-16 CODE UNITS, so it can land
+    // between the two halves of an astral character (emoji, most CJK
+    // extensions, mathematical alphanumerics) and leave a lone high surrogate
+    // ending one chunk and a lone low surrogate opening the next. Telegram
+    // rejects a lone surrogate in the request body with a 400 that is not a
+    // Markdown-parse error, so telegram.ts rethrows and the whole reply is
+    // lost; iMessage renders both halves as U+FFFD. Back off one unit — never
+    // to 0, which would push an empty chunk and never shorten `remaining`.
+    // The newline/space branches above cannot land mid-pair (their split
+    // character is itself a single BMP unit), so this only ever bites the
+    // fallback.
+    if (splitAt > 1 && isHighSurrogate(remaining.charCodeAt(splitAt - 1))) splitAt -= 1;
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
   }

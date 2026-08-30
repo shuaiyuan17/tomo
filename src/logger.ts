@@ -4,7 +4,9 @@ import { dirname } from "node:path";
 import { watchBus } from "./watch/bus.js";
 import { LOG_REDACT_PATHS, redactLogRecord, redactSerializedError, scrubSecretValues } from "./redact.js";
 
-const logFile = process.env.TOMO_LOG_FILE;
+// Blank is unset here too: `TOMO_LOG_FILE="  "` is truthy as a string and
+// would have opened a whitespace-named file in the working directory.
+const logFile = process.env.TOMO_LOG_FILE?.trim() || undefined;
 
 // When running as daemon, log to file; otherwise pretty-print to stdout
 const transport = logFile
@@ -43,7 +45,10 @@ function issueMessage(args: unknown[]): string {
 }
 
 export const log = pino({
-  level: process.env.LOG_LEVEL ?? "debug",
+  // A blank LOG_LEVEL is unset, not a level: pino throws on "" at import,
+  // which kills the daemon before it can say why. (config.ts envVar has the
+  // same rule; this module cannot import it.)
+  level: process.env.LOG_LEVEL?.trim() || "debug",
   transport,
   // Second line of defence for credentials. `configIssues` is the surface that
   // actually leaked one (a bad `allowlist` stringified the whole channel entry

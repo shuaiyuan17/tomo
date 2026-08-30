@@ -19,6 +19,19 @@ describe("runtime paths", () => {
     expect(paths.workspaceDir).toBe("/Users/tester/.tomo/workspace");
     expect(paths.sessionsDir).toBe("/Users/tester/.tomo/data/sessions");
     expect(paths.sdkSessionsDir).toContain("/Users/tester/.claude/projects/");
+    expect(paths.ignoredEnvOverrides).toEqual([]);
+  });
+
+  it("ignores a blank workspace/session override and reports it by name", () => {
+    // resolve("") is the current working directory — a blank TOMO_WORKSPACE
+    // used to make wherever the daemon was launched from the workspace.
+    const paths = createRuntimePaths({
+      homeDir: "/Users/tester",
+      env: { TOMO_WORKSPACE: "", SESSIONS_DIR: "   " },
+    });
+    expect(paths.workspaceDir).toBe("/Users/tester/.tomo/workspace");
+    expect(paths.sessionsDir).toBe("/Users/tester/.tomo/data/sessions");
+    expect(paths.ignoredEnvOverrides).toEqual(["TOMO_WORKSPACE", "SESSIONS_DIR"]);
   });
 
   it("resolves relative workspaces before encoding the SDK project path", () => {

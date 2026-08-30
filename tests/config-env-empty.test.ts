@@ -14,12 +14,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
  * writes the developer's real ~/.tomo.
  */
 let home = "";
+/** Every scratch home this file made; a test may load the config more than once. */
+const homes: string[] = [];
 
 async function loadConfigWith(
   file: Record<string, unknown>,
   env: Record<string, string>,
 ): Promise<typeof import("../src/config.js")> {
   home = mkdtempSync(join(tmpdir(), "tomo-config-env-"));
+  homes.push(home);
   mkdirSync(join(home, ".tomo"), { recursive: true });
   writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(file));
   vi.resetModules();
@@ -34,6 +37,12 @@ async function loadConfigWith(
   ]) {
     vi.stubEnv(name, undefined as unknown as string);
   }
+  // Any OTHER blank variable in the ambient environment (`TOMO_METRICS=`,
+  // `HISTORY_LIMIT=`, …) would be recorded as an ignored override too and make
+  // the registry assertions below depend on the runner's shell. Clear them all.
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && value.trim() === "") vi.stubEnv(name, undefined as unknown as string);
+  }
   for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
   return import("../src/config.js");
 }
@@ -41,7 +50,7 @@ async function loadConfigWith(
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.resetModules();
-  if (home) rmSync(home, { recursive: true, force: true });
+  for (const dir of homes.splice(0)) rmSync(dir, { recursive: true, force: true });
   home = "";
 });
 
@@ -133,6 +142,20 @@ describe("empty-string env overrides", () => {
     expect([...ignoredEnvOverrideNames].sort()).toEqual(["CLAUDE_MODEL", "TOMO_CITY"]);
   });
 
+  it("renders the startup notice naming every ignored variable, and nothing when there are none", async () => {
+    // `tomo start` prints this on BOTH paths — as a log line on a good boot,
+    // and after the error when a config assertion fails — so the wording is
+    // pinned here rather than in start.ts, which has no test harness.
+    const withBlanks = await loadConfigWith({ model: "claude-sonnet-5" }, { CLAUDE_MODEL: "", TOMO_CITY: "" });
+    const notice = withBlanks.ignoredEnvOverridesNotice?.();
+    expect(notice).toMatch(/^Ignoring blank environment overrides/);
+    expect(notice).toContain("CLAUDE_MODEL");
+    expect(notice).toContain("TOMO_CITY");
+
+    const clean = await loadConfigWith({ model: "claude-sonnet-5" }, { CLAUDE_MODEL: "claude-opus-5" });
+    expect(clean.ignoredEnvOverridesNotice?.()).toBeUndefined();
+  });
+
   it("records nothing when the overrides are absent or genuinely set", async () => {
     const ignoredEnvOverrideNames = (await loadConfigWith(
       { model: "claude-sonnet-5" },
@@ -156,5 +179,13 @@ describe("empty-string env overrides for runtime paths", () => {
   it("keeps the default sessions dir when SESSIONS_DIR is empty", async () => {
     const { config } = await loadConfigWith({}, { SESSIONS_DIR: "" });
     expect(config.sessionsDir).toBe(join(home, ".tomo", "data", "sessions"));
+  });
+
+  it("records the blank path overrides too, so the startup notice names them", async () => {
+    // runtime-paths.ts cannot import config.ts; it reports what it ignored on
+    // its result and config.ts folds that into the same registry.
+    const ignoredEnvOverrideNames = (await loadConfigWith({}, { TOMO_WORKSPACE: "", SESSIONS_DIR: "  " }))
+      .ignoredEnvOverrideNames ?? [];
+    expect([...ignoredEnvOverrideNames].sort()).toEqual(["SESSIONS_DIR", "TOMO_WORKSPACE"]);
   });
 });

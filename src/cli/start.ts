@@ -48,30 +48,30 @@ async function startForeground(): Promise<void> {
 
   // Validate config before loading the heavy daemon modules so a fresh
   // install fails with a clear message instead of a module-load crash.
-  const { config, assertConfigValid, assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
+  const {
+    config, assertConfigValid, assertAuthConfigured, assertChannelsConfigured,
+    ignoredEnvOverrideNames, ignoredEnvOverridesNotice,
+  } = await import("../config.js");
+  // An env override that is set but blank is ignored in favour of the config
+  // file (config.ts envVar). Say so once, whichever way startup goes: nothing
+  // else prints the effective model/token/gateway, so a mistyped
+  // `CLAUDE_MODEL=$UNSET` is otherwise indistinguishable from a working
+  // override — and on the failure path, "set TELEGRAM_BOT_TOKEN" makes no
+  // sense to someone whose shell already has `TELEGRAM_BOT_TOKEN=` in it.
+  const envNotice = ignoredEnvOverridesNotice();
   try {
     assertConfigValid();
     assertAuthConfigured();
     assertChannelsConfigured();
   } catch (err) {
     console.error((err as Error).message);
+    if (envNotice) console.error(envNotice);
     process.exit(1);
   }
 
   const { Agent } = await import("../agent.js");
   const { log } = await import("../logger.js");
-
-  // An env override that is set but blank is ignored in favour of the config
-  // file (config.ts envVar). Say so once: nothing else prints the effective
-  // model/token/gateway, so a mistyped `CLAUDE_MODEL=$UNSET` is otherwise
-  // indistinguishable from a working override.
-  const { ignoredEnvOverrideNames } = await import("../config.js");
-  if (ignoredEnvOverrideNames.length > 0) {
-    log.info(
-      { vars: [...ignoredEnvOverrideNames] },
-      "Ignoring blank environment overrides; using the config file or default value",
-    );
-  }
+  if (envNotice) log.info({ vars: [...ignoredEnvOverrideNames] }, envNotice);
   const { TelegramChannel } = await import("../channels/index.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
   const { PetScheduler } = await import("../mcp/pet-scheduler.js");
@@ -269,13 +269,17 @@ async function startDaemon(): Promise<void> {
 
   // Validate config before spawning: the detached child would die instantly
   // with this error buried in tomo.err while we print "started in background".
-  const { assertConfigValid, assertAuthConfigured, assertChannelsConfigured } = await import("../config.js");
+  const { assertConfigValid, assertAuthConfigured, assertChannelsConfigured, ignoredEnvOverridesNotice } = await import("../config.js");
   try {
     assertConfigValid();
     assertAuthConfigured();
     assertChannelsConfigured();
   } catch (err) {
     console.error((err as Error).message);
+    // Same explanation the foreground path gives: a blank override is the
+    // likeliest reason "set X" reads as nonsense to someone who has `X=` set.
+    const envNotice = ignoredEnvOverridesNotice();
+    if (envNotice) console.error(envNotice);
     process.exit(1);
   }
 

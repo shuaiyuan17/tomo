@@ -63,7 +63,7 @@
 
   `src/runtime-paths.ts` had the same gap with worse consequences, and is fixed the same way: `resolve("")` is the current working directory, so `TOMO_WORKSPACE=` made whatever directory the daemon was launched from the workspace — taking `sdkSessionsDir`, which is derived from the workspace path, with it. Same for `SESSIONS_DIR=`.
 
-  Because the fallback is otherwise invisible — no surface prints the *effective* model, token or gateway, so a mistyped override looks exactly like a working one — the ignored variables are recorded and the daemon logs them once at startup: `Ignoring blank environment overrides; using the config file or default value`.
+  Because the fallback is otherwise invisible — no surface prints the *effective* model, token or gateway, so a mistyped override looks exactly like a working one — the ignored variables are recorded (the path overrides included) and `tomo start` names them once, whichever way startup goes: as a log line on a good boot, and after the error when a config assertion fails, since "set `TELEGRAM_BOT_TOKEN`" is no help to someone whose shell already has `TELEGRAM_BOT_TOKEN=` in it. `LOG_LEVEL=` had the same gap outside `config.ts` with a sharper consequence — it handed pino an empty level, which throws at import and killed the daemon before it could say why — and follows the same rule now, as does `TOMO_LOG_FILE`. (`TOMO_BACKUP_RETENTION_DAYS=` — zero days, so every local backup was pruned — is handled by `tomo backup`'s own input validation, #310.)
 
 ## 0.8.14 (2026-08-14)
 

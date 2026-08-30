@@ -246,8 +246,20 @@ function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallbac
  * the *effective* model, token or gateway, so `CLAUDE_MODEL=$TYPO` looks
  * exactly like a working override. The daemon logs it once at startup.
  */
-const ignoredEnvOverrides: string[] = [];
+const ignoredEnvOverrides: string[] = [...defaultRuntimePaths.ignoredEnvOverrides];
 export const ignoredEnvOverrideNames: readonly string[] = ignoredEnvOverrides;
+
+/**
+ * One line naming the blank overrides that were ignored, or undefined when
+ * there were none. `tomo start` prints it whichever way startup goes: as a log
+ * line on success, and after the error when a config assertion fails —
+ * "set TELEGRAM_BOT_TOKEN" is a baffling instruction to someone whose shell
+ * already has `TELEGRAM_BOT_TOKEN=` in it.
+ */
+export function ignoredEnvOverridesNotice(): string | undefined {
+  if (ignoredEnvOverrides.length === 0) return undefined;
+  return `Ignoring blank environment overrides (${ignoredEnvOverrides.join(", ")}); using the config file or default value`;
+}
 
 /**
  * Env var for a setting; empty string counts as unset.
@@ -257,12 +269,13 @@ export const ignoredEnvOverrideNames: readonly string[] = ignoredEnvOverrides;
  * `=` produces, and it is what `FOO=$UNSET` expands to. Reading
  * `process.env.FOO ?? file.foo` would let that empty string win over the
  * config file, because `??` only falls through on null/undefined — so every
- * env override parsed in this file goes through here.
+ * env override parsed in this file goes through here. Exported for any CLI
+ * module that reads its own override.
  *
  * (`src/runtime-paths.ts` cannot import this — config.ts imports IT — and
  * keeps its own copy of the same rule.)
  */
-function envVar(name: string): string | undefined {
+export function envVar(name: string): string | undefined {
   const value = process.env[name];
   if (value === undefined) return undefined;
   if (value.trim() === "") {

@@ -385,7 +385,12 @@ export function sdkModuleMock() {
   return {
     query: vi.fn(({ prompt, options }: { prompt: AsyncGenerator; options?: { env?: Record<string, string> } }) =>
       createMockQuery(prompt, options?.env?.TOMO_SESSION_KEY ?? "")),
-    createSdkMcpServer: vi.fn((opts: { name: string }) => ({ type: "sdk", name: opts.name, instance: {} })),
+    // `tools` is kept (the real SDK hides them inside `instance`) so a test can
+    // build the tomo-internal server for a session and call its handlers
+    // directly — see tests/summon-private-tools.test.ts.
+    createSdkMcpServer: vi.fn((opts: { name: string; tools?: unknown[] }) => ({
+      type: "sdk", name: opts.name, instance: {}, tools: opts.tools ?? [],
+    })),
     tool: vi.fn((name: string, description: string, inputSchema: unknown, handler: unknown) => ({
       name, description, inputSchema, handler,
     })),

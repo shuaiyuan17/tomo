@@ -49,6 +49,46 @@ describe("people MCP tools", () => {
     expect(groupNames).toEqual(["Kevin Wang"]);
   });
 
+  // One MCP server is built per live session, but a dm: session's audience
+  // changes turn to turn while a group is summoned into it — so the flag is a
+  // getter, resolved per call.
+  it("resolves includePrivate per call, so a summoned-group turn sees no private records", async () => {
+    writePerson(dirs.publicDir, "kevin.md", `---\nname: Kevin Wang\n---\n`);
+    writePerson(dirs.privateDir, "secret.md", `---\nname: Secret Friend\n---\n`);
+
+    let ownTurn = true;
+    const tools = buildPeopleTools({ includePrivate: () => ownTurn, dirs });
+    const list = getTool(tools, "list_people");
+    const upsert = getTool(tools, "upsert_person");
+
+    const dmNames = (JSON.parse((await list.handler({}, {})).content[0].text) as Array<{ name: string }>)
+      .map((p) => p.name);
+    expect(dmNames.sort()).toEqual(["Kevin Wang", "Secret Friend"]);
+
+    // Same tool objects, next turn — a group is now steering this session.
+    ownTurn = false;
+    const summonedNames = (JSON.parse((await list.handler({}, {})).content[0].text) as Array<{ name: string }>)
+      .map((p) => p.name);
+    expect(summonedNames).toEqual(["Kevin Wang"]);
+
+    // ...and cannot reach the private subtree by writing into it either.
+    const refused = await upsert.handler(
+      { name: "Someone Else", replace_aliases: false, private: true },
+      {},
+    );
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain("can only be used from a DM session");
+
+    // The record is matched against public records only, so a private record
+    // cannot be updated (or even confirmed to exist) from a summoned turn.
+    const created = await upsert.handler(
+      { name: "Secret Friend", replace_aliases: false },
+      {},
+    );
+    expect(created.content[0].text).toContain("Created person record");
+    expect(created.content[0].text).not.toContain("private");
+  });
+
   it("upsert_person creates and then updates by alias", async () => {
     const upsert = getTool(buildPeopleTools({ includePrivate: true, dirs }), "upsert_person");
 

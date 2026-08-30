@@ -1,4 +1,5 @@
-import { isAbsolute, relative, resolve as pathResolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve as pathResolve } from "node:path";
 import { minimatch } from "minimatch";
 import { config } from "../config.js";
 import { log } from "../logger.js";
@@ -8,9 +9,78 @@ import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../worksp
 // canUseTool: re-allow `.claude/skills/` under bypassPermissions
 // ---------------------------------------------------------------------------
 
-/** Canonical (resolved, no trailing slash) skills root. */
+/**
+ * The skills root as SPELLED — resolved lexically, no symlinks followed.
+ *
+ * Kept alongside the real path because the two can differ (`/tmp` is a symlink
+ * to `/private/tmp` on macOS) and each answers a different question: this one
+ * is what a caller's string is compared against to decide whether it is
+ * CLAIMING to target the skills dir, and {@link realSkillsRoot} is what decides
+ * whether it actually lands there.
+ */
 const SKILLS_ROOT = pathResolve(config.workspaceDir, ".claude", "skills");
 const SKILLS_DIR = `${SKILLS_ROOT}/`;
+/** Protected siblings the SDK defers to this callback and we never re-allow. */
+const CLAUDE_DIR = pathResolve(config.workspaceDir, ".claude");
+const GIT_DIR = pathResolve(config.workspaceDir, ".git");
+
+/**
+ * Resolve to a REAL path, tolerating a target that does not exist yet.
+ *
+ * `realpathSync` is the only containment check that survives a symlink, but it
+ * throws on a path that has not been created — and Write/mkdir name files that
+ * are about to exist. So: realpath the deepest ancestor that does exist, then
+ * re-attach the segments below it. `<skills>/escape/x.md` where `escape` is a
+ * symlink to `/tmp/evil` resolves to `/tmp/evil/x.md` whether or not `x.md` is
+ * there yet.
+ *
+ * This is also what makes the comparison correct on a case-insensitive volume:
+ * `realpathSync` returns the on-disk casing, so both sides of the containment
+ * check are normalised the same way.
+ */
+function realResolve(p: string): string {
+  const target = abs(p, config.workspaceDir);
+  let current = target;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(current);
+      return tail.length > 0 ? pathResolve(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = dirname(current);
+      // Reached the filesystem root without finding anything that exists.
+      if (parent === current) return target;
+      tail.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** The skills root with symlinks and casing resolved. Recomputed per call: the
+ *  directory is created by `start.ts` after this module is imported. */
+function realSkillsRoot(): string {
+  return realResolve(SKILLS_ROOT);
+}
+
+/**
+ * Does `p` contain a `..` segment?
+ *
+ * Denied outright rather than normalised. `path.resolve` collapses `..`
+ * LEXICALLY, before any symlink is followed, so `<skills>/link/../x` normalises
+ * to `<skills>/x` — inside — while the real path is `<link-target>/../x`,
+ * outside. Refusing `..` closes that without needing to resolve the shell's
+ * and the kernel's disagreement, and costs nothing: a caller that wants a
+ * skills path can spell it directly, and a deny here only means the tool call
+ * falls back to the SDK's normal permission flow.
+ */
+function hasTraversalSegment(p: string): boolean {
+  return p.split(/[/\\]/).includes("..");
+}
+
+/** True when `p` really lands at or under the skills root. */
+function landsInSkills(p: string): boolean {
+  return isInside(realResolve(p), realSkillsRoot());
+}
 
 /** SDK canUseTool callback. The SDK auto-approves most tools under
  *  `bypassPermissions`, but writes to `.claude/`, `.git/`, etc. are protected
@@ -18,26 +88,136 @@ const SKILLS_DIR = `${SKILLS_ROOT}/`;
  *  tomo can manage its own skill library; every other protected path stays
  *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes.
  *
- *  The path is RESOLVED before it is compared. A raw `startsWith` on the
- *  skills prefix accepted `<skills>/../../.claude/settings.json`, which is
- *  exactly one of the protected paths the SDK deferred to this callback — the
- *  narrow re-allow became a hole through the whole protection. */
+ *  Containment is decided on the REAL path, and `..` is refused outright. A raw
+ *  `startsWith` on the skills prefix accepted
+ *  `<workspace>/.claude/skills/../../.claude/settings.json`, which is exactly
+ *  one of the protected paths the SDK deferred to this callback — the narrow
+ *  re-allow became a hole through the whole protection, and
+ *  `.claude/settings.json` is where permissions and hooks live, so the escape
+ *  landed on the file governing the sandbox itself. A lexical-only fix would
+ *  still have been escapable through a symlink planted inside the skills tree
+ *  (which the agent is allowed to create). */
 export async function skillsCanUseTool(
   toolName: string,
   input: Record<string, unknown>,
 ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
   const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
-  if (filePath && isInside(abs(filePath, config.workspaceDir), SKILLS_ROOT)) {
+  if (filePath && !hasTraversalSegment(filePath) && landsInSkills(filePath)) {
     return { behavior: "allow", updatedInput: input };
   }
-  // Bash mkdir / touch / etc. — allow if command targets the skills dir.
-  if (toolName === "Bash" && typeof input.command === "string" && input.command.includes(SKILLS_DIR)) {
+  // Bash mkdir / mv / cp / touch — allow only when every path it names that
+  // could reach a protected location lands inside the skills tree.
+  if (toolName === "Bash" && typeof input.command === "string" && bashStaysInSkills(input.command)) {
     return { behavior: "allow", updatedInput: input };
   }
   return {
     behavior: "deny",
     message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
   };
+}
+
+/**
+ * Anything that hides a path from a static reading of the command.
+ *
+ * Command substitution, backticks and variable expansion all produce their
+ * paths after this hook has run, so a command containing them cannot be
+ * cleared by inspecting its text. `sudo` is refused for the same reason in
+ * spirit — nothing about managing a skill library needs it.
+ */
+const OPAQUE_EXPANSION_RE = /\$\(|`|\$\{|\$[A-Za-z_]|\bsudo\b/;
+
+/** Split on whitespace and the shell operators that separate words. */
+const SHELL_SEPARATORS_RE = /[\s;|&()<>]+/;
+
+/**
+ * Redirection targets, which are the words a command writes to without ever
+ * naming them as an argument: `echo x > <path>`.
+ */
+const REDIRECTION_RE = /(?:>>|>|<)\s*("[^"]*"|'[^']*'|[^\s;|&()<>]+)/g;
+
+function stripQuotes(token: string): string {
+  return token.replace(/^['"]+/, "").replace(/['"]+$/, "");
+}
+
+/** Drop a `--flag=` / `-o=` prefix so `--dir=<path>` is checked as a path. */
+function stripFlagPrefix(token: string): string {
+  const eq = token.indexOf("=");
+  return eq > 0 && token.startsWith("-") ? token.slice(eq + 1) : token;
+}
+
+/** Worth resolving: anything with a path separator, or a home-relative path. */
+function looksLikePath(token: string): boolean {
+  return token.includes("/") || token.includes("\\") || token.startsWith("~");
+}
+
+/**
+ * Decide whether a Bash command may ride the skills re-allow.
+ *
+ * THE BUG THIS REPLACES: `input.command.includes(SKILLS_DIR)`. A substring
+ * ANYWHERE in the command approved the whole thing, so
+ * `touch <skills>/../../.claude/settings.json` was allowed — the same traversal
+ * the file_path branch had, reachable through the branch that did not check
+ * paths at all. So was
+ * `cp <workspace>/.claude/settings.json /tmp/x; echo <skills>/`.
+ *
+ * The rule now: at least one path must genuinely land in the skills tree, and
+ * NO path may claim the skills tree while landing outside it, contain a `..`
+ * segment, redirect anywhere but into the skills tree, or touch the protected
+ * siblings (`.claude/`, `.git/`) this callback exists to keep denied.
+ *
+ * LIMITATIONS, deliberately accepted. This is a static read of a shell command
+ * and cannot be complete — a shell's word splitting is not reproducible from
+ * outside it. Commands carrying `$(...)`, backticks, `${...}`, `$VAR` or
+ * `sudo` are therefore denied outright rather than guessed at, and so is any
+ * `~`-relative word, which this cannot resolve. What remains reachable is a
+ * command that writes to a path outside the workspace entirely while also
+ * naming the skills dir; that is not one of the paths the SDK protects, so it
+ * would have been auto-approved before reaching this callback anyway. A deny
+ * here is not a failure — it returns the call to the SDK's normal permission
+ * flow.
+ */
+function bashStaysInSkills(command: string): boolean {
+  if (OPAQUE_EXPANSION_RE.test(command)) return false;
+
+  const skillsRoot = realSkillsRoot();
+  // Realpath'd too: `/tmp` is a symlink to `/private/tmp` on macOS, so a
+  // lexical CLAUDE_DIR would not contain a realpath'd target and the
+  // protected-sibling check would silently never fire.
+  const claudeDir = realResolve(CLAUDE_DIR);
+  const gitDir = realResolve(GIT_DIR);
+  const claimsSkills = (token: string): boolean =>
+    token.includes(SKILLS_ROOT) || token.includes(skillsRoot);
+
+  let landsSomewhereInSkills = false;
+
+  const check = (raw: string, mustBeInSkills: boolean): boolean => {
+    const token = stripFlagPrefix(stripQuotes(raw));
+    if (!token) return true;
+    if (hasTraversalSegment(token)) return false;
+    if (!looksLikePath(token)) return !mustBeInSkills;
+    // `~` is expanded by the shell, after this hook — unresolvable here.
+    if (token.startsWith("~")) return false;
+    const real = realResolve(token);
+    const inSkills = isInside(real, skillsRoot);
+    if (inSkills) {
+      landsSomewhereInSkills = true;
+      return true;
+    }
+    if (mustBeInSkills) return false;
+    // A word that claims the skills dir but resolves elsewhere is the escape.
+    if (claimsSkills(token)) return false;
+    // A protected sibling must never ride along on a skills command.
+    return !isInside(real, claudeDir) && !isInside(real, gitDir);
+  };
+
+  for (const match of command.matchAll(REDIRECTION_RE)) {
+    if (!check(match[1], true)) return false;
+  }
+  for (const raw of command.split(SHELL_SEPARATORS_RE)) {
+    if (!check(raw, false)) return false;
+  }
+
+  return landsSomewhereInSkills;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // `permissions.ts` imports `config` at module load, which throws if no
 // channels are configured. CI has no config file and no env vars, so the real
@@ -239,6 +242,23 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
 const WS = "/tmp/tomo-mock-permissions";
 const SKILLS = `${WS}/.claude/skills`;
 
+/** A directory outside the workspace that a planted symlink can point at. */
+let outsideDir: string;
+
+beforeAll(() => {
+  // Real directories, because containment is now decided by realpath and a
+  // symlink escape cannot be expressed without a filesystem.
+  mkdirSync(`${SKILLS}/real-skill`, { recursive: true });
+  outsideDir = mkdtempSync(join(tmpdir(), "tomo-perm-outside-"));
+  mkdirSync(`${outsideDir}/loot`, { recursive: true });
+  try { symlinkSync(outsideDir, `${SKILLS}/escape`, "dir"); } catch { /* already there */ }
+});
+
+afterAll(() => {
+  rmSync(WS, { recursive: true, force: true });
+  rmSync(outsideDir, { recursive: true, force: true });
+});
+
 describe("skillsCanUseTool — narrow .claude/skills/ re-allow", () => {
   it("allows a write inside the skills dir", async () => {
     const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/my-skill/SKILL.md` });
@@ -279,5 +299,97 @@ describe("skillsCanUseTool — narrow .claude/skills/ re-allow", () => {
   it("denies when no path is present at all", async () => {
     const r = await skillsCanUseTool("WebFetch", { url: "https://example.com" });
     expect(r.behavior).toBe("deny");
+  });
+
+  describe("symlink escapes", () => {
+    it("denies a write through a symlink planted inside the skills tree", async () => {
+      // The agent is allowed to create files under skills/, so it can create
+      // the symlink too. Lexical containment says `<skills>/escape/x.md` is
+      // inside; realpath says it is in the temp dir.
+      const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/escape/loot/x.md` });
+      expect(r.behavior).toBe("deny");
+    });
+
+    it("denies even when the final component does not exist yet", async () => {
+      const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/escape/brand/new/file.md` });
+      expect(r.behavior).toBe("deny");
+    });
+
+    it("still allows a genuine directory next to the symlink", async () => {
+      const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/real-skill/SKILL.md` });
+      expect(r.behavior).toBe("allow");
+    });
+  });
+
+  it("normalises casing through realpath rather than string compare", async (ctx) => {
+    // Detected inside the test, not at collection time: beforeAll has not run
+    // when the describe body is evaluated, so the probe directory would not
+    // exist yet and this would skip on every volume.
+    let caseInsensitive = false;
+    try { statSync(`${SKILLS}/REAL-SKILL`); caseInsensitive = true; } catch { /* case-sensitive volume */ }
+    if (!caseInsensitive) return ctx.skip();
+    // On an APFS/HFS+ case-insensitive volume `<SKILLS>/REAL-SKILL` IS the same
+    // directory, so a case-sensitive string containment check would deny a path
+    // the filesystem resolves squarely inside the skills tree. realpath returns
+    // the on-disk casing, normalising both sides.
+    const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/REAL-SKILL/SKILL.md` });
+    expect(r.behavior).toBe("allow");
+  });
+});
+
+describe("the Bash arm of the re-allow", () => {
+  // Driven through skillsCanUseTool, the real entry point, so every case below
+  // exercises the same code path the SDK calls — and so each one demonstrates
+  // the defect against the previous implementation rather than merely noting
+  // that a new helper did not exist yet.
+  const allows = async (command: string): Promise<boolean> =>
+    (await skillsCanUseTool("Bash", { command })).behavior === "allow";
+
+  it("allows ordinary skill management", async () => {
+    expect(await allows(`mkdir -p ${SKILLS}/my-skill`)).toBe(true);
+    expect(await allows(`touch ${SKILLS}/my-skill/SKILL.md`)).toBe(true);
+    expect(await allows(`rm -rf ${SKILLS}/old-skill`)).toBe(true);
+    expect(await allows(`mv ${SKILLS}/a ${SKILLS}/b`)).toBe(true);
+  });
+
+  it("denies the traversal the substring check used to wave through", async () => {
+    // The headline: the SAME escape the file_path arm rejects, reachable
+    // through the arm that checked no paths at all.
+    expect(await allows(`touch ${SKILLS}/../../.claude/settings.json`)).toBe(false);
+  });
+
+  it("denies a command that reads a protected sibling and merely mentions skills", async () => {
+    expect(await allows(`cp ${WS}/.claude/settings.json /tmp/x; echo ${SKILLS}/`)).toBe(false);
+    expect(await allows(`cat ${WS}/.git/config && ls ${SKILLS}/`)).toBe(false);
+  });
+
+  it("denies redirection that lands outside the skills tree", async () => {
+    expect(await allows(`echo pwned > ${WS}/.claude/settings.json && ls ${SKILLS}/`)).toBe(false);
+    expect(await allows(`ls ${SKILLS}/ >> ${WS}/.claude/settings.json`)).toBe(false);
+  });
+
+  it("allows redirection into the skills tree", async () => {
+    expect(await allows(`echo hi > ${SKILLS}/my-skill/SKILL.md`)).toBe(true);
+  });
+
+  it("denies a write through a symlink planted inside the skills tree", async () => {
+    expect(await allows(`touch ${SKILLS}/escape/loot/x.md`)).toBe(false);
+  });
+
+  it("denies anything that hides its paths from a static read", async () => {
+    expect(await allows(`touch ${SKILLS}/$(whoami).md`)).toBe(false);
+    expect(await allows("touch `echo " + SKILLS + "`/x.md")).toBe(false);
+    expect(await allows(`touch $HOME/.claude/settings.json; ls ${SKILLS}/`)).toBe(false);
+    expect(await allows(`sudo touch ${SKILLS}/x.md`)).toBe(false);
+  });
+
+  it("denies a home-relative word it cannot resolve", async () => {
+    expect(await allows(`cp ${SKILLS}/x.md ~/.claude/settings.json`)).toBe(false);
+  });
+
+  it("denies a command that never lands in the skills tree", async () => {
+    expect(await allows("rm -rf /")).toBe(false);
+    expect(await allows(`cat ${WS}/.claude/settings.json`)).toBe(false);
+    expect(await allows("echo hello")).toBe(false);
   });
 });

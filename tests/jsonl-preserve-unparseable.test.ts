@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { parseJsonl, isRawJsonlLine, serializeJsonlRecord, reportRawJsonlLines } from "../src/jsonl.js";
+import { parseJsonl, isRawJsonlLine, serializeJsonlRecord, reportRawJsonlLines, RAW_JSONL_REWARN_MS } from "../src/jsonl.js";
+import { computeContextStats, resolveTimeRange } from "../src/lcm/stats.js";
+import { vi } from "vitest";
 import { compactSession } from "../src/lcm/compact.js";
 import { pruneTools } from "../src/lcm/prune-tools.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
@@ -77,6 +79,48 @@ describe("parseJsonl", () => {
     expect(records.map(serializeJsonlRecord).join("\n") + "\n").toBe(scalars);
     // Read-only mode is unchanged: it still hands `null` out, as before.
     expect(parseJsonl(scalars)).toEqual([null, 42, "hello", { real: true }]);
+  });
+
+  it("carries an array line — valid JSON, but not a record either", () => {
+    const text = '{"a":1}\n[1,2,3]\n{"b":2}\n';
+    const records = parseJsonl(text, { preserveUnparseable: true });
+    expect(isRawJsonlLine(records[1])).toBe(true);
+    expect(serializeJsonlRecord(records[1])).toBe("[1,2,3]");
+    expect(parseJsonl(text)).toEqual([{ a: 1 }, [1, 2, 3], { b: 2 }]);   // read-only: still a value
+  });
+
+  it("preserves when the flag is a non-literal boolean that happens to be true", () => {
+    const flag: boolean = process.env.TOMO_NEVER_SET === undefined;
+    const records = parseJsonl(text, { preserveUnparseable: flag });
+    expect(records.some(isRawJsonlLine)).toBe(true);
+  });
+
+  it("warns once per (file, line) and again only after 24h; dry runs go to debug and do not count", () => {
+    const logger = { warn: vi.fn(), debug: vi.fn() };
+    let clock = 1_000_000;
+    const now = () => clock;
+    const records = parseJsonl(text, { preserveUnparseable: true });
+
+    expect(reportRawJsonlLines(records, { sessionId: "s-dedupe" }, { logger, now })).toBe(1);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    reportRawJsonlLines(records, { sessionId: "s-dedupe" }, { logger, now });
+    expect(logger.warn).toHaveBeenCalledTimes(1);           // same line, same file: not again
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+
+    reportRawJsonlLines(records, { sessionId: "s-other" }, { logger, now });
+    expect(logger.warn).toHaveBeenCalledTimes(2);           // a different file: its own warning
+
+    clock += RAW_JSONL_REWARN_MS + 1;
+    reportRawJsonlLines(records, { sessionId: "s-dedupe" }, { logger, now });
+    expect(logger.warn).toHaveBeenCalledTimes(3);           // re-warned after the window
+
+    // A dry run (the per-turn nudge check) never warns and never marks.
+    logger.warn.mockClear(); logger.debug.mockClear();
+    reportRawJsonlLines(records, { sessionId: "s-dry" }, { logger, now, dryRun: true });
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    reportRawJsonlLines(records, { sessionId: "s-dry" }, { logger, now });
+    expect(logger.warn).toHaveBeenCalledTimes(1);           // the real run still warns
   });
 
   it("reports each carried line and returns the count", () => {
@@ -309,5 +353,33 @@ describe("transcript rotation preserves unparseable lines", () => {
     // ...and the current-month message plus the torn line stayed behind.
     expect(after.join("\n")).toContain("recent");
     expect(after).toHaveLength(2);
+  });
+});
+
+describe("read-only consumers survive non-object lines", () => {
+  const dir = join(tmpdir(), `tomo-jsonl-stats-${randomUUID()}`);
+  beforeEach(() => mkdirSync(dir, { recursive: true }));
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("computeContextStats and resolveTimeRange skip null and array lines instead of throwing", () => {
+    const sid = randomUUID();
+    const u = mkUserEvent(null, "2026-03-28T16:30:00.000Z", "hello");
+    const a = mkAssistantEvent(u.uuid, "2026-03-28T16:31:00.000Z", "hi");
+    writeFileSync(getSdkSessionPath(sid, dir), [
+      "null", JSON.stringify(u), "[1,2]", JSON.stringify(a), "42", "",
+    ].join("\n"));
+    const stats = computeContextStats(sid, dir);
+    expect(stats?.totalMessages).toBe(2);
+    const range = resolveTimeRange(sid, "2026-03-28T00:00", "2026-03-28T23:59", dir);
+    expect(range).toEqual({ fromIdx: 0, toIdx: 1, firstUuid: u.uuid, lastUuid: a.uuid });
+  });
+
+  it("the rollup subcommands expose --drop-unparseable like compact and prune-tools", async () => {
+    const { lcmCommand } = await import("../src/cli/lcm.js");
+    for (const name of ["daily", "weekly", "monthly", "yearly", "compact", "prune-tools"]) {
+      const cmd = lcmCommand.commands.find((c) => c.name() === name);
+      expect(cmd, name).toBeDefined();
+      expect(cmd!.options.some((o) => o.long === "--drop-unparseable"), name).toBe(true);
+    }
   });
 });

@@ -99,7 +99,7 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
     ? parseJsonl<SdkEvent>(snapshot.text)
     : parseJsonl<SdkEvent>(snapshot.text, { preserveUnparseable: true });
   if (!req.dropUnparseable) {
-    reportRawJsonlLines(events, { sessionId: req.sdkSessionId, op: "prune-tools" });
+    reportRawJsonlLines(events, { sessionId: req.sdkSessionId, op: "prune-tools" }, { dryRun: req.dryRun === true });
   }
 
   // Build a map of tool_use_id -> tool name from assistant tool_use events

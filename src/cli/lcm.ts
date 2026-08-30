@@ -86,6 +86,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
     .requiredOption("--session-id <id>", "SDK session ID")
     .requiredOption("--summary <text>", "Summary text")
     .option(periodOpt.flag, periodOpt.desc)
+    .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
     .action(async (opts) => {
       const paths = await getRuntimeDirs();
       // Option name is the part after `--`, converted to camelCase by commander.
@@ -117,6 +118,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
         summary: opts.summary,
         transcriptPath,
         blockTag: resolved.blockTag,
+        dropUnparseable: opts.dropUnparseable === true,
       });
 
       if (result.success) {

@@ -1,4 +1,5 @@
 import { readFileSync, openSync, closeSync, readSync, fstatSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { log } from "./logger.js";
 
 /**
@@ -54,15 +55,22 @@ export interface ParseJsonlOptions {
   preserveUnparseable?: boolean;
 }
 
-// The two overloads are the point: asking to preserve widens the element type,
+// The overloads are the point: asking to preserve widens the element type,
 // so a caller that opts in cannot then treat entries as plain `T` without
 // narrowing. A future rewriter gets a compile error instead of a `undefined`
-// field read on a carrier.
+// field read on a carrier. The plain `T[]` shape is offered ONLY when the flag
+// is absent or a literal `false`: a non-literal `boolean` (a CLI flag, a
+// request field) may be true at runtime, so it resolves to the widened union
+// rather than quietly to `T[]`.
 export function parseJsonl<T = unknown>(
   text: string,
   opts: ParseJsonlOptions & { preserveUnparseable: true },
 ): (T | RawJsonlLine)[];
-export function parseJsonl<T = unknown>(text: string, opts?: ParseJsonlOptions): T[];
+export function parseJsonl<T = unknown>(
+  text: string,
+  opts?: ParseJsonlOptions & { preserveUnparseable?: false },
+): T[];
+export function parseJsonl<T = unknown>(text: string, opts: ParseJsonlOptions): (T | RawJsonlLine)[];
 export function parseJsonl<T = unknown>(
   text: string,
   opts?: ParseJsonlOptions,
@@ -81,11 +89,11 @@ export function parseJsonl<T = unknown>(
       if (opts?.preserveUnparseable) records.push({ [RAW_JSONL_LINE]: line });
       continue;
     }
-    if (opts?.preserveUnparseable && (parsed === null || typeof parsed !== "object")) {
+    if (opts?.preserveUnparseable && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) {
       // A line that is valid JSON but not an object — `null`, a bare number, a
-      // quoted string — is not a record any rewriting caller can reason about,
-      // and `null` in particular makes every `evt.type` read throw. Carry it
-      // verbatim rather than handing it out as a `T`.
+      // quoted string, an array — is not a record any rewriting caller can
+      // reason about, and `null` in particular makes every `evt.type` read
+      // throw. Carry it verbatim rather than handing it out as a `T`.
       records.push({ [RAW_JSONL_LINE]: line });
       continue;
     }
@@ -98,7 +106,11 @@ export function readJsonlFileSync<T = unknown>(
   path: string,
   opts: ParseJsonlOptions & { preserveUnparseable: true },
 ): (T | RawJsonlLine)[];
-export function readJsonlFileSync<T = unknown>(path: string, opts?: ParseJsonlOptions): T[];
+export function readJsonlFileSync<T = unknown>(
+  path: string,
+  opts?: ParseJsonlOptions & { preserveUnparseable?: false },
+): T[];
+export function readJsonlFileSync<T = unknown>(path: string, opts: ParseJsonlOptions): (T | RawJsonlLine)[];
 export function readJsonlFileSync<T = unknown>(
   path: string,
   opts?: ParseJsonlOptions,
@@ -106,11 +118,32 @@ export function readJsonlFileSync<T = unknown>(
   return parseJsonl<T>(readFileSync(path, "utf-8"), opts as ParseJsonlOptions & { preserveUnparseable: true });
 }
 
+/** How long before the same preserved line in the same file is warned about again. */
+export const RAW_JSONL_REWARN_MS = 24 * 60 * 60 * 1000;
+const RAW_JSONL_WARNED_MAX = 5_000;
+/** `${scope}|${sha1(line)}` → last warned at. Bounded; oldest evicted. */
+const rawJsonlWarnedAt = new Map<string, number>();
+
+export interface ReportRawJsonlOptions {
+  /**
+   * A preview run. Logged at debug and NOT recorded, so the real rewrite that
+   * follows still warns. The nudge check calls `pruneTools({ dryRun: true })`
+   * on every turn — at warn level that would be one line per carrier per turn.
+   */
+  dryRun?: boolean;
+  /** Injected for tests. */
+  now?: () => number;
+  logger?: { warn: (obj: Record<string, unknown>, msg: string) => void; debug: (obj: Record<string, unknown>, msg: string) => void };
+}
+
 /**
- * Log every carrier in a parsed record list, one line each, and return how many
- * there were. Carriers are rare by construction (a torn write, bit rot), so
- * per-line logging is affordable and the byte offset is what a human needs to
- * go and look at the file.
+ * Log the carriers in a parsed record list and return how many there were.
+ *
+ * A preserved line is, by construction, still there on the next rewrite — so
+ * without memory this would warn about the same torn line on every compact,
+ * every prune and every rotation, forever. Each (file, line) pair is warned
+ * about once per {@link RAW_JSONL_REWARN_MS}; repeats within that window go to
+ * debug. The byte offset is what a human needs to go and look at the file.
  *
  * Rewriting callers should call this once after parsing: a line nobody can
  * read is worth surfacing even though it is being preserved rather than lost.
@@ -118,17 +151,37 @@ export function readJsonlFileSync<T = unknown>(
 export function reportRawJsonlLines(
   records: readonly unknown[],
   context: Record<string, unknown>,
+  opts: ReportRawJsonlOptions = {},
 ): number {
+  const logger = opts.logger ?? log;
+  const now = opts.now ?? Date.now;
+  const scope = String(context.sessionId ?? context.key ?? context.file ?? "");
   let count = 0;
   for (let index = 0; index < records.length; index++) {
     const record = records[index];
     if (!isRawJsonlLine(record)) continue;
     count++;
     const raw = record[RAW_JSONL_LINE];
-    log.warn(
-      { ...context, index, bytes: Buffer.byteLength(raw, "utf-8"), preview: raw.slice(0, 120) },
-      "Unparseable JSONL line preserved verbatim through a rewrite",
-    );
+    const fields = { ...context, index, bytes: Buffer.byteLength(raw, "utf-8"), preview: raw.slice(0, 120) };
+    if (opts.dryRun) {
+      logger.debug(fields, "Unparseable JSONL line would be preserved verbatim through a rewrite (dry run)");
+      continue;
+    }
+    const id = `${scope}|${createHash("sha1").update(raw).digest("hex")}`;
+    const last = rawJsonlWarnedAt.get(id);
+    const t = now();
+    if (last !== undefined && t - last < RAW_JSONL_REWARN_MS) {
+      logger.debug({ ...fields, lastWarnedAt: new Date(last).toISOString() }, "Unparseable JSONL line preserved verbatim through a rewrite (already reported)");
+      continue;
+    }
+    rawJsonlWarnedAt.delete(id);
+    rawJsonlWarnedAt.set(id, t);
+    while (rawJsonlWarnedAt.size > RAW_JSONL_WARNED_MAX) {
+      const oldest = rawJsonlWarnedAt.keys().next().value;
+      if (oldest === undefined) break;
+      rawJsonlWarnedAt.delete(oldest);
+    }
+    logger.warn(fields, "Unparseable JSONL line preserved verbatim through a rewrite");
   }
   return count;
 }

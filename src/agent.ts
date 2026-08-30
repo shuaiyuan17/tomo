@@ -28,9 +28,9 @@ import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
-import { DeliveryPipeline, isAgentErrorResponse } from "./agent/delivery-pipeline.js";
+import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
 import { TurnRunner, type RunWithRetryRequest } from "./agent/turn-runner.js";
-import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
+import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { resolveBlockRange } from "./lcm/blocks.js";
@@ -763,7 +763,7 @@ export class Agent {
           log.error({ err, key }, "Background task block delivery failed");
           // Still recorded, but MARKED: the turn composed this text, and it is
           // not known to have reached the owner.
-          slot.settle(`${DELIVERY_FAILED_MARKER}${block}`);
+          slot.settle(failedDeliveryEntry(block, err));
         }
       },
       onBlockAbandoned: () => transcript.abandonOldest(),

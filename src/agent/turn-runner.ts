@@ -6,7 +6,7 @@ import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { restoreLiteralNewlines } from "../channels/text-utils.js";
-import { type BlockSender, DeliveryPipeline, isAgentErrorResponse } from "./delivery-pipeline.js";
+import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
@@ -573,7 +573,7 @@ export class TurnRunner {
         // for an ambiguous failure, which may or may not have landed. A no-op
         // if the block was already abandoned for blowing its delivery budget —
         // that outcome was recorded, in order, when we gave up on it.
-        slot.settle(`${DELIVERY_FAILED_MARKER}${block}`);
+        slot.settle(failedDeliveryEntry(block, err));
       }
     };
 

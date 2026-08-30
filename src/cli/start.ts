@@ -1,31 +1,12 @@
 import { Command } from "commander";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquirePidFile, releasePidFile } from "./pidfile.js";
+import { getRunningPid } from "./status-info.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
-
-function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getRunningPid(): number | null {
-  if (!existsSync(PID_FILE)) return null;
-  const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-  if (isNaN(pid) || !isRunning(pid)) {
-    unlinkSync(PID_FILE);
-    return null;
-  }
-  return pid;
-}
 
 export const startCommand = new Command("start")
   .description("Start Tomo")

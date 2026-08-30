@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { DAEMON_STOP_TIMEOUT_MS, isPidAlive, isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -86,7 +87,7 @@ export async function restartAutostart(): Promise<void> {
   // If the running tomo wasn't actually the launchd-managed instance (e.g.
   // started via `tomo start` directly), kickstart -k won't reach it. SIGTERM
   // the PID-file PID directly so it exits and launchd can take over.
-  if (oldPid !== null && isAlive(oldPid)) {
+  if (oldPid !== null && isPidAlive(oldPid)) {
     try { process.kill(oldPid, "SIGTERM"); } catch { /* already dead */ }
   }
 
@@ -94,11 +95,11 @@ export async function restartAutostart(): Promise<void> {
   // actually exit and a new one to come up before reporting success. Graceful
   // shutdown can take tens of seconds if SIGTERM lands mid-turn (agent waits
   // for the in-flight assistant response to finish before closing).
-  const timeoutSec = 60;
-  const deadline = Date.now() + timeoutSec * 1000;
+  const timeoutSec = Math.round(DAEMON_STOP_TIMEOUT_MS / 1000);
+  const deadline = Date.now() + DAEMON_STOP_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 300));
-    if (oldPid !== null && isAlive(oldPid)) continue;
+    if (oldPid !== null && isPidAlive(oldPid)) continue;
     const newPid = readPidFile();
     if (newPid !== null && newPid !== oldPid) return;
   }
@@ -108,17 +109,7 @@ export async function restartAutostart(): Promise<void> {
 }
 
 function readPidFile(): number | null {
-  if (!existsSync(PID_FILE)) return null;
-  try {
-    const n = Number(readFileSync(PID_FILE, "utf-8").trim());
-    return Number.isFinite(n) && n > 0 ? n : null;
-  } catch {
-    return null;
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  return readPidFileRecord(PID_FILE)?.pid ?? null;
 }
 
 /**
@@ -153,19 +144,23 @@ async function runLaunchctl(
 }
 
 function stopPidfileTomo(): void {
-  if (!existsSync(PID_FILE)) return;
   try {
-    const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-    if (!isNaN(pid)) {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+    // Via readPidFileRecord, not `Number(readFileSync(...))`: the pid file is
+    // pid-on-line-1 plus an identity line, and a whole-file Number() is NaN.
+    // Signalling is gated on the recorded process still being the one on that
+    // pid — SIGTERMing a stranger who inherited a recycled pid is worse than
+    // doing nothing.
+    const record = readPidFileRecord(PID_FILE);
+    if (record && isRecordedProcessLive(record)) {
+      try { process.kill(record.pid, "SIGTERM"); } catch { /* already gone */ }
     }
-    unlinkSync(PID_FILE);
+    if (existsSync(PID_FILE)) unlinkSync(PID_FILE);
   } catch {
     /* best effort */
   }
 }
 
-function buildPlist(): string {
+export function buildPlist(): string {
   const nodePath = escapeXml(process.execPath);
   const cliPath = escapeXml(resolveCliPath());
   const home = escapeXml(homedir());
@@ -195,6 +190,14 @@ function buildPlist(): string {
 
     <key>KeepAlive</key>
     <true/>
+
+    <!-- Do not respawn faster than this. With KeepAlive and launchd's 10s
+         default, a start that fails deterministically (a pid file held by a
+         recycled pid, an uncaught exception on a bad config, a port already
+         bound) relaunches six times a minute forever, filling the logs and
+         burning CPU. 30s still recovers a real crash promptly. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
 
     <key>EnvironmentVariables</key>
     <dict>

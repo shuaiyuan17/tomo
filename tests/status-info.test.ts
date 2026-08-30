@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { getRunningPid, getDaemonStatus, isRunning } from "../src/cli/status-info.js";
+import { getRunningPid, getDaemonStatus, isPidAlive } from "../src/cli/status-info.js";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-status-info");
 const PID_FILE = join(TEST_DIR, "tomo.pid");
@@ -37,7 +37,7 @@ describe("status-info", () => {
     // Spawn a process that exits immediately; its pid is guaranteed dead.
     const child = spawnSync(process.execPath, ["-e", ""]);
     writeFileSync(PID_FILE, String(child.pid));
-    expect(isRunning(child.pid!)).toBe(false);
+    expect(isPidAlive(child.pid!)).toBe(false);
     expect(getRunningPid(PID_FILE)).toBeNull();
     expect(existsSync(PID_FILE)).toBe(false);
   });

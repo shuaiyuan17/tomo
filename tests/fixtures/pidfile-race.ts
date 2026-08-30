@@ -21,8 +21,18 @@ while (Date.now() < target) { /* busy-wait */ }
 const result = acquirePidFile(pidFile);
 process.stdout.write(JSON.stringify({ pid: process.pid, ...result }) + "\n");
 
-// The winner must stay alive long enough for EVERY other racer to observe it
-// as a live holder. A winner that exited first would leave a stale pid file,
-// which a late-starting racer is then entitled to take over — a correct
-// outcome for the code, but not the one this test is measuring.
-if (result.ok) setTimeout(() => process.exit(0), 6_000);
+// The winner must stay alive until every other racer has observed it. A
+// winner that exited first would leave a stale pid file, which a late-starting
+// racer is then entitled to take over — a correct outcome for the code, but
+// not the one this test is measuring.
+//
+// Rather than guess a duration (a 6s hold against a 5s barrier was one slow
+// `tsx` startup away from flaking), hold until the parent closes our stdin,
+// which it does once it has collected every result. The timeout is only a
+// safety net against an abandoned child.
+if (result.ok) {
+  process.stdin.resume();
+  process.stdin.on("end", () => process.exit(0));
+  process.stdin.on("close", () => process.exit(0));
+  setTimeout(() => process.exit(0), 60_000).unref();
+} 

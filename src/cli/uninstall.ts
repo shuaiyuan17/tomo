@@ -1,9 +1,10 @@
 import { Command } from "commander";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { disableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
@@ -65,9 +66,11 @@ function stopPidfileTomo(): void {
   const s = p.spinner();
   s.start("Stopping Tomo");
   try {
-    const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-    if (!isNaN(pid)) {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+    // See service.ts: parse the record, and only signal a pid that is still
+    // the daemon we recorded.
+    const record = readPidFileRecord(PID_FILE);
+    if (record && isRecordedProcessLive(record)) {
+      try { process.kill(record.pid, "SIGTERM"); } catch { /* already gone */ }
     }
     try { unlinkSync(PID_FILE); } catch { /* ignore */ }
     s.stop("Tomo stopped");

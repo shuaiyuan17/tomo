@@ -73,6 +73,16 @@ async function startForeground(): Promise<void> {
   const { Agent } = await import("../agent.js");
   const { log } = await import("../logger.js");
   if (envNotice) log.info({ vars: [...ignoredEnvOverrideNames] }, envNotice);
+
+  // Last-resort handlers, installed as soon as there is a logger to use them.
+  // Node >= 15 terminates on an unhandled rejection, and `shutdown()` is wired
+  // only to SIGINT/SIGTERM — so before this, a single stray rejection took the
+  // daemon down with none of the cleanup, leaving a stale pid file, an orphaned
+  // `imsg rpc` child, and the metrics port and watch socket held until the OS
+  // reaped them. See src/process-handlers.ts for why a rejection is survived
+  // and an uncaught exception is not.
+  const { installProcessErrorHandlers } = await import("../process-handlers.js");
+  installProcessErrorHandlers({ logger: log });
   const { TelegramChannel } = await import("../channels/index.js");
   const { CronScheduler } = await import("../cron/scheduler.js");
   const { PetScheduler } = await import("../mcp/pet-scheduler.js");

@@ -51,10 +51,11 @@ export interface CronJob {
   /** Failed runs of a one-shot ("at") job so far — bounds the retry loop. */
   retryCount?: number;
   /**
-   * Consecutive interruptions this recurring job has been resumed after.
-   * Bounds a crash loop: a turn that reliably kills the daemon would
-   * otherwise earn a fresh resume on every restart. Cleared by a run that
-   * reaches a successful outcome.
+   * How many times this recurring job has been resumed after an interruption
+   * since its last successful run — cumulative, not a streak of back-to-back
+   * restarts (nothing resets it except a run that reaches `"ok"`). Bounds a
+   * crash loop: a turn that reliably kills the daemon would otherwise earn a
+   * fresh resume on every restart.
    */
   resumeAttempts?: number;
 }

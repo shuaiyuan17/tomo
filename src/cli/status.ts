@@ -7,6 +7,7 @@ import { getDaemonStatus } from "./status-info.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { SessionStore } from "../sessions/store.js";
 import { CronStore } from "../cron/store.js";
+import { withCronStore } from "./cron-errors.js";
 import type { CronJob } from "../cron/types.js";
 import { formatDuration, formatRelative } from "../cron/format.js";
 
@@ -49,7 +50,9 @@ export async function gatherStatus(): Promise<StatusReport> {
       costUsd: e.stats?.totalCostUsd ?? 0,
     }));
 
-  const jobs = new CronStore().list();
+  // An unreadable jobs file exits non-zero rather than reporting zero tasks:
+  // "no scheduled tasks" and "could not look" must not print the same.
+  const jobs = withCronStore(() => new CronStore().list());
   const upcoming = jobs
     .filter((j): j is CronJob & { nextRunAt: number } => j.enabled && j.nextRunAt !== null)
     .sort((a, b) => a.nextRunAt - b.nextRunAt)

@@ -1,6 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { CronStore, parseScheduleString } from "../cron/store.js";
+import { CronStore, CronStoreReadError, computeNextRun, parseScheduleString } from "../cron/store.js";
+import { canManageJob } from "../cron/scope.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
 
 /**
@@ -21,11 +22,11 @@ import type { CronJob, CronRunStatus } from "../cron/types.js";
 /**
  * @param storePath  Override the jobs file (tests).
  * @param callerSessionKey  The session this MCP server instance belongs to.
- *   When set, `schedule_enable` only acts on jobs that deliver to that
- *   session: re-enabling is the one cron operation that makes a *dormant*
- *   job run again, and a group chat must not be able to restart a job that
- *   fires into the owner's DM. Listing/creating/removing remain unscoped —
- *   that surface is issue #312, deliberately not widened or narrowed here.
+ *   When set, `schedule_enable` is scoped by `canManageJob` (src/cron/scope.ts):
+ *   re-enabling is the one cron operation here that makes a *dormant* job run
+ *   again, so a group chat must not be able to restart a job that fires into
+ *   the owner's DM. Scoping of `schedule_list` / `schedule_create` /
+ *   `schedule_remove` is #319, which should adopt the same predicate.
  */
 export function buildCronTools(storePath?: string, callerSessionKey?: string) {
   return [
@@ -66,13 +67,23 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         ),
       },
       async ({ name, schedule, message, session, once }) => {
-        // Wrap both the parse and the store.add: parseScheduleString accepts
-        // any unrecognized string as `kind: "cron"` (catch-all), and croner
-        // throws inside `computeNextRun` when the expression is malformed.
-        // Either path means "this isn't a usable schedule" — surface it the
-        // same way so the agent doesn't think the job was scheduled.
+        // Validate the schedule on its own. parseScheduleString accepts any
+        // unrecognized string as `kind: "cron"` (catch-all) and croner only
+        // throws when the expression is actually evaluated, so the validation
+        // is the trial computeNextRun — not `store.add`, whose failures are
+        // about the STORE and must not be reported as a bad schedule.
+        let parsed;
         try {
-          const parsed = parseScheduleString(schedule);
+          parsed = parseScheduleString(schedule);
+          computeNextRun(parsed, Date.now());
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            isError: true,
+          };
+        }
+        try {
           const store = new CronStore(storePath);
           const job = store.add({
             name,
@@ -85,9 +96,13 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
             content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
           };
         } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
+          // The schedule was fine; the store was not. Say so, or the agent
+          // rewrites a perfectly good schedule string forever.
+          const detail = err instanceof CronStoreReadError
+            ? `the schedule store could not be read (${err.path}) — the schedule itself is valid`
+            : err instanceof Error ? err.message : String(err);
           return {
-            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            content: [{ type: "text" as const, text: `schedule_create failed: ${detail}` }],
             isError: true,
           };
         }
@@ -126,7 +141,7 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         "",
         "Pass `enabled: false` to park a job you want to keep but not run.",
         "",
-        "Scoped to this session: only jobs whose `sessionKey` is this conversation can be enabled or disabled here.",
+        "Scoped: this conversation's own jobs always; from a DM, also jobs that deliver into a group chat or that carry no session. A group chat can only enable or disable its own jobs.",
         "",
         "Returns the updated job, or `not_found`.",
       ].join("\n"),
@@ -140,7 +155,7 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         if (!existing) {
           return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
         }
-        if (callerSessionKey !== undefined && existing.sessionKey !== callerSessionKey) {
+        if (!canManageJob(existing, callerSessionKey)) {
           // Deliberately does not name the owning session.
           return {
             content: [{

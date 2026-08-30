@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { CronScheduler } from "../src/cron/scheduler.js";
-import { CronStore } from "../src/cron/store.js";
+import { CronStore, isInterrupted } from "../src/cron/store.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -486,6 +486,75 @@ describe("CronScheduler", () => {
     await tick(scheduler);
     expect(agent.handleCronMessage).toHaveBeenCalledTimes(1);
     expect(store.list()[0].lastStatus).toBe("ok");
+  });
+
+  it("a disable/enable round-trip during a live run does not erase the interruption", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    const job = storeA.add({
+      name: "send-the-order",
+      // Past due-time: re-enabling recomputes it to "now", so the job really
+      // is due when the next daemon scans — the assertion that it does not
+      // fire is about recovery, not about the schedule.
+      schedule: { kind: "at", at: new Date(Date.now() - 60_000).toISOString() },
+      message: "Place the order.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // While that turn is still running, someone toggles the job in `tomo
+    // config` / `tomo cron`. Enabling must not acknowledge the in-flight run:
+    // that would erase the only evidence the one-shot was ever dispatched.
+    const admin = new CronStore(TEST_PATH);
+    admin.setEnabled(job.id, false);
+    admin.setEnabled(job.id, true);
+    expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
+
+    // Restart: the one-shot must still be recognised as interrupted, and must
+    // not be placed a second time.
+    const second = hangingAgent();
+    const storeB = new CronStore(TEST_PATH);
+    const schedulerB = new CronScheduler(second.agent, storeB);
+    schedulerB.start();
+    await new Promise((r) => setTimeout(r, 30));
+    await tick(schedulerB);
+    schedulerB.stop();
+
+    expect(second.calls).toHaveLength(0);
+    const after = storeB.list()[0];
+    expect(after.enabled).toBe(false);
+    expect(after.lastStatus).toBe("interrupted");
+  });
+
+  it("re-enabling a settled interrupted job clears it for good", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    const job = storeA.add({
+      name: "send-the-order",
+      schedule: { kind: "at", at: new Date(Date.now() - 60_000).toISOString() },
+      message: "Place the order.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // Recovery settles and disables it; the operator then decides it should
+    // run after all. That decision must stick across the next restart.
+    new CronStore(TEST_PATH).recoverInterrupted();
+    new CronStore(TEST_PATH).setEnabled(job.id, true);
+
+    const second = hangingAgent();
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
+    schedulerB.start();
+    await waitFor(() => expect(second.calls).toHaveLength(1));
+    schedulerB.stop();
+    // A deliberate re-run, not a resume: the operator already adjudicated it.
+    expect(bodies(second.calls)[0]).not.toContain("[resumed]");
   });
 
   it("delivers the trigger as a cron tomo-event envelope (round-trip)", async () => {

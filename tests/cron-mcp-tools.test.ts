@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CronStore } from "../src/cron/store.js";
@@ -187,6 +187,93 @@ describe("cron MCP tools", () => {
     const allowed = await findTool("schedule_enable", "dm:shuai").handler({ id: job.id }, {});
     expect(allowed.isError).toBeFalsy();
     expect(JSON.parse(allowed.content[0].text).enabled).toBe(true);
+  });
+
+  it("schedule_enable — a DM can manage its own group's jobs and orphaned ones", async () => {
+    const store = new CronStore(TEST_PATH);
+    const groupJob = store.add({
+      name: "group-standup",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "standup",
+      sessionKey: "telegram:-100270",
+    });
+    const orphan = store.add({
+      name: "orphan",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "legacy",
+      sessionKey: "",
+    });
+    store.setEnabled(groupJob.id, false);
+    store.setEnabled(orphan.id, false);
+
+    // The internal MCP server is built for the session the turn runs on. A
+    // summoned group's background turns run on dm:<owner>, so scoping purely
+    // on equality would lock the owner out of jobs they created for a group,
+    // and nobody could ever re-enable a job with no session key.
+    const dm = findTool("schedule_enable", "dm:shuai");
+    expect(JSON.parse((await dm.handler({ id: groupJob.id }, {})).content[0].text).enabled).toBe(true);
+    expect(JSON.parse((await dm.handler({ id: orphan.id }, {})).content[0].text).enabled).toBe(true);
+  });
+
+  it("schedule_enable — a group can manage its own jobs but nothing else", async () => {
+    const store = new CronStore(TEST_PATH);
+    const mine = store.add({
+      name: "group-standup",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "standup",
+      sessionKey: "telegram:-100270",
+    });
+    const other = store.add({
+      name: "other-group",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "x",
+      sessionKey: "telegram:-100999",
+    });
+    const orphan = store.add({
+      name: "orphan",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "legacy",
+      sessionKey: "",
+    });
+    for (const j of [mine, other, orphan]) store.setEnabled(j.id, false);
+
+    const group = findTool("schedule_enable", "telegram:-100270");
+    expect(JSON.parse((await group.handler({ id: mine.id }, {})).content[0].text).enabled).toBe(true);
+    // Another group's job, and an unattributed one: a group adopts neither.
+    expect((await group.handler({ id: other.id }, {})).isError).toBe(true);
+    expect((await group.handler({ id: orphan.id }, {})).isError).toBe(true);
+    const after = new CronStore(TEST_PATH).list();
+    expect(after.find((j) => j.id === other.id)?.enabled).toBe(false);
+    expect(after.find((j) => j.id === orphan.id)?.enabled).toBe(false);
+  });
+
+  it("schedule_create — an unreadable store is not reported as an invalid schedule", async () => {
+    writeFileSync(TEST_PATH, "{ not json");
+    const result = await findTool("schedule_create").handler({
+      name: "test",
+      schedule: "every 1h",
+      message: "ping",
+      session: "dm:alice",
+    }, {});
+
+    expect(result.isError).toBe(true);
+    // The schedule was fine. Saying otherwise sends the agent off rewriting a
+    // perfectly good schedule string forever.
+    expect(result.content[0].text).not.toContain("invalid schedule");
+    expect(result.content[0].text).toContain("could not be read");
+    expect(result.content[0].text).toContain("the schedule itself is valid");
+  });
+
+  it("schedule_create — a malformed cron expression is still reported as invalid", async () => {
+    const result = await findTool("schedule_create").handler({
+      name: "test",
+      schedule: "not a cron expression at all",
+      message: "ping",
+      session: "dm:alice",
+    }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("invalid schedule");
   });
 
   it("schedule_remove — removes existing job; not-found returns text without isError", async () => {

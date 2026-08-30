@@ -1,5 +1,6 @@
 import * as p from "@clack/prompts";
-import { CronStore } from "../../cron/store.js";
+import { CronStore, CronStoreReadError } from "../../cron/store.js";
+import { cronStoreErrorMessage } from "../cron-errors.js";
 import type { CronJob } from "../../cron/types.js";
 import { formatSchedule, formatRelative } from "../../cron/format.js";
 
@@ -32,7 +33,17 @@ export async function configCron(): Promise<void> {
     // Fresh store per pass: the daemon and `tomo cron` mutate the same
     // jobs.json, so re-read instead of browsing a startup-time snapshot.
     const store = new CronStore();
-    const jobs = store.list();
+    let jobs;
+    try {
+      jobs = store.list();
+    } catch (err) {
+      if (!(err instanceof CronStoreReadError)) throw err;
+      // Interactive flow: say what is wrong and hand the user back to the
+      // config menu rather than killing the process mid-configuration. The
+      // scriptable surfaces (`tomo cron`, `tomo status`) exit non-zero.
+      p.log.error(`${cronStoreErrorMessage(err)} — fix or remove the file, then reopen this menu.`);
+      return;
+    }
 
     if (jobs.length === 0) {
       p.log.info("No scheduled tasks. Ask Tomo in chat, or use `tomo cron add`.");

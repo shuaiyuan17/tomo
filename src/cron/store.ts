@@ -23,7 +23,14 @@ export const MAX_RESUME_ATTEMPTS = 3;
 export class CronStore {
   private jobs: CronJob[] = [];
   /**
-   * Deep copy of `jobs` as of the last load — the merge base. Every save is a
+   * Per-job copy of `jobs` as of the last load — the merge base. The copies
+   * are SHALLOW (`{ ...job }`), which is sound only because no mutator edits
+   * a nested value in place: `schedule` is replaced wholesale, everything
+   * else is a primitive. A future mutator that reaches into a nested object
+   * would be invisible to the merge (base and ours would share the object and
+   * compare equal) and must deep-copy here instead.
+   *
+   * Every save is a
    * three-way merge (baseline / our in-memory jobs / whatever is on disk right
    * now), so a concurrent writer that loaded before us and saves between our
    * load and our save cannot silently revert fields we never touched, and we
@@ -133,14 +140,24 @@ export class CronStore {
       const next = computeNextRun(job.schedule, now);
       job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
       if (job.schedule.kind === "at") delete job.retryCount;
-      // Re-enabling adjudicates an interrupted run: whoever did it has
-      // decided this job should run again. Clear the interrupted state, or
-      // recovery would settle (and for a one-shot, immediately re-disable) it
-      // on the next daemon start.
-      if (job.lastStatus === "interrupted") job.lastStatus = null;
-      job.lastCompletedRunId = job.lastRunId ?? null;
-      job.interruptedAt = null;
-      delete job.resumeAttempts;
+      // Re-enabling adjudicates an interrupted run that recovery has ALREADY
+      // settled: whoever re-enabled it has decided the job should run again,
+      // so clear the state that would otherwise make the next daemon start
+      // settle (and for a one-shot, immediately re-disable) it a second time.
+      //
+      // Every clear is gated on that settled state. Acknowledging the run
+      // token unconditionally would erase live evidence: disable→enable
+      // *while a run is in flight* would mark the in-flight run complete, and
+      // the restart that followed would re-fire a one-shot with no [resumed]
+      // marker — the exact failure this PR exists to prevent. (Inside this
+      // branch the ack is a no-op in the normal path, since recovery already
+      // acknowledged the token; it stays as a repair for a hand-edited file.)
+      if (job.lastStatus === "interrupted") {
+        job.lastStatus = null;
+        job.lastCompletedRunId = job.lastRunId ?? null;
+        if (job.interruptedAt != null) job.interruptedAt = null;
+        delete job.resumeAttempts;
+      }
     } else {
       // Clear rather than leave a stale timestamp that list/detail views
       // would show as a "next run" that will never fire.
@@ -187,8 +204,12 @@ export class CronStore {
     job.lastStartedAt = Date.now();
     job.lastRunId = runId;
     // This dispatch supersedes any earlier interrupted run: whatever marker
-    // recovery left is being delivered right now.
-    job.interruptedAt = null;
+    // recovery left is being delivered right now. Only written when there is
+    // actually a marker to clear — an unconditional `= null` would add the
+    // key to every job on every dispatch and, since clearing a field is a
+    // merge edit that beats a concurrent value, would let a routine dispatch
+    // stomp a marker another process had just set.
+    if (job.interruptedAt != null) job.interruptedAt = null;
     this.save();
     return runId;
   }
@@ -230,9 +251,10 @@ export class CronStore {
    *   whole point is a single fire, and that fire already happened; whether it
    *   finished is unknowable. Disabled with `lastStatus: "interrupted"` so a
    *   human/agent can inspect and re-enable — never fired twice.
-   * - `skipped` with reason `"resume-cap"`: a recurring job interrupted
-   *   MAX_RESUME_ATTEMPTS times running. A turn that reliably takes the daemon
-   *   down (or a crash loop) would otherwise re-fire once per restart forever.
+   * - `skipped` with reason `"resume-cap"`: a recurring job that has been
+   *   resumed MAX_RESUME_ATTEMPTS times since its last successful run. A turn
+   *   that reliably takes the daemon down (or a crash loop) would otherwise
+   *   re-fire once per restart forever.
    */
   recoverInterrupted(): { resumed: CronJob[]; skipped: InterruptedSkip[] } {
     this.load();
@@ -397,9 +419,13 @@ class StaleWriteError extends Error {
  * the next save overwrite the real jobs with an empty list.
  */
 export class CronStoreReadError extends Error {
+  /** The store file that could not be read — surfaced by CLI error output. */
+  readonly path: string;
+
   constructor(path: string, cause: unknown) {
     super(`cron store could not be read: ${path}`, { cause });
     this.name = "CronStoreReadError";
+    this.path = path;
   }
 }
 

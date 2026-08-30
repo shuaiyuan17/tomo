@@ -34,6 +34,7 @@ import {
   makeMsg,
   mockSdk,
   resetConfig,
+  waitFor,
 } from "./helpers/agent-harness.js";
 import { createTomoInternalMcpServer } from "../src/mcp/internal-server.js";
 import type { Agent as AgentType } from "../src/agent.js";
@@ -255,6 +256,68 @@ describe("private tools during a summoned-group turn", () => {
     expect(names(people!)).toEqual(["Kevin Wang"]);
     expect(recall!.isError).toBe(true);
     expect(recall!.content[0].text).toContain("recall is unavailable");
+
+    await agent.stop();
+  });
+
+  it("stays closed when an owner DM steers into an in-flight summoned-group turn", async () => {
+    // Steering (config default, ON) bypasses the per-session queue: a message
+    // that arrives mid-turn is injected into the live session, so a second
+    // `runUserTurn` for the OWNER's DM is entered on `dm:shuai` while the
+    // group's turn is still running. The group turn's audience must survive
+    // that — a per-key single-slot record does not.
+    resetConfig({ identities: [OWNER], steering: true });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const tools = internalTools(agent, OWNER_DM);
+
+    mockSdk.responseFn = () => "noted";
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: `remember the ${PRIVATE_PHRASE} recipe` }));
+    await drainQueue(agent);
+
+    summon(agent, GROUP_CHAT_ID, "shuai");
+
+    let groupTurnStarted = false;
+    let steerLanded!: () => void;
+    const steered = new Promise<void>((resolve) => { steerLanded = resolve; });
+    let people: ToolResult | undefined;
+    let recall: ToolResult | undefined;
+    mockSdk.responseFn = async (text) => {
+      if (!text.includes("STEERED")) {
+        groupTurnStarted = true;
+        // Still inside the group's turn, after the owner's DM turn has been
+        // entered on the same session key.
+        await steered;
+        people = await tools.listPeople.handler({}, {});
+        recall = await tools.recall.handler({ query: PRIVATE_PHRASE, limit: 20 }, {});
+        return "NO_REPLY";
+      }
+      return "ok";
+    };
+
+    await tg.simulateMessage(makeMsg({
+      chatId: GROUP_CHAT_ID,
+      text: "@tomo hello",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+    }));
+    await waitFor(() => expect(groupTurnStarted).toBe(true));
+
+    // The owner types into their DM while the group's turn is in flight.
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "STEERED — who do you know?" }));
+    await waitFor(() => expect(
+      (agent as unknown as {
+        liveSessionManager: { liveSessions: Map<string, { pendingSteers: unknown[] }> };
+      }).liveSessionManager.liveSessions.get(OWNER_DM)!.pendingSteers.length,
+    ).toBe(1));
+
+    steerLanded();
+    await drainQueue(agent);
+
+    expect(names(people!)).toEqual(["Kevin Wang"]);
+    expect(recall!.isError).toBe(true);
 
     await agent.stop();
   });

@@ -13,6 +13,10 @@ export interface RuntimePaths {
   sessionsDir: string;
   logsDir: string;
   sdkSessionsDir: string;
+  /** Env overrides (`TOMO_WORKSPACE`, `SESSIONS_DIR`) that were set but blank,
+   *  and so ignored. config.ts folds these into `ignoredEnvOverrideNames` so
+   *  the startup notice names them alongside its own. */
+  ignoredEnvOverrides: readonly string[];
 }
 
 export interface RuntimePathOptions {
@@ -34,15 +38,36 @@ export function sdkSessionsDirForWorkspace(workspaceDir: string, homeDir = homed
   return join(homeDir, ".claude", "projects", encodedWorkspace);
 }
 
+/**
+ * An env override that is set but blank is not an override.
+ *
+ * Same rule as `envVar()` in config.ts, duplicated because config.ts imports
+ * this module and the dependency cannot go the other way. It matters more
+ * here than anywhere else: `resolve("")` is the *current working directory*,
+ * so `TOMO_WORKSPACE=` (or `TOMO_WORKSPACE=$TYPO`) would silently make
+ * whatever directory the daemon happened to be launched from the workspace —
+ * and with it `sdkSessionsDir`, which is derived from the workspace path.
+ */
+function envOverride(env: NodeJS.ProcessEnv, name: string, ignored: string[]): string | undefined {
+  const value = env[name];
+  if (value === undefined) return undefined;
+  if (value.trim() === "") {
+    ignored.push(name);
+    return undefined;
+  }
+  return value;
+}
+
 export function createRuntimePaths(options: RuntimePathOptions = {}): RuntimePaths {
   const env = options.env ?? process.env;
+  const ignoredEnvOverrides: string[] = [];
   const homeDir = resolve(options.homeDir ?? homedir());
   const tomoHome = resolve(options.tomoHome ?? join(homeDir, ".tomo"));
   const workspaceDir = resolve(
-    options.workspaceDir ?? env.TOMO_WORKSPACE ?? join(tomoHome, "workspace"),
+    options.workspaceDir ?? envOverride(env, "TOMO_WORKSPACE", ignoredEnvOverrides) ?? join(tomoHome, "workspace"),
   );
   const sessionsDir = resolve(
-    options.sessionsDir ?? env.SESSIONS_DIR ?? join(tomoHome, "data", "sessions"),
+    options.sessionsDir ?? envOverride(env, "SESSIONS_DIR", ignoredEnvOverrides) ?? join(tomoHome, "data", "sessions"),
   );
   const logsDir = resolve(options.logsDir ?? join(tomoHome, "logs"));
 
@@ -58,6 +83,7 @@ export function createRuntimePaths(options: RuntimePathOptions = {}): RuntimePat
     sessionsDir,
     logsDir,
     sdkSessionsDir: sdkSessionsDirForWorkspace(workspaceDir, homeDir),
+    ignoredEnvOverrides,
   };
 }
 

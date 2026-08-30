@@ -237,10 +237,52 @@ function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallbac
   return fallback;
 }
 
-/** Env var for a numeric/boolean setting; empty string counts as unset. */
-function envVar(name: string): string | undefined {
+/**
+ * Environment overrides that were SET but blank, and so were ignored.
+ *
+ * Unlike `configIssues` this is not a startup blocker — falling back to the
+ * config file is the right outcome. It is recorded because the fallback is
+ * otherwise completely silent: nothing (`tomo status`, `tomo config`) prints
+ * the *effective* model, token or gateway, so `CLAUDE_MODEL=$TYPO` looks
+ * exactly like a working override. The daemon logs it once at startup.
+ */
+const ignoredEnvOverrides: string[] = [...defaultRuntimePaths.ignoredEnvOverrides];
+export const ignoredEnvOverrideNames: readonly string[] = ignoredEnvOverrides;
+
+/**
+ * One line naming the blank overrides that were ignored, or undefined when
+ * there were none. `tomo start` prints it whichever way startup goes: as a log
+ * line on success, and after the error when a config assertion fails —
+ * "set TELEGRAM_BOT_TOKEN" is a baffling instruction to someone whose shell
+ * already has `TELEGRAM_BOT_TOKEN=` in it.
+ */
+export function ignoredEnvOverridesNotice(): string | undefined {
+  if (ignoredEnvOverrides.length === 0) return undefined;
+  return `Ignoring blank environment overrides (${ignoredEnvOverrides.join(", ")}); using the config file or default value`;
+}
+
+/**
+ * Env var for a setting; empty string counts as unset.
+ *
+ * `FOO=` (and `export FOO=""`) is the ordinary way to blank a variable out in
+ * a shell or a launchd plist, it is what a `.env` line with nothing after the
+ * `=` produces, and it is what `FOO=$UNSET` expands to. Reading
+ * `process.env.FOO ?? file.foo` would let that empty string win over the
+ * config file, because `??` only falls through on null/undefined — so every
+ * env override parsed in this file goes through here. Exported for any CLI
+ * module that reads its own override.
+ *
+ * (`src/runtime-paths.ts` cannot import this — config.ts imports IT — and
+ * keeps its own copy of the same rule.)
+ */
+export function envVar(name: string): string | undefined {
   const value = process.env[name];
-  return value === undefined || value.trim() === "" ? undefined : value;
+  if (value === undefined) return undefined;
+  if (value.trim() === "") {
+    if (!ignoredEnvOverrides.includes(name)) ignoredEnvOverrides.push(name);
+    return undefined;
+  }
+  return value;
 }
 
 // Coercing schemas: config.json values arrive typed, env overrides arrive as
@@ -394,13 +436,13 @@ const litellmEntrySchema = z.looseObject({
 
 function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
   const entry = validated("litellm", litellmEntrySchema, raw, {});
-  const baseUrl = String(process.env.TOMO_LITELLM_BASE_URL ?? entry.baseUrl ?? "").trim();
+  const baseUrl = String(envVar("TOMO_LITELLM_BASE_URL") ?? entry.baseUrl ?? "").trim();
   if (!baseUrl) return null;
 
   return {
-    mode: inferLiteLlmMode(process.env.TOMO_LITELLM_MODE ?? entry.mode, defaultModel),
+    mode: inferLiteLlmMode(envVar("TOMO_LITELLM_MODE") ?? entry.mode, defaultModel),
     baseUrl,
-    apiKey: String(process.env.TOMO_LITELLM_API_KEY ?? entry.apiKey ?? "").trim(),
+    apiKey: String(envVar("TOMO_LITELLM_API_KEY") ?? entry.apiKey ?? "").trim(),
   };
 }
 
@@ -417,7 +459,7 @@ function expandConfigPath(rawPath: string): string {
 
 function parseContinuityScriptConfig(raw: unknown): ContinuityScriptConfig | null {
   const entry = validated("continuityScript", continuityScriptEntrySchema, raw, {});
-  const rawPath = String(process.env.TOMO_CONTINUITY_SCRIPT ?? entry.path ?? "").trim();
+  const rawPath = String(envVar("TOMO_CONTINUITY_SCRIPT") ?? entry.path ?? "").trim();
 
   if (!rawPath) return null;
 
@@ -585,7 +627,7 @@ function buildConfig(): TomoConfig {
   const model = validated(
     "model (CLAUDE_MODEL)",
     z.string().min(1, "expected a non-empty model name"),
-    process.env.CLAUDE_MODEL ?? file.model,
+    envVar("CLAUDE_MODEL") ?? file.model,
     DEFAULT_MODEL,
   );
 
@@ -601,7 +643,7 @@ function buildConfig(): TomoConfig {
 
   return {
     auth: parseAnthropicAuthConfig(file.auth),
-    telegramToken: process.env.TELEGRAM_BOT_TOKEN ?? channels.telegram?.token ?? "",
+    telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",
     model,
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
@@ -612,7 +654,7 @@ function buildConfig(): TomoConfig {
     continuity: validated("continuity (TOMO_CONTINUITY)", boolLike, envVar("TOMO_CONTINUITY") ?? file.continuity, false),
     continuityIntervalMs: Math.round(Math.max(continuityIntervalMinutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
-    city: validated("city (TOMO_CITY)", z.string().nullable(), process.env.TOMO_CITY ?? file.city, null),
+    city: validated("city (TOMO_CITY)", z.string().nullable(), envVar("TOMO_CITY") ?? file.city, null),
     identities: parseIdentities(file.identities),
     imessageProvider: validated(
       "channels.imessage.provider (IMESSAGE_PROVIDER)",

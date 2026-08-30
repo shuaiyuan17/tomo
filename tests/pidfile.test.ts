@@ -111,48 +111,53 @@ describe("acquirePidFile", () => {
 
 describe("the takeover lock", () => {
   const lock = () => `${pidFile}.lock`;
-  function plantLock(owner: number, ageMs = 0): void {
+  /** Plant a lock as a holder would have left it: an `owner.<token>` entry naming pid + identity. */
+  function plantLock(owner: number, identity: string | null, ageMs = 0): void {
     mkdirSync(lock());
-    writeFileSync(join(lock(), "owner"), `${owner}\n`);
+    writeFileSync(join(lock(), "owner.planted"), `${owner}\n${identity ?? ""}\n`);
     if (ageMs > 0) {
       const t = (Date.now() - ageMs) / 1000;
       utimesSync(lock(), t, t);
     }
   }
+  const noLockLeft = () => expect(readdirSync(dir).filter((n) => n.includes(".lock"))).toEqual([]);
 
   it("reclaims a lock whose owner is dead, at once", () => {
-    plantLock(deadPid());
+    plantLock(deadPid(), null);
     expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: true, tookOverStale: null });
-    expect(existsSync(lock())).toBe(false);
-    expect(readdirSync(dir).filter((n) => n.includes(".lock"))).toEqual([]);
+    noLockLeft();
   });
 
-  it("reclaims a lock that is older than the stale budget even if its owner cannot be read", () => {
+  it("reclaims an aged lock whose pid now belongs to a different process", () => {
+    plantLock(process.pid, "some other process's identity", 60_000);
+    expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: true, tookOverStale: null });
+    noLockLeft();
+  });
+
+  it("takes over a lock left empty by a reclaim that died mid-flight", () => {
     mkdirSync(lock());
-    const t = (Date.now() - 60_000) / 1000;
-    utimesSync(lock(), t, t);
     expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: true, tookOverStale: null });
-    expect(existsSync(lock())).toBe(false);
+    noLockLeft();
   });
 
-  it("refuses, naming the lock rather than a daemon, when a live owner holds it for the whole wait", { timeout: 15_000 }, () => {
-    plantLock(process.pid);
+  it("never steals from a live owner, however old the lock: refuses and names the lock", { timeout: 15_000 }, () => {
+    // Old AND the owner is alive and still the recorded process — a slow
+    // holder, not an abandoned one. Stealing here is what reopens the race.
+    plantLock(process.pid, processIdentity(process.pid), 60_000);
     const started = Date.now();
     expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: false, holder: null });
     expect(Date.now() - started).toBeGreaterThanOrEqual(4_900);
-    // The busy lock is left exactly as it was: not ours to remove.
-    expect(existsSync(join(lock(), "owner"))).toBe(true);
+    expect(existsSync(join(lock(), "owner.planted"))).toBe(true);
     expect(existsSync(pidFile)).toBe(false);
   });
 
   it("does not leave the lock behind after any outcome", () => {
     writeFileSync(pidFile, `${process.pid}\n${processIdentity(process.pid)}\n`);
     expect(acquirePidFile(pidFile, 4242).ok).toBe(false);
-    expect(existsSync(lock())).toBe(false);
+    noLockLeft();
     releasePidFile(pidFile, process.pid);
-    expect(existsSync(lock())).toBe(false);
+    noLockLeft();
     expect(readLivePidFileRecord(pidFile)).toBeNull();
-    expect(existsSync(lock())).toBe(false);
     expect(readdirSync(dir)).toEqual([]);
   });
 
@@ -163,15 +168,11 @@ describe("the takeover lock", () => {
     expect(existsSync(join(dir, "no-such-dir"))).toBe(false);
   });
 
-  it("sweeps prepared locks and reclaim leftovers abandoned by dead processes", () => {
+  it("sweeps prepared locks abandoned by dead processes, keeping a live one", () => {
     mkdirSync(`${lock()}.${deadPid()}.abandoned`);
-    mkdirSync(`${lock()}.reclaim.old`);
-    const t = (Date.now() - 60_000) / 1000;
-    utimesSync(`${lock()}.reclaim.old`, t, t);
-    mkdirSync(`${lock()}.reclaim.fresh`);
+    mkdirSync(`${lock()}.${process.pid}.inflight`);
     expect(acquirePidFile(pidFile, 4242).ok).toBe(true);
-    const left = readdirSync(dir).sort();
-    expect(left).toEqual(["tomo.pid", "tomo.pid.lock.reclaim.fresh"]);
+    expect(readdirSync(dir).sort()).toEqual(["tomo.pid", `tomo.pid.lock.${process.pid}.inflight`]);
   });
 });
 

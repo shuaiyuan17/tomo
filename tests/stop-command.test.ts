@@ -102,8 +102,11 @@ describe("performStop", () => {
     // `recordLive` is consulted immediately before the kill, after the await:
     // the bootout may have reaped the daemon and the pid been recycled.
     const kill = vi.fn();
-    const out = await performStopWith(deps({ autostartEnabled: () => true, recordLive: () => false, kill }));
+    const wait = vi.fn(async () => false);
+    const out = await performStopWith(deps({ autostartEnabled: () => true, recordLive: () => false, kill, wait }));
     expect(kill).not.toHaveBeenCalled();
+    // And it does not sit out the 60s budget polling a stranger's pid.
+    expect(wait).not.toHaveBeenCalled();
     expect(out.code).toBe(0);
   });
 

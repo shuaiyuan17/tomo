@@ -1,6 +1,6 @@
 import {
-  closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync,
-  writeFileSync, writeSync,
+  closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync,
+  unlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -171,13 +171,13 @@ export async function stopRecordedDaemon(
 }
 
 /**
- * How long a takeover lock may sit on disk before it is presumed abandoned
- * even when its owner cannot be probed. The critical section it guards is a
- * handful of syscalls — microseconds — so a lock this old belongs to a
- * process that was SIGKILLed inside it. The usual signal is faster: the lock
- * records its owner's pid and a dead owner is reclaimed at once.
+ * An aged lock is examined more closely, not reclaimed: past this age a lock
+ * whose owner pid is alive is checked for identity (`ps`), so a pid recycled
+ * by an unrelated process cannot hold the lock forever. Below it, plain
+ * liveness is trusted — the critical section is microseconds, and `ps` is not
+ * something to spawn on every 5 ms poll.
  */
-const LOCK_STALE_MS = 10_000;
+const LOCK_IDENTITY_CHECK_AGE_MS = 10_000;
 /** How long a contender waits for the lock before giving up. */
 const LOCK_WAIT_MS = 5_000;
 const LOCK_POLL_MS = 5;
@@ -190,70 +190,36 @@ function lockDirFor(pidFile: string): string {
   return `${pidFile}.lock`;
 }
 
-function readLockOwnerPid(dir: string): number | null {
+/** The single `owner.<token>` entry of a lock directory, or null if it has none (mid-reclaim) or more than one (garbage). */
+function lockOwnerEntry(lockDir: string): { name: string; record: PidFileRecord | null } | null {
+  let names: string[];
   try {
-    const pid = Number(readFileSync(join(dir, "owner"), "utf-8").split("\n")[0]);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    names = readdirSync(lockDir).filter((n) => n.startsWith("owner."));
   } catch {
     return null;
   }
+  if (names.length !== 1) return null;
+  return { name: names[0], record: readPidFileRecord(join(lockDir, names[0])) };
 }
 
 /**
- * Take the directory at `lockDir` off its path — but only if it is still the
- * instance (inode) the caller examined. Returns true if that instance was
- * removed.
+ * Is the lock at `lockDir` abandoned? Only two things say yes: its owner pid
+ * is dead, or the lock is old AND the pid now belongs to a different process
+ * (a recycled pid). A live owner that is merely slow — suspended, swapped,
+ * a debugger attached — keeps its lock; contenders give up after
+ * `LOCK_WAIT_MS` rather than steal it, because stealing is what reopens the
+ * double-start this lock exists to prevent.
  *
- * `rename` is atomic and moves exactly one instance, so this is how a lock
- * can be reclaimed without the ABA race that a plain `rmdir` has: two
- * contenders both stat the same abandoned lock; A removes it, creates its own
- * and enters the critical section; B then executes its already-decided
- * `rmdir` — on A's fresh lock — and enters too. Here B's rename moves A's
- * lock, B sees the inode is not the one it judged, and puts it straight back.
- *
- * Residual window: if a third contender takes the vacated path in the
- * microseconds before B restores, the restore fails and A is inside without a
- * lock. That needs three starters to hit one abandoned lock in the same
- * instant; the ordinary two-party race is closed.
+ * Returns the owner entry name to remove when abandoned, else null.
  */
-function removeLockInstance(lockDir: string, expectedIno: bigint | number): boolean {
-  const graveyard = `${lockDir}.reclaim.${randomUUID()}`;
-  try {
-    renameSync(lockDir, graveyard);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false; // someone else got there first
-    throw err;
-  }
-  let ino: bigint | number | null = null;
-  try { ino = statSync(graveyard).ino; } catch { /* vanished */ }
-  if (ino === expectedIno) {
-    rmSync(graveyard, { recursive: true, force: true });
-    return true;
-  }
-  try {
-    renameSync(graveyard, lockDir);
-  } catch {
-    rmSync(graveyard, { recursive: true, force: true });
-  }
-  return false;
-}
-
-/** Reclaim `lockDir` if its owner is dead or it is older than `LOCK_STALE_MS`. True if the caller should retry at once. */
-function reclaimAbandonedLock(lockDir: string): boolean {
-  let ino: bigint | number;
+function abandonedLockOwner(lockDir: string): string | null {
+  const entry = lockOwnerEntry(lockDir);
+  if (entry === null || entry.record === null) return null;
+  if (!isPidAlive(entry.record.pid)) return entry.name;
   let ageMs: number;
-  try {
-    const st = statSync(lockDir);
-    ino = st.ino;
-    ageMs = Date.now() - st.mtimeMs;
-  } catch {
-    return true; // vanished between the failed acquire and the stat: retry now
-  }
-  const owner = readLockOwnerPid(lockDir);
-  const abandoned = (owner !== null && !isPidAlive(owner)) || ageMs > LOCK_STALE_MS;
-  if (!abandoned) return false;
-  removeLockInstance(lockDir, ino);
-  return true;
+  try { ageMs = Date.now() - statSync(lockDir).mtimeMs; } catch { return null; }
+  if (ageMs > LOCK_IDENTITY_CHECK_AGE_MS && !isRecordedProcessLive(entry.record)) return entry.name;
+  return null;
 }
 
 /**
@@ -267,12 +233,23 @@ function reclaimAbandonedLock(lockDir: string): boolean {
  * status` reap a claim that had just been re-taken. Every mutation of the pid
  * file goes through here so that judgement and unlink are one step.
  *
- * Acquisition is `rename(prepared, lockDir)` where `prepared` is a directory
- * already holding an `owner` file. Onto a non-existent path the rename
- * succeeds atomically; onto an existing non-empty directory it fails with
- * ENOTEMPTY. A lock at the path is therefore never observable as empty (the
- * one case where rename would replace it), and it always names its owner, so
- * a contender can tell an abandoned lock from a busy one without waiting.
+ * The lock is a directory whose sole entry, `owner.<token>`, names the owner
+ * (same two-line format as the pid file: pid, then identity). It is only ever
+ * created by `rename(prepared, lockDir)`, never by `mkdir` at the path:
+ * rename onto a NON-EMPTY directory fails with ENOTEMPTY (held), onto an
+ * EMPTY one atomically replaces it, and onto nothing succeeds. So the path is
+ * never vacant, and a lock is never observable without its owner unless a
+ * reclaim is mid-flight — in which case it is empty, and the next rename to
+ * reach it wins.
+ *
+ * Reclaiming an abandoned lock is one `unlink` of its owner entry, whose name
+ * carries a token unique to that lock INSTANCE. A reclaimer that judged
+ * instance S abandoned and unlinks `owner.<S>` either removes exactly S's
+ * entry (making S empty and replaceable) or gets ENOENT because the path now
+ * holds a different instance — it can never empty a lock it did not examine.
+ * That is what closes the ABA in the earlier rmdir/rename-based versions:
+ * nothing here ever removes or moves the directory at the path, only its own
+ * owner entry, and the transition to "held" is a single atomic rename.
  *
  * Returns `undefined` if the lock could not be taken within `LOCK_WAIT_MS`,
  * or if the pid file's directory does not exist (then there is no pid file to
@@ -280,16 +257,17 @@ function reclaimAbandonedLock(lockDir: string): boolean {
  */
 function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
   const lockDir = lockDirFor(pidFile);
-  const prepared = `${lockDir}.${process.pid}.${randomUUID()}`;
+  const token = randomUUID();
+  const prepared = `${lockDir}.${process.pid}.${token}`;
+  const ownerName = `owner.${token}`;
   try {
     mkdirSync(prepared);
-    writeFileSync(join(prepared, "owner"), `${process.pid}\n`);
+    writeFileSync(join(prepared, ownerName), `${process.pid}\n${processIdentity(process.pid) ?? ""}\n`);
   } catch (err) {
     rmSync(prepared, { recursive: true, force: true });
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw err;
   }
-  const ino = statSync(prepared).ino; // rename preserves the inode
   const deadline = Date.now() + LOCK_WAIT_MS;
   let held = false;
   try {
@@ -302,16 +280,25 @@ function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
         const code = (err as NodeJS.ErrnoException).code;
         if (code !== "ENOTEMPTY" && code !== "EEXIST") throw err;
       }
-      if (reclaimAbandonedLock(lockDir)) continue;
+      const abandoned = abandonedLockOwner(lockDir);
+      if (abandoned !== null) {
+        try { unlinkSync(join(lockDir, abandoned)); } catch { /* another reclaimer got there, or the instance changed */ }
+        continue; // the rename either replaces the emptied lock or finds a new holder
+      }
       if (Date.now() >= deadline) return undefined;
       sleepSync(LOCK_POLL_MS);
     }
     return fn();
   } finally {
-    // Release our own instance only: if `fn` somehow outlived LOCK_STALE_MS
-    // and a contender reclaimed us, the path now holds THEIR lock.
-    if (held) removeLockInstance(lockDir, ino);
-    else rmSync(prepared, { recursive: true, force: true });
+    if (held) {
+      // Our entry has a name only we know; after it is gone the (empty)
+      // directory is either removed here or atomically replaced by the next
+      // contender's rename — rmdir fails ENOTEMPTY in that case, which is fine.
+      try { unlinkSync(join(lockDir, ownerName)); } catch { /* reclaimed as abandoned — only possible if we are not us */ }
+      try { rmdirSync(lockDir); } catch { /* replaced by a contender, or already gone */ }
+    } else {
+      rmSync(prepared, { recursive: true, force: true });
+    }
   }
 }
 
@@ -459,15 +446,11 @@ function sweepAbandonedStaging(pidFile: string): void {
       if (!name.startsWith(prefix)) continue;
       const path = join(dir, name);
       if (name.startsWith(lockPrefix)) {
-        // `tomo.pid.lock.<pid>.<uuid>` is a prepared lock; `.lock.reclaim.<uuid>`
-        // a reclaim in flight. Either is abandoned if its owner is dead or it
-        // is old. The live lock itself (`tomo.pid.lock`) is never touched here.
-        const tag = name.slice(lockPrefix.length).split(".")[0];
-        const owner = Number(tag);
-        let old = false;
-        try { old = Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS; } catch { continue; }
-        const dead = Number.isInteger(owner) && owner > 0 && !isPidAlive(owner);
-        if (dead || old) rmSync(path, { recursive: true, force: true });
+        // `tomo.pid.lock.<pid>.<uuid>` is a lock prepared by a process that
+        // died before renaming it into place. The live lock itself
+        // (`tomo.pid.lock`) is never touched here.
+        const owner = Number(name.slice(lockPrefix.length).split(".")[0]);
+        if (Number.isInteger(owner) && owner > 0 && !isPidAlive(owner)) rmSync(path, { recursive: true, force: true });
         continue;
       }
       const owner = Number(name.slice(prefix.length).split(".")[0]);

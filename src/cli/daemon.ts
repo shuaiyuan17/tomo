@@ -90,7 +90,11 @@ export async function performStopWith(deps: StopDeps): Promise<StopOutcome> {
   // identity immediately before signalling, not just before the bootout:
   // SIGTERMing a stranger who inherited a recycled pid is worse than doing
   // nothing. Either way, wait for the pid to actually disappear.
-  if (deps.alive(pid) && deps.recordLive(record)) {
+  const stopped = { code: 0, message: `Stopped Tomo (PID ${pid})${autostartNote}.` };
+  if (deps.alive(pid)) {
+    // Identity changed under us: the daemon is gone and the pid is someone
+    // else's. Nothing to signal, and nothing to wait 60s for either.
+    if (!deps.recordLive(record)) return stopped;
     try {
       deps.kill(pid, "SIGTERM");
     } catch {
@@ -98,17 +102,13 @@ export async function performStopWith(deps: StopDeps): Promise<StopOutcome> {
     }
   }
 
-  if (await deps.wait(pid, deps.timeoutMs)) {
-    return { code: 0, message: `Stopped Tomo (PID ${pid})${autostartNote}.` };
-  }
+  if (await deps.wait(pid, deps.timeoutMs)) return stopped;
 
   // The pid is alive, but is it still OUR daemon? The poll is deliberately
   // cheap (`kill(pid, 0)`), so a daemon that exited and had its pid recycled
   // by an unrelated process looks identical to one that is wedged. Confirm
   // once, here, rather than 600 times during the poll.
-  if (!deps.recordLive(record)) {
-    return { code: 0, message: `Stopped Tomo (PID ${pid})${autostartNote}.` };
-  }
+  if (!deps.recordLive(record)) return stopped;
 
   return {
     code: 1,

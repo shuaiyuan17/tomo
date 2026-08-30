@@ -1964,6 +1964,24 @@ export class ImsgChannel implements Channel {
   ): Promise<SendResult | void> {
     if (!existsSync(filePath)) {
       log.warn({ path: filePath }, "Attachment file not found");
+      // The caption is independently deliverable, so a missing picture must
+      // not take the text with it. The pipeline hands over `caption + photo`
+      // as one send and marks the caption shipped on having CALLED this
+      // (delivery-pipeline.ts), so returning here dropped both halves of a
+      // "Here's the chart\nMEDIA:/tmp/chart.png" block — and reported it as
+      // delivered. The file can disappear between the pipeline's existsSync
+      // and this one, so this branch is reachable with a caption in hand.
+      if (caption) {
+        // The caption is the turn's last chance at the reply target, exactly
+        // as in the could-not-thread path below, and its own result speaks for
+        // the whole send (undefined = it threaded).
+        const captionResult = await this.send({
+          chatId: chatGuid,
+          text: caption,
+          ...(replyTo ? { replyTo } : {}),
+        });
+        return replyTo ? (captionResult ?? undefined) : undefined;
+      }
       return replyTo ? { threaded: false } : undefined;
     }
 

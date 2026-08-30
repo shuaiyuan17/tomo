@@ -156,11 +156,29 @@ async function confirm(prompt: string): Promise<boolean> {
 }
 
 /**
+ * A backup directory that passed validation, identified by BOTH its canonical
+ * path and its filesystem identity.
+ *
+ * The path alone is not an identity. `realpathSync` answers "what does this
+ * name point at right now", so a directory renamed away and replaced by
+ * another ordinary directory at the same pathname resolves to the identical
+ * string. `dev`+`ino` is what distinguishes the two.
+ */
+export interface ResolvedBackup {
+  /** Canonical path, symlinks resolved. */
+  path: string;
+  /** Device id — an inode number is only unique within its filesystem. */
+  dev: number;
+  /** Inode number, captured at validation time. */
+  ino: number;
+}
+
+/**
  * Resolve `date` to the directory `restore` may read, or null to refuse.
  *
  * Restore is the most destructive command here: for each of four components it
  * `rmSync`s the live tree and copies the backup's over it. So the argument has
- * to survive three separate questions, not one.
+ * to survive four separate questions, not one.
  *
  * 1. SHAPE. `YYYY-MM-DD_HHMM`, the same predicate `listBackups` applies. Alone
  *    this stops `restore ../../..`.
@@ -173,26 +191,34 @@ async function confirm(prompt: string): Promise<boolean> {
  *    candidate to sit directly inside the backups root. Lexical containment is
  *    not enough once any ancestor can be a link, and the root itself is under
  *    `homedir()`, which is a symlink on plenty of setups.
- *
- * Returns the REAL path, so what is validated is what is then read.
+ * 4. IDENTITY. `dev`+`ino` from the same `lstat` that answered (2), so the
+ *    caller can prove later that it is still looking at the same directory
+ *    and not a replacement wearing its name.
  */
-export function resolveBackupPath(date: string): string | null {
+export function resolveBackupPath(date: string): ResolvedBackup | null {
   if (!isBackupName(date)) return null;
   const candidate = join(BACKUPS_DIR, date);
   try {
     // Refuses a symlink, a file, a socket — anything that is not a directory
-    // in its own right.
-    if (!lstatSync(candidate).isDirectory()) return null;
+    // in its own right. The same stat supplies the identity below, so there is
+    // no second syscall for something else to slip between.
+    const entry = lstatSync(candidate);
+    if (!entry.isDirectory()) return null;
     const realRoot = realpathSync(BACKUPS_DIR);
     const realCandidate = realpathSync(candidate);
     // Directly inside, not merely underneath: a backup is always one level
     // down, so there is nothing to gain from accepting deeper paths.
     if (realCandidate !== join(realRoot, date)) return null;
-    return realCandidate;
+    return { path: realCandidate, dev: entry.dev, ino: entry.ino };
   } catch {
     // Missing, unreadable, or a broken link — all equally not restorable.
     return null;
   }
+}
+
+/** Same directory, not merely the same name. */
+function sameBackup(a: ResolvedBackup, b: ResolvedBackup | null): boolean {
+  return b !== null && a.path === b.path && a.dev === b.dev && a.ino === b.ino;
 }
 
 export const backupCommand = new Command("backup")
@@ -318,8 +344,8 @@ backupCommand
       }
     }
 
-    const backupPath = resolveBackupPath(date);
-    if (!backupPath) {
+    const backup = resolveBackupPath(date);
+    if (!backup) {
       console.error(`Not a restorable backup: ${date}`);
       console.error("Expected YYYY-MM-DD_HHMM naming a real directory directly inside " + BACKUPS_DIR + ".");
       console.error("Run 'tomo backup list' to see available backups.");
@@ -327,7 +353,7 @@ backupCommand
       return;
     }
 
-    console.log(`Restore from: ${backupPath}`);
+    console.log(`Restore from: ${backup.path}`);
     console.log("This will overwrite current tomo data.\n");
 
     const ok = await confirm("Proceed?");
@@ -336,23 +362,29 @@ backupCommand
       return;
     }
 
-    // RE-CHECK AFTER THE PROMPT. What survived the checks above is a STRING,
-    // and `confirm()` is an unbounded wait — the prompt sits there until a
-    // human answers. That window belongs to whoever can write to
-    // `~/Backups/tomo`: rename the validated directory away and drop a symlink
-    // in its place, and every `existsSync`/`cpSync` below follows the
-    // replacement, while the `rmSync`s still delete the live destinations.
+    // RE-CHECK AFTER THE PROMPT. What survived the checks above describes the
+    // directory as it was, and `confirm()` is an unbounded wait — the prompt
+    // sits there until a human answers. That window belongs to whoever can
+    // write to `~/Backups/tomo`: swap the validated directory out and every
+    // `existsSync`/`cpSync` below follows the replacement, while the `rmSync`s
+    // still delete the live destinations.
     //
-    // Re-resolving and requiring the SAME real path collapses the window to
-    // the gap between this line and the first copy, which contains no `await`
-    // — nothing below yields, so nothing else gets to run in between.
+    // COMPARED BY IDENTITY, NOT BY NAME. Re-resolving and comparing only the
+    // canonical path catches a symlink swap but not a directory one: rename
+    // the original away, `mkdir` an ordinary directory at the same pathname,
+    // and both resolutions return the identical string. `dev`+`ino` is what
+    // separates "the same directory" from "something else wearing its name".
+    //
+    // This collapses the window to the gap between this line and the first
+    // copy, which contains no `await` — nothing below yields, so nothing else
+    // gets to run in between.
     //
     // RESIDUAL: this is not descriptor pinning. A swap landing inside that
     // gap is still not detected, and closing it properly means holding an
     // `open()` handle on the directory and copying through `openat`-relative
     // operations, which Node's `fs` does not expose. Out of scope here; the
     // re-check turns an indefinite window into an instantaneous one.
-    if (resolveBackupPath(date) !== backupPath) {
+    if (!sameBackup(backup, resolveBackupPath(date))) {
       console.error(`Backup ${date} changed while waiting for confirmation; aborting without restoring.`);
       process.exit(1);
       return;
@@ -361,14 +393,14 @@ backupCommand
     console.log();
 
     // 1. config.json
-    const configSrc = join(backupPath, "config.json");
+    const configSrc = join(backup.path, "config.json");
     if (existsSync(configSrc)) {
       cpSync(configSrc, join(TOMO_HOME, "config.json"));
       console.log("  [ok] config.json");
     }
 
     // 2. workspace/ (preserve .claude/ which is populated by init/start)
-    const workspaceSrc = join(backupPath, "workspace");
+    const workspaceSrc = join(backup.path, "workspace");
     if (existsSync(workspaceSrc)) {
       restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
 
@@ -376,7 +408,7 @@ backupCommand
     }
 
     // 3. data/
-    const dataSrc = join(backupPath, "data");
+    const dataSrc = join(backup.path, "data");
     if (existsSync(dataSrc)) {
       const dataDest = join(TOMO_HOME, "data");
       rmSync(dataDest, { recursive: true, force: true });
@@ -385,7 +417,7 @@ backupCommand
     }
 
     // 4. SDK session files
-    const sdkSrc = join(backupPath, "sdk-sessions");
+    const sdkSrc = join(backup.path, "sdk-sessions");
     if (existsSync(sdkSrc)) {
       const sdkDest = config.sdkSessionsDir;
       rmSync(sdkDest, { recursive: true, force: true });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterAll, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { join } from "node:path";
 
@@ -207,6 +207,44 @@ describe("tomo backup restore — swapped between validation and copy", () => {
     // The rmSync that would have deleted this never ran...
     expect(existsSync(liveMarker)).toBe(true);
     // ...and nothing from the attacker's tree was copied in.
+    expect(existsSync(join(paths.tomoHome, "data", "loot.txt"))).toBe(false);
+  });
+
+  /**
+   * Replace the validated directory with a DIFFERENT ordinary directory at the
+   * same pathname. Both resolutions return the identical canonical string, so
+   * only filesystem identity separates them.
+   */
+  const swapForAnotherDirectory = (): void => {
+    rmSync(validDir, { recursive: true, force: true });
+    mkdirSync(join(validDir, "data"), { recursive: true });
+    writeFileSync(join(validDir, "data", "loot.txt"), "attacker payload");
+  };
+
+  it("aborts when the directory is replaced by another directory at the same path", async () => {
+    const before = statSync(validDir);
+
+    const { errors, exitCodes } = await runRestore(VALID, (async function* () {
+      swapForAnotherDirectory();
+      yield "y\n";
+    })());
+
+    // Guard the guard: if the replacement happened to reuse the inode there
+    // would be nothing to detect, and the test would pass for the wrong reason.
+    const after = statSync(validDir);
+    expect([after.dev, after.ino]).not.toEqual([before.dev, before.ino]);
+
+    expect(errors.join("\n")).toContain("changed while waiting for confirmation");
+    expect(exitCodes).toContain(1);
+  });
+
+  it("leaves the live destinations untouched when a same-path directory is swapped in", async () => {
+    await runRestore(VALID, (async function* () {
+      swapForAnotherDirectory();
+      yield "y\n";
+    })());
+
+    expect(existsSync(liveMarker)).toBe(true);
     expect(existsSync(join(paths.tomoHome, "data", "loot.txt"))).toBe(false);
   });
 

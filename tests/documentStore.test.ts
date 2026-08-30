@@ -155,6 +155,25 @@ describe("saveInboundDocument", () => {
     expect(st.size).toBe(buffer.length);
   });
 
+  it("never overwrites: two documents with the same computed name both survive", async () => {
+    // Telegram forwards two PDFs named the same thing in the same second, or
+    // the guid prefix collides — either way `buildDocumentPath` produces one
+    // path for both, and a plain write would leave one file on disk while
+    // reporting two saved.
+    const ts = new Date(2026, 7, 30, 9, 15, 0);
+    const meta = { sessionKey: "dm", guid: "abc12345-aaaa", timestamp: ts, filename: "report.pdf" };
+
+    const a = await saveInboundDocument(Buffer.from("first pdf"), "application/pdf", meta, baseDir);
+    const b = await saveInboundDocument(Buffer.from("second pdf"), "application/pdf", meta, baseDir);
+
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(b).not.toBe(a);
+    expect((await readFile(a!)).toString()).toBe("first pdf");
+    expect((await readFile(b!)).toString()).toBe("second pdf");
+    expect(b!.endsWith("_report-1.pdf")).toBe(true);
+  });
+
   it("returns null and does not throw on bad baseDir (parent unwritable)", async () => {
     // Use a path under /dev/null (a non-directory) so mkdir fails immediately
     // with ENOTDIR on both macOS and Linux. This avoids slow probe paths in

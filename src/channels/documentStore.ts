@@ -1,6 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "../logger.js";
+import { writeWithoutOverwrite } from "./attachment-write.js";
 
 export interface DocumentSaveMeta {
   /** Logical session or chat identifier (e.g. "dm_shuai", "tg_12345"). */
@@ -192,14 +192,20 @@ export async function saveInboundDocument(
   baseDir: string,
 ): Promise<string | null> {
   try {
-    const { dir, fullPath } = buildDocumentPath(baseDir, mimeType, meta);
-    await mkdir(dir, { recursive: true });
-    await writeFile(fullPath, buffer);
+    const { dir, filename } = buildDocumentPath(baseDir, mimeType, meta);
+    // Same reasoning as imageStore: the destination name is deterministic and
+    // therefore collidable, so the write must never overwrite. The path
+    // returned is the path written, not the path attempted.
+    const written = await writeWithoutOverwrite(dir, filename, buffer);
+    if (!written) {
+      log.error({ dir, filename }, "Gave up finding a free filename for inbound document");
+      return null;
+    }
     log.info(
-      { path: fullPath, bytes: buffer.length, mimeType },
+      { path: written, bytes: buffer.length, mimeType },
       "Saved inbound document",
     );
-    return fullPath;
+    return written;
   } catch (err) {
     log.error({ err, mimeType, bytes: buffer.length }, "Failed to save inbound document");
     return null;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterAll, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { join } from "node:path";
 
@@ -248,10 +248,21 @@ describe("tomo backup restore — swapped between validation and copy", () => {
    * same pathname. Both resolutions return the identical canonical string, so
    * only filesystem identity separates them.
    */
+  /**
+   * Replace the validated backup with a different directory at the same path.
+   *
+   * Order matters: the replacement is created while the original still
+   * exists (renamed aside), so the filesystem cannot hand it the inode it just
+   * freed. ext4 reuses freed inodes eagerly, and an rm-then-mkdir swap on
+   * Linux CI produced a "new" directory with the OLD dev+ino — indistinguishable
+   * from no swap at all, which is precisely what the guard keys on.
+   */
   const swapForAnotherDirectory = (): void => {
-    rmSync(validDir, { recursive: true, force: true });
+    const aside = `${validDir}.aside`;
+    renameSync(validDir, aside);
     mkdirSync(join(validDir, "data"), { recursive: true });
     writeFileSync(join(validDir, "data", "loot.txt"), "attacker payload");
+    rmSync(aside, { recursive: true, force: true });
   };
 
   it("aborts when the directory is replaced by another directory at the same path", async () => {
@@ -262,8 +273,9 @@ describe("tomo backup restore — swapped between validation and copy", () => {
       yield "y\n";
     })());
 
-    // Guard the guard: if the replacement happened to reuse the inode there
-    // would be nothing to detect, and the test would pass for the wrong reason.
+    // Guard the guard: the swap is built so the replacement cannot reuse the
+    // inode (see swapForAnotherDirectory). If it ever did, there would be
+    // nothing to detect and the test would pass for the wrong reason.
     const after = statSync(validDir);
     expect([after.dev, after.ino]).not.toEqual([before.dev, before.ino]);
 

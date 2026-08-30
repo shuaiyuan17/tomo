@@ -148,6 +148,8 @@ Custom context management that operates on the SDK's JSONL session files directl
 - `compact.ts` / `stats.ts` / `prune-tools.ts` — range summarization, usage breakdown, tool-result pruning
 - `blocks.ts` + `runner.ts` — hierarchical rollups (daily → weekly → monthly → yearly summary blocks); the runner nudges the agent when a completed period is due for promotion
 
+Any code path that rewrites a JSONL file it just read must call `parseJsonl(text, { preserveUnparseable: true })` and write records back with `serializeJsonlRecord` — the default tolerance drops malformed lines, which is fine for a reader and permanent data loss for a rewriter. Opting in widens the element type to `(T | RawJsonlLine)` (see the exported `SdkEntry`), so the compiler forces you to narrow with `isRawJsonlLine` before touching any field. Call `reportRawJsonlLines` after parsing so preserved corruption is visible in the logs. Read-only consumers keep the default.
+
 The harness emits context nudges at `lcm.nudgeAtPct` usage (default 70%, `src/config.ts`), escalating prune → daily rollup → full compact at 80% (decision logic in `src/agent/context-nudge.ts`).
 
 ## Code Conventions

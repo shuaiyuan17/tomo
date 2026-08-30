@@ -80,6 +80,9 @@ export function resolveTimeRange(
   let lastUuid: string | undefined;
 
   for (const e of events) {
+    // Read-only mode hands out every valid-JSON line as a value, `null` and
+    // arrays included; neither is an event.
+    if (e === null || typeof e !== "object" || Array.isArray(e)) continue;
     if (e.type !== "user" && e.type !== "assistant") continue;
 
     const tsMs = e.timestamp ? new Date(e.timestamp).getTime() : NaN;
@@ -150,6 +153,7 @@ export function computeContextStats(
   const events: ParsedEvent[] = [];
 
   for (const e of sdkEvents) {
+    if (e === null || typeof e !== "object" || Array.isArray(e)) continue;
     const type = e.type;
     if (type !== "user" && type !== "assistant") continue;
 

@@ -8,9 +8,10 @@ import {
   readSinceOffsetFromFd,
   readWholeFileFromFd,
   sleepMs,
+  type SdkEntry,
 } from "./compact.js";
 import { log } from "../logger.js";
-import { parseJsonl } from "../jsonl.js";
+import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 
 export interface PruneToolsRequest {
   sdkSessionId: string;
@@ -24,6 +25,11 @@ export interface PruneToolsRequest {
   includeImages?: boolean;
   /** Preview only, don't modify the file */
   dryRun?: boolean;
+  /**
+   * Drop lines that cannot be parsed instead of preserving them verbatim.
+   * See `tomo lcm prune-tools --drop-unparseable`; off by default.
+   */
+  dropUnparseable?: boolean;
   /** Path to archive original content */
   archivePath?: string;
 }
@@ -86,11 +92,20 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   // Pinned snapshot up to the last complete line; partial mid-write bytes
   // stay outside it and are handled by the late-splice loop below.
   const snapshot = readWholeFileFromFd(sourceFd);
-  const events = parseJsonl<SdkEvent>(snapshot.text);
+  // preserveUnparseable: this function rewrites the file it just read. Carried
+  // lines have no `message`, so every prune loop below skips them on its own
+  // `evt.message?.content` guard; they are simply re-emitted where they were.
+  const events: SdkEntry[] = req.dropUnparseable
+    ? parseJsonl<SdkEvent>(snapshot.text)
+    : parseJsonl<SdkEvent>(snapshot.text, { preserveUnparseable: true });
+  if (!req.dropUnparseable) {
+    reportRawJsonlLines(events, { sessionId: req.sdkSessionId, op: "prune-tools" }, { dryRun: req.dryRun === true });
+  }
 
   // Build a map of tool_use_id -> tool name from assistant tool_use events
   const toolNameById = new Map<string, string>();
   for (const evt of events) {
+    if (isRawJsonlLine(evt)) continue;
     const content = evt.message?.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
@@ -105,6 +120,7 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   const includeImages = req.includeImages !== false; // default true
 
   for (const evt of events) {
+    if (isRawJsonlLine(evt)) continue;
     const content = evt.message?.content;
     if (!Array.isArray(content)) continue;
 
@@ -190,15 +206,19 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   // Late-arrival splice: pick up events the SDK appended after our snapshot
   // so the rewrite doesn't truncate them. Mirrors compactSession's loop;
   // late events are appended as-is (they're this turn's fresh activity).
-  const lateEvents: SdkEvent[] = [];
+  const lateEvents: SdkEntry[] = [];
   const seenLateUuids = new Set<string>();
   let cursor = snapshot.size;
   let partialStillPending = false;
   for (let pass = 0; pass < 8; pass++) {
     const { events: late, readUpTo, hasPartialTail } = readSinceOffsetFromFd(sourceFd, cursor);
     for (const e of late) {
+      if (isRawJsonlLine(e)) {
+        lateEvents.push(e);
+        continue;
+      }
       if (e.uuid && seenLateUuids.has(e.uuid)) continue;
-      lateEvents.push(e as SdkEvent);
+      lateEvents.push(e);
       if (e.uuid) seenLateUuids.add(e.uuid);
     }
     cursor = readUpTo;
@@ -224,7 +244,7 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   // SDK's appender sees the old file fully or the new file fully — never a
   // half-written state. The temp name is per-process/per-call so two
   // concurrent prune invocations can't overwrite or rename each other's file.
-  const output = [...events, ...lateEvents].map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const output = [...events, ...lateEvents].map(serializeJsonlRecord).join("\n") + "\n";
   const tmp = `${path}.${process.pid}.${randomUUID()}.pruning.tmp`;
   try {
     writeFileSync(tmp, output);

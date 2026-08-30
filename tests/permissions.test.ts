@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, it, expect, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -395,7 +395,13 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
     expect(isPrivateMemoryAccess("Read", { file_path: "MEMORY/private/secret.md" }, realCtx)).toBe(true);
   });
 
-  it("denies a case-permuted symlink hop into private/", () => {
+  it("denies a case-permuted symlink hop into private/", ({ skip }) => {
+    // Only a case-folding filesystem (APFS on macOS) resolves `NOTES` to the
+    // `notes` link at all — on a case-sensitive volume (CI's ext4) the name
+    // does not exist, the read would ENOENT, and there is nothing to deny.
+    // The lexical fold in isInside() is exercised by the PRIVATE/ case above
+    // on both; this one needs the kernel's cooperation, so probe for it.
+    if (!existsSync(join(realCtx.memoryDir, "PRIVATE"))) skip();
     expect(isPrivateMemoryAccess("Read", { file_path: "memory/NOTES/secret.md" }, realCtx)).toBe(true);
   });
 });

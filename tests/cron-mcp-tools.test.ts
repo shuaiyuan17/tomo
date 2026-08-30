@@ -98,6 +98,71 @@ describe("cron MCP tools", () => {
     expect(jobs[0].nextRunAt).toBeTruthy();
   });
 
+  it("schedule_enable — brings back a job left disabled by an interrupted run", async () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "remind me",
+      sessionKey: "dm:alice",
+    });
+    // Dispatched, then the daemon died mid-run; recovery disables it rather
+    // than firing a second time. The agent's only way back was to re-create
+    // the job from scratch.
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
+
+    const result = await findTool("schedule_enable").handler({ id: job.id }, {});
+    expect(result.isError).toBeFalsy();
+    const summary = JSON.parse(result.content[0].text);
+    expect(summary.enabled).toBe(true);
+    expect(summary.lastStatus).toBeNull();
+    expect(summary.nextRunAt).toBeTruthy();
+
+    // And the fix sticks: the next daemon start must not settle it as
+    // interrupted all over again.
+    const outcome = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(outcome.skipped).toHaveLength(0);
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(true);
+  });
+
+  it("schedule_enable — disables without deleting, and reports a missing job", async () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "daily",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "morning",
+      sessionKey: "dm:alice",
+    });
+
+    const off = await findTool("schedule_enable").handler({ id: job.id, enabled: false }, {});
+    const summary = JSON.parse(off.content[0].text);
+    expect(summary.enabled).toBe(false);
+    expect(summary.nextRunAt).toBeNull();
+    expect(new CronStore(TEST_PATH).list()).toHaveLength(1);
+
+    const missing = await findTool("schedule_enable").handler({ id: "nope1234" }, {});
+    expect(missing.content[0].text).toContain("not found");
+  });
+
+  it("schedule_list — surfaces the interrupted state and the dispatch time", async () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "hourly",
+      schedule: { kind: "every", everyMs: 3_600_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+
+    const result = await findTool("schedule_list").handler({}, {});
+    const [summary] = JSON.parse(result.content[0].text);
+    expect(summary.lastStatus).toBe("interrupted");
+    expect(summary.lastStartedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
   it("schedule_remove — removes existing job; not-found returns text without isError", async () => {
     const create = findTool("schedule_create");
     const created = await create.handler({

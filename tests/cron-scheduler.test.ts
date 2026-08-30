@@ -358,6 +358,134 @@ describe("CronScheduler", () => {
     expect(bodies(calls)[1]).toBe('Scheduled task "hourly" triggered. tick');
   });
 
+  // --- failure handling around the store -------------------------------
+
+  it("does not scan for due jobs until recovery has persisted", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    storeA.add({
+      name: "quiet-hours",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "Do the upgrade.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // Daemon 2 comes up with an unwritable store. Recovery is the only thing
+    // standing between the scan and a duplicate run, so a failed recovery must
+    // stop the scan — not fire the job unmarked and hope.
+    const second = hangingAgent();
+    const storeB = new CronStore(TEST_PATH);
+    const recover = vi.spyOn(storeB, "recoverInterrupted");
+    recover.mockImplementationOnce(() => { throw new Error("EIO: store unwritable"); });
+    const schedulerB = new CronScheduler(second.agent, storeB);
+
+    // Not awaited: if the scan runs anyway it dispatches the hanging turn and
+    // the tick never settles — the assertion below should be what fails.
+    void tick(schedulerB);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(second.calls).toHaveLength(0);
+
+    // Next poll: the store is writable again, recovery lands, and the job
+    // fires exactly once — with its marker. (The turn hangs, so the tick is
+    // not awaited; the fire itself is what is being asserted.)
+    void tick(schedulerB);
+    await waitFor(() => expect(second.calls).toHaveLength(1));
+    expect(bodies(second.calls)[0]).toContain("[resumed]");
+  });
+
+  it("does not record an error when the turn succeeded and only the write failed", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "send-the-order",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "Place the order.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const agent = {
+      handleCronMessage: vi.fn(() => Promise.resolve(true)),
+    } as unknown as Agent;
+
+    const markRun = vi.spyOn(store, "markRun");
+    markRun.mockImplementationOnce(() => { throw new Error("ENOSPC"); });
+
+    const scheduler = new CronScheduler(agent, store);
+    await tick(scheduler);
+
+    // The one-shot's turn ran and succeeded. Recording "error" here would put
+    // it back on the failure-retry path (nextRunAt = now + 5min) and place the
+    // order a second time.
+    expect(markRun.mock.calls.map((c) => c[1])).not.toContain("error");
+    // ...and it is held out of the scan while the write is retried.
+    await tick(scheduler);
+    expect(agent.handleCronMessage).toHaveBeenCalledTimes(1);
+
+    // Once the store recovers, the outcome lands: the one-shot is deleted.
+    expect(store.list()).toHaveLength(0);
+  });
+
+  it("parks a finished one-shot whose outcome can never be written, instead of retrying it", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "send-the-order",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "Place the order.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const agent = {
+      handleCronMessage: vi.fn(() => Promise.resolve(true)),
+    } as unknown as Agent;
+
+    vi.spyOn(store, "markRun").mockImplementation(() => { throw new Error("ENOSPC"); });
+    const scheduler = new CronScheduler(agent, store);
+
+    // Dispatch, then several more polls' worth of failed outcome writes.
+    for (let i = 0; i < 5; i++) await tick(scheduler);
+
+    expect(agent.handleCronMessage).toHaveBeenCalledTimes(1);
+    const job = new CronStore(TEST_PATH).list()[0];
+    expect(job.enabled).toBe(false);
+    expect(job.nextRunAt).toBeNull();
+    expect(job.lastStatus).toBe("ok");
+    expect(job.retryCount ?? 0).toBe(0);
+  });
+
+  it("retries a job whose dispatch record could not be written, instead of wedging it", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "hourly",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    const agent = {
+      handleCronMessage: vi.fn(() => Promise.resolve(true)),
+    } as unknown as Agent;
+
+    const markStarted = vi.spyOn(store, "markStarted");
+    markStarted.mockImplementationOnce(() => { throw new Error("EIO"); });
+
+    const scheduler = new CronScheduler(agent, store);
+    await tick(scheduler);
+    // Nothing was dispatched — and the job must not be stranded in the
+    // in-flight set, which would hide it from every later scan this process
+    // makes.
+    expect(agent.handleCronMessage).not.toHaveBeenCalled();
+
+    await tick(scheduler);
+    expect(agent.handleCronMessage).toHaveBeenCalledTimes(1);
+    expect(store.list()[0].lastStatus).toBe("ok");
+  });
+
   it("delivers the trigger as a cron tomo-event envelope (round-trip)", async () => {
     const store = new CronStore(TEST_PATH);
     store.add({

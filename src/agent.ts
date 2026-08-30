@@ -86,6 +86,14 @@ interface CronTurnOptions {
    *  (delegate sends to a raw channel:chatId target canonicalized to a dm
    *  session key). */
   deliveryTarget?: ReplyTarget;
+  /** When this turn is handed to an active summoned dm session, resolve only
+   *  once that turn has actually run, instead of once it has been queued.
+   *  Callers that record a completion (CronScheduler.markRun advances or
+   *  deletes the job) must set this, or they record success before any work
+   *  happens. Off by default because the delegate path calls this from inside
+   *  a session turn that the handoff target may be waiting on — see
+   *  processCronMessage. */
+  waitForHandoff?: boolean;
 }
 
 /**
@@ -1289,15 +1297,28 @@ export class Agent {
       const parsed = parseRawSessionKey(sessionKey)!;
       const prompt = `${message}\n${this.summonReminder([`${parsed.channelName}:${parsed.chatId}`])}`;
       log.info({ from: sessionKey, to: summonedKey }, "Group background turn handed to active summoned session");
-      // This path is also used by send_message(delegate). If the summoning dm:
-      // session requested that delegate, awaiting its own queue would deadlock;
-      // schedule the owned follow-up and report that it was accepted.
-      this.enqueueForSession(summonedKey, () => this.processCronMessage(prompt, summonedKey, {
+      const handoff = this.enqueueForSession(summonedKey, () => this.processCronMessage(prompt, summonedKey, {
         ...options,
         // Summoned turns retain the private-output safety model. Group-facing
         // output must use the explicit direct-send path named in the reminder.
         deliveryTarget: undefined,
-      })).catch((err) => {
+      }));
+      // A caller that records completion (the cron scheduler advances or
+      // deletes the job on the returned boolean) must wait for the handed-off
+      // turn — otherwise the job is marked done, and a one-shot deleted,
+      // before the work runs, and a daemon that stops in between loses it with
+      // no interrupted-run trace. Safe here because the handoff target is a
+      // different queue from the group session we were enqueued on.
+      if (options.waitForHandoff) {
+        return handoff.catch((err) => {
+          log.error({ err, sessionKey: summonedKey }, "Summoned group background turn failed in queue");
+          return false;
+        });
+      }
+      // This path is also used by send_message(delegate). If the summoning dm:
+      // session requested that delegate, awaiting its own queue would deadlock;
+      // schedule the owned follow-up and report that it was accepted.
+      handoff.catch((err) => {
         log.error({ err, sessionKey: summonedKey }, "Summoned group background turn failed in queue");
       });
       return true;

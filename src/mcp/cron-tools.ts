@@ -94,7 +94,7 @@ export function buildCronTools(storePath?: string) {
         "",
         "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
         "",
-        "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. A `once` job in that state is left disabled rather than re-fired; re-enable it only after checking whether the task actually completed.",
+        "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. Such a job is left disabled rather than re-fired; use `schedule_enable` to run it again, and only after checking whether the task actually completed.",
       ].join("\n"),
       {},
       async () => {
@@ -106,6 +106,35 @@ export function buildCronTools(storePath?: string) {
       },
       {
         searchHint: "list scheduled tasks reminders crons jobs audit",
+      },
+    ),
+    tool(
+      "schedule_enable",
+      [
+        "Enable or disable a scheduled task without deleting it.",
+        "",
+        "The main use is a job left disabled after an interrupted run (`lastStatus: \"interrupted\"` in `schedule_list`) — the daemon restarted mid-run, so the task may already have done its work. Check that first; enabling it runs it again. Enabling clears the interrupted state and recomputes the next run (a one-shot whose time has passed fires on the next poll).",
+        "",
+        "Pass `enabled: false` to park a job you want to keep but not run.",
+        "",
+        "Returns the updated job, or `not_found`.",
+      ].join("\n"),
+      {
+        id: z.string().min(1).describe("The job id from `schedule_list` (e.g. `f43d8a93`)."),
+        enabled: z.boolean().optional().describe("Target state. Defaults to true (enable)."),
+      },
+      async ({ id, enabled }) => {
+        const store = new CronStore(storePath);
+        const job = store.setEnabled(id, enabled ?? true);
+        if (!job) {
+          return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
+        }
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
+        };
+      },
+      {
+        searchHint: "enable disable resume pause reactivate scheduled task reminder cron job interrupted",
       },
     ),
     tool(

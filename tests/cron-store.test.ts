@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CronStore,
+  MAX_RESUME_ATTEMPTS,
   isInterrupted,
+  mergeWithDisk,
   ONE_SHOT_MAX_RETRIES,
   ONE_SHOT_RETRY_DELAY_MS,
   parseScheduleString,
@@ -9,6 +11,8 @@ import {
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+type CronJobLike = Record<string, unknown> & { id: string };
 
 const TEST_DIR = join(tmpdir(), "tomo-test-cron");
 const TEST_PATH = join(TEST_DIR, "jobs.json");
@@ -498,7 +502,8 @@ describe("CronStore interrupted-run recovery", () => {
 
     const { resumed, skipped } = new CronStore(TEST_PATH).recoverInterrupted();
     expect(resumed).toHaveLength(0);
-    expect(skipped.map((j) => j.id)).toEqual([job.id]);
+    expect(skipped.map((s) => s.job.id)).toEqual([job.id]);
+    expect(skipped[0].reason).toBe("once");
 
     const after = new CronStore(TEST_PATH).list()[0];
     expect(after.enabled).toBe(false);
@@ -552,6 +557,286 @@ describe("CronStore interrupted-run recovery", () => {
     expect(outcome.resumed).toHaveLength(0);
     expect(outcome.skipped).toHaveLength(0);
     expect(store.getDueJobs()).toHaveLength(1);
+  });
+});
+
+describe("CronStore crash-loop cap and clock independence", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  function addRecurring(store: CronStore) {
+    return store.add({
+      name: "recurring",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+  }
+
+  it("stops resuming a job that is interrupted on every restart", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = addRecurring(store);
+
+    // A turn that takes the daemon down with it: dispatch, die, recover,
+    // dispatch again... Without a cap this repeats forever, once per restart.
+    for (let attempt = 1; attempt <= MAX_RESUME_ATTEMPTS; attempt++) {
+      store.markStarted(job.id);
+      const outcome = new CronStore(TEST_PATH).recoverInterrupted();
+      expect(outcome.resumed).toHaveLength(1);
+      expect(outcome.resumed[0].resumeAttempts).toBe(attempt);
+      expect(outcome.skipped).toHaveLength(0);
+    }
+
+    store.markStarted(job.id);
+    const final = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(final.resumed).toHaveLength(0);
+    expect(final.skipped.map((s) => s.reason)).toEqual(["resume-cap"]);
+
+    const after = new CronStore(TEST_PATH).list()[0];
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt).toBeNull();
+    expect(after.lastStatus).toBe("interrupted");
+  });
+
+  it("a run that reaches an outcome clears the crash-loop budget", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = addRecurring(store);
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    expect(new CronStore(TEST_PATH).list()[0].resumeAttempts).toBe(1);
+
+    const live = new CronStore(TEST_PATH);
+    live.markStarted(job.id);
+    live.markRun(job.id, "ok");
+    expect(new CronStore(TEST_PATH).list()[0].resumeAttempts).toBeUndefined();
+
+    // ...so the next interruption starts counting from one again.
+    live.markStarted(job.id);
+    const outcome = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(outcome.resumed[0].resumeAttempts).toBe(1);
+  });
+
+  it("reads completion from the run token, not the clock", () => {
+    // A completed run whose wall clock stepped BACKWARDS mid-turn (NTP
+    // correction, VM snapshot resume): lastRunAt is earlier than
+    // lastStartedAt. A timestamp comparison calls that interrupted and
+    // re-fires finished work; the run token says it completed.
+    const started = Date.now();
+    writeFileSync(TEST_PATH, JSON.stringify({
+      version: 1,
+      jobs: [{
+        id: "clockjmp",
+        name: "clock-jumper",
+        enabled: true,
+        schedule: { kind: "every", everyMs: 60_000 },
+        message: "x",
+        sessionKey: "dm:alice",
+        deleteAfterRun: false,
+        createdAt: started - 120_000,
+        nextRunAt: started + 60_000,
+        lastStartedAt: started,
+        lastRunAt: started - 5_000,
+        lastRunId: "run-1",
+        lastCompletedRunId: "run-1",
+        lastStatus: "ok",
+      }],
+    }));
+
+    const store = new CronStore(TEST_PATH);
+    expect(isInterrupted(store.list()[0])).toBe(false);
+    const outcome = store.recoverInterrupted();
+    expect(outcome.resumed).toHaveLength(0);
+    expect(outcome.skipped).toHaveLength(0);
+    expect(new CronStore(TEST_PATH).list()[0].lastStatus).toBe("ok");
+  });
+
+  it("still flags a dispatch whose token was never acknowledged, whatever the clock says", () => {
+    const started = Date.now();
+    writeFileSync(TEST_PATH, JSON.stringify({
+      version: 1,
+      jobs: [{
+        id: "clockjm2",
+        name: "clock-jumper",
+        enabled: true,
+        schedule: { kind: "every", everyMs: 60_000 },
+        message: "x",
+        sessionKey: "dm:alice",
+        deleteAfterRun: false,
+        createdAt: started - 120_000,
+        nextRunAt: started - 1_000,
+        lastStartedAt: started,
+        // Clock stepped FORWARD after the previous completion, so the naive
+        // comparison reads "already finished" and the interrupted run is lost.
+        lastRunAt: started + 5_000,
+        lastRunId: "run-2",
+        lastCompletedRunId: "run-1",
+        lastStatus: "ok",
+      }],
+    }));
+
+    expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
+    expect(new CronStore(TEST_PATH).recoverInterrupted().resumed).toHaveLength(1);
+  });
+
+  it("markUnacked parks a finished run whose outcome could not be recorded", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "place the order",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    store.markUnacked(job.id, "ok");
+
+    const after = new CronStore(TEST_PATH).list()[0];
+    // Not deleted (that write is what failed) but not retriable either, and
+    // the run token is acknowledged so recovery leaves it alone.
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt).toBeNull();
+    expect(after.lastStatus).toBe("ok");
+    expect(isInterrupted(after)).toBe(false);
+    expect(new CronStore(TEST_PATH).getDueJobs()).toHaveLength(0);
+  });
+
+  it("re-enabling clears the interrupted state so recovery leaves the job alone", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "remind me",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
+
+    const reenabled = new CronStore(TEST_PATH).setEnabled(job.id, true);
+    expect(reenabled?.enabled).toBe(true);
+    expect(reenabled?.lastStatus).toBeNull();
+
+    // Without clearing the token, the next daemon start would settle this as
+    // interrupted all over again and disable the job the operator just fixed.
+    const outcome = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(outcome.skipped).toHaveLength(0);
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(true);
+  });
+});
+
+describe("CronStore concurrent writers", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  function addRecurring(store: CronStore) {
+    return store.add({
+      name: "recurring",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+  }
+
+  /**
+   * Land another process's write inside this store's load→save window. `get`
+   * is called after the reload and before the save in every mutator, which is
+   * exactly the gap a real second process can slip into.
+   */
+  function interleave(store: CronStore, other: () => void): void {
+    const realGet = store.get.bind(store);
+    vi.spyOn(store, "get").mockImplementationOnce((id: string) => {
+      const found = realGet(id);
+      other();
+      return found;
+    });
+  }
+
+  it("a CLI write does not erase a dispatch record the daemon made mid-write", () => {
+    const daemon = new CronStore(TEST_PATH);
+    const job = addRecurring(daemon);
+
+    // The CLI process reloads, then the daemon dispatches a run, then the CLI
+    // saves. Its snapshot predates lastRunId — the losing write would take
+    // the only durable evidence of the in-flight run with it, and the restart
+    // that follows would re-fire the job.
+    const cli = new CronStore(TEST_PATH);
+    let runId: string | undefined;
+    interleave(cli, () => { runId = daemon.markStarted(job.id); });
+    cli.setEnabled(job.id, false);
+
+    const merged = new CronStore(TEST_PATH).list()[0];
+    expect(merged.enabled).toBe(false);      // the CLI's own edit lands
+    expect(merged.lastRunId).toBe(runId);    // ...without reverting the daemon's
+    expect(merged.lastStartedAt).toBeGreaterThan(0);
+    expect(isInterrupted(merged)).toBe(true);
+  });
+
+  it("a dispatch record does not revert a session rename made mid-write", () => {
+    const daemon = new CronStore(TEST_PATH);
+    const job = addRecurring(daemon);
+
+    const cli = new CronStore(TEST_PATH);
+    interleave(daemon, () => { cli.rewriteSessionKey("dm:alice", "dm:bob"); });
+    const runId = daemon.markStarted(job.id);
+
+    const merged = new CronStore(TEST_PATH).list()[0];
+    expect(merged.sessionKey).toBe("dm:bob");
+    expect(merged.lastRunId).toBe(runId);
+  });
+
+  it("a job added mid-write survives, and one removed mid-write stays removed", () => {
+    const daemon = new CronStore(TEST_PATH);
+    const job = addRecurring(daemon);
+    const doomed = daemon.add({
+      name: "doomed",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "y",
+      sessionKey: "dm:carol",
+    });
+
+    const cli = new CronStore(TEST_PATH);
+    interleave(daemon, () => {
+      cli.add({ name: "late", schedule: { kind: "every", everyMs: 60_000 }, message: "z", sessionKey: "dm:dave" });
+      cli.remove(doomed.id);
+    });
+    daemon.markStarted(job.id);
+
+    const names = new CronStore(TEST_PATH).list().map((j) => j.name).sort();
+    expect(names).toEqual(["late", "recurring"]);
+  });
+
+  it("mergeWithDisk keeps each writer's own edits and both deletions", () => {
+    const base = (over: Partial<CronJobLike> = {}): CronJobLike => ({
+      id: "a", name: "a", enabled: true, message: "m", sessionKey: "dm:alice",
+      deleteAfterRun: false, createdAt: 1, nextRunAt: 10, lastRunAt: null,
+      lastStatus: null, schedule: { kind: "every", everyMs: 60_000 }, ...over,
+    });
+    const baseline = new Map([["a", base()], ["gone", base({ id: "gone" })]]);
+    const ours = [base({ enabled: false }), base({ id: "mine" })];
+    const theirs = [base({ lastRunId: "r1" }), base({ id: "gone" }), base({ id: "yours" })];
+
+    const merged = mergeWithDisk(
+      baseline as never,
+      ours as never,
+      theirs as never,
+    ) as unknown as CronJobLike[];
+    const byId = new Map(merged.map((j) => [j.id, j]));
+
+    expect(byId.get("a")?.enabled).toBe(false);   // our field edit
+    expect(byId.get("a")?.lastRunId).toBe("r1");  // their field edit
+    expect(byId.has("gone")).toBe(false);         // we deleted it
+    expect(byId.has("mine")).toBe(true);          // we added it
+    expect(byId.has("yours")).toBe(true);         // they added it
   });
 });
 

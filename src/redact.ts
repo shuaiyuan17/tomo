@@ -27,16 +27,43 @@
  * them. Matched against the field name lowercased with separators removed, so
  * `api_key`, `apiKey` and `API-KEY` are all `apikey`.
  */
+/**
+ * Words that make a field a credential when they appear as a whole segment of
+ * its name. SEGMENT, not substring: `tokens` is not a `token`.
+ *
+ * Substring matching shipped in the first revision of this and redacted
+ * `tokens` out of every "Run completed" line — the daemon's most useful log
+ * record, whose `tokens` field is the string `"in:1234 out:567"`. `inputTokens`,
+ * `maxTokens` and `contextBreakdown[].tokens` went the same way. Plurals are
+ * deliberately absent for `token` because no credential in this codebase is
+ * named with one (the OAuth store uses `accessToken` / `refreshToken`), while
+ * every token COUNT is plural. `credential`/`secret` keep their plurals,
+ * because `credentials` and `secrets` really are used for the thing itself.
+ */
 const SECRET_WORDS = [
   "token",
   "secret",
+  "secrets",
   "password",
   "passwd",
+  "pwd",
   "apikey",
   "authorization",
   "cookie",
   "credential",
+  "credentials",
 ];
+
+/**
+ * Words that make a name a measurement of a credential rather than the
+ * credential. `tokenCount` is the case that needs this: it splits to
+ * `token` + `count`, so segment matching alone would still redact it.
+ *
+ * Kept to unambiguous metric nouns. `used`, `max` and `min` are deliberately
+ * NOT here — `tokenUsed` could plausibly name the credential that was used,
+ * and the plural forms (`maxTokens`) are already excluded by segment matching.
+ */
+const COUNT_WORDS = ["count", "counts", "length", "size", "limit", "total", "usage", "budget", "remaining"];
 
 /**
  * Qualifiers that turn a `…Key` name into a credential.
@@ -63,14 +90,26 @@ const SECRET_KEY_QUALIFIERS = [
   "master",
 ];
 
+/** Split a field name into lowercase words across camelCase, snake and kebab. */
+function nameSegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+}
+
 /** True when a field with this name holds a credential. */
 export function isSecretFieldName(name: string): boolean {
-  const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (SECRET_WORDS.some((word) => normalized.includes(word))) return true;
-  if (normalized.endsWith("key")) {
-    return SECRET_KEY_QUALIFIERS.includes(normalized.slice(0, -3));
-  }
-  return false;
+  const segments = nameSegments(name);
+  if (segments.some((word) => COUNT_WORDS.includes(word))) return false;
+  if (segments.some((word) => SECRET_WORDS.includes(word))) return true;
+  // `key` only counts when something in front of it says which kind.
+  const keyAt = segments.lastIndexOf("key");
+  if (keyAt > 0 && SECRET_KEY_QUALIFIERS.includes(segments[keyAt - 1])) return true;
+  // `apikey` written as one word survives the split as one segment, which the
+  // SECRET_WORDS check above already caught; this covers `apikeys`.
+  return segments.includes("apikeys");
 }
 
 /**
@@ -113,14 +152,26 @@ export function redactSecrets(value: unknown, fieldName?: string): unknown {
 type Censor = (value: unknown) => unknown;
 
 /**
- * Only plain objects and arrays are rebuilt. Anything else with structure —
- * Date, Map, Set, Buffer, RegExp, a class instance — is passed through
- * untouched. Rebuilding one from `Object.entries` would flatten it to `{}` and
- * silently destroy the value it was logged for.
+ * Values whose structure lives somewhere other than own enumerable properties.
+ * Rebuilding one from `Object.entries` would flatten it to `{}` and silently
+ * destroy the value it was logged for, so they pass through untouched.
+ *
+ * Everything else IS walked, including class instances. An earlier version
+ * only walked `Object.prototype` objects, which meant a config or client
+ * object nested at depth 2 — `{ mcp: { client: someInstanceWithAToken } }` —
+ * was handed back unredacted: `JSON.stringify` would happily emit its own
+ * enumerable `token` property that this never looked at.
  */
-function isPlainObject(value: object): boolean {
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+function isOpaque(value: object): boolean {
+  return value instanceof Date
+    || value instanceof RegExp
+    || value instanceof Map
+    || value instanceof Set
+    || value instanceof WeakMap
+    || value instanceof WeakSet
+    || value instanceof Promise
+    || ArrayBuffer.isView(value)
+    || value instanceof ArrayBuffer;
 }
 
 function redact(
@@ -135,7 +186,7 @@ function redact(
   // object (and that serializer is wrapped in logger.ts), and copying one here
   // would strip the prototype the serializer keys off, losing the stack.
   if (value instanceof Error) return value;
-  if (!Array.isArray(value) && !isPlainObject(value)) return value;
+  if (!Array.isArray(value) && isOpaque(value)) return value;
   // ANCESTORS, not "everything visited". A `seen` set that is never unwound
   // reports the second sighting of a shared-but-acyclic node as a cycle — and
   // config and log objects are full of shared references (the same identity
@@ -230,7 +281,7 @@ export function redactLogRecord<T>(record: T): T {
 function containsSecret(value: unknown, ancestors: Set<object>): boolean {
   if (value === null || typeof value !== "object") return false;
   if (value instanceof Error) return false;
-  if (!Array.isArray(value) && !isPlainObject(value)) return false;
+  if (!Array.isArray(value) && isOpaque(value)) return false;
   if (ancestors.has(value)) return false;
   ancestors.add(value);
   try {
@@ -299,9 +350,26 @@ export function scrubSecretValues(text: string): string {
 }
 
 /**
- * Ordered: the specific issuer formats run before the generic `key: value`
- * sweep, so a recognised token is replaced as a unit rather than being
- * half-caught by the looser rule.
+ * What a credential looks like when there is no key to identify it: either 8+
+ * characters containing a digit, or 16+ characters of anything. Never ending
+ * in punctuation, so a sentence keeps its full stop.
+ *
+ * This gate is what keeps the rules below off ordinary English. "required",
+ * "expired", "the", "meeting" and "endpoint" all fail it; a bot token, an
+ * `sk-` key and a base64 blob all pass.
+ */
+const CREDENTIAL_SHAPE = "(?:(?=[A-Za-z0-9._~+/=-]*\\d)[A-Za-z0-9._~+/=-]{7,}|[A-Za-z0-9._~+/=-]{15,})[A-Za-z0-9=]";
+
+/** Values that are facts about a credential rather than one. */
+const NOT_A_SECRET = "(?!(?:null|true|false|undefined|none|nil|unset|empty|0)\\b)";
+
+/** Field names that introduce a credential in `key: value` text. */
+const SECRET_KEY_NAMES = "access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|apikey|auth[_-]?token|bot[_-]?token|password|passwd|secret|token";
+
+/**
+ * Ordered: the specific issuer formats run first, then the header rules, then
+ * the generic key/value sweep. A recognised token is replaced as a unit rather
+ * than being half-caught by a looser rule.
  */
 const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
   // Telegram bot token: <numeric bot id>:<35-char secret>. NO leading \b —
@@ -323,14 +391,21 @@ const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\bAIza[A-Za-z0-9_-]{35}\b/g, "***"],
   // JWTs (three base64url segments).
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "***"],
-  // `Authorization: <anything>` — the whole header value, scheme included, as
-  // one unit. Runs BEFORE the Bearer rule: splitting it produces
-  // `Authorization: *** <credential>`, which redacts the scheme and publishes
-  // the secret.
-  [/(\bAuthorization["']?\s*[:=]\s*)(["'])[^"']*\2/gi, "$1$2***$2"],
-  [/(\bAuthorization\s*[:=]\s*)[^\r\n,}\]]+/gi, "$1***"],
-  // `Bearer <token>` / `Basic <token>` standing on their own, in curl
-  // commands and error messages that echo a request.
+  // `Authorization: <scheme> <credential>` / `Cookie: <value>`, quoted form.
+  // Inside quotes the key is unambiguous, so the whole value goes whatever it
+  // looks like.
+  [/\b(Authorization|Cookie|Set-Cookie)(["']?\s*[:=]\s*)(["'])[^"']*\3/gi, "$1$2$3***$3"],
+  // Unquoted header form. Consumes the scheme plus ONE token, never to end of
+  // line: `curl -H 'Authorization: Bearer …' https://example.com` must keep
+  // its URL, and `Authorization: required for this endpoint` must survive
+  // untouched, which the credential gate ensures.
+  [
+    new RegExp(`\\b(Authorization\\s*[:=]\\s*)((?:Bearer|Basic|Digest|Token|Negotiate)\\s+)?${CREDENTIAL_SHAPE}`, "gi"),
+    "$1$2***",
+  ],
+  [new RegExp(`\\b(Cookie\\s*[:=]\\s*)${NOT_A_SECRET}${CREDENTIAL_SHAPE}`, "gi"), "$1***"],
+  // `Bearer <token>` / `Basic <token>` standing on their own, in curl commands
+  // and error messages that echo a request.
   //
   // Tightly constrained, because this rule sits in front of ordinary English
   // and the cost of a false positive is a mangled log line. Verified against
@@ -343,16 +418,18 @@ const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
   //   - no `Token` alternative at all: as a scheme it is rare, and as an
   //     English word it precedes a noun in half the OAuth log lines we have.
   //     A real `Token <credential>` is still caught by the key/value rule.
-  //   - the value must LOOK like a credential: at least 16 characters and at
-  //     least one digit, which no English word or short identifier satisfies.
-  //   - the value cannot end in sentence punctuation, so "expired." keeps its
-  //     full stop.
-  [/\b(Bearer|Basic) ((?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{15,}[A-Za-z0-9=])/g, "$1 ***"],
-  // `"access_token": "..."`, `client_secret=...`, `--token abc`. The key is
-  // kept; only the value is replaced. Literal non-secrets are skipped so
-  // `token: null` — which is a fact worth logging — survives intact.
+  [new RegExp(`\\b(Bearer|Basic) (${CREDENTIAL_SHAPE})`, "g"), "$1 ***"],
+  // `"access_token": "..."` — quoted, so the key is unambiguous and the value
+  // goes whatever its shape, bar the literals that are facts worth keeping.
   [
-    /\b(access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|apikey|auth[_-]?token|bot[_-]?token|password|passwd|secret|token)(["']?\s*[:=]\s*)(["']?)(?!(?:null|true|false|undefined|none|nil|0)\b["',}\s]?)[^"'\s,;}&]+\3/gi,
+    new RegExp(`\\b(${SECRET_KEY_NAMES})(["']?\\s*[:=]\\s*)(["'])${NOT_A_SECRET}[^"']*\\3`, "gi"),
     "$1$2$3***$3",
+  ],
+  // `client_secret=hunter2hunter2`, `--token abc123def456`. Unquoted, so the
+  // value has to look like a credential — otherwise "secret: the meeting is
+  // at 3" and "authentication token: expired" lose their first word.
+  [
+    new RegExp(`\\b(${SECRET_KEY_NAMES})(["']?\\s*[:=]\\s*)${NOT_A_SECRET}${CREDENTIAL_SHAPE}`, "gi"),
+    "$1$2***",
   ],
 ];

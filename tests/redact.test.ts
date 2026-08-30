@@ -29,6 +29,30 @@ describe("redactSecrets", () => {
     });
   });
 
+  // Substring matching redacted `tokens` out of every "Run completed" line —
+  // the daemon's most useful record. A count is not a credential.
+  it("does not mistake a token COUNT for a token", () => {
+    for (const name of ["tokens", "inputTokens", "outputTokens", "maxTokens", "tokenCount", "cacheReadTokens"]) {
+      expect(isSecretFieldName(name), name).toBe(false);
+    }
+  });
+
+  it("leaves the real Run completed record intact", () => {
+    // The exact shape from live-session.ts. `tokens` is a STRING here, which
+    // is why a value-type check would not have saved it either.
+    const record = {
+      session: "dm:alice",
+      turns: 3,
+      duration: "1200ms",
+      cost: "$0.0123",
+      totalCost: "$1.2345",
+      tokens: "in:1234 out:567",
+      cache: "read:800 created:120",
+      context: "45% of 200000",
+    };
+    expect(redactLogRecord(record)).toBe(record);
+  });
+
   it("keeps routing identifiers readable", () => {
     // The whole point of a log line is usually the session it happened in.
     for (const name of ["key", "sessionKey", "storeKey", "channelKey", "chatKey", "keyword"]) {
@@ -69,6 +93,18 @@ describe("redactSecrets", () => {
     const cyclic: Record<string, unknown> = { name: "loop" };
     cyclic.self = cyclic;
     expect(redactSecrets(cyclic)).toEqual({ name: "loop", self: "[Circular]" });
+  });
+
+  // Only walking Object.prototype objects meant a class instance nested at
+  // depth 2 was handed back whole — and JSON.stringify would then emit its own
+  // enumerable `token`.
+  it("walks class instances, not just plain objects", () => {
+    class Client {
+      url = "https://api.example.com";
+      token = "sk-ant-NESTEDSECRET123456";
+    }
+    expect(redactLogRecord({ a: { cfg: new Client() } }))
+      .toEqual({ a: { cfg: { url: "https://api.example.com", token: "[Redacted]" } } });
   });
 
   it("passes structured non-plain values through instead of flattening them", () => {
@@ -182,18 +218,38 @@ describe("scrubSecretValues", () => {
       "Read /Users/x/notes.md (240 lines)",
       "Basic auth is not configured",
       "token: null",
+      // Header names in front of prose, not credentials.
+      "Authorization: required for this endpoint",
+      "Cookie: required",
+      // The key/value rule used to eat the first word of the sentence.
+      "secret: the meeting is at 3",
+      "authentication token: expired",
+      "password: unset",
     ];
     for (const line of untouched) {
       expect(scrubSecretValues(line), line).toBe(line);
     }
   });
 
+  // The unquoted Authorization rule used to consume to end of line, which
+  // destroyed the rest of a curl command in tomo.log and the watch feed.
+  it("takes the credential out of a header without eating the rest of the line", () => {
+    expect(scrubSecretValues("curl -H 'Authorization: Bearer abc123def456ghi789' https://example.com/api"))
+      .toBe("curl -H 'Authorization: Bearer ***' https://example.com/api");
+    expect(scrubSecretValues("Cookie: session=abc123def456ghi789; Path=/"))
+      .toContain("Path=/");
+    expect(scrubSecretValues("Cookie: session=abc123def456ghi789; Path=/"))
+      .not.toContain("abc123def456");
+    expect(scrubSecretValues('{"Set-Cookie":"sid=abcdef123456"}'))
+      .toBe('{"Set-Cookie":"***"}');
+  });
+
   it("still catches a real Bearer credential", () => {
-    // The whole header value goes, scheme included — redacting only the
-    // credential and keeping "Bearer" would be splitting the rule that has to
-    // stay atomic.
+    // The scheme is kept and only the credential goes. Consuming the whole
+    // value looks tidier but the unquoted rule then has to run to end of line,
+    // which destroys the rest of a curl command.
     expect(scrubSecretValues("Authorization: Bearer abc123def456ghi789jkl"))
-      .toBe("Authorization: ***");
+      .toBe("Authorization: Bearer ***");
     // ...and does not eat the sentence's full stop.
     expect(scrubSecretValues("sent Bearer abc123def456ghi789jkl."))
       .toBe("sent Bearer ***.");

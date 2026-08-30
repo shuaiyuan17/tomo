@@ -11,6 +11,10 @@
  * guessing at fields.
  */
 
+// Type-only, so it is erased at compile time and cannot create a runtime
+// import cycle with the agent modules that publish these events.
+import type { FabricatedMarkerShape } from "../agent/inbound-markers.js";
+
 export const WATCH_PROTOCOL_VERSION = 1;
 
 export type TurnSource = "user" | "cron" | "continuity";
@@ -39,8 +43,10 @@ export type WatchEvent =
   | { type: "issue"; ts: number; level: "warn" | "error"; msg: string }
   /** The MODEL wrote a line shaped like an inbound harness marker into its own
    *  reply. The block still ships (marked, not truncated) — see
-   *  src/agent/inbound-markers.ts. */
-  | { type: "fabricated-marker"; ts: number; sessionKey?: string; shape: string; marker: string };
+   *  src/agent/inbound-markers.ts. `shape` is the closed union rather than
+   *  `string` so the compiler, not a comment, is what keeps the Prometheus
+   *  label set bounded (the exporter labels its counter with it). */
+  | { type: "fabricated-marker"; ts: number; sessionKey?: string; shape: FabricatedMarkerShape; marker: string };
 
 export type WatchIssue = Extract<WatchEvent, { type: "issue" }>;
 

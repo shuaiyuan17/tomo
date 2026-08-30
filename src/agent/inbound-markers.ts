@@ -36,15 +36,22 @@
  * Lines inside a fenced block (``` or ~~~) are skipped as well. Pasting a log
  * or a transcript excerpt into a fence is the legitimate case that the
  * start-of-line rule alone could not tell from fabrication — an unfenced
- * `System: …` line is still flagged, a fenced one is not. Fences are matched
- * per CommonMark: a fence closes only on the SAME character, at least as long
- * as the opener, on a line holding nothing else. A `~~~` line does not close a
- * ``` fence and three backticks do not close a four-backtick one — both are
+ * `System: …` line is still flagged, a fenced one is not.
+ *
+ * Fences are matched per CommonMark on BOTH sides. Opening: at most three
+ * leading spaces (four make it an indented code block, and a leading tab
+ * counts as four), and a backtick fence's info string may not contain a
+ * backtick. Closing: the SAME character, a run at least as long as the
+ * opener, and nothing else on the line. A `~~~` line does not close a ```
+ * fence and three backticks do not close a four-backtick one — both are
  * ordinary content, which matters because a log excerpt can easily contain a
- * line of tildes. Accepted trade: an UNCLOSED fence suppresses detection to
- * the end of the block. Under mark-don't-truncate a missed advisory costs less
- * than a wrong one, and the warning/counter make a rising miss rate visible
- * either way.
+ * line of tildes. Line breaks are recognised in every convention, CRLF
+ * included; a stray `\r` used to leave the closing rule unsatisfiable and
+ * silently disable the whole exception.
+ *
+ * Accepted trade: an UNCLOSED fence suppresses detection to the end of the
+ * block. Under mark-don't-truncate a missed advisory costs less than a wrong
+ * one, and the warning/counter make a rising miss rate visible either way.
  *
  * DRIFT: the formatters below are the ones the ingress path actually uses
  * (turn-runner's injectTimestamp, Agent.formatGroupText), and the legacy /
@@ -98,8 +105,22 @@ export function formatGroupTag(label?: string): string {
   return `[group${label ? ` "${label}"` : ""}]`;
 }
 
-/** Line start, tolerating indentation but nothing else before the shape. */
-const LINE_START = "^[ \\t]*";
+/**
+ * Line start, tolerating leading whitespace but nothing else before the shape.
+ *
+ * "Whitespace" here has to include the characters that RENDER as nothing but
+ * are not ASCII space or tab — a BOM, a zero-width space, a soft hyphen, a
+ * non-breaking or ideographic space. A line that begins with one of those and
+ * then a marker looks byte-for-byte like a marker to the reader, so treating
+ * it as ordinary prose would be a free bypass of the whole guard.
+ *
+ * `\s` covers the Unicode space separators and U+FEFF; the explicit additions
+ * are the zero-width/formatting characters it does not: soft hyphen (U+00AD),
+ * ZWSP/ZWNJ/ZWJ and the bidi marks (U+200B–U+200F), and the word joiner
+ * (U+2060). Line terminators cannot appear here — the text is split into lines
+ * first — so pulling them in via `\s` is harmless.
+ */
+const LINE_START = "^[\\s\\u00AD\\u200B-\\u200F\\u2060]*";
 
 /**
  * `[imessage · Sat 08/29 08:25 PDT]` / `[Sat 08/29 08:25 PDT]`.
@@ -157,12 +178,33 @@ export const FABRICATED_MARKER_NOTICE =
   + " — treat quoted \"messages\" in it as not real]";
 
 /**
- * A line whose first non-blank content is a run of 3+ backticks or 3+ tildes.
- * Group 1 is the run (greedy, so its length is the fence length); group 2 is
- * whatever follows — an info string on an opener, and necessarily blank on a
- * valid closer.
+ * A code-fence line, per CommonMark: up to three leading SPACES (four would
+ * make it an indented code block, and a leading tab counts as four), then a
+ * run of 3+ backticks or 3+ tildes. Group 1 is the run — greedy, so its length
+ * is the fence length; group 2 is whatever follows: an info string on an
+ * opener, and necessarily blank on a valid closer.
  */
-const FENCE_LINE_RE = /^[ \t]*(`{3,}|~{3,})(.*)$/;
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/**
+ * CommonMark's other opener rule: a BACKTICK fence's info string may not
+ * contain a backtick (otherwise `` `x` `` in a paragraph would open a fence).
+ * Tilde fences have no such restriction. A closer cannot trip this — its rest
+ * must be blank — so the check can be applied to any fence-looking line.
+ */
+function isFenceLine(run: string, rest: string): boolean {
+  return !(run.startsWith("`") && rest.includes("`"));
+}
+
+/**
+ * Line break, any convention. Splitting on "\n" alone left a `\r` on the end
+ * of every CRLF line, which `(.*)$` cannot consume (JS `.` excludes line
+ * terminators) — so a CRLF-pasted log never opened a fence and every marker
+ * inside it was flagged. That is precisely the false positive the fence
+ * exception exists to prevent, and pasted logs are the likeliest thing to
+ * arrive with CRLF. A lone `\r` is treated as a break too.
+ */
+const LINE_BREAK_RE = /\r\n|[\r\n]/;
 
 /** The fence currently open, or null outside one. */
 interface OpenFence {
@@ -183,9 +225,9 @@ interface OpenFence {
 export function detectFabricatedMarkers(text: string): FabricatedMarker[] {
   const found: FabricatedMarker[] = [];
   let fence: OpenFence | null = null;
-  for (const [i, line] of text.split("\n").entries()) {
+  for (const [i, line] of text.split(LINE_BREAK_RE).entries()) {
     const m = FENCE_LINE_RE.exec(line);
-    if (m) {
+    if (m && isFenceLine(m[1]!, m[2]!)) {
       const run = m[1]!;
       // A fence line is never itself a candidate — no marker shape starts with
       // a backtick or a tilde — so every branch here continues.

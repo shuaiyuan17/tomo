@@ -150,11 +150,42 @@ describe("searchTranscript with records that cannot be placed in the window", ()
     expect(results.map((r) => r.content)).toEqual(["one"]);
   });
 
+  it("excludes a record with a corrupt timestamp from a toTime-bounded search", () => {
+    const day = (n: number) => Date.UTC(2026, 7, n);
+    writeJsonl(join(dir, "test.jsonl"), [
+      msg({ content: "aug 11", seq: 1, timestamp: day(11) }),
+      msg({ content: "legacy", seq: 2, timestamp: 0 }),
+      msg({ content: "aug 13", seq: 3, timestamp: day(13) }),
+    ]);
+
+    // `before` is the bound recall_conversation pages with; an epoch-0 record
+    // used to be "older than everything" and so inside every `before`.
+    const results = makeStore().searchTranscript("test", { toTime: day(12), limit: 50 });
+    expect(results.map((r) => r.content)).toEqual(["aug 11"]);
+  });
+
   it("still stops early at a record genuinely older than the window", () => {
     writeJsonl(join(dir, "test.jsonl"), Array.from({ length: 6 }, (_, i) =>
       msg({ content: `m${i + 1}`, seq: i + 1 })));
 
     const results = makeStore().searchTranscript("test", { fromSeq: 4, toSeq: 5, limit: 50 });
     expect(results.map((r) => r.seq)).toEqual([4, 5]);
+  });
+
+  it("ends the whole scan at a placeable record below the bound — archives behind it are not read", () => {
+    // Pins `break outer` as opposed to `continue`: with in-order data the two
+    // are indistinguishable, so put a record ABOVE the bound in an archive
+    // behind a record BELOW it in the active file. Early exit never sees it;
+    // a full scan would return it. (Out of order across files does not occur
+    // in practice — this is the one arrangement that makes the exit visible.)
+    writeJsonl(join(dir, "_archive_test_2020-01.jsonl"), [
+      msg({ content: "archived, above the bound", seq: 9, timestamp: Date.UTC(2020, 0, 15) }),
+    ]);
+    writeJsonl(join(dir, "test.jsonl"), [
+      msg({ content: "below the bound", seq: 1 }),
+    ]);
+
+    const results = makeStore().searchTranscript("test", { fromSeq: 5, limit: 50 });
+    expect(results).toEqual([]);
   });
 });

@@ -1,4 +1,7 @@
 node_modules/
+# The bare name too: a symlink called node_modules (a worktree convenience) is
+# not matched by the directory pattern above and was once committed by accident.
+node_modules
 dist/
 data/
 .claude/

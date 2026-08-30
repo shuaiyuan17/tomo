@@ -23,7 +23,7 @@ import { type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
 import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote, scopedCallerKeyFor } from "./agent/audience.js";
+import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
@@ -161,9 +161,9 @@ export class Agent {
   // summoning, one session interleaves private and group traffic — this is
   // how the harness detects the hop and reminds the model the audience changed.
   private lastAudiences = new Map<string, string>();
-  /** Inbound audiences of the turn currently running on each dm: session.
-   *  Read by `scopedCallerKey` while a tool call is in flight. */
-  private turnAudiences = new Map<string, string[]>();
+  /** Which turns are live on which session — the basis for scoping MCP tools
+   *  to the audience a turn actually came from. See TurnAudienceRegistry. */
+  private turnAudiences = new TurnAudienceRegistry();
   private readonly mcpOAuthManager: McpOAuthManager;
   /** Background sweep that refreshes OAuth tokens before they expire (start/stop). */
   private mcpTokenRefreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -993,39 +993,26 @@ export class Agent {
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
     // Published for the duration of the turn so session-scoped MCP tools can
-    // see where this turn's input actually came from. Cleared afterwards: a
-    // later cron or background turn on the same session is the owner's, and
-    // must not inherit a summoned group's narrower scope.
-    if (req.audiences?.length) this.turnAudiences.set(req.key, req.audiences);
+    // see where this turn's input actually came from. Registered per TURN, not
+    // per session: turns overlap under steering, and a per-key slot let the
+    // second one's cleanup unscope the first. Removed afterwards, so a later
+    // cron or background turn on the same session is the owner's again and
+    // does not inherit a summoned group's narrower scope.
+    const turnId = this.turnAudiences.begin(req.key, req.audiences);
     try {
       await this.runUserTurnInner(req);
     } finally {
-      this.turnAudiences.delete(req.key);
+      this.turnAudiences.end(req.key, turnId);
     }
   }
 
-  /**
-   * The session key a session-scoped tool should be judged against for the
-   * turn in flight.
-   *
-   * Normally this is just the session key. It is NOT for a summoned group: a
-   * summoned group's messages run on the owner's `dm:` session (router
-   * `summonGroup`), so every participant of that group is steering a session
-   * whose key says "the owner's private DM". Handing that key to a scoped tool
-   * gives the group the owner's own scope — which for the cron tools means
-   * listing, removing and re-aiming the owner's private reminders.
-   *
-   * Mixed batches fail CLOSED. A coalesced batch can carry DM messages and
-   * messages from several summoned groups at once (see `handleBatch`), and
-   * there is no single key that is correct for all of them; picking the last,
-   * or the session, would pick the *widest* scope on exactly the turn where a
-   * group's text is in the prompt. A sentinel that owns nothing is returned
-   * instead, so every scoped tool refuses and the model tells the user to use
-   * `tomo cron`.
-   */
+  /** The session key a session-scoped MCP tool should be judged against for
+   *  the turn in flight. See TurnAudienceRegistry for why this is not simply
+   *  `sessionKey`. */
   scopedCallerKey(sessionKey: string): string {
-    return scopedCallerKeyFor(sessionKey, this.turnAudiences.get(sessionKey));
+    return this.turnAudiences.scopedCallerKey(sessionKey);
   }
+
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {
     await this.turnRunner.runTurn({

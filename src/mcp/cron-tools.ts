@@ -236,21 +236,20 @@ export function buildCronTools(
       },
       async ({ id, enabled }) => {
         const store = new CronStore(storePath);
-        const existing = store.get(id);
-        if (!existing) {
-          return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
-        }
-        if (!manageable(existing)) {
+        // Guarded inside setEnabled's own load-modify-save, not against the
+        // constructor's snapshot — a job written by another process after the
+        // snapshot would otherwise skip the check entirely.
+        const job = store.setEnabled(id, enabled ?? true, manageable);
+        if (job === "refused") {
           // Deliberately does not name the owning session.
           return {
             content: [{
               type: "text" as const,
-              text: `Job ${id} belongs to a different session; this session can only enable or disable its own scheduled tasks.`,
+              text: `Job ${id} belongs to a different session; ${ELSEWHERE}`,
             }],
             isError: true,
           };
         }
-        const job = store.setEnabled(id, enabled ?? true);
         if (!job) {
           return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
         }

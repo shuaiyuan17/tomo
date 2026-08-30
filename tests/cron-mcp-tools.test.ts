@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CronStore } from "../src/cron/store.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
-import { MIXED_AUDIENCE_KEY, scopedCallerKeyFor } from "../src/agent/audience.js";
+import { MIXED_AUDIENCE_KEY, TurnAudienceRegistry, scopedCallerKeyFor } from "../src/agent/audience.js";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-cron-mcp");
 const TEST_PATH = join(TEST_DIR, "jobs.json");
@@ -494,6 +494,41 @@ describe("cron MCP tools — session scoping", () => {
     expect(new CronStore(TEST_PATH).get(job.id)).toBeTruthy();
   });
 
+  // Same window as remove(): setEnabled reloads, so a snapshot check misses
+  // anything another process wrote in between. schedule_enable is the one
+  // operation that makes a DORMANT job run again, so it is the worst place to
+  // skip an ownership check.
+  it("schedule_enable — checks ownership against the reloaded store, not a stale snapshot", () => {
+    const store = new CronStore(TEST_PATH);
+    const otherProcess = new CronStore(TEST_PATH);
+    const job = otherProcess.add({
+      name: "written-after-the-snapshot",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "private",
+      sessionKey: DM,
+    });
+    otherProcess.setEnabled(job.id, false);
+
+    expect(store.get(job.id)).toBeUndefined();
+    expect(store.setEnabled(job.id, true, (j) => j.sessionKey === GROUP)).toBe("refused");
+    expect(new CronStore(TEST_PATH).get(job.id)?.enabled).toBe(false);
+  });
+
+  it("schedule_enable — a group cannot re-enable a DM job", async () => {
+    const ids = seed();
+    new CronStore(TEST_PATH).setEnabled(ids.dm, false);
+
+    const refused = await findTool("schedule_enable", GROUP).handler({ id: ids.dm }, {});
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain("different session");
+    expect(refused.content[0].text).not.toContain(DM);
+    expect(new CronStore(TEST_PATH).get(ids.dm)?.enabled).toBe(false);
+
+    const allowed = await findTool("schedule_enable", DM).handler({ id: ids.dm }, {});
+    expect(allowed.isError).toBeFalsy();
+    expect(new CronStore(TEST_PATH).get(ids.dm)?.enabled).toBe(true);
+  });
+
   // A job with no sessionKey fires into no conversation but still runs. Scoped
   // strictly it would be invisible to everyone and unremovable through the
   // tools; canManageJob gives it to the owner's DM.
@@ -623,5 +658,96 @@ describe("scopedCallerKeyFor", () => {
     // where a group's text is in the prompt.
     expect(scopedCallerKeyFor(DM, ["dm", GROUP])).toBe(MIXED_AUDIENCE_KEY);
     expect(scopedCallerKeyFor(DM, [GROUP, OTHER_GROUP])).toBe(MIXED_AUDIENCE_KEY);
+  });
+});
+
+// With `steering` on (the default) InboundBatcher dispatches a drain OUTSIDE
+// the per-session queue when a live session is busy, so two runUserTurn calls
+// run concurrently on one key. The audience therefore has to be tracked per
+// TURN: a per-key slot let the second turn's cleanup unscope the first.
+describe("TurnAudienceRegistry", () => {
+  const DM = "dm:alice";
+  const GROUP = "telegram:-1001234567";
+  const OTHER_GROUP = "telegram:-1009999999";
+
+  it("scopes to the session when no turn is live", () => {
+    // Cron, LCM and continuity turns.
+    expect(new TurnAudienceRegistry().scopedCallerKey(DM)).toBe(DM);
+  });
+
+  it("scopes a summoned-group turn to that group", () => {
+    const r = new TurnAudienceRegistry();
+    r.begin(DM, [GROUP]);
+    expect(r.scopedCallerKey(DM)).toBe(GROUP);
+  });
+
+  // The regression this class exists for.
+  it("an owner DM steer during a summoned-group turn cannot widen the group turn's scope", () => {
+    const r = new TurnAudienceRegistry();
+    const groupTurn = r.begin(DM, [GROUP]);
+    expect(r.scopedCallerKey(DM)).toBe(GROUP);
+
+    // config.steering: the owner's DM message runs concurrently, not queued.
+    const steer = r.begin(DM, ["dm"]);
+    // Two live turns that disagree — a tool call cannot be attributed to
+    // either, so neither one's scope is granted.
+    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
+
+    // The steer finishes first. Its cleanup must not take the group turn's
+    // audience with it — that was the bug, and it fell back to the session
+    // key, which is the owner.
+    r.end(DM, steer);
+    expect(r.scopedCallerKey(DM)).toBe(GROUP);
+    expect(r.scopedCallerKey(DM)).not.toBe(DM);
+
+    r.end(DM, groupTurn);
+    expect(r.scopedCallerKey(DM)).toBe(DM);
+  });
+
+  it("keeps agreeing turns unambiguous", () => {
+    const r = new TurnAudienceRegistry();
+    // Two DM turns overlapping is still just the owner.
+    const a = r.begin(DM, ["dm"]);
+    const b = r.begin(DM, ["dm"]);
+    expect(r.scopedCallerKey(DM)).toBe(DM);
+    // ...and two turns from the same summoned group are still that group.
+    r.end(DM, a);
+    r.end(DM, b);
+    r.begin(DM, [GROUP]);
+    r.begin(DM, [GROUP]);
+    expect(r.scopedCallerKey(DM)).toBe(GROUP);
+  });
+
+  it("fails closed for two different summoned groups at once", () => {
+    const r = new TurnAudienceRegistry();
+    r.begin(DM, [GROUP]);
+    r.begin(DM, [OTHER_GROUP]);
+    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
+  });
+
+  it("never reads a live turn of unknown audience as 'no turn running'", () => {
+    // The fail-OPEN case: an unregistered live turn would fall back to the
+    // session key, which for a dm: session is the owner.
+    const r = new TurnAudienceRegistry();
+    r.begin(DM, undefined);
+    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
+    r.begin(DM, []);
+    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
+  });
+
+  it("removes only its own turn, by id, when two carry equal audiences", () => {
+    const r = new TurnAudienceRegistry();
+    const first = r.begin(DM, [GROUP]);
+    r.begin(DM, [GROUP]);
+    r.end(DM, first);
+    // The second is still live, so the scope is still the group.
+    expect(r.scopedCallerKey(DM)).toBe(GROUP);
+  });
+
+  it("leaves a group session's own key alone however many turns overlap", () => {
+    const r = new TurnAudienceRegistry();
+    r.begin(GROUP, ["dm"]);
+    r.begin(GROUP, [GROUP]);
+    expect(r.scopedCallerKey(GROUP)).toBe(GROUP);
   });
 });

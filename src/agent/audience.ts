@@ -76,3 +76,61 @@ export function scopedCallerKeyFor(sessionKey: string, audiences: readonly strin
   if (distinct.length > 1) return MIXED_AUDIENCE_KEY;
   return distinct[0] === "dm" ? sessionKey : distinct[0];
 }
+
+/**
+ * Which turns are live on which session, and therefore what a session-scoped
+ * MCP tool should be judged against right now.
+ *
+ * Per TURN, not per session key. With `steering` on (the default)
+ * `InboundBatcher` dispatches a drain outside the per-session queue whenever a
+ * live session is busy, so two `runUserTurn` calls run concurrently on one
+ * key. A single slot per key let the second turn's cleanup clear the first
+ * turn's audience, after which the resolver fell back to the session key —
+ * handing a summoned group the owner's DM scope, the exact hole the scoping
+ * exists to close.
+ *
+ * Deliberately NOT `AsyncLocalStorage`. Tool handlers are invoked by the SDK
+ * across a transport boundary, so the async context of the caller that started
+ * the turn is not guaranteed to reach them; a scheme whose safety depends on
+ * that propagation is a scheme that fails open when it stops holding. Taking
+ * the union of every live turn's audiences needs no attribution at all: when
+ * concurrent turns agree the answer is unambiguous, and when they disagree
+ * `scopedCallerKeyFor` already fails closed.
+ */
+export class TurnAudienceRegistry {
+  private live = new Map<string, Map<number, string[]>>();
+  private nextId = 1;
+
+  /** Register a turn. Returns the id to pass to `end`. */
+  begin(sessionKey: string, audiences: readonly string[] | undefined): number {
+    const id = this.nextId++;
+    let turns = this.live.get(sessionKey);
+    if (!turns) {
+      turns = new Map();
+      this.live.set(sessionKey, turns);
+    }
+    // A live turn whose audience is unknown must not read as "nothing is
+    // running" — that is the fail-OPEN case. Record it as unattributable.
+    turns.set(id, audiences?.length ? [...audiences] : [MIXED_AUDIENCE_KEY]);
+    return id;
+  }
+
+  end(sessionKey: string, id: number): void {
+    const turns = this.live.get(sessionKey);
+    if (!turns) return;
+    turns.delete(id);
+    if (turns.size === 0) this.live.delete(sessionKey);
+  }
+
+  /** The key a session-scoped tool should be judged against, right now. */
+  scopedCallerKey(sessionKey: string): string {
+    const turns = this.live.get(sessionKey);
+    // No live turn: a cron, LCM or other background turn the owner owns
+    // outright.
+    if (!turns || turns.size === 0) return scopedCallerKeyFor(sessionKey, undefined);
+    // The union of every live turn. A tool call cannot be attributed to one of
+    // several concurrent turns, so if they disagree, `scopedCallerKeyFor`
+    // fails closed for us — one rule, not two.
+    return scopedCallerKeyFor(sessionKey, [...turns.values()].flat());
+  }
+}

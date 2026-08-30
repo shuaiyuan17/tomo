@@ -129,10 +129,22 @@ export class CronStore {
    * ("at") job whose time already passed fires on the next poll, with its
    * retry budget reset — re-enabling a failed reminder is a manual retry.
    */
-  setEnabled(id: string, enabled: boolean): CronJob | undefined {
+  /**
+   * Enable or disable a job.
+   *
+   * `guard` runs against the job as it exists AFTER the reload, for the same
+   * reason `remove`'s does: checking ownership against a snapshot taken when
+   * the store was constructed misses anything another process wrote in
+   * between, and `load()` here replaces that snapshot anyway. Returns
+   * `"refused"` when the guard rejects, distinct from `undefined` (not found).
+   */
+  setEnabled(id: string, enabled: boolean): CronJob | undefined;
+  setEnabled(id: string, enabled: boolean, guard: (job: CronJob) => boolean): CronJob | undefined | "refused";
+  setEnabled(id: string, enabled: boolean, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" {
     this.load();
     const job = this.get(id);
     if (!job) return undefined;
+    if (guard && !guard(job)) return "refused";
     if (job.enabled === enabled) return job;
     job.enabled = enabled;
     if (enabled) {
@@ -183,6 +195,8 @@ export class CronStore {
    * Returns `"refused"` when the guard rejects, distinct from `false`
    * (not found) so the caller can say which happened.
    */
+  remove(id: string): boolean;
+  remove(id: string, guard: (job: CronJob) => boolean): boolean | "refused";
   remove(id: string, guard?: (job: CronJob) => boolean): boolean | "refused" {
     this.load();
     const existing = this.jobs.find((j) => j.id === id);

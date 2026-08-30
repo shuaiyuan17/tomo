@@ -1,9 +1,10 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, readSync, fstatSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
-import { readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync } from "../jsonl.js";
+import { parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TRANSCRIPT_TEXT_LIMIT } from "../watch/protocol.js";
@@ -27,6 +28,124 @@ function monthOf(timestamp: number): string {
 function isAfterMessage(msg: SessionMessage, last: SessionMessage): boolean {
   if (msg.seq != null && last.seq != null) return msg.seq > last.seq;
   return msg.timestamp > last.timestamp;
+}
+
+/**
+ * A rotation that has been running for longer than this is assumed dead — the
+ * process crashed, or was killed between the lock and its release. Rotation
+ * reads a file that is at most a few MB and rewrites it, so a live one takes
+ * milliseconds; a minute is three orders of magnitude of headroom.
+ */
+const ROTATE_LOCK_STALE_MS = 60_000;
+
+/**
+ * Take the exclusive right to rotate `file`, or return null if someone else
+ * holds it.
+ *
+ * `wx` is the whole mechanism: the create-or-fail decision happens in the
+ * kernel, so two processes cannot both believe they won. A stale lock (see
+ * ROTATE_LOCK_STALE_MS) is removed and the create is retried exactly once —
+ * bounded, because the alternative to giving up is spinning, and rotation is
+ * always safe to postpone.
+ *
+ * Deliberately NOT a liveness check on a recorded pid: pids are recycled, the
+ * lock can be written by a different user's process, and "is that pid alive"
+ * answers a question about *a* process rather than about this one.
+ */
+function acquireRotationLock(file: string): { release: () => void } | null {
+  const lockPath = `${file}.rotate-lock`;
+  const create = (): number | null => {
+    try {
+      return openSync(lockPath, "wx");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      return null;
+    }
+  };
+
+  let fd = create();
+  if (fd === null) {
+    let age: number;
+    try {
+      age = Date.now() - statSync(lockPath).mtimeMs;
+    } catch {
+      // Released between the failed create and the stat — just retry.
+      age = ROTATE_LOCK_STALE_MS + 1;
+    }
+    if (age <= ROTATE_LOCK_STALE_MS) return null;
+    log.warn({ lockPath, ageMs: age }, "Removing a stale transcript rotation lock");
+    try { unlinkSync(lockPath); } catch { /* someone else got there first */ }
+    fd = create();
+    if (fd === null) return null;
+  }
+
+  try {
+    writeFileSync(fd, `${process.pid} ${new Date().toISOString()}\n`);
+  } catch {
+    // The contents are diagnostic only; the existence of the file is the lock.
+  }
+  closeSync(fd);
+
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      try { unlinkSync(lockPath); } catch { /* already gone */ }
+    },
+  };
+}
+
+/**
+ * Read `fd` from `offset` up to the last complete line.
+ *
+ * Bytes after the final newline are a line another process is in the middle of
+ * writing; returning them would let rotation parse — or, worse, rewrite — half
+ * a record. The caller's cursor therefore advances only over complete lines,
+ * which is the same invariant compact.ts maintains for SDK JSONLs.
+ */
+function readCompleteLinesFromFd(fd: number, offset: number): { text: string; bytesRead: number } {
+  const size = fstatSync(fd).size;
+  if (size <= offset) return { text: "", bytesRead: offset };
+  const buf = Buffer.alloc(size - offset);
+  let total = 0;
+  while (total < buf.length) {
+    const n = readSync(fd, buf, total, buf.length - total, offset + total);
+    if (n === 0) break; // EOF earlier than fstat reported
+    total += n;
+  }
+  const lastNl = buf.subarray(0, total).lastIndexOf(0x0a);
+  if (lastNl < 0) return { text: "", bytesRead: offset };
+  return { text: buf.subarray(0, lastNl + 1).toString("utf-8"), bytesRead: offset + lastNl + 1 };
+}
+
+/**
+ * Copy any complete lines appended to `fd` past `cursor` onto `target`, and
+ * return the new cursor.
+ *
+ * This is what makes rotation safe against a concurrent APPENDER (the lock only
+ * excludes other rotators). The daemon appending an inbound message while the
+ * CLI rotates is the ordinary case, and on the old code that message was
+ * erased by the rename.
+ */
+function spliceAppendsSince(fd: number, cursor: number, target: string, key: string): number {
+  let text: string;
+  let bytesRead: number;
+  try {
+    ({ text, bytesRead } = readCompleteLinesFromFd(fd, cursor));
+  } catch (err) {
+    log.warn({ err, key }, "Could not re-read the transcript tail during rotation");
+    return cursor;
+  }
+  if (!text) return cursor;
+  try {
+    appendFileSync(target, text);
+  } catch (err) {
+    log.error({ err, key, target }, "Could not splice concurrent transcript appends; they remain in the pre-rotation file");
+    return cursor;
+  }
+  log.info({ key, bytes: text.length }, "Spliced messages appended during transcript rotation");
+  return bytesRead;
 }
 
 interface PendingNotesFile {
@@ -863,7 +982,76 @@ export class SessionStore {
     const currentMonth = monthOf(Date.now());
     if (this.rotateSkipMonth.get(key) === currentMonth) return;
 
-    const all = readJsonlFileSync<SessionMessage>(file);
+    // SERIALIZE ROTATORS ACROSS PROCESSES. `get()` triggers rotation, and
+    // `get()` is called from a second process — `tomo config identities`
+    // builds its own SessionStore while the daemon is up
+    // (cli/config/identities.ts). Two rotators interleaving is not a thought
+    // experiment: both read the same file, both write a temp, and both rename
+    // it over the original, so the later rename either loses the earlier
+    // rotator's work or, with the old FIXED temp name, fails with ENOENT
+    // because the other process already renamed that exact path away.
+    const lock = acquireRotationLock(file);
+    if (!lock) {
+      log.debug({ key }, "Transcript rotation already in progress elsewhere; skipping this pass");
+      return;
+    }
+    try {
+      this.rotateTranscriptLocked(key, file, currentMonth);
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * The rotation itself, with the lock held.
+   *
+   * Two things beyond the plain read-modify-rename it replaces:
+   *
+   * - The file is read through a PINNED fd and the byte offset of the last
+   *   complete line is remembered, so appends that land while we are working
+   *   can be identified and spliced onto the replacement instead of being
+   *   erased by the rename. The lock stops other rotators; it does not stop
+   *   the daemon's `appendFileSync`, which is a different code path entirely
+   *   and must not be blocked.
+   * - Every read is tolerant of the file being replaced or removed underneath
+   *   it (`tomo sessions clear`, another rotator that took over a stale lock):
+   *   rotation is an optimization, so it gives up quietly rather than throwing
+   *   out of `get()`.
+   */
+  private rotateTranscriptLocked(key: string, file: string, currentMonth: string): void {
+    let fd: number;
+    try {
+      fd = openSync(file, "r");
+    } catch {
+      // Vanished between the stat and here. Nothing to rotate.
+      return;
+    }
+
+    try {
+      let text: string;
+      let bytesRead: number;
+      try {
+        ({ text, bytesRead } = readCompleteLinesFromFd(fd, 0));
+      } catch (err) {
+        log.warn({ err, key }, "Could not read transcript for rotation; skipping this pass");
+        return;
+      }
+
+      const all = parseJsonl<SessionMessage>(text);
+      this.rotateFromSnapshot(key, file, currentMonth, fd, all, bytesRead);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  private rotateFromSnapshot(
+    key: string,
+    file: string,
+    currentMonth: string,
+    fd: number,
+    all: SessionMessage[],
+    bytesRead: number,
+  ): void {
     const keep: SessionMessage[] = [];
     const byMonth = new Map<string, SessionMessage[]>();
     for (const msg of all) {
@@ -894,9 +1082,29 @@ export class SessionStore {
       appendFileSync(archivePath, fresh.map((m) => JSON.stringify(m)).join("\n") + "\n");
     }
 
-    const tmp = `${file}.rotate-tmp`;
+    // UNIQUE TEMP NAME. The old fixed `.rotate-tmp` was a shared mutable path:
+    // two rotators wrote the same file and both renamed it into place, which
+    // is how one of them ends up renaming a path the other already moved.
+    // pid + random matches writeFileAtomicSync (fs-utils.ts) and pruneTools.
+    const tmp = `${file}.rotate-tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
     writeFileSync(tmp, keep.length > 0 ? keep.map((m) => JSON.stringify(m)).join("\n") + "\n" : "");
-    renameSync(tmp, file);
+
+    // SPLICE LATE APPENDS. Everything between our read and this line was
+    // appended by someone else — on the old code the rename below erased it,
+    // permanently and with no log line, and `getLastSeq` then re-derived seq
+    // from the surviving tail so the next message reused a seq that was
+    // already taken. Copy those bytes onto the replacement first.
+    const spliced = spliceAppendsSince(fd, bytesRead, tmp, key);
+    try {
+      renameSync(tmp, file);
+    } catch (err) {
+      log.warn({ err, key }, "Transcript rotation could not install the rewritten file; leaving the original in place");
+      try { unlinkSync(tmp); } catch { /* best-effort */ }
+      return;
+    }
+    // A writer that opened the path before the rename still holds the old
+    // inode; drain anything it wrote in that window onto the new file.
+    spliceAppendsSince(fd, spliced, file, key);
     log.info(
       { key, months: [...byMonth.keys()].sort(), archived: all.length - keep.length, kept: keep.length },
       "Transcript rotated: prior months moved to archive files",

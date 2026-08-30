@@ -189,6 +189,54 @@ describe("detectFabricatedMarkers", () => {
       expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["stamp", 1]]);
     });
 
+    /**
+     * CommonMark's closing rule, and not pedantry: the material people paste
+     * into a fence is exactly the material that contains stray delimiter
+     * lines. Closing a ``` fence on a line of tildes, or a four-backtick fence
+     * on three, would hand the rest of a log excerpt straight back to the
+     * detector — the false positive the fence exception exists to prevent.
+     */
+    it("does NOT close a backtick fence on a ~~~ line", () => {
+      const text = [
+        "```",                                              // 1 opens
+        "System: heartbeat",                                // 2 inside
+        "~~~",                                              // 3 wrong char — content, not a close
+        `${formatInboundStamp("imessage")} still inside`,   // 4 inside
+        "```",                                              // 5 the true close
+        `${formatInboundStamp("imessage")} outside`,        // 6 flagged
+      ].join("\n");
+      expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["stamp", 6]]);
+    });
+
+    it("does NOT close a four-backtick fence on a three-backtick line", () => {
+      const text = [
+        "````",              // 1 opens, length 4
+        "System: one",       // 2 inside
+        "```",               // 3 too short — content, not a close
+        "System: two",       // 4 still inside
+        "````",              // 5 the true close
+        "System: three",     // 6 flagged
+      ].join("\n");
+      expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["legacy-system", 6]]);
+    });
+
+    it("DOES close on a longer run of the same character", () => {
+      const text = ["```", "System: inside", "`````", "System: outside"].join("\n");
+      expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["legacy-system", 4]]);
+    });
+
+    it("does NOT close on a fence line that carries trailing content", () => {
+      const text = [
+        "```",               // 1 opens
+        "System: one",       // 2 inside
+        "``` js",            // 3 not bare — content, not a close
+        "System: two",       // 4 still inside
+        "```   ",            // 5 bare but for whitespace — the true close
+        "System: three",     // 6 flagged
+      ].join("\n");
+      expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["legacy-system", 6]]);
+    });
+
     it("an UNCLOSED fence suppresses to the end — the accepted trade", () => {
       // Documented in the module header: under mark-don't-truncate a missed
       // advisory costs less than a wrong one. Pinned so the behaviour is a

@@ -16,6 +16,7 @@ import {
 import { createInterface } from "node:readline";
 import { config } from "../config.js";
 import { restoreWorkspaceFromBackup } from "./backup-workspace.js";
+import { restoreLegsStaged, type RestoreLeg } from "./backup-restore.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 
 const TOMO_HOME = config.tomoHome;
@@ -444,38 +445,49 @@ backupCommand
 
     console.log();
 
-    // 1. config.json
+    // STAGED LEGS FIRST. config.json, data/ and sdk-sessions/ used to be
+    // three independent `rmSync` + `cpSync` pairs: the live tree was deleted
+    // before anything knew the copy would succeed, and a failure on the third
+    // left the first two replaced and the third destroyed. They now go
+    // through restoreLegsStaged, which copies everything into siblings and
+    // verifies it before a single live byte moves — so the ENOSPC case that
+    // motivated this aborts with all three still intact, INCLUDING the
+    // workspace below, which is why the staged legs run first.
+    const legs: RestoreLeg[] = [];
     const configSrc = join(backup.path, "config.json");
     if (existsSync(configSrc)) {
-      cpSync(configSrc, join(TOMO_HOME, "config.json"));
-      console.log("  [ok] config.json");
+      legs.push({ label: "config.json", src: configSrc, dest: join(TOMO_HOME, "config.json") });
+    }
+    const dataSrc = join(backup.path, "data");
+    if (existsSync(dataSrc)) {
+      legs.push({ label: "data/", src: dataSrc, dest: join(TOMO_HOME, "data") });
+    }
+    const sdkSrc = join(backup.path, "sdk-sessions");
+    if (existsSync(sdkSrc)) {
+      legs.push({ label: "sdk-sessions/", src: sdkSrc, dest: config.sdkSessionsDir });
     }
 
-    // 2. workspace/ (preserve .claude/ which is populated by init/start)
+    try {
+      restoreLegsStaged(legs, {
+        onLegRestored: (leg) => console.log(`  [ok] ${leg.label}`),
+        onWarning: (message) => console.error(`  [warn] ${message}`),
+      });
+    } catch (err) {
+      console.error(`\nRestore failed: ${(err as Error).message}`);
+      console.error("Nothing was replaced — your existing data is as it was.");
+      process.exit(1);
+      return;
+    }
+
+    // workspace/ (preserve .claude/ which is populated by init/start).
+    // Deliberately still on its own path: restoreWorkspaceFromBackup already
+    // snapshots and rolls back the live .claude, which is the part the other
+    // legs have no equivalent of.
     const workspaceSrc = join(backup.path, "workspace");
     if (existsSync(workspaceSrc)) {
       restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
 
       console.log("  [ok] workspace/");
-    }
-
-    // 3. data/
-    const dataSrc = join(backup.path, "data");
-    if (existsSync(dataSrc)) {
-      const dataDest = join(TOMO_HOME, "data");
-      rmSync(dataDest, { recursive: true, force: true });
-      cpSync(dataSrc, dataDest, { recursive: true });
-      console.log("  [ok] data/");
-    }
-
-    // 4. SDK session files
-    const sdkSrc = join(backup.path, "sdk-sessions");
-    if (existsSync(sdkSrc)) {
-      const sdkDest = config.sdkSessionsDir;
-      rmSync(sdkDest, { recursive: true, force: true });
-      mkdirSync(sdkDest, { recursive: true });
-      cpSync(sdkSrc, sdkDest, { recursive: true });
-      console.log("  [ok] sdk-sessions/");
     }
 
     console.log("\nRestore complete.");

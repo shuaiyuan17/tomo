@@ -14,8 +14,11 @@ export class PetScheduler {
 
   start(): void {
     log.info("Pet scheduler started");
-    this.tick();
-    this.timer = setInterval(() => this.tick(), TICK_INTERVAL_MS);
+    this.safeTick();
+    this.timer = setInterval(() => this.safeTick(), TICK_INTERVAL_MS);
+    // A toy pet must never hold the process open past shutdown (same rule as
+    // the MCP OAuth sweep in agent.ts).
+    this.timer.unref();
   }
 
   stop(): void {
@@ -24,6 +27,21 @@ export class PetScheduler {
       this.timer = null;
     }
     log.info("Pet scheduler stopped");
+  }
+
+  /**
+   * `tick()` writes to disk (PetStore.save -> mkdirSync + writeFileAtomicSync),
+   * which throws on ENOSPC/EACCES/EROFS. Uncaught, that throw propagates out of
+   * a setInterval callback with no listener above it and terminates the daemon:
+   * every channel and live session would die because a toy pet could not write
+   * its state file. Contain it here.
+   */
+  private safeTick(): void {
+    try {
+      this.tick();
+    } catch (err) {
+      log.warn({ err }, "Pet scheduler tick failed");
+    }
   }
 
   private tick(): void {

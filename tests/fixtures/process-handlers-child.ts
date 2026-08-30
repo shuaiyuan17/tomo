@@ -9,12 +9,16 @@
  *   rejection-bare        NO handlers (i.e. main), same synthetic rejection
  *   exception             handlers installed, then a synthetic uncaught throw
  *   exception-bare        NO handlers, same synthetic throw
+ *   startup-swallowed     handlers installed, then an async "start command" whose
+ *                         promise rejects with nobody awaiting it (commander's
+ *                         sync parse()) — the daemon half-starts and lives on
+ *   startup-fatal         as above, but the command catches and calls raiseFatal
  *
  * Every mode prints `ALIVE` and exits 0 after 400ms IF it survives. Whether
  * that line appears is the entire test: it cannot be observed in-process,
  * because Node's default unhandled-rejection behaviour is to terminate.
  */
-import { installProcessErrorHandlers } from "../../src/process-handlers.js";
+import { installProcessErrorHandlers, raiseFatal } from "../../src/process-handlers.js";
 
 const mode = process.argv[2];
 
@@ -32,7 +36,19 @@ if (!mode.endsWith("-bare")) {
   });
 }
 
-if (mode.startsWith("exception")) {
+if (mode.startsWith("startup")) {
+  // The shape of `cli.ts` + `startCommand`: an async action whose promise the
+  // synchronous `program.parse()` never observes. Its rejection is therefore
+  // an unhandled rejection — which the handlers above would survive.
+  const startForeground = async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    throw new Error("iMessage: imsg lacks Full Disk Access");
+  };
+  const action = mode === "startup-fatal"
+    ? async () => { try { await startForeground(); } catch (err) { raiseFatal(err, "startup"); } }
+    : startForeground;
+  void action();
+} else if (mode.startsWith("exception")) {
   // Outside any try/catch and off the main tick — the shape a real daemon
   // crash takes (a throw inside a setInterval callback, e.g. PetScheduler).
   setTimeout(() => { throw new Error("synthetic uncaught exception"); }, 20);

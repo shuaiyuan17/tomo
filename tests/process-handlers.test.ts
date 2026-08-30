@@ -2,12 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { inspect } from "node:util";
 import {
   installProcessErrorHandlers,
   UNHANDLED_REJECTION_MARKER,
   UNCAUGHT_EXCEPTION_MARKER,
   REJECTION_LOG_BURST,
   REJECTION_LOG_WINDOW_MS,
+  raiseFatal,
 } from "../src/process-handlers.js";
 
 describe("installProcessErrorHandlers", () => {
@@ -174,6 +176,52 @@ describe("rejection log rate limiting", () => {
     expect(summaryMsg).toContain(String(500 - REJECTION_LOG_BURST));
   });
 
+  it("reports the suppressed count when the window ends QUIETLY, via the timer", () => {
+    // A burst that then stops: no later rejection ever arrives to trigger
+    // the rollover summary, so the count would be lost without the timer.
+    const scheduled: Array<{ fn: () => void; ms: number }> = [];
+    uninstall();
+    uninstall = installProcessErrorHandlers({
+      target, logger, exit: vi.fn(), writeStderr: vi.fn(), now: () => clock,
+      schedule: (fn, ms) => scheduled.push({ fn, ms }),
+    });
+    reject(500);
+    logger.error.mockClear();
+    expect(scheduled).toHaveLength(1);              // armed once, on the first suppressed one
+    expect(scheduled[0].ms).toBe(REJECTION_LOG_WINDOW_MS);
+
+    clock += REJECTION_LOG_WINDOW_MS;
+    scheduled[0].fn();
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0].suppressed).toBe(500 - REJECTION_LOG_BURST);
+
+    // The window was closed by the timer; the next rejection must not report
+    // the same 495 again, and the next burst arms a fresh timer.
+    logger.error.mockClear();
+    reject(1);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0].suppressed).toBeUndefined();
+    reject(REJECTION_LOG_BURST);
+    expect(scheduled).toHaveLength(2);
+  });
+
+  it("a timer that fires early, or after uninstall, reports nothing", () => {
+    const scheduled: Array<() => void> = [];
+    uninstall();
+    uninstall = installProcessErrorHandlers({
+      target, logger, exit: vi.fn(), writeStderr: vi.fn(), now: () => clock,
+      schedule: (fn) => scheduled.push(fn),
+    });
+    reject(500);
+    logger.error.mockClear();
+    scheduled[0]();                                  // clock has not advanced
+    expect(logger.error).not.toHaveBeenCalled();
+    uninstall();
+    clock += REJECTION_LOG_WINDOW_MS;
+    scheduled[0]();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
   it("emits no summary when the window was never exceeded", () => {
     reject(REJECTION_LOG_BURST);
     logger.error.mockClear();
@@ -249,6 +297,54 @@ describe("crash-path inbound salvage", () => {
   });
 });
 
+describe("hostile values and caught-but-fatal errors", () => {
+  let target: EventEmitter;
+  let uninstall: (() => void) | null = null;
+  afterEach(() => uninstall?.());
+
+  const hostile = { [inspect.custom]() { throw new Error("inspect is a trap"); } };
+
+  it("a reason whose util.inspect.custom throws is logged, and the daemon continues", () => {
+    target = new EventEmitter();
+    const logger = { error: vi.fn(), fatal: vi.fn() };
+    const exit = vi.fn();
+    uninstall = installProcessErrorHandlers({ target, logger, exit, writeStderr: vi.fn() });
+    expect(() => target.emit("unhandledRejection", hostile, Promise.resolve())).not.toThrow();
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0].err.message).toContain("unrenderable");
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it("the same value as an uncaught exception still salvages and exits (the exit hook must run)", () => {
+    target = new EventEmitter();
+    const exit = vi.fn();
+    const stderr = vi.fn();
+    const salvage = vi.fn(() => { throw hostile; });
+    uninstall = installProcessErrorHandlers({ target, logger: { error: vi.fn(), fatal: vi.fn() }, exit, writeStderr: stderr, beforeExit: salvage });
+    expect(() => target.emit("uncaughtException", hostile, "uncaughtException")).not.toThrow();
+    expect(salvage).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls.map((c) => c[0]).join("")).toContain("salvage failed");
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("raiseFatal goes through the installed exception path: marker, salvage, exit 1", () => {
+    target = new EventEmitter();
+    const exit = vi.fn();
+    const stderr = vi.fn();
+    const salvage = vi.fn();
+    const logger = { error: vi.fn(), fatal: vi.fn() };
+    uninstall = installProcessErrorHandlers({ target, logger, exit, writeStderr: stderr, beforeExit: salvage });
+    raiseFatal(new Error("agent.start() failed"), "startup");
+    expect(stderr.mock.calls[0][0]).toContain(`${UNCAUGHT_EXCEPTION_MARKER} origin=startup`);
+    expect(stderr.mock.calls[0][0]).toContain("agent.start() failed");
+    expect(logger.fatal).toHaveBeenCalledTimes(1);
+    expect(salvage).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(1);
+    // Not the rejection path: nothing was "survived".
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+});
+
 const FIXTURE = fileURLToPath(new URL("./fixtures/process-handlers-child.ts", import.meta.url));
 const TSX = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
 
@@ -291,6 +387,24 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(stdout).toContain("ECONNRESET");
     expect(stdout).not.toContain("[object Object]");
   }, 60_000);
+
+  it("a startup rejection nobody awaits is SURVIVED by the handlers — the half-started daemon", { timeout: 60_000 }, async () => {
+    // This is what `cli.ts`'s sync parse() + an async start action produce
+    // if the command does not catch: the failure is logged as a stray
+    // rejection and the process lives on.
+    const { code, stdout } = await runChild("startup-swallowed");
+    expect(stdout).toContain(`marker=${UNHANDLED_REJECTION_MARKER}`);
+    expect(stdout).toContain("ALIVE");
+    expect(code).toBe(0);
+  });
+
+  it("the start command routes its failure through raiseFatal: exit 1, origin=startup", { timeout: 60_000 }, async () => {
+    const { code, stdout, stderr } = await runChild("startup-fatal");
+    expect(code).toBe(1);
+    expect(stdout).not.toContain("ALIVE");
+    expect(stderr).toContain(`${UNCAUGHT_EXCEPTION_MARKER} origin=startup`);
+    expect(stderr).toContain("Full Disk Access");
+  });
 
   it("exits non-zero on a synthetic uncaught exception, with the marker on stderr", { timeout: 60_000 }, async () => {
     const { code, stdout, stderr } = await runChild("exception");

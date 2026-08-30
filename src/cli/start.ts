@@ -12,10 +12,18 @@ export const startCommand = new Command("start")
   .description("Start Tomo")
   .option("-f, --foreground", "Run in foreground (default: background)")
   .action(async (opts) => {
-    if (opts.foreground) {
-      return startForeground();
+    // cli.ts runs commander's synchronous `parse()`, so a rejection of this
+    // async action is an UNHANDLED rejection. Once the process error handlers
+    // are installed that would be "log and continue" — a half-started daemon
+    // (pid file held, one channel polling, no schedulers) running forever.
+    // Startup failure is fatal; say so and exit through the fatal path.
+    try {
+      if (opts.foreground) await startForeground();
+      else await startDaemon();
+    } catch (err) {
+      const { raiseFatal } = await import("../process-handlers.js");
+      raiseFatal(err, "startup");
     }
-    return startDaemon();
   });
 
 async function startForeground(): Promise<void> {

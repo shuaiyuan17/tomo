@@ -1,5 +1,4 @@
 import { inspect } from "node:util";
-import { log } from "./logger.js";
 
 /**
  * Stable, greppable tokens. They are in the log MESSAGE (not only a structured
@@ -22,6 +21,14 @@ export interface ErrorLogger {
 }
 
 export interface ProcessErrorHandlerOptions {
+  /**
+   * Defaults to a console logger. This module deliberately does NOT import
+   * `logger.ts`: the daemon installs the bootstrap handlers before pino
+   * exists precisely so that a throw while pino is being set up (an
+   * unwritable `TOMO_LOG_FILE` directory fails `logger.ts` at module level)
+   * still dies with a marker. A static import here would have loaded pino
+   * first and defeated that.
+   */
   logger?: ErrorLogger;
   /**
    * Last-ditch salvage before an uncaught exception exits. MUST be
@@ -34,8 +41,19 @@ export interface ProcessErrorHandlerOptions {
   writeStderr?: (line: string) => void;
   /** Injected for tests. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Injected for tests. Defaults to an unref'd `setTimeout`. Used to flush the
+   * rate-limit summary when a window ends QUIETLY — otherwise a burst of 500
+   * rejections that then stops would never report the 495 it suppressed.
+   */
+  schedule?: (fn: () => void, ms: number) => void;
   target?: NodeJS.EventEmitter;
 }
+
+const consoleLogger: ErrorLogger = {
+  error: (obj, msg) => console.error(msg, obj.err),
+  fatal: (obj, msg) => console.error(msg, obj.err),
+};
 
 /**
  * Handlers currently installed by this module, so a second install replaces
@@ -43,6 +61,34 @@ export interface ProcessErrorHandlerOptions {
  * very top of startup, then again with pino once the logger exists.
  */
 let uninstallCurrent: (() => void) | null = null;
+/** The exception path of the current install, for {@link raiseFatal}. */
+let currentOnException: ((err: unknown, origin?: string) => void) | null = null;
+
+/**
+ * Route a failure that was CAUGHT, but is fatal, through the same path an
+ * uncaught exception takes: stderr marker, fatal log, salvage, exit(1).
+ *
+ * Exists for the startup promise. `cli.ts` runs commander's synchronous
+ * `parse()`, and `startForeground()` is async — so a rejection from
+ * `agent.start()` (say, iMessage refusing because `imsg` lacks Full Disk
+ * Access after Telegram has already begun polling) surfaces as an UNHANDLED
+ * REJECTION. With the rejection handler installed, "log and continue" would
+ * have left a half-started daemon — pid file held, one channel live, no
+ * schedulers, no watch server — running indefinitely. Startup failure is not
+ * a stray promise; it is fatal, and the start command catches it and sends it
+ * here. Works before any handler is installed too (bare stderr + exit).
+ */
+export function raiseFatal(err: unknown, origin: string): void {
+  if (currentOnException) {
+    currentOnException(err, origin);
+    return;
+  }
+  const error = err instanceof Error ? err : new Error(describeReason(err));
+  try {
+    process.stderr.write(`${UNCAUGHT_EXCEPTION_MARKER} origin=${origin} ${error.stack ?? error.message}\n`);
+  } catch { /* stderr closed */ }
+  process.exit(1);
+}
 
 /**
  * A console-only variant for the window before the logger module is loaded.
@@ -51,12 +97,7 @@ let uninstallCurrent: (() => void) | null = null;
  * no marker is exactly the gap this module is meant to close.
  */
 export function installBootstrapErrorHandlers(): () => void {
-  return installProcessErrorHandlers({
-    logger: {
-      error: (obj, msg) => console.error(msg, obj.err),
-      fatal: (obj, msg) => console.error(msg, obj.err),
-    },
-  });
+  return installProcessErrorHandlers({ logger: consoleLogger });
 }
 
 /**
@@ -109,31 +150,48 @@ export function installProcessErrorHandlers(options: ProcessErrorHandlerOptions 
   // the same event, which would double-log and, worse, call `exit` twice.
   uninstallCurrent?.();
 
-  const logger = options.logger ?? log;
+  const logger = options.logger ?? consoleLogger;
   const exit = options.exit ?? ((code: number) => process.exit(code));
   const writeStderr = options.writeStderr ?? ((line: string) => { process.stderr.write(line); });
   const now = options.now ?? Date.now;
+  const schedule = options.schedule ?? ((fn, ms) => { setTimeout(fn, ms).unref(); });
   const target = options.target ?? process;
 
   let windowStart = now();
   let windowCount = 0;
+  let installed = true;
+
+  // Close the current window: report what it suppressed (if anything) and
+  // start a fresh one. Called on the first rejection after a window has
+  // elapsed, AND from a timer at the window's end so a burst that simply
+  // stops still gets its count reported.
+  const closeWindow = () => {
+    const suppressed = windowCount - REJECTION_LOG_BURST;
+    if (suppressed > 0) {
+      logger.error(
+        { marker: UNHANDLED_REJECTION_MARKER, suppressed, windowMs: REJECTION_LOG_WINDOW_MS },
+        `${UNHANDLED_REJECTION_MARKER}: ${suppressed} further unhandled rejections suppressed in the last ${REJECTION_LOG_WINDOW_MS / 1000}s`,
+      );
+    }
+    windowStart = now();
+    windowCount = 0;
+  };
 
   const onRejection = (reason: unknown) => {
-    const elapsed = now() - windowStart;
-    if (elapsed >= REJECTION_LOG_WINDOW_MS) {
-      const suppressed = windowCount - REJECTION_LOG_BURST;
-      if (suppressed > 0) {
-        logger.error(
-          { marker: UNHANDLED_REJECTION_MARKER, suppressed, windowMs: REJECTION_LOG_WINDOW_MS },
-          `${UNHANDLED_REJECTION_MARKER}: ${suppressed} further unhandled rejections suppressed in the last ${REJECTION_LOG_WINDOW_MS / 1000}s`,
-        );
-      }
-      windowStart = now();
-      windowCount = 0;
-    }
+    if (now() - windowStart >= REJECTION_LOG_WINDOW_MS) closeWindow();
 
     windowCount++;
-    if (windowCount > REJECTION_LOG_BURST) return;
+    if (windowCount > REJECTION_LOG_BURST) {
+      // First suppressed rejection of this window: make sure the window is
+      // closed — and its count logged — even if no further rejection arrives.
+      if (windowCount === REJECTION_LOG_BURST + 1) {
+        const openedAt = windowStart;
+        schedule(() => {
+          if (installed && windowStart === openedAt && now() - windowStart >= REJECTION_LOG_WINDOW_MS) closeWindow();
+        }, Math.max(0, windowStart + REJECTION_LOG_WINDOW_MS - now()));
+      }
+      return;
+    }
 
     // A rejection reason is NOT necessarily an Error. `String(reason)` renders
     // the common object case as "[object Object]", discarding the only
@@ -180,7 +238,7 @@ export function installProcessErrorHandlers(options: ProcessErrorHandlerOptions 
         options.beforeExit();
       } catch (salvageErr) {
         try {
-          writeStderr(`${UNCAUGHT_EXCEPTION_MARKER} salvage failed: ${String(salvageErr)}\n`);
+          writeStderr(`${UNCAUGHT_EXCEPTION_MARKER} salvage failed: ${describeReason(salvageErr)}\n`);
         } catch { /* stderr closed */ }
       }
       // Synchronous work cannot be preempted, so this is a report, not a cap:
@@ -201,16 +259,33 @@ export function installProcessErrorHandlers(options: ProcessErrorHandlerOptions 
   target.on("uncaughtException", onException);
 
   const uninstall = () => {
+    installed = false;
     target.off("unhandledRejection", onRejection);
     target.off("uncaughtException", onException);
-    if (uninstallCurrent === uninstall) uninstallCurrent = null;
+    if (uninstallCurrent === uninstall) {
+      uninstallCurrent = null;
+      currentOnException = null;
+    }
   };
   uninstallCurrent = uninstall;
+  currentOnException = onException;
   return uninstall;
 }
 
-/** Render any rejection reason usefully — objects included. */
+/**
+ * Render any rejection reason usefully — objects included. Must not throw:
+ * a value with a hostile `util.inspect.custom` (or `toString`) reaching the
+ * exception handler would otherwise make the handler itself throw, which on
+ * Node 22 skips the `exit` event — and with it the pid-file release and the
+ * inbound salvage.
+ */
 function describeReason(reason: unknown): string {
   if (typeof reason === "string") return reason;
-  return inspect(reason, { depth: 3, breakLength: Infinity });
+  try {
+    return inspect(reason, { depth: 3, breakLength: Infinity });
+  } catch {
+    let ctor = "";
+    try { ctor = (reason as { constructor?: { name?: string } })?.constructor?.name ?? ""; } catch { /* hostile getter */ }
+    return `<unrenderable ${typeof reason}${ctor ? ` ${ctor}` : ""}: inspect() threw>`;
+  }
 }

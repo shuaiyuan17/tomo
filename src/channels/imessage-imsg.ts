@@ -19,7 +19,16 @@ import { log } from "../logger.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
-import { convertHeicImage, heicHasAlpha, looksLikeHeic, type HeicTargetFormat } from "./heic.js";
+import { convertHeicImage, heicHasAlpha, looksLikeHeic, SIPS_TIMEOUT_MS, type HeicTargetFormat } from "./heic.js";
+
+/**
+ * Total wall-clock a single inbound message may spend converting HEIC
+ * attachments. `loadAttachments` walks its attachments sequentially, so the
+ * per-`sips` deadline alone bounds one child, not one message: ten hostile
+ * HEICs would serialise into ten deadlines of inbound-FIFO stall. Images past
+ * the budget are delivered in their original format and marked unconverted.
+ */
+export const MESSAGE_CONVERSION_BUDGET_MS = 60_000;
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
@@ -232,12 +241,14 @@ export interface ImsgChannelConfig {
    * returns the path to a temp JPEG/PNG (the channel reads then unlinks it)
    * or `null` on failure. Defaults to a macOS `sips`-backed implementation.
    */
-  convertHeic?: (srcPath: string, format: HeicTargetFormat) => Promise<string | null>;
+  convertHeic?: (srcPath: string, format: HeicTargetFormat, timeoutMs?: number) => Promise<string | null>;
+  /** Override {@link MESSAGE_CONVERSION_BUDGET_MS}. Tests only. */
+  conversionBudgetMs?: number;
   /**
    * Test seam: alpha-channel probe for a source image file. `true`/`false` on
    * a clean probe, `null` when unknown. Defaults to `sips -g hasAlpha`.
    */
-  probeHeicAlpha?: (srcPath: string) => Promise<boolean | null>;
+  probeHeicAlpha?: (srcPath: string, timeoutMs?: number) => Promise<boolean | null>;
 }
 
 interface PendingRequest {
@@ -287,8 +298,9 @@ export class ImsgChannel implements Channel {
   private readonly drainWaitTimeoutMs: number;
   private messageGuidDedupe: MessageGuidDedupeStore;
   private readonly serviceLookup: ServiceLookup;
-  private readonly convertHeicFn: (srcPath: string, format: HeicTargetFormat) => Promise<string | null>;
-  private readonly probeHeicAlphaFn: (srcPath: string) => Promise<boolean | null>;
+  private readonly convertHeicFn: (srcPath: string, format: HeicTargetFormat, timeoutMs?: number) => Promise<string | null>;
+  private readonly conversionBudgetMs: number;
+  private readonly probeHeicAlphaFn: (srcPath: string, timeoutMs?: number) => Promise<boolean | null>;
   // Settles a request's parked-on-'drain' write link, keyed by request id, so a
   // request timeout/cancel can release its own stuck write (else future writes
   // queue behind a forever-pending drain-wait).
@@ -365,6 +377,7 @@ export class ImsgChannel implements Channel {
     this.messageGuidDedupe = new MessageGuidDedupeStore(config.dedupeStorePath ?? null);
     this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
     this.convertHeicFn = config.convertHeic ?? convertHeicImage;
+    this.conversionBudgetMs = config.conversionBudgetMs ?? MESSAGE_CONVERSION_BUDGET_MS;
     this.probeHeicAlphaFn = config.probeHeicAlpha ?? heicHasAlpha;
     this.loadCursor();
   }
@@ -1367,8 +1380,17 @@ export class ImsgChannel implements Channel {
     const imageSavedPaths = images.filter((i) => !i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
     const stickerSavedPaths = images.filter((i) => i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
     const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
-    const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths);
-    const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths);
+    // Counted over the same partition as intendedImageCount/intendedStickerCount
+    // above — `image.isSticker` is set from the identical `att.is_sticker ===
+    // true` predicate — so the note can never claim more unconverted
+    // attachments than the marker says were sent. `images` is a subset of the
+    // intended set (an attachment that failed to READ never makes it here), so
+    // the counts are consistent by construction; formatImageMarker clamps
+    // anyway rather than emit "[Sent an image; 2 attachments could not …]".
+    const unconvertedImages = images.filter((i) => !i.isSticker && i.conversionFailed).length;
+    const unconvertedStickers = images.filter((i) => i.isSticker && i.conversionFailed).length;
+    const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths, unconvertedStickers);
+    const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths, unconvertedImages);
     const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
     // Path-only marker: unlike the image/document markers this is the ONLY
     // representation of the file the agent gets — no bytes are attached.
@@ -1643,6 +1665,14 @@ export class ImsgChannel implements Channel {
     const documents: DocumentAttachment[] = [];
     const files: SavedFileNotice[] = [];
 
+    // Per-`sips` deadlines bound one conversion; this bounds the MESSAGE. The
+    // loop below is sequential, so ten hostile HEICs in one iMessage would
+    // otherwise stall the inbound FIFO for ten times the per-child deadline —
+    // the same denial of service, just requiring an attachment picker instead
+    // of a single crafted file. Once the budget is gone the remaining images
+    // skip conversion outright and are marked unconverted.
+    const conversionDeadline = Date.now() + this.conversionBudgetMs;
+
     for (const att of attachments) {
       const mimeType = this.attachmentMime(att);
       // A MIME-less row is skipped ONLY when it is positively identifiable as
@@ -1707,9 +1737,10 @@ export class ImsgChannel implements Channel {
           // transparency into a solid background), to JPEG otherwise.
           // Failure keeps the original bytes — never drop the attachment.
           const isSticker = att.is_sticker === true;
-          const { buffer: imageBuffer, mimeType: imageMime } = await this.normalizeHeicImage(buffer, mimeType, filePath, isSticker);
+          const { buffer: imageBuffer, mimeType: imageMime, conversionFailed } = await this.normalizeHeicImage(buffer, mimeType, filePath, isSticker, conversionDeadline);
           const image = await buildImageAttachment(imageBuffer, imageMime, meta, this.imageStoreBaseDir);
           if (isSticker) image.isSticker = true;
+          if (conversionFailed) image.conversionFailed = true;
           images.push(image);
         } else {
           const filename = (typeof att.transfer_name === "string" && att.transfer_name) || basename(filePath);
@@ -1839,29 +1870,47 @@ export class ImsgChannel implements Channel {
     mimeType: string,
     filePath: string,
     isSticker = false,
-  ): Promise<{ buffer: Buffer; mimeType: string }> {
+    conversionDeadline = Date.now() + this.conversionBudgetMs,
+  ): Promise<{ buffer: Buffer; mimeType: string; conversionFailed?: boolean }> {
     if (!looksLikeHeic(mimeType, filePath, buffer)) return { buffer, mimeType };
+
+    // Whatever is left of the message-wide budget, capped at the per-child
+    // deadline. Exhausted means: do not spawn at all — an earlier attachment
+    // has already spent the time this message was allowed to take.
+    const remainingMs = conversionDeadline - Date.now();
+    if (remainingMs <= 0) {
+      log.error(
+        { path: filePath, budgetMs: this.conversionBudgetMs },
+        "Per-message HEIC conversion budget exhausted; delivering the original bytes unconverted",
+      );
+      return { buffer, mimeType, conversionFailed: true };
+    }
+    const timeoutMs = Math.min(SIPS_TIMEOUT_MS, remainingMs);
 
     let format: HeicTargetFormat;
     if (isSticker) {
       format = "png";
     } else {
-      const alpha = await this.probeHeicAlphaFn(filePath).catch(() => null);
+      const alpha = await this.probeHeicAlphaFn(filePath, timeoutMs).catch(() => null);
       format = alpha === true ? "png" : "jpeg";
     }
 
-    const outPath = await this.convertHeicFn(filePath, format).catch((err) => {
+    const outPath = await this.convertHeicFn(filePath, format, Math.max(0, conversionDeadline - Date.now())).catch((err) => {
       log.error({ err, path: filePath, format }, "HEIC conversion threw; keeping original attachment");
       return null;
     });
-    if (!outPath) return { buffer, mimeType };
+    // `conversionFailed` covers every way this can go wrong — sips missing, a
+    // non-zero exit, a throw, and (the case this flag was added for) a sips
+    // that hung and was killed at its deadline. In all of them the agent gets
+    // HEIC bytes it cannot display, so it is told so.
+    if (!outPath) return { buffer, mimeType, conversionFailed: true };
 
     try {
       const converted = await readFile(outPath);
       return { buffer: converted, mimeType: format === "png" ? "image/png" : "image/jpeg" };
     } catch (err) {
       log.error({ err, path: filePath, outPath }, "Failed to read converted image; keeping original attachment");
-      return { buffer, mimeType };
+      return { buffer, mimeType, conversionFailed: true };
     } finally {
       await unlink(outPath).catch(() => undefined);
     }

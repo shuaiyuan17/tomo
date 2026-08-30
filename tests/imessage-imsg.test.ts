@@ -473,7 +473,7 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(convertHeic).toHaveBeenCalledWith(heicPath, "jpeg");
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "jpeg", expect.any(Number));
       const msg = handler.mock.calls[0][0];
       expect(msg.images).toHaveLength(1);
       expect(msg.images![0].mediaType).toBe("image/jpeg");
@@ -511,7 +511,7 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(convertHeic).toHaveBeenCalledWith(srcPath, "jpeg");
+      expect(convertHeic).toHaveBeenCalledWith(srcPath, "jpeg", expect.any(Number));
       const msg = handler.mock.calls[0][0];
       expect(msg.images).toHaveLength(1);
       expect(msg.images![0].mediaType).toBe("image/jpeg");
@@ -547,12 +547,169 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(convertHeic).toHaveBeenCalledWith(heicPath, "jpeg");
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "jpeg", expect.any(Number));
       const msg = handler.mock.calls[0][0];
       // Attachment is NOT dropped — original HEIC bytes/mime are kept.
       expect(msg.images).toHaveLength(1);
       expect(msg.images![0].mediaType).toBe("image/heic");
       expect(Buffer.from(msg.images![0].data, "base64").equals(heicBytes)).toBe(true);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("tells the agent the attachment could not be converted (rather than handing it invisible HEIC)", async () => {
+    // A `sips` killed at its deadline (see heic.ts) resolves null, exactly
+    // like any other conversion failure. The message must still be delivered —
+    // blocking on it stalls the whole inbound FIFO — but the agent is holding
+    // HEIC bytes the harness image reader cannot display, so the marker says so.
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const heicPath = join(dir, "wedged.heic");
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => null); // timed out / failed
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-timeout",
+        chat_guid: DM_GUID,
+        text: "look at this",
+        attachments: [{
+          filename: "wedged.heic",
+          mime_type: "image/heic",
+          original_path: heicPath,
+          missing: false,
+        }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images).toHaveLength(1);
+      expect(msg.text).toContain("1 attachment could not be converted from HEIC");
+      expect(msg.text).toContain("look at this");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("shares one conversion budget across a message instead of resetting per attachment", async () => {
+    // `loadAttachments` is sequential, so a per-`sips` deadline alone bounds
+    // one child, not one message. Two HEICs must draw down a single budget.
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-budget-"));
+    const heicBytes = Buffer.from("000000246674797068656963000000006d696631", "hex");
+    const a = join(dir, "a.heic");
+    const b = join(dir, "b.heic");
+    writeFileSync(a, heicBytes);
+    writeFileSync(b, heicBytes);
+
+    try {
+      const budgets: number[] = [];
+      const convertHeic = vi.fn(async (_src: string, _fmt: string, timeoutMs?: number) => {
+        budgets.push(timeoutMs!);
+        await new Promise((r) => setTimeout(r, 60));
+        return null;
+      });
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "budget-guid-1",
+        chat_guid: DM_GUID,
+        text: "",
+        attachments: [
+          { filename: "a.heic", mime_type: "image/heic", original_path: a, missing: false },
+          { filename: "b.heic", mime_type: "image/heic", original_path: b, missing: false },
+        ],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(budgets).toHaveLength(2);
+      // The second conversion gets strictly less time than the first — the
+      // budget is the message's, not the attachment's.
+      expect(budgets[1]).toBeLessThan(budgets[0]);
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stops converting once the message budget is exhausted, and still delivers", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-budget-"));
+    const heicBytes = Buffer.from("000000246674797068656963000000006d696631", "hex");
+    const paths = ["a", "b", "c"].map((n) => {
+      const p = join(dir, `${n}.heic`);
+      writeFileSync(p, heicBytes);
+      return p;
+    });
+
+    try {
+      // 40ms of budget; the first conversion alone burns 80ms.
+      const convertHeic = vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, 80));
+        return null;
+      });
+      const { channel, children } = makeChannel({ config: {
+        convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir, conversionBudgetMs: 40,
+      } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "budget-guid-2",
+        chat_guid: DM_GUID,
+        text: "",
+        attachments: paths.map((p, i) => ({
+          filename: `${["a", "b", "c"][i]}.heic`, mime_type: "image/heic", original_path: p, missing: false,
+        })),
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      // Only the first attachment ever reached sips; the other two were past
+      // the deadline and skipped without spawning anything.
+      expect(convertHeic).toHaveBeenCalledTimes(1);
+
+      // Nothing is dropped: all three are delivered, all three flagged.
+      const msg = handler.mock.calls[0][0];
+      expect(msg.images).toHaveLength(3);
+      expect(msg.text).toContain("3 attachments could not be converted from HEIC");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("says nothing extra when the conversion succeeds", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-heic-"));
+    const heicPath = join(dir, "ok.heic");
+    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+    const jpegPath = join(dir, "ok.jpg");
+    writeFileSync(jpegPath, Buffer.from("ffd8ffe000104a464946", "hex"));
+
+    try {
+      const convertHeic = vi.fn(async (_src: string) => jpegPath);
+      const { channel, children } = makeChannel({ config: { convertHeic, probeHeicAlpha: async () => false, imageStoreBaseDir: dir } });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "heic-guid-ok",
+        chat_guid: DM_GUID,
+        text: "",
+        attachments: [{ filename: "ok.heic", mime_type: "image/heic", original_path: heicPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      expect(handler.mock.calls[0][0].text).not.toContain("could not be converted");
       await channel.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -625,7 +782,7 @@ describe("imsg inbound message mapping", () => {
 
       // Stickers force PNG without consulting the alpha probe — the source is
       // die-cut transparent art by construction.
-      expect(convertHeic).toHaveBeenCalledWith(heicPath, "png");
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "png", expect.any(Number));
       expect(probeHeicAlpha).not.toHaveBeenCalled();
 
       const msg = handler.mock.calls[0][0];
@@ -702,8 +859,8 @@ describe("imsg inbound message mapping", () => {
       }));
       await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-      expect(probeHeicAlpha).toHaveBeenCalledWith(heicPath);
-      expect(convertHeic).toHaveBeenCalledWith(heicPath, "png");
+      expect(probeHeicAlpha).toHaveBeenCalledWith(heicPath, expect.any(Number));
+      expect(convertHeic).toHaveBeenCalledWith(heicPath, "png", expect.any(Number));
       const msg = handler.mock.calls[0][0];
       expect(msg.images![0].mediaType).toBe("image/png");
       expect(msg.images![0].isSticker).toBeUndefined();

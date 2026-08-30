@@ -1,11 +1,36 @@
 import { EventEmitter } from "node:events";
 import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { isHeicMimeType, hasHeicExtension, sniffHeic, looksLikeHeic, convertHeicImage, heicHasAlpha } from "../src/channels/heic.js";
+import { type ChildProcess } from "node:child_process";
+import {
+  isHeicMimeType, hasHeicExtension, sniffHeic, looksLikeHeic, convertHeicImage, heicHasAlpha,
+  SIPS_TIMEOUT_MS, SIPS_PROBE_TIMEOUT_MS,
+} from "../src/channels/heic.js";
 
 const spawnMock = vi.fn();
+// The mock replaces `spawn` for this whole module graph — including this test
+// file — so stash the real one for the integration test at the bottom, which
+// needs an actual child process.
+const hoisted = vi.hoisted(() => ({
+  realSpawn: null as unknown as typeof import("node:child_process").spawn,
+  /** When set, every `unlink` inside heic.ts blocks on it. */
+  blockUnlink: null as null | Promise<void>,
+}));
+// heic.ts unlinks its temp output through fs/promises. Gating it is how the
+// "settles without waiting for the unlink" test below holds the fs call open.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    unlink: async (path: string) => {
+      if (hoisted.blockUnlink) await hoisted.blockUnlink;
+      return actual.unlink(path);
+    },
+  };
+});
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
+  hoisted.realSpawn = actual.spawn;
   return { ...actual, spawn: (...args: unknown[]) => spawnMock(...args) };
 });
 
@@ -13,6 +38,9 @@ vi.mock("node:child_process", async (importOriginal) => {
 class FakeChild extends EventEmitter {
   stderr = new EventEmitter();
   stdout = new EventEmitter();
+  /** Signals this child was sent, in order. */
+  signals: string[] = [];
+  kill(signal?: string) { this.signals.push(signal ?? "SIGTERM"); return true; }
 }
 
 /** Pull the `--out <path>` value the code chose out of the spawn args. */
@@ -99,7 +127,8 @@ describe("convertHeicImage temp-file cleanup", () => {
 
     expect(result).toBeNull();
     expect(capturedOut).not.toBe("");
-    expect(existsSync(capturedOut)).toBe(false);
+    // Fire-and-forget by design (see scrubOutput) — assert eventually, not now.
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
   it("unlinks the temp output on a spawn error and returns null", async () => {
@@ -115,7 +144,7 @@ describe("convertHeicImage temp-file cleanup", () => {
     const result = await convertHeicImage("/tmp/input.heic", "jpeg");
 
     expect(result).toBeNull();
-    expect(existsSync(capturedOut)).toBe(false);
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
   it("returns null without throwing when no temp file was written (ENOENT tolerated)", async () => {
@@ -130,7 +159,7 @@ describe("convertHeicImage temp-file cleanup", () => {
     const result = await convertHeicImage("/tmp/input.heic", "jpeg");
 
     expect(result).toBeNull();
-    expect(existsSync(capturedOut)).toBe(false);
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
   it("returns the output path on a successful (code 0) conversion", async () => {
@@ -217,5 +246,187 @@ describe("heicHasAlpha probe", () => {
     });
     await heicHasAlpha("/a/b/sticker.heic");
     expect(capturedArgs).toEqual(["-g", "hasAlpha", "/a/b/sticker.heic"]);
+  });
+});
+
+
+describe("sips deadlines (the inbound-FIFO wedge)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resolves null and escalates SIGTERM → SIGKILL when a conversion overruns", async () => {
+    vi.useFakeTimers();
+    let child!: FakeChild;
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      child = new FakeChild(); // never emits exit/error — a wedged sips
+      return child;
+    });
+
+    const promise = convertHeicImage("/tmp/hostile.heic", "jpeg");
+
+    // Nothing yet: a slow conversion is still allowed to finish.
+    await vi.advanceTimersByTimeAsync(SIPS_TIMEOUT_MS - 1);
+    expect(child.signals).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    // The promise settles at the deadline — NOT when the child dies. That
+    // ordering is the fix: `watchChain` is a strict FIFO and `quiesce()` is
+    // `await this.watchChain`, so a promise that waits for an unkillable
+    // child is a permanent inbound stall plus an unkillable daemon.
+    await expect(promise).resolves.toBeNull();
+    expect(child.signals).toEqual(["SIGTERM"]);
+
+    // SIGTERM ignored → SIGKILL after the grace. This escalation used to be
+    // cancelled by the disarm that runs when the promise settles.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false)); // partial output cleaned up
+  });
+
+  it("does not signal a conversion that finishes inside the deadline", async () => {
+    vi.useFakeTimers();
+    let child!: FakeChild;
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      writeFileSync(capturedOut, Buffer.from("ffd8ffe0", "hex"));
+      child = new FakeChild();
+      return child;
+    });
+
+    const promise = convertHeicImage("/tmp/input.heic", "jpeg");
+    await vi.advanceTimersByTimeAsync(10);
+    child.emit("exit", 0);
+    await expect(promise).resolves.toBe(capturedOut);
+
+    // Well past the deadline: a disarmed timer must not fire on a child that
+    // already exited (and, in the real world, on a recycled pid).
+    await vi.advanceTimersByTimeAsync(SIPS_TIMEOUT_MS + 5_000);
+    expect(child.signals).toEqual([]);
+    unlinkSync(capturedOut);
+  });
+
+  it("resolves null and kills the alpha probe when it overruns", async () => {
+    vi.useFakeTimers();
+    let child!: FakeChild;
+    spawnMock.mockImplementation(() => {
+      child = new FakeChild();
+      return child;
+    });
+
+    const promise = heicHasAlpha("/tmp/hostile.heic");
+    await vi.advanceTimersByTimeAsync(SIPS_PROBE_TIMEOUT_MS - 1);
+    expect(child.signals).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(promise).resolves.toBeNull();
+    expect(child.signals).toEqual(["SIGTERM"]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+});
+
+/**
+ * The property that matters is process semantics — "the await returns even
+ * though the child is still alive", and "the child dies anyway". Neither can
+ * be observed against a fake child, so this runs against a real one that
+ * installs a SIGTERM handler and refuses to die.
+ */
+describe("convertHeicImage against a real un-SIGTERM-able child", () => {
+  const spawned: ChildProcess[] = [];
+
+  afterEach(() => {
+    for (const c of spawned) { try { c.kill("SIGKILL"); } catch { /* gone */ } }
+    spawned.length = 0;
+  });
+
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+  it("settles at the deadline while the child lives, then SIGKILLs it", async () => {
+    spawnMock.mockImplementation(() => {
+      const c = hoisted.realSpawn(process.execPath, [
+        "-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);',
+      ], { stdio: ["ignore", "ignore", "pipe"] });
+      spawned.push(c);
+      return c;
+    });
+
+    const started = Date.now();
+    const result = await convertHeicImage("/tmp/hostile.heic", "jpeg", 300);
+    const elapsed = Date.now() - started;
+
+    // On unchanged main there is no deadline at all: this await never returns
+    // and the test times out.
+    expect(result).toBeNull();
+    expect(elapsed).toBeLessThan(2_000);
+
+    const pid = spawned[0].pid!;
+    expect(alive(pid)).toBe(true); // SIGTERM was ignored; we did not wait for it
+
+    // …but the escalation still runs (2s grace) even though the promise is
+    // long settled.
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(alive(pid)).toBe(false);
+  }, 20_000);
+});
+
+
+describe("settling is never behind an fs call", () => {
+  afterEach(() => { hoisted.blockUnlink = null; });
+
+  it("resolves without waiting for the temp-file unlink", async () => {
+    // The deadline exists to keep the inbound FIFO moving, so nothing
+    // unbounded may sit between "deadline reached" and "promise settled".
+    // `unlink` is unbounded (it is a syscall on a possibly-wedged filesystem),
+    // so it must run AFTER the resolve, not before it.
+    let release!: () => void;
+    hoisted.blockUnlink = new Promise<void>((r) => { release = r; });
+
+    let capturedOut = "";
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      capturedOut = outPathFromArgs(args);
+      writeFileSync(capturedOut, Buffer.from("partial"));
+      const child = new FakeChild();
+      queueMicrotask(() => child.emit("exit", 1));
+      return child;
+    });
+
+    // Before the fix this awaited the blocked unlink and timed out.
+    await expect(convertHeicImage("/tmp/input.heic", "jpeg")).resolves.toBeNull();
+
+    release();
+    hoisted.blockUnlink = null;
+    await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
+  }, 5_000);
+
+  it("scrubs the output again when a killed child exits after the deadline", async () => {
+    // The child has up to SIPS_KILL_GRACE_MS still running after we settle, so
+    // it can create (or re-create) outPath behind the first scrub.
+    vi.useFakeTimers();
+    try {
+      let child!: FakeChild;
+      let capturedOut = "";
+      spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+        capturedOut = outPathFromArgs(args);
+        child = new FakeChild();
+        return child;
+      });
+
+      const promise = convertHeicImage("/tmp/hostile.heic", "jpeg");
+      await vi.advanceTimersByTimeAsync(SIPS_TIMEOUT_MS);
+      await expect(promise).resolves.toBeNull();
+
+      // sips writes its partial output only now, after the first scrub ran.
+      writeFileSync(capturedOut, Buffer.from("partial written during the grace"));
+      child.emit("exit", null);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

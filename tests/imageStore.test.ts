@@ -16,7 +16,7 @@ vi.mock("../src/logger.js", () => ({
   },
 }));
 
-const { buildImagePath, findExifOrientation, formatStickerMarker, mimeToExt, normalizeJpegBuffer, saveInboundImage } = await import("../src/channels/imageStore.js");
+const { buildImagePath, findExifOrientation, formatImageMarker, formatStickerMarker, mimeToExt, normalizeJpegBuffer, saveInboundImage } = await import("../src/channels/imageStore.js");
 
 /**
  * Build a minimal JPEG buffer that contains just enough structure for the EXIF
@@ -237,6 +237,43 @@ describe("formatStickerMarker", () => {
   });
 
   it("pluralizes multiple stickers", () => {
+    expect(formatStickerMarker(2, ["/abs/a.png", "/abs/b.png"])).toBe(
+      "[Sent 2 stickers, saved to: /abs/a.png, /abs/b.png; resend with STICKER:<saved path>]",
+    );
+  });
+});
+
+
+describe("unconverted-attachment note on the inline markers", () => {
+  // A HEIC whose sips conversion failed (or was killed at its deadline) is
+  // still delivered — with the ORIGINAL bytes, which the harness image reader
+  // cannot display. Saying so is the difference between "the agent can't see
+  // it and doesn't know why" and a usable message.
+  it("is absent when everything converted", () => {
+    expect(formatImageMarker(1, ["/abs/a.jpg"])).toBe("[Sent an image, saved to: /abs/a.jpg]");
+    expect(formatImageMarker(1, ["/abs/a.jpg"], 0)).toBe("[Sent an image, saved to: /abs/a.jpg]");
+    expect(formatImageMarker(1, [])).toBe("[Sent an image]");
+  });
+
+  it("appends the note to the image marker, with and without saved paths", () => {
+    expect(formatImageMarker(1, ["/abs/a.heic"], 1)).toBe(
+      "[Sent an image, saved to: /abs/a.heic; 1 attachment could not be converted from HEIC"
+      + " — the original bytes are attached and may not be readable]",
+    );
+    expect(formatImageMarker(2, [], 2)).toBe(
+      "[Sent 2 images; 2 attachments could not be converted from HEIC"
+      + " — the original bytes are attached and may not be readable]",
+    );
+  });
+
+  it("appends the note to the sticker marker before the resend hint", () => {
+    expect(formatStickerMarker(1, ["/abs/s.heic"], 1)).toBe(
+      "[Sent a sticker, saved to: /abs/s.heic; 1 attachment could not be converted from HEIC"
+      + " — the original bytes are attached and may not be readable; resend with STICKER:<saved path>]",
+    );
+  });
+
+  it("leaves the existing marker shapes untouched (no third argument)", () => {
     expect(formatStickerMarker(2, ["/abs/a.png", "/abs/b.png"])).toBe(
       "[Sent 2 stickers, saved to: /abs/a.png, /abs/b.png; resend with STICKER:<saved path>]",
     );

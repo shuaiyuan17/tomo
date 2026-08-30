@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,24 +110,68 @@ describe("acquirePidFile", () => {
 });
 
 describe("the takeover lock", () => {
-  it("reclaims a lock abandoned by a process killed inside the critical section", () => {
-    const lockDir = `${pidFile}.lock`;
-    mkdirSync(lockDir);
-    const old = (Date.now() - 60_000) / 1000;
-    utimesSync(lockDir, old, old);
-    const res = acquirePidFile(pidFile, 4242);
-    expect(res).toEqual({ ok: true, tookOverStale: null });
-    expect(existsSync(lockDir)).toBe(false);
+  const lock = () => `${pidFile}.lock`;
+  function plantLock(owner: number, ageMs = 0): void {
+    mkdirSync(lock());
+    writeFileSync(join(lock(), "owner"), `${owner}\n`);
+    if (ageMs > 0) {
+      const t = (Date.now() - ageMs) / 1000;
+      utimesSync(lock(), t, t);
+    }
+  }
+
+  it("reclaims a lock whose owner is dead, at once", () => {
+    plantLock(deadPid());
+    expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: true, tookOverStale: null });
+    expect(existsSync(lock())).toBe(false);
+    expect(readdirSync(dir).filter((n) => n.includes(".lock"))).toEqual([]);
+  });
+
+  it("reclaims a lock that is older than the stale budget even if its owner cannot be read", () => {
+    mkdirSync(lock());
+    const t = (Date.now() - 60_000) / 1000;
+    utimesSync(lock(), t, t);
+    expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: true, tookOverStale: null });
+    expect(existsSync(lock())).toBe(false);
+  });
+
+  it("refuses, naming the lock rather than a daemon, when a live owner holds it for the whole wait", { timeout: 15_000 }, () => {
+    plantLock(process.pid);
+    const started = Date.now();
+    expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: false, holder: null });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(4_900);
+    // The busy lock is left exactly as it was: not ours to remove.
+    expect(existsSync(join(lock(), "owner"))).toBe(true);
+    expect(existsSync(pidFile)).toBe(false);
   });
 
   it("does not leave the lock behind after any outcome", () => {
     writeFileSync(pidFile, `${process.pid}\n${processIdentity(process.pid)}\n`);
     expect(acquirePidFile(pidFile, 4242).ok).toBe(false);
-    expect(existsSync(`${pidFile}.lock`)).toBe(false);
+    expect(existsSync(lock())).toBe(false);
     releasePidFile(pidFile, process.pid);
-    expect(existsSync(`${pidFile}.lock`)).toBe(false);
+    expect(existsSync(lock())).toBe(false);
     expect(readLivePidFileRecord(pidFile)).toBeNull();
-    expect(existsSync(`${pidFile}.lock`)).toBe(false);
+    expect(existsSync(lock())).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("lets readers answer without creating the runtime directory", () => {
+    const missing = join(dir, "no-such-dir", "tomo.pid");
+    expect(readLivePidFileRecord(missing)).toBeNull();
+    expect(() => releasePidFile(missing, process.pid)).not.toThrow();
+    expect(existsSync(join(dir, "no-such-dir"))).toBe(false);
+  });
+
+  it("sweeps prepared locks and reclaim leftovers abandoned by dead processes", () => {
+    mkdirSync(`${lock()}.${deadPid()}.abandoned`);
+    mkdirSync(`${lock()}.reclaim.old`);
+    const t = (Date.now() - 60_000) / 1000;
+    utimesSync(`${lock()}.reclaim.old`, t, t);
+    mkdirSync(`${lock()}.reclaim.fresh`);
+    expect(acquirePidFile(pidFile, 4242).ok).toBe(true);
+    const left = readdirSync(dir).sort();
+    expect(left).toEqual(["tomo.pid", "tomo.pid.lock.reclaim.fresh"]);
   });
 });
 
@@ -238,7 +282,7 @@ describe("releasePidFile", () => {
 const FIXTURE = fileURLToPath(new URL("./fixtures/pidfile-race.ts", import.meta.url));
 const TSX = fileURLToPath(new URL("../node_modules/.bin/tsx", import.meta.url));
 
-interface RacerLine { pid: number; ok: boolean; holder?: number; tookOverStale?: number | null }
+interface RacerLine { pid: number; ok: boolean; holder?: number | null; tookOverStale?: number | null }
 
 interface Racer { result: Promise<RacerLine>; child: ReturnType<typeof spawn> }
 

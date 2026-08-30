@@ -85,9 +85,12 @@ export async function performStopWith(deps: StopDeps): Promise<StopOutcome> {
   }
   const pid = record.pid;
 
-  // The bootout above may already have taken it down; only signal if it is
-  // still there, and either way wait for the pid to actually disappear.
-  if (deps.alive(pid)) {
+  // The bootout above may already have taken it down — and, since that was
+  // an await, the pid may by now belong to someone else. Confirm the recorded
+  // identity immediately before signalling, not just before the bootout:
+  // SIGTERMing a stranger who inherited a recycled pid is worse than doing
+  // nothing. Either way, wait for the pid to actually disappear.
+  if (deps.alive(pid) && deps.recordLive(record)) {
     try {
       deps.kill(pid, "SIGTERM");
     } catch {

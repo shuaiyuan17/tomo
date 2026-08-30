@@ -98,7 +98,10 @@ export async function restartAutostart(): Promise<void> {
   // If the running tomo wasn't actually the launchd-managed instance (e.g.
   // started via `tomo start` directly), kickstart -k won't reach it. SIGTERM
   // the PID-file PID directly so it exits and launchd can take over.
-  if (oldPid !== null) {
+  // Re-confirm the identity NOW, after the launchctl await: kickstart may
+  // already have reaped the old daemon and its pid can have been recycled in
+  // the meantime.
+  if (oldPid !== null && oldRecord !== null && isRecordedProcessLive(oldRecord)) {
     try { process.kill(oldPid, "SIGTERM"); } catch { /* already dead */ }
   }
 
@@ -108,9 +111,16 @@ export async function restartAutostart(): Promise<void> {
   // for the in-flight assistant response to finish before closing).
   const timeoutSec = Math.round(DAEMON_STOP_TIMEOUT_MS / 1000);
   const deadline = Date.now() + DAEMON_STOP_TIMEOUT_MS;
-  while (Date.now() < deadline) {
+  let waitingOn = oldPid;
+  for (let tick = 1; Date.now() < deadline; tick++) {
     await new Promise((r) => setTimeout(r, 300));
-    if (oldPid !== null && isPidAlive(oldPid)) continue;
+    if (waitingOn !== null && isPidAlive(waitingOn)) {
+      // The poll is cheap liveness; every ~3s confirm it is still OUR daemon
+      // on that pid, so a recycled pid cannot hold the wait for the whole
+      // budget. (`ps` once per ten ticks, not once per tick.)
+      if (tick % 10 !== 0 || (oldRecord !== null && isRecordedProcessLive(oldRecord))) continue;
+      waitingOn = null;
+    }
     const newPid = readPidFile();
     if (newPid !== null && newPid !== recordedPid) return;
   }

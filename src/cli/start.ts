@@ -31,7 +31,11 @@ async function startForeground(): Promise<void> {
   // autostart racing a manual `tomo start` put BOTH daemons past the check.
   const acquired = acquirePidFile(PID_FILE);
   if (!acquired.ok) {
-    console.error(`Tomo is already running (PID ${acquired.holder}). Refusing to start a second instance.`);
+    console.error(
+      acquired.holder === null
+        ? `Could not take the pid-file lock (${PID_FILE}.lock stayed busy). Another tomo process may be starting or stopping; refusing to start a second instance. Check \`tomo status\` and retry.`
+        : `Tomo is already running (PID ${acquired.holder}). Refusing to start a second instance.`,
+    );
     process.exit(1);
   }
   if (acquired.tookOverStale !== null) {

@@ -1,10 +1,10 @@
 import { Command } from "commander";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync } from "node:fs";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { disableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { stopRecordedDaemon } from "./pidfile.js";
+import { readLivePidFileRecord, stopRecordedDaemon } from "./pidfile.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
@@ -70,8 +70,10 @@ async function stopPidfileTomo(): Promise<void> {
     // the exit rather than report it. The daemon releases its own pid file;
     // a stale one is swept below so `~/.tomo` is left clean.
     const result = await stopRecordedDaemon(PID_FILE);
-    // Only a file nobody live is holding: stale, or released by the exit.
-    try { unlinkSync(PID_FILE); } catch { /* already released */ }
+    // Sweep a stale file — under the pid-file lock, which is what guarantees
+    // we never unlink a claim that a concurrent `tomo start` has just taken.
+    // (The daemon that just exited released its own.)
+    readLivePidFileRecord(PID_FILE);
     s.stop(result === null ? "Nothing to stop" : "Tomo stopped");
   } catch (err) {
     s.stop("Could not stop Tomo");

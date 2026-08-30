@@ -1,5 +1,5 @@
 import {
-  closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync,
+  closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync,
   writeFileSync, writeSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -171,9 +171,11 @@ export async function stopRecordedDaemon(
 }
 
 /**
- * How long a takeover lock may sit on disk before it is presumed abandoned.
- * The critical section it guards is a handful of syscalls — microseconds —
- * so a lock this old belongs to a process that was SIGKILLed inside it.
+ * How long a takeover lock may sit on disk before it is presumed abandoned
+ * even when its owner cannot be probed. The critical section it guards is a
+ * handful of syscalls — microseconds — so a lock this old belongs to a
+ * process that was SIGKILLed inside it. The usual signal is faster: the lock
+ * records its owner's pid and a dead owner is reclaimed at once.
  */
 const LOCK_STALE_MS = 10_000;
 /** How long a contender waits for the lock before giving up. */
@@ -184,9 +186,78 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function lockDirFor(pidFile: string): string {
+  return `${pidFile}.lock`;
+}
+
+function readLockOwnerPid(dir: string): number | null {
+  try {
+    const pid = Number(readFileSync(join(dir, "owner"), "utf-8").split("\n")[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Run `fn` with `<pidFile>.lock` held. `mkdir` is atomic, so exactly one
- * process can create the directory; everyone else waits.
+ * Take the directory at `lockDir` off its path — but only if it is still the
+ * instance (inode) the caller examined. Returns true if that instance was
+ * removed.
+ *
+ * `rename` is atomic and moves exactly one instance, so this is how a lock
+ * can be reclaimed without the ABA race that a plain `rmdir` has: two
+ * contenders both stat the same abandoned lock; A removes it, creates its own
+ * and enters the critical section; B then executes its already-decided
+ * `rmdir` — on A's fresh lock — and enters too. Here B's rename moves A's
+ * lock, B sees the inode is not the one it judged, and puts it straight back.
+ *
+ * Residual window: if a third contender takes the vacated path in the
+ * microseconds before B restores, the restore fails and A is inside without a
+ * lock. That needs three starters to hit one abandoned lock in the same
+ * instant; the ordinary two-party race is closed.
+ */
+function removeLockInstance(lockDir: string, expectedIno: bigint | number): boolean {
+  const graveyard = `${lockDir}.reclaim.${randomUUID()}`;
+  try {
+    renameSync(lockDir, graveyard);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false; // someone else got there first
+    throw err;
+  }
+  let ino: bigint | number | null = null;
+  try { ino = statSync(graveyard).ino; } catch { /* vanished */ }
+  if (ino === expectedIno) {
+    rmSync(graveyard, { recursive: true, force: true });
+    return true;
+  }
+  try {
+    renameSync(graveyard, lockDir);
+  } catch {
+    rmSync(graveyard, { recursive: true, force: true });
+  }
+  return false;
+}
+
+/** Reclaim `lockDir` if its owner is dead or it is older than `LOCK_STALE_MS`. True if the caller should retry at once. */
+function reclaimAbandonedLock(lockDir: string): boolean {
+  let ino: bigint | number;
+  let ageMs: number;
+  try {
+    const st = statSync(lockDir);
+    ino = st.ino;
+    ageMs = Date.now() - st.mtimeMs;
+  } catch {
+    return true; // vanished between the failed acquire and the stat: retry now
+  }
+  const owner = readLockOwnerPid(lockDir);
+  const abandoned = (owner !== null && !isPidAlive(owner)) || ageMs > LOCK_STALE_MS;
+  if (!abandoned) return false;
+  removeLockInstance(lockDir, ino);
+  return true;
+}
+
+/**
+ * Run `fn` with `<pidFile>.lock` held.
  *
  * The lock exists because "read the pid file, judge it stale, unlink it" is a
  * check-then-act, and `link()` alone only makes the PUBLISH atomic. Without
@@ -196,38 +267,51 @@ function sleepSync(ms: number): void {
  * status` reap a claim that had just been re-taken. Every mutation of the pid
  * file goes through here so that judgement and unlink are one step.
  *
- * A lock left by a process killed mid-section is reclaimed by age. That
- * reclaim is itself a check-then-act, but the window needs a process to be
- * suspended for `LOCK_STALE_MS` between stat and rmdir — not a live daemon's
- * whole startup sequence, which is the window this module closes.
+ * Acquisition is `rename(prepared, lockDir)` where `prepared` is a directory
+ * already holding an `owner` file. Onto a non-existent path the rename
+ * succeeds atomically; onto an existing non-empty directory it fails with
+ * ENOTEMPTY. A lock at the path is therefore never observable as empty (the
+ * one case where rename would replace it), and it always names its owner, so
+ * a contender can tell an abandoned lock from a busy one without waiting.
  *
- * Returns `undefined` if the lock could not be taken within `LOCK_WAIT_MS`.
+ * Returns `undefined` if the lock could not be taken within `LOCK_WAIT_MS`,
+ * or if the pid file's directory does not exist (then there is no pid file to
+ * guard, and a reader must not create `~/.tomo` as a side effect).
  */
 function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
-  const lockDir = `${pidFile}.lock`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-      break;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    }
-    try {
-      if (Date.now() - statSync(lockDir).mtimeMs > LOCK_STALE_MS) {
-        try { rmdirSync(lockDir); } catch { /* someone else reclaimed it */ }
-        continue;
-      }
-    } catch {
-      continue; // vanished between the mkdir and the stat: retry immediately
-    }
-    if (Date.now() >= deadline) return undefined;
-    sleepSync(LOCK_POLL_MS);
-  }
+  const lockDir = lockDirFor(pidFile);
+  const prepared = `${lockDir}.${process.pid}.${randomUUID()}`;
   try {
+    mkdirSync(prepared);
+    writeFileSync(join(prepared, "owner"), `${process.pid}\n`);
+  } catch (err) {
+    rmSync(prepared, { recursive: true, force: true });
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  const ino = statSync(prepared).ino; // rename preserves the inode
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let held = false;
+  try {
+    for (;;) {
+      try {
+        renameSync(prepared, lockDir);
+        held = true;
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOTEMPTY" && code !== "EEXIST") throw err;
+      }
+      if (reclaimAbandonedLock(lockDir)) continue;
+      if (Date.now() >= deadline) return undefined;
+      sleepSync(LOCK_POLL_MS);
+    }
     return fn();
   } finally {
-    try { rmdirSync(lockDir); } catch { /* reclaimed by age while we ran; nothing to do */ }
+    // Release our own instance only: if `fn` somehow outlived LOCK_STALE_MS
+    // and a contender reclaimed us, the path now holds THEIR lock.
+    if (held) removeLockInstance(lockDir, ino);
+    else rmSync(prepared, { recursive: true, force: true });
   }
 }
 
@@ -237,8 +321,12 @@ export type PidFileAcquisition =
    * removed, or null when the file simply did not exist.
    */
   | { ok: true; tookOverStale: number | null }
-  /** Another live daemon holds it; `holder` is its pid. */
-  | { ok: false; holder: number };
+  /**
+   * Another live daemon holds it; `holder` is its pid. Null when no holder
+   * could be identified: the takeover lock stayed busy for the whole wait
+   * budget, or the file was being churned by something outside this module.
+   */
+  | { ok: false; holder: number | null };
 
 /**
  * Claim the daemon pid file, atomically.
@@ -304,12 +392,13 @@ export function acquirePidFile(pidFile: string = PID_FILE, pid: number = process
       // Five rounds with no live holder means the file is being churned by
       // something outside this module. Refusing is safer than looping: the
       // caller exits non-zero.
-      return { ok: false, holder: readPidFileRecord(pidFile)?.pid ?? 0 };
+      return { ok: false, holder: null };
     });
     // Could not take the lock: another process has been inside the critical
-    // section for longer than the whole wait budget. Treat whatever the file
-    // says as the holder rather than start a daemon we cannot prove is alone.
-    return outcome ?? { ok: false, holder: readPidFileRecord(pidFile)?.pid ?? 0 };
+    // section for longer than the whole wait budget. Refuse rather than start
+    // a daemon we cannot prove is alone — and say it was the lock, not a
+    // daemon, so the diagnosis does not point at a pid that is not running.
+    return outcome ?? { ok: false, holder: null };
   } finally {
     try { unlinkSync(staging); } catch { /* already gone */ }
   }
@@ -365,11 +454,25 @@ function sweepAbandonedStaging(pidFile: string): void {
   try {
     const dir = dirname(pidFile);
     const prefix = `${basename(pidFile)}.`;
+    const lockPrefix = `${basename(lockDirFor(pidFile))}.`;
     for (const name of readdirSync(dir)) {
       if (!name.startsWith(prefix)) continue;
+      const path = join(dir, name);
+      if (name.startsWith(lockPrefix)) {
+        // `tomo.pid.lock.<pid>.<uuid>` is a prepared lock; `.lock.reclaim.<uuid>`
+        // a reclaim in flight. Either is abandoned if its owner is dead or it
+        // is old. The live lock itself (`tomo.pid.lock`) is never touched here.
+        const tag = name.slice(lockPrefix.length).split(".")[0];
+        const owner = Number(tag);
+        let old = false;
+        try { old = Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS; } catch { continue; }
+        const dead = Number.isInteger(owner) && owner > 0 && !isPidAlive(owner);
+        if (dead || old) rmSync(path, { recursive: true, force: true });
+        continue;
+      }
       const owner = Number(name.slice(prefix.length).split(".")[0]);
       if (!Number.isInteger(owner) || owner <= 0 || isPidAlive(owner)) continue;
-      try { unlinkSync(join(dir, name)); } catch { /* raced or not ours */ }
+      try { unlinkSync(path); } catch { /* raced or not ours */ }
     }
   } catch { /* unreadable directory is not a reason to refuse to start */ }
 }

@@ -98,6 +98,15 @@ describe("performStop", () => {
     expect(out).toEqual({ code: 1, message: "Failed to stop LaunchAgent: boom" });
   });
 
+  it("does not signal a pid whose identity changed during the launchd bootout", async () => {
+    // `recordLive` is consulted immediately before the kill, after the await:
+    // the bootout may have reaped the daemon and the pid been recycled.
+    const kill = vi.fn();
+    const out = await performStopWith(deps({ autostartEnabled: () => true, recordLive: () => false, kill }));
+    expect(kill).not.toHaveBeenCalled();
+    expect(out.code).toBe(0);
+  });
+
   it("does not signal a pid that already exited, but still confirms the exit", async () => {
     const kill = vi.fn();
     const out = await performStopWith(deps({ alive: () => false, kill }));

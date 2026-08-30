@@ -36,7 +36,11 @@ export type WatchEvent =
   | { type: "cron.done"; ts: number; jobId: string; name: string; ok: boolean }
   | { type: "heartbeat"; ts: number }
   | { type: "compact"; ts: number; sessionKey?: string; preTokens?: number; postTokens?: number }
-  | { type: "issue"; ts: number; level: "warn" | "error"; msg: string };
+  | { type: "issue"; ts: number; level: "warn" | "error"; msg: string }
+  /** The MODEL wrote a line shaped like an inbound harness marker into its own
+   *  reply. The block still ships (marked, not truncated) — see
+   *  src/agent/inbound-markers.ts. */
+  | { type: "fabricated-marker"; ts: number; sessionKey?: string; shape: string; marker: string };
 
 export type WatchIssue = Extract<WatchEvent, { type: "issue" }>;
 

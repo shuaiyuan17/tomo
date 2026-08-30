@@ -88,6 +88,25 @@ describe("MetricsExporter", () => {
     expect(await metricValue(exporter, "tomo_heartbeats_total")).toBe(1);
   });
 
+  /**
+   * The outlet guard (src/agent/inbound-markers.ts) delivers a fabricated
+   * inbound marker rather than cutting it, so the ONLY way to notice the rate
+   * at which the model does this is a counter. `tomo status` runs in a
+   * different process from the daemon and could never read an in-memory one;
+   * the exporter is where daemon counters live.
+   */
+  it("counts fabricated inbound markers in outgoing text, by session and shape", async () => {
+    bus.publish({ type: "fabricated-marker", sessionKey: "dm:me", shape: "stamp", marker: "[imessage · Sat 08/29 08:25 PDT] hi" });
+    bus.publish({ type: "fabricated-marker", sessionKey: "dm:me", shape: "stamp", marker: "[telegram · Sat 08/29 09:00 PDT] yo" });
+    bus.publish({ type: "fabricated-marker", sessionKey: "telegram:-100", shape: "tomo-event", marker: "<tomo-event type=\"cron\">" });
+    // A block from an unowned SDK turn has no session key; it must still count.
+    bus.publish({ type: "fabricated-marker", shape: "legacy-system", marker: "System: heartbeat" });
+
+    expect(await metricValue(exporter, "tomo_fabricated_markers_total", { session: "dm:me", shape: "stamp" })).toBe(2);
+    expect(await metricValue(exporter, "tomo_fabricated_markers_total", { session: "telegram:-100", shape: "tomo-event" })).toBe(1);
+    expect(await metricValue(exporter, "tomo_fabricated_markers_total", { session: "unknown", shape: "legacy-system" })).toBe(1);
+  });
+
   it("exports upcoming cron runs and heartbeat schedule from collectors", async () => {
     exporter.stop();
     let nextHeartbeat: number | null = 1_800_000_000_000;

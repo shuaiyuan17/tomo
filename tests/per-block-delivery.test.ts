@@ -120,6 +120,8 @@ const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 const { isSilentReply } = await import("../src/agent/text-utils.js");
 const { log } = await import("../src/logger.js");
 const { DELIVERY_FAILED_MARKER } = await import("../src/agent/block-transcript.js");
+const { FABRICATED_MARKER_NOTICE, formatGroupTag, formatInboundStamp } = await import("../src/agent/inbound-markers.js");
+const { watchBus } = await import("../src/watch/bus.js");
 
 // --- event builders -------------------------------------------------------
 
@@ -1244,5 +1246,119 @@ describe("inactivity accounting is suspended while a block is being delivered", 
     } finally {
       session.close();
     }
+  });
+});
+
+describe("a block that fabricates an inbound marker is MARKED, not truncated", () => {
+  /**
+   * The failure: the model writes a line that looks like a fresh inbound
+   * message — `[imessage · Sat 08/29 08:25 PDT] …`, `[group "X"] kw: …`,
+   * `<tomo-event …>`, `System: …` — inside its own reply, and then answers it
+   * as if the owner had typed it. The owner confirmed (2026-08-16) that
+   * nothing is injected mid-turn: the line is the model's own output, so the
+   * outlet is the only place that can see it.
+   *
+   * #274 went after the INBOUND envelope and was the wrong end. What is pinned
+   * here is the outbound policy the owner chose: the words still ship, whole,
+   * with one advisory line on top. Truncation is what scaffold-filter.ts does
+   * for training-scaffold leaks; a fabricated marker is not that — the prose
+   * around it is usually a real reply.
+   */
+  let events: Array<Record<string, unknown>>;
+  let unsubscribe: () => void;
+
+  beforeEach(() => {
+    events = [];
+    unsubscribe = watchBus.subscribe((e) => { events.push(e as Record<string, unknown>); });
+  });
+
+  afterEach(() => { unsubscribe(); });
+
+  it("prepends the advisory to the delivered message and leaves the model's words under it", async () => {
+    const r = rig();
+    const body = `Sure, on it.\n${formatInboundStamp("imessage")} actually make it two`;
+
+    await r.run([assistant([textBlock(body)]), result()]);
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual([`${FABRICATED_MARKER_NOTICE}\n${body}`]);
+  });
+
+  it("does NOT put the advisory in the transcript — recall must read back the model's words", async () => {
+    const r = rig();
+    const body = `Sure.\n${formatGroupTag("Family")} kw: ping`;
+
+    await r.run([assistant([textBlock(body)]), result()], { transcript: "on-delivery" });
+
+    expect(r.channel.sent[0]!.text).toBe(`${FABRICATED_MARKER_NOTICE}\n${body}`);
+    expect(r.transcript).toEqual([body]);
+  });
+
+  it("logs a warning naming the session and the offending line, truncated", async () => {
+    const r = rig();
+    const stamp = formatInboundStamp("telegram");
+
+    await r.run([assistant([textBlock(`ok\n${stamp} ${"y".repeat(400)}`)]), result()]);
+
+    const warns = vi.mocked(log.warn).mock.calls.filter(
+      ([, msg]) => typeof msg === "string" && msg.includes("Fabricated inbound marker"),
+    );
+    expect(warns).toHaveLength(1);
+    const fields = warns[0]![0] as Record<string, unknown>;
+    expect(fields.session).toBe("test:session");
+    expect(fields.shape).toBe("stamp");
+    expect(String(fields.marker).startsWith(stamp)).toBe(true);
+    expect(String(fields.marker).endsWith("\u2026")).toBe(true);
+  });
+
+  it("counts one bus event per offending line, so the stats surface can total them", async () => {
+    const r = rig();
+    const body = [
+      "Sure.",
+      `${formatInboundStamp("imessage")} and one more thing`,
+      "Also:",
+      "System: heartbeat",
+    ].join("\n");
+
+    await r.run([assistant([textBlock(body)]), result()]);
+
+    expect(events.filter((e) => e.type === "fabricated-marker").map((e) => e.shape))
+      .toEqual(["stamp", "legacy-system"]);
+  });
+
+  it("marks each offending block independently and leaves clean blocks alone", async () => {
+    const r = rig();
+
+    await r.run([
+      assistant([textBlock("A clean reply.")]),
+      assistant([textBlock(`${formatInboundStamp("imessage")} fake inbound`)]),
+      assistant([textBlock("Another clean one.")]),
+      result(),
+    ]);
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual([
+      "A clean reply.",
+      `${FABRICATED_MARKER_NOTICE}\n${formatInboundStamp("imessage")} fake inbound`,
+      "Another clean one.",
+    ]);
+    expect(events.filter((e) => e.type === "fabricated-marker")).toHaveLength(1);
+  });
+
+  it("leaves an ordinary reply completely untouched — no advisory, no warning, no count", async () => {
+    const r = rig();
+
+    await r.run([assistant([textBlock("Dinner at 7 works. See you then!")]), result()]);
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["Dinner at 7 works. See you then!"]);
+    expect(events.filter((e) => e.type === "fabricated-marker")).toEqual([]);
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("marks a thinking block routed as text too — same outlet, same guard", async () => {
+    const r = rig({ showThinking: false });
+    const body = `${formatInboundStamp("imessage")} what about tomorrow?`;
+
+    await r.run([assistant([thinkingBlock(body)]), result()]);
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual([`${FABRICATED_MARKER_NOTICE}\n${body}`]);
   });
 });

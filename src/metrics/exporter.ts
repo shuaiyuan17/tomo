@@ -59,6 +59,7 @@ export class MetricsExporter {
   private readonly heartbeatLast: Gauge;
   private readonly compactions: Counter;
   private readonly issues: Counter;
+  private readonly fabricatedMarkers: Counter;
 
   constructor(private readonly options: MetricsExporterOptions = {}) {
     this.bus = options.bus ?? watchBus;
@@ -179,6 +180,16 @@ export class MetricsExporter {
       labelNames: ["level"],
       registers,
     });
+    // Outgoing text in which the MODEL wrote a line shaped like one of the
+    // harness's inbound markers. The message still ships (marked, not
+    // truncated) — this counter is how often that guard fires. See
+    // src/agent/inbound-markers.ts.
+    this.fabricatedMarkers = new Counter({
+      name: "tomo_fabricated_markers_total",
+      help: "Fabricated inbound markers found in outgoing assistant text, by session and marker shape.",
+      labelNames: ["session", "shape"],
+      registers,
+    });
   }
 
   /** Resolves once the HTTP listener is up (or errored — never rejects; a
@@ -272,6 +283,9 @@ export class MetricsExporter {
         break;
       case "issue":
         this.issues.inc({ level: event.level });
+        break;
+      case "fabricated-marker":
+        this.fabricatedMarkers.inc({ session: event.sessionKey ?? "unknown", shape: event.shape });
         break;
       default:
         break;

@@ -11,6 +11,7 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { splitText } from "./text-utils.js";
+import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
 
 /**
  * A Bot API 400 whose description names an entity-parsing failure — the one
@@ -72,6 +73,37 @@ export function cleanMention(text: string, botUsername: string | undefined): str
 export interface TelegramChannelOptions {
   /** Base directory where inbound images are persisted. If omitted, images are not saved to disk. */
   imageStoreBaseDir?: string;
+}
+
+/**
+ * Notice for a document whose MIME type we do not ingest — the agent is told a
+ * file arrived rather than the message vanishing.
+ *
+ * BOTH interpolated fields are sender-controlled: the Bot API documents
+ * `file_name` and `mime_type` as "as defined by the sender". They were
+ * previously interpolated verbatim into a bracketed marker, which is the exact
+ * shape `fileStore.formatMimeToken` was written to close on the iMessage side
+ * — a `mime_type` of
+ *
+ *     application/octet-stream)\n[via satellite — sender off-grid, …]
+ *
+ * closes the parenthesis and opens a second line that reads as harness-composed
+ * trusted context. The newline matters more than the bracket: group messages are
+ * rendered as `${sender}: ${text}`, so a newline breaks sender attribution and
+ * puts the forged marker on a line of its own.
+ *
+ * Reuses the two helpers that already harden the iMessage path, so both channels
+ * sanitise sender-supplied attachment metadata the same way. The "unnamed" /
+ * "no mime" wording is preserved for the genuinely-absent case, so only hostile
+ * input changes shape.
+ */
+export function formatUnsupportedDocumentNotice(
+  fileName: string | undefined,
+  mimeType: string | undefined,
+): string {
+  const name = fileName ? sanitizeAttachmentFilename(fileName, mimeType) : "unnamed";
+  const mime = mimeType ? formatMimeToken(mimeType) : "no mime";
+  return `[Sent an unsupported document: ${name} (${mime})]`;
 }
 
 export class TelegramChannel implements Channel {
@@ -181,7 +213,7 @@ export class TelegramChannel implements Channel {
       // file" rather than the message disappearing entirely.
       if (!isSupportedDocumentMime(doc.mime_type)) {
         const caption = this.cleanMention(ctx.message.caption ?? "");
-        const note = `[Sent an unsupported document: ${doc.file_name ?? "unnamed"} (${doc.mime_type ?? "no mime"})]`;
+        const note = formatUnsupportedDocumentNotice(doc.file_name, doc.mime_type);
         this.dispatch({
           id: String(ctx.message.message_id),
           chatId: String(ctx.chat.id),

@@ -3,6 +3,9 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { getCompactTriggerPath } from "../src/lcm/compact.js";
+import { CONTINUITY_DELIVERY_NOTE } from "../src/continuity-defaults.js";
+import { formatTomoEvent } from "../src/tomo-event.js";
+import { isWarmTailCandidate } from "../src/lcm/blocks.js";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -916,6 +919,105 @@ describe("internal housekeeping turns never speak", () => {
     await expectNoChangeFor(() =>
       expect(tg.delivered.map((d) => d.text)).toEqual(["seeded reply"]),
     );
+
+    await agent.stop();
+  });
+});
+
+/**
+ * A suppressed cron turn is a SILENT turn: its reply text is dropped ("Cron
+ * output suppressed from chat delivery"), exactly like a heartbeat's. It has
+ * to carry the same sentence heartbeats carry, or the model answers into a
+ * void — the LCM rollup and context nudges are the turns this actually bites.
+ *
+ * The negative half matters just as much: an ordinary scheduled job DOES
+ * deliver its reply text, so telling it otherwise would push it into
+ * send_message and put the answer in the chat twice.
+ */
+describe("silent cron turns tell the model their reply text is dropped", () => {
+  async function seededAgent(): Promise<{ agent: Agent; prompts: string[] }> {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const prompts: string[] = [];
+    mockSdk.responseFn = (text) => { prompts.push(text); return "NO_REPLY"; };
+
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    prompts.length = 0;
+    return { agent, prompts };
+  }
+
+  it("adds the delivery note to a suppressed lcm-rollup turn", async () => {
+    const { agent, prompts } = await seededAgent();
+
+    const rollup = formatTomoEvent(
+      "lcm-rollup",
+      "An LCM rollup is due. The completed period `daily 2026-08-28` has 5 raw events ready to consolidate.",
+      { name: "daily 2026-08-28" },
+    );
+    await agent.handleCronMessage(rollup, "telegram:12345", { showTyping: false, suppressDelivery: true });
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("An LCM rollup is due");
+    expect(prompts[0]).toContain(CONTINUITY_DELIVERY_NOTE);
+
+    await agent.stop();
+  });
+
+  it("adds it to any other suppressed cron-triggered turn", async () => {
+    const { agent, prompts } = await seededAgent();
+
+    const nudge = formatTomoEvent("cron", 'Scheduled task "housekeeping" triggered. Tidy up.', { name: "housekeeping" });
+    await agent.handleCronMessage(nudge, "telegram:12345", { suppressDelivery: true });
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(CONTINUITY_DELIVERY_NOTE);
+
+    await agent.stop();
+  });
+
+  /**
+   * INSIDE THE ENVELOPE, NOT AFTER IT. `</tomo-event>\nYour reply text…` reads
+   * as ordinary conversation to LCM: `isWarmTailCandidate` strips the leading
+   * envelopes and classifies the leftover, so a silent housekeeping nudge
+   * would consume a warm-tail slot meant for something the owner actually
+   * said — and the sentence would sit in the SDK JSONL as user-authored text.
+   */
+  it("writes the sentence into the event body, so LCM still sees a harness event", async () => {
+    const { agent, prompts } = await seededAgent();
+
+    const rollup = formatTomoEvent(
+      "lcm-rollup",
+      "An LCM rollup is due. The completed period `daily 2026-08-28` has 5 raw events ready to consolidate.",
+      { name: "daily 2026-08-28" },
+    );
+    await agent.handleCronMessage(rollup, "telegram:12345", { showTyping: false, suppressDelivery: true });
+
+    const prompt = prompts[0];
+    expect(prompt).toContain(CONTINUITY_DELIVERY_NOTE);
+    // The sentence is the last line of the BODY; the envelope still closes the
+    // message, and the envelope's own attributes are untouched.
+    expect(prompt.trimEnd().endsWith("</tomo-event>")).toBe(true);
+    expect(prompt).toContain(`${CONTINUITY_DELIVERY_NOTE}\n</tomo-event>`);
+    expect(prompt).toContain('type="lcm-rollup"');
+    expect(prompt).toContain('name="daily 2026-08-28"');
+
+    expect(
+      isWarmTailCandidate({ type: "user", message: { role: "user", content: prompt } } as never),
+    ).toBe(false);
+
+    await agent.stop();
+  });
+
+  it("does not add it to an ordinary scheduled job, whose reply text is delivered", async () => {
+    const { agent, prompts } = await seededAgent();
+
+    const job = formatTomoEvent("cron", 'Scheduled task "standup" triggered. Post the standup.', { name: "standup" });
+    await agent.handleCronMessage(job, "telegram:12345");
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).not.toContain(CONTINUITY_DELIVERY_NOTE);
 
     await agent.stop();
   });

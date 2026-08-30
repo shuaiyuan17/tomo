@@ -511,7 +511,7 @@ export class LiveSessionManager {
   }
 
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
-    const { key, prompt, images, documents, steer = false, onBlock, onBlockAbandoned, hasShipped, origin } = req;
+    const { key, prompt, images, documents, steer = false, steerAudience, onBlock, onBlockAbandoned, hasShipped, origin, silentDelivery } = req;
 
     let session: LiveSession | undefined;
     try {
@@ -526,8 +526,8 @@ export class LiveSessionManager {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
       return await this.runTurnOnSession(key, session, steer, () => (steer
-        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin)
-        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin)));
+        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience)
+        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery)));
     } catch (err) {
       // A turn the CLI ended on an error result is NOT a session error:
       // runTurnOnSession already recorded it; let it through to TurnRunner's
@@ -626,7 +626,7 @@ export class LiveSessionManager {
         // Same bookkeeping as the first attempt — a retry that ends on an SDK
         // error result still ran, and its (new) session id must be kept.
         return await this.runTurnOnSession(key, retrySession, false, () =>
-          retrySession.send(prompt, images, documents, onBlock, onBlockAbandoned, origin));
+          retrySession.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery));
       }
 
       throw err;

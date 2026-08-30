@@ -73,8 +73,6 @@ export function loadConfig(): Record<string, unknown> {
  * removing the parameter makes the old mistake a compile error.
  */
 export function saveConfig(cfg: Record<string, unknown>): void {
-  const path = CONFIG_PATH;
-  const backupPath = CONFIG_BACKUP_PATH;
   // Re-check the file at write time, not just at load time. Two reasons, and
   // both are data loss:
   //  - the backup is a copy of THIS file, so rotating it from a file we
@@ -86,10 +84,10 @@ export function saveConfig(cfg: Record<string, unknown>): void {
   // The file can also have been hand-edited between load and save (the config
   // UI is a long-lived interactive session), so the load-time check alone is
   // not enough.
-  readConfigFile(path);
-  mkdirSync(dirname(path), { recursive: true });
-  backupFileIfExistsSync(path, backupPath, { mode: 0o600 });
-  writeJsonAtomicSync(path, cfg, { mode: 0o600 });
+  readConfigFile(CONFIG_PATH);
+  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
+  writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
 }
 
 /**

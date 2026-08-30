@@ -222,6 +222,7 @@ describe("`tomo config` against a corrupt config", () => {
     // menu at all, which is the point — a parse error does not end it.
     expect(r.output).toContain("Scheduled tasks");
     expect(r.output).toContain("Cost analysis");
+    if (process.platform === "darwin") expect(r.output).toContain("Autostart");
     expect(r.output).toContain("Exit");
     expect(r.status).not.toBe(0);
   });
@@ -271,5 +272,43 @@ describe("backupConfigIfParseableSync", () => {
   it("does nothing when there is no config yet", () => {
     expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
     expect(existsSync(CONFIG_BACKUP_PATH)).toBe(false);
+  });
+});
+
+describe("`tomo init --force` over an existing config", () => {
+  // The init command is interactive, so the write step is exercised through
+  // the function it calls; the guard itself is tested above. Isolated in a
+  // temp tree — the paths are explicit parameters here.
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-init-force-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("does not rotate a corrupt config over a good .bak", async () => {
+    const { writeInitConfig } = await import("../src/cli/init.js");
+    const cfg = join(dir, ".tomo", "config.json");
+    const bak = join(dir, ".tomo", "config.json.bak");
+    mkdirSync(dirname(cfg), { recursive: true });
+    const good = JSON.stringify(GOOD_CONFIG, null, 2);
+    writeFileSync(cfg, CORRUPT);
+    writeFileSync(bak, good);
+
+    writeInitConfig(cfg, bak, { model: "fresh" });
+
+    expect(readFileSync(bak, "utf-8")).toBe(good);            // the last recoverable version survives
+    expect(JSON.parse(readFileSync(cfg, "utf-8"))).toEqual({ model: "fresh" });
+  });
+
+  it("rotates a config that parses, as before", async () => {
+    const { writeInitConfig } = await import("../src/cli/init.js");
+    const cfg = join(dir, ".tomo", "config.json");
+    const bak = join(dir, ".tomo", "config.json.bak");
+    mkdirSync(dirname(cfg), { recursive: true });
+    const good = JSON.stringify(GOOD_CONFIG, null, 2);
+    writeFileSync(cfg, good);
+
+    writeInitConfig(cfg, bak, { model: "fresh" });
+
+    expect(readFileSync(bak, "utf-8")).toBe(good);
+    expect(JSON.parse(readFileSync(cfg, "utf-8"))).toEqual({ model: "fresh" });
   });
 });

@@ -15,6 +15,14 @@ import {
 import { createInterface } from "node:readline";
 import { config } from "../config.js";
 import { restoreWorkspaceFromBackup } from "./backup-workspace.js";
+import {
+  acquireRestoreLock,
+  RestoreLockHeldError,
+  restoreLegsStaged,
+  StagedRestoreError,
+  sweepRestoreLeftovers,
+  type RestoreLeg,
+} from "./backup-restore.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
@@ -374,109 +382,196 @@ backupCommand
       return;
     }
 
-    console.log(`Restore from: ${backup.path}`);
-    console.log("This will overwrite current tomo data.\n");
-
-    const ok = await confirm("Proceed?");
-    if (!ok) {
-      console.log("Aborted.");
-      return;
+    // ONE RESTORE AT A TIME, and the lock is taken BEFORE the leftover sweep
+    // and held across the prompt. The sweep moves a parked copy back when the
+    // live path is missing — and for the two renames in the middle of another
+    // restore's swap, it is missing. See acquireRestoreLock.
+    let releaseRestoreLock: () => void;
+    try {
+      releaseRestoreLock = acquireRestoreLock(TOMO_HOME);
+    } catch (err) {
+      if (err instanceof RestoreLockHeldError) {
+        console.error(`Cannot restore: ${err.message}.`);
+        process.exit(1);
+        return;
+      }
+      throw err;
     }
 
-    // RE-CHECK AFTER THE PROMPT. What survived the checks above describes the
-    // directory as it was, and `confirm()` is an unbounded wait — the prompt
-    // sits there until a human answers. That window belongs to whoever can
-    // write to `~/Backups/tomo`: swap the validated directory out and every
-    // `existsSync`/`cpSync` below follows the replacement, while the `rmSync`s
-    // still delete the live destinations.
-    //
-    // COMPARED BY IDENTITY, NOT BY NAME. Re-resolving and comparing only the
-    // canonical path catches a symlink swap but not a directory one: rename
-    // the original away, `mkdir` an ordinary directory at the same pathname,
-    // and both resolutions return the identical string. `dev`+`ino` is what
-    // separates "the same directory" from "something else wearing its name".
-    //
-    // WHAT THIS DOES AND DOES NOT GUARANTEE. It establishes the identity of
-    // the backup DIRECTORY ONLY. Its contents are not validated and are not
-    // frozen: a child of the backup can be a symlink pointing anywhere
-    // (`<backup>/data -> /tmp/outside/data`), and a file inside it can be
-    // rewritten at any moment. Neither needs a race to exploit — a backup
-    // directory that was already hostile when it was written stays hostile.
-    // The `lstat` sweep below closes the top-level symlink case, which is the
-    // cheap half; deep content is out of scope, and `~/Backups/tomo` is
-    // trusted to the extent that anything under the invoking user's home is.
-    if (!sameBackup(backup, resolveBackupPath(date))) {
-      console.error(`Backup ${date} changed while waiting for confirmation; aborting without restoring.`);
-      process.exit(1);
-      return;
-    }
+    try {
+      console.log(`Restore from: ${backup.path}`);
+      console.log("This will overwrite current tomo data.\n");
 
-    // Each restore leg is read with `existsSync`, which FOLLOWS a symlink and
-    // answers about the target. So a `data` symlink inside an otherwise
-    // genuine backup redirects that whole leg out of the tree while the
-    // matching `rmSync` still deletes the live one. And a leg of the wrong
-    // KIND is just as destructive without any redirection: a regular file
-    // named `workspace` passes `existsSync`, the live workspace is deleted,
-    // and the file is copied into its place. Both refused here rather than
-    // per leg, so the command aborts before it has overwritten anything.
-    for (const leg of RESTORE_LEGS) {
-      const legPath = join(backup.path, leg);
-      let entry;
+      const legs: RestoreLeg[] = [];
+      const configSrc = join(backup.path, "config.json");
+      if (existsSync(configSrc)) {
+        legs.push({ label: "config.json", src: configSrc, dest: join(TOMO_HOME, "config.json") });
+      }
+      const dataSrc = join(backup.path, "data");
+      if (existsSync(dataSrc)) {
+        legs.push({ label: "data/", src: dataSrc, dest: join(TOMO_HOME, "data") });
+      }
+      const sdkSrc = join(backup.path, "sdk-sessions");
+      if (existsSync(sdkSrc)) {
+        legs.push({ label: "sdk-sessions/", src: sdkSrc, dest: config.sdkSessionsDir });
+      }
+
+      // BEFORE THE PROMPT, because it is a repair of a PREVIOUS run rather than
+      // part of this one: a restore killed mid-swap can leave `~/.tomo/data`
+      // absent with a complete copy parked beside it, and declining here should
+      // still leave the machine mended rather than broken.
+      const leftovers = sweepRestoreLeftovers(
+        // Sweep every leg the staged path can own, not just the ones this backup
+        // happens to contain — the interrupted run may have had more.
+        [
+          { label: "config.json", dest: join(TOMO_HOME, "config.json") },
+          { label: "data/", dest: join(TOMO_HOME, "data") },
+          { label: "sdk-sessions/", dest: config.sdkSessionsDir },
+        ],
+      );
+      if (leftovers.length > 0) {
+        console.log("Found leftovers from an interrupted restore:");
+        for (const item of leftovers) {
+          console.log(`  ${item.recovered ? "[recovered]" : "[left in place]"} ${item.path}`);
+        }
+        for (const item of leftovers.filter((l) => l.recovered)) {
+          console.log(`  ${item.label} was missing and has been restored from the copy above.`);
+        }
+        console.log("Anything still listed is safe to delete once you have checked it.\n");
+      }
+
+      const ok = await confirm("Proceed?");
+      if (!ok) {
+        console.log("Aborted.");
+        return;
+      }
+
+      // RE-CHECK AFTER THE PROMPT. What survived the checks above describes the
+      // directory as it was, and `confirm()` is an unbounded wait — the prompt
+      // sits there until a human answers. That window belongs to whoever can
+      // write to `~/Backups/tomo`: swap the validated directory out and every
+      // `existsSync`/`cpSync` below follows the replacement, while the `rmSync`s
+      // still delete the live destinations.
+      //
+      // COMPARED BY IDENTITY, NOT BY NAME. Re-resolving and comparing only the
+      // canonical path catches a symlink swap but not a directory one: rename
+      // the original away, `mkdir` an ordinary directory at the same pathname,
+      // and both resolutions return the identical string. `dev`+`ino` is what
+      // separates "the same directory" from "something else wearing its name".
+      //
+      // WHAT THIS DOES AND DOES NOT GUARANTEE. It establishes the identity of
+      // the backup DIRECTORY ONLY. Its contents are not validated and are not
+      // frozen: a child of the backup can be a symlink pointing anywhere
+      // (`<backup>/data -> /tmp/outside/data`), and a file inside it can be
+      // rewritten at any moment. Neither needs a race to exploit — a backup
+      // directory that was already hostile when it was written stays hostile.
+      // The `lstat` sweep below closes the top-level symlink case, which is the
+      // cheap half; deep content is out of scope, and `~/Backups/tomo` is
+      // trusted to the extent that anything under the invoking user's home is.
+      if (!sameBackup(backup, resolveBackupPath(date))) {
+        console.error(`Backup ${date} changed while waiting for confirmation; aborting without restoring.`);
+        process.exit(1);
+        return;
+      }
+
+      // Each restore leg is read with `existsSync`, which FOLLOWS a symlink and
+      // answers about the target. So a `data` symlink inside an otherwise
+      // genuine backup redirects that whole leg out of the tree while the
+      // matching `rmSync` still deletes the live one. And a leg of the wrong
+      // KIND is just as destructive without any redirection: a regular file
+      // named `workspace` passes `existsSync`, the live workspace is deleted,
+      // and the file is copied into its place. Both refused here rather than
+      // per leg, so the command aborts before it has overwritten anything.
+      for (const leg of RESTORE_LEGS) {
+        const legPath = join(backup.path, leg);
+        let entry;
+        try {
+          entry = lstatSync(legPath);
+        } catch {
+          continue; // absent legs are legitimate; each copy is already gated.
+        }
+        if (entry.isSymbolicLink()) {
+          console.error(`Backup ${date} has a symlink at ${leg}; aborting without restoring.`);
+          process.exit(1);
+          return;
+        }
+        const wantDir = leg !== "config.json";
+        if (wantDir ? !entry.isDirectory() : !entry.isFile()) {
+          console.error(
+            `Backup ${date} has ${wantDir ? "a non-directory" : "a non-file"} at ${leg}; aborting without restoring.`,
+          );
+          process.exit(1);
+          return;
+        }
+      }
+
+      console.log();
+
+      // STAGED LEGS FIRST. config.json, data/ and sdk-sessions/ used to be
+      // three independent `rmSync` + `cpSync` pairs: the live tree was deleted
+      // before anything knew the copy would succeed, and a failure on the third
+      // left the first two replaced and the third destroyed. They now go
+      // through restoreLegsStaged, which copies everything into siblings and
+      // verifies it before a single live byte moves — so the ENOSPC case that
+      // motivated this aborts with all three still intact, INCLUDING the
+      // workspace below, which is why the staged legs run first.
       try {
-        entry = lstatSync(legPath);
-      } catch {
-        continue; // absent legs are legitimate; each copy is already gated.
-      }
-      if (entry.isSymbolicLink()) {
-        console.error(`Backup ${date} has a symlink at ${leg}; aborting without restoring.`);
+        restoreLegsStaged(legs, {
+          onLegRestored: (leg) => console.log(`  [ok] ${leg.label}`),
+          onWarning: (message) => console.error(`  [warn] ${message}`),
+        });
+      } catch (err) {
+        console.error(`\nRestore failed: ${(err as Error).message}`);
+        // "Nothing was replaced" is a claim, and it has to be earned. A rollback
+        // that could not put a leg back means something WAS replaced, and the
+        // operator needs the path of their original data far more than they need
+        // reassurance.
+        if (err instanceof StagedRestoreError && !err.rollbackClean) {
+          console.error("\nSome components could NOT be rolled back:");
+          for (const hint of err.recovery) {
+            console.error(`  ${hint.label}: ${hint.dest} now holds ${hint.occupiedBy}.`);
+            console.error(`    Your data before this restore is at: ${hint.preRestore}`);
+          }
+          console.error("\nRecover by moving each path above back over its destination, e.g.");
+          const first = err.recovery[0];
+          if (first) console.error(`  rm -rf "${first.dest}" && mv "${first.preRestore}" "${first.dest}"`);
+        } else {
+          console.error("Nothing was replaced — your existing data is as it was.");
+        }
         process.exit(1);
         return;
       }
-      const wantDir = leg !== "config.json";
-      if (wantDir ? !entry.isDirectory() : !entry.isFile()) {
-        console.error(
-          `Backup ${date} has ${wantDir ? "a non-directory" : "a non-file"} at ${leg}; aborting without restoring.`,
-        );
-        process.exit(1);
-        return;
+
+      // workspace/ (preserve .claude/ which is populated by init/start).
+      //
+      // OUTSIDE THE TRANSACTION ABOVE, deliberately: restoreWorkspaceFromBackup
+      // snapshots and rolls back the live `.claude`, which the other legs have
+      // no equivalent of, and folding it in would mean rebuilding that. The
+      // consequence is stated rather than hidden — if this leg fails, the three
+      // staged legs are already restored and are NOT rolled back with it.
+      const workspaceSrc = join(backup.path, "workspace");
+      if (existsSync(workspaceSrc)) {
+        try {
+          restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
+          console.log("  [ok] workspace/");
+        } catch (err) {
+          console.error(`  [fail] workspace/: ${(err as Error).message}`);
+          const done = legs.map((leg) => leg.label);
+          console.error(
+            done.length > 0
+              ? `\nRestore INCOMPLETE. ${done.join(", ")} ${done.length === 1 ? "was" : "were"} restored;`
+              : "\nRestore INCOMPLETE. This backup carried no config.json, data/ or sdk-sessions/;",
+          );
+          console.error("the workspace was not. It is restored outside that transaction (its live");
+          console.error(".claude/ is put back on failure; the rest of the live workspace may be partly");
+          console.error(`replaced), so it has not been rolled back. The backup's copy is at ${workspaceSrc}.`);
+          process.exit(1);
+          return;
+        }
       }
+
+      console.log("\nRestore complete.");
+    } finally {
+      releaseRestoreLock();
     }
-
-    console.log();
-
-    // 1. config.json
-    const configSrc = join(backup.path, "config.json");
-    if (existsSync(configSrc)) {
-      cpSync(configSrc, join(TOMO_HOME, "config.json"));
-      console.log("  [ok] config.json");
-    }
-
-    // 2. workspace/ (preserve .claude/ which is populated by init/start)
-    const workspaceSrc = join(backup.path, "workspace");
-    if (existsSync(workspaceSrc)) {
-      restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
-
-      console.log("  [ok] workspace/");
-    }
-
-    // 3. data/
-    const dataSrc = join(backup.path, "data");
-    if (existsSync(dataSrc)) {
-      const dataDest = join(TOMO_HOME, "data");
-      rmSync(dataDest, { recursive: true, force: true });
-      cpSync(dataSrc, dataDest, { recursive: true });
-      console.log("  [ok] data/");
-    }
-
-    // 4. SDK session files
-    const sdkSrc = join(backup.path, "sdk-sessions");
-    if (existsSync(sdkSrc)) {
-      const sdkDest = config.sdkSessionsDir;
-      rmSync(sdkDest, { recursive: true, force: true });
-      mkdirSync(sdkDest, { recursive: true });
-      cpSync(sdkSrc, sdkDest, { recursive: true });
-      console.log("  [ok] sdk-sessions/");
-    }
-
-    console.log("\nRestore complete.");
   });

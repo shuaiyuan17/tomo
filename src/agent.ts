@@ -39,6 +39,7 @@ import { consumeRestartReasonFile } from "./restart-reason.js";
 import {
   consumeRestartRequestFromToolResult,
   restartWorkerInvocation,
+  takePendingRestartRequest,
   type RestartRequest,
 } from "./restart-request.js";
 import { pruneTools } from "./lcm/index.js";
@@ -230,6 +231,9 @@ export class Agent {
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       handleToolResult: (key, toolName, content, isError) => {
         this.handleToolResult(key, toolName, content, isError);
+      },
+      handleTurnComplete: (key) => {
+        this.handleTurnComplete(key);
       },
       maybeNudgeCompact: (key, ctx) => this.maybeNudgeCompact(key, ctx),
       refreshExternalMcpToken: (serverName) => this.mcpOAuthManager
@@ -1527,6 +1531,31 @@ export class Agent {
       this.queuePendingErrorNote(sessionKey, "A Tomo restart was already in progress; the duplicate restart request was ignored.");
       return;
     }
+    this.restartInFlight = true;
+    this.launchAcknowledgedRestart(request);
+  }
+
+  /**
+   * Fallback for a restart whose marker never came back.
+   *
+   * The handshake in `handleToolResult` needs the marker line to survive into
+   * the Bash tool result, and the model writes the command: `tomo restart
+   * >/dev/null`, a redirect into a log, or `... | tail -1` all discard it. The
+   * CLI has already told the owner a restart is coming, so the turn ending is
+   * the backstop — later than the acknowledgement boundary #257 wants, but
+   * still after the SDK recorded the tool result, and infinitely better than
+   * silently doing nothing. A request claimed here is one that mid-turn
+   * acknowledgement missed, so log it: a rising rate means the model has
+   * settled on a redirecting invocation and the happy path has gone dark.
+   */
+  private handleTurnComplete(sessionKey: string): void {
+    if (this.restartInFlight) return;
+    const request = takePendingRestartRequest(sessionKey);
+    if (!request) return;
+    log.warn(
+      { sessionKey, requestId: request.id },
+      "Restart request never appeared in a Bash result; restarting at end of turn",
+    );
     this.restartInFlight = true;
     this.launchAcknowledgedRestart(request);
   }

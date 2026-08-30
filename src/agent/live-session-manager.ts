@@ -95,6 +95,8 @@ export interface LiveSessionManagerDeps {
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
   /** Observe persisted SDK tool-result events for daemon control handshakes. */
   handleToolResult?(key: string, toolName: string, content: unknown, isError: boolean): void;
+  /** A turn on this session just finished (successfully or with an SDK error). */
+  handleTurnComplete?(key: string): void;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
   maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
   /**
@@ -635,6 +637,12 @@ export class LiveSessionManager {
   }
 
   private recordTurnCompletion(key: string, session: LiveSession): void {
+    // BEFORE the compact early-return below: a deferred restart that was never
+    // acknowledged mid-turn has to be honoured on every path out of a turn,
+    // and a turn that happened to compact is not a turn the owner asked to
+    // wait longer for.
+    this.deps.handleTurnComplete?.(key);
+
     // Capture session ID if new
     const sid = session.getSessionId();
     if (sid && !this.deps.getSdkSessionId(key)) {

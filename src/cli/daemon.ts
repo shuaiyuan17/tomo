@@ -6,32 +6,112 @@ import { TOMO_SESSION_KEY_ENV, resolveRestartInitiator, writeRestartReasonFile }
 import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { isRunning, getRunningPid } from "./status-info.js";
+import { isRunning, getRunningPid, waitForExit, STOP_TIMEOUT_MS } from "./status-info.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
 
+export interface StopDeps {
+  autostartEnabled: () => boolean;
+  stopLaunchd: () => Promise<void>;
+  runningPid: () => number | null;
+  alive: (pid: number) => boolean;
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  wait: (pid: number, timeoutMs: number) => Promise<boolean>;
+  timeoutMs?: number;
+}
+
+export interface StopOutcome {
+  /** Process exit code the CLI should use. Non-zero means nothing was stopped. */
+  code: number;
+  message: string;
+}
+
+const defaultStopDeps: StopDeps = {
+  autostartEnabled: isAutostartEnabled,
+  stopLaunchd: stopLaunchdJob,
+  runningPid: () => getRunningPid(),
+  alive: isRunning,
+  kill: (pid, signal) => { process.kill(pid, signal); },
+  wait: (pid, timeoutMs) => waitForExit(pid, timeoutMs),
+};
+
+/**
+ * `tomo stop`, as a function so it can be tested without a process exit.
+ *
+ * Two things this must not do, both of which it used to:
+ *
+ * 1. Report success on the strength of the launchd bootout alone.
+ *    `isAutostartEnabled()` only checks that the plist FILE exists, and
+ *    `stopLaunchdJob()` passes `ignoreFailure: true` so "no such job" is
+ *    swallowed. With the plist on disk but the running daemon started by hand,
+ *    the old code booted out a job that was not loaded, printed "Stopped
+ *    Tomo", and left the manual daemon polling Telegram and holding the `imsg
+ *    rpc` child — after which `tomo start` said "already running" with no
+ *    explanation. So: always fall through to the pid file, exactly as
+ *    `restartAutostart()` already does.
+ *
+ * 2. Report success on the strength of having SENT SIGTERM. The signal is
+ *    asynchronous and the daemon's handler runs `agent.stop()` first, so the
+ *    old `kill(); console.log("Stopped Tomo")` was true only by coincidence —
+ *    and false outright when the handler was wedged. Wait for the pid to go
+ *    away, and say so honestly when it does not.
+ */
+export async function performStop(overrides: Partial<StopDeps> = {}): Promise<StopOutcome> {
+  const deps = { ...defaultStopDeps, ...overrides };
+  const timeoutMs = deps.timeoutMs ?? STOP_TIMEOUT_MS;
+
+  const autostart = deps.autostartEnabled();
+  // Read the pid BEFORE the bootout: launchd may reap the process, and a pid
+  // read afterwards would be null and indistinguishable from "not running".
+  const pid = deps.runningPid();
+
+  if (autostart) {
+    try {
+      await deps.stopLaunchd();
+    } catch (err) {
+      return { code: 1, message: `Failed to stop LaunchAgent: ${(err as Error).message}` };
+    }
+  }
+
+  const autostartNote = autostart
+    ? " (will restart at next login — use `tomo config` to disable autostart)"
+    : "";
+
+  if (pid === null) {
+    return { code: 0, message: `Tomo is not running.${autostart ? " (LaunchAgent unloaded; it will restart at next login.)" : ""}` };
+  }
+
+  // The bootout above may already have taken it down; only signal if it is
+  // still there, and either way wait for the pid to actually disappear.
+  if (deps.alive(pid)) {
+    try {
+      deps.kill(pid, "SIGTERM");
+    } catch {
+      /* raced away between the liveness check and the signal — the wait below settles it */
+    }
+  }
+
+  if (await deps.wait(pid, timeoutMs)) {
+    return { code: 0, message: `Stopped Tomo (PID ${pid})${autostartNote}.` };
+  }
+
+  return {
+    code: 1,
+    message:
+      `Tomo (PID ${pid}) is still running ${Math.round(timeoutMs / 1000)}s after SIGTERM. `
+      + `It may be finishing an in-flight turn — check \`tomo logs -f\`. `
+      + `To force it: kill -9 ${pid}`,
+  };
+}
+
 export const stopCommand = new Command("stop")
   .description("Stop Tomo daemon")
   .action(async () => {
-    if (isAutostartEnabled()) {
-      try {
-        await stopLaunchdJob();
-        console.log("Stopped Tomo (will restart at next login — use `tomo config` to disable autostart).");
-      } catch (err) {
-        console.error(`Failed to stop LaunchAgent: ${(err as Error).message}`);
-        process.exit(1);
-      }
-      return;
-    }
-
-    const pid = getRunningPid();
-    if (!pid) {
-      console.log("Tomo is not running.");
-      return;
-    }
-    process.kill(pid, "SIGTERM");
-    console.log(`Stopped Tomo (PID ${pid})`);
+    const { code, message } = await performStop();
+    if (code === 0) console.log(message);
+    else console.error(message);
+    if (code !== 0) process.exit(code);
   });
 
 /**

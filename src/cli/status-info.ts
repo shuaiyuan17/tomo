@@ -40,3 +40,30 @@ export function getDaemonStatus(pidFile = PID_FILE): DaemonStatus {
   } catch { /* pid file raced away; report running without uptime */ }
   return { pid, uptimeMs };
 }
+
+/** How long `tomo stop` waits for the daemon to actually exit. */
+export const STOP_TIMEOUT_MS = 10_000;
+
+/**
+ * Poll until `pid` is gone, or `timeoutMs` elapses. Returns true iff the
+ * process exited.
+ *
+ * Signals are asynchronous: `process.kill(pid, "SIGTERM")` returns as soon as
+ * the signal is queued, long before the daemon has finished `agent.stop()`
+ * (which can take tens of seconds when SIGTERM lands mid-turn) — and returns
+ * just the same when the handler never runs at all. Anything reporting
+ * "stopped" needs to observe the exit, not the send.
+ */
+export async function waitForExit(
+  pid: number,
+  timeoutMs = STOP_TIMEOUT_MS,
+  pollMs = 100,
+  alive: (p: number) => boolean = isRunning,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!alive(pid)) return true;
+    if (Date.now() >= deadline) return !alive(pid);
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+  }
+}

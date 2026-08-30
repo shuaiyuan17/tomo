@@ -1,8 +1,9 @@
 import { Command } from "commander";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { acquirePidFile, releasePidFile } from "./pidfile.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
@@ -37,14 +38,29 @@ export const startCommand = new Command("start")
   });
 
 async function startForeground(): Promise<void> {
-  // Refuse to start if another tomo (manual daemon or launchd-managed) already
-  // owns the pidfile. Prevents two tomos fighting over Telegram polling, the
-  // `imsg rpc` child, and the session registry.
-  const existing = getRunningPid();
-  if (existing) {
-    console.error(`Tomo is already running (PID ${existing}). Refusing to start a second instance.`);
+  // FIRST action, before any await: claim the pid file with O_EXCL. Refuse to
+  // start if another tomo (manual daemon or launchd-managed) already owns it —
+  // two tomos fight over Telegram polling, the `imsg rpc` child, the metrics
+  // port and the session registry.
+  //
+  // This used to be a plain existsSync/kill(0) check here with the
+  // `writeFileSync(PID_FILE, …)` all the way down at the end of startup. The
+  // gap between them spanned config load, five mkdirs, a recursive skills
+  // copy, channel construction and `await metricsExporter.start()`, so a login
+  // autostart racing a manual `tomo start` put BOTH daemons past the check.
+  const acquired = acquirePidFile(PID_FILE);
+  if (!acquired.ok) {
+    console.error(`Tomo is already running (PID ${acquired.holder}). Refusing to start a second instance.`);
     process.exit(1);
   }
+  if (acquired.tookOverStale !== null) {
+    console.error(`Removed a stale PID file left by PID ${acquired.tookOverStale} (no longer running); taking over.`);
+  }
+  // Release on every exit path, not just the signal handlers: the config
+  // validation below can `process.exit(1)`, and leaving our own dead pid on
+  // disk would make the next `tomo start` print a stale-takeover line for a
+  // daemon that never started.
+  process.on("exit", () => releasePidFile(PID_FILE));
 
   // Validate config before loading the heavy daemon modules so a fresh
   // install fails with a clear message instead of a module-load crash.
@@ -226,8 +242,8 @@ async function startForeground(): Promise<void> {
     }
   }
 
-  // Write PID so `tomo stop` can find us
-  writeFileSync(PID_FILE, String(process.pid));
+  // NB: the pid file was already written at the top of this function. Writing
+  // it here (as this used to) is what allowed two daemons to start at once.
 
   const shutdown = async () => {
     activityLog?.stop();
@@ -248,7 +264,7 @@ async function startForeground(): Promise<void> {
     } catch (err) {
       log.error({ err }, "Agent shutdown failed; exiting anyway");
     }
-    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
+    releasePidFile(PID_FILE);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

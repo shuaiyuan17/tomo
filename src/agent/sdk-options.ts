@@ -6,7 +6,7 @@ import { isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
-import { privateMemoryGuardHooks, skillsCanUseTool } from "./permissions.js";
+import { privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
 import { resolvePlugins } from "./plugins.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 
@@ -58,6 +58,16 @@ export interface SessionContext {
     isPassive: boolean;
   };
   onMcpElicitation?: (request: ElicitationRequest) => Promise<ElicitationResult>;
+  /**
+   * Does the turn in flight belong to this session? (`Agent.isOwnAudienceTurn`)
+   *
+   * A GETTER: the SDK options — and the hooks built from them — are assembled
+   * once when the live session is created, but a dm: session's audience
+   * changes turn to turn while a group is summoned into it. Left undefined
+   * (tests, callers with no audience notion), every turn counts as the
+   * session's own.
+   */
+  isOwnAudienceTurn?: () => boolean;
 }
 
 export function sdkOptions(
@@ -70,6 +80,22 @@ export function sdkOptions(
 ) {
   const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
   let systemPrompt = buildSystemPrompt({ isGroup });
+
+  // Why `memory/private/` is closed for the turn in flight — or null when it is
+  // open. INSTALLED FOR EVERY SESSION, and resolved per tool call rather than
+  // here: these options, and the hooks built from them, are assembled once when
+  // the live session is created (live-session-manager.ts), while a dm:
+  // session's entitlement changes turn to turn. The old
+  // `guardPrivateMemory: isGroup` decided it once, at creation, from the
+  // session key alone — and `isGroupSessionKey("dm:owner")` is false for
+  // exactly the turns a SUMMONED group is steering, so the guard was not
+  // installed at all for them.
+  const ownAudienceTurn = sessionContext?.isOwnAudienceTurn;
+  const privateMemoryBar = (): PrivateMemoryBar | null => {
+    if (isGroup) return "group-session";
+    if (ownAudienceTurn && !ownAudienceTurn()) return "summoned-turn";
+    return null;
+  };
 
   // Inject session context so the agent can use LCM tools
   if (sessionContext) {
@@ -192,7 +218,7 @@ export function sdkOptions(
       turnBudget,
       maxTurns: config.maxTurns,
       sessionKey: sessionContext?.sessionKey,
-      guardPrivateMemory: isGroup,
+      privateMemoryBar,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -299,21 +325,23 @@ function buildSdkEnv(args: {
   return env;
 }
 
-/** Combine the turn-budget PostToolBatch hook and the group-session
- *  private-memory PreToolUse guard into a single SDK `hooks` option. Returns
+/** Combine the turn-budget PostToolBatch hook and the private-memory
+ *  PreToolUse guard into a single SDK `hooks` option. Returns
  *  an empty object when neither hook is needed so spread {} stays a no-op. */
 function buildHooksOption(args: {
   turnBudget?: TurnBudget;
   maxTurns: number;
   sessionKey?: string;
-  guardPrivateMemory: boolean;
+  /** Per-call reason this session may not reach `memory/private/`, or null
+   *  when it may. Undefined ⇒ the guard is not installed. */
+  privateMemoryBar?: () => PrivateMemoryBar | null;
 }) {
   const hooks: Record<string, unknown> = {};
   if (args.turnBudget) {
     Object.assign(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
   }
-  if (args.guardPrivateMemory) {
-    Object.assign(hooks, privateMemoryGuardHooks(args.sessionKey));
+  if (args.privateMemoryBar) {
+    Object.assign(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

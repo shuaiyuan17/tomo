@@ -138,6 +138,7 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
     createInternalMcpServer: () => ({} as ReturnType<Deps["createInternalMcpServer"]>),
     buildExternalMcpServers: async () => ({}),
     buildGroupContext: () => undefined,
+    isOwnAudienceTurn: () => true,
     handleMcpElicitation: async () => ({ action: "decline" as const }),
     createUnownedTurnRequest: () => undefined,
     maybeNudgeCompact: vi.fn(),

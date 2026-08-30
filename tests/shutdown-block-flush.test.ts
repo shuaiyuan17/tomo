@@ -123,6 +123,7 @@ function makeManagerDeps(buildExternalMcpServers?: Deps["buildExternalMcpServers
     getModelOverride: () => undefined,
     createInternalMcpServer: () => ({} as ReturnType<Deps["createInternalMcpServer"]>),
     buildGroupContext: () => undefined,
+    isOwnAudienceTurn: () => true,
     handleMcpElicitation: async () => ({ action: "decline" as const }),
     createUnownedTurnRequest: () => undefined,
     maybeNudgeCompact: vi.fn(),

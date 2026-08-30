@@ -260,6 +260,7 @@ export class Agent {
         { authorizationWaitMs: 0 },
       ),
       buildGroupContext: (key) => this.buildGroupContext(key),
+      isOwnAudienceTurn: (key) => this.isOwnAudienceTurn(key),
       handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       handleToolResult: (key, toolName, content, isError) => {
@@ -639,10 +640,12 @@ export class Agent {
    * disabled. Naming the blocked tools would tell a model that has just been
    * refused where else to look — and the enforcement is not total: the
    * system prompt for a dm: session is built once per live session and
-   * already carries private people names, and the PreToolUse private-memory
-   * guard is keyed on the session key, so Read/Grep over memory/private are
-   * not blocked on a summoned turn (a separate fix). "Off limits, by any
-   * route" is both the instruction we want and the honest description.
+   * already carries private people names. The PreToolUse private-memory guard
+   * now DOES cover a summoned turn (see `agent/permissions.ts`, gated on
+   * `isOwnAudienceTurn`), so Read/Grep/Bash over memory/private are blocked
+   * too — but the norm is still the right thing to state, since it also covers
+   * what the model already has in context. "Off limits, by any route" is both
+   * the instruction we want and the honest description.
    */
   private summonReminder(targets: string[]): string {
     const list = targets.map((t) => `"${t}"`).join(", ");
@@ -1051,7 +1054,9 @@ export class Agent {
    * while concurrent turns on the session disagree about the audience. The
    * private people subtree (`memory/private/people/`) and the owner's DM
    * transcript are off limits for such a turn — see `internal-server.ts`,
-   * which gates `buildPeopleTools`/`buildRecallTools` on this.
+   * which gates `buildPeopleTools`/`buildRecallTools` on this, and
+   * `agent/permissions.ts`, whose PreToolUse hook gates the private memory
+   * FILES on it.
    */
   isOwnAudienceTurn(sessionKey: string): boolean {
     return this.turnAudiences.isOwnAudienceTurn(sessionKey);

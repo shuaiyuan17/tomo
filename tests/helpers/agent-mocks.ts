@@ -75,6 +75,10 @@ export const mockSdk = {
    *  turn ran on without depending on that turn delivering anything — which
    *  suppressed turns (continuity, restart notice) deliberately do not. */
   promptsBySession: [] as Array<{ sessionKey: string; text: string }>,
+  /** Options each live session was built with, keyed by session. Lets a test
+   *  reach the SDK `hooks` the harness installed — see
+   *  tests/summon-private-memory-hook.test.ts. */
+  optionsBySession: [] as Array<{ sessionKey: string; options: Record<string, unknown> }>,
 };
 
 export function resetMockSdk(): void {
@@ -88,6 +92,7 @@ export function resetMockSdk(): void {
   mockSdk.queryControllers = [];
   mockSdk.mcpServerSets = [];
   mockSdk.promptsBySession = [];
+  mockSdk.optionsBySession = [];
 }
 
 /** Track in-flight mock queries so tests can assert no concurrency */
@@ -383,8 +388,13 @@ export function workspaceModuleMock() {
 
 export function sdkModuleMock() {
   return {
-    query: vi.fn(({ prompt, options }: { prompt: AsyncGenerator; options?: { env?: Record<string, string> } }) =>
-      createMockQuery(prompt, options?.env?.TOMO_SESSION_KEY ?? "")),
+    query: vi.fn(({ prompt, options }: { prompt: AsyncGenerator; options?: { env?: Record<string, string> } }) => {
+      mockSdk.optionsBySession.push({
+        sessionKey: options?.env?.TOMO_SESSION_KEY ?? "",
+        options: (options ?? {}) as Record<string, unknown>,
+      });
+      return createMockQuery(prompt, options?.env?.TOMO_SESSION_KEY ?? "");
+    }),
     // `tools` is kept (the real SDK hides them inside `instance`) so a test can
     // build the tomo-internal server for a session and call its handlers
     // directly — see tests/summon-private-tools.test.ts.

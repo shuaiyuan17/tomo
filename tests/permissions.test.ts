@@ -321,20 +321,33 @@ describe("skillsCanUseTool — narrow .claude/skills/ re-allow", () => {
     });
   });
 
-  it("normalises casing through realpath rather than string compare", async (ctx) => {
+  it("denies a case-permuted skills root rather than normalising it", async (ctx) => {
     // Detected inside the test, not at collection time: beforeAll has not run
-    // when the describe body is evaluated, so the probe directory would not
-    // exist yet and this would skip on every volume.
+    // when the describe body is evaluated.
     let caseInsensitive = false;
     try { statSync(`${SKILLS}/REAL-SKILL`); caseInsensitive = true; } catch { /* case-sensitive volume */ }
     if (!caseInsensitive) return ctx.skip();
-    // On an APFS/HFS+ case-insensitive volume `<SKILLS>/REAL-SKILL` IS the same
-    // directory, so a case-sensitive string containment check would deny a path
-    // the filesystem resolves squarely inside the skills tree. realpath returns
-    // the on-disk casing, normalising both sides.
+
+    // Node's realpathSync PRESERVES the caller's spelling — realpath of
+    // `<ws>/.CLAUDE/SKILLS` is `<ws>/.CLAUDE/SKILLS`, not the on-disk
+    // `.claude/skills`. So containment fails and the path is DENIED even
+    // though it opens the same file on this volume. Conservative, not an
+    // escape: it falls back to the SDK's ordinary permission handling.
+    const r = await skillsCanUseTool("Write", { file_path: `${WS}/.CLAUDE/SKILLS/x.md` });
+    expect(r.behavior).toBe("deny");
+  });
+
+  it("allows a case-permuted CHILD under a correctly-spelled root", async (ctx) => {
+    let caseInsensitive = false;
+    try { statSync(`${SKILLS}/REAL-SKILL`); caseInsensitive = true; } catch { /* case-sensitive volume */ }
+    if (!caseInsensitive) return ctx.skip();
+
+    // Containment only compares the root prefix, and here that prefix is spelled
+    // correctly — so the permuted leaf is immaterial.
     const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/REAL-SKILL/SKILL.md` });
     expect(r.behavior).toBe("allow");
   });
+
 });
 
 describe("the Bash arm of the re-allow", () => {
@@ -458,6 +471,77 @@ describe("the Bash arm of the re-allow", () => {
       expect(await allows("rm -rf /")).toBe(false);
       expect(await allows("ls")).toBe(false);
       expect(await allows("")).toBe(false);
+    });
+  });
+
+  describe("shell expansion that would escape after validation", () => {
+    it("denies glob metacharacters that expand to the parent directory", async () => {
+      // `.?` expands to `..`, so the word validated here is not the word that
+      // runs. Quoting the prefix does not help: whether a quote suppresses
+      // expansion depends on the shell and where it falls.
+      expect(await allows(`rm -rf "${SKILLS}/".?/*`)).toBe(false);
+      expect(await allows(`rm -rf ${SKILLS}/.?/*`)).toBe(false);
+    });
+
+    it("denies brace expansion that synthesises a parent reference", async () => {
+      expect(await allows(`cat "${SKILLS}/"{.,}./settings.json`)).toBe(false);
+      expect(await allows(`cat ${SKILLS}/{.,}./settings.json`)).toBe(false);
+    });
+
+    it("denies ordinary globs too, contained or not", async () => {
+      // No carve-out for a glob that looks safe: it is still not a literal path.
+      expect(await allows(`ls ${SKILLS}/*.md`)).toBe(false);
+      expect(await allows(`rm -rf ${SKILLS}/[a-z]*`)).toBe(false);
+      expect(await allows(`cat ${SKILLS}/?.md`)).toBe(false);
+    });
+  });
+
+  describe("flags that carry a path", () => {
+    it("denies a long flag with an attached value", async () => {
+      expect(await allows(`cp --target-directory=.. ${SKILLS}/x`)).toBe(false);
+      expect(await allows(`cp --target-directory=${WS}/.claude ${SKILLS}/x`)).toBe(false);
+    });
+
+    it("denies a short flag with an attached value", async () => {
+      // `-f.env` is ONE word: grep reads its pattern list from `.env`, and a
+      // "does this flag contain a slash" test never saw a path at all.
+      expect(await allows(`grep -f.env ${SKILLS}/x`)).toBe(false);
+      expect(await allows(`grep -f/etc/passwd ${SKILLS}/x`)).toBe(false);
+    });
+
+    it("denies an unknown long flag even without a value", async () => {
+      expect(await allows(`cp --archive ${SKILLS}/a ${SKILLS}/b`)).toBe(false);
+      expect(await allows(`ls -- ${SKILLS}`)).toBe(false);
+      expect(await allows(`cat - ${SKILLS}/x`)).toBe(false);
+    });
+
+    it("still allows the value-less flags skill management actually uses", async () => {
+      expect(await allows(`rm -rf ${SKILLS}/old`)).toBe(true);
+      expect(await allows(`mkdir -p ${SKILLS}/a/b`)).toBe(true);
+      expect(await allows(`ls -la ${SKILLS}`)).toBe(true);
+      expect(await allows(`cp --recursive ${SKILLS}/a ${SKILLS}/b`)).toBe(true);
+    });
+  });
+
+  describe("the skills root as an operand", () => {
+    it("denies destroying or relocating the root itself", async () => {
+      // `<skills>` is a contained path by every check above, and wiping it
+      // takes the whole skill library with it.
+      expect(await allows(`rm -rf ${SKILLS}`)).toBe(false);
+      expect(await allows(`rmdir ${SKILLS}`)).toBe(false);
+      expect(await allows(`mv ${SKILLS} ${SKILLS}/nested`)).toBe(false);
+      expect(await allows(`mv ${SKILLS}/a ${SKILLS}`)).toBe(false);
+    });
+
+    it("still allows destroying something inside it", async () => {
+      expect(await allows(`rm -rf ${SKILLS}/old-skill`)).toBe(true);
+      expect(await allows(`mv ${SKILLS}/a ${SKILLS}/b`)).toBe(true);
+    });
+
+    it("still allows reading the root", async () => {
+      expect(await allows(`ls ${SKILLS}`)).toBe(true);
+      expect(await allows(`stat ${SKILLS}`)).toBe(true);
+      expect(await allows(`find ${SKILLS}`)).toBe(true);
     });
   });
 

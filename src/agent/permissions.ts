@@ -36,9 +36,14 @@ const SKILLS_DIR = `${SKILLS_ROOT}/`;
  * symlink to `/tmp/evil` resolves to `/tmp/evil/x.md` whether or not `x.md` is
  * there yet.
  *
- * This is also what makes the comparison correct on a case-insensitive volume:
- * `realpathSync` returns the on-disk casing, so both sides of the containment
- * check are normalised the same way.
+ * CASING IS NOT NORMALISED, and an earlier version of this comment claimed it
+ * was. Node's `realpathSync` PRESERVES the caller's spelling on a
+ * case-insensitive volume — `realpathSync("<ws>/.CLAUDE/SKILLS")` returns
+ * `<ws>/.CLAUDE/SKILLS`, not the on-disk `.claude/skills`. So a case-permuted
+ * path fails the containment check and is DENIED. That is conservative rather
+ * than an escape (the permuted spelling opens the same file, but auto-approval
+ * is refused and it falls back to the SDK's ordinary permission handling), and
+ * it is the behaviour asserted in the tests.
  */
 function realResolve(p: string): string {
   const target = abs(p, config.workspaceDir);
@@ -148,8 +153,20 @@ const SKILLS_BASH_ALLOWED_PROGRAMS = new Set([
  * `$` is rejected wholesale rather than just `$(` and `${`: `$VAR` expands at
  * run time too, and a filename containing a literal `$` is not worth the
  * carve-out. Backslash escapes are rejected by the tokenizer.
+ *
+ * GLOB AND BRACE METACHARACTERS ARE IN HERE TOO, and quoting does not exempt
+ * them. Whether a quote suppresses expansion depends on which shell runs the
+ * command and where the quote falls, which is not knowable from here — and the
+ * expansion happens after this hook, so what is validated is not what runs:
+ *
+ *     rm -rf "<skills>/".?/*        `.?` expands to `..`
+ *     cat "<skills>/"{.,}./x        brace expansion synthesises `..`
+ *
+ * Both name only literal-looking, contained paths at validation time and reach
+ * the parent directory at run time. Auto-allow therefore requires a LITERAL
+ * path: no `*`, `?`, `[`, `]`, `{`, `}` anywhere in the command.
  */
-const SHELL_CONTROL_RE = /\|\||&&|[;|&<>\n\r`$]/;
+const SHELL_CONTROL_RE = /\|\||&&|[;|&<>\n\r`$*?[\]{}]/;
 
 /** A leading `FOO=bar` assignment, which changes the command's environment. */
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -209,19 +226,73 @@ function tokenizeSimpleCommand(command: string): string[] | null {
 }
 
 /**
+ * Single-dash flag letters that never take a value, so a cluster of them
+ * cannot be hiding a path.
+ *
+ * Anything not here — including any letter that takes an attached value —
+ * refuses the whole command. `grep -f.env <skills>/x` reads its pattern list
+ * from `.env`: `f` takes a value, and `-f.env` is one word, so a "does this
+ * flag contain a slash" test never saw a path at all.
+ */
+const VALUELESS_SHORT_FLAG_LETTERS = new Set([
+  "r", "R", "f", "n", "l", "a", "p", "v", "i", "h", "1",
+]);
+
+/**
+ * The only long flags accepted, all value-less.
+ *
+ * A long flag is refused unless it is on this list, which is what stops
+ * `cp --target-directory=.. <skills>/x` — the attached value never has to be
+ * recognised as a path, because the flag itself is not allowed.
+ */
+const VALUELESS_LONG_FLAGS = new Set([
+  "--recursive", "--force", "--parents", "--verbose",
+]);
+
+/**
+ * A flag that provably carries no path.
+ *
+ * `=` is refused outright, and so is `--` (the end-of-options separator) and a
+ * bare `-` (stdin): neither is on the long list, and a bare `-` has no letters
+ * to check. The point is that after this returns true, the word can be skipped
+ * without inspecting it for paths — which is exactly what the previous version
+ * did on the strength of "it has no slash in it".
+ */
+function isValuelessFlag(token: string): boolean {
+  if (token.includes("=")) return false;
+  if (token.startsWith("--")) return VALUELESS_LONG_FLAGS.has(token);
+  const letters = token.slice(1);
+  if (letters.length === 0) return false;
+  return [...letters].every((c) => VALUELESS_SHORT_FLAG_LETTERS.has(c));
+}
+
+/**
+ * Programs for which the skills root itself is not an acceptable operand.
+ *
+ * `rm -rf <skills>` names a contained path and destroys the entire skill
+ * library; `mv <skills> <skills>/x` does the same by relocating it. Reading
+ * the root (`ls`, `stat`, `find`, `cat`) is harmless, so equality stays
+ * allowed there.
+ */
+const REQUIRE_STRICT_DESCENDANT = new Set(["rm", "rmdir", "mv"]);
+
+/**
  * One argument: an absolute path that really lands inside the skills tree.
  *
  * Absolute is required because a relative path is resolved against the SHELL's
  * working directory, which this hook does not know and cannot bound — `cd` is
  * refused, but so is any other way the cwd could differ from the workspace.
  */
-function skillsPathArgument(token: string): boolean {
+function skillsPathArgument(token: string, strictDescendant: boolean): boolean {
   if (!token) return false;
   // `~` is expanded by the shell, after this hook runs.
   if (token.includes("~")) return false;
   if (!isAbsolute(token)) return false;
   if (hasTraversalSegment(token)) return false;
-  return isInside(realResolve(token), realSkillsRoot());
+  const real = realResolve(token);
+  const root = realSkillsRoot();
+  if (strictDescendant && real === root) return false;
+  return isInside(real, root);
 }
 
 /**
@@ -246,17 +317,22 @@ function skillsPathArgument(token: string): boolean {
  *     backtick, `$`, backslash escape, or leading `FOO=bar` assignment;
  *   - the program is one of {@link SKILLS_BASH_ALLOWED_PROGRAMS} (which
  *     excludes `cd`, `sudo`, and every program that runs another program);
- *   - every non-flag word is an ABSOLUTE path, free of `..` and `~`, whose
- *     realpath lands at or inside the resolved skills root;
- *   - a flag containing `/` must be `--name=<path>` and its value must pass
- *     the same check;
+ *   - no glob or brace metacharacter anywhere, quoted or not, so the words
+ *     validated here are the words that run;
+ *   - every non-flag word is an ABSOLUTE, LITERAL path, free of `..` and `~`,
+ *     whose realpath lands inside the resolved skills root — strictly inside
+ *     it for `rm`/`rmdir`/`mv`, which would otherwise accept the root itself;
+ *   - every flag is one that provably carries no value
+ *     ({@link isValuelessFlag}); a flag with an attached or `=` value refuses
+ *     the command outright rather than being parsed;
  *   - at least one path actually lands in the tree, so a command that names
  *     none of it is not auto-allowed by default.
  *
  * THE RESIDUAL, ACCEPTED DELIBERATELY. This refuses plenty of legitimate skill
  * management: `grep pattern <skills>/x` (the pattern is not a path),
- * `chmod +x <skills>/x` (`+x` is neither), anything with a pipe, and every
- * relative path. Those now go through the SDK's ordinary permission handling
+ * `chmod +x <skills>/x` (`+x` is neither), `ls <skills>/*.md` (a glob),
+ * `rm -rf <skills>` (the root itself), any flag carrying a value, anything
+ * with a pipe, and every relative path. Those now go through the SDK's ordinary permission handling
  * instead of being waved through, which is the intended trade — this callback
  * exists to widen a deliberately narrow hole, and a hole that cannot be
  * described precisely should not be widened at all.
@@ -271,19 +347,17 @@ function bashStaysInSkills(command: string): boolean {
   if (ENV_ASSIGNMENT_RE.test(program)) return false;
   if (!SKILLS_BASH_ALLOWED_PROGRAMS.has(program)) return false;
 
+  const strictDescendant = REQUIRE_STRICT_DESCENDANT.has(program);
   let landsInSkills = false;
   for (const arg of args) {
     if (arg.startsWith("-")) {
-      // A bare flag names no path. One carrying a `/` does, and is only
-      // readable in the `--name=<value>` form.
-      if (!arg.includes("/")) continue;
-      const eq = arg.indexOf("=");
-      if (eq < 0) return false;
-      if (!skillsPathArgument(arg.slice(eq + 1))) return false;
-      landsInSkills = true;
+      // Only flags that provably carry no value are skipped. Everything else
+      // — attached values, `=` values, unknown long flags — refuses the
+      // command rather than being reasoned about per program.
+      if (!isValuelessFlag(arg)) return false;
       continue;
     }
-    if (!skillsPathArgument(arg)) return false;
+    if (!skillsPathArgument(arg, strictDescendant)) return false;
     landsInSkills = true;
   }
 

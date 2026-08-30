@@ -115,6 +115,12 @@ interface CronTurnOptions {
   audiences?: string[];
 }
 
+interface QueuedInboundWork {
+  sessionKey: string;
+  items: InboundItem[];
+  steer: boolean;
+}
+
 /**
  * Deadlines for the two channel-side shutdown steps. Both exist because
  * `start.ts` cannot call `process.exit()` until `stop()` resolves, so an
@@ -146,6 +152,13 @@ export class Agent {
   private sessions: SessionStore;
   private router: IdentityRouter;
   private sessionQueue = new SessionQueue();
+  /**
+   * Inbound work that has been accepted by a channel but has not started its
+   * per-session task yet. Unlike the generic SessionQueue tail, this retains
+   * the messages themselves so shutdown can record them instead of merely
+   * waiting for an arbitrary queued model turn.
+   */
+  private queuedInbound = new Map<symbol, QueuedInboundWork>();
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
@@ -507,8 +520,7 @@ export class Agent {
       // Through processInboundItems (not handleMessage directly) so the
       // allowlist and /pause state are re-checked at processing time — this
       // task can wait behind an in-flight turn, and both can change meanwhile.
-      this.enqueueForSession(sessionKey, () => this.processInboundItems([{ channel, message, resolution }]))
-        .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
+      this.enqueueInboundForSession(sessionKey, [{ channel, message, resolution }]);
       return true;
     }
 
@@ -581,8 +593,10 @@ export class Agent {
     const receiptKey = allowed[0].resolution.sessionKey;
     const routedKey = routed[0].resolution.sessionKey;
     if (routedKey !== receiptKey) {
-      this.enqueueForSession(routedKey, () => this.processInboundItems(routed))
-        .catch((err) => log.error({ err, sessionKey: routedKey }, "Unhandled error rerouting queued group message to summoned session"));
+      // Transfer custody into a fresh queued-inbound record before returning.
+      // A plain SessionQueue task here recreates #295 when the destination key
+      // is busy and shutdown lands while this handoff waits.
+      this.enqueueInboundForSession(routedKey, routed, steer, "rerouting queued group message to summoned session");
       return;
     }
 
@@ -591,6 +605,29 @@ export class Agent {
       return;
     }
     await this.handleBatchedMessages(routed, steer);
+  }
+
+  /**
+   * Queue inbound work while retaining enough information to salvage it at
+   * shutdown. The record is removed immediately before processing starts;
+   * processInboundItems reaches the transcript append synchronously before
+   * its first model/channel await, or transfers custody to another record if
+   * summon routing moves it to a different session queue.
+   */
+  private enqueueInboundForSession(
+    sessionKey: string,
+    items: InboundItem[],
+    steer = false,
+    action = "message queue",
+  ): void {
+    const token = Symbol(sessionKey);
+    this.queuedInbound.set(token, { sessionKey, items, steer });
+    this.enqueueForSession(sessionKey, async () => {
+      const work = this.queuedInbound.get(token);
+      if (!work) return; // shutdown already recorded it
+      this.queuedInbound.delete(token);
+      await this.processInboundItems(work.items, work.steer);
+    }).catch((err) => log.error({ err, sessionKey }, `Unhandled error ${action}`));
   }
 
   private rerouteQueuedItemToActiveSummon(item: InboundItem): InboundItem {
@@ -2221,6 +2258,12 @@ export class Agent {
 
   private recordUnprocessedInbound(): void {
     const pending = this.batcher.drainForShutdown();
+    for (const [token, work] of this.queuedInbound) {
+      const items = pending.get(work.sessionKey) ?? [];
+      items.push(...work.items);
+      pending.set(work.sessionKey, items);
+      this.queuedInbound.delete(token);
+    }
     for (const [key, items] of pending) {
       for (const { channel, message } of items) {
         this.sessions.append(key, {

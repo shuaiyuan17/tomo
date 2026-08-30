@@ -3,7 +3,7 @@ import {
   SessionStore as SessionStoreImpl,
   SessionRegistryReadError,
 } from "../src/sessions/store.js";
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -45,7 +45,7 @@ describe("session registry read failure", () => {
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
-  it("does not overwrite a corrupt registry when a mutator runs", () => {
+  it("does not overwrite a corrupt registry when any mutator runs", () => {
     const store = seed();
     const good = readFileSync(REGISTRY, "utf-8");
 
@@ -54,15 +54,76 @@ describe("session registry read failure", () => {
     const corrupt = good.slice(0, Math.floor(good.length / 2));
     writeFileSync(REGISTRY, corrupt);
 
-    // Every mutator is loadRegistry() + saveRegistry(). None of them may
-    // publish anything.
-    expect(() => store.updateStats("telegram:1", STATS)).toThrow(SessionRegistryReadError);
-    expect(() => store.touchSession("telegram:2")).toThrow(SessionRegistryReadError);
-    expect(() => store.setChatTitle("telegram:2", "Chat")).toThrow(SessionRegistryReadError);
+    // Bookkeeping mutators skip silently; link-changing mutators refuse
+    // loudly. Neither may publish anything.
+    store.updateStats("telegram:1", STATS);
+    store.touchSession("telegram:2");
+    store.setChatTitle("telegram:2", "Chat");
+    store.addParticipant("telegram:2", "Ada");
+    store.setReplyTarget("telegram:2", { channelName: "telegram", chatId: "2" });
+
     expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
     expect(() => store.clearSdkSessionId("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(() => store.retireSdkSessionId("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(() => store.migrateSessionKey("telegram:1", "identity:me")).toThrow(SessionRegistryReadError);
 
     expect(readFileSync(REGISTRY, "utf-8")).toBe(corrupt);
+  });
+
+  it("never throws from a bookkeeping mutator, whatever the failure", () => {
+    // These sit on the inbound path (addParticipant runs before the message is
+    // appended, and the rejection is swallowed upstream) and on the
+    // turn-completion path (updateStats runs after the model already
+    // answered). A throw drops a message or fails a successful turn.
+    const store = seed();
+    writeFileSync(REGISTRY, "{ not json");
+
+    expect(() => store.updateStats("telegram:1", STATS)).not.toThrow();
+    expect(() => store.touchSession("telegram:1")).not.toThrow();
+    expect(() => store.setChatTitle("telegram:1", "Title")).not.toThrow();
+    expect(() => store.addParticipant("telegram:1", "Ada", "u1")).not.toThrow();
+    expect(() => store.setReplyTarget("telegram:1", { channelName: "telegram", chatId: "1" })).not.toThrow();
+    // ...including for a key that has no entry yet, where the bookkeeping
+    // path would otherwise create a stub it cannot persist.
+    expect(() => store.setChatTitle("telegram:new", "Fresh")).not.toThrow();
+    expect(() => store.addParticipant("telegram:new", "Bob")).not.toThrow();
+  });
+
+  it("leaves no un-persisted mutation behind in memory", () => {
+    const store = seed();
+    writeFileSync(REGISTRY, "{ not json");
+
+    // A refused link change must not have already applied itself: the probe
+    // is that the link still resolves the way it did before the refusal.
+    expect(() => store.clearSdkSessionId("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+
+    expect(() => store.retireSdkSessionId("telegram:2")).toThrow(SessionRegistryReadError);
+    expect(store.getSdkSessionId("telegram:2")).toBe("sdk-bbb");
+
+    expect(() => store.setSdkSessionId("telegram:1", "sdk-other")).toThrow(SessionRegistryReadError);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+
+    // A skipped bookkeeping write must not leave a stub entry either.
+    store.setChatTitle("telegram:new", "Fresh");
+    store.addParticipant("telegram:new", "Bob");
+    expect(store.listActiveEntries()).toHaveLength(3);
+    expect(store.listActiveEntries().map((e) => e.channelKey)).not.toContain("telegram:new");
+  });
+
+  it("resumes bookkeeping writes once the file is readable again", () => {
+    const store = seed();
+    const good = readFileSync(REGISTRY, "utf-8");
+
+    writeFileSync(REGISTRY, "{ not json");
+    store.setChatTitle("telegram:1", "Skipped");
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("{ not json");
+
+    writeFileSync(REGISTRY, good);
+    store.setChatTitle("telegram:1", "Applied");
+    const onDisk = JSON.parse(readFileSync(REGISTRY, "utf-8"));
+    expect(onDisk.sessions.find((e: { channelKey: string }) => e.channelKey === "telegram:1").chatTitle)
+      .toBe("Applied");
   });
 
   it("keeps the last known-good state in memory instead of reading as empty", () => {
@@ -81,7 +142,7 @@ describe("session registry read failure", () => {
     const good = readFileSync(REGISTRY, "utf-8");
 
     writeFileSync(REGISTRY, "}}}}");
-    expect(() => store.touchSession("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-x")).toThrow(SessionRegistryReadError);
 
     // The transient condition clears.
     writeFileSync(REGISTRY, good);
@@ -111,7 +172,7 @@ describe("session registry read failure", () => {
     writeFileSync(REGISTRY, updated);
     chmodSync(REGISTRY, 0o000);
 
-    expect(() => store.touchSession("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-x")).toThrow(SessionRegistryReadError);
 
     chmodSync(REGISTRY, 0o644);
     expect(readFileSync(REGISTRY, "utf-8")).toBe(updated);
@@ -124,7 +185,7 @@ describe("session registry read failure", () => {
     const store = seed();
     const corrupt = '{"version":1,"sessions":"oops"}';
     writeFileSync(REGISTRY, corrupt);
-    expect(() => store.touchSession("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-x")).toThrow(SessionRegistryReadError);
     expect(readFileSync(REGISTRY, "utf-8")).toBe(corrupt);
   });
 
@@ -138,12 +199,63 @@ describe("session registry read failure", () => {
   it("recovers when the registry is deleted while unreadable", () => {
     const store = seed();
     writeFileSync(REGISTRY, "nope");
-    expect(() => store.touchSession("telegram:1")).toThrow(SessionRegistryReadError);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-x")).toThrow(SessionRegistryReadError);
 
     // `tomo sessions clear` removing the file is a legitimate empty state.
     rmSync(REGISTRY);
     store.setSdkSessionId("telegram:5", "sdk-eee");
     expect(JSON.parse(readFileSync(REGISTRY, "utf-8")).sessions).toHaveLength(4);
+  });
+
+  it("treats a 0-byte registry as empty when nothing is held, and refuses when something is", () => {
+    // JSON.parse("") throws, so without special handling a truncated file is a
+    // permanent refusal with no way back.
+
+    // Nothing held (an interrupted first write on a fresh install): empty and
+    // writable, so it self-heals.
+    writeFileSync(REGISTRY, "");
+    const fresh = new SessionStore(TEST_DIR);
+    expect(fresh.listActiveEntries()).toEqual([]);
+    fresh.setSdkSessionId("telegram:1", "sdk-aaa");
+    expect(JSON.parse(readFileSync(REGISTRY, "utf-8")).sessions).toHaveLength(1);
+
+    // Sessions held (something truncated a real registry): refuse.
+    const store = seed();
+    writeFileSync(REGISTRY, "");
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+
+    // Documented recovery: delete the file, which reads as ENOENT = empty.
+    rmSync(REGISTRY);
+    store.setSdkSessionId("telegram:9", "sdk-new");
+    expect(JSON.parse(readFileSync(REGISTRY, "utf-8")).sessions.length).toBeGreaterThan(0);
+  });
+
+  it("never deletes an SDK session file from a registry it could not read", () => {
+    const store = seed();
+    const sdkDir = join(TEST_DIR, "sdk-sessions");
+    mkdirSync(sdkDir, { recursive: true });
+    const sdkFile = join(sdkDir, "sdk-aaa.jsonl");
+    writeFileSync(sdkFile, "{}\n");
+
+    // Expire the entry on disk, then make the file unreadable, then start a
+    // process — cleanupExpired runs from the constructor and unlinks JSONLs.
+    const parsed = JSON.parse(readFileSync(REGISTRY, "utf-8"));
+    for (const e of parsed.sessions) { e.unlinkedAt = 1; e.expiresAt = 1; }
+    writeFileSync(REGISTRY, JSON.stringify(parsed));
+    const expired = readFileSync(REGISTRY, "utf-8");
+    writeFileSync(REGISTRY, "{ not json");
+
+    new SessionStore(TEST_DIR);
+    expect(existsSync(sdkFile)).toBe(true);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("{ not json");
+
+    // Control: with the same registry readable, it does get cleaned up.
+    writeFileSync(REGISTRY, expired);
+    new SessionStore(TEST_DIR);
+    expect(existsSync(sdkFile)).toBe(false);
+    void store;
   });
 
   it("constructs without throwing when the registry is unreadable at startup", () => {

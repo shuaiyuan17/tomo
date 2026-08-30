@@ -402,6 +402,10 @@ export class SessionStore {
   private registryLoadError: SessionRegistryReadError | null = null;
   /** The failure is logged once per failure streak, not once per mutator. */
   private registryLoadErrorLogged = false;
+  /** Ditto for "this read is answering from stale state" and for deferred
+   *  bookkeeping writes — one line each per streak, not one per call. */
+  private registryStaleReadLogged = false;
+  private registryDeferredWriteLogged = false;
   // Stat of the registry file as of the last read/write. loadRegistry() is
   // called on nearly every store operation to pick up external changes
   // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
@@ -696,6 +700,7 @@ export class SessionStore {
   getSdkSessionId(key: string): string | undefined {
     // Re-read from disk to pick up external changes (e.g. `tomo sessions clear`)
     this.loadRegistry();
+    this.noteStaleRead("getSdkSessionId");
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     return entry?.sdkSessionId || undefined;
   }
@@ -703,12 +708,15 @@ export class SessionStore {
   /** Get the active registry entry for a channel key */
   getEntry(key: string): SessionEntry | undefined {
     this.loadRegistry();
+    this.noteStaleRead("getEntry");
     return this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
   }
 
   /** Link a new SDK session to a channel key */
   setSdkSessionId(key: string, sessionId: string): void {
     this.loadRegistry();
+    // Link change: refuse before mutating anything in memory.
+    this.assertRegistryLoaded();
 
     // A metadata-only stub (created by setChatTitle/addParticipant before any
     // SDK session existed — e.g. a freshly summoned group) is upgraded in
@@ -761,6 +769,9 @@ export class SessionStore {
     // config) rewrite the registry; saving a stale in-memory copy would
     // silently revert their changes.
     this.loadRegistry();
+    // Bookkeeping: this runs after the model has already answered. Skipping it
+    // costs a stale stat line; throwing would fail a turn that succeeded.
+    if (!this.canWriteRegistry("updateStats")) return;
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (!entry) return;
 
@@ -792,10 +803,11 @@ export class SessionStore {
   /** Touch the active session (update lastActiveAt) */
   touchSession(key: string): void {
     this.loadRegistry();
+    if (!this.canWriteRegistry("touchSession")) return;
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     if (entry) {
       entry.lastActiveAt = Date.now();
-      this.saveRegistry();
+      this.saveRegistryBestEffort("touchSession");
     }
   }
 
@@ -806,6 +818,7 @@ export class SessionStore {
     // Metadata-only stubs (no SDK session yet) are excluded — consumers treat
     // these pairs as resumable sessions.
     this.loadRegistry();
+    this.noteStaleRead("listSdkSessionIds");
     return this.registry
       .filter((e) => e.unlinkedAt === null && e.sdkSessionId)
       .map((e) => [e.channelKey, e.sdkSessionId]);
@@ -814,12 +827,14 @@ export class SessionStore {
   /** Active registry entries (linked sessions AND metadata-only stubs). */
   listActiveEntries(): SessionEntry[] {
     this.loadRegistry();
+    this.noteStaleRead("listActiveEntries");
     return this.registry.filter((e) => e.unlinkedAt === null);
   }
 
   /** List all sessions including unlinked */
   listAllSessions(): SessionEntry[] {
     this.loadRegistry();
+    this.noteStaleRead("listAllSessions");
     return [...this.registry];
   }
 
@@ -827,6 +842,7 @@ export class SessionStore {
    *  have no SDK file to TTL — they are removed outright. */
   clearSdkSessionId(key: string): void {
     this.loadRegistry();
+    this.assertRegistryLoaded();
     const now = Date.now();
     this.registry = this.registry.filter((entry) => {
       if (entry.channelKey === key && entry.unlinkedAt === null && !entry.sdkSessionId) {
@@ -856,6 +872,7 @@ export class SessionStore {
    */
   retireSdkSessionId(key: string): string | undefined {
     this.loadRegistry();
+    this.assertRegistryLoaded();
     const now = Date.now();
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && e.sdkSessionId);
     if (!entry) return undefined;
@@ -901,6 +918,10 @@ export class SessionStore {
 
   /** Delete expired unlinked sessions and their SDK JSONL files */
   private cleanupExpired(): void {
+    // Runs from the constructor, so it must not throw. It also unlinks SDK
+    // JSONL files, which is irreversible — never do that from a registry we
+    // could not read.
+    if (!this.canWriteRegistry("cleanupExpired")) return;
     const now = Date.now();
     const sdkDir = this.sdkSessionsDir;
     const expired = this.registry.filter((e) => e.expiresAt !== null && e.expiresAt <= now);
@@ -950,31 +971,43 @@ export class SessionStore {
   /** Get the persisted reply target for a session key */
   getReplyTarget(key: string): ReplyTarget | undefined {
     this.loadRegistry();
+    this.noteStaleRead("getReplyTarget");
     const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
     return entry?.replyTarget;
   }
 
   /** Set and persist the reply target for a session key. No-op if unchanged. */
   setReplyTarget(key: string, target: ReplyTarget): void {
+    this.loadRegistry();
+    // Checked BEFORE ensureActiveEntry, which would otherwise push a stub into
+    // the in-memory registry that we then could not persist.
+    if (!this.canWriteRegistry("setReplyTarget")) return;
     const entry = this.ensureActiveEntry(key);
     const prev = entry.replyTarget;
     if (prev && prev.channelName === target.channelName && prev.chatId === target.chatId) return;
     entry.replyTarget = target;
-    this.saveRegistry();
+    this.saveRegistryBestEffort("setReplyTarget");
   }
 
   /** Persist a friendly chat title for a session (mainly groups). No-op if unchanged. */
   setChatTitle(key: string, title: string): void {
+    this.loadRegistry();
+    if (!this.canWriteRegistry("setChatTitle")) return;
     const entry = this.ensureActiveEntry(key);
     if (entry.chatTitle !== title) {
       entry.chatTitle = title;
-      this.saveRegistry();
+      this.saveRegistryBestEffort("setChatTitle");
     }
   }
 
   /** Add a participant name (and, when known, its stable sender id) to a
    *  session. No-op if nothing new was learned. */
   addParticipant(key: string, name: string, senderId?: string): void {
+    this.loadRegistry();
+    // Bookkeeping, and on the INBOUND path: updateGroupContext calls this
+    // before the message is appended to the transcript, and the rejection is
+    // swallowed upstream — a throw here silently drops the message.
+    if (!this.canWriteRegistry("addParticipant")) return;
     const entry = this.ensureActiveEntry(key);
     let changed = false;
 
@@ -993,7 +1026,7 @@ export class SessionStore {
       }
     }
 
-    if (changed) this.saveRegistry();
+    if (changed) this.saveRegistryBestEffort("addParticipant");
   }
 
   /** Active entry for a key, creating a metadata-only stub (empty sdkSessionId)
@@ -1031,6 +1064,7 @@ export class SessionStore {
   /** Migrate a session from one key to another (for identity-based session unification) */
   migrateSessionKey(oldKey: string, newKey: string): void {
     this.loadRegistry();
+    this.assertRegistryLoaded();
     const idx = this.registry.findIndex((e) => e.channelKey === oldKey && e.unlinkedAt === null);
     if (idx === -1) return;
     const entry = this.registry[idx];
@@ -1138,6 +1172,28 @@ export class SessionStore {
       this.migrateOldFormat();
       return;
     }
+    if (stat.size === 0) {
+      // A zero-byte registry is ambiguous, and JSON.parse("") throws — so
+      // without this it would be a permanent refusal with no way to self-heal.
+      // There is no `.bak` for the registry to arbitrate with, so prior good
+      // state is the only signal available:
+      //  - holding nothing: an interrupted first write on a fresh install.
+      //    Reading it as empty loses nothing and recovers on the next save.
+      //  - holding entries: something truncated a real registry, and reading
+      //    it as empty is exactly the loss this class exists to prevent.
+      // Recovery from the refusing case is to delete the file — that reads as
+      // ENOENT, i.e. legitimately empty.
+      if (this.registry.length > 0) {
+        this.onRegistryLoadFailure(
+          new Error(`registry file is 0 bytes while ${this.registry.length} session(s) are held in memory`),
+        );
+        return;
+      }
+      this.registry = [];
+      this.registryStat = stat;
+      this.clearRegistryLoadError();
+      return;
+    }
     // Skip the stat cache while we are in a failed state: the point of every
     // subsequent call is to find out whether the file has become readable.
     if (this.registryLoadError === null
@@ -1181,10 +1237,79 @@ export class SessionStore {
     }
   }
 
+  /**
+   * Guard for a mutator that changes WHICH SDK session a key resolves to
+   * (`setSdkSessionId`, `clearSdkSessionId`, `retireSdkSessionId`,
+   * `migrateSessionKey`). Throws before anything is mutated in memory.
+   *
+   * These are hard refusals because getting them wrong is the data loss this
+   * class is guarding against: a link silently rewritten from a registry we
+   * could not read orphans a JSONL for good. A caller that cannot relink is
+   * better off failing loudly than continuing against a link it invented.
+   */
+  private assertRegistryLoaded(): void {
+    if (this.registryLoadError !== null) throw this.registryLoadError;
+  }
+
+  /**
+   * Guard for a bookkeeping mutator (stats, timestamps, chat titles,
+   * participants, reply target). Returns false when the registry is
+   * unreadable, and the caller returns without touching memory or disk.
+   *
+   * These must NEVER throw. They sit on the inbound and turn-completion paths
+   * — `addParticipant` runs before the message is appended to the transcript,
+   * `updateStats` runs after the model has already produced its answer — and
+   * a throw there drops an inbound message or fails a turn that actually
+   * succeeded. A permanently unreadable registry would otherwise mean every
+   * message fails, which is a far worse outage than stats going stale.
+   *
+   * Returning false (rather than mutating and hoping) also keeps memory and
+   * disk consistent: a mutation applied but not persisted is a lie that the
+   * next reader would act on.
+   */
+  private canWriteRegistry(op: string): boolean {
+    if (this.registryLoadError === null) return true;
+    if (!this.registryDeferredWriteLogged) {
+      this.registryDeferredWriteLogged = true;
+      log.warn(
+        { file: this.registryPath, op },
+        "Skipping session-registry bookkeeping writes while the file is unreadable",
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Persist a bookkeeping change without letting a refusal escape. Only the
+   * read-failure refusal is downgraded — a genuine write error (ENOSPC,
+   * EROFS) still propagates, because that is not something to hide.
+   */
+  private saveRegistryBestEffort(op: string): void {
+    try {
+      this.saveRegistry();
+    } catch (err) {
+      if (!(err instanceof SessionRegistryReadError)) throw err;
+      this.canWriteRegistry(op);
+    }
+  }
+
+  /** Note, once per streak, that a read is being answered from stale state. */
+  private noteStaleRead(op: string): void {
+    if (this.registryLoadError === null || this.registryStaleReadLogged) return;
+    this.registryStaleReadLogged = true;
+    log.warn(
+      { file: this.registryPath, op, entries: this.registry.length },
+      "Answering session-registry reads from the last known-good in-memory state; " +
+      "a short-lived process that never had a good read reports an empty list",
+    );
+  }
+
   private clearRegistryLoadError(): void {
     if (this.registryLoadError === null) return;
     this.registryLoadError = null;
     this.registryLoadErrorLogged = false;
+    this.registryStaleReadLogged = false;
+    this.registryDeferredWriteLogged = false;
     log.info({ file: this.registryPath }, "Session registry readable again");
   }
 

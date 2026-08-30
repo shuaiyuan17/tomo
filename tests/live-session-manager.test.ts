@@ -122,6 +122,7 @@ vi.mock("../src/logger.js", () => ({
 
 const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
+const { SdkResultError } = await import("../src/agent/live-session.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
 function makeDeps(overrides: Partial<Deps> = {}): Deps {
@@ -140,6 +141,7 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
     handleMcpElicitation: async () => ({ action: "decline" as const }),
     createUnownedTurnRequest: () => undefined,
     maybeNudgeCompact: vi.fn(),
+    handleTurnComplete: vi.fn(),
     refreshExternalMcpToken: vi.fn(async () => "refreshed" as const),
     ...overrides,
   };
@@ -618,6 +620,74 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.setSdkSessionId).toHaveBeenCalledWith("telegram:1", "sdk-1");
     expect(deps.updateStats).toHaveBeenCalledWith("telegram:1", { contextUsed: 5, contextMax: 100 });
     expect(deps.maybeNudgeCompact).toHaveBeenCalledWith("telegram:1", { contextUsed: 5, contextMax: 100 });
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
+  });
+
+  it("signals turn completion even when the turn compacted (deferred restarts must not be stranded)", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.compactTriggered = true;
+    mockState.sendImpl = async () => "hello";
+
+    await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+
+    // The compact path returns early — before the context-pressure check —
+    // but a turn still ended, so the end-of-turn restart fallback must fire.
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
+    expect(deps.maybeNudgeCompact).not.toHaveBeenCalled();
+  });
+
+  it("signals turn completion when the turn ends in an SDK result error", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => { throw new SdkResultError("boom", "error_during_execution"); };
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toThrow();
+
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
+  });
+
+  it("signals turn completion on a query timeout", async () => {
+    // The timeout path retires the session and rethrows from `dispatchTurn`;
+    // it never reaches `recordTurnCompletion`. A restart deferred to the end
+    // of this turn must still fire.
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => { throw new Error("Query timed out after 10 minutes"); };
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toThrow();
+
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
+  });
+
+  it("signals turn completion on the legacy max-turns throw", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => { throw new Error("Reached maximum number of turns"); };
+
+    await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
+  });
+
+  it("signals turn completion on an unrecoverable session error", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => { throw new Error("something entirely unrecognised"); };
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toThrow();
+
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
+  });
+
+  it("signals turn completion for a turn refused during shutdown", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+
+    await manager.stop();
+    expect(await manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).toBe(SHUTDOWN_NOT_PROCESSED);
+
+    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
   });
 
   it("skips per-turn bookkeeping when a steered message merges (STEER_MERGED)", async () => {
@@ -630,6 +700,9 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(response).toBe("");
     expect(deps.setSdkSessionId).not.toHaveBeenCalled();
     expect(deps.maybeNudgeCompact).not.toHaveBeenCalled();
+    // The owning turn does this session's bookkeeping, including the restart
+    // fallback — a merged steer must not fire it a second time.
+    expect(deps.handleTurnComplete).not.toHaveBeenCalled();
   });
 
   it("clears the persisted SDK session id and retries once on 'No conversation found'", async () => {

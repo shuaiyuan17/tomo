@@ -93,6 +93,10 @@ export interface LiveSessionManagerDeps {
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
+  /** Observe persisted SDK tool-result events for daemon control handshakes. */
+  handleToolResult?(key: string, toolName: string, content: unknown, isError: boolean): void;
+  /** A turn on this session just finished (successfully or with an SDK error). */
+  handleTurnComplete?(key: string): void;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
   maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
   /**
@@ -280,6 +284,9 @@ export class LiveSessionManager {
       timeoutMs: config.liveSessionTimeoutMs,
       showThinking: config.showThinking,
       onMcpAuthError: (serverName) => this.deps.refreshExternalMcpToken(serverName),
+      onToolResult: (toolName, content, isError) => {
+        this.deps.handleToolResult?.(key, toolName, content, isError);
+      },
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
     // yields — it can spend real time on OAuth — and stop() may have run its
@@ -442,14 +449,33 @@ export class LiveSessionManager {
     // blocks to the owner and then die at process exit with its deferred block
     // transcript unflushed: exactly the hole the previous commit closed for
     // pre-existing sessions, reopened for late ones.
-    if (this.stopping) return this.refuseForShutdown(req, "admitted after stop()");
-
-    const turn = this.dispatchTurn(req);
-    this.inFlightTurns.add(turn);
+    // EVERY EXIT FROM A TURN SIGNALS COMPLETION, which is why this is a
+    // `finally` around the whole dispatch rather than a call inside
+    // `recordTurnCompletion`. That hook only runs on the two paths that end
+    // with a usable response; a turn can also leave via a shutdown refusal, a
+    // session closed during shutdown, the legacy max-turns throw, a query
+    // timeout, or an unrecoverable session error — and a deferred restart
+    // waiting on the end of the turn must not be stranded by whichever exit
+    // the turn happened to take.
+    let merged = false;
     try {
-      return await turn;
+      if (this.stopping) return this.refuseForShutdown(req, "admitted after stop()");
+
+      const turn = this.dispatchTurn(req);
+      this.inFlightTurns.add(turn);
+      try {
+        const response = await turn;
+        // A steered message that MERGED into a running turn is the one exit
+        // that is not a turn ending: the owning turn is still going, and
+        // firing the signal here would let a restart claim its request and
+        // kill it mid-flight. The owner's own exit reports for both.
+        merged = req.steer === true && response === STEER_MERGED;
+        return response;
+      } finally {
+        this.inFlightTurns.delete(turn);
+      }
     } finally {
-      this.inFlightTurns.delete(turn);
+      if (!merged) this.deps.handleTurnComplete?.(req.key);
     }
   }
 

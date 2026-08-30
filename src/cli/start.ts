@@ -156,6 +156,25 @@ async function startForeground(): Promise<void> {
     }
   }
 
+  // Drop restart requests that can no longer be honoured before any session
+  // can observe one. A request outlives the daemon whenever the process went
+  // away before its turn ended (which is the case a `tomo restart` request is
+  // most likely to produce), and without this the directory only ever grows.
+  const { sweepStaleRestartRequests } = await import("../restart-request.js");
+  // Each one is a restart the owner was told would happen and now will not, so
+  // report them individually at warn rather than as a count.
+  sweepStaleRestartRequests(undefined, undefined, (discarded) => {
+    log.warn(
+      {
+        reason: discarded.reason,
+        ...("request" in discarded
+          ? { requestId: discarded.request.id, sessionKey: discarded.request.sessionKey, requestedAt: discarded.request.requestedAt }
+          : {}),
+      },
+      "Swept a restart request that outlived its turn; no restart will happen for it",
+    );
+  });
+
   const agent = new Agent();
   // The messages this daemon accepted and would now never answer are recorded
   // in the transcript even on the crash path (#294).

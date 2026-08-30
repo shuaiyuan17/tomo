@@ -2,7 +2,8 @@ import { Command } from "commander";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RESTART_REASON_FILE } from "../config.js";
-import { TOMO_SESSION_KEY_ENV, resolveRestartInitiator, writeRestartReasonFile } from "../restart-reason.js";
+import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV, resolveRestartInitiator, writeRestartReasonFile } from "../restart-reason.js";
+import { createRestartRequest, formatRestartRequestResult } from "../restart-request.js";
 import { spawn } from "node:child_process";
 import { isAutostartEnabled, restartAutostart, stopLaunchdJob } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
@@ -17,6 +18,38 @@ import type { PidFileRecord } from "./pidfile.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
+/**
+ * The session key to defer this restart to, or null to restart synchronously.
+ *
+ * Two conditions, not one. `TOMO_SESSION_KEY` alone says only that this
+ * process descends from SOME session's shell at SOME point — env vars are
+ * inherited by every child and survive the daemon that set them, so a restart
+ * typed into a terminal that once had a session's environment, or run from a
+ * script that captured it, would defer: write a request file, print "restart
+ * scheduled", and be watched by nobody. Requiring `TOMO_DAEMON_PID` to name
+ * the daemon that is running RIGHT NOW makes the claim self-validating —
+ * a stale environment names a dead or different PID and falls through to the
+ * synchronous path, which is the correct behaviour when there is no live
+ * daemon to observe the handshake.
+ *
+ * A session spawned by a daemon predating `TOMO_DAEMON_PID` has no marker and
+ * so restarts synchronously — the pre-existing behaviour, self-healing after
+ * one restart. Returning the key rather than a boolean keeps the caller from
+ * having to re-derive (and re-null-check) something already proven here.
+ */
+export function deferredRestartSessionKey(
+  env: NodeJS.ProcessEnv = process.env,
+  runningPid: number | null = getRunningPidRecord()?.pid ?? null,
+): { sessionKey: string; daemonPid: number } | null {
+  const sessionKey = env[TOMO_SESSION_KEY_ENV]?.trim();
+  if (!sessionKey) return null;
+
+  const stampedPid = Number(env[TOMO_DAEMON_PID_ENV]?.trim());
+  if (!Number.isInteger(stampedPid) || stampedPid <= 0) return null;
+  if (runningPid === null || stampedPid !== runningPid) return null;
+
+  return { sessionKey, daemonPid: stampedPid };
+}
 
 export interface StopDeps {
   autostartEnabled: () => boolean;
@@ -165,9 +198,28 @@ export const restartCommand = new Command("restart")
   .option("--reason <reason>", "Reason for restart (sent to agent after restart)")
   .option("--session <key>", `Session key the reason belongs to (defaults to $${TOMO_SESSION_KEY_ENV}, injected into every session's shell)`)
   .action(async (opts: { reason?: string; session?: string }) => {
+    // The env pair decides whether deferring is safe at all; an explicit
+    // --session is ATTRIBUTION and never the claim key. Filing under the
+    // --session value was wrong: only the session that ran the command has
+    // turn ends and tool results the daemon matches requests against, so
+    // `tomo restart --session <other>` produced a request nobody could claim,
+    // which sat until the sweep and never restarted anything.
+    const deferTo = deferredRestartSessionKey();
+    if (deferTo) {
+      const request = createRestartRequest({
+        sessionKey: deferTo.sessionKey,
+        daemonPid: deferTo.daemonPid,
+        reason: opts.reason,
+        attributedSessionKey: resolveRestartInitiator(opts.session),
+      });
+      console.log(formatRestartRequestResult(request));
+      return;
+    }
+
     if (opts.reason) {
       recordRestartReason(opts.reason, opts.session);
     }
+
     if (isAutostartEnabled()) {
       try {
         await restartAutostart();

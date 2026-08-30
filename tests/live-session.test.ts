@@ -103,11 +103,26 @@ function makeSession(settings?: {
   showThinking?: boolean;
   onMcpAuthError?: (serverName: string) => Promise<string> | string;
   now?: () => number;
+  onToolResult?: (toolName: string, content: unknown, isError: boolean) => void;
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
   return { session, harness };
 }
+
+describe("LiveSession tool-result observation", () => {
+  it("notifies after the SDK emits a named tool result", async () => {
+    const onToolResult = vi.fn();
+    const { session, harness } = makeSession({ onToolResult });
+
+    harness.pushEvent(assistantToolEvent("Bash", "tool-1"));
+    harness.pushEvent(toolResultEvent("tool-1", "scheduled"));
+
+    await waitFor(() => onToolResult.mock.calls.length === 1);
+    expect(onToolResult).toHaveBeenCalledWith("Bash", "scheduled", false);
+    session.close();
+  });
+});
 
 async function waitFor(cond: () => boolean, ms = 500): Promise<void> {
   const deadline = Date.now() + ms;

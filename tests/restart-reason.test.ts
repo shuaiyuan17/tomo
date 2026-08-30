@@ -8,7 +8,10 @@ import {
   restartReasonSessionFile,
   writeRestartReasonFile,
 } from "../src/restart-reason.js";
-import { recordRestartReason } from "../src/cli/daemon.js";
+import {
+  recordRestartReason,
+  deferredRestartSessionKey,
+} from "../src/cli/daemon.js";
 
 let tmpDir: string;
 let reasonFile: string;
@@ -151,5 +154,40 @@ describe("recordRestartReason (CLI writer seam)", () => {
     recordRestartReason("manual restart", undefined, {}, reasonFile);
     expect(readFileSync(reasonFile, "utf-8")).toBe("manual restart");
     expect(existsSync(sidecarFile)).toBe(false);
+  });
+});
+
+describe("session-aware restart scheduling", () => {
+  const LIVE = 4242;
+  const live = { TOMO_SESSION_KEY: "dm:shuai", TOMO_DAEMON_PID: String(LIVE) };
+
+  it("defers a restart run inside a session of the daemon that is running now", () => {
+    expect(deferredRestartSessionKey(live, LIVE)).toEqual({ sessionKey: "dm:shuai", daemonPid: LIVE });
+  });
+
+  it("keeps terminal restarts synchronous", () => {
+    expect(deferredRestartSessionKey({}, LIVE)).toBeNull();
+    expect(deferredRestartSessionKey({ TOMO_SESSION_KEY: "  ", TOMO_DAEMON_PID: String(LIVE) }, LIVE)).toBeNull();
+  });
+
+  it("refuses to defer on an inherited environment from a daemon that is no longer the one running", () => {
+    // The exact silent-failure shape: a shell that once held a session's env,
+    // used after the daemon restarted. The key still looks plausible; the PID
+    // proves nobody is watching for the request file.
+    expect(deferredRestartSessionKey(live, 9999)).toBeNull();
+  });
+
+  it("refuses to defer when no daemon is running at all", () => {
+    expect(deferredRestartSessionKey(live, null)).toBeNull();
+  });
+
+  it("refuses to defer without the daemon marker (a session from an older daemon)", () => {
+    expect(deferredRestartSessionKey({ TOMO_SESSION_KEY: "dm:shuai" }, LIVE)).toBeNull();
+  });
+
+  it("refuses to defer on a malformed daemon marker", () => {
+    for (const pid of ["", "  ", "not-a-pid", "0", "-1", "12.5"]) {
+      expect(deferredRestartSessionKey({ TOMO_SESSION_KEY: "dm:shuai", TOMO_DAEMON_PID: pid }, LIVE)).toBeNull();
+    }
   });
 });

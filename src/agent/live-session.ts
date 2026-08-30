@@ -209,6 +209,7 @@ export interface LiveSessionSettings {
   onMcpAuthError?: (serverName: string) => Promise<McpAuthRefreshOutcome> | McpAuthRefreshOutcome;
   /** Clock for the MCP auth-refresh rate window. Injected by tests. */
   now?: () => number;
+  onToolResult?: (toolName: string, content: unknown, isError: boolean) => void;
 }
 
 /** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
@@ -563,6 +564,7 @@ export class LiveSession {
   /** Per-server timestamps of exchanges actually triggered, pruned to the window. */
   private mcpAuthRefreshAttempts = new Map<string, number[]>();
   private now: () => number;
+  private onToolResult: LiveSessionSettings["onToolResult"];
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -600,6 +602,7 @@ export class LiveSession {
     this.showThinking = settings.showThinking ?? false;
     this.onMcpAuthError = settings.onMcpAuthError;
     this.now = settings.now ?? Date.now;
+    this.onToolResult = settings.onToolResult;
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -1155,6 +1158,7 @@ export class LiveSession {
           ...(startedAt !== undefined ? { durationMs: Date.now() - startedAt } : {}),
           ...(agent ? { agent } : {}),
         });
+        this.onToolResult?.(name ?? "?", tr.content, tr.is_error === true);
       }
     }
   }

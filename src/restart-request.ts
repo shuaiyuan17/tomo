@@ -31,7 +31,12 @@ export const RESTART_REQUEST_TTL_MS = 10 * 60 * 1000;
 export type RestartRequestDiscardDetail =
   | { reason: "expired"; request: RestartRequest }
   | { reason: "malformed" }
-  | { reason: "superseded"; request: RestartRequest };
+  /** Filed by a session of a daemon that is no longer this process. */
+  | { reason: "foreign-daemon"; request: RestartRequest }
+  /** A restart for this session is already in flight. */
+  | { reason: "superseded"; request: RestartRequest }
+  /** The daemon is going down on purpose; a restart would resurrect it. */
+  | { reason: "shutting-down"; request: RestartRequest };
 
 export type RestartRequestDiscard = RestartRequestDiscardDetail & { path: string };
 
@@ -65,7 +70,21 @@ function readRequest(path: string): RestartRequest | null {
   if (typeof request.id !== "string" || !REQUEST_ID_RE.test(request.id)) return null;
   if (typeof request.sessionKey !== "string" || request.sessionKey === "") return null;
   if (typeof request.requestedAt !== "string") return null;
+  // Fail closed: a request we cannot attribute to a daemon cannot be shown to
+  // belong to THIS one, and acting on it is the spurious-restart bug.
+  if (!Number.isInteger(request.daemonPid) || request.daemonPid <= 0) return null;
   return request;
+}
+
+/** Remove a request file. False when it was already gone. */
+function removeFile(path: string): boolean {
+  try {
+    unlinkSync(path);
+    return true;
+  } catch {
+    // Already gone, or not ours to remove — either way there is nothing to do.
+    return false;
+  }
 }
 
 function discard(
@@ -73,15 +92,9 @@ function discard(
   detail: RestartRequestDiscardDetail,
   onDiscard?: OnRestartRequestDiscard,
 ): void {
-  try {
-    unlinkSync(path);
-  } catch {
-    // Already gone, or not ours to remove — either way there is nothing to do.
-    return;
-  }
   // Only report what we actually removed, so the count a caller logs matches
   // the number of restarts that will not happen.
-  onDiscard?.({ path, ...detail });
+  if (removeFile(path)) onDiscard?.({ path, ...detail });
 }
 
 function listRequestFiles(requestDir: string): string[] {
@@ -93,17 +106,23 @@ function listRequestFiles(requestDir: string): string[] {
 }
 
 /**
- * Drop every request that can no longer be honoured — expired, or malformed.
+ * Drop every request this daemon can never honour.
  *
- * Called once at daemon startup. Without it the directory is append-only: a
- * request whose marker never came back (and whose turn never completed,
- * because the process went away) would sit there for the life of the install.
+ * Called once at daemon startup, and the ONLY thing standing between a
+ * previous daemon's pending requests and a spurious restart. A request that
+ * was still inside the TTL when its daemon died is otherwise indistinguishable
+ * from a live one, so the next daemon's first unrelated turn end would claim
+ * it and restart — announcing a reason from before the outage, possibly for a
+ * different session entirely. `daemonPid` is what makes them distinguishable:
+ * anything not filed by THIS process is gone, whatever its age.
+ *
  * Returns the number of files removed, for the startup log.
  */
 export function sweepStaleRestartRequests(
   requestDir: string = DEFAULT_REQUEST_DIR,
   now: number = Date.now(),
   onDiscard?: OnRestartRequestDiscard,
+  currentDaemonPid: number = process.pid,
 ): number {
   let removed = 0;
   for (const name of listRequestFiles(requestDir)) {
@@ -114,11 +133,52 @@ export function sweepStaleRestartRequests(
       removed += 1;
       continue;
     }
+    if (request.daemonPid !== currentDaemonPid) {
+      discard(path, { reason: "foreign-daemon", request }, onDiscard);
+      removed += 1;
+      continue;
+    }
     if (!isExpired(request, now)) continue;
     discard(path, { reason: "expired", request }, onDiscard);
     removed += 1;
   }
   return removed;
+}
+
+/** A request file that has been removed from disk and is now ours to decide on. */
+interface ClaimedRequest {
+  request: RestartRequest;
+  /** The path it was actually read from — what a log line should name. */
+  path: string;
+}
+
+/**
+ * Take every request for `sessionKey` off disk, oldest first.
+ *
+ * Malformed files encountered on the way are discarded and reported; other
+ * sessions' requests are left alone (their own session's turn end, or the next
+ * startup sweep, deals with them). Reporting the claimed ones is the caller's
+ * job, because only the caller knows whether it is about to act on one.
+ */
+function claimForSession(
+  sessionKey: string,
+  requestDir: string,
+  onDiscard?: OnRestartRequestDiscard,
+): ClaimedRequest[] {
+  const claimed: ClaimedRequest[] = [];
+  for (const name of listRequestFiles(requestDir)) {
+    const path = join(requestDir, name);
+    const request = readRequest(path);
+    if (!request) {
+      discard(path, { reason: "malformed" }, onDiscard);
+      continue;
+    }
+    if (request.sessionKey !== sessionKey) continue;
+    if (removeFile(path)) claimed.push({ request, path });
+  }
+  // Oldest first: it carries the reason the owner is actually waiting on.
+  claimed.sort((a, b) => Date.parse(a.request.requestedAt) - Date.parse(b.request.requestedAt));
+  return claimed;
 }
 
 /**
@@ -134,46 +194,68 @@ export function sweepStaleRestartRequests(
  * the request silently deleted and no restart, after the CLI had already told
  * the owner one was scheduled.
  *
- * EVERY live request for the session is claimed, not just the returned one —
- * two `tomo restart` calls in one turn are one restart, and leaving the second
- * file behind would fire it again after the daemon came back. Callers that are
- * dropping rather than acting (a restart already in flight) pass
- * `reason: "superseded"` so the discard is reported that way.
+ * EVERY request for the session is claimed, not just the returned one — two
+ * `tomo restart` calls in one turn are one restart, and leaving the second
+ * file behind would fire it again after the daemon came back. The extras are
+ * reported as superseded; the returned one is the caller's to report or act on.
  */
 export function takePendingRestartRequest(
   sessionKey: string,
   requestDir: string = DEFAULT_REQUEST_DIR,
   onDiscard?: OnRestartRequestDiscard,
 ): RestartRequest | null {
-  const live: RestartRequest[] = [];
-  for (const name of listRequestFiles(requestDir)) {
-    const path = join(requestDir, name);
-    const request = readRequest(path);
-    if (!request) {
-      discard(path, { reason: "malformed" }, onDiscard);
-      continue;
-    }
-    // Another session's request is none of this turn's business, whatever its
-    // age — its own session's turn end (or the startup sweep) will deal with it.
-    if (request.sessionKey !== sessionKey) continue;
-    live.push(request);
-    // Claimed, so remove the file; the caller decides what to do with it. The
-    // extras are reported as superseded — only `live[0]` is acted on.
-    discard(path, { reason: "superseded", request }, undefined);
+  const claimed = claimForSession(sessionKey, requestDir, onDiscard);
+  if (claimed.length === 0) return null;
+  for (const extra of claimed.slice(1)) {
+    onDiscard?.({ path: extra.path, reason: "superseded", request: extra.request });
   }
-  if (live.length === 0) return null;
-  // Oldest first: it carries the reason the owner is actually waiting on.
-  live.sort((a, b) => Date.parse(a.requestedAt) - Date.parse(b.requestedAt));
-  for (const superseded of live.slice(1)) {
-    onDiscard?.({ path: requestPath(superseded.id, requestDir), reason: "superseded", request: superseded });
+  return claimed[0].request;
+}
+
+/**
+ * Claim every request for `sessionKey` and honour none of them.
+ *
+ * For the two cases where a restart must not happen but the files must not
+ * survive either: one is already in flight, or the daemon is deliberately
+ * going down. Every claimed request is reported — the whole point is that a
+ * restart the owner was promised never disappears without a line saying so.
+ * Returns how many were dropped.
+ */
+export function drainRestartRequests(
+  sessionKey: string,
+  reason: "superseded" | "shutting-down",
+  requestDir: string = DEFAULT_REQUEST_DIR,
+  onDiscard?: OnRestartRequestDiscard,
+): number {
+  const claimed = claimForSession(sessionKey, requestDir, onDiscard);
+  for (const { request, path } of claimed) {
+    onDiscard?.({ path, reason, request });
   }
-  return live[0];
+  return claimed.length;
 }
 
 export interface RestartRequest {
   id: string;
+  /**
+   * The session that can CLAIM this request — always the one whose shell ran
+   * the command, because that is the only session whose turn end and tool
+   * results the daemon will match it against.
+   */
   sessionKey: string;
+  /**
+   * PID of the daemon whose session filed this. A request is only actionable
+   * by that exact process: once it is gone, nothing is waiting on the promise
+   * the CLI printed, and honouring the file on a NEW daemon means a restart
+   * out of nowhere at the end of some unrelated turn.
+   */
+  daemonPid: number;
   reason?: string;
+  /**
+   * Session the reason is ABOUT, when `tomo restart --session <other>` names
+   * one explicitly. Kept apart from `sessionKey` so an explicit attribution
+   * cannot file the request under a session that will never claim it.
+   */
+  attributedSessionKey?: string;
   requestedAt: string;
 }
 
@@ -183,15 +265,26 @@ function requestPath(id: string, requestDir: string): string {
 
 /** Persist a session-originated restart until its Bash result is observed. */
 export function createRestartRequest(
-  sessionKey: string,
-  reason?: string,
+  opts: {
+    /** Session whose shell ran the command — the only one that can claim it. */
+    sessionKey: string;
+    /** Daemon that owns that session, from TOMO_DAEMON_PID. */
+    daemonPid: number;
+    reason?: string;
+    /** Explicit `--session` attribution, when it names a different session. */
+    attributedSessionKey?: string;
+  },
   requestDir: string = DEFAULT_REQUEST_DIR,
 ): RestartRequest {
   mkdirSync(requestDir, { recursive: true });
   const request: RestartRequest = {
     id: randomUUID(),
-    sessionKey,
-    ...(reason ? { reason } : {}),
+    sessionKey: opts.sessionKey,
+    daemonPid: opts.daemonPid,
+    ...(opts.reason ? { reason: opts.reason } : {}),
+    ...(opts.attributedSessionKey && opts.attributedSessionKey !== opts.sessionKey
+      ? { attributedSessionKey: opts.attributedSessionKey }
+      : {}),
     requestedAt: new Date().toISOString(),
   };
   writeFileSync(requestPath(request.id, requestDir), `${JSON.stringify(request)}\n`, {
@@ -222,8 +315,11 @@ export function restartWorkerInvocation(
       cliPath,
       "restart",
       ...(request.reason ? ["--reason", request.reason] : []),
+      // Attribution, not the claim key: an explicit `--session` names where the
+      // reason should be delivered, which need not be the session that ran the
+      // command. Defaults to the filing session.
       "--session",
-      request.sessionKey,
+      request.attributedSessionKey ?? request.sessionKey,
     ],
     env: workerEnv,
   };

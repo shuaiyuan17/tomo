@@ -162,7 +162,7 @@ describe("session-aware restart scheduling", () => {
   const live = { TOMO_SESSION_KEY: "dm:shuai", TOMO_DAEMON_PID: String(LIVE) };
 
   it("defers a restart run inside a session of the daemon that is running now", () => {
-    expect(deferredRestartSessionKey(live, LIVE)).toBe("dm:shuai");
+    expect(deferredRestartSessionKey(live, LIVE)).toEqual({ sessionKey: "dm:shuai", daemonPid: LIVE });
   });
 
   it("keeps terminal restarts synchronous", () => {

@@ -40,7 +40,7 @@ const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
 export function deferredRestartSessionKey(
   env: NodeJS.ProcessEnv = process.env,
   runningPid: number | null = getRunningPid(),
-): string | null {
+): { sessionKey: string; daemonPid: number } | null {
   const sessionKey = env[TOMO_SESSION_KEY_ENV]?.trim();
   if (!sessionKey) return null;
 
@@ -48,7 +48,7 @@ export function deferredRestartSessionKey(
   if (!Number.isInteger(stampedPid) || stampedPid <= 0) return null;
   if (runningPid === null || stampedPid !== runningPid) return null;
 
-  return sessionKey;
+  return { sessionKey, daemonPid: stampedPid };
 }
 
 export interface StopDeps {
@@ -198,12 +198,20 @@ export const restartCommand = new Command("restart")
   .option("--reason <reason>", "Reason for restart (sent to agent after restart)")
   .option("--session <key>", `Session key the reason belongs to (defaults to $${TOMO_SESSION_KEY_ENV}, injected into every session's shell)`)
   .action(async (opts: { reason?: string; session?: string }) => {
-    // An explicit --session still wins for attribution, exactly as it does on
-    // the synchronous path; the env pair is what decides whether deferring is
-    // safe at all.
+    // The env pair decides whether deferring is safe at all; an explicit
+    // --session is ATTRIBUTION and never the claim key. Filing under the
+    // --session value was wrong: only the session that ran the command has
+    // turn ends and tool results the daemon matches requests against, so
+    // `tomo restart --session <other>` produced a request nobody could claim,
+    // which sat until the sweep and never restarted anything.
     const deferTo = deferredRestartSessionKey();
     if (deferTo) {
-      const request = createRestartRequest(resolveRestartInitiator(opts.session) ?? deferTo, opts.reason);
+      const request = createRestartRequest({
+        sessionKey: deferTo.sessionKey,
+        daemonPid: deferTo.daemonPid,
+        reason: opts.reason,
+        attributedSessionKey: resolveRestartInitiator(opts.session),
+      });
       console.log(formatRestartRequestResult(request));
       return;
     }

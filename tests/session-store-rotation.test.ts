@@ -278,7 +278,7 @@ describe("transcript rotation under concurrency", () => {
     // no lock at all, since both then archive and both then rename.
     const lockPath = `${TRANSCRIPT}.rotate-lock`;
     writeFileSync(lockPath, "abandoned\n");
-    const longAgo = new Date(Date.now() - 10 * 60_000);
+    const longAgo = new Date(Date.now() - 20 * 60_000);
     utimesSync(lockPath, longAgo, longAgo);
 
     let swapped = false;
@@ -301,6 +301,99 @@ describe("transcript rotation under concurrency", () => {
     expect(existsSync(ARCHIVE_JAN)).toBe(false);
     // ...and nothing was left parked under a claim name.
     expect(readdirSync(env.dir).filter((n) => n.includes(".claimed-"))).toEqual([]);
+  });
+
+  it("does not steal a live lock that reused the abandoned one's inode", () => {
+    // The Linux case. ext4 hands a freed inode straight back to the next
+    // create, so the live lock that replaces an abandoned one can carry the
+    // SAME dev+ino — which is exactly what the takeover used to compare.
+    // Reproduced by construction rather than by luck: the replacement is
+    // created with the same content shape but a different token, at the
+    // same name, and the identity check must key on the token.
+    const lockPath = `${TRANSCRIPT}.rotate-lock`;
+    writeFileSync(lockPath, "abandoned\n");
+    const longAgo = new Date(Date.now() - 20 * 60_000);
+    utimesSync(lockPath, longAgo, longAgo);
+
+    let swapped = false;
+    env.hooks.onStat = (path) => {
+      if (swapped || path !== lockPath) return;
+      swapped = true;
+      // Overwrite IN PLACE: same inode by definition, different token.
+      writeFileSync(lockPath, "someone-else-live\n");
+    };
+
+    const before = readFileSync(TRANSCRIPT, "utf-8");
+    expect(() => store().get("test")).not.toThrow();
+    expect(swapped).toBe(true);
+
+    expect(readFileSync(lockPath, "utf-8")).toBe("someone-else-live\n");
+    expect(readFileSync(TRANSCRIPT, "utf-8")).toBe(before);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".claimed-"))).toEqual([]);
+  });
+
+  it("puts a mistakenly claimed lock back without displacing a newer one", () => {
+    // Between "live lock renamed to the claim name" and "put back", the lock
+    // path is empty and a THIRD rotator can create its own there. Putting
+    // ours back with a rename would silently replace that one.
+    const lockPath = `${TRANSCRIPT}.rotate-lock`;
+    writeFileSync(lockPath, "abandoned\n");
+    const longAgo = new Date(Date.now() - 20 * 60_000);
+    utimesSync(lockPath, longAgo, longAgo);
+
+    let swapped = false;
+    env.hooks.onStat = (path) => {
+      if (swapped || path !== lockPath) return;
+      swapped = true;
+      unlinkSync(lockPath);
+      writeFileSync(lockPath, "someone-else-live\n");
+    };
+    env.hooks.onRenamed = (_from, to) => {
+      if (to.includes(".claimed-")) writeFileSync(lockPath, "third-rotator\n");
+    };
+
+    const before = readFileSync(TRANSCRIPT, "utf-8");
+    expect(() => store().get("test")).not.toThrow();
+
+    expect(readFileSync(lockPath, "utf-8")).toBe("third-rotator\n");
+    expect(readFileSync(TRANSCRIPT, "utf-8")).toBe(before);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".claimed-"))).toEqual([]);
+    expect(logLines.warn.join("\n")).toContain("A newer rotation lock appeared meanwhile");
+  });
+
+  it("abandons the install when its lock was taken meanwhile", () => {
+    // A rotation that outlived the staleness window, or whose lock was
+    // displaced: someone else now holds the lock and is about to install
+    // their own rewrite. Installing ours too is the double rotation.
+    const lockPath = `${TRANSCRIPT}.rotate-lock`;
+    env.hooks.onRotateTempWritten = () => {
+      writeFileSync(lockPath, "taken-over\n");
+    };
+
+    const before = readFileSync(TRANSCRIPT, "utf-8");
+    expect(() => store().get("test")).not.toThrow();
+
+    expect(readFileSync(TRANSCRIPT, "utf-8")).toBe(before);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-tmp"))).toEqual([]);
+    expect(logLines.warn.join("\n")).toContain("the rotation lock is no longer ours");
+    // And it did not remove the lock it no longer held.
+    expect(readFileSync(lockPath, "utf-8")).toBe("taken-over\n");
+  });
+
+  it("does not rename over a transcript that was replaced underneath it", () => {
+    // `tomo sessions clear` removed the file and the daemon recreated it
+    // with a new message while we were rewriting the OLD one. The pinned fd
+    // never saw that message; installing our rewrite would erase it.
+    env.hooks.onRotateTempWritten = () => {
+      unlinkSync(TRANSCRIPT);
+      writeFileSync(TRANSCRIPT, JSON.stringify(msg({ content: "written to the new file", seq: 1 })) + "\n");
+    };
+
+    expect(() => store().get("test")).not.toThrow();
+
+    expect(contentsOf(activeLines())).toEqual(["written to the new file"]);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-"))).toEqual([]);
+    expect(logLines.warn.join("\n")).toContain("the transcript was replaced underneath it");
   });
 
   it("treats a lock dated in the future as abandoned instead of blocking forever", () => {
@@ -378,7 +471,7 @@ describe("transcript rotation under concurrency", () => {
   it("takes over a lock left behind by a crashed rotator", () => {
     const lockPath = `${TRANSCRIPT}.rotate-lock`;
     writeFileSync(lockPath, "999999 crashed\n");
-    const longAgo = new Date(Date.now() - 10 * 60_000);
+    const longAgo = new Date(Date.now() - 20 * 60_000);
     utimesSync(lockPath, longAgo, longAgo);
 
     store().get("test");

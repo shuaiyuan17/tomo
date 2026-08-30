@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, readSync, fstatSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, readSync, fstatSync, linkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
@@ -32,11 +32,18 @@ function isAfterMessage(msg: SessionMessage, last: SessionMessage): boolean {
 
 /**
  * A rotation that has been running for longer than this is assumed dead — the
- * process crashed, or was killed between the lock and its release. Rotation
- * reads a file that is at most a few MB and rewrites it, so a live one takes
- * milliseconds; a minute is three orders of magnitude of headroom.
+ * process crashed, or was killed between the lock and its release.
+ *
+ * GENEROUS ON PURPOSE. The transcript is not "at most a few MB": rotation is
+ * skipped for the rest of a month once everything in the file is current, so
+ * a busy session can be far larger than the rotate threshold by the time the
+ * month turns, and a slow disk can make that rewrite take a while. The two
+ * errors are not symmetric. A crashed rotator's lock that outlives this only
+ * delays an optimization; a LIVE rotator's lock taken over destroys data —
+ * both rotators rename over the transcript. So the threshold errs long, and
+ * the install step re-checks ownership regardless (see rotateFromSnapshot).
  */
-const ROTATE_LOCK_STALE_MS = 60_000;
+const ROTATE_LOCK_STALE_MS = 10 * 60_000;
 
 /**
  * How far into the future a lock's mtime may sit before it is read as wrong
@@ -51,6 +58,8 @@ const ROTATE_LOCK_FUTURE_SKEW_MS = 5_000;
 
 interface RotationLock {
   release: () => void;
+  /** Is the lock on disk still the one we took? Never throws. */
+  stillHeld: () => boolean;
 }
 
 /**
@@ -72,13 +81,15 @@ interface RotationLock {
  */
 function acquireRotationLock(file: string, key: string): RotationLock | null {
   const lockPath = `${file}.rotate-lock`;
-  // Identifies this ACQUISITION, not this process. A pid cannot distinguish
-  // our lock from one the same pid took and lost a moment earlier, and the
-  // question being asked later is "is the file on disk still the one we
-  // created", which only a fresh random value can answer.
-  const token = `${process.pid}.${randomUUID()}`;
+  let token: string;
 
   try {
+    // Identifies this ACQUISITION, not this process. A pid cannot distinguish
+    // our lock from one the same pid took and lost a moment earlier, and the
+    // question being asked later is "is the file on disk still the one we
+    // created", which only a fresh random value can answer. Inside the try:
+    // "never throws" has to include the crypto provider.
+    token = `${process.pid}.${randomUUID()}`;
     if (!createLockFile(lockPath, token) && !takeOverStaleLock(lockPath, token, key)) {
       return null;
     }
@@ -100,6 +111,7 @@ function acquireRotationLock(file: string, key: string): RotationLock | null {
 
   let released = false;
   return {
+    stillHeld: () => lockHoldsToken(lockPath, token),
     release: () => {
       if (released) return;
       released = true;
@@ -131,10 +143,15 @@ function createLockFile(lockPath: string, token: string): boolean {
 
 /** Is the lock file on disk the one we created? */
 function lockHoldsToken(lockPath: string, token: string): boolean {
+  return readLockToken(lockPath) === token;
+}
+
+/** First line of a lock file, or null if it cannot be read. */
+function readLockToken(lockPath: string): string | null {
   try {
-    return readFileSync(lockPath, "utf-8").split("\n")[0] === token;
+    return readFileSync(lockPath, "utf-8").split("\n")[0];
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -150,10 +167,17 @@ function lockHoldsToken(lockPath: string, token: string): boolean {
  * and gives up for this pass.
  */
 function takeOverStaleLock(lockPath: string, token: string, key: string): boolean {
-  let judged: { age: number; dev: number; ino: number } | null;
+  let judged: { age: number; dev: number; ino: number; token: string | null } | null;
   try {
+    // TOKEN FIRST, THEN AGE. The two reads are separate syscalls and the
+    // file can be replaced between them. In this order a replacement after
+    // the token read shows up as a fresh mtime and we step aside; one after
+    // the stat shows up as a token mismatch on the claim and is put back.
+    // The other order has a hole: a stale age paired with the NEW token,
+    // which the claim check would then accept.
+    const token = readLockToken(lockPath);
     const st = statSync(lockPath);
-    judged = { age: Date.now() - st.mtimeMs, dev: st.dev, ino: st.ino };
+    judged = { age: Date.now() - st.mtimeMs, dev: st.dev, ino: st.ino, token };
   } catch {
     // Released between the failed create and the stat — nothing to take over.
     judged = null;
@@ -188,24 +212,37 @@ function takeOverStaleLock(lockPath: string, token: string, key: string): boolea
     // and the rename, the rotator that abandoned it may have been replaced by
     // a live one taking the lock legitimately. Renaming by path would then
     // have stolen a FRESH lock, and both rotators would proceed — the exact
-    // damage the lock exists to prevent. dev+ino is what distinguishes "the
-    // lock I decided was dead" from "whatever is sitting at that name now".
-    let claimed: { dev: number; ino: number } | null = null;
+    // damage the lock exists to prevent.
+    //
+    // THE TOKEN IS THE IDENTITY, NOT THE INODE. ext4 hands a freed inode
+    // straight back to the next create, so "the lock I judged dead" and "the
+    // fresh lock that replaced it" can share dev+ino; on Linux CI they did.
+    // The token is a random value per acquisition and cannot collide. dev+ino
+    // is still compared as a cheap extra, never as the deciding one.
+    let claimed: { dev: number; ino: number; token: string | null } | null = null;
     try {
       const st = statSync(claim);
-      claimed = { dev: st.dev, ino: st.ino };
+      claimed = { dev: st.dev, ino: st.ino, token: readLockToken(claim) };
     } catch { /* treated as a mismatch below */ }
 
-    if (!claimed || claimed.dev !== judged.dev || claimed.ino !== judged.ino) {
+    if (!claimed || claimed.token !== judged.token || claimed.dev !== judged.dev || claimed.ino !== judged.ino) {
       log.warn({ lockPath, key }, "Rotation lock was replaced while being taken over; putting it back");
+      // PUT BACK WITH A LINK, NOT A RENAME. For the instant the live lock sat
+      // under the claim name, the lock path was empty, and a third rotator can
+      // have created its own lock there. A rename would silently replace that
+      // one; a link fails with EEXIST and leaves it. The rotator whose lock we
+      // displaced then finds its token gone at install time and abandons —
+      // see rotateFromSnapshot — so the third one runs alone either way.
       try {
-        renameSync(claim, lockPath);
+        linkSync(claim, lockPath);
       } catch (err) {
-        // Leave the claim file rather than unlink it: it still holds the other
-        // rotator's token, and its release checks that token before removing
-        // anything, so nothing here can make it delete a lock it lost.
-        log.error({ err, claim, lockPath }, "Could not restore a rotation lock taken over in error");
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+          log.warn({ claim, lockPath, key }, "A newer rotation lock appeared meanwhile; the displaced one is abandoned");
+        } else {
+          log.error({ err, claim, lockPath }, "Could not restore a rotation lock taken over in error");
+        }
       }
+      try { unlinkSync(claim); } catch { /* best-effort; leaves one stray file */ }
       return false;
     }
 
@@ -213,6 +250,17 @@ function takeOverStaleLock(lockPath: string, token: string, key: string): boolea
   }
 
   return createLockFile(lockPath, token);
+}
+
+/** Does `path` still name the inode `fd` is open on? False on any error. */
+function sameInode(fd: number, path: string): boolean {
+  try {
+    const a = fstatSync(fd);
+    const b = statSync(path);
+    return a.dev === b.dev && a.ino === b.ino;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1127,7 +1175,7 @@ export class SessionStore {
       return;
     }
     try {
-      this.rotateTranscriptLocked(key, file, currentMonth);
+      this.rotateTranscriptLocked(key, file, currentMonth, lock);
     } finally {
       lock.release();
     }
@@ -1149,7 +1197,7 @@ export class SessionStore {
    *   rotation is an optimization, so it gives up quietly rather than throwing
    *   out of `get()`.
    */
-  private rotateTranscriptLocked(key: string, file: string, currentMonth: string): void {
+  private rotateTranscriptLocked(key: string, file: string, currentMonth: string, lock: RotationLock): void {
     let fd: number;
     try {
       fd = openSync(file, "r");
@@ -1169,7 +1217,7 @@ export class SessionStore {
       }
 
       const all = parseJsonl<SessionMessage>(text);
-      this.rotateFromSnapshot(key, file, currentMonth, fd, all, bytesRead);
+      this.rotateFromSnapshot(key, file, currentMonth, fd, all, bytesRead, lock);
     } finally {
       closeSync(fd);
     }
@@ -1182,6 +1230,7 @@ export class SessionStore {
     fd: number,
     all: SessionMessage[],
     bytesRead: number,
+    lock: RotationLock,
   ): void {
     const keep: SessionMessage[] = [];
     const byMonth = new Map<string, SessionMessage[]>();
@@ -1230,8 +1279,40 @@ export class SessionStore {
       // We could not carry the concurrent appends across, so installing the
       // rewrite would destroy them. Abandon this pass instead: the original
       // file still holds every message, and the already-written archive
-      // entries are skipped next time by the isAfterMessage check.
+      // entries are skipped next time by the isAfterMessage check. Until
+      // that next pass succeeds, those records exist in BOTH files, and
+      // searchTranscript reports them twice: a visible duplicate, chosen over
+      // the alternative of archiving after the rename, which would leave a
+      // crash between the two with the records in neither.
       log.warn({ key }, "Abandoning transcript rotation: concurrent appends could not be carried over");
+      try { unlinkSync(tmp); } catch { /* best-effort */ }
+      return;
+    }
+
+    // MAY WE STILL INSTALL? The rename below is the one destructive step, and
+    // two things can have changed since the lock was taken:
+    //
+    // - THE LOCK. A rotator that ran past ROTATE_LOCK_STALE_MS, or whose
+    //   lock was displaced by a takeover made in error, no longer holds it,
+    //   and whoever does is about to rename its own rewrite over this file.
+    //   Two installs of two snapshots is the double-rotation the lock exists
+    //   to prevent; the one that lost the lock steps aside.
+    // - THE FILE. `tomo sessions clear` removes the transcript and the daemon
+    //   recreates it; the pinned fd still reads the OLD inode, so nothing we
+    //   spliced came from the new file, and renaming over it would erase
+    //   everything written there. The open descriptor is what makes dev+ino
+    //   trustworthy here: an inode with a descriptor on it cannot be freed,
+    //   so it cannot be reused for the replacement.
+    //
+    // Both checks sit immediately before the rename: the gap between them
+    // and it is a few syscalls, against a staleness window of minutes.
+    if (!lock.stillHeld()) {
+      log.warn({ key }, "Abandoning transcript rotation: the rotation lock is no longer ours");
+      try { unlinkSync(tmp); } catch { /* best-effort */ }
+      return;
+    }
+    if (!sameInode(fd, file)) {
+      log.warn({ key, file }, "Abandoning transcript rotation: the transcript was replaced underneath it");
       try { unlinkSync(tmp); } catch { /* best-effort */ }
       return;
     }

@@ -1,6 +1,54 @@
 import { readFileSync, openSync, closeSync, readSync, fstatSync } from "node:fs";
 
-export function parseJsonl<T = unknown>(text: string): T[] {
+/**
+ * Carrier for a line that could not be parsed as JSON. A `Symbol` key, so it
+ * cannot collide with a real field and `JSON.stringify` ignores it — a raw
+ * line that leaked into a plain stringify would serialize as `{}` rather than
+ * as itself, which is exactly the loss this exists to prevent. Use
+ * {@link serializeJsonlRecord} to write records back out.
+ */
+const RAW_JSONL_LINE = Symbol("tomo.rawJsonlLine");
+
+export interface RawJsonlLine {
+  [RAW_JSONL_LINE]: string;
+}
+
+export function isRawJsonlLine(value: unknown): value is RawJsonlLine {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as RawJsonlLine)[RAW_JSONL_LINE] === "string";
+}
+
+/**
+ * Serialize one record from `parseJsonl(text, { preserveUnparseable: true })`.
+ * Real records stringify; carried-through lines are emitted byte-for-byte as
+ * they were read.
+ */
+export function serializeJsonlRecord(value: unknown): string {
+  return isRawJsonlLine(value) ? value[RAW_JSONL_LINE] : JSON.stringify(value);
+}
+
+export interface ParseJsonlOptions {
+  /**
+   * Emit an opaque {@link RawJsonlLine} for every line that fails to parse,
+   * in its original position, instead of dropping it.
+   *
+   * **Every caller that rewrites the file it read must set this.** Dropping is
+   * the right tolerance for a read-only consumer, but a read-modify-rewrite
+   * that emits only what parsed *deletes* the rest: a single mid-file torn
+   * line (a power loss, with a later append landing behind it so `hasPartialTail`
+   * no longer sees it) is silently erased by the next compact or prune, and if
+   * it was an assistant `tool_use` the following `tool_result` is left with a
+   * dangling `tool_use_id`.
+   *
+   * Carried lines have no `type`, `uuid`, `message` or `timestamp`, so the
+   * normal field tests skip them; they are never archived, summarized or
+   * re-stitched, only preserved.
+   */
+  preserveUnparseable?: boolean;
+}
+
+export function parseJsonl<T = unknown>(text: string, opts?: ParseJsonlOptions): T[] {
   const records: T[] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
@@ -9,14 +57,18 @@ export function parseJsonl<T = unknown>(text: string): T[] {
       records.push(JSON.parse(trimmed) as T);
     } catch {
       // Tolerant by design: SDK JSONL files can contain partial or malformed
-      // lines if inspected while another process is writing.
+      // lines if inspected while another process is writing. Read-only
+      // consumers skip them; rewriters carry them through verbatim.
+      if (opts?.preserveUnparseable) {
+        records.push({ [RAW_JSONL_LINE]: line } as RawJsonlLine as T);
+      }
     }
   }
   return records;
 }
 
-export function readJsonlFileSync<T = unknown>(path: string): T[] {
-  return parseJsonl<T>(readFileSync(path, "utf-8"));
+export function readJsonlFileSync<T = unknown>(path: string, opts?: ParseJsonlOptions): T[] {
+  return parseJsonl<T>(readFileSync(path, "utf-8"), opts);
 }
 
 /**

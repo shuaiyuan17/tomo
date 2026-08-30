@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
-import { parseJsonl } from "../jsonl.js";
+import { isRawJsonlLine, parseJsonl, serializeJsonlRecord } from "../jsonl.js";
 
 /** Path to the compact trigger file for a given session */
 export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: string): string {
@@ -119,7 +119,11 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // (counted in `allEvents` AND in the late tail), producing duplicate uuids.
   const snapshot = readWholeFileFromFd(sourceFd);
   const bytesAtRead = snapshot.size;
-  const allEvents = parseJsonl<SdkEvent>(snapshot.text);
+  // preserveUnparseable: this function REWRITES the file it just read, so a
+  // line that only the parser could not understand must still be in the
+  // output. Carried lines have no `type`, so they never enter convIndices,
+  // never anchor a range, and are never archived — they are only relocated.
+  const allEvents = parseJsonl<SdkEvent>(snapshot.text, { preserveUnparseable: true });
 
   // Separate conversation events (user/assistant) from metadata events
   // We need to track the original indices so we can reconstruct
@@ -209,6 +213,10 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // including any metadata events (queue-operation, last-prompt, attachment) that sit between them
   const removeSet = new Set<number>();
   for (let i = removeStartGlobal; i <= removeEndGlobal; i++) {
+    // A line we could not parse is not something we can claim to have
+    // summarized, and archiveEvents would write `{"_archived":true}` with no
+    // payload. It is carried through to the output below instead.
+    if (isRawJsonlLine(allEvents[i])) continue;
     removeSet.add(i);
   }
 
@@ -261,7 +269,19 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
 
   newEvents.push(summaryEvent);
 
+  // Unparseable lines that sat inside the collapsed range. The span they were
+  // in is gone, so "in place" is immediately after the summary that replaced
+  // it — the closest surviving position, and still before everything that
+  // followed them.
+  for (let i = removeStartGlobal; i <= removeEndGlobal; i++) {
+    if (isRawJsonlLine(allEvents[i])) newEvents.push(allEvents[i]);
+  }
+
   for (let i = removeEndGlobal + 1; i < allEvents.length; i++) {
+    if (isRawJsonlLine(allEvents[i])) {
+      newEvents.push(allEvents[i]);
+      continue;
+    }
     const event = { ...allEvents[i] };
     if (event.parentUuid && removedUuids.has(event.parentUuid)) {
       event.parentUuid = summaryUuid;
@@ -290,6 +310,11 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   for (let pass = 0; pass < 8; pass++) {
     const { events: lateEvents, readUpTo, hasPartialTail } = readSinceOffsetFromFd(sourceFd, cursor);
     for (const e of lateEvents) {
+      if (isRawJsonlLine(e)) {
+        newEvents.push(e);
+        lateAppended++;
+        continue;
+      }
       // Defense in depth against the duplication race: skip any uuid we've
       // already spliced in. (The atomic read above should make this
       // impossible, but a duplicated splice would corrupt the chain.)
@@ -340,7 +365,7 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // file fully or the new file fully — never a half-written state. The
   // post-rename drain below covers appends that land on the old inode after
   // this final tail read.
-  const output = newEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
+  const output = newEvents.map(serializeJsonlRecord).join("\n") + "\n";
   const tmp = path + ".compacting.tmp";
   writeFileSync(tmp, output);
   req.beforeRenameForTest?.();
@@ -529,7 +554,9 @@ export function readSinceOffsetFromFd(
     return { events: [], readUpTo: offset, hasPartialTail: total > 0 };
   }
   const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
-  const events = parseJsonl<SdkEvent>(completeBytes);
+  // preserveUnparseable: both callers splice these events straight back into
+  // the file they are rewriting.
+  const events = parseJsonl<SdkEvent>(completeBytes, { preserveUnparseable: true });
   return {
     events,
     readUpTo: offset + lastNl + 1,
@@ -559,6 +586,11 @@ export function drainOldInodeAfterRename(args: {
     const { events, readUpTo, hasPartialTail } = readSinceOffsetFromFd(args.sourceFd, cursor);
     const lines: string[] = [];
     for (const e of events) {
+      if (isRawJsonlLine(e)) {
+        lines.push(serializeJsonlRecord(e));
+        appended++;
+        continue;
+      }
       if (e.uuid && args.seenLateUuids.has(e.uuid)) continue;
       const event = { ...e };
       if (event.parentUuid && args.removedUuids.has(event.parentUuid)) {

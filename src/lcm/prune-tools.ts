@@ -10,7 +10,7 @@ import {
   sleepMs,
 } from "./compact.js";
 import { log } from "../logger.js";
-import { parseJsonl } from "../jsonl.js";
+import { parseJsonl, serializeJsonlRecord } from "../jsonl.js";
 
 export interface PruneToolsRequest {
   sdkSessionId: string;
@@ -86,7 +86,10 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   // Pinned snapshot up to the last complete line; partial mid-write bytes
   // stay outside it and are handled by the late-splice loop below.
   const snapshot = readWholeFileFromFd(sourceFd);
-  const events = parseJsonl<SdkEvent>(snapshot.text);
+  // preserveUnparseable: this function rewrites the file it just read. Carried
+  // lines have no `message`, so every prune loop below skips them on its own
+  // `evt.message?.content` guard; they are simply re-emitted where they were.
+  const events = parseJsonl<SdkEvent>(snapshot.text, { preserveUnparseable: true });
 
   // Build a map of tool_use_id -> tool name from assistant tool_use events
   const toolNameById = new Map<string, string>();
@@ -224,7 +227,7 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
   // SDK's appender sees the old file fully or the new file fully — never a
   // half-written state. The temp name is per-process/per-call so two
   // concurrent prune invocations can't overwrite or rename each other's file.
-  const output = [...events, ...lateEvents].map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const output = [...events, ...lateEvents].map(serializeJsonlRecord).join("\n") + "\n";
   const tmp = `${path}.${process.pid}.${randomUUID()}.pruning.tmp`;
   try {
     writeFileSync(tmp, output);

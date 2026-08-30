@@ -4,7 +4,10 @@ import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
-import { parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync } from "../jsonl.js";
+import {
+  parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
+  isRawJsonlLine, serializeJsonlRecord, type RawJsonlLine,
+} from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TRANSCRIPT_TEXT_LIMIT } from "../watch/protocol.js";
@@ -1292,7 +1295,11 @@ export class SessionStore {
         return;
       }
 
-      const all = parseJsonl<SessionMessage>(text);
+      // preserveUnparseable: rotation rewrites the active transcript, so a
+      // line we could not parse has to come back out. It stays in the active
+      // file rather than being archived — its timestamp is exactly the thing
+      // we could not read, so there is no month to file it under.
+      const all = parseJsonl<SessionMessage>(text, { preserveUnparseable: true });
       this.rotateFromSnapshot(key, file, currentMonth, fd, all, bytesRead, lock);
     } finally {
       closeSync(fd);
@@ -1304,13 +1311,19 @@ export class SessionStore {
     file: string,
     currentMonth: string,
     fd: number,
-    all: SessionMessage[],
+    all: (SessionMessage | RawJsonlLine)[],
     bytesRead: number,
     lock: RotationLock,
   ): void {
-    const keep: SessionMessage[] = [];
+    // Union element type: `keep` carries both real messages and the carriers
+    // for lines nobody could parse.
+    const keep: (SessionMessage | RawJsonlLine)[] = [];
     const byMonth = new Map<string, SessionMessage[]>();
     for (const msg of all) {
+      if (isRawJsonlLine(msg)) {
+        keep.push(msg);
+        continue;
+      }
       const month = monthOf(msg.timestamp);
       if (month >= currentMonth) {
         keep.push(msg);
@@ -1343,7 +1356,7 @@ export class SessionStore {
     // is how one of them ends up renaming a path the other already moved.
     // pid + random matches writeFileAtomicSync (fs-utils.ts) and pruneTools.
     const tmp = `${file}.rotate-tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
-    writeFileSync(tmp, keep.length > 0 ? keep.map((m) => JSON.stringify(m)).join("\n") + "\n" : "");
+    writeFileSync(tmp, keep.length > 0 ? keep.map(serializeJsonlRecord).join("\n") + "\n" : "");
 
     // SPLICE LATE APPENDS. Everything appended between our read and this line
     // is not in `tmp` — on the old code the rename below erased it,

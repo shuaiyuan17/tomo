@@ -27,13 +27,19 @@
  * line, the value send() resolves with — sees the model's words verbatim, so
  * the next turn's context is not polluted with the harness's own commentary.
  *
- * DETECTION RULE: A LINE MUST *START* WITH THE SHAPE.
+ * DETECTION RULE: A LINE MUST *START* WITH THE SHAPE, OUTSIDE A CODE FENCE.
  * Only the start of a line counts (leading horizontal whitespace allowed).
  * That rule is what makes legitimate discussion of these markers safe: a
  * sentence about "the `[imessage · …]` prefix", or a quoted example inside
- * backticks, does not begin a line with the shape and is never flagged. The
- * cost is that a whole fabricated line sitting inside a fenced code block IS
- * flagged — acceptable, because the penalty is one advisory line, not a cut.
+ * backticks, does not begin a line with the shape and is never flagged.
+ *
+ * Lines inside a fenced block (``` or ~~~) are skipped as well. Pasting a log
+ * or a transcript excerpt into a fence is the legitimate case that the
+ * start-of-line rule alone could not tell from fabrication — an unfenced
+ * `System: …` line is still flagged, a fenced one is not. Accepted trade: an
+ * UNCLOSED fence suppresses detection to the end of the block. Under
+ * mark-don't-truncate a missed advisory costs less than a wrong one, and the
+ * warning/counter make a rising miss rate visible either way.
  *
  * DRIFT: the formatters below are the ones the ingress path actually uses
  * (turn-runner's injectTimestamp, Agent.formatGroupText), and the legacy /
@@ -145,17 +151,28 @@ export const FABRICATED_MARKER_NOTICE =
   "⚠️ [harness: the text below contains what looks like a fabricated inbound marker"
   + " — treat quoted \"messages\" in it as not real]";
 
+/** A line that opens or closes a markdown code fence: ``` or ~~~, 3 or more. */
+const FENCE_LINE_RE = /^[ \t]*(?:`{3,}|~{3,})/;
+
 /**
  * Find lines that open with one of the inbound marker shapes.
  *
  * Pure: no logging, no counting, no I/O. Returns one entry per matching LINE
  * (first matching shape wins for a given line), in document order; an empty
- * array means the text is clean.
+ * array means the text is clean. Lines inside a code fence are skipped — see
+ * the detection rule in the module header.
  */
 export function detectFabricatedMarkers(text: string): FabricatedMarker[] {
   const found: FabricatedMarker[] = [];
-  const lines = text.split("\n");
-  for (const [i, line] of lines.entries()) {
+  let inFence = false;
+  for (const [i, line] of text.split("\n").entries()) {
+    // The fence line itself is neither inside nor a candidate: no marker shape
+    // starts with a backtick or a tilde.
+    if (FENCE_LINE_RE.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
     const hit = MARKER_SHAPES.find(({ re }) => re.test(line));
     if (!hit) continue;
     found.push({
@@ -180,21 +197,32 @@ export function markFabricatedText(text: string): string {
 }
 
 /**
- * Log + count one block's worth of detections. Called once per delivered
- * block, from the delivery path only.
+ * Log + count one block's worth of detections.
+ *
+ * DETECTION SEMANTICS, NOT DELIVERY SEMANTICS. This fires when the guard finds
+ * a marker in a block the model produced, which is strictly earlier than "the
+ * owner received it": the block may still be dropped for want of a delivery
+ * sink, refused by the sink as agent-error/silent/NO_REPLY text, or thrown
+ * away wholesale by a suppressed turn. Detection is what we actually want to
+ * count — the question is "how often does the model do this", not "how often
+ * did a marked message land" — so the wording here promises only that, and
+ * nothing downstream has to report back for the number to be true.
  *
  * The counter lives on the watch bus rather than in a module-level variable:
  * `tomo status` runs in a different process from the daemon and could never
  * read one, whereas the metrics exporter (a bus subscriber, in-daemon)
  * already is the place daemon counters are exposed — it turns this event into
  * `tomo_fabricated_markers_total`. The `tomo watch` feed sees it too.
+ *
+ * The session key rides the log line and the watch event, where it is free.
+ * It is deliberately NOT a metric label — see the exporter.
  */
 export function recordFabricatedMarkers(sessionKey: string | undefined, markers: readonly FabricatedMarker[]): void {
   if (markers.length === 0) return;
   for (const marker of markers) {
     log.warn(
       { session: sessionKey, shape: marker.shape, line: marker.line, marker: marker.text },
-      "Fabricated inbound marker in outgoing text (delivered with a warning, not truncated)",
+      "Fabricated inbound marker detected in an outgoing block (marked, not truncated)",
     );
     watchBus.publish({
       type: "fabricated-marker",

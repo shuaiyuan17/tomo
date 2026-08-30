@@ -866,6 +866,14 @@ export class LiveSession {
     // The surrounding words are usually a real reply, so the block ships whole
     // with an advisory on top. Applied HERE and not in renderBlock because
     // renderBlock also builds the transcript, which must stay verbatim.
+    //
+    // COUNTED AT DETECTION, WHICH IS WHY IT IS RECORDED HERE. This block may
+    // still never reach anybody: there may be no delivery sink (the unowned
+    // -turn drop below), the sink may refuse it as agent-error/silent/NO_REPLY
+    // text, or a suppressed turn may throw it away. The question the counter
+    // answers is "how often does the model fabricate a marker", not "how often
+    // did a marked message land", so it fires on the model's output and the
+    // log line says "detected", not "delivered".
     recordFabricatedMarkers(this.sessionKey, rendered.fabricatedMarkers);
     const outgoing = rendered.fabricatedMarkers.length > 0
       ? markFabricatedText(rendered.text)

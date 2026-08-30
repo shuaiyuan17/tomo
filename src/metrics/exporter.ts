@@ -180,14 +180,23 @@ export class MetricsExporter {
       labelNames: ["level"],
       registers,
     });
-    // Outgoing text in which the MODEL wrote a line shaped like one of the
+    // Outgoing blocks in which the MODEL wrote a line shaped like one of the
     // harness's inbound markers. The message still ships (marked, not
-    // truncated) — this counter is how often that guard fires. See
+    // truncated) — this counter is how often the guard fires. See
     // src/agent/inbound-markers.ts.
+    //
+    // SHAPE ONLY, NEVER THE SESSION KEY. prom-client retains every label
+    // combination for the lifetime of the daemon, and session keys are
+    // open-ended (`telegram:<chatId>` for any chat that ever talks to Tomo),
+    // so a `session` label would grow the series set without bound over a
+    // long-running process. `shape` has four values, forever. Session
+    // attribution is still there where it costs nothing and is actually
+    // useful for debugging one incident: the warn log line and the
+    // `fabricated-marker` watch event both carry it.
     this.fabricatedMarkers = new Counter({
       name: "tomo_fabricated_markers_total",
-      help: "Fabricated inbound markers found in outgoing assistant text, by session and marker shape.",
-      labelNames: ["session", "shape"],
+      help: "Fabricated inbound markers detected in outgoing assistant text, by marker shape.",
+      labelNames: ["shape"],
       registers,
     });
   }
@@ -285,7 +294,7 @@ export class MetricsExporter {
         this.issues.inc({ level: event.level });
         break;
       case "fabricated-marker":
-        this.fabricatedMarkers.inc({ session: event.sessionKey ?? "unknown", shape: event.shape });
+        this.fabricatedMarkers.inc({ shape: event.shape });
         break;
       default:
         break;

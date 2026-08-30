@@ -1293,7 +1293,7 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
     expect(r.transcript).toEqual([body]);
   });
 
-  it("logs a warning naming the session and the offending line, truncated", async () => {
+  it("logs a warning naming the session and the offending line, truncated, in DETECTION terms", async () => {
     const r = rig();
     const stamp = formatInboundStamp("telegram");
 
@@ -1303,6 +1303,12 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
       ([, msg]) => typeof msg === "string" && msg.includes("Fabricated inbound marker"),
     );
     expect(warns).toHaveLength(1);
+    // The guard fires on the model's output, which is strictly earlier than
+    // "the owner received it" — a block can still be dropped for want of a
+    // sink, refused as silent/error text, or thrown away by a suppressed turn.
+    // The line must not claim a delivery it cannot know about.
+    expect(warns[0]![1]).toContain("detected");
+    expect(warns[0]![1]).not.toContain("delivered");
     const fields = warns[0]![0] as Record<string, unknown>;
     expect(fields.session).toBe("test:session");
     expect(fields.shape).toBe("stamp");

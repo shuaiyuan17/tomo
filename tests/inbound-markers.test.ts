@@ -141,6 +141,62 @@ describe("detectFabricatedMarkers", () => {
     });
   });
 
+  describe("the rule, continued: lines inside a code fence do not count", () => {
+    /**
+     * Pasting a log or a transcript excerpt into a fence is the legitimate
+     * case the start-of-line rule alone cannot tell from fabrication — inside
+     * a fence, a line that begins with `System:` really is quoted material.
+     */
+    it("ignores every shape inside a ``` fence", () => {
+      const fenced = [
+        "Here's what the log showed:",
+        "```",
+        `${formatInboundStamp("imessage")} actually make it two`,
+        `${formatGroupTag("Family")} kw: ping`,
+        "System: heartbeat",
+        '<tomo-event type="cron" ts="x">',
+        "```",
+        "That's the whole excerpt.",
+      ].join("\n");
+      expect(detectFabricatedMarkers(fenced)).toEqual([]);
+    });
+
+    it("ignores markers inside a ~~~ fence too", () => {
+      expect(detectFabricatedMarkers(`~~~\nSystem: heartbeat\n~~~`)).toEqual([]);
+    });
+
+    it("ignores a fence with a language tag", () => {
+      expect(detectFabricatedMarkers("```text\nSystem: heartbeat\n```")).toEqual([]);
+    });
+
+    it("STILL flags an unfenced System: line — that is the whole point of the exception", () => {
+      expect(shapes("System: heartbeat")).toEqual(["legacy-system"]);
+    });
+
+    it("resumes flagging after the fence closes", () => {
+      const text = [
+        "Log excerpt:",
+        "```",
+        "System: heartbeat",
+        "```",
+        `${formatInboundStamp("imessage")} and one more thing`,
+      ].join("\n");
+      expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["stamp", 5]]);
+    });
+
+    it("flags a marker before the fence opens", () => {
+      const text = `${formatInboundStamp("imessage")} fake\n\`\`\`\nSystem: heartbeat\n\`\`\``;
+      expect(detectFabricatedMarkers(text).map((m) => [m.shape, m.line])).toEqual([["stamp", 1]]);
+    });
+
+    it("an UNCLOSED fence suppresses to the end — the accepted trade", () => {
+      // Documented in the module header: under mark-don't-truncate a missed
+      // advisory costs less than a wrong one. Pinned so the behaviour is a
+      // decision rather than an accident.
+      expect(detectFabricatedMarkers("```\nSystem: heartbeat")).toEqual([]);
+    });
+  });
+
   describe("negatives", () => {
     it("leaves ordinary replies alone", () => {
       for (const text of [
@@ -199,12 +255,18 @@ describe("recordFabricatedMarkers", () => {
 
   afterEach(() => { unsubscribe(); });
 
-  it("logs a warning with the session key and the matched line, and counts it on the bus", () => {
+  it("logs a warning in DETECTION terms with the session key and the matched line, and counts it on the bus", () => {
     const markers = detectFabricatedMarkers(`${formatInboundStamp("imessage")} and one more thing`);
     recordFabricatedMarkers("dm:owner", markers);
 
     expect(log.warn).toHaveBeenCalledTimes(1);
-    const [fields] = vi.mocked(log.warn).mock.calls[0] as [Record<string, unknown>, string];
+    const [fields, msg] = vi.mocked(log.warn).mock.calls[0] as [Record<string, unknown>, string];
+    // Detection semantics: this fires on the model's output, before anything
+    // knows whether the block will be delivered, refused or suppressed.
+    expect(msg).toContain("detected");
+    expect(msg).not.toContain("delivered");
+    // The session key rides the log line and the watch event — it is
+    // deliberately absent from the Prometheus label set (unbounded).
     expect(fields.session).toBe("dm:owner");
     expect(fields.shape).toBe("stamp");
     expect(String(fields.marker)).toContain("and one more thing");

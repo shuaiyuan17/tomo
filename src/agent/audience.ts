@@ -78,6 +78,45 @@ export function scopedCallerKeyFor(sessionKey: string, audiences: readonly strin
 }
 
 /**
+ * The audience a turn STARTED on one session must carry when it is dispatched
+ * onto ANOTHER session — `send_message(mode: "delegate")`, and the handoff of
+ * a group's background turn into the summoning `dm:` session.
+ *
+ * A delegated turn runs with `source: "cron"` on the target session, so
+ * without this it registered nothing and every session-scoped tool it called
+ * resolved against the TARGET's session key. A participant in a summoned group
+ * could therefore say "ask your other conversation to list and remove the
+ * clinic reminders": the group turn is scoped to the group, but the turn it
+ * spawns on `dm:<owner>` was the owner. The scope has to travel with the
+ * request, not be re-derived from wherever it lands.
+ *
+ * Returns the audience list to register for the dispatched turn, or
+ * `undefined` when the caller's own audience is unattributable (MIXED) — the
+ * delegate is refused rather than run under a guessed one, same fail-closed
+ * rule as `scopedCallerKeyFor`.
+ *
+ * - caller is a `dm:` session speaking privately → `["dm"]`: the owner, who
+ *   keeps their own scope wherever the turn lands.
+ * - caller is a `dm:` session carrying a summoned group → `[<group key>]`:
+ *   the group travels with the request, so the delegated turn stays
+ *   group-scoped even on the owner's own session key.
+ * - caller IS a raw group/chat session → `[<its own key>]`, for the same
+ *   reason: any participant can steer it.
+ */
+export function originAudienceFor(
+  callerSessionKey: string,
+  audiences: readonly string[] | undefined,
+): string[] | undefined {
+  const scoped = scopedCallerKeyFor(callerSessionKey, audiences);
+  if (scoped === MIXED_AUDIENCE_KEY) return undefined;
+  // `scoped === callerSessionKey` means "no narrowing happened" — which on a
+  // `dm:` key is the owner's private audience, and on a raw key is the chat
+  // itself. The distinction matters: registering "dm" for a raw group caller
+  // would hand the group the target session's own scope.
+  return [scoped === callerSessionKey && callerSessionKey.startsWith("dm:") ? "dm" : scoped];
+}
+
+/**
  * Which turns are live on which session, and therefore what a session-scoped
  * MCP tool should be judged against right now.
  *
@@ -127,6 +166,21 @@ export class TurnAudienceRegistry {
     if (!turns) return;
     turns.delete(id);
     if (turns.size === 0) this.live.delete(sessionKey);
+  }
+
+  /** The audiences of every turn live on this session right now, or
+   *  undefined when none is. */
+  liveAudiences(sessionKey: string): string[] | undefined {
+    const turns = this.live.get(sessionKey);
+    if (!turns || turns.size === 0) return undefined;
+    return [...new Set([...turns.values()].flat())];
+  }
+
+  /** The audience a turn dispatched FROM this session onto another one must
+   *  carry. Undefined when this session's live turns are unattributable —
+   *  see `originAudienceFor`. */
+  originAudience(sessionKey: string): string[] | undefined {
+    return originAudienceFor(sessionKey, this.liveAudiences(sessionKey));
   }
 
   /** The key a session-scoped tool should be judged against, right now. */

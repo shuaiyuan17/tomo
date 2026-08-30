@@ -98,6 +98,14 @@ interface CronTurnOptions {
    *  a session turn that the handoff target may be waiting on — see
    *  processCronMessage. */
   waitForHandoff?: boolean;
+  /** The audience this turn carries from the session that ASKED for it —
+   *  `send_message(mode: "delegate")`, or a group's background turn handed to
+   *  the summoning dm: session. Registered in the TurnAudienceRegistry for the
+   *  turn's duration, so its session-scoped MCP tools resolve against the
+   *  origin rather than the session key it happens to run on. Left undefined
+   *  for harness-originated turns (the cron scheduler, LCM nudges), which the
+   *  owner owns outright. */
+  audiences?: string[];
 }
 
 /**
@@ -284,8 +292,11 @@ export class Agent {
       setChatTitle: (sessionKey, title) => this.sessions.setChatTitle(sessionKey, title),
       listActiveEntries: () => this.sessions.listActiveEntries(),
       queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
-      runDelegateTurn: (systemMsg, sessionKey, deliveryTarget) =>
-        this.handleCronMessage(systemMsg, sessionKey, deliveryTarget ? { deliveryTarget } : {}),
+      runDelegateTurn: (systemMsg, sessionKey, deliveryTarget, audiences) =>
+        this.handleCronMessage(systemMsg, sessionKey, {
+          ...(deliveryTarget ? { deliveryTarget } : {}),
+          ...(audiences ? { audiences } : {}),
+        }),
     });
 
     // Load persistent per-session model overrides
@@ -1345,6 +1356,19 @@ export class Agent {
         // Summoned turns retain the private-output safety model. Group-facing
         // output must use the explicit direct-send path named in the reminder.
         deliveryTarget: undefined,
+        // The turn now runs on the OWNER's session key while its prompt and
+        // its reply audience are the group's. Register the group so its
+        // session-scoped tools stay group-scoped instead of inheriting the
+        // owner's — this is the same hole as the delegate one, reached from
+        // the other side (a job the group scheduled, firing into a session
+        // whose key says "the owner's private DM"). "dm" is dropped rather
+        // than unioned: an owner-originated request into a group is not a
+        // conflict, it is simply group-facing. A DIFFERENT group's audience is
+        // kept, so the union fails closed the way it should.
+        audiences: [...new Set([
+          ...(options.audiences ?? []).filter((a) => a !== "dm"),
+          `${parsed.channelName}:${parsed.chatId}`,
+        ])],
       }));
       // A caller that records completion (the cron scheduler advances or
       // deletes the job on the returned boolean) must wait for the handed-off
@@ -1380,37 +1404,47 @@ export class Agent {
     // Silent housekeeping turns suppress them in DMs as well when requested.
     const suppressErrorDelivery = isGroupSessionKey(key) || options.suppressDelivery === true;
 
-    return this.turnRunner.runTurn({
-      key,
-      source: "cron",
-      prompt: message,
-      stampChannelName: deliveryChannel.name,
-      ...(options.showTyping === false ? {} : {
-        typing: {
+    // Published for the turn's duration when it carries a foreign origin, the
+    // same way runUserTurn publishes an inbound turn's audience. Harness-owned
+    // turns (the cron scheduler, LCM nudges) register nothing and keep the
+    // session's own scope — except while a summoned turn overlaps them, which
+    // narrows them to that group and which `scopedCallerKey` logs at debug.
+    const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
+    try {
+      return await this.turnRunner.runTurn({
+        key,
+        source: "cron",
+        prompt: message,
+        stampChannelName: deliveryChannel.name,
+        ...(options.showTyping === false ? {} : {
+          typing: {
+            channel: deliveryChannel,
+            chatId: deliveryChatId,
+            passiveListen: this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
+          },
+        }),
+        delivery: {
+          kind: "send",
           channel: deliveryChannel,
           chatId: deliveryChatId,
-          passiveListen: this.isPassiveReplyTarget(deliveryChannel.name, deliveryChatId),
+          suppressDelivery: options.suppressDelivery,
+          suppressedLog: "Cron output suppressed from chat delivery",
         },
-      }),
-      delivery: {
-        kind: "send",
-        channel: deliveryChannel,
-        chatId: deliveryChatId,
-        suppressDelivery: options.suppressDelivery,
-        suppressedLog: "Cron output suppressed from chat delivery",
-      },
-      silentMatcher: isSilentReply,
-      silentLog: "Cron completed silently (no reply sent)",
-      transcript: "on-delivery",
-      errors: {
-        visiblePrefix: "[error] cron failed: ",
-        response: suppressErrorDelivery ? "note-only" : "deliver",
-        responseSuppressedLog: "Cron error suppressed from chat delivery",
-        thrown: suppressErrorDelivery ? "note-only" : "deliver",
-        thrownSuppressedLog: "Thrown cron error suppressed from chat delivery",
-        thrownLogMessage: "Cron message handling failed",
-      },
-    });
+        silentMatcher: isSilentReply,
+        silentLog: "Cron completed silently (no reply sent)",
+        transcript: "on-delivery",
+        errors: {
+          visiblePrefix: "[error] cron failed: ",
+          response: suppressErrorDelivery ? "note-only" : "deliver",
+          responseSuppressedLog: "Cron error suppressed from chat delivery",
+          thrown: suppressErrorDelivery ? "note-only" : "deliver",
+          thrownSuppressedLog: "Thrown cron error suppressed from chat delivery",
+          thrownLogMessage: "Cron message handling failed",
+        },
+      });
+    } finally {
+      if (turnId !== undefined) this.turnAudiences.end(key, turnId);
+    }
   }
 
   /** Handle a continuity heartbeat — runs on the first active DM session (queued) */
@@ -1462,13 +1496,26 @@ export class Agent {
       log.info({ from: sessionKey, to: summonedKey }, "Group restart notice handed to active summoned session");
     }
 
-    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey))
+    // A restart notice for a group, routed onto the owner's session because the
+    // group is summoned, is the group's turn wherever it runs — same rule as
+    // the cron handoff in processCronMessage.
+    const audiences = summonedKey ? [sessionKey] : undefined;
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences))
       .catch((err) => {
         log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
   }
 
-  private async processContinuity(prompt: string, key: string): Promise<void> {
+  private async processContinuity(prompt: string, key: string, audiences?: string[]): Promise<void> {
+    const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
+    try {
+      await this.runContinuityTurn(prompt, key);
+    } finally {
+      if (turnId !== undefined) this.turnAudiences.end(key, turnId);
+    }
+  }
+
+  private async runContinuityTurn(prompt: string, key: string): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
@@ -1542,8 +1589,30 @@ export class Agent {
     return this.proactive.sendToSession(target, text, callerSessionKey, options);
   }
 
-  async delegateToSession(target: string, request: string): Promise<SendResult> {
-    return this.proactive.delegateToSession(target, request);
+  /**
+   * `send_message(mode: "delegate")`. The delegated turn runs on the TARGET
+   * session, so the caller's audience has to be resolved HERE, while the
+   * calling turn is still live in the registry, and handed down — by the time
+   * the turn runs, the caller's registration is gone.
+   *
+   * Refuses outright when the caller's own turn is unattributable (a coalesced
+   * batch spanning the owner's DM and a summoned group, or two groups). That
+   * turn cannot say which audience the request came from, and a delegate is
+   * precisely the operation that would launder the ambiguity into full scope
+   * on another session.
+   */
+  async delegateToSession(target: string, request: string, callerSessionKey?: string): Promise<SendResult> {
+    let callerAudiences: string[] | undefined;
+    if (callerSessionKey !== undefined) {
+      callerAudiences = this.turnAudiences.originAudience(callerSessionKey);
+      if (!callerAudiences) {
+        return {
+          ok: false,
+          error: "delegate mode is unavailable on this turn: its messages span more than one audience (a private DM and a summoned group, or two groups), so the delegated turn cannot be attributed to one of them. Reply in this conversation instead, or use mode \"direct\" to send verbatim text.",
+        };
+      }
+    }
+    return this.proactive.delegateToSession(target, request, callerAudiences);
   }
 
   async renameGroupChat(target: string, title: string): Promise<SendResult> {

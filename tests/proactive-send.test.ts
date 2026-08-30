@@ -62,7 +62,7 @@ interface Harness {
   transcript: Array<{ sessionKey: string; content: string; channelName: string }>;
   notes: Array<{ sessionKey: string; note: string }>;
   titles: Array<{ sessionKey: string; title: string }>;
-  delegated: Array<{ systemMsg: string; sessionKey: string; deliveryTarget?: { channelName: string; chatId: string } }>;
+  delegated: Array<{ systemMsg: string; sessionKey: string; deliveryTarget?: { channelName: string; chatId: string }; audiences?: string[] }>;
 }
 
 function makeHarness(overrides: Partial<Deps> = {}, channel = new FakeChannel()): Harness {
@@ -82,8 +82,8 @@ function makeHarness(overrides: Partial<Deps> = {}, channel = new FakeChannel())
     setChatTitle: (sessionKey, title) => { titles.push({ sessionKey, title }); },
     listActiveEntries: () => [],
     queuePendingNote: (sessionKey, note) => { notes.push({ sessionKey, note }); },
-    runDelegateTurn: async (systemMsg, sessionKey, deliveryTarget) => {
-      delegated.push({ systemMsg, sessionKey, deliveryTarget });
+    runDelegateTurn: async (systemMsg, sessionKey, deliveryTarget, audiences) => {
+      delegated.push({ systemMsg, sessionKey, deliveryTarget, audiences });
       return true;
     },
     ...overrides,
@@ -409,6 +409,20 @@ describe("ProactiveSendService.delegateToSession", () => {
     expect(h.delegated[0].sessionKey).toBe("telegram:12345");
     expect(h.delegated[0].systemMsg).toContain("follow up with Alice");
     expect(h.delegated[0].systemMsg).toContain("Reply NO_REPLY");
+  });
+
+  it("hands the caller's audience to the delegated turn", async () => {
+    const h = makeHarness();
+
+    // Resolved by the Agent from the live turn registry — the delegated turn
+    // is registered under the TARGET key with the CALLER's audience, so a
+    // summoned group cannot spend the owner's scope on another session.
+    await h.service.delegateToSession("telegram:12345", "follow up with Alice", ["telegram:-987"]);
+    expect(h.delegated[0].audiences).toEqual(["telegram:-987"]);
+
+    // No caller session (CLI, tests): nothing to register, unchanged.
+    await h.service.delegateToSession("telegram:12345", "follow up with Alice");
+    expect(h.delegated[1].audiences).toBeUndefined();
   });
 
   it("rejects delegation to a disconnected channel without dispatching", async () => {

@@ -14,7 +14,11 @@ export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
  * In-process MCP server exposing tomo-internal tools to the agent.
  *
  * Created per LiveSession, bound to that session's key so tool handlers know
- * which session is calling (the SDK itself passes no caller context).
+ * which session is calling (the SDK itself passes no caller context). The key
+ * alone is not the caller's SCOPE — a summoned group's turn runs on the
+ * owner's dm: key — so anything scoped resolves it through the agent's turn
+ * audience registry at call time: `agent.scopedCallerKey` for the cron tools,
+ * `delegateToSession`'s own lookup for `send_message(mode: "delegate")`.
  * Delegate-to-self is intentionally not blocked (see Agent.delegateToSession
  * for rationale).
  */
@@ -104,7 +108,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
             ? await agent.sendToSession(target, message, callerSessionKey, reply_to !== undefined || effect !== undefined
               ? { ...(reply_to !== undefined ? { replyTo: reply_to } : {}), ...(effect !== undefined ? { effect } : {}) }
               : undefined)
-            : await agent.delegateToSession(target, message);
+            : await agent.delegateToSession(target, message, callerSessionKey);
 
           if (result.ok) {
             return {

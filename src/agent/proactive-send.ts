@@ -39,8 +39,16 @@ export interface ProactiveSendDeps {
   /** Queue a delegate request as a system turn on the target session
    *  (Agent.handleCronMessage — per-session queue, never rejects).
    *  `deliveryTarget` pins the turn's delivery to a specific channel/chat
-   *  instead of the session's reply-target resolution. */
-  runDelegateTurn(systemMsg: string, sessionKey: string, deliveryTarget?: ReplyTarget): Promise<boolean>;
+   *  instead of the session's reply-target resolution. `audiences` is the
+   *  CALLER's audience (see agent/audience.ts `originAudienceFor`), registered
+   *  for the delegated turn so its session-scoped tools are judged against
+   *  where the request came from, not the session it landed on. */
+  runDelegateTurn(
+    systemMsg: string,
+    sessionKey: string,
+    deliveryTarget?: ReplyTarget,
+    audiences?: string[],
+  ): Promise<boolean>;
 }
 
 /**
@@ -193,12 +201,20 @@ export class ProactiveSendService {
    * the recipient's Claude finishes. The user observes the actual outcome in
    * the recipient channel directly (since they're a participant).
    *
+   * `callerAudiences` is the audience of the turn asking for the delegate,
+   * already resolved by the Agent (`originAudienceFor`). It rides along so the
+   * delegated turn is registered under the TARGET session key with the
+   * CALLER's audience: a delegate requested while a summoned group is steering
+   * the owner's dm: session stays group-scoped after it lands, instead of
+   * picking up the target session's own (owner) scope. Undefined only for
+   * callers with no session at all — the CLI and tests.
+   *
    * Note: delegate-to-self isn't blocked here. If it happens, the system
    * request is just queued behind the current turn via enqueueForSession —
    * one extra Claude turn fires, no infinite loop. For mid-loop self-progress
    * updates, prefer direct mode (no extra turn).
    */
-  async delegateToSession(target: string, request: string): Promise<SendResult> {
+  async delegateToSession(target: string, request: string, callerAudiences?: string[]): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
@@ -219,7 +235,7 @@ export class ProactiveSendService {
     // A raw channel:chatId target canonicalized to a dm key pins delivery to
     // the named channel, like direct mode; otherwise the turn resolves its
     // own delivery target from the session's reply policy.
-    this.deps.runDelegateTurn(systemMsg, sessionKey, resolved.rawReplyTarget).catch((err) => {
+    this.deps.runDelegateTurn(systemMsg, sessionKey, resolved.rawReplyTarget, callerAudiences).catch((err) => {
       log.error({ err, sessionKey }, "Delegated send failed");
     });
 

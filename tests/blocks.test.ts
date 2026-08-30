@@ -197,6 +197,7 @@ describe("findDuePromotions — past-day nudging", () => {
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(10);
+    expect(dailyDue!.replacesExistingBlock).toBe(false);
   });
 
   it("does NOT flag a heartbeat-only past day with no daily block", () => {
@@ -273,6 +274,7 @@ describe("findDuePromotions — past-day nudging", () => {
     const dailyDue = due.find((d) => d.level === "daily" && d.period === pastDay);
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(8);
+    expect(dailyDue!.replacesExistingBlock).toBe(true);
   });
 
   it("does NOT flag a past day with a block and 7 leftover raw events", () => {
@@ -639,6 +641,7 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
     const dailyDue = due.find((d) => d.level === "daily" && d.period === day);
     expect(dailyDue).toBeDefined();
     expect(dailyDue!.childCount).toBe(12);
+    expect(dailyDue!.replacesExistingBlock).toBe(true);
   });
 
   it("the sweep absorbs the day for good — no residue, chain intact, never due again", () => {

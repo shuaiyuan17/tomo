@@ -173,9 +173,55 @@ export const LOG_CENSOR = "[Redacted]";
  *
  * Returns the ORIGINAL object when there is nothing to redact, which is the
  * overwhelmingly common case — the daemon logs at `debug` by default, so
- * cloning every record would be a real cost for nothing. The scan is a plain
- * key walk with no allocation.
+ * cloning every record would be a real cost for nothing. The scan still walks
+ * the record (via `Object.entries`, which allocates), but it does not rebuild
+ * it, and it stops at the first secret-named key it finds.
  */
+/**
+ * Redact a *serialized* error object: censor secret-named fields at any depth,
+ * and scrub every string by value.
+ *
+ * Errors need their own pass for three reasons, all verified against a real
+ * pino instance:
+ *  - `formatters.log` runs BEFORE serializers, so the deep pass sees a raw
+ *    `Error` and steps over it;
+ *  - `pino.stdSerializers.err` returns an object with a non-`Object` prototype
+ *    (as do the entries of `aggregateErrors`), so a plain-object-only walker
+ *    rejects it at the door — leaving `err.response.data.config.headers
+ *    .Authorization` (depth 6) exposed;
+ *  - the credential is often in `message` or `stack`, under no key that any
+ *    name rule could match, and `AggregateError`'s sub-errors carry their own.
+ *
+ * So this walks ANY object, and scrubs strings as well as censoring names.
+ * Error trees are small and rare, so the extra work is bounded.
+ */
+export function redactSerializedError(value: unknown): unknown {
+  return redactErrorNode(value, undefined, new Set());
+}
+
+function redactErrorNode(value: unknown, fieldName: string | undefined, ancestors: Set<object>): unknown {
+  if (fieldName !== undefined && isSecretFieldName(fieldName)) return LOG_CENSOR;
+  if (typeof value === "string") return scrubSecretValues(value);
+  if (value === null || typeof value !== "object") return value;
+  if (ancestors.has(value)) return "[Circular]";
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => redactErrorNode(item, undefined, ancestors));
+    }
+    // Own enumerable properties only — exactly what JSON.stringify would have
+    // emitted, so nothing visible in the output is lost by rebuilding as a
+    // plain object.
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = redactErrorNode(item, key, ancestors);
+    }
+    return result;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
 export function redactLogRecord<T>(record: T): T {
   if (!containsSecret(record, new Set())) return record;
   return redact(record, undefined, () => LOG_CENSOR, new Set()) as T;
@@ -199,58 +245,25 @@ function containsSecret(value: unknown, ancestors: Set<object>): boolean {
   }
 }
 
-/**
- * Concrete field names for pino's `redact.paths`. fast-redact matches literal
- * keys, not patterns, so `isSecretFieldName`'s rule is enumerated here for the
- * names that actually occur — config keys, OAuth token records, and HTTP
- * header casings (paths are case-sensitive).
- *
- * This list is deliberately narrower than the predicate. The predicate guards
- * `configIssues`, where a false positive costs one unreadable value in an
- * error message; over-redacting here would quietly cost a field in every log
- * line that carries it (`tokenStoreKey`, for instance, matches the predicate
- * but names an OAuth store slot rather than holding a credential).
- */
-const LOG_SECRET_FIELDS = [
-  "token",
-  "accessToken",
-  "refreshToken",
-  "idToken",
-  "botToken",
-  "telegramToken",
-  "secret",
-  "groupSecret",
-  "clientSecret",
-  "password",
-  "passwd",
-  "apiKey",
-  "api_key",
-  "apikey",
-  "privateKey",
-  "secretKey",
-  "accessKey",
-  "authorization",
-  "Authorization",
-  "cookie",
-  "Cookie",
-  "credential",
-  "credentials",
-];
 
 /**
- * `field` through `*.*.*.*.field` for each name above — a fast, well-tested
- * path for the depths that actually occur. It is NOT the boundary: a ladder of
- * literal paths can always be out-nested, so `redactLogRecord` runs over every
- * record as well and catches the general case. Both censor to the same
- * `[Redacted]`, so which one fired is invisible in the output.
+ * A deliberately SHORT ladder for pino's `redact.paths`.
+ *
+ * It used to be every name above at five depths — 115 paths with four nested
+ * wildcards — which measured 25-120x the cost of the whole rest of the
+ * redaction on a single log line (142 us for a 5-deep record, against 4.6 us
+ * for `redactLogRecord` alone), on a logger that runs at `debug` by default.
+ * It was also redundant: `redactLogRecord` covers every plain-object record at
+ * any depth, and the `err` serializer covers error trees, so the ladder was
+ * paying fast-redact's per-path cost to find things already found.
+ *
+ * What is left is the top-level and one-deep header casings — the shapes most
+ * likely to appear and the cheapest possible check — kept purely as a
+ * belt-and-braces layer in front of the hooks. Everything censors to the same
+ * `[Redacted]`, so which layer fired is invisible in the output.
  */
-export const LOG_REDACT_PATHS: string[] = LOG_SECRET_FIELDS.flatMap((field) => [
-  field,
-  `*.${field}`,
-  `*.*.${field}`,
-  `*.*.*.${field}`,
-  `*.*.*.*.${field}`,
-]);
+export const LOG_REDACT_PATHS: string[] = ["Authorization", "authorization", "Cookie", "cookie", "token", "apiKey"]
+  .flatMap((field) => [field, `*.${field}`]);
 
 /**
  * Redact credentials out of a free-text string.
@@ -310,14 +323,36 @@ const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\bAIza[A-Za-z0-9_-]{35}\b/g, "***"],
   // JWTs (three base64url segments).
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "***"],
-  // `Authorization: Bearer <token>` and bare `Bearer <token>`, in headers,
-  // curl commands, and error messages that echo the request.
-  [/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***"],
-  [/\b(Authorization)(["']?\s*[:=]\s*)(["']?)[^"'\s,}]+\3/gi, "$1$2$3***$3"],
+  // `Authorization: <anything>` — the whole header value, scheme included, as
+  // one unit. Runs BEFORE the Bearer rule: splitting it produces
+  // `Authorization: *** <credential>`, which redacts the scheme and publishes
+  // the secret.
+  [/(\bAuthorization["']?\s*[:=]\s*)(["'])[^"']*\2/gi, "$1$2***$2"],
+  [/(\bAuthorization\s*[:=]\s*)[^\r\n,}\]]+/gi, "$1***"],
+  // `Bearer <token>` / `Basic <token>` standing on their own, in curl
+  // commands and error messages that echo a request.
+  //
+  // Tightly constrained, because this rule sits in front of ordinary English
+  // and the cost of a false positive is a mangled log line. Verified against
+  // real messages in tomo.log that an earlier, looser version destroyed:
+  // "assuming basic features are supported", "Missing token endpoint or
+  // client id", "OAuth token response did not include access_token",
+  // "access token expired."
+  //   - case-SENSITIVE: `Bearer`/`Basic` are HTTP scheme tokens and are
+  //     capitalised; "basic"/"token" in prose are not.
+  //   - no `Token` alternative at all: as a scheme it is rare, and as an
+  //     English word it precedes a noun in half the OAuth log lines we have.
+  //     A real `Token <credential>` is still caught by the key/value rule.
+  //   - the value must LOOK like a credential: at least 16 characters and at
+  //     least one digit, which no English word or short identifier satisfies.
+  //   - the value cannot end in sentence punctuation, so "expired." keeps its
+  //     full stop.
+  [/\b(Bearer|Basic) ((?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{15,}[A-Za-z0-9=])/g, "$1 ***"],
   // `"access_token": "..."`, `client_secret=...`, `--token abc`. The key is
-  // kept; only the value is replaced.
+  // kept; only the value is replaced. Literal non-secrets are skipped so
+  // `token: null` — which is a fact worth logging — survives intact.
   [
-    /\b(access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|apikey|auth[_-]?token|bot[_-]?token|password|passwd|secret|token)(["']?\s*[:=]\s*)(["']?)[^"'\s,;}&]+\3/gi,
+    /\b(access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_-]?key|apikey|auth[_-]?token|bot[_-]?token|password|passwd|secret|token)(["']?\s*[:=]\s*)(["']?)(?!(?:null|true|false|undefined|none|nil|0)\b["',}\s]?)[^"'\s,;}&]+\3/gi,
     "$1$2$3***$3",
   ],
 ];

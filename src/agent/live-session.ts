@@ -13,6 +13,7 @@ import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
 import { endsWithTrailingNoReply } from "./text-utils.js";
 import { filterScaffoldLeak } from "./scaffold-filter.js";
+import { scrubSecretValues } from "../redact.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
@@ -423,12 +424,19 @@ export interface QueryResult {
   contextBreakdown?: { name: string; tokens: number }[];
 }
 
+/**
+ * Tool summaries are the daemon's highest-volume path for other people's
+ * secrets: the model reads config files, token stores and `.env`s on request,
+ * and these two functions put the result into a log line AND onto the watch
+ * bus. Scrubbing here rather than at each call site covers both — the watch
+ * publish in `publishToolStart` never goes through pino's `logMethod` hook.
+ */
 function summarizeToolResult(content: unknown): string {
   // Tool results arrive as either a string or an array of content blocks
   // ({type:"text",text:"..."} | {type:"image",...} | etc.). We flatten to a
   // short readable string for log lines — no need to be exhaustive.
   if (content == null) return "(empty)";
-  if (typeof content === "string") return content.slice(0, 500);
+  if (typeof content === "string") return scrubSecretValues(content.slice(0, 500));
   if (Array.isArray(content)) {
     const parts: string[] = [];
     for (const b of content) {
@@ -440,12 +448,16 @@ function summarizeToolResult(content: unknown): string {
         }
       }
     }
-    return parts.join(" ").slice(0, 500);
+    return scrubSecretValues(parts.join(" ").slice(0, 500));
   }
-  return JSON.stringify(content).slice(0, 500);
+  return scrubSecretValues(JSON.stringify(content).slice(0, 500));
 }
 
 function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
+  return scrubSecretValues(describeToolInput(name, input));
+}
+
+function describeToolInput(name: string, input?: Record<string, unknown>): string {
   if (!input) return name;
   switch (name) {
     case "Read": return `Read ${input.file_path}`;

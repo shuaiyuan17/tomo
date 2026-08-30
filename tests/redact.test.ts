@@ -8,6 +8,7 @@ import {
   isSecretFieldName,
   redactLogRecord,
   redactSecretValue,
+  redactSerializedError,
   redactSecrets,
   scrubSecretValues,
 } from "../src/redact.js";
@@ -86,6 +87,57 @@ describe("redactSecrets", () => {
 // `summarizeToolResult` puts the first 500 characters of every tool result
 // into the message at info, so `Read ~/.tomo/config.json` wrote live
 // credentials into ~/.tomo/logs/tomo.log.
+describe("redactLogRecord", () => {
+  it("censors secret-named fields at any depth and returns the record when there is nothing to censor", () => {
+    const clean = { sessionKey: "dm:alice", nested: { count: 2 } };
+    // Untouched AND not cloned: this runs on every log line at debug level.
+    expect(redactLogRecord(clean)).toBe(clean);
+
+    expect(redactLogRecord({ config: { channels: { telegram: { token: TOKEN } } } }))
+      .toEqual({ config: { channels: { telegram: { token: "[Redacted]" } } } });
+    expect(redactLogRecord({ list: [{ apiKey: "sk-live-abcdefghijkl" }] }))
+      .toEqual({ list: [{ apiKey: "[Redacted]" }] });
+  });
+});
+
+describe("redactSerializedError", () => {
+  it("reaches into a serialized error tree that a plain-object walker rejects", () => {
+    // pino.stdSerializers.err output has a non-Object prototype, and
+    // formatters.log runs before serializers, so this is the only pass that
+    // can see inside an error.
+    const serialized = Object.create({ notOwn: 1 });
+    Object.assign(serialized, {
+      type: "Error",
+      message: `failed for ${TOKEN}`,
+      stack: "Error: failed\n    at x",
+      response: { data: { config: { headers: { Authorization: `Bearer ${TOKEN}` } } } },
+    });
+
+    const out = redactSerializedError(serialized) as Record<string, unknown>;
+    const text = JSON.stringify(out);
+    expect(text).not.toContain(TOKEN);
+    // Depth 6, past any practical path ladder.
+    expect((out.response as Record<string, Record<string, Record<string, Record<string, string>>>>)
+      .data.config.headers.Authorization).toBe("[Redacted]");
+    // The stack survives — the serializer is wrapped, not replaced.
+    expect(out.stack).toBe("Error: failed\n    at x");
+    expect(out.type).toBe("Error");
+  });
+
+  it("recurses into AggregateError sub-errors", () => {
+    const serialized = {
+      type: "AggregateError",
+      message: "all failed",
+      aggregateErrors: [
+        { type: "Error", message: `sub failed with ${TOKEN}`, stack: `at f ${TOKEN}` },
+      ],
+    };
+    const text = JSON.stringify(redactSerializedError(serialized));
+    expect(text).not.toContain(TOKEN);
+    expect(text).toContain("sub failed with ***");
+  });
+});
+
 describe("scrubSecretValues", () => {
   it("redacts issuer-shaped credentials out of free text", () => {
     const cases: Array<[string, string]> = [
@@ -115,6 +167,36 @@ describe("scrubSecretValues", () => {
     // Non-secrets are left alone; the line still has to read.
     expect(scrubSecretValues("Read /Users/x/notes.md (240 lines)"))
       .toBe("Read /Users/x/notes.md (240 lines)");
+  });
+
+  // Verified against real lines in tomo.log that an earlier, looser version of
+  // the Bearer/Basic/Token rule destroyed. A log scrubber that mangles prose
+  // gets turned off, so these matter as much as the leaks.
+  it("leaves ordinary prose alone", () => {
+    const untouched = [
+      "assuming basic features are supported",
+      "Missing token endpoint or client id",
+      "OAuth token response did not include access_token",
+      "access token expired.",
+      "Bearer token refresh failed",
+      "Read /Users/x/notes.md (240 lines)",
+      "Basic auth is not configured",
+      "token: null",
+    ];
+    for (const line of untouched) {
+      expect(scrubSecretValues(line), line).toBe(line);
+    }
+  });
+
+  it("still catches a real Bearer credential", () => {
+    // The whole header value goes, scheme included — redacting only the
+    // credential and keeping "Bearer" would be splitting the rule that has to
+    // stay atomic.
+    expect(scrubSecretValues("Authorization: Bearer abc123def456ghi789jkl"))
+      .toBe("Authorization: ***");
+    // ...and does not eat the sentence's full stop.
+    expect(scrubSecretValues("sent Bearer abc123def456ghi789jkl."))
+      .toBe("sent Bearer ***.");
   });
 
   // grammY reports failures by echoing the request URL, where the token is
@@ -217,8 +299,14 @@ async function readWhenReady(file: string, marker: string): Promise<string> {
 describe("logger redaction", () => {
   it("censors secret fields at every depth the daemon logs at", () => {
     const written: string[] = [];
+    // Same three layers logger.ts wires up: the short paths ladder, the deep
+    // pass, and the error serializer.
     const log = pino(
-      { level: "debug", redact: { paths: LOG_REDACT_PATHS } },
+      {
+        level: "debug",
+        redact: { paths: LOG_REDACT_PATHS },
+        formatters: { log: (record) => redactLogRecord(record) },
+      },
       { write: (chunk: string) => void written.push(chunk) } as unknown as pino.DestinationStream,
     );
 

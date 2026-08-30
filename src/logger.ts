@@ -2,7 +2,7 @@ import pino from "pino";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { watchBus } from "./watch/bus.js";
-import { LOG_REDACT_PATHS, redactLogRecord, scrubSecretValues } from "./redact.js";
+import { LOG_REDACT_PATHS, redactLogRecord, redactSerializedError, scrubSecretValues } from "./redact.js";
 
 const logFile = process.env.TOMO_LOG_FILE;
 
@@ -65,17 +65,12 @@ export const log = pino({
   serializers: {
     // An error object is the other way a credential arrives: grammY puts the
     // bot token in the request URL it echoes, an axios-shaped error carries
-    // `config.headers.Authorization`. Serialize first (so the stack survives),
-    // then redact by name, then scrub the message and stack by value — a token
-    // inside `err.message` is under no key that could be matched.
-    err: (err: unknown) => {
-      const serialized = redactLogRecord(pino.stdSerializers.err(err as Error)) as Record<string, unknown>;
-      for (const field of ["message", "stack", "type"]) {
-        const value = serialized[field];
-        if (typeof value === "string") serialized[field] = scrubSecretValues(value);
-      }
-      return serialized;
-    },
+    // `config.headers.Authorization` (and `response.data.config.headers…`
+    // deeper still), and an AggregateError's sub-errors carry their own
+    // messages and stacks. Serialize first, so the stack survives — the deep
+    // `formatters.log` pass cannot help here, because it runs BEFORE
+    // serializers and so only ever sees a raw Error.
+    err: (err: unknown) => redactSerializedError(pino.stdSerializers.err(err as Error)),
   },
   hooks: {
     // Tap warn/error so the watch TUI's "last issue" pane works without

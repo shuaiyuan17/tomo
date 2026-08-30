@@ -39,7 +39,7 @@ const LOG_FILE = join(defaultRuntimePaths.logsDir, "tomo.log");
  */
 export function deferredRestartSessionKey(
   env: NodeJS.ProcessEnv = process.env,
-  runningPid: number | null = getRunningPid(),
+  runningPid: number | null = getRunningPidRecord()?.pid ?? null,
 ): { sessionKey: string; daemonPid: number } | null {
   const sessionKey = env[TOMO_SESSION_KEY_ENV]?.trim();
   if (!sessionKey) return null;

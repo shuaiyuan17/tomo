@@ -113,23 +113,6 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  it("rewrites [[NL]] to a real newline and never ships the token literally", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    mockSdk.responseFn = () => "intro[[NL]]detail\nnext";
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("intro\ndetail\nnext");
-    expect(im.delivered[0].text).not.toContain("[[NL]]");
-
-    await agent.stop();
-  });
-
   it("delivers a one-word `count` reply verbatim (#291 P1)", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
@@ -166,18 +149,12 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  it("keeps [[NL]] line-formatted lists together in iMessage groups", async () => {
+  it("keeps line-formatted lists together in iMessage groups", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
-    mockSdk.responseFn = () => [
-      "清单 🦀[[NL]]",
-      "· Lululemon ×3[[NL]]",
-      "· Canada Goose ×1[[NL]]",
-      "[[NL]]",
-      "取货：国庆自取。",
-    ].join("\n");
+    mockSdk.responseFn = () => "清单 🦀\n· Lululemon ×3\n· Canada Goose ×1\n\n取货：国庆自取。";
 
     await im.simulateMessage(makeMsg({
       chatId: "iMessage;+;group123",

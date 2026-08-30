@@ -92,7 +92,7 @@ describe("continuity delivery", () => {
 
     // Formatting and attachments are not a loophole: suppression is decided by
     // the turn's delivery policy, before anything inspects the content.
-    mockSdk.responseFn = () => `first thought\nsecond[[NL]]detail MEDIA:"${imagePath}"`;
+    mockSdk.responseFn = () => `first thought\nsecond detail MEDIA:"${imagePath}"`;
 
     await agent.handleContinuity("System: Free time.");
 

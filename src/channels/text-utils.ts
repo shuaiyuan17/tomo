@@ -1,25 +1,4 @@
 /**
- * Legacy placeholder the assistant used to emit for a literal newline back
- * when a newline was a message boundary (#179). Since #292/#293 a reply ships
- * as one message with its newlines intact, so the marker is DEPRECATED — the
- * model is told to write a real newline. It is still TOLERATED: an older
- * prompt, a cached habit, or a cron job written before the change can still
- * produce it, and it must never reach a chat literally (it did on 2026-08-30,
- * through `send_message` direct mode, which skipped this rewrite).
- *
- * The rewrite is a single `\n` per marker. Spaces or tabs hugging the marker
- * belong to it, not to the prose (`AI [[NL]] · item` is `AI\n· item`, not
- * `AI \n · item`), and a source newline immediately after it is absorbed so
- * `intro[[NL]]\ndetail` does not gain a blank line. Two markers in a row are
- * two newlines — a deliberate blank line.
- */
-const LITERAL_NEWLINE_TOKEN_RE = /[ \t]*\[\[NL\]\][ \t]*(?:\r\n|\r|\n)?/g;
-
-export function restoreLiteralNewlines(text: string): string {
-  return text.replace(LITERAL_NEWLINE_TOKEN_RE, "\n");
-}
-
-/**
  * Marker prepended to inbound satellite (Apple emergency low-bandwidth relay)
  * messages so the model knows the sender is off-grid: keep replies short,
  * text-only, and don't expect or request photos.

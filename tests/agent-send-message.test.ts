@@ -46,21 +46,6 @@ describe("send_message direct mode", () => {
     await agent.stop();
   });
 
-  it("converts the legacy [[NL]] marker to a newline on a direct send", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    const result = await agent.sendToSession("telegram:12345", "AI [[NL]] · item one\n· item two");
-
-    expect(result).toEqual({ ok: true });
-    expect(tg.delivered).toEqual([
-      { chatId: "12345", text: "AI\n· item one\n· item two", photo: undefined, sticker: undefined },
-    ]);
-
-    await agent.stop();
-  });
-
   it("preserves verbatim direct text when there are no attachment tags", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

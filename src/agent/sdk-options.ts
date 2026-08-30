@@ -97,10 +97,11 @@ export function sdkOptions(
     return null;
   };
 
-  // Inject session context so the agent can use LCM tools
+  // Inject the small amount of runtime context that cannot live in the
+  // user-editable workspace prompt.
   if (sessionContext) {
     const lines = [
-      "\n\n# SESSION — Current Session Info",
+      "\n\n# SESSION",
       `- Session key: ${sessionContext.sessionKey}`,
     ];
     if (sessionContext.sdkSessionId) {
@@ -112,16 +113,13 @@ export function sdkOptions(
       lines.push("## Group Chat Context");
       if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
       if (g.participants && g.participants.length > 0) {
-        lines.push("- Known participants (more may join later — you'll see new senders prefixed in incoming messages):");
-        for (const p of g.participants) {
-          lines.push(`  - ${p}`);
-        }
+        lines.push(`- Known participants: ${g.participants.join(", ")}`);
       }
-      lines.push("- Messages from each sender are prefixed with their name (e.g. `Alice: ...`). When a sender is matched to a person in your PEOPLE registry, the canonical name is appended in parentheses (e.g. `kw 🚀 (Kevin Wang): ...`) — treat them as the same person.");
+      lines.push("- Incoming messages identify the sender. A canonical PEOPLE name in parentheses refers to the same person.");
       if (g.isPassive) {
-        lines.push("- **Listen mode: passive.** You see every message in this group; no @mention is required to address you. Reply only when you have something genuinely useful to add — reply `NO_REPLY` to stay silent. Do not respond to casual chatter, greetings, or messages not directed at you.");
+        lines.push("- **Listen mode: passive.** You see every message. Reply only when directly addressed or genuinely useful; otherwise reply `NO_REPLY`.");
       } else {
-        lines.push("- **Listen mode: mention-required.** You only receive messages that explicitly tag you; respond as you would in a DM.");
+        lines.push("- **Listen mode: mention-required.** Every message you receive explicitly tagged you; respond as in a DM.");
       }
     }
     systemPrompt += lines.join("\n");
@@ -145,7 +143,7 @@ export function sdkOptions(
   const resolvedModel = resolveModelName(effectiveModel) ?? effectiveModel;
   const resolvedLabel = modelLabel(resolvedModel);
   const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
-  systemPrompt += `\n\n# RUNTIME — Current Model\nYou are currently running on: ${modelDisplay}. This is the real model serving this session right now — trust it over any introspective guess about which model you are.`;
+  systemPrompt += `\n\n# RUNTIME\n- Current model: ${modelDisplay}\n- Treat this model value as authoritative.`;
 
   const sdkEnv = buildSdkEnv({
     disableAutoCompact: shouldDisableAutoCompact,
@@ -208,9 +206,8 @@ export function sdkOptions(
     // that bypassPermissions otherwise routes here as denials.
     canUseTool: skillsCanUseTool,
     ...(sessionContext?.onMcpElicitation ? { onElicitation: sessionContext.onMcpElicitation } : {}),
-    // Delivery is non-streaming: the turn runs to completion and its content
-    // blocks are delivered once (see delivery-pipeline.ts). Partial messages
-    // would only add per-token events nothing consumes.
+    // Token-level partials are disabled. Completed content blocks still arrive
+    // on assistant events and are delivered immediately (delivery-pipeline.ts).
     includePartialMessages: false,
     ...(thinking ? { thinking } : {}),
     maxTurns: config.maxTurns,

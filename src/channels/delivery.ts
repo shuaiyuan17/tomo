@@ -1,13 +1,11 @@
 import type { Channel, SendResult } from "./types.js";
-import { restoreLiteralNewlines } from "./text-utils.js";
 
 /**
- * Deliver one assistant reply as ONE channel message.
+ * Deliver one text unit through the channel.
  *
  * Newlines inside a reply are formatting, not message separators: a
- * three-line reply is one bubble with two embedded newlines, not three
- * bubbles. `[[NL]]` is rewritten to a real newline here — the model has been
- * trained to emit it, and it must never ship literally.
+ * three-line unit is one bubble with two embedded newlines, not three bubbles
+ * (unless the channel must chunk it at its provider limit).
  *
  * Splitting is left to the channel's own `send()`, which chunks at its
  * provider limit (iMessage 4000, Telegram 4096) and never truncates.
@@ -23,7 +21,7 @@ export async function deliverText(
   text: string,
   options: { replyTo?: string } = {},
 ): Promise<SendResult | null> {
-  const body = restoreLiteralNewlines(text).trim();
+  const body = text.trim();
   if (!body) return null;
   return await channel.send({
     chatId,

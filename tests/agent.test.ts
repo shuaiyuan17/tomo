@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
-import { restoreLiteralNewlines } from "../src/channels/text-utils.js";
 import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
@@ -149,35 +148,6 @@ describe("extractAttachments", () => {
     expect(cleanText).toBe("Look");
     expect(mediaPaths).toEqual(["/tmp/a.png"]);
     expect(stickerIds).toEqual(["CAAC-123"]);
-  });
-});
-
-describe("restoreLiteralNewlines", () => {
-  // Replies now ship as one message with their newlines intact, so [[NL]] is
-  // redundant — but the model still emits it, so it must never ship literally.
-  it("rewrites [[NL]] to a real newline", () => {
-    expect(restoreLiteralNewlines("intro[[NL]]detail\nnext")).toBe("intro\ndetail\nnext");
-  });
-
-  it("absorbs a source newline that immediately follows the token", () => {
-    expect(restoreLiteralNewlines("intro[[NL]]\ndetail\nnext")).toBe("intro\ndetail\nnext");
-  });
-
-  it("leaves text without the token untouched", () => {
-    expect(restoreLiteralNewlines(" line A \nline B ")).toBe(" line A \nline B ");
-  });
-
-  // The 2026-08-30 shape: `AI[[NL]]· item`, and its spaced siblings. The
-  // spaces belong to the marker, so the result is one clean newline.
-  it("absorbs spaces and tabs hugging the token into the single newline", () => {
-    expect(restoreLiteralNewlines("AI [[NL]] · item")).toBe("AI\n· item");
-    expect(restoreLiteralNewlines("AI\t[[NL]]\t\n· item")).toBe("AI\n· item");
-    expect(restoreLiteralNewlines("AI[[NL]] · item")).toBe("AI\n· item");
-  });
-
-  it("turns two adjacent tokens into a blank line", () => {
-    expect(restoreLiteralNewlines("para one[[NL]][[NL]]para two")).toBe("para one\n\npara two");
-    expect(restoreLiteralNewlines("para one [[NL]] [[NL]] para two")).toBe("para one\n\npara two");
   });
 });
 

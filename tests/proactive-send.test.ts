@@ -126,39 +126,6 @@ describe("ProactiveSendService.sendToSession", () => {
     );
   });
 
-  it("rewrites the legacy [[NL]] marker to a newline instead of sending it verbatim", async () => {
-    // 2026-08-30: a cron morning brief sent through send_message direct mode
-    // reached iMessage with `AI[[NL]]· ...` in it — this was the one outlet
-    // that skipped the rewrite every reply block gets.
-    const h = makeHarness();
-
-    const result = await h.service.sendToSession("telegram:12345", "☕ 早报\n\nAI [[NL]] · item", "dm:alice");
-
-    expect(result).toEqual({ ok: true });
-    expect(h.channel.sent).toEqual([{ chatId: "12345", text: "☕ 早报\n\nAI\n· item" }]);
-    // The transcript and the pending note record what was actually sent.
-    expect(h.transcript[0].content).toBe("[proactive] ☕ 早报\n\nAI\n· item");
-    expect(h.notes[0].note).not.toContain("[[NL]]");
-  });
-
-  it("rewrites [[NL]] in the caption of an attachment send too", async () => {
-    const dir = join(tmpdir(), `tomo-proactive-nl-${process.pid}`);
-    mkdirSync(dir, { recursive: true });
-    const photo = join(dir, "pic.png");
-    writeFileSync(photo, "fake");
-    try {
-      const h = makeHarness();
-
-      const result = await h.service.sendToSession("telegram:12345", `caption[[NL]]line two MEDIA:${photo}`);
-
-      expect(result).toEqual({ ok: true });
-      expect(h.channel.sent[0]).toEqual({ chatId: "12345", text: "caption\nline two" });
-      expect(h.channel.sent[1]).toMatchObject({ chatId: "12345", photo });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   describe("the outlet guard on direct mode", () => {
     // Direct mode was the one outlet that shipped model text without the
     // fabricated-marker guard every reply block gets (inbound-markers.ts).
@@ -649,18 +616,6 @@ describe("ProactiveSendService edit/unsend of own messages", () => {
     expect(result).toEqual({ ok: true });
     expect(h.channel.edited).toEqual([
       { chatId: "12345", messageId: "mine-2", text: "dinner is at 8pm" },
-    ]);
-  });
-
-  it("rewrites the legacy [[NL]] marker in an edit", async () => {
-    const h = makeHarness();
-    h.channel.recent = [own("mine-1", "dinner at 7")];
-
-    const result = await h.service.editSentMessage("telegram:12345", "dinner at 8 [[NL]] bring wine");
-
-    expect(result).toEqual({ ok: true });
-    expect(h.channel.edited).toEqual([
-      { chatId: "12345", messageId: "mine-1", text: "dinner at 8\nbring wine" },
     ]);
   });
 

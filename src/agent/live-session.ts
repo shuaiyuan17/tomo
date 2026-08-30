@@ -341,7 +341,7 @@ export type BlockRender =
  *     it is the model having written a message in the wrong block type, and it
  *     ships EXACTLY LIKE A `text` BLOCK — unmarked, through the same scaffold
  *     filter, the same bare-NO_REPLY rule and the same downstream attachment
- *     and `[[NL]]` handling.
+ *     handling.
  *
  * WHERE THAT LAST RULE COMES FROM (owner decision, 2026-08-28). One session's
  * SDK transcript for the day, flag off, held 173 thinking blocks with a 0-char

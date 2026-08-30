@@ -741,7 +741,7 @@ describe("chat commands", () => {
 
     const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
     const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
-    expect(lastCall.options?.systemPrompt).toContain("# RUNTIME — Current Model");
+    expect(lastCall.options?.systemPrompt).toContain("# RUNTIME");
     // alias "sonnet" must be resolved to its concrete id, not echoed raw
     expect(lastCall.options?.systemPrompt).toContain("claude-sonnet-5");
 

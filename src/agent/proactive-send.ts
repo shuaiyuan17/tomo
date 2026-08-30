@@ -10,7 +10,6 @@ import {
   replyTargetFromRawSessionKey,
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
-import { restoreLiteralNewlines } from "../channels/text-utils.js";
 import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
 import { normalizeSendTarget } from "./send-target.js";
 import { formatTomoEvent } from "../tomo-event.js";
@@ -69,12 +68,7 @@ export class ProactiveSendService {
    * A pending note is queued so the recipient's next Claude turn has context.
    */
   async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string }): Promise<SendResult> {
-    // The ONE exception to "verbatim": the legacy `[[NL]]` marker becomes a
-    // real newline, exactly as it does for a reply block. Direct mode used to
-    // skip this, so a cron brief sent through send_message on 2026-08-30
-    // reached iMessage with the marker in it. The transcript and the pending
-    // note below record the rewritten text — what was actually sent.
-    const text = restoreLiteralNewlines(rawText);
+    const text = rawText;
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
       return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
@@ -344,9 +338,7 @@ export class ProactiveSendService {
    * contains `match`.
    */
   async editSentMessage(target: string, rawNewText: string, match?: string): Promise<SendResult> {
-    // Same outlet class as a direct send: model-authored text straight to a
-    // channel, so the legacy `[[NL]]` marker is rewritten here too.
-    const newText = restoreLiteralNewlines(rawNewText);
+    const newText = rawNewText;
     if (!newText.trim()) {
       return { ok: false, error: "Edited message text cannot be empty" };
     }

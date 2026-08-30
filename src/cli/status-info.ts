@@ -1,26 +1,39 @@
-import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { statSync } from "node:fs";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import {
+  DAEMON_STOP_TIMEOUT_MS,
+  isPidAlive,
+  isRecordedProcessLive,
+  readLivePidFileRecord,
+  readPidFileRecord,
+  waitForExit,
+  type PidFileRecord,
+} from "./pidfile.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
-export function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+// Liveness lives in exactly one place. There used to be three copies of a
+// `kill(pid, 0)` wrapper (here, start.ts, service.ts) and they disagreed about
+// EPERM, so a daemon owned by another uid was "dead" to two of them.
+export { isPidAlive, isRecordedProcessLive, readPidFileRecord, waitForExit, DAEMON_STOP_TIMEOUT_MS };
+
+/**
+ * The record in the daemon's pid file, or null when it is absent or stale.
+ * Stale files are removed — under the pid-file lock, so this can never delete
+ * a claim that a starting daemon has just re-taken.
+ *
+ * "Stale" means the recorded process is gone — including the pid-reuse case,
+ * where the pid is alive but is now some OTHER process (see
+ * {@link isRecordedProcessLive}). It deliberately does NOT mean "we could not
+ * prove it is alive": a cross-uid daemon answers EPERM and stays.
+ */
+export function getRunningPidRecord(pidFile = PID_FILE): PidFileRecord | null {
+  return readLivePidFileRecord(pidFile);
 }
 
 /** PID from the daemon's pid file, or null if absent/stale (stale files are removed). */
 export function getRunningPid(pidFile = PID_FILE): number | null {
-  if (!existsSync(pidFile)) return null;
-  const pid = Number(readFileSync(pidFile, "utf-8").trim());
-  if (isNaN(pid) || !isRunning(pid)) {
-    try { unlinkSync(pidFile); } catch { /* ignore */ }
-    return null;
-  }
-  return pid;
+  return getRunningPidRecord(pidFile)?.pid ?? null;
 }
 
 export interface DaemonStatus {

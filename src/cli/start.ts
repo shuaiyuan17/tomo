@@ -1,30 +1,12 @@
 import { Command } from "commander";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { acquirePidFile, readPidFileRecord, releasePidFile } from "./pidfile.js";
+import { getRunningPid } from "./status-info.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
-
-function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getRunningPid(): number | null {
-  if (!existsSync(PID_FILE)) return null;
-  const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-  if (isNaN(pid) || !isRunning(pid)) {
-    unlinkSync(PID_FILE);
-    return null;
-  }
-  return pid;
-}
 
 export const startCommand = new Command("start")
   .description("Start Tomo")
@@ -37,14 +19,33 @@ export const startCommand = new Command("start")
   });
 
 async function startForeground(): Promise<void> {
-  // Refuse to start if another tomo (manual daemon or launchd-managed) already
-  // owns the pidfile. Prevents two tomos fighting over Telegram polling, the
-  // `imsg rpc` child, and the session registry.
-  const existing = getRunningPid();
-  if (existing) {
-    console.error(`Tomo is already running (PID ${existing}). Refusing to start a second instance.`);
+  // FIRST action, before any await: claim the pid file with O_EXCL. Refuse to
+  // start if another tomo (manual daemon or launchd-managed) already owns it —
+  // two tomos fight over Telegram polling, the `imsg rpc` child, the metrics
+  // port and the session registry.
+  //
+  // This used to be a plain existsSync/kill(0) check here with the
+  // `writeFileSync(PID_FILE, …)` all the way down at the end of startup. The
+  // gap between them spanned config load, five mkdirs, a recursive skills
+  // copy, channel construction and `await metricsExporter.start()`, so a login
+  // autostart racing a manual `tomo start` put BOTH daemons past the check.
+  const acquired = acquirePidFile(PID_FILE);
+  if (!acquired.ok) {
+    console.error(
+      acquired.holder === null
+        ? `Could not take the pid-file lock (${PID_FILE}.lock stayed busy). Another tomo process may be starting or stopping; refusing to start a second instance. Check \`tomo status\` and retry.`
+        : `Tomo is already running (PID ${acquired.holder}). Refusing to start a second instance.`,
+    );
     process.exit(1);
   }
+  if (acquired.tookOverStale !== null) {
+    console.error(`Removed a stale PID file left by PID ${acquired.tookOverStale} (no longer running); taking over.`);
+  }
+  // Release on every exit path, not just the signal handlers: the config
+  // validation below can `process.exit(1)`, and leaving our own dead pid on
+  // disk would make the next `tomo start` print a stale-takeover line for a
+  // daemon that never started.
+  process.on("exit", () => releasePidFile(PID_FILE));
 
   // Validate config before loading the heavy daemon modules so a fresh
   // install fails with a clear message instead of a module-load crash.
@@ -226,8 +227,8 @@ async function startForeground(): Promise<void> {
     }
   }
 
-  // Write PID so `tomo stop` can find us
-  writeFileSync(PID_FILE, String(process.pid));
+  // NB: the pid file was already written at the top of this function. Writing
+  // it here (as this used to) is what allowed two daemons to start at once.
 
   const shutdown = async () => {
     activityLog?.stop();
@@ -248,7 +249,7 @@ async function startForeground(): Promise<void> {
     } catch (err) {
       log.error({ err }, "Agent shutdown failed; exiting anyway");
     }
-    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
+    releasePidFile(PID_FILE);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -290,6 +291,9 @@ async function startDaemon(): Promise<void> {
   const { mkdirSync: mkdirSyncFs } = await import("node:fs");
   mkdirSyncFs(join(TOMO_HOME, "logs"), { recursive: true });
   const errFd = openSync(errFile, "a");
+  const { statSync } = await import("node:fs");
+  let errSizeBefore = 0;
+  try { errSizeBefore = statSync(errFile).size; } catch { /* fresh file */ }
 
   // Re-run ourselves in foreground mode as a detached child
   const child = spawn(process.execPath, [process.argv[1], "start", "--foreground"], {
@@ -301,8 +305,73 @@ async function startDaemon(): Promise<void> {
     },
   });
 
+  // Do not report success on the strength of having spawned. The child's
+  // first act is `acquirePidFile`, and it exits 1 if another daemon holds the
+  // file — so two concurrent `tomo start`s used to both print "started" while
+  // one child died with its message buried in tomo.err. Wait until the pid
+  // file names this child, or the child is gone.
+  const exited = new Promise<number | null>((resolve) => {
+    child.on("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+    child.on("error", () => resolve(1));
+  });
+  const outcome = await awaitBackgroundClaim({ pidFile: PID_FILE, childPid: child.pid ?? -1, exited });
   child.unref();
-  console.log(`Tomo started in background (PID ${child.pid})`);
-  console.log(`Logs: ${logFile}`);
-  process.exit(0);
+
+  if (outcome.kind === "claimed") {
+    console.log(`Tomo started in background (PID ${child.pid})`);
+    console.log(`Logs: ${logFile}`);
+    process.exit(0);
+  }
+  const { readFileSync } = await import("node:fs");
+  let tail = "";
+  try {
+    tail = readFileSync(errFile, "utf-8").slice(errSizeBefore).trim();
+  } catch { /* nothing to show */ }
+  if (outcome.kind === "exited") {
+    console.error(`Tomo exited during startup (code ${outcome.code ?? "?"}).${tail ? `\n${tail}` : ""}`);
+    console.error(`Full output: ${errFile}`);
+  } else {
+    console.error(
+      `Tomo (PID ${child.pid}) has not claimed the pid file after ${Math.round(outcome.waitedMs / 1000)}s; `
+      + `cannot confirm it started. Check \`tomo status\` and ${errFile}.`,
+    );
+  }
+  process.exit(1);
+}
+
+export type BackgroundClaimOutcome =
+  | { kind: "claimed" }
+  | { kind: "exited"; code: number | null }
+  | { kind: "timeout"; waitedMs: number };
+
+/**
+ * Resolve once `pidFile` names `childPid`, the child has exited, or
+ * `timeoutMs` passes — whichever is first. Exported for tests.
+ */
+export async function awaitBackgroundClaim(opts: {
+  pidFile: string;
+  childPid: number;
+  exited: Promise<number | null>;
+  timeoutMs?: number;
+  pollMs?: number;
+}): Promise<BackgroundClaimOutcome> {
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const pollMs = opts.pollMs ?? 100;
+  const started = Date.now();
+  let exitCode: number | null | undefined;
+  void opts.exited.then((code) => { exitCode = code; });
+  for (;;) {
+    if (readPidFileRecord(opts.pidFile)?.pid === opts.childPid) return { kind: "claimed" };
+    // Let a settled `exited` land before judging; a child that exits 1 the
+    // instant after our poll must be reported as exited, not as slow.
+    await new Promise((r) => setTimeout(r, 0));
+    if (exitCode !== undefined) {
+      // One last look: the child may have claimed and been killed in the gap.
+      if (readPidFileRecord(opts.pidFile)?.pid === opts.childPid) return { kind: "claimed" };
+      return { kind: "exited", code: exitCode };
+    }
+    const waitedMs = Date.now() - started;
+    if (waitedMs >= timeoutMs) return { kind: "timeout", waitedMs };
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, timeoutMs - waitedMs)));
+  }
 }

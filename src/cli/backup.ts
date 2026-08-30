@@ -6,7 +6,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -17,6 +16,7 @@ import { createInterface } from "node:readline";
 import { config } from "../config.js";
 import { restoreWorkspaceFromBackup } from "./backup-workspace.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
 const TOMO_HOME = config.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
@@ -353,15 +353,15 @@ backupCommand
   .action(async (date: string) => {
     // Refuse to restore while daemon is running
     if (existsSync(PID_FILE)) {
-      const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-      if (!isNaN(pid)) {
-        try {
-          process.kill(pid, 0);
-          console.error("Tomo daemon is running. Run `tomo stop` first.");
-          process.exit(1);
-        } catch {
-          // process not alive — stale PID file, continue
-        }
+      // readPidFileRecord + isRecordedProcessLive, not a bare kill(pid, 0):
+      // the pid file carries an identity line (so a whole-file Number() is
+      // NaN), and a pid inherited by an unrelated process must not block a
+      // restore. isPidAlive also treats EPERM as alive, so a daemon owned by
+      // another uid is correctly refused instead of silently restored over.
+      const record = readPidFileRecord(PID_FILE);
+      if (record && isRecordedProcessLive(record)) {
+        console.error("Tomo daemon is running. Run `tomo stop` first.");
+        process.exit(1);
       }
     }
 

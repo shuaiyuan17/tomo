@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { DAEMON_STOP_TIMEOUT_MS, isPidAlive, isRecordedProcessLive, readPidFileRecord, stopRecordedDaemon } from "./pidfile.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,7 +31,11 @@ export async function enableAutostart(): Promise<void> {
     throw new Error("Autostart is only supported on macOS.");
   }
 
-  stopPidfileTomo();
+  // Wait for the manual daemon to actually exit before handing the pid file
+  // to launchd. Bootstrapping while it was still inside its graceful shutdown
+  // — and with its exclusion claim already unlinked — started a second daemon
+  // alongside it. If it will not die, refuse rather than double up.
+  await stopRecordedDaemon(PID_FILE);
 
   const plist = buildPlist();
   mkdirSync(dirname(LAUNCH_AGENT_PLIST_PATH), { recursive: true });
@@ -72,7 +77,14 @@ export async function restartAutostart(): Promise<void> {
     );
   }
   const domain = guiDomain();
-  const oldPid = readPidFile();
+  // The record's pid is what a NEW pid file must differ from; the pid we
+  // signal and wait on is only meaningful if it is still the recorded daemon.
+  // A recycled pid (SIGKILLed daemon, pid inherited by an editor) is alive but
+  // not ours: SIGTERMing it would kill a stranger, and waiting on it would
+  // time out on a process that is never going to exit for us.
+  const oldRecord = readPidFileRecord(PID_FILE);
+  const recordedPid = oldRecord?.pid ?? null;
+  const oldPid = oldRecord !== null && isRecordedProcessLive(oldRecord) ? oldRecord.pid : null;
 
   // Happy path: service is loaded → kickstart restarts it in place.
   // If the plist is on disk but the service isn't loaded (e.g. after `tomo stop`
@@ -86,7 +98,10 @@ export async function restartAutostart(): Promise<void> {
   // If the running tomo wasn't actually the launchd-managed instance (e.g.
   // started via `tomo start` directly), kickstart -k won't reach it. SIGTERM
   // the PID-file PID directly so it exits and launchd can take over.
-  if (oldPid !== null && isAlive(oldPid)) {
+  // Re-confirm the identity NOW, after the launchctl await: kickstart may
+  // already have reaped the old daemon and its pid can have been recycled in
+  // the meantime.
+  if (oldPid !== null && oldRecord !== null && isRecordedProcessLive(oldRecord)) {
     try { process.kill(oldPid, "SIGTERM"); } catch { /* already dead */ }
   }
 
@@ -94,13 +109,20 @@ export async function restartAutostart(): Promise<void> {
   // actually exit and a new one to come up before reporting success. Graceful
   // shutdown can take tens of seconds if SIGTERM lands mid-turn (agent waits
   // for the in-flight assistant response to finish before closing).
-  const timeoutSec = 60;
-  const deadline = Date.now() + timeoutSec * 1000;
-  while (Date.now() < deadline) {
+  const timeoutSec = Math.round(DAEMON_STOP_TIMEOUT_MS / 1000);
+  const deadline = Date.now() + DAEMON_STOP_TIMEOUT_MS;
+  let waitingOn = oldPid;
+  for (let tick = 1; Date.now() < deadline; tick++) {
     await new Promise((r) => setTimeout(r, 300));
-    if (oldPid !== null && isAlive(oldPid)) continue;
+    if (waitingOn !== null && isPidAlive(waitingOn)) {
+      // The poll is cheap liveness; every ~3s confirm it is still OUR daemon
+      // on that pid, so a recycled pid cannot hold the wait for the whole
+      // budget. (`ps` once per ten ticks, not once per tick.)
+      if (tick % 10 !== 0 || (oldRecord !== null && isRecordedProcessLive(oldRecord))) continue;
+      waitingOn = null;
+    }
     const newPid = readPidFile();
-    if (newPid !== null && newPid !== oldPid) return;
+    if (newPid !== null && newPid !== recordedPid) return;
   }
   throw new Error(
     `Restart didn't complete within ${timeoutSec}s (old PID ${oldPid ?? "?"} still alive or no new PID file yet). Check \`tomo status\` and logs.`,
@@ -108,17 +130,7 @@ export async function restartAutostart(): Promise<void> {
 }
 
 function readPidFile(): number | null {
-  if (!existsSync(PID_FILE)) return null;
-  try {
-    const n = Number(readFileSync(PID_FILE, "utf-8").trim());
-    return Number.isFinite(n) && n > 0 ? n : null;
-  } catch {
-    return null;
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  return readPidFileRecord(PID_FILE)?.pid ?? null;
 }
 
 /**
@@ -152,20 +164,7 @@ async function runLaunchctl(
   }
 }
 
-function stopPidfileTomo(): void {
-  if (!existsSync(PID_FILE)) return;
-  try {
-    const pid = Number(readFileSync(PID_FILE, "utf-8").trim());
-    if (!isNaN(pid)) {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
-    }
-    unlinkSync(PID_FILE);
-  } catch {
-    /* best effort */
-  }
-}
-
-function buildPlist(): string {
+export function buildPlist(): string {
   const nodePath = escapeXml(process.execPath);
   const cliPath = escapeXml(resolveCliPath());
   const home = escapeXml(homedir());
@@ -195,6 +194,14 @@ function buildPlist(): string {
 
     <key>KeepAlive</key>
     <true/>
+
+    <!-- Do not respawn faster than this. With KeepAlive and launchd's 10s
+         default, a start that fails deterministically (a pid file held by a
+         recycled pid, an uncaught exception on a bad config, a port already
+         bound) relaunches six times a minute forever, filling the logs and
+         burning CPU. 30s still recovers a real crash promptly. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
 
     <key>EnvironmentVariables</key>
     <dict>

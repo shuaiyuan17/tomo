@@ -27,13 +27,25 @@ import { join } from "node:path";
  *    and a path outside the root yields "Sticker must use imsg's trusted
  *    staging directory".
  *
- * So a staging refusal on a correctly-formed RPC call almost always means an
- * ANCESTOR directory fails the hygiene test (the staged leaf itself was just
- * created 0700/0600 by imsg). This module reproduces the dylib's checks from
- * the daemon side so the log can name the offending component and the exact
- * remedy, instead of leaving an opaque bridge error. (Observed live
- * 2026-08-06: `~/Library/Messages` chmod'd 0777 — world-writable — which
- * fails the S_IWOTH check and blocked every sticker send on the machine.)
+ * This module reproduces the dylib's checks from the daemon side so the log
+ * can name the offending component and the exact remedy, instead of leaving
+ * an opaque bridge error. (Observed live 2026-08-06: `~/Library/Messages`
+ * chmod'd 0777 — world-writable — which fails the S_IWOTH check.)
+ *
+ * IMPORTANT CAVEAT (learned the hard way, same day): a clean walk here does
+ * NOT mean the send will work. The dylib runs inside Messages.app's sandbox
+ * and begins its secure walk by opening the user's HOME directory — a path
+ * the sandbox denies (its exceptions cover only ~/Library/Messages). That
+ * first open fails regardless of permissions, so on imsg ≤0.13.4 the sticker
+ * path was refused unconditionally while the rich-link path — which starts
+ * its walk at the trusted root — worked. Reported as openclaw/imsg#211 and
+ * FIXED in imsg v0.14.0.
+ *
+ * VERIFIED WORKING 2026-08-24 on imsg 0.14.1: native sticker send lands as a
+ * real sticker balloon. The all-clear verdict below therefore no longer points
+ * at #211 as the likely cause — on a current imsg a clean walk plus a refusal
+ * means something we have not characterised yet, so say that instead of naming
+ * a bug that is already fixed.
  */
 
 /**
@@ -130,7 +142,11 @@ export function stickerStagingDiagnosis(home: string = homedir()): StickerStagin
   return {
     stagingRoot,
     checked,
-    verdict: "every ancestor of the staging root passes the dylib's hygiene checks from this process's view; "
-      + `the refusal came from inside Messages.app for a state not visible here (path checked: ${current})`,
+    verdict: "every ancestor of the staging root passes the dylib's hygiene checks from this process's view, "
+      + "so the refusal is not a filesystem-permission problem — no chmod and no relaunch will change it. "
+      + "It is also no longer openclaw/imsg#211: the dylib used to begin its secure walk at $HOME, which "
+      + "Messages.app's sandbox denies, and that was fixed in imsg v0.14.0 (native sticker send verified "
+      + "working on 0.14.1 on 2026-08-24). On a current imsg this combination is uncharacterised — report the "
+      + `bridge error verbatim instead of naming a cause we no longer have evidence for. Path checked: ${current}`,
   };
 }

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquirePidFile, readPidFileRecord, releasePidFile } from "./pidfile.js";
 import { getRunningPid } from "./status-info.js";
+import type { CronJob } from "../cron/types.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
@@ -210,7 +211,20 @@ async function startForeground(): Promise<void> {
   }
 
   const { CronStore } = await import("../cron/store.js");
+  const { readCronJobsSafely } = await import("./cron-errors.js");
   const cronStore = new CronStore();
+  // The watch snapshot and the metrics scrape must not fail whole because
+  // jobs.json is unreadable: dropping a `tomo watch` client or 500ing a
+  // scrape hides every other thing those surfaces report. Degrade the cron
+  // section only, and say so in the log (the scheduler surfaces the same
+  // failure properly, by refusing to scan until it can read the store).
+  const cronJobsForReporting = (): CronJob[] => {
+    const { jobs, unreadablePath } = readCronJobsSafely(cronStore);
+    if (unreadablePath) {
+      log.warn({ path: unreadablePath }, "Cron store unreadable; reporting an empty cron section");
+    }
+    return jobs;
+  };
   const scheduler = new CronScheduler(agent, cronStore);
   const petScheduler = new PetScheduler(agent);
 
@@ -245,7 +259,7 @@ async function startForeground(): Promise<void> {
       version: getCurrentVersion(),
       model: config.model,
       overview: () => agent.watchOverview(),
-      cronJobs: () => cronStore.list(),
+      cronJobs: cronJobsForReporting,
       nextHeartbeatAt: () => continuity.nextFireAt(),
     }),
     sendChat: (text) => agent.handleWatchChat(text),
@@ -262,7 +276,7 @@ async function startForeground(): Promise<void> {
       version: getCurrentVersion(),
       model: config.model,
       collectors: {
-        cronJobs: () => cronStore.list(),
+        cronJobs: cronJobsForReporting,
         nextHeartbeatAt: () => continuity.nextFireAt(),
       },
     });

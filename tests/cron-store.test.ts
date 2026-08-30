@@ -10,6 +10,7 @@ import {
   parseScheduleString,
 } from "../src/cron/store.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readCronJobsSafely } from "../src/cli/cron-errors.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -918,6 +919,44 @@ describe("CronStore unreadable file", () => {
     writeFileSync(TEST_PATH, contents);
     expect(store.getDueJobs()).toEqual([]);   // reload clears the error
     expect(store.list()).toHaveLength(1);
+  });
+});
+
+describe("readCronJobsSafely", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  it("returns jobs when the store is readable", () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "x",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+    const result = readCronJobsSafely(new CronStore(TEST_PATH));
+    expect(result.jobs).toHaveLength(1);
+    expect(result.unreadablePath).toBeUndefined();
+  });
+
+  it("degrades to an empty list AND the path when the store is unreadable", () => {
+    writeFileSync(TEST_PATH, "{ not json");
+    const result = readCronJobsSafely(new CronStore(TEST_PATH));
+    // Both halves matter: the caller keeps working (watch snapshot, metrics
+    // scrape, status report) and can still say "unreadable" rather than
+    // "none" — an empty list on its own would restore the original lie.
+    expect(result.jobs).toEqual([]);
+    expect(result.unreadablePath).toBe(TEST_PATH);
+  });
+
+  it("does not swallow errors that are not read failures", () => {
+    const exploding = { list(): never { throw new TypeError("boom"); } };
+    expect(() => readCronJobsSafely(exploding)).toThrow(TypeError);
   });
 });
 

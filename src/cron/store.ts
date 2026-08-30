@@ -145,14 +145,16 @@ export class CronStore {
       // so clear the state that would otherwise make the next daemon start
       // settle (and for a one-shot, immediately re-disable) it a second time.
       //
-      // Every clear is gated on that settled state. Acknowledging the run
-      // token unconditionally would erase live evidence: disable→enable
-      // *while a run is in flight* would mark the in-flight run complete, and
-      // the restart that followed would re-fire a one-shot with no [resumed]
-      // marker — the exact failure this PR exists to prevent. (Inside this
-      // branch the ack is a no-op in the normal path, since recovery already
-      // acknowledged the token; it stays as a repair for a hand-edited file.)
-      if (job.lastStatus === "interrupted") {
+      // "Settled" is BOTH halves: the status says interrupted AND the run
+      // token is acknowledged. The status alone is not enough — recovery
+      // stamps it on a *resumed recurring* job too, and that job then gets
+      // dispatched again with the status still set, so a disable→enable
+      // during the resumed run would acknowledge the LIVE token and the next
+      // restart would re-fire it with no [resumed] marker. Checking
+      // isInterrupted means a live run is never mistaken for a settled one.
+      // (For a genuinely settled job the ack is a no-op — recovery already
+      // acknowledged the token — and stays only to repair a hand-edited file.)
+      if (job.lastStatus === "interrupted" && !isInterrupted(job)) {
         job.lastStatus = null;
         job.lastCompletedRunId = job.lastRunId ?? null;
         if (job.interruptedAt != null) job.interruptedAt = null;
@@ -209,7 +211,16 @@ export class CronStore {
     // key to every job on every dispatch and, since clearing a field is a
     // merge edit that beats a concurrent value, would let a routine dispatch
     // stomp a marker another process had just set.
-    if (job.interruptedAt != null) job.interruptedAt = null;
+    //
+    // The status goes with it: from here on the interruption is being acted
+    // on, not waiting to be. Leaving `lastStatus: "interrupted"` behind on a
+    // live run makes the job look settled to anything that reads the status
+    // (setEnabled did exactly that), and it is stale besides — this run's
+    // outcome is what markRun is about to write.
+    if (job.interruptedAt != null) {
+      job.interruptedAt = null;
+      if (job.lastStatus === "interrupted") job.lastStatus = null;
+    }
     this.save();
     return runId;
   }

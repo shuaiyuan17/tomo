@@ -7,7 +7,7 @@ import { getDaemonStatus } from "./status-info.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { SessionStore } from "../sessions/store.js";
 import { CronStore } from "../cron/store.js";
-import { withCronStore } from "./cron-errors.js";
+import { readCronJobsSafely } from "./cron-errors.js";
 import type { CronJob } from "../cron/types.js";
 import { formatDuration, formatRelative } from "../cron/format.js";
 
@@ -22,7 +22,13 @@ export interface StatusReport {
     enabled: number;
     failing: number;
     upcoming: Array<{ name: string; nextRunAt: number }>;
-  };
+    /**
+     * Set when jobs.json exists but could not be read. The counts are then
+     * zero because nothing could be counted — which is NOT the same as a
+     * store with no jobs, so it is reported separately.
+     */
+    unreadable?: string;
+};
 }
 
 const MAX_SESSIONS_SHOWN = 5;
@@ -50,9 +56,11 @@ export async function gatherStatus(): Promise<StatusReport> {
       costUsd: e.stats?.totalCostUsd ?? 0,
     }));
 
-  // An unreadable jobs file exits non-zero rather than reporting zero tasks:
-  // "no scheduled tasks" and "could not look" must not print the same.
-  const jobs = withCronStore(() => new CronStore().list());
+  // An unreadable jobs file degrades this one section instead of taking the
+  // whole report down — daemon state, config issues and channels are exactly
+  // what someone runs `tomo status` for when something is broken. It is still
+  // never reported as "no scheduled tasks": that lie is what this PR is about.
+  const { jobs, unreadablePath } = readCronJobsSafely(new CronStore());
   const upcoming = jobs
     .filter((j): j is CronJob & { nextRunAt: number } => j.enabled && j.nextRunAt !== null)
     .sort((a, b) => a.nextRunAt - b.nextRunAt)
@@ -68,6 +76,7 @@ export async function gatherStatus(): Promise<StatusReport> {
     ],
     sessions,
     cron: {
+      ...(unreadablePath ? { unreadable: unreadablePath } : {}),
       total: jobs.length,
       enabled: jobs.filter((j) => j.enabled).length,
       failing: jobs.filter((j) => j.lastStatus === "error").length,
@@ -115,7 +124,10 @@ export function renderStatusReport(r: StatusReport, now = Date.now()): string {
   }
 
   lines.push("");
-  if (r.cron.total === 0) {
+  if (r.cron.unreadable) {
+    lines.push(`Scheduled tasks: store unreadable (${r.cron.unreadable})`);
+    lines.push("  fix or remove the file; the daemon recreates it empty");
+  } else if (r.cron.total === 0) {
     lines.push("Scheduled tasks: none");
   } else {
     const failing = r.cron.failing ? `, ${r.cron.failing} failing` : "";

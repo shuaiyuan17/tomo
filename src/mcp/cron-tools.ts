@@ -1,7 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { CronStore, CronStoreReadError, computeNextRun, parseScheduleString } from "../cron/store.js";
-import { canManageJob } from "../cron/scope.js";
+import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
 
 /**
@@ -72,6 +72,17 @@ export function buildCronTools(storePath?: string, callerSessionKey?: string) {
         // throws when the expression is actually evaluated, so the validation
         // is the trial computeNextRun — not `store.add`, whose failures are
         // about the STORE and must not be reported as a bad schedule.
+        if (!isStorableSessionKey(session)) {
+          // Persisting a malformed target buys a job that can never deliver,
+          // found out days later when the reminder does not arrive.
+          return {
+            content: [{
+              type: "text" as const,
+              text: `schedule_create failed: "${session}" is not a session key. Use the session key from the system prompt — "dm:<identity>", or "<channel>:<chatId>" such as "telegram:-1001234567".`,
+            }],
+            isError: true,
+          };
+        }
         let parsed;
         try {
           parsed = parseScheduleString(schedule);

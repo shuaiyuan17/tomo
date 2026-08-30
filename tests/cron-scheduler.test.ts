@@ -529,6 +529,54 @@ describe("CronScheduler", () => {
     expect(after.lastStatus).toBe("interrupted");
   });
 
+  it("a disable/enable during a RESUMED recurring run does not erase the interruption", async () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "quiet-hours",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "Do the upgrade.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+
+    // Run 1 dies mid-turn.
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, store));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+
+    // Daemon 2 settles it and delivers the resumed fire — which also hangs.
+    const second = hangingAgent();
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
+    schedulerB.start();
+    await waitFor(() => expect(second.calls).toHaveLength(1));
+    schedulerB.stop();
+    expect(bodies(second.calls)[0]).toContain("[resumed]");
+
+    // The toggle lands while that RESUMED run is still in flight. recovery
+    // leaves `lastStatus: "interrupted"` on a resumed recurring job, so a
+    // status-only gate would treat this live run as settled, acknowledge its
+    // token, and lose the interruption entirely.
+    const admin = new CronStore(TEST_PATH);
+    admin.setEnabled(job.id, false);
+    admin.setEnabled(job.id, true);
+    expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
+
+    // Daemon 3 must still see an interrupted run, and its fire must carry the
+    // marker. (Re-enabling pushed nextRunAt forward, so make it due again —
+    // the marker is persisted and waits for whenever the job next runs.)
+    const third = hangingAgent();
+    const storeC = new CronStore(TEST_PATH);
+    const schedulerC = new CronScheduler(third.agent, storeC);
+    schedulerC.start();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(storeC.list()[0].resumeAttempts).toBe(2);
+    makeJobsDue();
+    void tick(schedulerC);
+    await waitFor(() => expect(third.calls).toHaveLength(1));
+    schedulerC.stop();
+    expect(bodies(third.calls)[0]).toContain("[resumed]");
+  });
+
   it("re-enabling a settled interrupted job clears it for good", async () => {
     const storeA = new CronStore(TEST_PATH);
     const job = storeA.add({

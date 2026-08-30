@@ -29,6 +29,18 @@ function baseReport(): StatusReport {
 }
 
 describe("renderStatusReport", () => {
+  it("renders an unreadable cron store as unreadable, never as none", () => {
+    const r = baseReport();
+    r.cron = { unreadable: "/home/x/.tomo/data/cron/jobs.json", total: 0, enabled: 0, failing: 0, upcoming: [] };
+    const out = renderStatusReport(r, NOW);
+    expect(out).toContain("Scheduled tasks: store unreadable (/home/x/.tomo/data/cron/jobs.json)");
+    expect(out).not.toContain("Scheduled tasks: none");
+    // The rest of the report still renders — that is the point of degrading.
+    expect(out).toContain("Tomo v1.2.3 — running");
+    expect(out).toContain("Sessions (2 active):");
+  });
+
+
   it("renders a running daemon with uptime", () => {
     const out = renderStatusReport(baseReport(), NOW);
     expect(out).toContain("Tomo v1.2.3 — running (PID 4321, up 2h 30m)");

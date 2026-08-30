@@ -211,8 +211,14 @@ describe("cron MCP tools", () => {
     // on equality would lock the owner out of jobs they created for a group,
     // and nobody could ever re-enable a job with no session key.
     const dm = findTool("schedule_enable", "dm:shuai");
-    expect(JSON.parse((await dm.handler({ id: groupJob.id }, {})).content[0].text).enabled).toBe(true);
-    expect(JSON.parse((await dm.handler({ id: orphan.id }, {})).content[0].text).enabled).toBe(true);
+    const onGroup = await dm.handler({ id: groupJob.id }, {});
+    const onOrphan = await dm.handler({ id: orphan.id }, {});
+    // Assert the outcome before parsing, so a regression to the old
+    // equality-only rule fails as "was denied" rather than as a JSON error.
+    expect(onGroup.isError).toBeFalsy();
+    expect(onOrphan.isError).toBeFalsy();
+    expect(JSON.parse(onGroup.content[0].text).enabled).toBe(true);
+    expect(JSON.parse(onOrphan.content[0].text).enabled).toBe(true);
   });
 
   it("schedule_enable — a group can manage its own jobs but nothing else", async () => {
@@ -262,6 +268,21 @@ describe("cron MCP tools", () => {
     expect(result.content[0].text).not.toContain("invalid schedule");
     expect(result.content[0].text).toContain("could not be read");
     expect(result.content[0].text).toContain("the schedule itself is valid");
+  });
+
+  it("schedule_create — refuses a target that is not a session key", async () => {
+    for (const session of ["", "shuai", "dm:", "dm:alice\nreally:evil"]) {
+      const result = await findTool("schedule_create").handler({
+        name: "test",
+        schedule: "every 1h",
+        message: "ping",
+        session,
+      }, {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("is not a session key");
+    }
+    // Nothing undeliverable was persisted.
+    expect(new CronStore(TEST_PATH).list()).toHaveLength(0);
   });
 
   it("schedule_create — a malformed cron expression is still reported as invalid", async () => {

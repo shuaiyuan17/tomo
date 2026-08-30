@@ -369,7 +369,9 @@ function usableTimestamp(msg: SessionMessage): number | null {
     && msg.timestamp >= MIN_PLAUSIBLE_TIMESTAMP_MS
     ? msg.timestamp
     : null;
+}
 
+/**
  * The registry file exists but could not be turned into a session list — a
  * JSON parse failure, a transient `EMFILE`/`EIO`, a half-restored file. Carries
  * the underlying error as `cause`.

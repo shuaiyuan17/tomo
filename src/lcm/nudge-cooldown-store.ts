@@ -26,6 +26,15 @@ interface NudgeCooldownFile {
   nudged: Record<string, number>;
 }
 
+const FILE_VERSION = 1;
+
+function isCooldownFile(raw: unknown): raw is NudgeCooldownFile {
+  if (typeof raw !== "object" || raw === null) return false;
+  const { version, nudged } = raw as Partial<NudgeCooldownFile>;
+  return version === FILE_VERSION
+    && typeof nudged === "object" && nudged !== null && !Array.isArray(nudged);
+}
+
 /** Is this timestamp usable as a cooldown start at `now`? */
 function isUsable(ts: unknown, now: number): ts is number {
   return typeof ts === "number" && Number.isFinite(ts)
@@ -99,8 +108,12 @@ export class NudgeCooldownStore {
     const entries = new Map<string, number>();
     if (!this.filePath || !existsSync(this.filePath)) return { entries, corrupt: false };
     try {
-      const raw = JSON.parse(readFileSync(this.filePath, "utf-8")) as NudgeCooldownFile;
-      for (const [key, ts] of Object.entries(raw?.nudged ?? {})) {
+      const raw: unknown = JSON.parse(readFileSync(this.filePath, "utf-8"));
+      // Valid JSON of the wrong shape (another version, `nudged` that is not a
+      // record) is corruption too — silently reading it as empty would hide
+      // the problem and then overwrite it as version 1 without a word.
+      if (!isCooldownFile(raw)) throw new Error("unexpected shape");
+      for (const [key, ts] of Object.entries(raw.nudged)) {
         if (isUsable(ts, now)) entries.set(key, ts);
       }
       return { entries, corrupt: false };
@@ -136,7 +149,7 @@ export class NudgeCooldownStore {
         if (disk === undefined || ts > disk) merged.set(key, ts);
       }
       this.nudged = merged;
-      const data: NudgeCooldownFile = { version: 1, nudged: Object.fromEntries(merged) };
+      const data: NudgeCooldownFile = { version: FILE_VERSION, nudged: Object.fromEntries(merged) };
       writeJsonAtomicSync(this.filePath, data);
     } catch (err) {
       // Losing the file only costs us the restart guarantee — never a nudge.

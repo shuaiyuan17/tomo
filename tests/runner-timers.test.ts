@@ -10,6 +10,11 @@ vi.mock("../src/config.js", () => ({
 
 const { VersionChecker } = await import("../src/version.js");
 const { RollupRunner } = await import("../src/lcm/runner.js");
+const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js");
+
+// These cases are about timers, not the cooldown: an in-memory store (null
+// path) keeps them off the disk and off the mocked config's missing tomoHome.
+const inMemoryCooldowns = () => new NudgeCooldownStore(null);
 
 /**
  * Both background runners arm TWO timers in start(): a one-shot initial-delay
@@ -39,7 +44,7 @@ describe("background runners release their timers on stop()", () => {
   });
 
   it("RollupRunner.stop() clears the initial-delay check as well as the interval", () => {
-    const runner = new RollupRunner({ listActiveSessions: vi.fn(() => []) } as never);
+    const runner = new RollupRunner({ listActiveSessions: vi.fn(() => []) } as never, inMemoryCooldowns());
     runner.start();
     const armed = vi.getTimerCount();
     runner.stop();
@@ -48,7 +53,7 @@ describe("background runners release their timers on stop()", () => {
 
   it("a stopped RollupRunner never runs its initial check", async () => {
     const listActiveSessions = vi.fn(() => []);
-    const runner = new RollupRunner({ listActiveSessions } as never);
+    const runner = new RollupRunner({ listActiveSessions } as never, inMemoryCooldowns());
     runner.start();
     runner.stop();
     await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
@@ -68,7 +73,7 @@ describe("background runners release their timers on stop()", () => {
     try {
       const runner = new RollupRunner({
         listActiveSessions: vi.fn(() => { throw new Error("registry unreadable"); }),
-      } as never);
+      } as never, inMemoryCooldowns());
       runner.start();
       await vi.advanceTimersByTimeAsync(3 * 60 * 1000);
       runner.stop();

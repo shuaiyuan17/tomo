@@ -276,7 +276,8 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           searchHint: "unsend delete retract undo sent message telegram imessage imsg",
         },
       ),
-      ...buildCronTools(),
+      // Scoped: schedule_enable can only act on this session's own jobs.
+      ...buildCronTools(undefined, callerSessionKey),
       ...buildPetTools(),
       // Group sessions never see private people records through these tools —
       // same boundary as the private memory subtree they live in.

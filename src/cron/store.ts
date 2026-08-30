@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -37,19 +37,37 @@ export class CronStore {
    * the only durable record that a run was dispatched.
    */
   private baseline = new Map<string, CronJob>();
+  /**
+   * Set when the last load failed. The instance still exists (constructing a
+   * store must not take the daemon down over a transient read error) but it
+   * holds no trustworthy state, so reads and writes refuse rather than report
+   * an empty store. Cleared by the next successful load.
+   */
+  private loadError: unknown = null;
   private path: string;
 
   constructor(path = DEFAULT_STORE_PATH) {
     this.path = path;
-    this.load();
+    try {
+      this.load();
+    } catch (err) {
+      this.loadError = err;
+    }
   }
 
   list(): CronJob[] {
+    this.assertLoaded();
     return [...this.jobs];
   }
 
   get(id: string): CronJob | undefined {
+    this.assertLoaded();
     return this.jobs.find((j) => j.id === id);
+  }
+
+  /** Refuse to serve or overwrite state we could not read. */
+  private assertLoaded(): void {
+    if (this.loadError !== null) throw this.loadError;
   }
 
   add(opts: {
@@ -312,28 +330,104 @@ export class CronStore {
   }
 
   private load(): void {
-    this.jobs = readJobs(this.path);
+    const disk = readStore(this.path);
+    this.jobs = disk.jobs;
     this.baseline = snapshot(this.jobs);
+    this.loadError = null;
   }
 
+  /**
+   * Publish our merged view. Optimistic concurrency, not a lock: the file
+   * carries a monotonic `revision`, we merge against the revision we just
+   * read, and we re-check that revision at the last possible moment — after
+   * the temp file is written, immediately before the rename. If another
+   * process published in between we re-read, re-merge and try again, so a
+   * write can only be lost inside the rename syscall itself instead of across
+   * the whole read-modify-write.
+   */
   private save(): void {
+    // Never publish from a state we could not read: that is how a transient
+    // read error turns into an empty jobs file.
+    this.assertLoaded();
     const dir = dirname(this.path);
     mkdirSync(dir, { recursive: true });
-    // Merge against the file as it stands NOW, not as it stood at our load.
-    this.jobs = mergeWithDisk(this.baseline, this.jobs, readJobs(this.path));
-    writeJsonAtomicSync(this.path, { version: 1, jobs: this.jobs });
-    this.baseline = snapshot(this.jobs);
+    for (let attempt = 1; ; attempt++) {
+      const disk = readStore(this.path);
+      const merged = mergeWithDisk(this.baseline, this.jobs, disk.jobs);
+      try {
+        writeJsonAtomicSync(
+          this.path,
+          { version: STORE_SCHEMA_VERSION, revision: disk.revision + 1, jobs: merged },
+          {
+            beforeRename: () => {
+              if (readStore(this.path).revision !== disk.revision) {
+                throw new StaleWriteError(this.path);
+              }
+            },
+          },
+        );
+      } catch (err) {
+        if (err instanceof StaleWriteError && attempt < SAVE_MAX_ATTEMPTS) continue;
+        throw err;
+      }
+      this.jobs = merged;
+      this.baseline = snapshot(merged);
+      return;
+    }
   }
 }
 
-function readJobs(path: string): CronJob[] {
-  if (!existsSync(path)) return [];
-  try {
-    const data = JSON.parse(readFileSync(path, "utf-8"));
-    return data.jobs ?? [];
-  } catch {
-    return [];
+/** Schema version of the on-disk file. Unrelated to `revision`. */
+const STORE_SCHEMA_VERSION = 1;
+/** Optimistic save retries before giving up and reporting a write failure. */
+const SAVE_MAX_ATTEMPTS = 5;
+
+/** The file changed under an optimistic save; re-read, re-merge, retry. */
+class StaleWriteError extends Error {
+  constructor(path: string) {
+    super(`cron store changed during write: ${path}`);
+    this.name = "StaleWriteError";
   }
+}
+
+/**
+ * The store could not be read. Distinct from "no store yet": an unreadable or
+ * corrupt file must never be mistaken for an empty one — that reading would
+ * let interrupted-run recovery "succeed" with nothing to recover and then let
+ * the next save overwrite the real jobs with an empty list.
+ */
+export class CronStoreReadError extends Error {
+  constructor(path: string, cause: unknown) {
+    super(`cron store could not be read: ${path}`, { cause });
+    this.name = "CronStoreReadError";
+  }
+}
+
+function readStore(path: string): { jobs: CronJob[]; revision: number } {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    // Absent is a normal state — a fresh install has no jobs file. Anything
+    // else (EACCES, EIO, a directory in the way) is a failure, not emptiness.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { jobs: [], revision: 0 };
+    throw new CronStoreReadError(path, err);
+  }
+  let data: { jobs?: unknown; revision?: unknown };
+  try {
+    data = JSON.parse(raw);
+  } catch (err) {
+    throw new CronStoreReadError(path, err);
+  }
+  if (data === null || typeof data !== "object" || !Array.isArray(data.jobs)) {
+    throw new CronStoreReadError(path, new Error("missing or malformed `jobs` array"));
+  }
+  return {
+    jobs: data.jobs as CronJob[],
+    // Files written before revisions existed start at 0 and get 1 on the next
+    // save; the counter only ever has to be monotonic within one file.
+    revision: typeof data.revision === "number" ? data.revision : 0,
+  };
 }
 
 function snapshot(jobs: CronJob[]): Map<string, CronJob> {
@@ -341,7 +435,12 @@ function snapshot(jobs: CronJob[]): Map<string, CronJob> {
 }
 
 function sameValue(a: unknown, b: unknown): boolean {
-  return a === b || JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  if (a === b) return true;
+  // Absence and an explicit null are different edits: clearing a field
+  // (`interruptedAt = null`, `nextRunAt = null`) is a change that must beat a
+  // concurrent non-null value, not be read as "we never touched it".
+  if (a === undefined || b === undefined) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 /**

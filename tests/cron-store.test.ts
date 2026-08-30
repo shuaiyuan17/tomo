@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CronStore,
+  CronStoreReadError,
   MAX_RESUME_ATTEMPTS,
   isInterrupted,
   mergeWithDisk,
@@ -815,6 +816,25 @@ describe("CronStore concurrent writers", () => {
     expect(names).toEqual(["late", "recurring"]);
   });
 
+  it("mergeWithDisk treats clearing a field as an edit, not as an absence", () => {
+    // `interruptedAt = null` (marker consumed) against a baseline that had no
+    // such key at all. Reading undefined and null as the same value would let
+    // a concurrent writer's stale non-null value survive, and the [resumed]
+    // marker would be delivered twice.
+    const base = {
+      id: "a", name: "a", enabled: true, message: "m", sessionKey: "dm:alice",
+      deleteAfterRun: false, createdAt: 1, nextRunAt: 10, lastRunAt: null,
+      lastStatus: null, schedule: { kind: "every", everyMs: 60_000 },
+    };
+    const merged = mergeWithDisk(
+      new Map([["a", { ...base }]]) as never,
+      [{ ...base, interruptedAt: null }] as never,
+      [{ ...base, interruptedAt: 1234 }] as never,
+    ) as unknown as CronJobLike[];
+
+    expect(merged[0].interruptedAt).toBeNull();
+  });
+
   it("mergeWithDisk keeps each writer's own edits and both deletions", () => {
     const base = (over: Partial<CronJobLike> = {}): CronJobLike => ({
       id: "a", name: "a", enabled: true, message: "m", sessionKey: "dm:alice",
@@ -837,6 +857,67 @@ describe("CronStore concurrent writers", () => {
     expect(byId.has("gone")).toBe(false);         // we deleted it
     expect(byId.has("mine")).toBe(true);          // we added it
     expect(byId.has("yours")).toBe(true);         // they added it
+  });
+});
+
+describe("CronStore unreadable file", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  it("treats an absent file as empty and a corrupt one as a failure", () => {
+    // No file yet is a normal state — a fresh install has no jobs.
+    expect(new CronStore(TEST_PATH).list()).toEqual([]);
+
+    // A corrupt file is not an empty one. Reporting "no jobs" here is what
+    // lets interrupted-run recovery believe it has nothing to do.
+    writeFileSync(TEST_PATH, "{ not json");
+    const store = new CronStore(TEST_PATH);
+    expect(() => store.list()).toThrow(CronStoreReadError);
+    expect(() => store.recoverInterrupted()).toThrow(CronStoreReadError);
+    expect(() => store.getDueJobs()).toThrow(CronStoreReadError);
+  });
+
+  it("never overwrites a file it could not read", () => {
+    writeFileSync(TEST_PATH, "{ not json");
+    const store = new CronStore(TEST_PATH);
+    expect(() => store.add({
+      name: "x",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    })).toThrow(CronStoreReadError);
+    // The old behaviour (read error -> empty list) would have published an
+    // empty store over the real one.
+    expect(readFileSync(TEST_PATH, "utf-8")).toBe("{ not json");
+  });
+
+  it("rejects a well-formed file with no jobs array", () => {
+    writeFileSync(TEST_PATH, JSON.stringify({ version: 1 }));
+    expect(() => new CronStore(TEST_PATH).list()).toThrow(CronStoreReadError);
+  });
+
+  it("recovers once the file is readable again", () => {
+    const good = new CronStore(TEST_PATH);
+    good.add({
+      name: "x",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+    const contents = readFileSync(TEST_PATH, "utf-8");
+
+    writeFileSync(TEST_PATH, "{ not json");
+    const store = new CronStore(TEST_PATH);
+    expect(() => store.list()).toThrow(CronStoreReadError);
+
+    writeFileSync(TEST_PATH, contents);
+    expect(store.getDueJobs()).toEqual([]);   // reload clears the error
+    expect(store.list()).toHaveLength(1);
   });
 });
 

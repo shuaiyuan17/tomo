@@ -360,7 +360,7 @@ describe("CronScheduler", () => {
 
   // --- failure handling around the store -------------------------------
 
-  it("does not scan for due jobs until recovery has persisted", async () => {
+  it("does not scan for due jobs until the store could actually be read", async () => {
     const storeA = new CronStore(TEST_PATH);
     storeA.add({
       name: "quiet-hours",
@@ -373,25 +373,27 @@ describe("CronScheduler", () => {
     const first = hangingAgent();
     void tick(new CronScheduler(first.agent, storeA));
     await waitFor(() => expect(first.calls).toHaveLength(1));
+    const goodFile = readFileSync(TEST_PATH, "utf-8");
 
-    // Daemon 2 comes up with an unwritable store. Recovery is the only thing
-    // standing between the scan and a duplicate run, so a failed recovery must
-    // stop the scan — not fire the job unmarked and hope.
+    // Daemon 2 comes up while the store is unreadable. A read error must not
+    // be read as "no jobs": that would let recovery report success with
+    // nothing to recover, latch, and then fire the interrupted job unmarked
+    // as soon as the file came back.
+    writeFileSync(TEST_PATH, "{ this is not json");
     const second = hangingAgent();
-    const storeB = new CronStore(TEST_PATH);
-    const recover = vi.spyOn(storeB, "recoverInterrupted");
-    recover.mockImplementationOnce(() => { throw new Error("EIO: store unwritable"); });
-    const schedulerB = new CronScheduler(second.agent, storeB);
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
 
     // Not awaited: if the scan runs anyway it dispatches the hanging turn and
     // the tick never settles — the assertion below should be what fails.
     void tick(schedulerB);
     await new Promise((r) => setTimeout(r, 20));
     expect(second.calls).toHaveLength(0);
+    // ...and nothing overwrote the file we could not read.
+    expect(readFileSync(TEST_PATH, "utf-8")).toBe("{ this is not json");
 
-    // Next poll: the store is writable again, recovery lands, and the job
-    // fires exactly once — with its marker. (The turn hangs, so the tick is
-    // not awaited; the fire itself is what is being asserted.)
+    // The file is readable again: recovery lands and the job fires exactly
+    // once, with its marker.
+    writeFileSync(TEST_PATH, goodFile);
     void tick(schedulerB);
     await waitFor(() => expect(second.calls).toHaveLength(1));
     expect(bodies(second.calls)[0]).toContain("[resumed]");

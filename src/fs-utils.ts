@@ -1,7 +1,20 @@
 import { chmodSync, copyFileSync, existsSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-export function writeFileAtomicSync(path: string, content: string, opts?: { mode?: number }): void {
+export interface AtomicWriteOptions {
+  mode?: number;
+  /**
+   * Called after the temp file is written and immediately before the rename
+   * that publishes it. Throwing aborts the write (the temp file is cleaned
+   * up and the error propagates) — the hook exists so a caller doing an
+   * optimistic read-modify-write can re-check its precondition at the last
+   * possible moment, leaving only the rename itself in the race window
+   * rather than the whole serialize-and-write.
+   */
+  beforeRename?: () => void;
+}
+
+export function writeFileAtomicSync(path: string, content: string, opts?: AtomicWriteOptions): void {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   // Explicit mode wins (e.g. 0600 for secrets, applied even on first write);
   // otherwise preserve the existing file's mode.
@@ -12,6 +25,7 @@ export function writeFileAtomicSync(path: string, content: string, opts?: { mode
     } else {
       writeFileSync(tmp, content, { mode });
     }
+    opts?.beforeRename?.();
     renameSync(tmp, path);
     if (mode !== undefined) chmodSync(path, mode);
   } catch (err) {
@@ -20,7 +34,7 @@ export function writeFileAtomicSync(path: string, content: string, opts?: { mode
   }
 }
 
-export function writeJsonAtomicSync(path: string, value: unknown, opts?: { mode?: number }): void {
+export function writeJsonAtomicSync(path: string, value: unknown, opts?: AtomicWriteOptions): void {
   writeFileAtomicSync(path, `${JSON.stringify(value, null, 2)}\n`, opts);
 }
 

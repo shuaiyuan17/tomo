@@ -16,8 +16,8 @@ interface ToolHandle {
   }>;
 }
 
-function findTool(name: string): ToolHandle {
-  const tools = buildCronTools(TEST_PATH) as unknown as ToolHandle[];
+function findTool(name: string, callerSessionKey?: string): ToolHandle {
+  const tools = buildCronTools(TEST_PATH, callerSessionKey) as unknown as ToolHandle[];
   const found = tools.find((t) => t.name === name);
   if (!found) throw new Error(`Tool ${name} not found`);
   return found;
@@ -161,6 +161,32 @@ describe("cron MCP tools", () => {
     const [summary] = JSON.parse(result.content[0].text);
     expect(summary.lastStatus).toBe("interrupted");
     expect(summary.lastStartedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("schedule_enable — a group session cannot re-enable a DM's job", async () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "owner-only",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "place the order",
+      sessionKey: "dm:shuai",
+    });
+    store.setEnabled(job.id, false);
+
+    // Re-enabling is the one cron operation that makes a dormant job run
+    // again. A group chat must not be able to restart a task that fires into
+    // the owner's DM.
+    const denied = await findTool("schedule_enable", "telegram:-100270").handler({ id: job.id }, {});
+    expect(denied.isError).toBe(true);
+    expect(denied.content[0].text).toContain("different session");
+    // The refusal does not name the owning session.
+    expect(denied.content[0].text).not.toContain("dm:shuai");
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
+
+    // The owning session can.
+    const allowed = await findTool("schedule_enable", "dm:shuai").handler({ id: job.id }, {});
+    expect(allowed.isError).toBeFalsy();
+    expect(JSON.parse(allowed.content[0].text).enabled).toBe(true);
   });
 
   it("schedule_remove — removes existing job; not-found returns text without isError", async () => {

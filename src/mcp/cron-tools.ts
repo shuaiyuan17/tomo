@@ -18,7 +18,16 @@ import type { CronJob, CronRunStatus } from "../cron/types.js";
  * from the CLI, the scheduler, or external edits (the constructor calls
  * `load()` from disk). The on-disk JSON is the single source of truth.
  */
-export function buildCronTools(storePath?: string) {
+/**
+ * @param storePath  Override the jobs file (tests).
+ * @param callerSessionKey  The session this MCP server instance belongs to.
+ *   When set, `schedule_enable` only acts on jobs that deliver to that
+ *   session: re-enabling is the one cron operation that makes a *dormant*
+ *   job run again, and a group chat must not be able to restart a job that
+ *   fires into the owner's DM. Listing/creating/removing remain unscoped —
+ *   that surface is issue #312, deliberately not widened or narrowed here.
+ */
+export function buildCronTools(storePath?: string, callerSessionKey?: string) {
   return [
     tool(
       "schedule_create",
@@ -117,6 +126,8 @@ export function buildCronTools(storePath?: string) {
         "",
         "Pass `enabled: false` to park a job you want to keep but not run.",
         "",
+        "Scoped to this session: only jobs whose `sessionKey` is this conversation can be enabled or disabled here.",
+        "",
         "Returns the updated job, or `not_found`.",
       ].join("\n"),
       {
@@ -125,6 +136,20 @@ export function buildCronTools(storePath?: string) {
       },
       async ({ id, enabled }) => {
         const store = new CronStore(storePath);
+        const existing = store.get(id);
+        if (!existing) {
+          return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
+        }
+        if (callerSessionKey !== undefined && existing.sessionKey !== callerSessionKey) {
+          // Deliberately does not name the owning session.
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Job ${id} belongs to a different session; this session can only enable or disable its own scheduled tasks.`,
+            }],
+            isError: true,
+          };
+        }
         const job = store.setEnabled(id, enabled ?? true);
         if (!job) {
           return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };

@@ -336,6 +336,38 @@ export function getSdkSessionPath(
   return join(sdkSessionsDir, `${sessionId}.jsonl`);
 }
 
+/**
+ * The oldest timestamp a real transcript record can carry. Tomo did not exist
+ * before this, so anything below it is corrupt rather than ancient: a
+ * `timestamp: 0` legacy record, a negative value, or a seconds-precision epoch
+ * written where milliseconds were expected (1_700_000_000 is 1970-01-20).
+ *
+ * This matters because searchTranscript's lower bounds END the scan, so
+ * reading such a value as "older than everything" truncates an entire recall.
+ */
+const MIN_PLAUSIBLE_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
+
+/**
+ * A record's seq, or null when it has none we can order by.
+ *
+ * Stricter than `getLastSeq` / `isAfterMessage`, which accept any non-null
+ * value: a hand-edited `seq: "12"` is invisible to a search bound here but
+ * would still seed the next append there. Search must not order by a string;
+ * the append path's leniency is pre-existing and left alone.
+ */
+function usableSeq(msg: SessionMessage): number | null {
+  return typeof msg.seq === "number" && Number.isFinite(msg.seq) ? msg.seq : null;
+}
+
+/** A record's timestamp, or null when it has none we can order by. */
+function usableTimestamp(msg: SessionMessage): number | null {
+  return typeof msg.timestamp === "number"
+    && Number.isFinite(msg.timestamp)
+    && msg.timestamp >= MIN_PLAUSIBLE_TIMESTAMP_MS
+    ? msg.timestamp
+    : null;
+}
+
 export class SessionStore {
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
@@ -469,14 +501,55 @@ export class SessionStore {
     const queryLower = opts.query?.toLowerCase();
     const files = [this.transcriptPath(key), ...this.listTranscriptArchives(key)];
 
+    // Records skipped for being unplaceable under a bound, per file. Said
+    // once per file after its scan, not once per record: the degenerate case
+    // below can skip every line of a large transcript, and the point is only
+    // that a search that reports "N message(s)" silently left some out.
+    let skipped = 0;
+    const noteSkipped = (file: string): void => {
+      if (skipped > 0) log.debug({ file, skipped }, "Skipped transcript records that cannot be placed in the search window");
+      skipped = 0;
+    };
+
     outer: for (const file of files) {
       for (const msg of iterateJsonlBackwardsSync<SessionMessage>(file)) {
-        // Scanning newest→oldest: once past the window's lower bound,
-        // nothing older can match.
-        if (opts.fromSeq != null && (msg.seq ?? 0) < opts.fromSeq) break outer;
-        if (opts.fromTime != null && msg.timestamp < opts.fromTime) break outer;
-        if (opts.toSeq != null && (msg.seq ?? 0) > opts.toSeq) continue;
-        if (opts.toTime != null && msg.timestamp > opts.toTime) continue;
+        // Scanning newest→oldest: once past the window's lower bound, nothing
+        // older can match — but only a record whose position is KNOWN may end
+        // the scan. `break outer` abandons the rest of this file AND every
+        // rotation archive behind it, so a record that cannot be placed in the
+        // window (no seq, no timestamp, a `timestamp: 0` legacy record) is
+        // skipped instead, exactly like the non-string-content guard below.
+        // `fromTime` is the live path: recall_conversation's `after` is the
+        // only lower bound any caller passes, and one epoch-0 record used to
+        // end the search while it still reported success.
+        //
+        // The cost of that choice is bounded by the transcript: if EVERY record
+        // is unplaceable under the requested bound (a pre-seq legacy transcript
+        // searched by `fromSeq`), the scan reads the whole active file and every
+        // archive to return nothing, where it used to stop at the first record.
+        // The live `fromTime` path cannot hit this — every channel writes a
+        // millisecond `Date`-derived timestamp — so it is a CLI-only cost.
+        const seq = usableSeq(msg);
+        const time = usableTimestamp(msg);
+
+        if (opts.fromSeq != null) {
+          if (seq == null) { skipped++; continue; }
+          if (seq < opts.fromSeq) break outer;
+        }
+        if (opts.fromTime != null) {
+          if (time == null) { skipped++; continue; }
+          if (time < opts.fromTime) break outer;
+        }
+        // Upper bounds exclude an unplaceable record rather than coercing it
+        // to 0 and silently accepting it into every bounded result.
+        if (opts.toSeq != null) {
+          if (seq == null) { skipped++; continue; }
+          if (seq > opts.toSeq) continue;
+        }
+        if (opts.toTime != null) {
+          if (time == null) { skipped++; continue; }
+          if (time > opts.toTime) continue;
+        }
         // Legacy/hand-edited records may lack a string content — skip rather
         // than throw out of the whole search (this backs an agent tool call).
         if (typeof msg.content !== "string") continue;
@@ -485,7 +558,10 @@ export class SessionStore {
         results.push(msg);
         if (results.length >= limit) break outer;
       }
+      noteSkipped(file);
     }
+    // The `break outer` paths leave the current file's count unreported.
+    noteSkipped(files[files.length - 1] ?? "");
 
     return results.reverse();
   }

@@ -90,6 +90,14 @@ export interface LiveSessionManagerDeps {
   buildExternalMcpServers(key: string): Promise<Record<string, McpServerConfig>>;
   /** Group metadata snapshot for the system prompt — undefined for non-groups. */
   buildGroupContext(key: string): SessionContext["group"];
+  /**
+   * Does the turn currently in flight on `key` belong to that session?
+   * (`Agent.isOwnAudienceTurn`.) False while a summoned group is steering a
+   * dm: session, and for a batch spanning several audiences. Read per tool
+   * call by the private-memory PreToolUse guard, so it must be a live query
+   * and not a value snapshotted at session creation.
+   */
+  isOwnAudienceTurn(key: string): boolean;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
@@ -279,6 +287,7 @@ export class LiveSessionManager {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.deps.buildGroupContext(key),
+      isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
     }, turnBudget, externalMcpServers);
 

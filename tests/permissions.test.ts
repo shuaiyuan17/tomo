@@ -252,6 +252,10 @@ beforeAll(() => {
   outsideDir = mkdtempSync(join(tmpdir(), "tomo-perm-outside-"));
   mkdirSync(`${outsideDir}/loot`, { recursive: true });
   try { symlinkSync(outsideDir, `${SKILLS}/escape`, "dir"); } catch { /* already there */ }
+  // DANGLING symlinks — the target does not exist, so realpathSync throws
+  // ENOENT for the link itself, exactly as it does for an absent name.
+  try { symlinkSync(`${WS}/.claude/settings.local.json`, `${SKILLS}/dangling-out`); } catch { /* already there */ }
+  try { symlinkSync(`${SKILLS}/not-created-yet.md`, `${SKILLS}/dangling-in`); } catch { /* already there */ }
 });
 
 afterAll(() => {
@@ -317,6 +321,69 @@ describe("skillsCanUseTool — narrow .claude/skills/ re-allow", () => {
 
     it("still allows a genuine directory next to the symlink", async () => {
       const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/real-skill/SKILL.md` });
+      expect(r.behavior).toBe("allow");
+    });
+  });
+
+  describe("dangling symlinks", () => {
+    it("denies a write onto a dangling symlink whose target is outside the tree", async () => {
+      // realpathSync throws ENOENT for a link with a missing target, which is
+      // indistinguishable from an absent name — so the parent-walk fallback
+      // reported the LINK's own path, inside the tree, and the write followed
+      // the link to settings.local.json.
+      const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/dangling-out` });
+      expect(r.behavior).toBe("deny");
+    });
+
+    it("allows a dangling symlink whose target is inside the tree", async () => {
+      const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/dangling-in` });
+      expect(r.behavior).toBe("allow");
+    });
+
+    it("denies the same escape through every Bash program that writes", async () => {
+      const allowed = async (command: string): Promise<boolean> =>
+        (await skillsCanUseTool("Bash", { command })).behavior === "allow";
+      expect(await allowed(`cp ${SKILLS}/real-skill/SKILL.md ${SKILLS}/dangling-out`)).toBe(false);
+      expect(await allowed(`mv ${SKILLS}/real-skill/SKILL.md ${SKILLS}/dangling-out`)).toBe(false);
+      expect(await allowed(`touch ${SKILLS}/dangling-out`)).toBe(false);
+    });
+  });
+
+  describe("the file arm is gated on the tool", () => {
+    it("does not let a Bash call take the file arm via a decoy path key", async () => {
+      // Tool input is model-authored. An ungated file arm reads
+      // `file_path ?? notebook_path ?? path` off ANY tool, so a decoy key
+      // alongside the real command returned allow and the command ran without
+      // ever meeting the Bash allowlist.
+      const r = await skillsCanUseTool("Bash", {
+        command: `cat ${WS}/.claude/settings.json`,
+        path: `${SKILLS}/a.md`,
+      });
+      expect(r.behavior).toBe("deny");
+    });
+
+    it("does not let an unknown tool take the file arm", async () => {
+      const r = await skillsCanUseTool("WebFetch", { path: `${SKILLS}/a.md` });
+      expect(r.behavior).toBe("deny");
+    });
+
+    it("honours the SDK's blockedPath when it disagrees with the input", async () => {
+      // blockedPath is the SDK's own answer to "which path triggered this",
+      // so a contained input path must not vouch for an escaping one.
+      const r = await skillsCanUseTool(
+        "Write",
+        { file_path: `${SKILLS}/a.md` },
+        { blockedPath: `${WS}/.claude/settings.json` },
+      );
+      expect(r.behavior).toBe("deny");
+    });
+
+    it("allows when blockedPath and the input both land inside", async () => {
+      const r = await skillsCanUseTool(
+        "Write",
+        { file_path: `${SKILLS}/a.md` },
+        { blockedPath: `${SKILLS}/a.md` },
+      );
       expect(r.behavior).toBe("allow");
     });
   });
@@ -500,6 +567,21 @@ describe("the Bash arm of the re-allow", () => {
     it("denies a long flag with an attached value", async () => {
       expect(await allows(`cp --target-directory=.. ${SKILLS}/x`)).toBe(false);
       expect(await allows(`cp --target-directory=${WS}/.claude ${SKILLS}/x`)).toBe(false);
+    });
+
+    it("denies an attached value built from otherwise-allowed letters", async () => {
+      // Every letter of `-flah` is in the old shared set, but BSD grep reads
+      // this as `-f lah` and takes its pattern list from the file `lah`. A
+      // per-character check over one shared set cannot see the difference.
+      expect(await allows(`grep -flah ${SKILLS}/a.md`)).toBe(false);
+      expect(await allows(`grep -fair ${SKILLS}/a.md`)).toBe(false);
+    });
+
+    it("denies a value-taking flag the program actually has", async () => {
+      // `-f` is --force to cp/mv/rm but --file=FILE to grep, so "valueless" is
+      // a property of the program, not of the letter.
+      expect(await allows(`grep -f ${SKILLS}/a.md`)).toBe(false);
+      expect(await allows(`head -n ${SKILLS}/a.md`)).toBe(false);
     });
 
     it("denies a short flag with an attached value", async () => {

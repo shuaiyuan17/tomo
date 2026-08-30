@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve as pathResolve } from "node:path";
 import { minimatch } from "minimatch";
 import { config } from "../config.js";
@@ -27,36 +27,70 @@ const SKILLS_DIR = `${SKILLS_ROOT}/`;
 // thought to list, and let `cp <skills>/a /etc/x` through.
 
 /**
+ * How many symlink hops to follow before giving up. Well above any real path;
+ * the point is that a symlink cycle cannot spin here forever.
+ */
+const MAX_SYMLINK_HOPS = 32;
+
+/**
  * Resolve to a REAL path, tolerating a target that does not exist yet.
+ * Returns null when the path cannot be resolved safely, which callers treat as
+ * "deny".
  *
  * `realpathSync` is the only containment check that survives a symlink, but it
  * throws on a path that has not been created — and Write/mkdir name files that
  * are about to exist. So: realpath the deepest ancestor that does exist, then
- * re-attach the segments below it. `<skills>/escape/x.md` where `escape` is a
- * symlink to `/tmp/evil` resolves to `/tmp/evil/x.md` whether or not `x.md` is
- * there yet.
+ * re-attach the segments below it.
+ *
+ * DANGLING SYMLINKS ARE WHY THIS IS NOT JUST A TRY/CATCH. `realpathSync`
+ * throws ENOENT for a symlink whose TARGET does not exist, which is
+ * indistinguishable from "this name is not there at all" — so the plain
+ * fallback re-attached the basename under its parent and reported the LINK's
+ * own path, which is inside the tree. The write then followed the link. The
+ * agent may create files under skills/, so it may plant the link:
+ *
+ *     ln -s <ws>/.claude/settings.local.json <skills>/x
+ *     cp payload <skills>/x        -> writes settings.local.json
+ *
+ * Verified: realpathSync throws ENOENT, lstat reports a symlink, and the old
+ * fallback returned `<skills>/x`. So the ENOENT branch asks `lstat` whether
+ * the entry exists as a link and follows it by hand, bounded by
+ * {@link MAX_SYMLINK_HOPS}.
  *
  * CASING IS NOT NORMALISED, and an earlier version of this comment claimed it
  * was. Node's `realpathSync` PRESERVES the caller's spelling on a
  * case-insensitive volume — `realpathSync("<ws>/.CLAUDE/SKILLS")` returns
  * `<ws>/.CLAUDE/SKILLS`, not the on-disk `.claude/skills`. So a case-permuted
  * path fails the containment check and is DENIED. That is conservative rather
- * than an escape (the permuted spelling opens the same file, but auto-approval
- * is refused and it falls back to the SDK's ordinary permission handling), and
- * it is the behaviour asserted in the tests.
+ * than an escape, and it is the behaviour asserted in the tests.
  */
-function realResolve(p: string): string {
-  const target = abs(p, config.workspaceDir);
-  let current = target;
+function realResolve(p: string): string | null {
+  let current = abs(p, config.workspaceDir);
   const tail: string[] = [];
+  let hops = 0;
+
   for (;;) {
     try {
       const real = realpathSync(current);
       return tail.length > 0 ? pathResolve(real, ...tail.reverse()) : real;
     } catch {
+      // ENOENT here is ambiguous: the name may be absent, or it may be a
+      // symlink whose target is absent. Only lstat can tell them apart.
+      let link: string | null = null;
+      try {
+        if (lstatSync(current).isSymbolicLink()) link = readlinkSync(current);
+      } catch {
+        // Genuinely not present — fall through to the parent walk.
+      }
+      if (link !== null) {
+        if (++hops > MAX_SYMLINK_HOPS) return null;
+        // Re-resolve the target with the SAME tail, so segments below the link
+        // stay attached below its destination.
+        current = pathResolve(dirname(current), link);
+        continue;
+      }
       const parent = dirname(current);
-      // Reached the filesystem root without finding anything that exists.
-      if (parent === current) return target;
+      if (parent === current) return null;
       tail.push(basename(current));
       current = parent;
     }
@@ -65,7 +99,7 @@ function realResolve(p: string): string {
 
 /** The skills root with symlinks and casing resolved. Recomputed per call: the
  *  directory is created by `start.ts` after this module is imported. */
-function realSkillsRoot(): string {
+function realSkillsRoot(): string | null {
   return realResolve(SKILLS_ROOT);
 }
 
@@ -86,7 +120,28 @@ function hasTraversalSegment(p: string): boolean {
 
 /** True when `p` really lands at or under the skills root. */
 function landsInSkills(p: string): boolean {
-  return isInside(realResolve(p), realSkillsRoot());
+  const real = realResolve(p);
+  const root = realSkillsRoot();
+  return real !== null && root !== null && isInside(real, root);
+}
+
+/**
+ * Tools whose input names a single file this callback may vet.
+ *
+ * GATED BY NAME, because the arm below reads `file_path ?? notebook_path ??
+ * path` off ANY tool's input. Tool input is model-authored, so an ungated arm
+ * is a bypass of everything else here: a `Bash` call carrying an unused
+ * `path: "<skills>/a.md"` alongside its real `command` took the file arm,
+ * returned `allow`, and the command ran without ever meeting the allowlist.
+ */
+const SKILLS_FILE_TOOLS = new Set([
+  "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+]);
+
+/** The subset of the SDK's options this callback reads. */
+interface SkillsPermissionOptions {
+  /** The path the SDK itself flagged as triggering the prompt. */
+  blockedPath?: string;
 }
 
 /** SDK canUseTool callback. The SDK auto-approves most tools under
@@ -107,9 +162,23 @@ function landsInSkills(p: string): boolean {
 export async function skillsCanUseTool(
   toolName: string,
   input: Record<string, unknown>,
+  options?: SkillsPermissionOptions,
 ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
-  const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
-  if (filePath && !hasTraversalSegment(filePath) && landsInSkills(filePath)) {
+  const inputPath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
+  // `blockedPath` is the SDK's own answer to "which path triggered this", so
+  // it is authoritative where the input is model-authored. BOTH must land
+  // inside when both are present — an allow is only as good as its narrowest
+  // claim.
+  const candidates = [options?.blockedPath, inputPath].filter(
+    (c): c is string => typeof c === "string" && c.length > 0,
+  );
+  const filePath = candidates[0];
+
+  if (
+    SKILLS_FILE_TOOLS.has(toolName)
+    && candidates.length > 0
+    && candidates.every((c) => !hasTraversalSegment(c) && landsInSkills(c))
+  ) {
     return { behavior: "allow", updatedInput: input };
   }
   // Bash — a strict allowlist of simple, fully-pathed commands inside the
@@ -226,20 +295,50 @@ function tokenizeSimpleCommand(command: string): string[] | null {
 }
 
 /**
- * Single-dash flag letters that never take a value, so a cluster of them
- * cannot be hiding a path.
+ * The longest single-dash cluster accepted.
  *
- * Anything not here — including any letter that takes an attached value —
- * refuses the whole command. `grep -f.env <skills>/x` reads its pattern list
- * from `.env`: `f` takes a value, and `-f.env` is one word, so a "does this
- * flag contain a slash" test never saw a path at all.
+ * A cap, not a preference. The check below is per character, and a character
+ * class cannot tell a cluster of flags from a flag with an ATTACHED VALUE made
+ * of the same letters — `grep -flah` is `-f lah` to BSD grep, which then reads
+ * its pattern list from the file `lah`. Three keeps `-rf`, `-la` and `-rfv`
+ * working while leaving very little room for a value to hide in.
  */
-const VALUELESS_SHORT_FLAG_LETTERS = new Set([
-  "r", "R", "f", "n", "l", "a", "p", "v", "i", "h", "1",
-]);
+const MAX_SHORT_FLAG_CLUSTER = 3;
 
 /**
- * The only long flags accepted, all value-less.
+ * Per program, the single-dash letters that take NO value.
+ *
+ * Per program because "valueless" is not a property of a letter. `-f` is
+ * `--force` to `cp`/`mv`/`rm` and `--file=FILE` to `grep`; `-n` is
+ * `--line-number` to `grep` and a line COUNT to `head`/`tail`. A single shared
+ * set let `grep -f.env <skills>/a.md` and `grep -flah <skills>/a.md` read a
+ * file outside the tree, so `f` is absent from grep's set.
+ *
+ * An empty set means "no short flags at all": `head`/`tail`/`stat`/`find` are
+ * left with none rather than reasoned about, since their interesting flags
+ * take values.
+ */
+const VALUELESS_SHORT_FLAGS: Record<string, ReadonlySet<string>> = {
+  ls: new Set(["l", "a", "1", "h", "R"]),
+  cat: new Set(["n"]),
+  head: new Set(),
+  tail: new Set(),
+  wc: new Set(["l", "w", "c"]),
+  mkdir: new Set(["p", "v"]),
+  cp: new Set(["r", "R", "f", "p", "v", "i"]),
+  mv: new Set(["f", "v", "i"]),
+  rm: new Set(["r", "R", "f", "v", "i"]),
+  rmdir: new Set(["p", "v"]),
+  touch: new Set(["a", "c", "m"]),
+  chmod: new Set(["R", "v"]),
+  stat: new Set(),
+  find: new Set(),
+  grep: new Set(["n", "l", "i", "r", "R", "v", "h"]),
+};
+
+/**
+ * The only long flags accepted, all value-less in every program that takes
+ * them.
  *
  * A long flag is refused unless it is on this list, which is what stops
  * `cp --target-directory=.. <skills>/x` — the attached value never has to be
@@ -250,20 +349,22 @@ const VALUELESS_LONG_FLAGS = new Set([
 ]);
 
 /**
- * A flag that provably carries no path.
+ * A flag that provably carries no path, for THIS program.
  *
  * `=` is refused outright, and so is `--` (the end-of-options separator) and a
  * bare `-` (stdin): neither is on the long list, and a bare `-` has no letters
- * to check. The point is that after this returns true, the word can be skipped
- * without inspecting it for paths — which is exactly what the previous version
- * did on the strength of "it has no slash in it".
+ * to check. After this returns true the word can be skipped without inspecting
+ * it for paths — which is what the previous version did on the strength of
+ * "it has no slash in it", and then on the strength of a shared letter set.
  */
-function isValuelessFlag(token: string): boolean {
+function isValuelessFlag(program: string, token: string): boolean {
   if (token.includes("=")) return false;
   if (token.startsWith("--")) return VALUELESS_LONG_FLAGS.has(token);
   const letters = token.slice(1);
-  if (letters.length === 0) return false;
-  return [...letters].every((c) => VALUELESS_SHORT_FLAG_LETTERS.has(c));
+  if (letters.length === 0 || letters.length > MAX_SHORT_FLAG_CLUSTER) return false;
+  const allowed = VALUELESS_SHORT_FLAGS[program];
+  if (!allowed) return false;
+  return [...letters].every((c) => allowed.has(c));
 }
 
 /**
@@ -291,6 +392,7 @@ function skillsPathArgument(token: string, strictDescendant: boolean): boolean {
   if (hasTraversalSegment(token)) return false;
   const real = realResolve(token);
   const root = realSkillsRoot();
+  if (real === null || root === null) return false;
   if (strictDescendant && real === root) return false;
   return isInside(real, root);
 }
@@ -322,9 +424,9 @@ function skillsPathArgument(token: string, strictDescendant: boolean): boolean {
  *   - every non-flag word is an ABSOLUTE, LITERAL path, free of `..` and `~`,
  *     whose realpath lands inside the resolved skills root — strictly inside
  *     it for `rm`/`rmdir`/`mv`, which would otherwise accept the root itself;
- *   - every flag is one that provably carries no value
- *     ({@link isValuelessFlag}); a flag with an attached or `=` value refuses
- *     the command outright rather than being parsed;
+ *   - every flag provably carries no value FOR THAT PROGRAM
+ *     ({@link isValuelessFlag}); an attached or `=` value, an over-long
+ *     cluster, or an unknown long flag refuses the command outright;
  *   - at least one path actually lands in the tree, so a command that names
  *     none of it is not auto-allowed by default.
  *
@@ -348,20 +450,21 @@ function bashStaysInSkills(command: string): boolean {
   if (!SKILLS_BASH_ALLOWED_PROGRAMS.has(program)) return false;
 
   const strictDescendant = REQUIRE_STRICT_DESCENDANT.has(program);
-  let landsInSkills = false;
+  // Named so it does not shadow the module-level `landsInSkills` predicate.
+  let namedSomethingInSkills = false;
   for (const arg of args) {
     if (arg.startsWith("-")) {
-      // Only flags that provably carry no value are skipped. Everything else
-      // — attached values, `=` values, unknown long flags — refuses the
-      // command rather than being reasoned about per program.
-      if (!isValuelessFlag(arg)) return false;
+      // Only flags that provably carry no value FOR THIS PROGRAM are skipped.
+      // Everything else — attached values, `=` values, over-long clusters,
+      // unknown long flags — refuses the command.
+      if (!isValuelessFlag(program, arg)) return false;
       continue;
     }
     if (!skillsPathArgument(arg, strictDescendant)) return false;
-    landsInSkills = true;
+    namedSomethingInSkills = true;
   }
 
-  return landsInSkills;
+  return namedSomethingInSkills;
 }
 
 // ---------------------------------------------------------------------------

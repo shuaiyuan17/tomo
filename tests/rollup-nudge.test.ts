@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { nudgeText } from "../src/lcm/runner.js";
 
-const promo = (level: "daily" | "weekly") => ({
+const promo = (level: "daily" | "weekly", replacesExistingBlock = false) => ({
   level,
   period: level === "daily" ? "2026-08-23" : "2026-W34",
   childCount: 42,
+  replacesExistingBlock,
 }) as Parameters<typeof nudgeText>[0];
 
 describe("rollup nudge text", () => {
@@ -27,5 +28,18 @@ describe("rollup nudge text", () => {
     // A weekly rollup is where intervals matter most — it spans the longest gaps.
     const weekly = nudgeText(promo("weekly"), "sess-1", "dm:someone");
     expect(weekly).toMatch(/elapsed interval carries meaning/);
+  });
+
+  it("warns that a rebuild replaces the existing block and requires a whole-period summary", () => {
+    const text = nudgeText(promo("daily", true), "sess-1", "dm:someone");
+    expect(text).toContain("already has a rollup block");
+    expect(text).toContain("REPLACES that block; it does not append");
+    expect(text).toContain("fresh summary covering the WHOLE period");
+    expect(text).toContain("Preserve the existing block's important content");
+  });
+
+  it("does not show the replacement warning for a first-time rollup", () => {
+    const text = nudgeText(promo("daily"), "sess-1", "dm:someone");
+    expect(text).not.toContain("REPLACES that block");
   });
 });

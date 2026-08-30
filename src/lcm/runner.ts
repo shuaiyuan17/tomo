@@ -56,6 +56,11 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
   const lines = [
     `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
+    ...(p.replacesExistingBlock ? [
+      `IMPORTANT: \`${p.level} ${p.period}\` already has a rollup block. The command below REPLACES that block; it does not append to it.`,
+      "Write a fresh summary covering the WHOLE period. Preserve the existing block's important content and integrate the newly eligible source material.",
+      "",
+    ] : []),
     "The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:",
     `  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`,
     "",

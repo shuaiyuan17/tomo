@@ -8,19 +8,26 @@ import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../worksp
 // canUseTool: re-allow `.claude/skills/` under bypassPermissions
 // ---------------------------------------------------------------------------
 
-const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;
+/** Canonical (resolved, no trailing slash) skills root. */
+const SKILLS_ROOT = pathResolve(config.workspaceDir, ".claude", "skills");
+const SKILLS_DIR = `${SKILLS_ROOT}/`;
 
 /** SDK canUseTool callback. The SDK auto-approves most tools under
  *  `bypassPermissions`, but writes to `.claude/`, `.git/`, etc. are protected
  *  and fall through to canUseTool. We narrowly re-allow `.claude/skills/` so
  *  tomo can manage its own skill library; every other protected path stays
- *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes. */
+ *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes.
+ *
+ *  The path is RESOLVED before it is compared. A raw `startsWith` on the
+ *  skills prefix accepted `<skills>/../../.claude/settings.json`, which is
+ *  exactly one of the protected paths the SDK deferred to this callback — the
+ *  narrow re-allow became a hole through the whole protection. */
 export async function skillsCanUseTool(
   toolName: string,
   input: Record<string, unknown>,
 ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
   const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
-  if (filePath && filePath.startsWith(SKILLS_DIR)) {
+  if (filePath && isInside(abs(filePath, config.workspaceDir), SKILLS_ROOT)) {
     return { behavior: "allow", updatedInput: input };
   }
   // Bash mkdir / touch / etc. — allow if command targets the skills dir.

@@ -9,7 +9,7 @@ vi.mock("../src/config.js", () => ({
   config: { workspaceDir: "/tmp/tomo-mock-permissions" },
 }));
 
-const { isPrivateMemoryAccess } = await import("../src/agent/permissions.js");
+const { isPrivateMemoryAccess, skillsCanUseTool } = await import("../src/agent/permissions.js");
 
 const ctx = {
   cwd: "/ws",
@@ -232,5 +232,52 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
       expect(isPrivateMemoryAccess("WebSearch", { query: "private memory" }, ctx)).toBe(false);
       expect(isPrivateMemoryAccess("TaskCreate", { task: "test" }, ctx)).toBe(false);
     });
+  });
+});
+
+// The mocked workspaceDir above; skillsCanUseTool derives its allowed root from it.
+const WS = "/tmp/tomo-mock-permissions";
+const SKILLS = `${WS}/.claude/skills`;
+
+describe("skillsCanUseTool — narrow .claude/skills/ re-allow", () => {
+  it("allows a write inside the skills dir", async () => {
+    const r = await skillsCanUseTool("Write", { file_path: `${SKILLS}/my-skill/SKILL.md` });
+    expect(r.behavior).toBe("allow");
+  });
+
+  it("allows notebook_path and path inputs inside the skills dir", async () => {
+    expect((await skillsCanUseTool("NotebookEdit", { notebook_path: `${SKILLS}/a/b.ipynb` })).behavior)
+      .toBe("allow");
+    expect((await skillsCanUseTool("Read", { path: `${SKILLS}/a/b.md` })).behavior)
+      .toBe("allow");
+  });
+
+  it("denies a path outside the skills dir", async () => {
+    const r = await skillsCanUseTool("Write", { file_path: `${WS}/.claude/settings.json` });
+    expect(r.behavior).toBe("deny");
+  });
+
+  it("denies traversal that escapes the skills dir into .claude/", async () => {
+    const r = await skillsCanUseTool("Write", {
+      file_path: `${SKILLS}/../../.claude/settings.json`,
+    });
+    expect(r.behavior).toBe("deny");
+  });
+
+  it("denies traversal that escapes the workspace entirely", async () => {
+    const r = await skillsCanUseTool("Write", {
+      file_path: `${SKILLS}/../../../../../../etc/passwd`,
+    });
+    expect(r.behavior).toBe("deny");
+  });
+
+  it("denies a sibling directory that merely shares the skills prefix", async () => {
+    const r = await skillsCanUseTool("Write", { file_path: `${WS}/.claude/skills-evil/x.md` });
+    expect(r.behavior).toBe("deny");
+  });
+
+  it("denies when no path is present at all", async () => {
+    const r = await skillsCanUseTool("WebFetch", { url: "https://example.com" });
+    expect(r.behavior).toBe("deny");
   });
 });

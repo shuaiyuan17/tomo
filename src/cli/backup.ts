@@ -24,7 +24,36 @@ const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
 // over two weeks, so 14 days was holding 32 GB on a disk that was down to 21 GB
 // free. Seven days of local history plus the other two legs is the trade we
 // picked (2026-08-16). Override with TOMO_BACKUP_RETENTION_DAYS.
-const RETENTION_DAYS = Number(process.env.TOMO_BACKUP_RETENTION_DAYS ?? 7);
+export const DEFAULT_RETENTION_DAYS = 7;
+
+/**
+ * Resolve the retention window from `TOMO_BACKUP_RETENTION_DAYS`.
+ *
+ * This used to be a bare `Number(env ?? 7)`, which failed in both directions
+ * and silently. `"7d"` — a plausible typo in a shell profile or a launchd
+ * `EnvironmentVariables` block — is `NaN`, so `Date.now() - NaN` is `NaN`,
+ * every `date < NaN` is false, and pruning stops entirely with no "Pruned N"
+ * line to notice: exactly the unbounded growth this file's comment above was
+ * written about. `0` (or a negative) puts the cutoff at or after now, so the
+ * backup that was just created is itself deleted, along with every other one,
+ * and the command then prints `Backup complete: 0 B` because the size is read
+ * after the prune.
+ *
+ * Anything not a finite value >= 1 falls back to the default and says so.
+ */
+export function resolveRetentionDays(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_RETENTION_DAYS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    console.warn(
+      `Ignoring TOMO_BACKUP_RETENTION_DAYS=${JSON.stringify(raw)} (expected a number of days >= 1); using ${DEFAULT_RETENTION_DAYS}.`,
+    );
+    return DEFAULT_RETENTION_DAYS;
+  }
+  return parsed;
+}
+
+const RETENTION_DAYS = resolveRetentionDays(process.env.TOMO_BACKUP_RETENTION_DAYS);
 
 function timestamp(): string {
   const now = new Date();
@@ -65,10 +94,24 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+/**
+ * The only shape a backup directory name may have: `YYYY-MM-DD_HHMM`, as
+ * produced by `timestamp()`.
+ *
+ * `listBackups` has always filtered on this, but `tomo backup restore <date>`
+ * joined its argument onto BACKUPS_DIR unchecked — so `restore ../../..` named
+ * an arbitrary directory, which the restore then treats as a backup: it
+ * `rmSync`s the live `~/.tomo/data` and `sdk-sessions` and copies whatever it
+ * finds (or nothing) over them. Same predicate, both places.
+ */
+export function isBackupName(name: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}_\d{4}$/.test(name);
+}
+
 function listBackups(): { name: string; path: string; date: Date; size: number }[] {
   if (!existsSync(BACKUPS_DIR)) return [];
   const entries = readdirSync(BACKUPS_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && /^\d{4}-\d{2}-\d{2}_\d{4}$/.test(e.name))
+    .filter((e) => e.isDirectory() && isBackupName(e.name))
     .map((e) => {
       const full = join(BACKUPS_DIR, e.name);
       // Parse date from folder name: YYYY-MM-DD_HHMM
@@ -231,6 +274,12 @@ backupCommand
           // process not alive — stale PID file, continue
         }
       }
+    }
+
+    if (!isBackupName(date)) {
+      console.error(`Not a backup name: ${date} (expected YYYY-MM-DD_HHMM).`);
+      console.error("Run 'tomo backup list' to see available backups.");
+      process.exit(1);
     }
 
     const backupPath = join(BACKUPS_DIR, date);

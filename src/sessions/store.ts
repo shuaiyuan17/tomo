@@ -369,11 +369,39 @@ function usableTimestamp(msg: SessionMessage): number | null {
     && msg.timestamp >= MIN_PLAUSIBLE_TIMESTAMP_MS
     ? msg.timestamp
     : null;
+
+ * The registry file exists but could not be turned into a session list — a
+ * JSON parse failure, a transient `EMFILE`/`EIO`, a half-restored file. Carries
+ * the underlying error as `cause`.
+ *
+ * Thrown by `saveRegistry()` rather than by the read: the read keeps serving
+ * the last state we successfully loaded, which is strictly better than `[]`,
+ * but nothing may be persisted from it until the file can be read again.
+ */
+export class SessionRegistryReadError extends Error {
+  readonly path: string;
+  constructor(path: string, cause: unknown) {
+    super(`session registry could not be read: ${path}`, { cause });
+    this.name = "SessionRegistryReadError";
+    this.path = path;
+  }
 }
 
 export class SessionStore {
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
+  /**
+   * Set when the last load failed. While it is set the in-memory registry is
+   * the last good state (or the empty initial one, if we have never had a good
+   * read) and MUST NOT be written back: every mutator is loadRegistry() then
+   * saveRegistry(), so persisting here is what turned one unreadable instant
+   * into a permanently empty registry — every session→SDK-session link gone,
+   * every JSONL orphaned beyond the reach of cleanupExpired. Cleared by the
+   * next successful load.
+   */
+  private registryLoadError: SessionRegistryReadError | null = null;
+  /** The failure is logged once per failure streak, not once per mutator. */
+  private registryLoadErrorLogged = false;
   // Stat of the registry file as of the last read/write. loadRegistry() is
   // called on nearly every store operation to pick up external changes
   // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
@@ -1084,29 +1112,88 @@ export class SessionStore {
 
   private loadRegistry(): void {
     const file = this.registryPath;
-    const stat = this.statRegistry();
+
+    // "No file at all" and "file we cannot read" are different states, and
+    // conflating them is the whole bug: only the first one legitimately means
+    // there are no sessions. statSync's own errors have to be split the same
+    // way — an EACCES on the directory is not an absent registry.
+    let stat: { mtimeMs: number; size: number } | null;
+    try {
+      const s = statSync(file);
+      stat = { mtimeMs: s.mtimeMs, size: s.size };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.onRegistryLoadFailure(err);
+        return;
+      }
+      stat = null;
+    }
+
     if (!stat) {
+      // Legitimately empty: a fresh install, or `tomo sessions clear`. This is
+      // a successful load, so it clears any earlier failure.
+      this.clearRegistryLoadError();
       this.registryStat = null;
       // Migrate from old _sdk_sessions.json if it exists
       this.migrateOldFormat();
       return;
     }
-    if (this.registryStat
+    // Skip the stat cache while we are in a failed state: the point of every
+    // subsequent call is to find out whether the file has become readable.
+    if (this.registryLoadError === null
+      && this.registryStat
       && this.registryStat.mtimeMs === stat.mtimeMs
       && this.registryStat.size === stat.size) {
       return;
     }
+    let data: SessionRegistry;
     try {
-      const data: SessionRegistry = JSON.parse(readFileSync(file, "utf-8"));
-      this.registry = data.sessions ?? [];
-      this.registryStat = stat;
-    } catch {
-      this.registry = [];
-      this.registryStat = null;
+      data = JSON.parse(readFileSync(file, "utf-8")) as SessionRegistry;
+    } catch (err) {
+      this.onRegistryLoadFailure(err);
+      return;
+    }
+    if (data === null || typeof data !== "object"
+      || (data.sessions !== undefined && !Array.isArray(data.sessions))) {
+      this.onRegistryLoadFailure(new Error("missing or malformed `sessions` array"));
+      return;
+    }
+    this.registry = data.sessions ?? [];
+    this.registryStat = stat;
+    this.clearRegistryLoadError();
+  }
+
+  /**
+   * Record that the registry could not be read. Deliberately leaves
+   * `this.registry` and `this.registryStat` alone: the last state we
+   * successfully loaded is the best information we have, and resetting to `[]`
+   * is exactly what the next saveRegistry() would have made permanent.
+   */
+  private onRegistryLoadFailure(err: unknown): void {
+    this.registryLoadError = new SessionRegistryReadError(this.registryPath, err);
+    if (!this.registryLoadErrorLogged) {
+      this.registryLoadErrorLogged = true;
+      log.error(
+        { err, file: this.registryPath },
+        "Session registry unreadable; keeping the last known-good state in memory " +
+        "and refusing to persist until it can be read again",
+      );
     }
   }
 
+  private clearRegistryLoadError(): void {
+    if (this.registryLoadError === null) return;
+    this.registryLoadError = null;
+    this.registryLoadErrorLogged = false;
+    log.info({ file: this.registryPath }, "Session registry readable again");
+  }
+
   private saveRegistry(): void {
+    // Refuse to publish state we could not read. Loud beats silent here: the
+    // alternative is writing `{version:1,sessions:[]}` over a file that still
+    // holds every session→SDK-session link, which is unrecoverable and, as
+    // shipped, had no log line at all.
+    if (this.registryLoadError !== null) throw this.registryLoadError;
     const data: SessionRegistry = { version: 1, sessions: this.registry };
     writeJsonAtomicSync(this.registryPath, data);
     // Record our own write's stat so the next loadRegistry() doesn't re-read

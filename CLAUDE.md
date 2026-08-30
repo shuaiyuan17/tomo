@@ -89,7 +89,7 @@ Use the helpers in `src/sessions/keys.ts` — don't re-parse keys by hand:
 2. `session.send(text)` — sends a user message, returns the full assistant response
 3. `runWithRetry(key, prompt)` — send with auto-retry on session errors (resets and retries once)
 
-SDK session IDs are persisted in the session registry so conversations survive daemon restarts.
+SDK session IDs are persisted in the session registry so conversations survive daemon restarts. A registry that cannot be read is not an empty one: `loadRegistry()` separates ENOENT (legitimately empty) from a read/parse failure, keeps the last known-good state in memory, and makes `saveRegistry()` throw `SessionRegistryReadError` until a later load succeeds — so one unreadable instant can no longer be persisted as `{version:1,sessions:[]}`.
 
 With config `steering` (default on), user messages that arrive mid-turn bypass the per-session queue via `session.steer(text)` — they either merge into the in-flight turn or are promoted to their own follow-up turn. Details (STEER_MERGED sentinel, replay detection, idle-wait) live in `src/agent/turn-runner.ts` and `src/agent/live-session.ts`; set `steering: false` or `TOMO_STEERING=false` to keep mid-turn messages queued.
 

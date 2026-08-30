@@ -6,7 +6,7 @@ import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, type DuePromotion } fro
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
 import { formatTomoEvent } from "../tomo-event.js";
-import { NudgeCooldownStore } from "./nudge-cooldown-store.js";
+import { NudgeCooldownStore, nudgeCooldownStore } from "./nudge-cooldown-store.js";
 
 /**
  * Periodic rollup promotion checker.
@@ -100,8 +100,10 @@ export class RollupRunner {
 
   constructor(agent: Agent, cooldowns?: NudgeCooldownStore) {
     this.agent = agent;
-    // Loads on construction — i.e. before start() can fire the first check.
-    this.lastNudged = cooldowns ?? new NudgeCooldownStore(defaultNudgeCooldownPath());
+    // Shared per path and loaded on first construction — i.e. before start()
+    // can fire the first check, and without a second runner in this process
+    // holding an independent snapshot of the same file.
+    this.lastNudged = cooldowns ?? nudgeCooldownStore(defaultNudgeCooldownPath());
   }
 
   start(): void {
@@ -145,7 +147,7 @@ export class RollupRunner {
         // Debounce — filter out ones we nudged recently
         const fresh = due.filter((p) => {
           const k = `${sessionKey}:${p.level}:${p.period}`;
-          const last = this.lastNudged.get(k);
+          const last = this.lastNudged.get(k, now);
           return !last || now - last >= NUDGE_COOLDOWN_MS;
         });
         if (fresh.length === 0) continue;

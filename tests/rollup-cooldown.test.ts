@@ -10,9 +10,13 @@
  *
  * A restart is modelled here the way the process does it: throw the runner away
  * and build a NEW one over a NEW store reading the SAME file.
+ *
+ * (The store is injected in this file so the store's own contracts can be
+ * exercised directly. `rollup-cooldown-wiring.test.ts` covers the other half:
+ * that production actually wires the default store up.)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -25,100 +29,174 @@ vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
 }));
 
 const { RollupRunner } = await import("../src/lcm/runner.js");
-const { NudgeCooldownStore, NUDGE_COOLDOWN_RETENTION_MS } =
-  await import("../src/lcm/nudge-cooldown-store.js");
+const {
+  NudgeCooldownStore,
+  nudgeCooldownStore,
+  resetNudgeCooldownStores,
+  NUDGE_COOLDOWN_RETENTION_MS,
+  NUDGE_COOLDOWN_FUTURE_SLACK_MS,
+} = await import("../src/lcm/nudge-cooldown-store.js");
 const { log } = await import("../src/logger.js");
 
 const TEST_DIR = join(tmpdir(), "tomo-test-rollup-cooldown");
 const FILE = join(TEST_DIR, "nudge-cooldown.json");
 const SESSION = "dm:owner";
 const KEY = `${SESSION}:daily:2026-08-28`;
+const T0715 = new Date("2026-08-29T07:15:00").getTime();
 
-/** A daemon lifetime: one runner over one store reading `FILE`. */
-function bootRunner(): { runner: InstanceType<typeof RollupRunner>; nudges: string[] } {
+type Store = InstanceType<typeof NudgeCooldownStore>;
+
+/** A daemon lifetime: one runner over one store. */
+function bootRunner(store: Store): { runner: InstanceType<typeof RollupRunner>; nudges: string[] } {
   const nudges: string[] = [];
   const agent = {
     listActiveSessions: () => [[SESSION, "sdk-session-1"]] as Array<[string, string]>,
     handleCronMessage: async (text: string) => { nudges.push(text); return true; },
   };
-  return {
-    runner: new RollupRunner(agent as never, new NudgeCooldownStore(FILE)),
-    nudges,
-  };
+  return { runner: new RollupRunner(agent as never, store), nudges };
 }
 
 /** `checkAll` is private; the scheduler is the only production caller. */
 const checkAll = (runner: InstanceType<typeof RollupRunner>) =>
   (runner as unknown as { checkAll(): Promise<void> }).checkAll();
 
+const onDisk = (): Record<string, number> => JSON.parse(readFileSync(FILE, "utf-8")).nudged;
+
 describe("rollup nudge cooldown persistence", () => {
   beforeEach(() => {
     rmSync(TEST_DIR, { recursive: true, force: true });
     mkdirSync(TEST_DIR, { recursive: true });
+    resetNudgeCooldownStores();
     // The runner skips outside 07:00–22:00; pin a daytime clock.
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-29T07:15:00"));
+    vi.setSystemTime(new Date(T0715));
     vi.mocked(log.warn).mockClear();
   });
   afterEach(() => {
     vi.useRealTimers();
+    resetNudgeCooldownStores();
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
   it("still holds the cooldown after a restart — the 08:14 → 08:16 re-nudge", async () => {
-    const first = bootRunner();
+    const first = bootRunner(new NudgeCooldownStore(FILE));
     await checkAll(first.runner);
     expect(first.nudges).toHaveLength(1);
 
     // 08:14: daemon restarts. 08:16: first check of the new process.
     vi.setSystemTime(new Date("2026-08-29T08:16:00"));
-    const afterRestart = bootRunner();
+    const afterRestart = bootRunner(new NudgeCooldownStore(FILE));
     await checkAll(afterRestart.runner);
     expect(afterRestart.nudges).toHaveLength(0);
 
     // ...and the window still expires normally (07:15 + 6h).
     vi.setSystemTime(new Date("2026-08-29T13:16:00"));
-    const later = bootRunner();
+    const later = bootRunner(new NudgeCooldownStore(FILE));
     await checkAll(later.runner);
     expect(later.nudges).toHaveLength(1);
   });
 
-  it("treats a corrupt cooldown file as empty, logs once, and keeps nudging", async () => {
+  it("shares one store per path, so two runners in one process share one cooldown", async () => {
+    expect(nudgeCooldownStore(FILE)).toBe(nudgeCooldownStore(FILE));
+
+    const first = bootRunner(nudgeCooldownStore(FILE));
+    await checkAll(first.runner);
+    expect(first.nudges).toHaveLength(1);
+
+    // No reload involved — the second runner reads the same live map.
+    const second = bootRunner(nudgeCooldownStore(FILE));
+    await checkAll(second.runner);
+    expect(second.nudges).toHaveLength(0);
+  });
+
+  it("merges on write, so a second store over the same path can't erase the first's entries", () => {
+    const a = new NudgeCooldownStore(FILE);
+    const b = new NudgeCooldownStore(FILE); // independent snapshot, loaded empty
+
+    a.set("dm:owner:daily:2026-08-27", T0715 - 1000);
+    b.set(KEY, T0715); // b never saw a's entry; a naive rewrite would drop it
+
+    expect(Object.keys(onDisk()).sort()).toEqual(["dm:owner:daily:2026-08-27", KEY].sort());
+
+    // ...and the merge is symmetric: a's next write picks up b's entry.
+    a.set("dm:owner:daily:2026-08-26", T0715);
+    expect(Object.keys(onDisk()).sort())
+      .toEqual(["dm:owner:daily:2026-08-26", "dm:owner:daily:2026-08-27", KEY].sort());
+    expect(a.size()).toBe(3);
+
+    // Newest timestamp per key wins, never the last writer's stale copy.
+    b.set(KEY, T0715 + 60_000);
+    a.set(KEY, T0715);
+    expect(onDisk()[KEY]).toBe(T0715 + 60_000);
+  });
+
+  it("treats a corrupt cooldown file as empty, warns once per process, and keeps nudging", async () => {
     writeFileSync(FILE, "{ this is not json");
 
-    const { runner, nudges } = bootRunner();
+    // Two runners, one shared store: the file is parsed once, so one warning.
+    const first = bootRunner(nudgeCooldownStore(FILE));
+    const second = bootRunner(nudgeCooldownStore(FILE));
     expect(vi.mocked(log.warn)).toHaveBeenCalledTimes(1);
 
     // Empty, not stuck: the period is nudged, and the file is rewritten clean.
-    await checkAll(runner);
-    expect(nudges).toHaveLength(1);
-    expect(JSON.parse(readFileSync(FILE, "utf-8")).nudged[KEY])
-      .toBe(new Date("2026-08-29T07:15:00").getTime());
+    await checkAll(first.runner);
+    expect(first.nudges).toHaveLength(1);
+    expect(onDisk()[KEY]).toBe(T0715);
+    await checkAll(second.runner);
+    expect(second.nudges).toHaveLength(0);
 
     // A missing file is the same story, without the warning.
     rmSync(FILE);
+    resetNudgeCooldownStores();
     vi.mocked(log.warn).mockClear();
-    const fresh = bootRunner();
+    const fresh = bootRunner(nudgeCooldownStore(FILE));
     expect(vi.mocked(log.warn)).not.toHaveBeenCalled();
     await checkAll(fresh.runner);
     expect(fresh.nudges).toHaveLength(1);
   });
 
-  it("prunes entries older than the retention window on write", async () => {
-    const now = new Date("2026-08-29T07:15:00").getTime();
-    const stale = now - NUDGE_COOLDOWN_RETENTION_MS - 1;
-    const recent = now - NUDGE_COOLDOWN_RETENTION_MS + 60_000;
+  it("ignores and drops future-dated entries — a backward clock correction can't suppress for years", async () => {
+    // Written by a clock that was days fast; the clock has since been fixed.
+    // `now - last` is negative, so a naive check suppresses until it catches up.
+    writeFileSync(FILE, JSON.stringify({
+      version: 1,
+      nudged: { [KEY]: T0715 + 3 * 24 * 60 * 60 * 1000 },
+    }));
+
+    const { runner, nudges } = bootRunner(new NudgeCooldownStore(FILE));
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(onDisk()[KEY]).toBe(T0715); // replaced by a sane stamp, not kept
+
+    // Ordinary small skew is still honoured as a cooldown.
+    const skewed = T0715 + NUDGE_COOLDOWN_FUTURE_SLACK_MS - 1000;
+    writeFileSync(FILE, JSON.stringify({ version: 1, nudged: { [KEY]: skewed } }));
+    const tolerant = bootRunner(new NudgeCooldownStore(FILE));
+    await checkAll(tolerant.runner);
+    expect(tolerant.nudges).toHaveLength(0);
+  });
+
+  it("prunes entries older than the retention window", () => {
+    const stale = T0715 - NUDGE_COOLDOWN_RETENTION_MS - 1;
+    const recent = T0715 - NUDGE_COOLDOWN_RETENTION_MS + 60_000;
     writeFileSync(FILE, JSON.stringify({
       version: 1,
       nudged: { "dm:owner:daily:2026-08-01": stale, "dm:owner:daily:2026-08-22": recent },
     }));
 
     const store = new NudgeCooldownStore(FILE);
-    expect(store.size()).toBe(2); // load keeps whatever is there
-    store.set(KEY, now);
+    expect(store.size()).toBe(1); // the stale one never makes it into memory
+    store.set(KEY, T0715);
 
-    const onDisk = JSON.parse(readFileSync(FILE, "utf-8")).nudged;
-    expect(Object.keys(onDisk).sort()).toEqual(["dm:owner:daily:2026-08-22", KEY].sort());
+    expect(Object.keys(onDisk()).sort()).toEqual(["dm:owner:daily:2026-08-22", KEY].sort());
     expect(store.size()).toBe(2);
+    expect(existsSync(FILE)).toBe(true);
+  });
+
+  it("works purely in memory with a null path", async () => {
+    const { runner, nudges } = bootRunner(new NudgeCooldownStore(null));
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(existsSync(FILE)).toBe(false);
   });
 });

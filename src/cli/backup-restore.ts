@@ -39,13 +39,15 @@ import { basename, dirname, join } from "node:path";
  * beside its destination is guaranteed to be on the same one; a temp directory
  * under `/tmp` is not, and would silently degrade the swap back into a copy.
  *
- * THE COST, STATED PLAINLY. Staging means the copy exists alongside the live
- * tree, so a restore now needs room for both — where the old code freed the
- * live tree's space first. A restore that used to *just* fit may now fail with
- * ENOSPC. That is the trade being made deliberately: the old code bought that
- * headroom by destroying the only copy of the live data before it knew the new
- * one would land. Failing while everything is still intact is the better half
- * of that bargain, and the error names the leg it died on.
+ * THE COST, STATED PLAINLY. At the peak, three copies of the data exist at
+ * once: the backup, the live tree, and the staged copy. The old code only ever
+ * held two, because it deleted the live tree before copying. So a restore that
+ * used to *just* fit can now be refused. That is the trade being made
+ * deliberately — the old code bought that headroom by destroying the only copy
+ * of the live data before it knew the new one would land — and the refusal is
+ * now a PRE-FLIGHT (see the free-space check in restoreLegsStaged) that states
+ * both numbers before writing anything, rather than an ENOSPC part-way
+ * through a copy.
  */
 
 /** One component of a backup: a source inside the backup and where it goes. */
@@ -100,8 +102,16 @@ function pathExists(path: string): boolean {
  * passes `dereference: false`: source and staging then have identical
  * structure, so identical counts are a real check rather than an approximate
  * one. (`cpSync`'s default, `dereference: true`, would turn one symlink into a
- * whole subtree and make any comparison meaningless — as well as silently
- * inflating a restore, which is a separate note in #312's finding 41.)
+ * whole subtree and make any comparison meaningless.)
+ *
+ * WHAT THAT DOES AND DOES NOT CHANGE for a real restore: `backup create`
+ * copies these legs with `cpSync`'s default (`copyIfExists`, backup.ts:80 —
+ * only the skills copy at :287 passes `dereference: false`), so a backup made
+ * by tomo contains no symlinks in `data/`, `sdk-sessions/` or `config.json` in
+ * the first place. Preserving them here therefore changes nothing for those
+ * backups; it matters only for a hand-assembled backup directory, where it is
+ * also the safer reading of intent. The asymmetry on the create side is #312's
+ * finding 41 and is not addressed by this PR.
  *
  * Deliberately not a checksum: backups carry no manifest to check against, so
  * a hash would only prove the copy matches a source we just read — at the cost

@@ -36,6 +36,8 @@ const paths = vi.hoisted(() => {
     failParkWhenSrcEndsWith: null as string | null,
     /** Fail every rename that would put a parked copy back. */
     failRestoreFromPreRestore: false,
+    /** Make lstat of this path fail with EIO — "unreadable", not "absent". */
+    failLstatWhenPathEndsWith: null as string | null,
   };
 });
 
@@ -82,6 +84,16 @@ vi.mock("node:fs", async (orig) => {
       }
       return (actual.cpSync as (...a: unknown[]) => unknown)(src, dest, opts);
     }) as typeof actual.cpSync,
+    lstatSync: ((path: unknown, opts?: unknown) => {
+      if (
+        paths.failLstatWhenPathEndsWith
+        && typeof path === "string"
+        && path.endsWith(paths.failLstatWhenPathEndsWith)
+      ) {
+        throw errno("EIO", `EIO: i/o error, lstat '${path}'`);
+      }
+      return (actual.lstatSync as (...a: unknown[]) => unknown)(path, opts);
+    }) as typeof actual.lstatSync,
     renameSync: ((from: unknown, to: unknown) => {
       const f = String(from);
       const t = String(to);
@@ -102,9 +114,12 @@ function errno(code: string, message: string): NodeJS.ErrnoException {
   return err;
 }
 
-const { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } = await import("node:fs");
+const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } =
+  await import("node:fs");
+const actualCopy = (from: string, to: string): void => cpSync(from, to, { recursive: true, dereference: false });
 const { backupCommand } = await import("../src/cli/backup.js");
-const { restoreLegsStaged, StagedRestoreError, sweepRestoreLeftovers } = await import("../src/cli/backup-restore.js");
+const { acquireRestoreLock, RestoreLockHeldError, restoreLegsStaged, StagedRestoreError, sweepRestoreLeftovers } =
+  await import("../src/cli/backup-restore.js");
 
 afterAll(() => {
   rmSync(paths.home, { recursive: true, force: true });
@@ -126,6 +141,7 @@ function resetInjections(): void {
   paths.failCopyWhenSrcEndsWith = null;
   paths.failParkWhenSrcEndsWith = null;
   paths.failRestoreFromPreRestore = false;
+  paths.failLstatWhenPathEndsWith = null;
 }
 
 // --------------------------------------------------------------------------
@@ -439,7 +455,153 @@ describe("tomo backup restore — a leg fails to copy", () => {
   });
 });
 
+describe("restoreLegsStaged — what it refuses to guess", () => {
+  it("does not treat an unreadable live path as absent", () => {
+    // A file leg, because that is where a wrong answer is silent: `rename`
+    // onto an existing FILE overwrites it. If "EIO on lstat" read as "nothing
+    // live here", the swap would skip parking, rename the staged copy over the
+    // original, and a later rollback would have nothing to put back while
+    // calling itself clean.
+    const src = join(paths.unit, "backup", "config.json");
+    const dest = join(paths.unit, "live", "config.json");
+    mkdirSync(join(paths.unit, "backup"), { recursive: true });
+    mkdirSync(join(paths.unit, "live"), { recursive: true });
+    writeFileSync(src, "from backup");
+    writeFileSync(dest, "the only live copy");
+    paths.failLstatWhenPathEndsWith = join("live", "config.json");
+
+    let thrown: unknown;
+    try {
+      restoreLegsStaged([{ label: "config.json", src, dest }], { freeSpace: () => null });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(StagedRestoreError);
+    expect((thrown as Error).message).toMatch(/EIO/);
+    paths.failLstatWhenPathEndsWith = null;
+    expect(readFileSync(dest, "utf-8")).toBe("the only live copy");
+    expect(leftovers(join(paths.unit, "live"))).toEqual([]);
+  });
+
+  it("names the entry on which the staged copy differs, not just a total", () => {
+    // Same entry count, same total bytes, different tree: a copy that dropped
+    // one file and gained another of the same size. Count-plus-size cannot see
+    // it; a per-entry manifest names the first entry that differs.
+    const { legs } = unitFixture();
+    let thrown: unknown;
+    try {
+      restoreLegsStaged(legs, {
+        freeSpace: () => null,
+        copy: (from, to) => {
+          actualCopy(from, to);
+          if (from.endsWith("alpha")) renameSync(join(to, "file.txt"), join(to, "eile.txt"));
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect((thrown as Error).message).toMatch(/alpha\/: staged copy does not match the backup/);
+    expect((thrown as Error).message).toContain("eile.txt");
+    expect(leftovers(join(paths.unit, "live"))).toEqual([]);
+  });
+
+  it("checks free space on the volume each leg is going to, not just the first", () => {
+    // sdkSessionsDir is configurable and can live on another disk. A roomy
+    // first volume must not vouch for a full second one.
+    const src = join(paths.unit, "backup");
+    mkdirSync(join(src, "alpha"), { recursive: true });
+    writeFileSync(join(src, "alpha", "file.txt"), "x".repeat(100));
+    mkdirSync(join(src, "beta"), { recursive: true });
+    writeFileSync(join(src, "beta", "file.txt"), "y".repeat(100));
+    const legs: RestoreLeg[] = [
+      { label: "alpha/", src: join(src, "alpha"), dest: join(paths.unit, "diskA", "alpha") },
+      { label: "beta/", src: join(src, "beta"), dest: join(paths.unit, "diskB", "beta") },
+    ];
+
+    expect(() => restoreLegsStaged(legs, {
+      volumeOf: (path) => (path.endsWith("diskB") ? "B" : "A"),
+      freeSpace: (path) => (path.endsWith("diskB") ? 10 : 10 ** 12),
+    })).toThrow(/not enough free space[\s\S]*volume holding .*diskB/);
+    expect(existsSync(join(paths.unit, "diskA", "alpha"))).toBe(false);
+  });
+});
+
+describe("acquireRestoreLock", () => {
+  it("refuses while another restore holds the lock", () => {
+    const dir = join(paths.unit, "tomo");
+    const release = acquireRestoreLock(dir, { pid: 1111, isAlive: () => true });
+
+    expect(() => acquireRestoreLock(dir, { pid: 2222, isAlive: () => true })).toThrow(RestoreLockHeldError);
+    expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("1111");
+
+    release();
+    expect(existsSync(join(dir, "restore.lock"))).toBe(false);
+  });
+
+  it("takes over a lock whose holder is gone", () => {
+    const dir = join(paths.unit, "tomo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "restore.lock"), "1111\n");
+    // Old enough that an unreadable pid would not be read as "still writing".
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "restore.lock"), old, old);
+
+    const release = acquireRestoreLock(dir, { pid: 2222, isAlive: (pid) => pid !== 1111 });
+
+    expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("2222");
+    release();
+    expect(existsSync(join(dir, "restore.lock"))).toBe(false);
+  });
+
+  it("releases only its own lock", () => {
+    // The lock was taken over by a later restore after this one was judged
+    // dead; releasing must not remove the newer holder's lock.
+    const dir = join(paths.unit, "tomo");
+    const release = acquireRestoreLock(dir, { pid: 1111, isAlive: () => true });
+    writeFileSync(join(dir, "restore.lock"), "3333\n");
+
+    release();
+
+    expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("3333");
+  });
+});
+
 describe("sweepRestoreLeftovers", () => {
+  it("ignores names that merely start with the leg's prefix", () => {
+    // Anything moved onto the live path BECOMES the live data, so only a name
+    // this module could have written qualifies. A user's own directory that
+    // happens to share the prefix is neither moved nor reported.
+    const dest = join(paths.unit, "live", "data");
+    mkdirSync(join(paths.unit, "live"), { recursive: true });
+    const impostor = `${dest}.pre-restore-z`;
+    mkdirSync(impostor, { recursive: true });
+    writeFileSync(join(impostor, "registry.json"), "not a backup of anything");
+
+    const found = sweepRestoreLeftovers([{ label: "data/", dest }]);
+
+    expect(found).toEqual([]);
+    expect(existsSync(dest)).toBe(false);
+    expect(existsSync(impostor)).toBe(true);
+  });
+
+  it("leaves two parked copies alone even when the live path is missing", () => {
+    // Two interrupted restores. Which parked copy is "the" original is not
+    // knowable here — stamps from the same second cannot even be ordered.
+    const dest = join(paths.unit, "live", "data");
+    mkdirSync(join(paths.unit, "live"), { recursive: true });
+    const older = `${dest}.pre-restore-20260101-000000-11`;
+    const newer = `${dest}.pre-restore-20260101-000000-99`;
+    mkdirSync(older, { recursive: true });
+    mkdirSync(newer, { recursive: true });
+
+    const found = sweepRestoreLeftovers([{ label: "data/", dest }]);
+
+    expect(existsSync(dest)).toBe(false);
+    expect(found.map((f) => [f.path, f.recovered])).toEqual([[older, false], [newer, false]]);
+  });
+
   it("puts back a leg whose live path is missing", () => {
     const dest = join(paths.unit, "live", "data");
     mkdirSync(join(paths.unit, "live"), { recursive: true });
@@ -512,6 +674,28 @@ describe("tomo backup restore — rollback and leftovers, end to end", () => {
     expect(readFileSync(join(paths.tomoHome, "data", "irreplaceable.txt"), "utf-8"))
       .toBe("months of transcripts");
     expect(existsSync(parked)).toBe(false);
+  });
+
+  it("refuses to run beside another restore, before it sweeps", async () => {
+    // The sweep would un-park a running restore's original at the exact
+    // moment its live path is renamed aside. So: a live lock refuses the
+    // command, and the parked copy — which here belongs to the "other" run —
+    // is not touched.
+    mkdirSync(paths.tomoHome, { recursive: true });
+    writeFileSync(join(paths.tomoHome, "restore.lock"), `${process.pid}\n`);
+    const parked = join(paths.tomoHome, "data.pre-restore-20260101-000000-4242");
+    mkdirSync(parked, { recursive: true });
+    rmSync(join(paths.tomoHome, "data"), { recursive: true, force: true });
+
+    const { logs, errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("another restore is in progress");
+    expect(exitCodes).toContain(1);
+    expect(logs.join("\n")).not.toContain("Found leftovers");
+    expect(existsSync(parked)).toBe(true);
+    expect(existsSync(join(paths.tomoHome, "data"))).toBe(false);
+    // Refusing must not remove the other restore's lock either.
+    expect(readFileSync(join(paths.tomoHome, "restore.lock"), "utf-8").trim()).toBe(String(process.pid));
   });
 
   it("does not claim success when the workspace leg fails", async () => {

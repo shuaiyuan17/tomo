@@ -3,7 +3,7 @@ import { IdentityRouter } from "../src/router.js";
 import { rawSessionKeyForBinding } from "../src/sessions/keys.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { SummonStore } from "../src/sessions/summon-store.js";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -443,6 +443,32 @@ describe("IdentityRouter", () => {
 
       expect(rawSessionKeyForBinding("imessage", "+15551234567", sessions.listAllSessions()))
         .toBe("imessage:any;-;+15551234567");
+    });
+
+    it("routes to the legacy key, without throwing, while the registry cannot be read — then migrates", () => {
+      // The migration is a link change and refuses while the registry file is
+      // unreadable. That refusal used to escape resolve() on the inbound path
+      // and lose the message. Now the message goes to the session it has
+      // always had, and the migration happens on the next readable message.
+      sessions.setSdkSessionId("telegram:111", "session-old");
+      const registry = join(TEST_DIR, "_sessions.json");
+      const good = readFileSync(registry, "utf-8");
+      writeFileSync(registry, good.slice(0, Math.floor(good.length / 2)));
+
+      const router = new IdentityRouter(
+        [{ name: "Frank", channels: { telegram: "111" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      let result: ReturnType<typeof router.resolve> | undefined;
+      expect(() => { result = router.resolve("telegram", "111", false); }).not.toThrow();
+      expect(result!.sessionKey).toBe("telegram:111");
+      expect(readFileSync(registry, "utf-8")).toBe(good.slice(0, Math.floor(good.length / 2)));   // untouched
+
+      writeFileSync(registry, good);
+      expect(router.resolve("telegram", "111", false).sessionKey).toBe("dm:frank");
+      expect(sessions.getSdkSessionId("dm:frank")).toBe("session-old");
+      expect(sessions.getSdkSessionId("telegram:111")).toBeUndefined();
     });
 
     it("does not migrate if unified key already has a session", () => {

@@ -25,18 +25,10 @@ export const configCommand = new Command("config")
       await runConfig();
     } catch (err) {
       if (!(err instanceof ConfigReadError)) throw err;
-      // The config became unparseable while this session was open (a hand-edit
-      // in another window), and a save was refused as a result.
-      //
-      // Deliberately NOT "nothing was written": earlier submenus in this same
-      // run may have saved successfully before the file went bad. Only *this*
-      // save was refused.
-      p.log.error(
-        `${describeReadFailure(err)}\n` +
-        "This save was refused — config.json is unchanged by it. Any earlier " +
-        "changes you made in this session were already saved.\n" +
-        `${fixHint()}`,
-      );
+      // Backstop only. A ConfigReadError raised by a submenu is caught inside
+      // the menu loop and returns the user to the menu (see runConfig); this
+      // catches the ones raised outside it.
+      p.log.error(`${describeReadFailure(err)}\n${fixHint()}`);
       p.outro("");
       process.exitCode = 1;
     }
@@ -45,6 +37,27 @@ export const configCommand = new Command("config")
 function describeReadFailure(err: ConfigReadError): string {
   const detail = err.cause instanceof Error ? err.cause.message : String(err.cause);
   return `Config at ${err.path} could not be read:\n  ${detail}`;
+}
+
+/**
+ * A submenu hit an unreadable config. Report and return to the menu — do not
+ * end the command.
+ *
+ * The message is worded to be true of both ways this happens, because the
+ * caller cannot tell them apart and the common one is the less obvious one:
+ * every `configXxx()` opens with `loadConfig()`, so the usual case is a load
+ * failure at submenu open, where no save was ever attempted. The other is a
+ * save refused mid-submenu. In both, this action wrote nothing, and in both,
+ * earlier submenus in the same run may already have saved.
+ */
+function reportSubmenuReadFailure(err: ConfigReadError): void {
+  p.log.error(
+    `${describeReadFailure(err)}\n` +
+    "This action wrote nothing. Any earlier changes in this session were " +
+    "already saved.\n" +
+    `${fixHint()}`,
+  );
+  process.exitCode = 1;
 }
 
 function fixHint(): string {
@@ -137,16 +150,25 @@ async function runConfig(): Promise<void> {
 
       if (p.isCancel(choice) || choice === "exit") break;
 
-      if (choice === "model") await configModel();
-      if (choice === "auth") await configAnthropicAuth();
-      if (choice === "litellm") await configLiteLlm();
-      if (choice === "channels") await configChannels();
-      if (choice === "identities") await configIdentities();
-      if (choice === "groups") await configGroups();
-      if (choice === "sessions") await configSessions();
-      if (choice === "cron") await configCron();
-      if (choice === "costs") await configCostAnalysis();
-      if (choice === "autostart") await configAutostart();
+      try {
+        if (choice === "model") await configModel();
+        if (choice === "auth") await configAnthropicAuth();
+        if (choice === "litellm") await configLiteLlm();
+        if (choice === "channels") await configChannels();
+        if (choice === "identities") await configIdentities();
+        if (choice === "groups") await configGroups();
+        if (choice === "sessions") await configSessions();
+        if (choice === "cron") await configCron();
+        if (choice === "costs") await configCostAnalysis();
+        if (choice === "autostart") await configAutostart();
+      } catch (err) {
+        if (!(err instanceof ConfigReadError)) throw err;
+        // The config went bad underneath a running session. Report, remember
+        // it so the next pass offers only the submenus that do not read the
+        // file, and keep the menu alive rather than dumping the user out.
+        reportSubmenuReadFailure(err);
+        readError = err;
+      }
     }
 
     p.outro(readError

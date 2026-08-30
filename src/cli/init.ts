@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync } from "../fs-utils.js";
+import { backupConfigIfParseableSync } from "./config/shared.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { DEFAULT_MODEL } from "../models.js";
 
@@ -319,7 +320,11 @@ export const initCommand = new Command("init")
       }
 
       mkdirSync(dirname(configPath), { recursive: true });
-      backupFileIfExistsSync(configPath, CONFIG_BACKUP_PATH, { mode: 0o600 });
+      // `tomo init --force` overwrites an existing config on purpose, so the
+      // .bak is the only copy of what was there. Rotating it content-blind
+      // meant a corrupt config replaced a good backup — losing the last
+      // recoverable version rather than preserving it.
+      backupConfigIfParseableSync(configPath, CONFIG_BACKUP_PATH);
       writeJsonAtomicSync(configPath, config, { mode: 0o600 });
       p.log.success("Config saved");
       p.log.info(

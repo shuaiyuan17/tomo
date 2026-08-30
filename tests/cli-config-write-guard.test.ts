@@ -10,14 +10,15 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 // ---------------------------------------------------------------------------
-// Isolation MUST NOT depend on the fix being present.
+// Isolation MUST NOT depend on anything the fix introduced.
 //
-// These tests are meant to be run against unchanged `main` as well, and
-// loadConfig/saveConfig take no path arguments in any revision: they read and
-// WRITE `~/.tomo/config.json` unconditionally. An earlier version of this file
-// isolated by passing a temp path — a parameter only the fixed build has —
-// and when it was run against main those arguments were ignored and the run
-// overwrote a real config.json.
+// These tests are meant to be run against unchanged `main` too. An earlier
+// version of this file isolated by passing a temp path to loadConfig/
+// saveConfig — a parameter only the fixed build had. Run against main those
+// arguments were ignored and the run overwrote a real ~/.tomo/config.json.
+// (Those parameters have since been deleted outright, so that particular
+// mistake is now a compile error — but the isolation below must not depend on
+// that either.)
 //
 // So isolate by $HOME, which every revision honours (os.homedir() reads
 // process.env.HOME on POSIX, and runtime-paths.ts derives everything from it
@@ -30,6 +31,10 @@ vi.resetModules();
 
 const shared = await import("../src/cli/config/shared.js");
 const { CONFIG_PATH, CONFIG_BACKUP_PATH, loadConfig, saveConfig } = shared;
+// Absent on main; the tests that need it skip themselves rather than crash.
+const backupConfigIfParseableSync = (shared as {
+  backupConfigIfParseableSync?: (p: string, b: string) => boolean;
+}).backupConfigIfParseableSync;
 // `ConfigReadError` does not exist on unchanged main; `toThrow(undefined)`
 // then degrades to "throws anything", which is the honest assertion there.
 const ConfigReadError = (shared as { ConfigReadError?: new (...a: never[]) => Error }).ConfigReadError;
@@ -51,14 +56,21 @@ const GOOD_CONFIG = {
 
 const CORRUPT = '{\n  "model": "claude-opus-4",\n}\n';
 
+// Only ever remove the two files under test, never the containing directory:
+// a bug in the isolation above must not become a recursive delete of a real
+// ~/.tomo.
+function clearConfigFiles(): void {
+  for (const f of [CONFIG_PATH, CONFIG_BACKUP_PATH]) {
+    rmSync(f, { recursive: true, force: true });
+  }
+}
+
 beforeEach(() => {
-  rmSync(dirname(CONFIG_PATH), { recursive: true, force: true });
   mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+  clearConfigFiles();
 });
 
-afterEach(() => {
-  rmSync(dirname(CONFIG_PATH), { recursive: true, force: true });
-});
+afterEach(clearConfigFiles);
 
 function writeGoodConfig(): void {
   writeFileSync(CONFIG_PATH, JSON.stringify(GOOD_CONFIG, null, 2));
@@ -133,52 +145,131 @@ describe("saveConfig", () => {
   });
 });
 
+/** Run the real CLI against a throwaway $HOME and report what it printed. */
+function runConfigCli(files: { config?: string; backup?: string }): {
+  status: number; output: string; home: string; configAfter?: string; backupAfter?: string;
+} {
+  const home = mkdtempSync(join(tmpdir(), "tomo-config-cli-home-"));
+  const tomoHome = join(home, ".tomo");
+  mkdirSync(tomoHome, { recursive: true });
+  const cfg = join(tomoHome, "config.json");
+  const bak = join(tomoHome, "config.json.bak");
+  if (files.config !== undefined) writeFileSync(cfg, files.config);
+  if (files.backup !== undefined) writeFileSync(bak, files.backup);
+
+  let status = 0;
+  let output: string;
+  try {
+    output = execFileSync(
+      process.execPath,
+      ["--import", "tsx", join(REPO_ROOT, "src", "cli.ts"), "config"],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          HOME: home,
+          TOMO_WORKSPACE: join(home, "workspace"),
+          SESSIONS_DIR: join(home, "sessions"),
+        },
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 60_000,
+      },
+    );
+  } catch (err) {
+    const e = err as { status?: number; stdout?: string; stderr?: string };
+    status = e.status ?? -1;
+    output = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+  }
+  return {
+    status,
+    output,
+    home,
+    configAfter: existsSync(cfg) ? readFileSync(cfg, "utf-8") : undefined,
+    backupAfter: existsSync(bak) ? readFileSync(bak, "utf-8") : undefined,
+  };
+}
+
 describe("`tomo config` against a corrupt config", () => {
+  const homes: string[] = [];
+  afterEach(() => {
+    for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true });
+  });
+
   it("exits non-zero and touches neither the config nor its backup", () => {
-    // The subprocess gets its own HOME for the same reason: it must not be
-    // able to reach a real config even if the code under test ignores
-    // everything else we do.
-    const home = mkdtempSync(join(tmpdir(), "tomo-config-cli-home-"));
-    try {
-      const tomoHome = join(home, ".tomo");
-      mkdirSync(tomoHome, { recursive: true });
-      const cfg = join(tomoHome, "config.json");
-      const bak = join(tomoHome, "config.json.bak");
-      writeFileSync(cfg, CORRUPT);
-      writeFileSync(bak, JSON.stringify(GOOD_CONFIG, null, 2));
-      const bakBefore = readFileSync(bak, "utf-8");
+    const good = JSON.stringify(GOOD_CONFIG, null, 2);
+    const r = runConfigCli({ config: CORRUPT, backup: good });
+    homes.push(r.home);
 
-      let status = 0;
-      let output = "";
-      try {
-        output = execFileSync(
-          process.execPath,
-          ["--import", "tsx", join(REPO_ROOT, "src", "cli.ts"), "config"],
-          {
-            cwd: REPO_ROOT,
-            env: {
-              ...process.env,
-              HOME: home,
-              TOMO_WORKSPACE: join(home, "workspace"),
-              SESSIONS_DIR: join(home, "sessions"),
-            },
-            encoding: "utf-8",
-            stdio: ["ignore", "pipe", "pipe"],
-            timeout: 60_000,
-          },
-        );
-      } catch (err) {
-        const e = err as { status?: number; stdout?: string; stderr?: string };
-        status = e.status ?? -1;
-        output = `${e.stdout ?? ""}${e.stderr ?? ""}`;
-      }
+    expect(r.status).not.toBe(0);
+    expect(r.output).toContain("could not be read");
+    expect(r.configAfter).toBe(CORRUPT);
+    expect(r.backupAfter).toBe(good);
+  });
 
-      expect(status).not.toBe(0);
-      expect(output).toContain("could not be read");
-      expect(readFileSync(cfg, "utf-8")).toBe(CORRUPT);
-      expect(readFileSync(bak, "utf-8")).toBe(bakBefore);
-    } finally {
-      rmSync(home, { recursive: true, force: true });
+  it("keeps the command alive and offers only the submenus that read no config", () => {
+    const r = runConfigCli({ config: CORRUPT });
+    homes.push(r.home);
+
+    // Withdrawn: every one of these is loadConfig() -> mutate -> saveConfig().
+    for (const label of [
+      "Anthropic authentication", "Model", "LiteLLM gateway",
+      "Channels", "Identities", "Group chats", "Sessions",
+    ]) {
+      expect(r.output).not.toContain(label);
     }
-  }, 90_000);
+    // Still offered: these read no config at all. The command reached the
+    // menu at all, which is the point — a parse error does not end it.
+    expect(r.output).toContain("Scheduled tasks");
+    expect(r.output).toContain("Cost analysis");
+    expect(r.output).toContain("Exit");
+    expect(r.status).not.toBe(0);
+  });
+
+  it("offers the full menu and exits 0 when the config parses", () => {
+    const r = runConfigCli({ config: JSON.stringify(GOOD_CONFIG, null, 2) });
+    homes.push(r.home);
+
+    expect(r.output).toContain("Anthropic authentication");
+    expect(r.output).toContain("Identities");
+    expect(r.output).toContain("Scheduled tasks");
+    expect(r.status).toBe(0);
+  });
+
+  it("names the backup to restore only when there is one", () => {
+    const withBak = runConfigCli({ config: CORRUPT, backup: JSON.stringify(GOOD_CONFIG) });
+    homes.push(withBak.home);
+    expect(withBak.output).toContain("config.json.bak");
+    expect(withBak.output).not.toContain("no backup to restore");
+
+    const withoutBak = runConfigCli({ config: CORRUPT });
+    homes.push(withoutBak.home);
+    expect(withoutBak.output).toContain("no backup to restore");
+  });
+});
+
+describe("backupConfigIfParseableSync", () => {
+  // `tomo init --force` overwrites the config on purpose, so the .bak is the
+  // only surviving copy — rotating it content-blind replaced a good backup
+  // with the corrupt file.
+  it("rotates a config that parses", () => {
+    const good = JSON.stringify(GOOD_CONFIG, null, 2);
+    writeFileSync(CONFIG_PATH, good);
+    expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(true);
+    expect(readFileSync(CONFIG_BACKUP_PATH, "utf-8")).toBe(good);
+  });
+
+  it("keeps the existing backup when the config does not parse", () => {
+    const good = JSON.stringify(GOOD_CONFIG, null, 2);
+    writeFileSync(CONFIG_BACKUP_PATH, good);
+    writeFileSync(CONFIG_PATH, CORRUPT);
+
+    expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
+    expect(readFileSync(CONFIG_BACKUP_PATH, "utf-8")).toBe(good);
+  });
+
+  it("does nothing when there is no config yet", () => {
+    expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
+    expect(existsSync(CONFIG_BACKUP_PATH)).toBe(false);
+  });
 });

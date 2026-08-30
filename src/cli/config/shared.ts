@@ -59,15 +59,22 @@ function readConfigFile(path: string): Record<string, unknown> | undefined {
 }
 
 /** Throws {@link ConfigReadError} when the file exists but is unreadable. */
-export function loadConfig(path = CONFIG_PATH): Record<string, unknown> {
-  return readConfigFile(path) ?? {};
+export function loadConfig(): Record<string, unknown> {
+  return readConfigFile(CONFIG_PATH) ?? {};
 }
 
-export function saveConfig(
-  cfg: Record<string, unknown>,
-  path = CONFIG_PATH,
-  backupPath = CONFIG_BACKUP_PATH,
-): void {
+/**
+ * Neither this nor {@link loadConfig} takes a path override, deliberately.
+ * An earlier revision let tests pass a temp path, which meant the test
+ * isolated only on a build that had the parameter — run against one without
+ * it, the same test wrote the developer's real ~/.tomo/config.json. That
+ * happened. Tests isolate by $HOME instead (see
+ * tests/cli-config-write-guard.test.ts), which holds on every revision;
+ * removing the parameter makes the old mistake a compile error.
+ */
+export function saveConfig(cfg: Record<string, unknown>): void {
+  const path = CONFIG_PATH;
+  const backupPath = CONFIG_BACKUP_PATH;
   // Re-check the file at write time, not just at load time. Two reasons, and
   // both are data loss:
   //  - the backup is a copy of THIS file, so rotating it from a file we
@@ -83,6 +90,27 @@ export function saveConfig(
   mkdirSync(dirname(path), { recursive: true });
   backupFileIfExistsSync(path, backupPath, { mode: 0o600 });
   writeJsonAtomicSync(path, cfg, { mode: 0o600 });
+}
+
+/**
+ * Rotate `path` into `backupPath` only if it currently parses.
+ *
+ * `backupFileIfExistsSync` is content-blind, so calling it directly on a
+ * config that has gone bad replaces the one good backup with the broken file
+ * — which is what made the damage in this issue unrecoverable after a second
+ * write. Callers that intend to overwrite regardless (`tomo init --force`)
+ * want to skip the rotation, not abort, so this reports rather than throws.
+ *
+ * Returns true when a backup was taken.
+ */
+export function backupConfigIfParseableSync(path: string, backupPath: string): boolean {
+  try {
+    if (readConfigFile(path) === undefined) return false; // nothing there yet
+  } catch {
+    return false; // unparseable: keep whatever backup already exists
+  }
+  backupFileIfExistsSync(path, backupPath, { mode: 0o600 });
+  return true;
 }
 
 export { modelLabel };

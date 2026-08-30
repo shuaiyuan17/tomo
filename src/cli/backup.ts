@@ -210,8 +210,13 @@ export function resolveBackupPath(date: string): ResolvedBackup | null {
   const candidate = join(BACKUPS_DIR, date);
   try {
     // Refuses a symlink, a file, a socket — anything that is not a directory
-    // in its own right. The same stat supplies the identity below, so there is
-    // no second syscall for something else to slip between.
+    // in its own right. The same stat supplies the identity below, so the
+    // kind and the identity describe ONE entry, not two observations that a
+    // swap could straddle. What this does not do is pin the entry: the
+    // `realpathSync` that follows is a separate syscall, and a directory
+    // renamed in between yields A's identity with B at the path. Node's `fs`
+    // has no `openat`, so no sequence of pathname syscalls can close that;
+    // it is the same residual as content changing under the copy itself.
     const entry = lstatSync(candidate);
     if (!entry.isDirectory()) return null;
     const realRoot = realpathSync(BACKUPS_DIR);

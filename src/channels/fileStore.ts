@@ -1,6 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "../logger.js";
+import { writeWithoutOverwrite } from "./attachment-write.js";
 import { documentMimeToExt, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { neutralizeMarkerDelimiters } from "./text-utils.js";
 
@@ -247,16 +247,6 @@ export function buildFilePath(
   return { dir, filename, fullPath: join(dir, filename) };
 }
 
-/** Split "a.tar.gz" into ["a.tar", ".gz"]; a leading-dot-free name is assumed. */
-function splitExt(filename: string): [string, string] {
-  const dot = filename.lastIndexOf(".");
-  if (dot <= 0) return [filename, ""];
-  return [filename.slice(0, dot), filename.slice(dot)];
-}
-
-/** How many `name-1`, `name-2`, … variants to try before giving up. */
-const MAX_COLLISION_ATTEMPTS = 50;
-
 /**
  * Save an inbound file to disk without ever overwriting an existing one.
  *
@@ -280,25 +270,16 @@ export async function saveInboundFile(
 ): Promise<string | null> {
   try {
     const { dir, filename } = buildFilePath(baseDir, mimeType, meta);
-    await mkdir(dir, { recursive: true });
-    const [stem, ext] = splitExt(filename);
-
-    for (let attempt = 0; attempt <= MAX_COLLISION_ATTEMPTS; attempt++) {
-      const candidate = join(dir, attempt === 0 ? filename : `${stem}-${attempt}${ext}`);
-      try {
-        await writeFile(candidate, buffer, { flag: "wx" });
-        log.info(
-          { path: candidate, bytes: buffer.length, mimeType },
-          "Saved inbound file",
-        );
-        return candidate;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      }
+    const written = await writeWithoutOverwrite(dir, filename, buffer);
+    if (!written) {
+      log.error({ dir, filename }, "Gave up finding a free filename for inbound file");
+      return null;
     }
-
-    log.error({ dir, filename }, "Gave up finding a free filename for inbound file");
-    return null;
+    log.info(
+      { path: written, bytes: buffer.length, mimeType },
+      "Saved inbound file",
+    );
+    return written;
   } catch (err) {
     log.error({ err, mimeType, bytes: buffer.length }, "Failed to save inbound file");
     return null;

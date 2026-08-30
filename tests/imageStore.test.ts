@@ -146,6 +146,47 @@ describe("saveInboundImage", () => {
     expect(st.size).toBe(buffer.length);
   });
 
+  it("never overwrites: two images with the same computed name both survive", async () => {
+    // The real shape of this, from iMessage: two photos in ONE message. Same
+    // second, same chat, and `shortGuid` slices the attachment guid to 8
+    // characters — `IMG_20260830_A.jpg` and `IMG_20260830_B.jpg` both reduce
+    // to `IMG_2026`, so both compute the identical destination path.
+    const meta = {
+      sessionKey: "dm_shuai",
+      guid: "IMG_20260830_A.jpg",
+      timestamp: new Date(2026, 7, 30, 9, 15, 0),
+    };
+    const first = Buffer.from("first photo");
+    const second = Buffer.from("second photo");
+
+    const a = await saveInboundImage(first, "image/jpeg", meta, base);
+    const b = await saveInboundImage(second, "image/jpeg", { ...meta, guid: "IMG_20260830_B.jpg" }, base);
+
+    // Distinct paths, and each holds the bytes it was given. Before the fix
+    // both calls returned the same path and only `second photo` existed.
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(b).not.toBe(a);
+    expect((await readFile(a!)).toString()).toBe("first photo");
+    expect((await readFile(b!)).toString()).toBe("second photo");
+    // The second name is derived from the first, not random.
+    expect(b).toBe(join(base, "memory/incoming-images/2026-08-30/091500_dm_shuai_IMG_2026-1.jpg"));
+  });
+
+  it("keeps every one of a burst of same-named images", async () => {
+    const meta = { sessionKey: "dm", guid: "same", timestamp: new Date(2026, 7, 30, 9, 15, 0) };
+    const paths: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const written = await saveInboundImage(Buffer.from(`photo ${i}`), "image/png", meta, base);
+      expect(written).not.toBeNull();
+      paths.push(written!);
+    }
+    expect(new Set(paths).size).toBe(5);
+    for (let i = 0; i < 5; i++) {
+      expect((await readFile(paths[i])).toString()).toBe(`photo ${i}`);
+    }
+  });
+
   it("returns null and does not throw on bad baseDir", async () => {
     const buffer = Buffer.from("hello");
     // A file path (not a directory) as baseDir: mkdir-recursive will fail on the parent chain

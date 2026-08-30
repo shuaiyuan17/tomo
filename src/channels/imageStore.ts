@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { log } from "../logger.js";
 import { SIPS_TIMEOUT_MS } from "./heic.js";
+import { writeWithoutOverwrite } from "./attachment-write.js";
 
 const execFileP = promisify(execFile);
 
@@ -325,14 +326,21 @@ export async function saveInboundImage(
   baseDir: string,
 ): Promise<string | null> {
   try {
-    const { dir, fullPath } = buildImagePath(baseDir, mimeType, meta);
-    await mkdir(dir, { recursive: true });
-    await writeFile(fullPath, buffer);
+    const { dir, filename } = buildImagePath(baseDir, mimeType, meta);
+    // Never `writeFile(fullPath, …)`: the path is deterministic to the second
+    // and two photos in one message share it, so a plain write silently
+    // destroys the first while both are reported as saved. The returned path
+    // is the one actually written, which is what the marker line must name.
+    const written = await writeWithoutOverwrite(dir, filename, buffer);
+    if (!written) {
+      log.error({ dir, filename }, "Gave up finding a free filename for inbound image");
+      return null;
+    }
     log.info(
-      { path: fullPath, bytes: buffer.length, mimeType },
+      { path: written, bytes: buffer.length, mimeType },
       "Saved inbound image",
     );
-    return fullPath;
+    return written;
   } catch (err) {
     log.error({ err, mimeType, bytes: buffer.length }, "Failed to save inbound image");
     return null;

@@ -319,17 +319,27 @@ const DEFAULT_METRICS: MetricsConfig = {
   includeMessageText: true,
 };
 
-const metricsSchema = z.object({
-  enabled: boolLike.default(DEFAULT_METRICS.enabled),
-  port: positiveInt.default(DEFAULT_METRICS.port),
-  activityLog: boolLike.default(DEFAULT_METRICS.activityLog),
-  includeMessageText: boolLike.default(DEFAULT_METRICS.includeMessageText),
-});
-
+/**
+ * Validate the metrics block field by field.
+ *
+ * Falling the whole object back to DEFAULT_METRICS on one bad field is not a
+ * safe default here: the defaults turn `activityLog` and `includeMessageText`
+ * back ON, so a typo in `port` would start writing transcript text into
+ * activity.ndjson for a user who had deliberately turned it off (the field is
+ * documented as "disable if the log is shipped off this machine"). Drop only
+ * the offending field, as parseIdentities and parsePlugins already do — each
+ * bad field still raises its own configIssue.
+ */
 function parseMetricsConfig(raw: unknown): MetricsConfig {
-  const entry = validated("metrics", metricsSchema, raw, DEFAULT_METRICS);
+  const entry = validated("metrics", z.looseObject({}), raw, {}) as Record<string, unknown>;
   return {
-    ...entry,
+    activityLog: validated("metrics.activityLog", boolLike, entry.activityLog, DEFAULT_METRICS.activityLog),
+    includeMessageText: validated(
+      "metrics.includeMessageText",
+      boolLike,
+      entry.includeMessageText,
+      DEFAULT_METRICS.includeMessageText,
+    ),
     enabled: validated(
       "metrics.enabled (TOMO_METRICS)",
       boolLike,

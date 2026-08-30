@@ -39,6 +39,8 @@
 
 - **A failed pet-state write no longer takes the daemon down.** `PetScheduler.tick()` calls `PetStore.save()` (`mkdirSync` + an atomic write), which throws on `ENOSPC`, `EACCES` and `EROFS`. It ran unguarded both synchronously from `start()` — killing daemon startup — and from its hourly `setInterval`, where a throw has nothing above it to catch it and ends the process: every channel, live session and the `imsg rpc` child would die because a toy pet could not write its state file. The tick is now wrapped and logged, so a failed write is a skipped tick and the next hour still runs. The interval is also `unref`'d, matching every other background timer, so it can no longer hold the process open during shutdown.
 
+- **One bad `metrics` field no longer discards the whole block.** `validated("metrics", …, DEFAULT_METRICS)` fell the entire object back on a single invalid field, and the defaults turn `activityLog` and `includeMessageText` back **on** — so a typo in `port` would have re-enabled writing transcript text into `activity.ndjson` for a user who deliberately turned it off. `assertConfigValid()` blocks startup on any config issue, so what actually happened was a refusal to boot rather than a silent privacy regression; the fix is about blast radius and diagnostics. Each field is now validated on its own, as `parseIdentities` and `parsePlugins` already do: only the offending field falls back, and it raises its own named issue (`metrics.port: …`) instead of one issue for the whole block. A `metrics` value that is not an object is still reported as one issue with all four defaults applied.
+
 ## 0.8.14 (2026-08-14)
 
 ### Features

@@ -406,6 +406,9 @@ export class SessionStore {
    *  bookkeeping writes — one line each per streak, not one per call. */
   private registryStaleReadLogged = false;
   private registryDeferredWriteLogged = false;
+  /** A bookkeeping SAVE failed (ENOSPC, EROFS, EACCES on the directory…):
+   *  logged once per streak, cleared by the next successful save. */
+  private registryWriteErrorLogged = false;
   // Stat of the registry file as of the last read/write. loadRegistry() is
   // called on nearly every store operation to pick up external changes
   // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
@@ -797,7 +800,7 @@ export class SessionStore {
       entry.stats.contextBreakdown = update.contextBreakdown;
     }
     entry.lastActiveAt = Date.now();
-    this.saveRegistry();
+    this.saveRegistryBestEffort("updateStats");
   }
 
   /** Touch the active session (update lastActiveAt) */
@@ -1280,16 +1283,32 @@ export class SessionStore {
   }
 
   /**
-   * Persist a bookkeeping change without letting a refusal escape. Only the
-   * read-failure refusal is downgraded — a genuine write error (ENOSPC,
-   * EROFS) still propagates, because that is not something to hide.
+   * Persist a bookkeeping change without letting ANY failure escape.
+   *
+   * The read-failure refusal is the expected case and is reported through
+   * `canWriteRegistry` (once per streak). A genuine write error — ENOSPC,
+   * EROFS, EACCES on the sessions directory — is not hidden either: it is
+   * logged at error level, once per streak, with the cause. But it must not
+   * propagate. `updateStats` runs after the model has already answered, and
+   * `addParticipant` runs before an inbound message is appended: a throw there
+   * fails a turn that succeeded or drops a message over a stat line. The
+   * in-memory state keeps the change; the next successful save publishes it.
    */
   private saveRegistryBestEffort(op: string): void {
     try {
       this.saveRegistry();
     } catch (err) {
-      if (!(err instanceof SessionRegistryReadError)) throw err;
-      this.canWriteRegistry(op);
+      if (err instanceof SessionRegistryReadError) {
+        this.canWriteRegistry(op);
+        return;
+      }
+      if (!this.registryWriteErrorLogged) {
+        this.registryWriteErrorLogged = true;
+        log.error(
+          { err, file: this.registryPath, op },
+          "Session-registry bookkeeping write failed; keeping the change in memory and retrying on the next save",
+        );
+      }
     }
   }
 
@@ -1321,6 +1340,10 @@ export class SessionStore {
     if (this.registryLoadError !== null) throw this.registryLoadError;
     const data: SessionRegistry = { version: 1, sessions: this.registry };
     writeJsonAtomicSync(this.registryPath, data);
+    if (this.registryWriteErrorLogged) {
+      this.registryWriteErrorLogged = false;
+      log.info({ file: this.registryPath }, "Session-registry writes succeeding again");
+    }
     // Record our own write's stat so the next loadRegistry() doesn't re-read
     // what we just wrote. An external writer landing in the stat window would
     // be missed until its next write — the same read-modify-write race the

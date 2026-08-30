@@ -141,11 +141,11 @@ export class IdentityRouter {
         // or the summon would capture a fresh empty dm: session and block the
         // old channel-scoped session from ever migrating.
         const identity = this.identities.find((id) => id.name.toLowerCase() === summoned);
-        if (identity) this.maybeMigrate(identity, dmKey);
+        const routedKey = identity ? this.maybeMigrate(identity, dmKey) : dmKey;
         const replyTarget = this.sessions.getReplyTarget(dmKey)
           ?? this.deriveReplyTargetFromConfig(summoned);
         if (replyTarget) {
-          return { sessionKey: dmKey, replyTarget, identityName: summoned };
+          return { sessionKey: routedKey, replyTarget, identityName: summoned };
         }
         // Stale summon: the identity was renamed/removed since summons.json
         // was written, so there is no private DM target. Falling back to the
@@ -175,8 +175,11 @@ export class IdentityRouter {
 
     const sessionKey = `dm:${identity.name.toLowerCase()}`;
 
-    // Migrate from old channel-scoped key if needed (one-time)
-    this.maybeMigrate(identity, sessionKey);
+    // Migrate from old channel-scoped key if needed (one-time). If the
+    // migration cannot be persisted right now, this is the legacy key: the
+    // message still reaches its conversation, and the migration is retried
+    // on the next one.
+    const routedKey = this.maybeMigrate(identity, sessionKey);
 
     // Determine reply target based on policy
     const replyTarget = this.resolveReplyTarget(identity, channelName, chatId);
@@ -184,7 +187,7 @@ export class IdentityRouter {
     // Persist updated reply target
     this.sessions.setReplyTarget(sessionKey, replyTarget);
 
-    return { sessionKey, replyTarget, identityName: identity.name };
+    return { sessionKey: routedKey, replyTarget, identityName: identity.name };
   }
 
   /** Get the current reply target for a session key (used by cron/continuity) */
@@ -252,9 +255,24 @@ export class IdentityRouter {
     return { channelName, chatId };
   }
 
-  private maybeMigrate(identity: IdentityConfig, sessionKey: string): void {
+  /**
+   * One-time migration of a channel-scoped session to the unified `dm:` key.
+   * Returns the key the message should be routed to: the unified key, or —
+   * when a migration was due but could not be persisted — the legacy key.
+   *
+   * Best-effort on purpose. This runs on the inbound path for every message
+   * (`router.resolve()` at receipt), and `migrateSessionKey` refuses with
+   * `SessionRegistryReadError` while the registry file cannot be read. Letting
+   * that throw here lost the message outright: the Telegram handler's
+   * rejection is swallowed, and the iMessage cursor never advances past it.
+   * Routing to the legacy key instead keeps the conversation reachable, and
+   * deliberately does NOT fall through to the unified key — a turn run there
+   * would cold-start a `dm:` session, after which the "already has a session"
+   * guard above would block this migration forever.
+   */
+  private maybeMigrate(identity: IdentityConfig, sessionKey: string): string {
     // Already has a session under the unified key
-    if (this.sessions.getSdkSessionId(sessionKey)) return;
+    if (this.sessions.getSdkSessionId(sessionKey)) return sessionKey;
 
     // Collect all old channel-specific keys that have an active session.
     // Matched against the live registry rather than rebuilt from the config
@@ -266,12 +284,20 @@ export class IdentityRouter {
       candidates.push(...legacySessionKeysForBinding(activeKeys, chName, chId));
     }
 
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) return sessionKey;
 
     if (candidates.length === 1) {
-      this.sessions.migrateSessionKey(candidates[0], sessionKey);
+      try {
+        this.sessions.migrateSessionKey(candidates[0], sessionKey);
+      } catch (err) {
+        log.warn(
+          { err, identity: identity.name, from: candidates[0], to: sessionKey },
+          "Session migration could not be persisted; routing to the existing channel-scoped session and retrying on the next message",
+        );
+        return candidates[0];
+      }
       log.info({ identity: identity.name, from: candidates[0], to: sessionKey }, "Migrated session to unified identity");
-      return;
+      return sessionKey;
     }
 
     // Ambiguous: multiple bound channels already have sessions. Don't silently
@@ -280,5 +306,6 @@ export class IdentityRouter {
       { identity: identity.name, candidates, unifiedKey: sessionKey },
       "Multiple existing sessions found for identity; refusing to auto-migrate. Run `tomo config` → Identities to choose which session to keep.",
     );
+    return sessionKey;
   }
 }

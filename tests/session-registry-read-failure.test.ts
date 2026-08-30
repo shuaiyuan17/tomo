@@ -41,6 +41,7 @@ describe("session registry read failure", () => {
   });
 
   afterEach(() => {
+    try { chmodSync(TEST_DIR, 0o755); } catch { /* may not exist */ }
     try { chmodSync(REGISTRY, 0o644); } catch { /* may not exist */ }
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
@@ -256,6 +257,28 @@ describe("session registry read failure", () => {
     new SessionStore(TEST_DIR);
     expect(existsSync(sdkFile)).toBe(false);
     void store;
+  });
+
+  it.skipIf(process.getuid?.() === 0)("never throws from a bookkeeping mutator when the SAVE fails, and publishes once it can", () => {
+    // Not a read failure: the file is fine, the directory refuses new files
+    // (writeJsonAtomicSync writes a temp file beside it). updateStats runs
+    // after the model has answered; a throw here fails a good turn.
+    const store = seed();
+    chmodSync(TEST_DIR, 0o500);
+    try {
+      expect(() => store.updateStats("telegram:1", STATS)).not.toThrow();
+      expect(() => store.updateStats("telegram:1", STATS)).not.toThrow();
+      expect(() => store.touchSession("telegram:2")).not.toThrow();
+      expect(() => store.addParticipant("telegram:1", "Ann")).not.toThrow();
+      // The change is held in memory…
+      expect(store.getEntry("telegram:1")?.stats?.totalQueries).toBe(2);
+    } finally {
+      chmodSync(TEST_DIR, 0o755);
+    }
+    // …and published by the next save that succeeds.
+    store.touchSession("telegram:1");
+    const onDisk = JSON.parse(readFileSync(REGISTRY, "utf-8")) as { sessions: Array<{ channelKey: string; stats: { totalQueries: number } }> };
+    expect(onDisk.sessions.find((e) => e.channelKey === "telegram:1")?.stats.totalQueries).toBe(2);
   });
 
   it("constructs without throwing when the registry is unreadable at startup", () => {

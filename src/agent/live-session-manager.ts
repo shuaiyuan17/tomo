@@ -116,6 +116,8 @@ export interface LiveSessionManagerDeps {
  */
 export class LiveSessionManager {
   private liveSessions = new Map<string, LiveSession>();
+  /** Keys whose current SDK session id could not be written to the registry; retried on the next turn completion. */
+  private unpersistedLinks = new Set<string>();
   private externalMcpServersBySession = new Map<string, ReadonlySet<string>>();
   private mcpServerConfigsBySession = new Map<string, Record<string, McpServerConfig>>();
   private hotMountQueue: Promise<void> = Promise.resolve();
@@ -656,11 +658,25 @@ export class LiveSessionManager {
   }
 
   private recordTurnCompletion(key: string, session: LiveSession): void {
-    // Capture session ID if new
+    // Capture session ID if new — or if an earlier capture could not be
+    // persisted. The registry may refuse a link change while its file is
+    // unreadable (SessionRegistryReadError); by the time we are here the model
+    // has already answered, so that must not fail the turn. Remember the key
+    // and try again after the next turn; until then the live session keeps
+    // working and only the durable link is missing.
     const sid = session.getSessionId();
-    if (sid && !this.deps.getSdkSessionId(key)) {
-      this.deps.setSdkSessionId(key, sid);
-      log.info({ sessionId: sid, key }, "Session ID captured");
+    if (sid && (this.unpersistedLinks.has(key) || !this.deps.getSdkSessionId(key))) {
+      try {
+        this.deps.setSdkSessionId(key, sid);
+        if (this.unpersistedLinks.delete(key)) {
+          log.info({ sessionId: sid, key }, "Session ID persisted on retry");
+        } else {
+          log.info({ sessionId: sid, key }, "Session ID captured");
+        }
+      } catch (err) {
+        this.unpersistedLinks.add(key);
+        log.error({ err, sessionId: sid, key }, "Could not persist the SDK session link; will retry after the next turn");
+      }
     }
 
     // Save stats

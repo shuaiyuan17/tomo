@@ -690,6 +690,43 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
   });
 
+  it("keeps the answer when the registry refuses the link, and persists it on a later turn", async () => {
+    // setSdkSessionId throws while the registry file is unreadable
+    // (SessionRegistryReadError). That happens AFTER the model answered, so
+    // it must not fail the turn — and it must be retried even once the
+    // registry's last-good state reports some other (stale) link for the
+    // key, which the plain "no link yet" guard would treat as done.
+    const deps = makeDeps();
+    let refuse = true;
+    deps.setSdkSessionId = vi.fn(() => { if (refuse) throw new Error("session registry could not be read"); });
+    deps.getSdkSessionId = vi.fn(() => undefined);
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => "hello";
+
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).resolves.toBe("hello");
+    expect(deps.setSdkSessionId).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ key: "telegram:1", sessionId: "sdk-1" }),
+      expect.stringContaining("will retry"),
+    );
+
+    // Still refusing: another turn, another attempt, still a good answer.
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "again" })).resolves.toBe("hello");
+    expect(deps.setSdkSessionId).toHaveBeenCalledTimes(2);
+
+    // Registry readable again — but its last-good state names a stale link.
+    refuse = false;
+    deps.getSdkSessionId = vi.fn(() => "sdk-stale");
+    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "third" })).resolves.toBe("hello");
+    expect(deps.setSdkSessionId).toHaveBeenCalledTimes(3);
+    expect(deps.setSdkSessionId).toHaveBeenLastCalledWith("telegram:1", "sdk-1");
+    expect(log.info).toHaveBeenCalledWith({ sessionId: "sdk-1", key: "telegram:1" }, "Session ID persisted on retry");
+
+    // Persisted: a fourth turn does not touch the link again.
+    await manager.runWithRetry({ key: "telegram:1", prompt: "fourth" });
+    expect(deps.setSdkSessionId).toHaveBeenCalledTimes(3);
+  });
+
   it("skips per-turn bookkeeping when a steered message merges (STEER_MERGED)", async () => {
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);

@@ -36,6 +36,33 @@ describe("MAX_FILE_BYTES", () => {
 });
 
 describe("sanitizeAttachmentFilename", () => {
+  it("caps a long sanitised name", () => {
+    expect(sanitizeAttachmentFilename(`${"a".repeat(500)}.zip`, "application/zip"))
+      .toHaveLength(120);
+  });
+
+  it("caps the FALLBACK name too, not just the sanitised one", () => {
+    // The cap sat on the `cleaned` branch only. A filename that reduces to
+    // nothing — "." survives the NUL strip and the basename split, then loses
+    // its only character to the leading-dot strip — falls through to
+    // `file.${documentMimeToExt(mimeType)}`, and the MIME is exactly as
+    // sender-controlled as the name. `text/` + 100 KB of letters survives the
+    // `[^a-z0-9]` strip intact.
+    const name = sanitizeAttachmentFilename(".", `text/${"a".repeat(100_000)}`);
+    expect(name.length).toBeLessThanOrEqual(120);
+  });
+
+  it("caps the extension derived from an inflated MIME subtype", () => {
+    expect(sanitizeAttachmentFilename(undefined, `application/${"b".repeat(5_000)}`))
+      .toBe(`file.${"b".repeat(16)}`);
+  });
+
+  it("still derives ordinary extensions unchanged", () => {
+    expect(sanitizeAttachmentFilename(undefined, "application/json")).toBe("file.json");
+    expect(sanitizeAttachmentFilename(undefined, "text/yaml")).toBe("file.yaml");
+    expect(sanitizeAttachmentFilename(undefined, undefined)).toBe("file.bin");
+  });
+
   it("preserves the sender's original filename", () => {
     // The whole point: "dmit-207121-id_rsa.zip" beats "220446_….bin".
     expect(sanitizeAttachmentFilename("dmit-207121-id_rsa.zip", "application/zip"))

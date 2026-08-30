@@ -36,6 +36,17 @@ export function isSupportedDocumentMime(mimeType: string | undefined): boolean {
 }
 
 /** Map a MIME type to a filesystem extension (no leading dot). Falls back to "bin". */
+/**
+ * Longest extension we will derive from a MIME subtype.
+ *
+ * The subtype is sender-controlled and unbounded: `text/` + 100 KB of letters
+ * survives the `[^a-z0-9]` strip intact, and the result is used both as an
+ * on-disk filename component and — via `sanitizeAttachmentFilename`'s fallback
+ * — inside the notice shown to the model. Sixteen clears every real extension
+ * (`json`, `yaml`, `xml`, `sqlite3`) with room to spare.
+ */
+export const MAX_MIME_EXT_LENGTH = 16;
+
 export function documentMimeToExt(mimeType: string | undefined): string {
   if (!mimeType) return "bin";
   const m = mimeType.toLowerCase();
@@ -47,7 +58,7 @@ export function documentMimeToExt(mimeType: string | undefined): string {
   // Fall back to subtype for application/* and text/*
   if (m.startsWith("application/") || m.startsWith("text/")) {
     const sub = m.split("/")[1] ?? "";
-    return sub.replace(/[^a-z0-9]/g, "") || "bin";
+    return sub.replace(/[^a-z0-9]/g, "").slice(0, MAX_MIME_EXT_LENGTH) || "bin";
   }
   return "bin";
 }

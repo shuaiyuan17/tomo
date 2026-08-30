@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, truncateSync, writeFileSync, writeSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
@@ -1755,8 +1755,14 @@ describe("imsg sticker sends", () => {
   });
 
   it("expands a leading ~ before the existence check and the RPC", async () => {
-    const name = `.tomo-imsg-sticker-test-${process.pid}-${Date.now()}.jpg`;
-    const absolute = join(homedir(), name);
+    // Point HOME at a throwaway directory rather than writing a probe file
+    // into the developer's real home. `ImsgChannel.send` reads `homedir()` at
+    // call time, so the stub is what the expansion under test resolves — and
+    // a run killed mid-test can no longer leave a stray file in `~`.
+    const home = mkdtempSync(join(tmpdir(), "tomo-imsg-home-"));
+    vi.stubEnv("HOME", home);
+    const name = "sticker.jpg";
+    const absolute = join(home, name);
     writeFileSync(absolute, "fake-jpeg-bytes");
     try {
       const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
@@ -1769,7 +1775,8 @@ describe("imsg sticker sends", () => {
       expect(stickers[0].params.file).toBe(absolute);
       await channel.stop();
     } finally {
-      rmSync(absolute, { force: true });
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
     }
   });
 

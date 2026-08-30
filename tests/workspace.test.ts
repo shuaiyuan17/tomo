@@ -1,10 +1,43 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { buildSystemPrompt } from "../src/workspace/index.js";
-import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { describe, it, expect, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 
-const TOMO_WORKSPACE = join(homedir(), ".tomo", "workspace");
+// HERMETIC BY CONSTRUCTION, and it has to be done before the import below.
+//
+// `src/workspace/index.ts` resolves MEMORY_DIR once, at module load, from
+// `defaultRuntimePaths` — which is itself a module-level const built from
+// `homedir()` and `$TOMO_WORKSPACE`. So the paths this suite exercises are
+// fixed by the environment as it stands at import time, and a static
+// `import { buildSystemPrompt }` would bind them to the developer's real
+// `~/.tomo/workspace` before any hook could intervene.
+//
+// That was not theoretical. `buildSystemPrompt()` calls `mkdirSync(MEMORY_DIR)`
+// on every invocation, and two describes below overwrite `MEMORY.md` with
+// fixture text and restore it afterwards — against the real file. A run that
+// died between `beforeEach` and `afterEach` left the owner's memory index
+// replaced by three lines of test data, and a daemon reading it inside that
+// window saw the fixture.
+//
+// Stub both keys: `TOMO_WORKSPACE` takes precedence over `$HOME` in
+// `createRuntimePaths`, so stubbing HOME alone would still resolve to the real
+// workspace for anyone who has it set — which every Tomo developer does.
+const TEST_HOME = mkdtempSync(join(tmpdir(), "tomo-workspace-test-"));
+const TOMO_WORKSPACE = join(TEST_HOME, ".tomo", "workspace");
+vi.stubEnv("HOME", TEST_HOME);
+vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
+
+// Drop anything another entry point already evaluated against the real
+// environment, so hermeticity here does not quietly depend on vitest's
+// `isolate: true` staying on. Same guard as tests/config.test.ts.
+vi.resetModules();
+
+const { buildSystemPrompt } = await import("../src/workspace/index.js");
+
+afterAll(() => {
+  vi.unstubAllEnvs();
+  rmSync(TEST_HOME, { recursive: true, force: true });
+});
 
 describe("buildSystemPrompt", () => {
   it("includes all sections", () => {
@@ -43,20 +76,14 @@ describe("buildSystemPrompt", () => {
   describe("loads MEMORY.md content", () => {
     const memoryDir = join(TOMO_WORKSPACE, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
-    let originalContent: string | null = null;
 
     beforeEach(() => {
       mkdirSync(memoryDir, { recursive: true });
-      originalContent = existsSync(memoryFile) ? readFileSync(memoryFile, "utf-8") : null;
       writeFileSync(memoryFile, "- [Test](test.md) — test memory\n");
     });
 
     afterEach(() => {
-      if (originalContent !== null) {
-        writeFileSync(memoryFile, originalContent);
-      } else {
-        rmSync(memoryFile, { force: true });
-      }
+      rmSync(memoryFile, { force: true });
     });
 
     it("includes memory entry in prompt", () => {
@@ -68,11 +95,9 @@ describe("buildSystemPrompt", () => {
   describe("private memory filtering for group sessions", () => {
     const memoryDir = join(TOMO_WORKSPACE, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
-    let originalContent: string | null = null;
 
     beforeEach(() => {
       mkdirSync(memoryDir, { recursive: true });
-      originalContent = existsSync(memoryFile) ? readFileSync(memoryFile, "utf-8") : null;
       writeFileSync(memoryFile, [
         "- [Public](public.md) — visible everywhere",
         "- [Private](private/secret.md) — DM only",
@@ -81,11 +106,7 @@ describe("buildSystemPrompt", () => {
     });
 
     afterEach(() => {
-      if (originalContent !== null) {
-        writeFileSync(memoryFile, originalContent);
-      } else {
-        rmSync(memoryFile, { force: true });
-      }
+      rmSync(memoryFile, { force: true });
     });
 
     it("DM sessions see private/ entries", () => {

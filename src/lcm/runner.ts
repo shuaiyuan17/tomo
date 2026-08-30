@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
@@ -5,6 +6,7 @@ import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, type DuePromotion } fro
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
 import { formatTomoEvent } from "../tomo-event.js";
+import { NudgeCooldownStore, nudgeCooldownStore } from "./nudge-cooldown-store.js";
 
 /**
  * Periodic rollup promotion checker.
@@ -19,9 +21,15 @@ const INITIAL_DELAY_MS = 2 * 60 * 1000;       // 2 min after startup
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;     // every hour
 const DAY_START_HOUR = 7;
 const DAY_END_HOUR = 22;
-// Debounce: don't re-nudge the same promotion more than once per 6h within
-// a single daemon run (agent might be busy; give it time to act).
+// Debounce: don't re-nudge the same promotion more than once per 6h (agent
+// might be busy; give it time to act). Persisted (see NudgeCooldownStore), so
+// the window survives a daemon restart.
 const NUDGE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/** Where the cooldown lives — alongside the other daemon state under ~/.tomo/data. */
+export function defaultNudgeCooldownPath(): string {
+  return join(config.tomoHome, "data", "lcm", "nudge-cooldown.json");
+}
 
 function isDaytime(): boolean {
   const h = new Date().getHours();
@@ -82,10 +90,20 @@ export class RollupRunner {
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Initial delayed check. Held so stop() can cancel it — see VersionChecker. */
   private initialTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastNudged = new Map<string, number>(); // `${sessionKey}:${level}:${period}` → timestamp
+  /**
+   * `${sessionKey}:${level}:${period}` → timestamp of the last nudge. Backed by
+   * a JSON file so a restart doesn't re-arm every period (2026-08-29: daemon up
+   * at 08:14, `daily 2026-08-28` re-nudged at 08:16, 1h after the 07:15 nudge).
+   * Reads stay in memory; only a nudge touches the disk.
+   */
+  private lastNudged: NudgeCooldownStore;
 
-  constructor(agent: Agent) {
+  constructor(agent: Agent, cooldowns?: NudgeCooldownStore) {
     this.agent = agent;
+    // Shared per path and loaded on first construction — i.e. before start()
+    // can fire the first check, and without a second runner in this process
+    // holding an independent snapshot of the same file.
+    this.lastNudged = cooldowns ?? nudgeCooldownStore(defaultNudgeCooldownPath());
   }
 
   start(): void {
@@ -129,7 +147,7 @@ export class RollupRunner {
         // Debounce — filter out ones we nudged recently
         const fresh = due.filter((p) => {
           const k = `${sessionKey}:${p.level}:${p.period}`;
-          const last = this.lastNudged.get(k);
+          const last = this.lastNudged.get(k, now);
           return !last || now - last >= NUDGE_COOLDOWN_MS;
         });
         if (fresh.length === 0) continue;

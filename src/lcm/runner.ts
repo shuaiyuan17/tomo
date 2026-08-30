@@ -80,6 +80,8 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
 export class RollupRunner {
   private agent: Agent;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Initial delayed check. Held so stop() can cancel it — see VersionChecker. */
+  private initialTimer: ReturnType<typeof setTimeout> | null = null;
   private lastNudged = new Map<string, number>(); // `${sessionKey}:${level}:${period}` → timestamp
 
   constructor(agent: Agent) {
@@ -88,8 +90,8 @@ export class RollupRunner {
 
   start(): void {
     log.info("Rollup runner started (hourly)");
-    setTimeout(() => this.checkAll(), INITIAL_DELAY_MS);
-    this.timer = setInterval(() => this.checkAll(), CHECK_INTERVAL_MS);
+    this.initialTimer = setTimeout(() => this.runCheckAll(), INITIAL_DELAY_MS);
+    this.timer = setInterval(() => this.runCheckAll(), CHECK_INTERVAL_MS);
   }
 
   stop(): void {
@@ -97,6 +99,17 @@ export class RollupRunner {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.initialTimer) {
+      clearTimeout(this.initialTimer);
+      this.initialTimer = null;
+    }
+  }
+
+  /** Timer entry point. `checkAll()` is async and unawaited; its per-session
+   *  body is guarded but `listActiveSessions()` (a disk read) is not, so an
+   *  unguarded rejection here would take the daemon down with it. */
+  private runCheckAll(): void {
+    this.checkAll().catch((err) => log.warn({ err }, "Rollup check failed"));
   }
 
   private async checkAll(): Promise<void> {

@@ -72,6 +72,10 @@ export async function fetchLatestVersion(): Promise<string | null> {
 export class VersionChecker {
   private agent: Agent;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Initial delayed check. Held so stop() can cancel it — an un-cancelled
+   *  one fires against a checker the daemon has already torn down, and holds
+   *  the event loop open for the rest of its delay. */
+  private initialTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(agent: Agent) {
     this.agent = agent;
@@ -80,8 +84,8 @@ export class VersionChecker {
   start(): void {
     log.info("Version checker started (weekly)");
     // Initial check after 60s to let channels initialize
-    setTimeout(() => this.check(), 60_000);
-    this.timer = setInterval(() => this.check(), CHECK_INTERVAL_MS);
+    this.initialTimer = setTimeout(() => this.runCheck(), 60_000);
+    this.timer = setInterval(() => this.runCheck(), CHECK_INTERVAL_MS);
   }
 
   stop(): void {
@@ -89,6 +93,18 @@ export class VersionChecker {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.initialTimer) {
+      clearTimeout(this.initialTimer);
+      this.initialTimer = null;
+    }
+  }
+
+  /** Timer entry point. `check()` is async and nothing awaits it here, so an
+   *  unguarded rejection (writeCache hitting ENOSPC/EACCES, say) would surface
+   *  as an unhandled rejection — which Node turns into a process exit, killing
+   *  the whole daemon over a failed version check. */
+  private runCheck(): void {
+    this.check().catch((err) => log.warn({ err }, "Version check failed"));
   }
 
   private async check(): Promise<void> {

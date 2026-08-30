@@ -4,7 +4,7 @@ import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { disableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
+import { stopRecordedDaemon } from "./pidfile.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
@@ -47,7 +47,7 @@ export const uninstallCommand = new Command("uninstall")
       }
     }
 
-    stopPidfileTomo();
+    await stopPidfileTomo();
 
     p.note(
       [
@@ -61,20 +61,20 @@ export const uninstallCommand = new Command("uninstall")
     p.outro("Tomo uninstalled.");
   });
 
-function stopPidfileTomo(): void {
+async function stopPidfileTomo(): Promise<void> {
   if (!existsSync(PID_FILE)) return;
   const s = p.spinner();
   s.start("Stopping Tomo");
   try {
-    // See service.ts: parse the record, and only signal a pid that is still
-    // the daemon we recorded.
-    const record = readPidFileRecord(PID_FILE);
-    if (record && isRecordedProcessLive(record)) {
-      try { process.kill(record.pid, "SIGTERM"); } catch { /* already gone */ }
-    }
-    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
-    s.stop("Tomo stopped");
-  } catch {
-    s.stop("Nothing to stop");
+    // Signal only a pid that is still the daemon we recorded, and wait for
+    // the exit rather than report it. The daemon releases its own pid file;
+    // a stale one is swept below so `~/.tomo` is left clean.
+    const result = await stopRecordedDaemon(PID_FILE);
+    // Only a file nobody live is holding: stale, or released by the exit.
+    try { unlinkSync(PID_FILE); } catch { /* already released */ }
+    s.stop(result === null ? "Nothing to stop" : "Tomo stopped");
+  } catch (err) {
+    s.stop("Could not stop Tomo");
+    p.log.warn((err as Error).message);
   }
 }

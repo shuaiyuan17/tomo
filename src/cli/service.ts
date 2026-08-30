@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { DAEMON_STOP_TIMEOUT_MS, isPidAlive, isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
+import { DAEMON_STOP_TIMEOUT_MS, isPidAlive, isRecordedProcessLive, readPidFileRecord, stopRecordedDaemon } from "./pidfile.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,7 +31,11 @@ export async function enableAutostart(): Promise<void> {
     throw new Error("Autostart is only supported on macOS.");
   }
 
-  stopPidfileTomo();
+  // Wait for the manual daemon to actually exit before handing the pid file
+  // to launchd. Bootstrapping while it was still inside its graceful shutdown
+  // — and with its exclusion claim already unlinked — started a second daemon
+  // alongside it. If it will not die, refuse rather than double up.
+  await stopRecordedDaemon(PID_FILE);
 
   const plist = buildPlist();
   mkdirSync(dirname(LAUNCH_AGENT_PLIST_PATH), { recursive: true });
@@ -73,7 +77,14 @@ export async function restartAutostart(): Promise<void> {
     );
   }
   const domain = guiDomain();
-  const oldPid = readPidFile();
+  // The record's pid is what a NEW pid file must differ from; the pid we
+  // signal and wait on is only meaningful if it is still the recorded daemon.
+  // A recycled pid (SIGKILLed daemon, pid inherited by an editor) is alive but
+  // not ours: SIGTERMing it would kill a stranger, and waiting on it would
+  // time out on a process that is never going to exit for us.
+  const oldRecord = readPidFileRecord(PID_FILE);
+  const recordedPid = oldRecord?.pid ?? null;
+  const oldPid = oldRecord !== null && isRecordedProcessLive(oldRecord) ? oldRecord.pid : null;
 
   // Happy path: service is loaded → kickstart restarts it in place.
   // If the plist is on disk but the service isn't loaded (e.g. after `tomo stop`
@@ -87,7 +98,7 @@ export async function restartAutostart(): Promise<void> {
   // If the running tomo wasn't actually the launchd-managed instance (e.g.
   // started via `tomo start` directly), kickstart -k won't reach it. SIGTERM
   // the PID-file PID directly so it exits and launchd can take over.
-  if (oldPid !== null && isPidAlive(oldPid)) {
+  if (oldPid !== null) {
     try { process.kill(oldPid, "SIGTERM"); } catch { /* already dead */ }
   }
 
@@ -101,7 +112,7 @@ export async function restartAutostart(): Promise<void> {
     await new Promise((r) => setTimeout(r, 300));
     if (oldPid !== null && isPidAlive(oldPid)) continue;
     const newPid = readPidFile();
-    if (newPid !== null && newPid !== oldPid) return;
+    if (newPid !== null && newPid !== recordedPid) return;
   }
   throw new Error(
     `Restart didn't complete within ${timeoutSec}s (old PID ${oldPid ?? "?"} still alive or no new PID file yet). Check \`tomo status\` and logs.`,
@@ -140,23 +151,6 @@ async function runLaunchctl(
     const e = err as { stderr?: string; stdout?: string; message?: string };
     const detail = (e.stderr || e.stdout || e.message || "").toString().trim();
     throw new Error(`launchctl ${args.join(" ")} failed: ${detail}`, { cause: err });
-  }
-}
-
-function stopPidfileTomo(): void {
-  try {
-    // Via readPidFileRecord, not `Number(readFileSync(...))`: the pid file is
-    // pid-on-line-1 plus an identity line, and a whole-file Number() is NaN.
-    // Signalling is gated on the recorded process still being the one on that
-    // pid — SIGTERMing a stranger who inherited a recycled pid is worse than
-    // doing nothing.
-    const record = readPidFileRecord(PID_FILE);
-    if (record && isRecordedProcessLive(record)) {
-      try { process.kill(record.pid, "SIGTERM"); } catch { /* already gone */ }
-    }
-    if (existsSync(PID_FILE)) unlinkSync(PID_FILE);
-  } catch {
-    /* best effort */
   }
 }
 

@@ -35,4 +35,4 @@ if (result.ok) {
   process.stdin.on("end", () => process.exit(0));
   process.stdin.on("close", () => process.exit(0));
   setTimeout(() => process.exit(0), 60_000).unref();
-} 
+}

@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { acquirePidFile, releasePidFile } from "./pidfile.js";
+import { acquirePidFile, readPidFileRecord, releasePidFile } from "./pidfile.js";
 import { getRunningPid } from "./status-info.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -287,6 +287,9 @@ async function startDaemon(): Promise<void> {
   const { mkdirSync: mkdirSyncFs } = await import("node:fs");
   mkdirSyncFs(join(TOMO_HOME, "logs"), { recursive: true });
   const errFd = openSync(errFile, "a");
+  const { statSync } = await import("node:fs");
+  let errSizeBefore = 0;
+  try { errSizeBefore = statSync(errFile).size; } catch { /* fresh file */ }
 
   // Re-run ourselves in foreground mode as a detached child
   const child = spawn(process.execPath, [process.argv[1], "start", "--foreground"], {
@@ -298,8 +301,73 @@ async function startDaemon(): Promise<void> {
     },
   });
 
+  // Do not report success on the strength of having spawned. The child's
+  // first act is `acquirePidFile`, and it exits 1 if another daemon holds the
+  // file — so two concurrent `tomo start`s used to both print "started" while
+  // one child died with its message buried in tomo.err. Wait until the pid
+  // file names this child, or the child is gone.
+  const exited = new Promise<number | null>((resolve) => {
+    child.on("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+    child.on("error", () => resolve(1));
+  });
+  const outcome = await awaitBackgroundClaim({ pidFile: PID_FILE, childPid: child.pid ?? -1, exited });
   child.unref();
-  console.log(`Tomo started in background (PID ${child.pid})`);
-  console.log(`Logs: ${logFile}`);
-  process.exit(0);
+
+  if (outcome.kind === "claimed") {
+    console.log(`Tomo started in background (PID ${child.pid})`);
+    console.log(`Logs: ${logFile}`);
+    process.exit(0);
+  }
+  const { readFileSync } = await import("node:fs");
+  let tail = "";
+  try {
+    tail = readFileSync(errFile, "utf-8").slice(errSizeBefore).trim();
+  } catch { /* nothing to show */ }
+  if (outcome.kind === "exited") {
+    console.error(`Tomo exited during startup (code ${outcome.code ?? "?"}).${tail ? `\n${tail}` : ""}`);
+    console.error(`Full output: ${errFile}`);
+  } else {
+    console.error(
+      `Tomo (PID ${child.pid}) has not claimed the pid file after ${Math.round(outcome.waitedMs / 1000)}s; `
+      + `cannot confirm it started. Check \`tomo status\` and ${errFile}.`,
+    );
+  }
+  process.exit(1);
+}
+
+export type BackgroundClaimOutcome =
+  | { kind: "claimed" }
+  | { kind: "exited"; code: number | null }
+  | { kind: "timeout"; waitedMs: number };
+
+/**
+ * Resolve once `pidFile` names `childPid`, the child has exited, or
+ * `timeoutMs` passes — whichever is first. Exported for tests.
+ */
+export async function awaitBackgroundClaim(opts: {
+  pidFile: string;
+  childPid: number;
+  exited: Promise<number | null>;
+  timeoutMs?: number;
+  pollMs?: number;
+}): Promise<BackgroundClaimOutcome> {
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const pollMs = opts.pollMs ?? 100;
+  const started = Date.now();
+  let exitCode: number | null | undefined;
+  void opts.exited.then((code) => { exitCode = code; });
+  for (;;) {
+    if (readPidFileRecord(opts.pidFile)?.pid === opts.childPid) return { kind: "claimed" };
+    // Let a settled `exited` land before judging; a child that exits 1 the
+    // instant after our poll must be reported as exited, not as slow.
+    await new Promise((r) => setTimeout(r, 0));
+    if (exitCode !== undefined) {
+      // One last look: the child may have claimed and been killed in the gap.
+      if (readPidFileRecord(opts.pidFile)?.pid === opts.childPid) return { kind: "claimed" };
+      return { kind: "exited", code: exitCode };
+    }
+    const waitedMs = Date.now() - started;
+    if (waitedMs >= timeoutMs) return { kind: "timeout", waitedMs };
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, timeoutMs - waitedMs)));
+  }
 }

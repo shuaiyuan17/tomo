@@ -1,4 +1,7 @@
-import { closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import {
+  closeSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync,
+  writeFileSync, writeSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
@@ -103,6 +106,131 @@ export function isRecordedProcessLive(record: PidFileRecord): boolean {
   return current === record.identity;
 }
 
+/**
+ * Poll until `pid` is gone, or `timeoutMs` elapses. Returns true iff the
+ * process exited.
+ *
+ * Signals are asynchronous: `process.kill(pid, "SIGTERM")` returns as soon as
+ * the signal is queued, long before the daemon has finished `agent.stop()`
+ * (which can take tens of seconds when SIGTERM lands mid-turn) — and returns
+ * just the same when the handler never runs at all. Anything reporting
+ * "stopped" needs to observe the exit, not the send.
+ *
+ * The poll uses plain liveness rather than the full identity check: the latter
+ * spawns `ps`, and at 100ms intervals over a 60s budget that is 600 processes.
+ * Callers that care about pid reuse confirm once, at the end (see
+ * `performStopWith`).
+ */
+export async function waitForExit(
+  pid: number,
+  timeoutMs = DAEMON_STOP_TIMEOUT_MS,
+  pollMs = 100,
+  alive: (p: number) => boolean = isPidAlive,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!alive(pid)) return true;
+    if (Date.now() >= deadline) return !alive(pid);
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+  }
+}
+
+/**
+ * Signal the daemon the pid file describes and wait for it to exit. Resolves
+ * once the pid is gone (or was never ours to begin with); throws when it is
+ * still the recorded daemon after `timeoutMs`.
+ *
+ * Deliberately does NOT unlink the pid file. The daemon releases its own claim
+ * on exit, and a claim left by a crash is taken over by the next
+ * `acquirePidFile`. Unlinking here — as `enableAutostart` used to, right after
+ * sending SIGTERM — removed a LIVE daemon's exclusion claim while it was still
+ * spending its 23–33s graceful-shutdown budget, so the launchd job bootstrapped
+ * immediately afterwards started a second daemon alongside it.
+ */
+export async function stopRecordedDaemon(
+  pidFile: string = PID_FILE,
+  deps: {
+    kill?: (pid: number, signal: NodeJS.Signals) => void;
+    wait?: (pid: number, timeoutMs: number) => Promise<boolean>;
+    timeoutMs?: number;
+  } = {},
+): Promise<{ pid: number; stopped: boolean } | null> {
+  const record = readPidFileRecord(pidFile);
+  if (record === null || !isRecordedProcessLive(record)) return null;
+  const kill = deps.kill ?? ((pid, signal) => { process.kill(pid, signal); });
+  const wait = deps.wait ?? ((pid, t) => waitForExit(pid, t));
+  const timeoutMs = deps.timeoutMs ?? DAEMON_STOP_TIMEOUT_MS;
+  try { kill(record.pid, "SIGTERM"); } catch { /* raced away; the wait settles it */ }
+  if (await wait(record.pid, timeoutMs)) return { pid: record.pid, stopped: true };
+  // Cheap poll timed out; confirm identity once before calling it wedged.
+  if (!isRecordedProcessLive(record)) return { pid: record.pid, stopped: true };
+  throw new Error(
+    `Tomo (PID ${record.pid}) is still running ${Math.round(timeoutMs / 1000)}s after SIGTERM. `
+    + `It may be finishing an in-flight turn — check \`tomo logs -f\`, or force it with: kill -9 ${record.pid}`,
+  );
+}
+
+/**
+ * How long a takeover lock may sit on disk before it is presumed abandoned.
+ * The critical section it guards is a handful of syscalls — microseconds —
+ * so a lock this old belongs to a process that was SIGKILLed inside it.
+ */
+const LOCK_STALE_MS = 10_000;
+/** How long a contender waits for the lock before giving up. */
+const LOCK_WAIT_MS = 5_000;
+const LOCK_POLL_MS = 5;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run `fn` with `<pidFile>.lock` held. `mkdir` is atomic, so exactly one
+ * process can create the directory; everyone else waits.
+ *
+ * The lock exists because "read the pid file, judge it stale, unlink it" is a
+ * check-then-act, and `link()` alone only makes the PUBLISH atomic. Without
+ * it, two starters facing one stale file both judge it stale; A unlinks and
+ * publishes, and B — having already decided to unlink — deletes A's live claim
+ * and publishes its own. Both start. The same race let a concurrent `tomo
+ * status` reap a claim that had just been re-taken. Every mutation of the pid
+ * file goes through here so that judgement and unlink are one step.
+ *
+ * A lock left by a process killed mid-section is reclaimed by age. That
+ * reclaim is itself a check-then-act, but the window needs a process to be
+ * suspended for `LOCK_STALE_MS` between stat and rmdir — not a live daemon's
+ * whole startup sequence, which is the window this module closes.
+ *
+ * Returns `undefined` if the lock could not be taken within `LOCK_WAIT_MS`.
+ */
+function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
+  const lockDir = `${pidFile}.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    try {
+      if (Date.now() - statSync(lockDir).mtimeMs > LOCK_STALE_MS) {
+        try { rmdirSync(lockDir); } catch { /* someone else reclaimed it */ }
+        continue;
+      }
+    } catch {
+      continue; // vanished between the mkdir and the stat: retry immediately
+    }
+    if (Date.now() >= deadline) return undefined;
+    sleepSync(LOCK_POLL_MS);
+  }
+  try {
+    return fn();
+  } finally {
+    try { rmdirSync(lockDir); } catch { /* reclaimed by age while we ran; nothing to do */ }
+  }
+}
+
 export type PidFileAcquisition =
   /**
    * We own the pid file. `tookOverStale` is the dead pid whose file we
@@ -134,17 +262,17 @@ export type PidFileAcquisition =
  * six processes won that way.
  *
  * A file left behind by a crashed daemon (or one whose contents are garbage)
- * is taken over: the recorded pid is probed with `kill(pid, 0)` and, if dead,
- * the file is unlinked and the link retried. The retry loop is bounded because
- * the unlink→link pair is NOT atomic — two processes both finding the same
- * stale file can interleave — and losing that sub-race just means the other
- * one is now the live holder, which the next iteration observes.
+ * is taken over: the recorded process is checked (liveness plus identity) and,
+ * if gone, the file is unlinked and the link retried. Judgement and unlink
+ * happen under {@link withPidFileLock}: without it two starters that both
+ * found the same stale file could both take it over — the second one's
+ * already-decided unlink deleted the first one's freshly published claim. The
+ * retry loop is still bounded, against a file being churned by something
+ * outside this module.
  *
  * Call this as the FIRST action of daemon startup, before any `await`.
  */
 export function acquirePidFile(pidFile: string = PID_FILE, pid: number = process.pid): PidFileAcquisition {
-  let tookOverStale: number | null = null;
-
   mkdirSync(dirname(pidFile), { recursive: true });
   sweepAbandonedStaging(pidFile);
 
@@ -152,30 +280,36 @@ export function acquirePidFile(pidFile: string = PID_FILE, pid: number = process
   writeFileSync(staging, `${pid}\n${processIdentity(pid) ?? ""}\n`);
 
   try {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      if (publishClaim(staging, pidFile)) return { ok: true, tookOverStale };
+    const outcome = withPidFileLock(pidFile, (): PidFileAcquisition => {
+      let tookOverStale: number | null = null;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (publishClaim(staging, pidFile)) return { ok: true, tookOverStale };
 
-      const record = readPidFileRecord(pidFile);
-      // `record.pid === pid` is us: a pid file we already own (or one a
-      // recycled pid left behind that happens to be ours). Either way it is
-      // not a second daemon, so take it over — and do NOT report it as a
-      // stale takeover, which would print "left by PID <ourselves>".
-      if (record !== null && record.pid !== pid && isRecordedProcessLive(record)) {
-        return { ok: false, holder: record.pid };
+        const record = readPidFileRecord(pidFile);
+        // `record.pid === pid` is us: a pid file we already own (or one a
+        // recycled pid left behind that happens to be ours). Either way it is
+        // not a second daemon, so take it over — and do NOT report it as a
+        // stale takeover, which would print "left by PID <ourselves>".
+        if (record !== null && record.pid !== pid && isRecordedProcessLive(record)) {
+          return { ok: false, holder: record.pid };
+        }
+
+        tookOverStale = record !== null && record.pid !== pid ? record.pid : null;
+        try {
+          unlinkSync(pidFile);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
       }
-
-      tookOverStale = record !== null && record.pid !== pid ? record.pid : null;
-      try {
-        unlinkSync(pidFile);
-      } catch (err) {
-        // Someone else cleaned it up first; the next claim attempt settles it.
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      }
-    }
-
-    // Five rounds with no live holder means another process is churning the
-    // same file. Refusing is safer than looping: the caller exits non-zero.
-    return { ok: false, holder: readPidFileRecord(pidFile)?.pid ?? 0 };
+      // Five rounds with no live holder means the file is being churned by
+      // something outside this module. Refusing is safer than looping: the
+      // caller exits non-zero.
+      return { ok: false, holder: readPidFileRecord(pidFile)?.pid ?? 0 };
+    });
+    // Could not take the lock: another process has been inside the critical
+    // section for longer than the whole wait budget. Treat whatever the file
+    // says as the holder rather than start a daemon we cannot prove is alone.
+    return outcome ?? { ok: false, holder: readPidFileRecord(pidFile)?.pid ?? 0 };
   } finally {
     try { unlinkSync(staging); } catch { /* already gone */ }
   }
@@ -250,9 +384,32 @@ function sweepAbandonedStaging(pidFile: string): void {
  */
 export function releasePidFile(pidFile: string = PID_FILE, pid: number = process.pid): void {
   try {
-    if (readPidFileRecord(pidFile)?.pid !== pid) return;
-    unlinkSync(pidFile);
+    withPidFileLock(pidFile, () => {
+      if (readPidFileRecord(pidFile)?.pid !== pid) return;
+      unlinkSync(pidFile);
+    });
   } catch {
     /* best effort — a missing or unreadable pid file needs no cleanup */
   }
+}
+
+/**
+ * The record in the pid file if the recorded process is still live; otherwise
+ * null, with the stale or garbage file removed — under the same lock the
+ * daemon acquires with, so a `tomo status` cannot reap a claim that a starting
+ * daemon has just re-taken (the judgement and the unlink are one step).
+ *
+ * If the lock cannot be taken the file is left alone and reported as it reads:
+ * a reader must never delete what it could not examine exclusively.
+ */
+export function readLivePidFileRecord(pidFile: string = PID_FILE): PidFileRecord | null {
+  const result = withPidFileLock(pidFile, (): PidFileRecord | null => {
+    const record = readPidFileRecord(pidFile);
+    if (record !== null && isRecordedProcessLive(record)) return record;
+    try { unlinkSync(pidFile); } catch { /* already gone */ }
+    return null;
+  });
+  if (result !== undefined) return result;
+  const record = readPidFileRecord(pidFile);
+  return record !== null && isRecordedProcessLive(record) ? record : null;
 }

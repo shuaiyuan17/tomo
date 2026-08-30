@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   acquirePidFile, releasePidFile, isPidAlive, processIdentity, readPidFileRecord,
-  isRecordedProcessLive, DAEMON_STOP_TIMEOUT_MS,
+  isRecordedProcessLive, readLivePidFileRecord, stopRecordedDaemon, waitForExit, DAEMON_STOP_TIMEOUT_MS,
 } from "../src/cli/pidfile.js";
 import { getRunningPid } from "../src/cli/status-info.js";
 
@@ -106,6 +106,39 @@ describe("acquirePidFile", () => {
     expect(existsSync(abandoned)).toBe(false);
     expect(existsSync(live)).toBe(true);
     rmSync(live, { force: true });
+  });
+});
+
+describe("the takeover lock", () => {
+  it("reclaims a lock abandoned by a process killed inside the critical section", () => {
+    const lockDir = `${pidFile}.lock`;
+    mkdirSync(lockDir);
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(lockDir, old, old);
+    const res = acquirePidFile(pidFile, 4242);
+    expect(res).toEqual({ ok: true, tookOverStale: null });
+    expect(existsSync(lockDir)).toBe(false);
+  });
+
+  it("does not leave the lock behind after any outcome", () => {
+    writeFileSync(pidFile, `${process.pid}\n${processIdentity(process.pid)}\n`);
+    expect(acquirePidFile(pidFile, 4242).ok).toBe(false);
+    expect(existsSync(`${pidFile}.lock`)).toBe(false);
+    releasePidFile(pidFile, process.pid);
+    expect(existsSync(`${pidFile}.lock`)).toBe(false);
+    expect(readLivePidFileRecord(pidFile)).toBeNull();
+    expect(existsSync(`${pidFile}.lock`)).toBe(false);
+  });
+});
+
+describe("readLivePidFileRecord", () => {
+  it("returns the record for a live daemon and reaps a stale one", () => {
+    writeFileSync(pidFile, `${process.pid}\n${processIdentity(process.pid)}\n`);
+    expect(readLivePidFileRecord(pidFile)?.pid).toBe(process.pid);
+    expect(existsSync(pidFile)).toBe(true);
+    writeFileSync(pidFile, `${deadPid()}\n`);
+    expect(readLivePidFileRecord(pidFile)).toBeNull();
+    expect(existsSync(pidFile)).toBe(false);
   });
 });
 
@@ -257,6 +290,68 @@ describe("acquirePidFile across real processes", () => {
       // late-starting racer can inherit a stale file and legitimately win too.
       for (const r of racers) { r.child.stdin?.end(); r.child.kill("SIGKILL"); }
     }
+  });
+});
+
+describe("acquirePidFile across real processes, over a shared STALE file", () => {
+  // The dangerous case is not an empty slot but a stale file every racer
+  // judges takeable at once: without the takeover lock, the second racer's
+  // already-decided unlink deletes the first racer's freshly published claim
+  // and both "win".
+  it("lets exactly one of six concurrent processes take it over", { timeout: 60_000 }, async () => {
+    const stale = deadPid();
+    writeFileSync(pidFile, `${stale}\n`);
+    const startAt = Date.now() + 5_000;
+    const racers = Array.from({ length: 6 }, () => race(startAt));
+    try {
+      const results = await Promise.all(racers.map((r) => r.result));
+      const winners = results.filter((r) => r.ok);
+      expect(winners).toHaveLength(1);
+      expect(winners[0].tookOverStale).toBe(stale);
+      for (const loser of results.filter((r) => !r.ok)) {
+        expect(loser.holder).toBe(winners[0].pid);
+      }
+      expect(readPidFileRecord(pidFile)?.pid).toBe(winners[0].pid);
+    } finally {
+      for (const r of racers) { r.child.stdin?.end(); r.child.kill("SIGKILL"); }
+    }
+  });
+});
+
+describe("stopRecordedDaemon", () => {
+  const children: ReturnType<typeof spawn>[] = [];
+  afterEach(() => { for (const c of children) { try { c.kill("SIGKILL"); } catch { /* gone */ } } });
+
+  /** Spawn a child and resolve its pid only once it has printed "ready" — i.e. after its handlers are installed. */
+  function child(script: string): Promise<number> {
+    const c = spawn(process.execPath, ["-e", `${script}; process.stdout.write("ready\\n");`], { stdio: ["ignore", "pipe", "ignore"] });
+    children.push(c);
+    return new Promise((resolve) => c.stdout!.once("data", () => resolve(c.pid!)));
+  }
+
+  it("is a no-op on a stale file and leaves it for the next acquirer", async () => {
+    writeFileSync(pidFile, `${deadPid()}\n`);
+    expect(await stopRecordedDaemon(pidFile)).toBeNull();
+    expect(existsSync(pidFile)).toBe(true);
+  });
+
+  it("waits for a cooperative daemon and does not unlink its claim itself", async () => {
+    const pid = await child(`process.on("SIGTERM", () => setTimeout(() => process.exit(0), 300)); setInterval(() => {}, 1000)`);
+    writeFileSync(pidFile, `${pid}\n${processIdentity(pid)}\n`);
+    const res = await stopRecordedDaemon(pidFile, { wait: (p, t) => waitForExit(p, t, 50) });
+    expect(res).toEqual({ pid, stopped: true });
+    expect(isPidAlive(pid)).toBe(false);
+    // Releasing the claim is the daemon's job (or the next acquirer's).
+    expect(existsSync(pidFile)).toBe(true);
+  });
+
+  it("throws rather than report a daemon that ignores SIGTERM as stopped", async () => {
+    const pid = await child(`process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)`);
+    writeFileSync(pidFile, `${pid}\n${processIdentity(pid)}\n`);
+    await expect(stopRecordedDaemon(pidFile, { timeoutMs: 500, wait: (p, t) => waitForExit(p, t, 50) }))
+      .rejects.toThrow(`kill -9 ${pid}`);
+    expect(isPidAlive(pid)).toBe(true);
+    expect(existsSync(pidFile)).toBe(true);
   });
 });
 

@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync } from "../fs-utils.js";
+import { backupConfigIfParseableSync } from "./config/shared.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { DEFAULT_MODEL } from "../models.js";
 
@@ -318,9 +319,7 @@ export const initCommand = new Command("init")
         config.groupSecret = groupSecret;
       }
 
-      mkdirSync(dirname(configPath), { recursive: true });
-      backupFileIfExistsSync(configPath, CONFIG_BACKUP_PATH, { mode: 0o600 });
-      writeJsonAtomicSync(configPath, config, { mode: 0o600 });
+      writeInitConfig(configPath, CONFIG_BACKUP_PATH, config);
       p.log.success("Config saved");
       p.log.info(
         `Owner identity "${ownerIdentity.name}" created — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Manage it later with \`tomo config\` → Identities.`,
@@ -373,6 +372,21 @@ export const initCommand = new Command("init")
  *  the owner's DM a unified dm:<name> session key. The name feeds that session
  *  key (lowercased by the router), so use only the first word of the display
  *  name and fall back to "owner" when none was given. */
+/**
+ * Write the config `tomo init` assembled, rotating the previous file into
+ * `backupPath` only if it parses.
+ *
+ * `tomo init --force` overwrites an existing config on purpose, so the .bak
+ * is the only copy of what was there. Rotating it content-blind meant a
+ * corrupt config replaced a good backup — losing the last recoverable
+ * version rather than preserving it. Exported for tests.
+ */
+export function writeInitConfig(configPath: string, backupPath: string, config: Record<string, unknown>): void {
+  mkdirSync(dirname(configPath), { recursive: true });
+  backupConfigIfParseableSync(configPath, backupPath);
+  writeJsonAtomicSync(configPath, config, { mode: 0o600 });
+}
+
 export function deriveOwnerIdentity(
   userName: string,
   telegramUserId: string,

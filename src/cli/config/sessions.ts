@@ -72,11 +72,26 @@ export async function configSessions(): Promise<void> {
     if (action === "clear-session") {
       const confirm = await p.confirm({ message: `Clear session "${key}"? This will start a new conversation.` });
       if (p.isCancel(confirm) || !confirm) continue;
-      store.clearSdkSessionId(key);
+      // Save first. saveConfig refuses when config.json cannot be parsed, and
+      // clearing the SDK session is not undoable — doing it first would retire
+      // the conversation and then abort, leaving the override behind.
       delete overrides[key];
       cfg.sessionModelOverrides = overrides;
       saveConfig(cfg);
-      p.log.success(`Session "${key}" cleared`);
+      // The config is already saved, so that is the truthful state to report
+      // whatever happens next. clearSdkSessionId can refuse when the session
+      // registry itself is unreadable; that must not take the menu down with
+      // a stack trace, and the override removal genuinely did land.
+      try {
+        store.clearSdkSessionId(key);
+        p.log.success(`Session "${key}" cleared`);
+      } catch (err) {
+        p.log.error(
+          "Model override removed, but the session could not be cleared: " +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+        process.exitCode = 1;
+      }
     }
   }
 }

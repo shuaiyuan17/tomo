@@ -27,6 +27,11 @@ const TOMO_WORKSPACE = join(TEST_HOME, ".tomo", "workspace");
 vi.stubEnv("HOME", TEST_HOME);
 vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
 
+// Drop anything another entry point already evaluated against the real
+// environment, so hermeticity here does not quietly depend on vitest's
+// `isolate: true` staying on. Same guard as tests/config.test.ts.
+vi.resetModules();
+
 const { buildSystemPrompt } = await import("../src/workspace/index.js");
 
 afterAll(() => {

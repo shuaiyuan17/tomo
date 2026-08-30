@@ -4,9 +4,11 @@ import { homedir } from "node:os";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -24,7 +26,46 @@ const BACKUPS_DIR = join(homedir(), "Backups", "tomo");
 // over two weeks, so 14 days was holding 32 GB on a disk that was down to 21 GB
 // free. Seven days of local history plus the other two legs is the trade we
 // picked (2026-08-16). Override with TOMO_BACKUP_RETENTION_DAYS.
-const RETENTION_DAYS = Number(process.env.TOMO_BACKUP_RETENTION_DAYS ?? 7);
+export const DEFAULT_RETENTION_DAYS = 7;
+/** Ten years. Past this a value is a typo or a units mix-up, not a policy. */
+export const MAX_RETENTION_DAYS = 3650;
+
+/**
+ * Resolve the retention window from `TOMO_BACKUP_RETENTION_DAYS`.
+ *
+ * This used to be a bare `Number(env ?? 7)`, which failed in both directions
+ * and silently. `"7d"` — a plausible typo in a shell profile or a launchd
+ * `EnvironmentVariables` block — is `NaN`, so `Date.now() - NaN` is `NaN`,
+ * every `date < NaN` is false, and pruning stops entirely with no "Pruned N"
+ * line to notice: exactly the unbounded growth this file's comment above was
+ * written about. `0` (or a negative) puts the cutoff at or after now, so the
+ * backup that was just created is itself deleted, along with every other one,
+ * and the command then prints `Backup complete: 0 B` because the size is read
+ * after the prune.
+ *
+ * Anything not a finite value in [1, MAX_RETENTION_DAYS] falls back to the
+ * default and says so — including an empty string, which is how a shell
+ * profile most often 'unsets' a variable.
+ */
+export function resolveRetentionDays(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_RETENTION_DAYS;
+  const parsed = Number(raw);
+  // An UPPER bound as well as a lower one. A retention of a million days is
+  // not a policy, it is a typo or a units mix-up (milliseconds, seconds), and
+  // it disables pruning exactly as thoroughly as NaN did — silently, and with
+  // the same unbounded-growth consequence the comment above describes. Ten
+  // years is far past any plausible intent.
+  if (raw.trim() === "" || !Number.isFinite(parsed) || parsed < 1 || parsed > MAX_RETENTION_DAYS) {
+    console.warn(
+      `Ignoring TOMO_BACKUP_RETENTION_DAYS=${JSON.stringify(raw)} `
+      + `(expected a number of days between 1 and ${MAX_RETENTION_DAYS}); using ${DEFAULT_RETENTION_DAYS}.`,
+    );
+    return DEFAULT_RETENTION_DAYS;
+  }
+  return parsed;
+}
+
+const RETENTION_DAYS = resolveRetentionDays(process.env.TOMO_BACKUP_RETENTION_DAYS);
 
 function timestamp(): string {
   const now = new Date();
@@ -65,10 +106,24 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+/**
+ * The only shape a backup directory name may have: `YYYY-MM-DD_HHMM`, as
+ * produced by `timestamp()`.
+ *
+ * `listBackups` has always filtered on this, but `tomo backup restore <date>`
+ * joined its argument onto BACKUPS_DIR unchecked — so `restore ../../..` named
+ * an arbitrary directory, which the restore then treats as a backup: it
+ * `rmSync`s the live `~/.tomo/data` and `sdk-sessions` and copies whatever it
+ * finds (or nothing) over them. Same predicate, both places.
+ */
+export function isBackupName(name: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}_\d{4}$/.test(name);
+}
+
 function listBackups(): { name: string; path: string; date: Date; size: number }[] {
   if (!existsSync(BACKUPS_DIR)) return [];
   const entries = readdirSync(BACKUPS_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && /^\d{4}-\d{2}-\d{2}_\d{4}$/.test(e.name))
+    .filter((e) => e.isDirectory() && isBackupName(e.name))
     .map((e) => {
       const full = join(BACKUPS_DIR, e.name);
       // Parse date from folder name: YYYY-MM-DD_HHMM
@@ -108,6 +163,83 @@ async function confirm(prompt: string): Promise<boolean> {
       resolve(answer.trim().toLowerCase() === "y");
     });
   });
+}
+
+/**
+ * A backup directory that passed validation, identified by BOTH its canonical
+ * path and its filesystem identity.
+ *
+ * The path alone is not an identity. `realpathSync` answers "what does this
+ * name point at right now", so a directory renamed away and replaced by
+ * another ordinary directory at the same pathname resolves to the identical
+ * string. `dev`+`ino` is what distinguishes the two.
+ */
+export interface ResolvedBackup {
+  /** Canonical path, symlinks resolved. */
+  path: string;
+  /** Device id — an inode number is only unique within its filesystem. */
+  dev: number;
+  /** Inode number, captured at validation time. */
+  ino: number;
+}
+
+/**
+ * Resolve `date` to the directory `restore` may read, or null to refuse.
+ *
+ * Restore is the most destructive command here: for each of four components it
+ * `rmSync`s the live tree and copies the backup's over it. So the argument has
+ * to survive four separate questions, not one.
+ *
+ * 1. SHAPE. `YYYY-MM-DD_HHMM`, the same predicate `listBackups` applies. Alone
+ *    this stops `restore ../../..`.
+ * 2. KIND. `lstatSync`, NOT `statSync` or `existsSync`, both of which follow
+ *    the link and answer about the target. A symlink at
+ *    `~/Backups/tomo/2026-08-30_0142` pointing anywhere passes a shape check
+ *    and an existence check while being a redirect, so the entry must be a
+ *    real directory.
+ * 3. CONTAINMENT, ON REAL PATHS. `realpathSync` both sides and require the
+ *    candidate to sit directly inside the backups root. Lexical containment is
+ *    not enough once any ancestor can be a link, and the root itself is under
+ *    `homedir()`, which is a symlink on plenty of setups.
+ * 4. IDENTITY. `dev`+`ino` from the same `lstat` that answered (2), so the
+ *    caller can prove later that it is still looking at the same directory
+ *    and not a replacement wearing its name.
+ */
+export function resolveBackupPath(date: string): ResolvedBackup | null {
+  if (!isBackupName(date)) return null;
+  const candidate = join(BACKUPS_DIR, date);
+  try {
+    // Refuses a symlink, a file, a socket — anything that is not a directory
+    // in its own right. The same stat supplies the identity below, so the
+    // kind and the identity describe ONE entry, not two observations that a
+    // swap could straddle. What this does not do is pin the entry: the
+    // `realpathSync` that follows is a separate syscall, and a directory
+    // renamed in between yields A's identity with B at the path. Node's `fs`
+    // has no `openat`, so no sequence of pathname syscalls can close that;
+    // it is the same residual as content changing under the copy itself.
+    const entry = lstatSync(candidate);
+    if (!entry.isDirectory()) return null;
+    const realRoot = realpathSync(BACKUPS_DIR);
+    const realCandidate = realpathSync(candidate);
+    // Directly inside, not merely underneath: a backup is always one level
+    // down, so there is nothing to gain from accepting deeper paths.
+    if (realCandidate !== join(realRoot, date)) return null;
+    return { path: realCandidate, dev: entry.dev, ino: entry.ino };
+  } catch {
+    // Missing, unreadable, or a broken link — all equally not restorable.
+    return null;
+  }
+}
+
+/**
+ * The top-level entries `restore` copies. Checked as a set before any of them
+ * is acted on, so an aborted restore has not already half-overwritten.
+ */
+const RESTORE_LEGS = ["config.json", "workspace", "data", "sdk-sessions"] as const;
+
+/** Same directory, not merely the same name. */
+function sameBackup(a: ResolvedBackup, b: ResolvedBackup | null): boolean {
+  return b !== null && a.path === b.path && a.dev === b.dev && a.ino === b.ino;
 }
 
 export const backupCommand = new Command("backup")
@@ -233,14 +365,16 @@ backupCommand
       }
     }
 
-    const backupPath = join(BACKUPS_DIR, date);
-    if (!existsSync(backupPath)) {
-      console.error(`Backup not found: ${backupPath}`);
+    const backup = resolveBackupPath(date);
+    if (!backup) {
+      console.error(`Not a restorable backup: ${date}`);
+      console.error("Expected YYYY-MM-DD_HHMM naming a real directory directly inside " + BACKUPS_DIR + ".");
       console.error("Run 'tomo backup list' to see available backups.");
       process.exit(1);
+      return;
     }
 
-    console.log(`Restore from: ${backupPath}`);
+    console.log(`Restore from: ${backup.path}`);
     console.log("This will overwrite current tomo data.\n");
 
     const ok = await confirm("Proceed?");
@@ -249,17 +383,76 @@ backupCommand
       return;
     }
 
+    // RE-CHECK AFTER THE PROMPT. What survived the checks above describes the
+    // directory as it was, and `confirm()` is an unbounded wait — the prompt
+    // sits there until a human answers. That window belongs to whoever can
+    // write to `~/Backups/tomo`: swap the validated directory out and every
+    // `existsSync`/`cpSync` below follows the replacement, while the `rmSync`s
+    // still delete the live destinations.
+    //
+    // COMPARED BY IDENTITY, NOT BY NAME. Re-resolving and comparing only the
+    // canonical path catches a symlink swap but not a directory one: rename
+    // the original away, `mkdir` an ordinary directory at the same pathname,
+    // and both resolutions return the identical string. `dev`+`ino` is what
+    // separates "the same directory" from "something else wearing its name".
+    //
+    // WHAT THIS DOES AND DOES NOT GUARANTEE. It establishes the identity of
+    // the backup DIRECTORY ONLY. Its contents are not validated and are not
+    // frozen: a child of the backup can be a symlink pointing anywhere
+    // (`<backup>/data -> /tmp/outside/data`), and a file inside it can be
+    // rewritten at any moment. Neither needs a race to exploit — a backup
+    // directory that was already hostile when it was written stays hostile.
+    // The `lstat` sweep below closes the top-level symlink case, which is the
+    // cheap half; deep content is out of scope, and `~/Backups/tomo` is
+    // trusted to the extent that anything under the invoking user's home is.
+    if (!sameBackup(backup, resolveBackupPath(date))) {
+      console.error(`Backup ${date} changed while waiting for confirmation; aborting without restoring.`);
+      process.exit(1);
+      return;
+    }
+
+    // Each restore leg is read with `existsSync`, which FOLLOWS a symlink and
+    // answers about the target. So a `data` symlink inside an otherwise
+    // genuine backup redirects that whole leg out of the tree while the
+    // matching `rmSync` still deletes the live one. And a leg of the wrong
+    // KIND is just as destructive without any redirection: a regular file
+    // named `workspace` passes `existsSync`, the live workspace is deleted,
+    // and the file is copied into its place. Both refused here rather than
+    // per leg, so the command aborts before it has overwritten anything.
+    for (const leg of RESTORE_LEGS) {
+      const legPath = join(backup.path, leg);
+      let entry;
+      try {
+        entry = lstatSync(legPath);
+      } catch {
+        continue; // absent legs are legitimate; each copy is already gated.
+      }
+      if (entry.isSymbolicLink()) {
+        console.error(`Backup ${date} has a symlink at ${leg}; aborting without restoring.`);
+        process.exit(1);
+        return;
+      }
+      const wantDir = leg !== "config.json";
+      if (wantDir ? !entry.isDirectory() : !entry.isFile()) {
+        console.error(
+          `Backup ${date} has ${wantDir ? "a non-directory" : "a non-file"} at ${leg}; aborting without restoring.`,
+        );
+        process.exit(1);
+        return;
+      }
+    }
+
     console.log();
 
     // 1. config.json
-    const configSrc = join(backupPath, "config.json");
+    const configSrc = join(backup.path, "config.json");
     if (existsSync(configSrc)) {
       cpSync(configSrc, join(TOMO_HOME, "config.json"));
       console.log("  [ok] config.json");
     }
 
     // 2. workspace/ (preserve .claude/ which is populated by init/start)
-    const workspaceSrc = join(backupPath, "workspace");
+    const workspaceSrc = join(backup.path, "workspace");
     if (existsSync(workspaceSrc)) {
       restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
 
@@ -267,7 +460,7 @@ backupCommand
     }
 
     // 3. data/
-    const dataSrc = join(backupPath, "data");
+    const dataSrc = join(backup.path, "data");
     if (existsSync(dataSrc)) {
       const dataDest = join(TOMO_HOME, "data");
       rmSync(dataDest, { recursive: true, force: true });
@@ -276,7 +469,7 @@ backupCommand
     }
 
     // 4. SDK session files
-    const sdkSrc = join(backupPath, "sdk-sessions");
+    const sdkSrc = join(backup.path, "sdk-sessions");
     if (existsSync(sdkSrc)) {
       const sdkDest = config.sdkSessionsDir;
       rmSync(sdkDest, { recursive: true, force: true });

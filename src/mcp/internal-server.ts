@@ -27,6 +27,13 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
   const identityHint = identityList.length > 0
     ? `Known identity targets: ${identityList.map((n) => `"${n}"`).join(", ")}.`
     : `No identities are configured — use a session key form instead.`;
+  /**
+   * Is the turn in flight this session's own? Resolved per tool call — the
+   * server is built once per live session (live-session-manager.ts), but a
+   * dm: session's audience changes turn to turn while a group is summoned
+   * into it. False for a summoned-group turn and for a mixed batch.
+   */
+  const isOwnAudience = (): boolean => agent.isOwnAudienceTurn(callerSessionKey);
 
   return createSdkMcpServer({
     name: TOMO_INTERNAL_MCP_NAME,
@@ -290,10 +297,26 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ...buildPetTools(),
       // Group sessions never see private people records through these tools —
       // same boundary as the private memory subtree they live in.
-      ...buildPeopleTools({ includePrivate: !isGroupSessionKey(callerSessionKey) }),
+      //
+      // A getter, for the same reason as the cron tools above: the session key
+      // alone says "private DM" for a turn a SUMMONED GROUP is steering, since
+      // that group's messages run on the owner's dm: session. `isOwnAudience`
+      // resolves the turn's real audience and fails closed on a mixed batch.
+      ...buildPeopleTools({
+        includePrivate: () => isOwnAudience() && !isGroupSessionKey(callerSessionKey),
+      }),
       // Bound to the calling session's key: recall can only read the caller's
       // own transcript, so group sessions cannot search DM history.
-      ...buildRecallTools({ search: (opts) => agent.searchSessionTranscript(callerSessionKey, opts) }),
+      //
+      // Binding the key is not enough during a summon: the caller's own
+      // transcript IS the owner's private DM history, and the turn asking for
+      // it belongs to a group. Rather than silently searching a narrower
+      // slice, recall refuses for the duration of such a turn — the owner can
+      // ask again in their own DM, or dismiss the summon.
+      ...buildRecallTools({
+        search: (opts) => agent.searchSessionTranscript(callerSessionKey, opts),
+        canSearch: isOwnAudience,
+      }),
     ],
   });
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { audienceOf, audienceSwitchNote } from "../src/agent/audience.js";
+import { audienceOf, audienceSwitchNote, isOwnAudienceTurn } from "../src/agent/audience.js";
 
 const label = (a: string) => (a === "dm" ? "the private DM" : `the group ${a}`);
 
@@ -56,5 +56,41 @@ describe("audienceSwitchNote", () => {
 
   it("handles empty input", () => {
     expect(audienceSwitchNote("dm", [], label)).toBe("");
+  });
+});
+
+// The predicate that gates this session's PRIVATE surfaces — the private
+// people subtree and the session transcript — for the turn in flight.
+describe("isOwnAudienceTurn", () => {
+  const DM = "dm:alice";
+  const GROUP = "telegram:-1001234567";
+  const OTHER_GROUP = "telegram:-1009999999";
+
+  it("is true for a group session's own turn", () => {
+    expect(isOwnAudienceTurn(GROUP, [GROUP])).toBe(true);
+    // A group session's audience bookkeeping is DM-session-shaped; the key
+    // already names the audience, so the turn is always its own.
+    expect(isOwnAudienceTurn(GROUP, undefined)).toBe(true);
+  });
+
+  it("is true for the owner's own DM turn", () => {
+    expect(isOwnAudienceTurn(DM, ["dm"])).toBe(true);
+    expect(isOwnAudienceTurn(DM, ["dm", "dm"])).toBe(true);
+  });
+
+  it("is true for a background turn with no recorded audience", () => {
+    // Cron, LCM, continuity — the owner's own, nobody else is steering.
+    expect(isOwnAudienceTurn(DM, undefined)).toBe(true);
+    expect(isOwnAudienceTurn(DM, [])).toBe(true);
+  });
+
+  it("is false for a summoned group's turn on the owner's DM session", () => {
+    expect(isOwnAudienceTurn(DM, [GROUP])).toBe(false);
+    expect(isOwnAudienceTurn(DM, [GROUP, GROUP])).toBe(false);
+  });
+
+  it("fails closed for a batch spanning several audiences", () => {
+    expect(isOwnAudienceTurn(DM, ["dm", GROUP])).toBe(false);
+    expect(isOwnAudienceTurn(DM, [GROUP, OTHER_GROUP])).toBe(false);
   });
 });

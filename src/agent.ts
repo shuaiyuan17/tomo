@@ -639,7 +639,7 @@ export class Agent {
     const list = targets.map((t) => `"${t}"`).join(", ");
     return formatTomoEvent(
       "summon-reminder",
-      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them.`,
+      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. This session's private surfaces are disabled for this turn: private people records are hidden from list_people/upsert_person, and recall_conversation refuses — the group is steering the turn, so the owner's private DM history is not readable from it.`,
     );
   }
 
@@ -1032,6 +1032,20 @@ export class Agent {
       log.debug({ sessionKey, scopedTo: scoped }, "Session-scoped tool call narrowed to the turn's audience");
     }
     return scoped;
+  }
+
+  /**
+   * Is the turn in flight the session's own — i.e. may tools read this
+   * session's private surfaces?
+   *
+   * False for a summoned-group turn on a `dm:` session, for a mixed batch, and
+   * while concurrent turns on the session disagree about the audience. The
+   * private people subtree (`memory/private/people/`) and the owner's DM
+   * transcript are off limits for such a turn — see `internal-server.ts`,
+   * which gates `buildPeopleTools`/`buildRecallTools` on this.
+   */
+  isOwnAudienceTurn(sessionKey: string): boolean {
+    return this.turnAudiences.isOwnAudienceTurn(sessionKey);
   }
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {

@@ -194,4 +194,34 @@ export class TurnAudienceRegistry {
     // fails closed for us — one rule, not two.
     return scopedCallerKeyFor(sessionKey, [...turns.values()].flat());
   }
+
+  /**
+   * May a tool read this session's OWN private surfaces right now — the
+   * private people subtree, the session transcript?
+   *
+   * `isOwnAudienceTurn` over the same resolution as `scopedCallerKey`, so
+   * there is one rule and one fail-closed path, not two. False while a
+   * summoned group is steering the session, and false when concurrent turns
+   * disagree about who is.
+   */
+  isOwnAudienceTurn(sessionKey: string): boolean {
+    return this.scopedCallerKey(sessionKey) === sessionKey;
+  }
+}
+
+/**
+ * Does a turn with these audiences belong to the session it runs on?
+ *
+ * True for an ordinary turn — a group session's own messages, the owner's own
+ * DM messages, and background turns (cron, LCM) that record no audience.
+ *
+ * False exactly when the session key overstates the turn's audience: a
+ * summoned group's messages running on the owner's `dm:` session, and a
+ * mixed or unattributable batch (which fails closed via `scopedCallerKeyFor`).
+ * Those are the turns where the session's own private surfaces — the private
+ * people subtree and the DM transcript — must not be readable, because the
+ * text steering the turn came from a group.
+ */
+export function isOwnAudienceTurn(sessionKey: string, audiences: readonly string[] | undefined): boolean {
+  return scopedCallerKeyFor(sessionKey, audiences) === sessionKey;
 }

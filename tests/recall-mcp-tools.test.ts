@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionStore } from "../src/sessions/store.js";
-import { buildRecallTools, formatRecallResults } from "../src/mcp/recall-tools.js";
+import { RECALL_FOREIGN_AUDIENCE_REFUSAL, buildRecallTools, formatRecallResults } from "../src/mcp/recall-tools.js";
 import type { SessionMessage } from "../src/sessions/types.js";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-recall-mcp");
@@ -157,6 +157,77 @@ describe("recall_conversation MCP tool", () => {
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain("good record");
+  });
+});
+
+// The transcript bound to this tool is the session's own — which, while a
+// group is summoned into a dm: session, is the OWNER's private DM history
+// with a group steering the turn. `canSearch` is that gate.
+describe("recall_conversation audience gate", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    store = new SessionStore(TEST_DIR, 20, join(TEST_DIR, "sdk-sessions"));
+    seedMessage(store, { content: "the safe-deposit box code is 4417", timestamp: 1000 });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  function gatedTool(canSearch: () => boolean): ToolHandle {
+    let searched = 0;
+    const tools = buildRecallTools({
+      search: (opts) => { searched++; return store.searchTranscript(SESSION_KEY, opts); },
+      canSearch,
+    }) as unknown as ToolHandle[];
+    const found = tools.find((t) => t.name === "recall_conversation");
+    if (!found) throw new Error("recall_conversation tool not found");
+    return Object.assign(found, { searchCount: () => searched }) as ToolHandle & { searchCount(): number };
+  }
+
+  it("refuses, and does not touch the transcript, when the turn is not this session's own", async () => {
+    const tool = gatedTool(() => false) as ToolHandle & { searchCount(): number };
+
+    const result = await tool.handler({ query: "safe-deposit", limit: 20 }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("recall is unavailable while a group is summoned into this session");
+    expect(result.content[0].text).toContain(RECALL_FOREIGN_AUDIENCE_REFUSAL);
+    // The refusal leaks nothing, not even a match count.
+    expect(result.content[0].text).not.toContain("4417");
+    expect(tool.searchCount()).toBe(0);
+  });
+
+  it("refuses before argument validation, so the refusal is the only outcome", async () => {
+    // A malformed `after` would otherwise be reported first, telling a group
+    // caller their query WOULD have run.
+    const tool = gatedTool(() => false);
+    const result = await tool.handler({ query: "safe-deposit", after: "not-a-date", limit: 20 }, {});
+
+    expect(result.content[0].text).toContain("recall is unavailable");
+    expect(result.content[0].text).not.toContain("Invalid after time");
+  });
+
+  it("is resolved per call, so the same tool works again once the summon ends", async () => {
+    // One MCP server is built per live session and reused across turns.
+    let own = false;
+    const tool = gatedTool(() => own);
+
+    expect((await tool.handler({ query: "safe-deposit", limit: 20 }, {})).isError).toBe(true);
+
+    own = true;
+    const allowed = await tool.handler({ query: "safe-deposit", limit: 20 }, {});
+    expect(allowed.isError).toBeFalsy();
+    expect(allowed.content[0].text).toContain("4417");
+  });
+
+  it("allows recall when no gate is supplied", async () => {
+    const result = await makeTool(store).handler({ query: "safe-deposit", limit: 20 }, {});
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain("4417");
   });
 });
 

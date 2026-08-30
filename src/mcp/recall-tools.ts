@@ -22,7 +22,26 @@ export interface RecallSearchOpts {
  */
 export interface RecallToolDeps {
   search(opts: RecallSearchOpts): SessionMessage[];
+  /**
+   * Per-call gate: may this turn read the bound session's transcript?
+   *
+   * A GETTER, resolved when the tool runs, because a session's audience is
+   * not fixed for its lifetime. A summoned group's messages run on the
+   * OWNER's `dm:` session (router `summonGroup`), so the transcript bound
+   * above is the owner's private DM history while the turn is being steered
+   * by a group chat — and a coalesced batch can mix both. Left undefined,
+   * recall is always allowed (tests, and any caller with no audience notion).
+   */
+  canSearch?: () => boolean;
 }
+
+/**
+ * Refusal text for a turn that may not read its session's transcript. Names
+ * the reason and the way round it, so the model can tell the user rather than
+ * retrying with a different query.
+ */
+export const RECALL_FOREIGN_AUDIENCE_REFUSAL =
+  "recall is unavailable while a group is summoned into this session. This turn's messages come from a summoned group (or span several audiences), and the transcript here is the owner's private DM history — it is not readable from a group-steered turn. Ask again in the owner's own DM, or `/dismiss` the summon first.";
 
 function parseTimeBound(value: string | undefined, label: string): number | undefined {
   if (value === undefined) return undefined;
@@ -100,6 +119,15 @@ export function buildRecallTools(deps: RecallToolDeps) {
         ),
       },
       async ({ query, after, before, limit }) => {
+        // Checked FIRST, before any argument parsing: the refusal must not
+        // depend on the caller's arguments, and must be the only observable
+        // outcome for a turn that may not read this transcript.
+        if (deps.canSearch && !deps.canSearch()) {
+          return {
+            content: [{ type: "text" as const, text: `recall_conversation failed: ${RECALL_FOREIGN_AUDIENCE_REFUSAL}` }],
+            isError: true,
+          };
+        }
         let fromTime: number | undefined;
         let toTime: number | undefined;
         try {

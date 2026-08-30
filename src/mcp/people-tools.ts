@@ -6,8 +6,13 @@ export interface PeopleToolDeps {
   /**
    * False for group sessions: private people records are then invisible to
    * both tools — not listed, not matchable, not creatable.
+   *
+   * May be a GETTER, resolved per call, because the audience of a session is
+   * not fixed for its lifetime: a summoned group's messages run on the
+   * owner's `dm:` session, so a turn that a group is steering would otherwise
+   * see the private subtree the group is defined to be outside of.
    */
-  includePrivate: boolean;
+  includePrivate: boolean | (() => boolean);
   /** Test override for the registry location. */
   dirs?: PeopleDirs;
 }
@@ -21,6 +26,9 @@ const NOTES_EXCERPT_CHARS = 500;
  * matched against existing records instead of creating near-duplicates.
  */
 export function buildPeopleTools(deps: PeopleToolDeps) {
+  /** Resolved per call: a summoned-group turn changes the answer mid-session. */
+  const includePrivate = (): boolean =>
+    typeof deps.includePrivate === "function" ? deps.includePrivate() : deps.includePrivate;
   return [
     tool(
       "list_people",
@@ -31,7 +39,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
       ].join("\n"),
       {},
       async () => {
-        const people = loadPeople({ includePrivate: deps.includePrivate, dirs: deps.dirs });
+        const people = loadPeople({ includePrivate: includePrivate(), dirs: deps.dirs });
         const listing = people.map((p) => ({
           name: p.name,
           aliases: p.aliases,
@@ -87,7 +95,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
         ),
       },
       async ({ name, match, aliases, replace_aliases, telegram, imessage, notes, private: isPrivate }) => {
-        if (isPrivate !== undefined && !deps.includePrivate) {
+        if (isPrivate !== undefined && !includePrivate()) {
           return {
             content: [{ type: "text" as const, text: "upsert_person failed: the `private` flag can only be used from a DM session." }],
             isError: true,
@@ -105,7 +113,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
               notes,
               isPrivate,
             },
-            { includePrivate: deps.includePrivate, dirs: deps.dirs },
+            { includePrivate: includePrivate(), dirs: deps.dirs },
           );
           const summary = {
             name: record.name,

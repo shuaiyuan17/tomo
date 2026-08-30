@@ -6,7 +6,7 @@ import { isAutostartEnabled, isMacOS } from "../service.js";
 import { getDaemonStatus } from "../status-info.js";
 import { formatDuration } from "../../cron/format.js";
 import { configIssues } from "../../config.js";
-import { CONFIG_PATH } from "./shared.js";
+import { CONFIG_PATH, ConfigReadError, loadConfig } from "./shared.js";
 import { configModel } from "./model.js";
 import { configAutostart } from "./autostart.js";
 import { configChannels } from "./channels.js";
@@ -21,6 +21,32 @@ import { configAnthropicAuth } from "./auth.js";
 export const configCommand = new Command("config")
   .description("Interactive configuration")
   .action(async () => {
+    try {
+      await runConfig();
+    } catch (err) {
+      if (!(err instanceof ConfigReadError)) throw err;
+      // The config was hand-edited into something we cannot parse while this
+      // session was open. Every save is a read-modify-write, so continuing
+      // would publish a config missing every key we failed to read. Nothing
+      // has been written; say what to fix and fail loudly.
+      reportUnreadableConfig(err);
+    }
+  });
+
+/** Print the parse failure and mark the process as failed. Never writes. */
+function reportUnreadableConfig(err: ConfigReadError): void {
+  const detail = err.cause instanceof Error ? err.cause.message : String(err.cause);
+  p.log.error(
+    `Config at ${err.path} could not be read, so it cannot be edited safely:\n` +
+    `  ${detail}\n` +
+    "Nothing was written. Fix the file by hand (or restore it from " +
+    `${CONFIG_PATH}.bak) and run \`tomo config\` again.`,
+  );
+  p.outro("");
+  process.exitCode = 1;
+}
+
+async function runConfig(): Promise<void> {
     printBanner();
     p.intro("Tomo Configuration");
 
@@ -29,6 +55,11 @@ export const configCommand = new Command("config")
       p.outro("");
       return;
     }
+
+    // Gate the whole menu on a readable config: every submenu is
+    // loadConfig() -> mutate one key -> saveConfig(). Throws ConfigReadError,
+    // handled by the caller.
+    loadConfig();
 
     const daemon = getDaemonStatus();
     if (daemon.pid) {
@@ -86,4 +117,4 @@ export const configCommand = new Command("config")
     }
 
     p.outro("Restart tomo for changes to take effect.");
-  });
+}

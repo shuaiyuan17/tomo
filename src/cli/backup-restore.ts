@@ -5,8 +5,9 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statfsSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /**
  * Staged, all-or-nothing restore of the directory legs of a backup.
@@ -66,6 +67,8 @@ export interface StagedRestoreIo {
   copy?: (src: string, dest: string) => void;
   rename?: (from: string, to: string) => void;
   remove?: (path: string) => void;
+  /** Bytes free on the volume holding a path; null disables the check. */
+  freeSpace?: (path: string) => number | null;
   /** Timestamp suffix for the staging/pre-restore names. */
   stamp?: string;
   /** Called after each leg is swapped in, for progress output. */
@@ -132,6 +135,63 @@ function defaultStamp(): string {
     + `-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}-${process.pid}`;
 }
 
+/**
+ * A leg whose original data could not be put back where it belongs.
+ *
+ * Only produced when a rollback fails, which needs an error that persists
+ * across two renames in opposite directions (a read-only remount, EIO on the
+ * device). Rare — and exactly when the operator must not be told "nothing was
+ * replaced", because something was.
+ */
+export interface RecoveryHint {
+  label: string;
+  /** The live path, and what is sitting there now. */
+  dest: string;
+  occupiedBy: "the backup's copy" | "nothing";
+  /** Where the original data is. */
+  preRestore: string;
+}
+
+/**
+ * Thrown by {@link restoreLegsStaged}. `rollbackClean` is the question the CLI
+ * has to answer before it prints anything reassuring.
+ */
+export class StagedRestoreError extends Error {
+  readonly rollbackClean: boolean;
+  readonly recovery: RecoveryHint[];
+
+  constructor(message: string, opts: { cause?: unknown; rollbackClean: boolean; recovery?: RecoveryHint[] }) {
+    super(message, { cause: opts.cause });
+    this.name = "StagedRestoreError";
+    this.rollbackClean = opts.rollbackClean;
+    this.recovery = opts.recovery ?? [];
+  }
+}
+
+/** Bytes free on the filesystem holding `path`, or null if it cannot be read. */
+function defaultFreeSpace(path: string): number | null {
+  let probe = path;
+  // `dest` need not exist yet; walk up to something that does.
+  for (let i = 0; i < 40 && !pathExists(probe); i++) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  try {
+    const fs = statfsSync(probe);
+    return Number(fs.bavail) * Number(fs.bsize);
+  } catch {
+    return null;
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 interface StagedLeg {
   leg: RestoreLeg;
   staging: string;
@@ -153,6 +213,31 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
   const warn = io.onWarning ?? (() => undefined);
 
   const staged: StagedLeg[] = [];
+
+  // PHASE 0 — is there room? Staging means the copy exists ALONGSIDE the live
+  // tree, so the peak requirement is the backup plus the live data plus the
+  // staged copy, where the old code freed the live tree's space first. Asking
+  // the filesystem up front turns "ENOSPC half-way through a 2.8 GB copy"
+  // into a refusal that names both numbers, before anything has been written.
+  const freeSpace = io.freeSpace ?? defaultFreeSpace;
+  if (legs.length > 0) {
+    let needed = 0;
+    for (const leg of legs) {
+      try {
+        needed += measureTree(leg.src).bytes;
+      } catch { /* unreadable leg — the copy will report it properly */ }
+    }
+    const available = freeSpace(dirname(legs[0].dest));
+    if (available !== null && available < needed) {
+      throw new StagedRestoreError(
+        `not enough free space to stage the restore: ${formatBytes(needed)} needed, `
+        + `${formatBytes(available)} available on the volume holding ${dirname(legs[0].dest)}. `
+        + "Staging keeps your current data in place until the copy has succeeded, so a restore "
+        + "needs room for both copies at once.",
+        { rollbackClean: true },
+      );
+    }
+  }
 
   // PHASE 1 — copy and verify. Nothing live is touched here, so any failure
   // is a clean abort: remove the staging trees and leave.
@@ -181,7 +266,9 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
       const staging = `${leg.dest}.restoring-${stamp}`;
       if (pathExists(staging)) safely(() => remove(staging), warn, `remove staging copy ${staging}`);
     }
-    throw err;
+    if (err instanceof StagedRestoreError) throw err;
+    // Nothing live was touched, so the rollback is vacuously clean.
+    throw new StagedRestoreError((err as Error).message, { cause: err, rollbackClean: true });
   }
 
   // PHASE 2 — swap. Two renames per leg, and rename is the one thing here
@@ -200,16 +287,35 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
       io.onLegRestored?.(s.leg);
     }
   } catch (err) {
-    rollback(swapped, rename, remove, warn);
-    // Legs that never swapped still have a staging copy to clear away.
+    const recovery = rollback(swapped, rename, remove, warn);
+
+    // The leg that failed mid-swap, plus any that never started: put their
+    // originals back and clear their staging copies.
     for (const s of staged) {
       if (swapped.includes(s)) continue;
-      if (pathExists(s.staging)) safely(() => remove(s.staging), warn, `remove staging copy ${s.staging}`);
-      if (s.preRestore && pathExists(s.preRestore)) {
-        safely(() => rename(s.preRestore!, s.leg.dest), warn, `restore ${s.leg.label} from ${s.preRestore}`);
+      const parked = s.preRestore;
+      if (parked && pathExists(parked) && !pathExists(s.leg.dest)) {
+        try {
+          rename(parked, s.leg.dest);
+          s.preRestore = null;
+        } catch (restoreErr) {
+          warn(`Could not restore ${s.leg.label} from ${parked}: ${(restoreErr as Error).message}`);
+          recovery.push({
+            label: s.leg.label,
+            dest: s.leg.dest,
+            occupiedBy: pathExists(s.leg.dest) ? "the backup's copy" : "nothing",
+            preRestore: parked,
+          });
+        }
       }
+      if (pathExists(s.staging)) safely(() => remove(s.staging), warn, `remove staging copy ${s.staging}`);
     }
-    throw err;
+
+    throw new StagedRestoreError((err as Error).message, {
+      cause: err,
+      rollbackClean: recovery.length === 0,
+      recovery,
+    });
   }
 
   // PHASE 3 — every leg is in place; only now is the old data expendable.
@@ -220,32 +326,66 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
 }
 
 /**
- * Undo the swaps that did happen, newest first: move the restored tree back to
- * its staging name and the live tree back to where it was.
+ * Undo the swaps that did happen, newest first, and report anything that could
+ * not be undone.
  *
- * A failure in here is reported, never thrown — the caller is already throwing
- * the original error, and hiding it behind a rollback error would lose the
- * only description of what actually went wrong. The warning names the
- * pre-restore path so the data is recoverable by hand in the worst case.
+ * THE DESTINATION IS NEVER LEFT EMPTY. The rollback is two renames — restored
+ * tree out, original tree back in — and the second can fail on its own (a
+ * volume remounted read-only, EIO) after the first succeeded. The earlier
+ * version stopped there, leaving the live path ABSENT while the caller printed
+ * "nothing was replaced": the worst outcome in the file, and produced by the
+ * code that exists to prevent it. Now the restored tree is moved back so
+ * something valid occupies the path, and the leg is reported as needing manual
+ * recovery with the location of the original.
+ *
+ * Failures are reported, never thrown: the caller is already throwing the
+ * original error, and replacing it with a rollback error would lose the only
+ * description of what actually went wrong.
  */
 function rollback(
   swapped: StagedLeg[],
   rename: (from: string, to: string) => void,
   remove: (path: string) => void,
   warn: (message: string) => void,
-): void {
+): RecoveryHint[] {
+  const recovery: RecoveryHint[] = [];
+
   for (const s of [...swapped].reverse()) {
-    safely(() => {
+    let movedAside = false;
+    try {
       if (pathExists(s.leg.dest)) {
         if (pathExists(s.staging)) remove(s.staging);
         rename(s.leg.dest, s.staging);
+        movedAside = true;
       }
       if (s.preRestore) rename(s.preRestore, s.leg.dest);
-    }, warn, `roll ${s.leg.label} back${s.preRestore ? ` from ${s.preRestore}` : ""}`);
+    } catch (err) {
+      warn(`Could not roll ${s.leg.label} back: ${(err as Error).message}`);
+      if (movedAside && !pathExists(s.leg.dest)) {
+        // Put SOMETHING valid back at the live path — the backup's copy is
+        // wrong-but-complete, and an absent directory is neither.
+        try {
+          rename(s.staging, s.leg.dest);
+        } catch (putBackErr) {
+          warn(`Could not put ${s.leg.label} back at ${s.leg.dest}: ${(putBackErr as Error).message}`);
+        }
+      }
+      if (s.preRestore) {
+        recovery.push({
+          label: s.leg.label,
+          dest: s.leg.dest,
+          occupiedBy: pathExists(s.leg.dest) ? "the backup's copy" : "nothing",
+          preRestore: s.preRestore,
+        });
+      }
+      continue;
+    }
     safely(() => {
       if (pathExists(s.staging)) remove(s.staging);
     }, warn, `remove staging copy ${s.staging}`);
   }
+
+  return recovery;
 }
 
 function safely(fn: () => void, warn: (message: string) => void, what: string): void {
@@ -254,4 +394,72 @@ function safely(fn: () => void, warn: (message: string) => void, what: string): 
   } catch (err) {
     warn(`Could not ${what}: ${(err as Error).message}`);
   }
+}
+
+/** What a sweep found — and, for a recovered leg, what it did about it. */
+export interface Leftover {
+  label: string;
+  path: string;
+  kind: "staging" | "pre-restore";
+  /** True when this was moved back to the live path. */
+  recovered: boolean;
+}
+
+/**
+ * Look for the wreckage of an interrupted restore, and put back anything the
+ * live path is missing.
+ *
+ * A restore that is killed inside phase 2 — `tomo restart`, a laptop lid, an
+ * OOM — leaves the live tree parked at `<dest>.pre-restore-<ts>` with either
+ * the staged copy or NOTHING at `dest`. Nothing sweeps for that on its own:
+ * the stamp carries a pid, so the next run's own guard never matches an
+ * earlier run's names, and `~/.tomo/data` would sit absent while a complete
+ * copy of it sat beside it under a name nobody reads.
+ *
+ * Recovery is deliberately limited to the unambiguous case — `dest` missing
+ * and exactly one parked copy available. When `dest` exists, the parked copy
+ * might be older or newer than what is there and only the operator can say, so
+ * it is reported and left alone rather than guessed at.
+ */
+export function sweepRestoreLeftovers(
+  legs: readonly { label: string; dest: string }[],
+  io: { rename?: (from: string, to: string) => void } = {},
+): Leftover[] {
+  const rename = io.rename ?? renameSync;
+  const found: Leftover[] = [];
+
+  for (const leg of legs) {
+    const dir = dirname(leg.dest);
+    const prefix = basename(leg.dest);
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+
+    const staging = names.filter((n) => n.startsWith(`${prefix}.restoring-`)).sort();
+    // Newest last: the stamp starts YYYYMMDD-HHMMSS, so a lexical sort is
+    // chronological.
+    const parked = names.filter((n) => n.startsWith(`${prefix}.pre-restore-`)).sort();
+
+    for (const name of staging) {
+      found.push({ label: leg.label, path: join(dir, name), kind: "staging", recovered: false });
+    }
+
+    for (const [i, name] of parked.entries()) {
+      const path = join(dir, name);
+      const isNewest = i === parked.length - 1;
+      let recovered = false;
+      if (isNewest && !pathExists(leg.dest)) {
+        try {
+          rename(path, leg.dest);
+          recovered = true;
+        } catch { /* reported below as an un-recovered leftover */ }
+      }
+      found.push({ label: leg.label, path, kind: "pre-restore", recovered });
+    }
+  }
+
+  return found;
 }

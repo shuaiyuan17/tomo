@@ -16,7 +16,7 @@ import {
 import { createInterface } from "node:readline";
 import { config } from "../config.js";
 import { restoreWorkspaceFromBackup } from "./backup-workspace.js";
-import { restoreLegsStaged, type RestoreLeg } from "./backup-restore.js";
+import { restoreLegsStaged, StagedRestoreError, sweepRestoreLeftovers, type RestoreLeg } from "./backup-restore.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 
 const TOMO_HOME = config.tomoHome;
@@ -378,6 +378,44 @@ backupCommand
     console.log(`Restore from: ${backup.path}`);
     console.log("This will overwrite current tomo data.\n");
 
+    const legs: RestoreLeg[] = [];
+    const configSrc = join(backup.path, "config.json");
+    if (existsSync(configSrc)) {
+      legs.push({ label: "config.json", src: configSrc, dest: join(TOMO_HOME, "config.json") });
+    }
+    const dataSrc = join(backup.path, "data");
+    if (existsSync(dataSrc)) {
+      legs.push({ label: "data/", src: dataSrc, dest: join(TOMO_HOME, "data") });
+    }
+    const sdkSrc = join(backup.path, "sdk-sessions");
+    if (existsSync(sdkSrc)) {
+      legs.push({ label: "sdk-sessions/", src: sdkSrc, dest: config.sdkSessionsDir });
+    }
+
+    // BEFORE THE PROMPT, because it is a repair of a PREVIOUS run rather than
+    // part of this one: a restore killed mid-swap can leave `~/.tomo/data`
+    // absent with a complete copy parked beside it, and declining here should
+    // still leave the machine mended rather than broken.
+    const leftovers = sweepRestoreLeftovers(
+      // Sweep every leg the staged path can own, not just the ones this backup
+      // happens to contain — the interrupted run may have had more.
+      [
+        { label: "config.json", dest: join(TOMO_HOME, "config.json") },
+        { label: "data/", dest: join(TOMO_HOME, "data") },
+        { label: "sdk-sessions/", dest: config.sdkSessionsDir },
+      ],
+    );
+    if (leftovers.length > 0) {
+      console.log("Found leftovers from an interrupted restore:");
+      for (const item of leftovers) {
+        console.log(`  ${item.recovered ? "[recovered]" : "[left in place]"} ${item.path}`);
+      }
+      for (const item of leftovers.filter((l) => l.recovered)) {
+        console.log(`  ${item.label} was missing and has been restored from the copy above.`);
+      }
+      console.log("Anything still listed is safe to delete once you have checked it.\n");
+    }
+
     const ok = await confirm("Proceed?");
     if (!ok) {
       console.log("Aborted.");
@@ -453,20 +491,6 @@ backupCommand
     // verifies it before a single live byte moves — so the ENOSPC case that
     // motivated this aborts with all three still intact, INCLUDING the
     // workspace below, which is why the staged legs run first.
-    const legs: RestoreLeg[] = [];
-    const configSrc = join(backup.path, "config.json");
-    if (existsSync(configSrc)) {
-      legs.push({ label: "config.json", src: configSrc, dest: join(TOMO_HOME, "config.json") });
-    }
-    const dataSrc = join(backup.path, "data");
-    if (existsSync(dataSrc)) {
-      legs.push({ label: "data/", src: dataSrc, dest: join(TOMO_HOME, "data") });
-    }
-    const sdkSrc = join(backup.path, "sdk-sessions");
-    if (existsSync(sdkSrc)) {
-      legs.push({ label: "sdk-sessions/", src: sdkSrc, dest: config.sdkSessionsDir });
-    }
-
     try {
       restoreLegsStaged(legs, {
         onLegRestored: (leg) => console.log(`  [ok] ${leg.label}`),
@@ -474,20 +498,46 @@ backupCommand
       });
     } catch (err) {
       console.error(`\nRestore failed: ${(err as Error).message}`);
-      console.error("Nothing was replaced — your existing data is as it was.");
+      // "Nothing was replaced" is a claim, and it has to be earned. A rollback
+      // that could not put a leg back means something WAS replaced, and the
+      // operator needs the path of their original data far more than they need
+      // reassurance.
+      if (err instanceof StagedRestoreError && !err.rollbackClean) {
+        console.error("\nSome components could NOT be rolled back:");
+        for (const hint of err.recovery) {
+          console.error(`  ${hint.label}: ${hint.dest} now holds ${hint.occupiedBy}.`);
+          console.error(`    Your data before this restore is at: ${hint.preRestore}`);
+        }
+        console.error("\nRecover by moving each path above back over its destination, e.g.");
+        const first = err.recovery[0];
+        if (first) console.error(`  rm -rf "${first.dest}" && mv "${first.preRestore}" "${first.dest}"`);
+      } else {
+        console.error("Nothing was replaced — your existing data is as it was.");
+      }
       process.exit(1);
       return;
     }
 
     // workspace/ (preserve .claude/ which is populated by init/start).
-    // Deliberately still on its own path: restoreWorkspaceFromBackup already
-    // snapshots and rolls back the live .claude, which is the part the other
-    // legs have no equivalent of.
+    //
+    // OUTSIDE THE TRANSACTION ABOVE, deliberately: restoreWorkspaceFromBackup
+    // snapshots and rolls back the live `.claude`, which the other legs have
+    // no equivalent of, and folding it in would mean rebuilding that. The
+    // consequence is stated rather than hidden — if this leg fails, the three
+    // staged legs are already restored and are NOT rolled back with it.
     const workspaceSrc = join(backup.path, "workspace");
     if (existsSync(workspaceSrc)) {
-      restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
-
-      console.log("  [ok] workspace/");
+      try {
+        restoreWorkspaceFromBackup(workspaceSrc, config.workspaceDir);
+        console.log("  [ok] workspace/");
+      } catch (err) {
+        console.error(`  [fail] workspace/: ${(err as Error).message}`);
+        console.error("\nRestore INCOMPLETE. config.json, data/ and sdk-sessions/ were restored;");
+        console.error("the workspace was not, and is restored outside that transaction, so it");
+        console.error(`has not been rolled back. The backup's copy is at ${workspaceSrc}.`);
+        process.exit(1);
+        return;
+      }
     }
 
     console.log("\nRestore complete.");

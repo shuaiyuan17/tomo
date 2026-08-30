@@ -32,6 +32,10 @@ const paths = vi.hoisted(() => {
     unit: `${home}/unit`,
     // Set by a test to make the copy of a particular leg fail.
     failCopyWhenSrcEndsWith: null as string | null,
+    /** Fail the rename that parks this leg's live tree aside. */
+    failParkWhenSrcEndsWith: null as string | null,
+    /** Fail every rename that would put a parked copy back. */
+    failRestoreFromPreRestore: false,
   };
 });
 
@@ -78,12 +82,29 @@ vi.mock("node:fs", async (orig) => {
       }
       return (actual.cpSync as (...a: unknown[]) => unknown)(src, dest, opts);
     }) as typeof actual.cpSync,
+    renameSync: ((from: unknown, to: unknown) => {
+      const f = String(from);
+      const t = String(to);
+      if (paths.failParkWhenSrcEndsWith && t.includes(".pre-restore-") && f.endsWith(paths.failParkWhenSrcEndsWith)) {
+        throw errno("EPERM", `EPERM: operation not permitted, rename '${f}'`);
+      }
+      if (paths.failRestoreFromPreRestore && f.includes(".pre-restore-")) {
+        throw errno("EROFS", `EROFS: read-only file system, rename '${f}'`);
+      }
+      return (actual.renameSync as (...a: unknown[]) => unknown)(from, to);
+    }) as typeof actual.renameSync,
   };
 });
 
+function errno(code: string, message: string): NodeJS.ErrnoException {
+  const err = new Error(message) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
 const { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } = await import("node:fs");
 const { backupCommand } = await import("../src/cli/backup.js");
-const { restoreLegsStaged } = await import("../src/cli/backup-restore.js");
+const { restoreLegsStaged, StagedRestoreError, sweepRestoreLeftovers } = await import("../src/cli/backup-restore.js");
 
 afterAll(() => {
   rmSync(paths.home, { recursive: true, force: true });
@@ -92,14 +113,20 @@ afterAll(() => {
 });
 
 beforeEach(() => {
-  paths.failCopyWhenSrcEndsWith = null;
+  resetInjections();
   rmSync(paths.home, { recursive: true, force: true });
 });
 
 afterEach(() => {
-  paths.failCopyWhenSrcEndsWith = null;
+  resetInjections();
   vi.restoreAllMocks();
 });
+
+function resetInjections(): void {
+  paths.failCopyWhenSrcEndsWith = null;
+  paths.failParkWhenSrcEndsWith = null;
+  paths.failRestoreFromPreRestore = false;
+}
 
 // --------------------------------------------------------------------------
 // restoreLegsStaged
@@ -210,6 +237,88 @@ describe("restoreLegsStaged", () => {
       expect(existsSync(join(dir, "only-live.txt"))).toBe(true);
     }
     expect(leftovers(join(paths.unit, "live"))).toEqual([]);
+  });
+
+  it("never leaves a destination absent when the rollback itself fails", () => {
+    // The correlated failure: whatever broke the swap (a volume remounted
+    // read-only, EIO) also breaks putting the original back. The earlier
+    // version stopped after moving the restored tree aside, leaving the live
+    // path ABSENT while the caller printed "nothing was replaced".
+    const { legs, live } = unitFixture();
+    let renames = 0;
+
+    let caught: unknown;
+    try {
+      restoreLegsStaged(legs, {
+        stamp: "TESTSTAMP",
+        rename: (from, to) => {
+          renames += 1;
+          // 3rd rename = parking beta's live tree, i.e. after alpha swapped.
+          if (renames === 3) throw new Error("EIO: i/o error");
+          // ...and the rollback's put-the-original-back also fails.
+          if (from.includes(".pre-restore-")) throw new Error("EROFS: read-only file system");
+          renameSync(from, to);
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    // SOMETHING valid occupies the path — the backup's copy, which is wrong
+    // but complete. An absent directory is neither.
+    expect(existsSync(live[0])).toBe(true);
+    expect(readFileSync(join(live[0], "file.txt"), "utf-8")).toBe("restored alpha");
+    // The original is still on disk, and the error says where.
+    expect(existsSync(join(paths.unit, "live", "alpha.pre-restore-TESTSTAMP"))).toBe(true);
+
+    expect(caught).toBeInstanceOf(StagedRestoreError);
+    const err = caught as InstanceType<typeof StagedRestoreError>;
+    expect(err.rollbackClean).toBe(false);
+    expect(err.recovery).toHaveLength(1);
+    expect(err.recovery[0]).toMatchObject({
+      label: "alpha/",
+      dest: live[0],
+      occupiedBy: "the backup's copy",
+      preRestore: join(paths.unit, "live", "alpha.pre-restore-TESTSTAMP"),
+    });
+  });
+
+  it("reports a clean rollback as clean", () => {
+    const { legs } = unitFixture();
+    let renames = 0;
+
+    let caught: unknown;
+    try {
+      restoreLegsStaged(legs, {
+        rename: (from, to) => {
+          renames += 1;
+          if (renames === 3) throw new Error("EIO: i/o error");
+          renameSync(from, to);
+        },
+      });
+    } catch (err) { caught = err; }
+
+    expect((caught as InstanceType<typeof StagedRestoreError>).rollbackClean).toBe(true);
+    expect((caught as InstanceType<typeof StagedRestoreError>).recovery).toEqual([]);
+  });
+
+  it("refuses up front when the volume cannot hold the staged copy", () => {
+    // Staging needs room for the copy ALONGSIDE the live tree. Asking first
+    // turns "ENOSPC half-way through 2.8 GB" into a refusal naming both
+    // numbers, with nothing written.
+    const { legs, live } = unitFixture();
+
+    expect(() => restoreLegsStaged(legs, { freeSpace: () => 8 }))
+      .toThrow(/not enough free space[\s\S]*available/);
+
+    expect(readFileSync(join(live[0], "file.txt"), "utf-8")).toBe("live alpha");
+    expect(leftovers(join(paths.unit, "live"))).toEqual([]);
+  });
+
+  it("proceeds when free space cannot be determined", () => {
+    const { legs, live } = unitFixture();
+    restoreLegsStaged(legs, { freeSpace: () => null });
+    expect(readFileSync(join(live[0], "file.txt"), "utf-8")).toBe("restored alpha");
   });
 
   it("keeps the pre-restore copies until every leg has swapped", () => {
@@ -327,5 +436,98 @@ describe("tomo backup restore — a leg fails to copy", () => {
     expect(readFileSync(join(paths.tomoHome, "sdk-sessions", "s.jsonl"), "utf-8")).toBe("backup session");
     expect(readFileSync(join(paths.tomoHome, "workspace", "SOUL.md"), "utf-8")).toBe("backup soul");
     expect(leftovers(paths.tomoHome)).toEqual([]);
+  });
+});
+
+describe("sweepRestoreLeftovers", () => {
+  it("puts back a leg whose live path is missing", () => {
+    const dest = join(paths.unit, "live", "data");
+    mkdirSync(join(paths.unit, "live"), { recursive: true });
+    const parked = `${dest}.pre-restore-20260101-000000-99`;
+    mkdirSync(parked, { recursive: true });
+    writeFileSync(join(parked, "registry.json"), "the only copy");
+
+    const found = sweepRestoreLeftovers([{ label: "data/", dest }]);
+
+    expect(readFileSync(join(dest, "registry.json"), "utf-8")).toBe("the only copy");
+    expect(found).toEqual([{ label: "data/", path: parked, kind: "pre-restore", recovered: true }]);
+  });
+
+  it("reports but does not touch a parked copy when the live path exists", () => {
+    // Which of the two is wanted is not knowable from here.
+    const dest = join(paths.unit, "live", "data");
+    mkdirSync(dest, { recursive: true });
+    writeFileSync(join(dest, "registry.json"), "current");
+    const parked = `${dest}.pre-restore-20260101-000000-99`;
+    mkdirSync(parked, { recursive: true });
+    const staging = `${dest}.restoring-20260101-000000-99`;
+    mkdirSync(staging, { recursive: true });
+
+    const found = sweepRestoreLeftovers([{ label: "data/", dest }]);
+
+    expect(readFileSync(join(dest, "registry.json"), "utf-8")).toBe("current");
+    expect(found.map((f) => [f.kind, f.recovered])).toEqual([["staging", false], ["pre-restore", false]]);
+    expect(existsSync(parked)).toBe(true);
+    expect(existsSync(staging)).toBe(true);
+  });
+});
+
+describe("tomo backup restore — rollback and leftovers, end to end", () => {
+  beforeEach(() => { cliFixture(); });
+
+  it("prints recovery paths instead of a false reassurance when a rollback fails", async () => {
+    // config.json swaps, data/ cannot be parked, and putting config.json back
+    // fails too. Something WAS replaced, so "nothing was replaced" would be a
+    // lie — and the one thing the operator needs is where their data is.
+    paths.failParkWhenSrcEndsWith = join(paths.tomoHome, "data");
+    paths.failRestoreFromPreRestore = true;
+
+    const { errors, exitCodes } = await runRestore(VALID);
+    const text = errors.join("\n");
+
+    expect(exitCodes).toContain(1);
+    expect(text).toContain("Some components could NOT be rolled back");
+    expect(text).toContain("config.json.pre-restore-");
+    expect(text).not.toContain("Nothing was replaced");
+    // The live path is occupied, and the original is still on disk.
+    expect(existsSync(join(paths.tomoHome, "config.json"))).toBe(true);
+    const parked = readdirSync(paths.tomoHome).filter((n) => n.startsWith("config.json.pre-restore-"));
+    expect(parked).toHaveLength(1);
+    expect(readFileSync(join(paths.tomoHome, parked[0]), "utf-8")).toContain("live");
+  });
+
+  it("recovers a leg parked by an interrupted restore before doing anything else", async () => {
+    // A previous run was killed inside the swap: `data/` is absent and the
+    // only copy is parked beside it. Nothing sweeps for that on its own.
+    const parked = join(paths.tomoHome, "data.pre-restore-20260101-000000-4242");
+    mkdirSync(parked, { recursive: true });
+    writeFileSync(join(parked, "irreplaceable.txt"), "months of transcripts");
+    rmSync(join(paths.tomoHome, "data"), { recursive: true, force: true });
+
+    // Declined at the prompt: the repair still stands.
+    const { logs } = await runRestore(VALID, ["n\n"]);
+
+    expect(logs.join("\n")).toContain("Found leftovers from an interrupted restore");
+    expect(logs.join("\n")).toContain("[recovered]");
+    expect(readFileSync(join(paths.tomoHome, "data", "irreplaceable.txt"), "utf-8"))
+      .toBe("months of transcripts");
+    expect(existsSync(parked)).toBe(false);
+  });
+
+  it("does not claim success when the workspace leg fails", async () => {
+    // The workspace is restored OUTSIDE the staged transaction, so its
+    // failure leaves the other three restored. Saying "Restore complete."
+    // there would be false.
+    paths.failCopyWhenSrcEndsWith = join(VALID, "workspace");
+
+    const { logs, errors, exitCodes } = await runRestore(VALID);
+
+    expect(logs.join("\n")).not.toContain("Restore complete.");
+    expect(errors.join("\n")).toContain("Restore INCOMPLETE");
+    expect(errors.join("\n")).toContain("has not been rolled back");
+    expect(exitCodes).toContain(1);
+    // ...and the staged legs really are in place, which is why it is incomplete
+    // rather than failed.
+    expect(readFileSync(join(paths.tomoHome, "data", "restored.txt"), "utf-8")).toBe("from backup");
   });
 });

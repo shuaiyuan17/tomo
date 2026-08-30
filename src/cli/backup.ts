@@ -409,7 +409,10 @@ backupCommand
     // Each restore leg is read with `existsSync`, which FOLLOWS a symlink and
     // answers about the target. So a `data` symlink inside an otherwise
     // genuine backup redirects that whole leg out of the tree while the
-    // matching `rmSync` still deletes the live one. Refused here rather than
+    // matching `rmSync` still deletes the live one. And a leg of the wrong
+    // KIND is just as destructive without any redirection: a regular file
+    // named `workspace` passes `existsSync`, the live workspace is deleted,
+    // and the file is copied into its place. Both refused here rather than
     // per leg, so the command aborts before it has overwritten anything.
     for (const leg of RESTORE_LEGS) {
       const legPath = join(backup.path, leg);
@@ -421,6 +424,14 @@ backupCommand
       }
       if (entry.isSymbolicLink()) {
         console.error(`Backup ${date} has a symlink at ${leg}; aborting without restoring.`);
+        process.exit(1);
+        return;
+      }
+      const wantDir = leg !== "config.json";
+      if (wantDir ? !entry.isDirectory() : !entry.isFile()) {
+        console.error(
+          `Backup ${date} has ${wantDir ? "a non-directory" : "a non-file"} at ${leg}; aborting without restoring.`,
+        );
         process.exit(1);
         return;
       }

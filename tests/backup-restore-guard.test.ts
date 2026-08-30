@@ -247,9 +247,6 @@ describe("tomo backup restore — swapped between validation and copy", () => {
    * Replace the validated directory with a DIFFERENT ordinary directory at the
    * same pathname. Both resolutions return the identical canonical string, so
    * only filesystem identity separates them.
-   */
-  /**
-   * Replace the validated backup with a different directory at the same path.
    *
    * Order matters: the replacement is created while the original still
    * exists (renamed aside), so the filesystem cannot hand it the inode it just
@@ -334,5 +331,36 @@ describe("tomo backup restore — a leg of the backup is a symlink", () => {
     expect(existsSync(liveMarker)).toBe(true);
     expect(existsSync(join(paths.tomoHome, "data", "loot.txt"))).toBe(false);
     expect(readFileSync(join(paths.tomoHome, "config.json"), "utf-8")).toContain("live");
+  });
+});
+
+describe("tomo backup restore — a leg of the backup is the wrong kind", () => {
+  it("refuses a backup whose workspace/ leg is a regular file", async () => {
+    // No redirection needed: `existsSync` is true for a file, the live
+    // workspace would be deleted, and the file copied into its place.
+    rmSync(join(validDir, "workspace"), { recursive: true, force: true });
+    writeFileSync(join(validDir, "workspace"), "not a directory");
+
+    const { errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("non-directory at workspace");
+    expect(exitCodes).toContain(1);
+    // Refused before ANY leg was acted on: config.json comes first and is intact.
+    expect(readFileSync(join(paths.tomoHome, "config.json"), "utf-8")).toContain("live");
+    expect(existsSync(join(paths.tomoHome, "workspace"))).toBe(true);
+    expect(statSync(join(paths.tomoHome, "workspace")).isDirectory()).toBe(true);
+    expect(existsSync(liveMarker)).toBe(true);
+  });
+
+  it("refuses a backup whose config.json leg is a directory", async () => {
+    rmSync(join(validDir, "config.json"), { force: true });
+    mkdirSync(join(validDir, "config.json"));
+
+    const { errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("non-file at config.json");
+    expect(exitCodes).toContain(1);
+    expect(readFileSync(join(paths.tomoHome, "config.json"), "utf-8")).toContain("live");
+    expect(existsSync(liveMarker)).toBe(true);
   });
 });

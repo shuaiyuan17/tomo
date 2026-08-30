@@ -714,8 +714,9 @@ export class RestoreLockHeldError extends Error {
  * "remove and recreate": the second removal would take the first's fresh lock.
  * So a takeover happens under a second lock of the same construction
  * (`restore.lock.claim`), inside which the verdict is re-read before anything
- * is removed. Two concurrent holders would need `kill(pid, 0)` to report a
- * live process dead, which it does not do.
+ * is removed — and the claim itself is never taken over, because that would
+ * be the same race one level down. Two concurrent holders would need
+ * `kill(pid, 0)` to report a live process dead, which it does not do.
  */
 export function acquireRestoreLock(
   dir: string,
@@ -740,15 +741,14 @@ export function acquireRestoreLock(
   // Holder gone (or the file is not something this module wrote). Take over,
   // but only with the claim held, and only if the verdict still stands once it
   // is: the lock may have changed hands while we were deciding.
+  //
+  // THE CLAIM IS NEVER STOLEN, whatever its pid says. Removing a claim judged
+  // stale would be the same check-then-unlink this claim exists to prevent,
+  // one level down: two takers judging it dead, one removing the other's fresh
+  // claim. It is held for microseconds, so a leftover one means a taker died
+  // inside that window; the refusal names the file to remove.
   const claimPath = `${lockPath}.claim`;
-  if (!linkLock(claimPath, pid)) {
-    const claimant = readLockPid(claimPath);
-    if (claimant !== null && isAlive(claimant)) throw new RestoreLockHeldError(lockPath, claimant);
-    try {
-      unlinkSync(claimPath); // its claimant is gone; a claim is held for microseconds.
-    } catch { /* already gone */ }
-    if (!linkLock(claimPath, pid)) throw new RestoreLockHeldError(lockPath, readLockPid(claimPath));
-  }
+  if (!linkLock(claimPath, pid)) throw new RestoreLockHeldError(claimPath, readLockPid(claimPath));
   try {
     const now = readLockPid(lockPath);
     if (now !== holder && now !== null && isAlive(now)) throw new RestoreLockHeldError(lockPath, now);

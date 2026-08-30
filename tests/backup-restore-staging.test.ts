@@ -600,6 +600,20 @@ describe("acquireRestoreLock", () => {
     expect(readFileSync(join(dir, "restore.lock.claim"), "utf-8").trim()).toBe("3333");
   });
 
+  it("does not steal a leftover claim even when its taker is gone", () => {
+    // Removing a claim judged dead is the same check-then-unlink the claim
+    // exists to prevent. A leftover claim is refused and named instead.
+    const dir = join(paths.unit, "tomo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "restore.lock"), "1111\n");
+    writeFileSync(join(dir, "restore.lock.claim"), "3333\n");
+
+    expect(() => acquireRestoreLock(dir, { pid: 2222, isAlive: () => false }))
+      .toThrow(/remove .*restore\.lock\.claim/);
+    expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("1111");
+    expect(readFileSync(join(dir, "restore.lock.claim"), "utf-8").trim()).toBe("3333");
+  });
+
   it("steps aside when the lock changed hands while it was deciding", () => {
     // Judged 1111 dead; by the time the claim is held, 4444 (alive) has the
     // lock. The re-read under the claim must see that and refuse.

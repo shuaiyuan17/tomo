@@ -114,7 +114,7 @@ function errno(code: string, message: string): NodeJS.ErrnoException {
   return err;
 }
 
-const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } =
+const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } =
   await import("node:fs");
 const actualCopy = (from: string, to: string): void => cpSync(from, to, { recursive: true, dereference: false });
 const { backupCommand } = await import("../src/cli/backup.js");
@@ -484,6 +484,39 @@ describe("restoreLegsStaged — what it refuses to guess", () => {
     expect(leftovers(join(paths.unit, "live"))).toEqual([]);
   });
 
+  it("does not call the rollback clean when something foreign took the live path mid-swap", () => {
+    // The original was parked, then something else — not this restore —
+    // created a directory at the live path before the staged copy could be
+    // renamed in (ENOTEMPTY). The original is safe at `.pre-restore-*`, but
+    // the live path holds neither it nor the backup, and "nothing was
+    // replaced" would be false.
+    const { legs, live } = unitFixture();
+    let thrown: unknown;
+    try {
+      restoreLegsStaged(legs, {
+        freeSpace: () => null,
+        rename: (from, to) => {
+          if (to.endsWith("beta") && from.includes(".restoring-")) {
+            mkdirSync(join(to, "intruder"), { recursive: true });
+          }
+          renameSync(from, to);
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(StagedRestoreError);
+    const e = thrown as InstanceType<typeof StagedRestoreError>;
+    expect(e.rollbackClean).toBe(false);
+    expect(e.recovery).toHaveLength(1);
+    expect(e.recovery[0].label).toBe("beta/");
+    expect(e.recovery[0].occupiedBy).toBe("something that appeared during the restore");
+    expect(readFileSync(join(e.recovery[0].preRestore, "only-live.txt"), "utf-8")).toBe("irreplaceable");
+    // The leg that had already swapped was rolled back.
+    expect(readFileSync(join(live[0], "file.txt"), "utf-8")).toBe("live alpha");
+  });
+
   it("names the entry on which the staged copy differs, not just a total", () => {
     // Same entry count, same total bytes, different tree: a copy that dropped
     // one file and gained another of the same size. Count-plus-size cannot see
@@ -544,15 +577,49 @@ describe("acquireRestoreLock", () => {
     const dir = join(paths.unit, "tomo");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "restore.lock"), "1111\n");
-    // Old enough that an unreadable pid would not be read as "still writing".
-    const old = new Date(Date.now() - 60_000);
-    utimesSync(join(dir, "restore.lock"), old, old);
 
     const release = acquireRestoreLock(dir, { pid: 2222, isAlive: (pid) => pid !== 1111 });
 
     expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("2222");
+    expect(readdirSync(dir)).toEqual(["restore.lock"]); // no claim, no private file left
     release();
     expect(existsSync(join(dir, "restore.lock"))).toBe(false);
+  });
+
+  it("does not take over a stale lock while another taker holds the claim", () => {
+    // Both judged pid 1111 dead. The other taker is inside the takeover;
+    // this one must not remove what it is about to create.
+    const dir = join(paths.unit, "tomo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "restore.lock"), "1111\n");
+    writeFileSync(join(dir, "restore.lock.claim"), "3333\n");
+
+    expect(() => acquireRestoreLock(dir, { pid: 2222, isAlive: (pid) => pid !== 1111 }))
+      .toThrow(RestoreLockHeldError);
+    expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("1111");
+    expect(readFileSync(join(dir, "restore.lock.claim"), "utf-8").trim()).toBe("3333");
+  });
+
+  it("steps aside when the lock changed hands while it was deciding", () => {
+    // Judged 1111 dead; by the time the claim is held, 4444 (alive) has the
+    // lock. The re-read under the claim must see that and refuse.
+    const dir = join(paths.unit, "tomo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "restore.lock"), "1111\n");
+    let asked = 0;
+    const isAlive = (pid: number): boolean => {
+      asked += 1;
+      if (asked === 1) {
+        // The first liveness question is about 1111; swap the lock underneath.
+        writeFileSync(join(dir, "restore.lock"), "4444\n");
+        return false;
+      }
+      return pid === 4444;
+    };
+
+    expect(() => acquireRestoreLock(dir, { pid: 2222, isAlive })).toThrow(/pid 4444/);
+    expect(readFileSync(join(dir, "restore.lock"), "utf-8").trim()).toBe("4444");
+    expect(existsSync(join(dir, "restore.lock.claim"))).toBe(false);
   });
 
   it("releases only its own lock", () => {

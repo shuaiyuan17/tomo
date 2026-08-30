@@ -1,9 +1,8 @@
 import {
-  closeSync,
   cpSync,
+  linkSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -12,7 +11,7 @@ import {
   statfsSync,
   statSync,
   unlinkSync,
-  writeSync,
+  writeFileSync,
   type Stats,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -214,17 +213,20 @@ export function manifestTree(root: string): string[] {
   const out: string[] = [];
   const walk = (path: string, rel: string): void => {
     const st = lstatSync(path);
+    // Path and link target are JSON-quoted so a tab or newline in a name
+    // cannot forge a record boundary.
+    const at = JSON.stringify(rel);
     if (st.isDirectory()) {
-      out.push(`${rel}\tdir`);
+      out.push(`${at}\tdir`);
       for (const name of readdirSync(path).sort()) {
         walk(join(path, name), rel === "" ? name : `${rel}/${name}`);
       }
     } else if (st.isSymbolicLink()) {
-      out.push(`${rel}\tlink\t${readlinkSync(path)}`);
+      out.push(`${at}\tlink\t${JSON.stringify(readlinkSync(path))}`);
     } else if (st.isFile()) {
-      out.push(`${rel}\tfile\t${st.size}`);
+      out.push(`${at}\tfile\t${st.size}`);
     } else {
-      out.push(`${rel}\tother`);
+      out.push(`${at}\tother`);
     }
   };
   walk(root, "");
@@ -236,7 +238,7 @@ export function firstDifference(want: string[], got: string[]): string | null {
   const describe = (line: string | undefined): string => {
     if (line === undefined) return "nothing";
     const [rel, kind, extra] = line.split("\t");
-    return `${rel === "" ? "." : rel} (${kind}${extra !== undefined ? ` ${extra}` : ""})`;
+    return `${rel === '""' ? "." : rel} (${kind}${extra !== undefined ? ` ${extra}` : ""})`;
   };
   const n = Math.max(want.length, got.length);
   for (let i = 0; i < n; i++) {
@@ -265,7 +267,11 @@ export interface RecoveryHint {
   label: string;
   /** The live path, and what is sitting there now. */
   dest: string;
-  occupiedBy: "the backup's copy" | "nothing" | "something that could not be read";
+  occupiedBy:
+    | "the backup's copy"
+    | "nothing"
+    | "something that could not be read"
+    | "something that appeared during the restore";
   /** Where the original data is. */
   preRestore: string;
 }
@@ -362,10 +368,14 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
   // refuse because the first cannot hold bytes that were never going there.
   const freeSpace = io.freeSpace ?? defaultFreeSpace;
   const volumeOf = io.volumeOf ?? defaultVolumeOf;
+  // Legs whose volume cannot be identified are pooled: two of them might
+  // share a disk, and vouching for each separately would let both pass on
+  // free space that only one of them can have. Pooling can refuse a restore
+  // that would have fit; splitting can pass one that will not.
   const volumes = new Map<string, { at: string; needed: number }>();
   for (const leg of legs) {
     const at = dirname(leg.dest);
-    const key = volumeOf(at) ?? `path:${at}`;
+    const key = volumeOf(at) ?? "unknown";
     const volume = volumes.get(key) ?? { at, needed: 0 };
     try {
       volume.needed += measureTree(leg.src).allocated;
@@ -419,9 +429,12 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
   try {
     for (const s of staged) {
       if (pathExists(s.leg.dest)) {
-        s.preRestore = `${s.leg.dest}.pre-restore-${stamp}`;
-        if (pathExists(s.preRestore)) remove(s.preRestore);
-        rename(s.leg.dest, s.preRestore);
+        // Recorded only once the rename has happened: `preRestore` set means
+        // "the original IS there", which is what every path below relies on.
+        const preRestore = `${s.leg.dest}.pre-restore-${stamp}`;
+        if (pathExists(preRestore)) remove(preRestore);
+        rename(s.leg.dest, preRestore);
+        s.preRestore = preRestore;
       }
       mkdirSync(dirname(s.leg.dest), { recursive: true });
       rename(s.staging, s.leg.dest);
@@ -436,10 +449,13 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
     for (const s of staged) {
       if (swapped.includes(s)) continue;
       const parked = s.preRestore;
-      if (parked && probablyExists(parked)) {
-        // Strict on purpose: putting the original back is a rename ONTO the
+      if (parked) {
+        // The original is at `parked` (see the swap loop: set only after the
+        // rename). Strict on purpose: putting it back is a rename ONTO the
         // live path, and for a file leg that overwrites whatever is there.
-        // "Could not read it" is not "nothing is there".
+        // "Could not read it" is not "nothing is there" — and "something is
+        // there" cannot be the backup's copy, because that rename is the one
+        // that failed. It is foreign, and the operator has to hear about it.
         let destState: "absent" | "occupied" | "unknown";
         try {
           destState = pathExists(s.leg.dest) ? "occupied" : "absent";
@@ -454,12 +470,14 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
             warn(`Could not restore ${s.leg.label} from ${parked}: ${(restoreErr as Error).message}`);
             recovery.push({ label: s.leg.label, dest: s.leg.dest, occupiedBy: occupancy(s.leg.dest), preRestore: parked });
           }
-        } else if (destState === "unknown") {
-          warn(`Could not tell what is at ${s.leg.dest}; leaving ${parked} where it is`);
+        } else {
+          warn(`${s.leg.dest} is ${destState === "occupied" ? "occupied" : "unreadable"}; leaving ${parked} where it is`);
           recovery.push({
             label: s.leg.label,
             dest: s.leg.dest,
-            occupiedBy: "something that could not be read",
+            occupiedBy: destState === "occupied"
+              ? "something that appeared during the restore"
+              : "something that could not be read",
             preRestore: parked,
           });
         }
@@ -668,12 +686,6 @@ export class RestoreLockHeldError extends Error {
 }
 
 /**
- * A lock that has existed for less than this and carries no readable pid is
- * one whose creator is between `open` and `write` — held, not abandoned.
- */
-const LOCK_WRITE_GRACE_MS = 5_000;
-
-/**
  * Serialize restores on one `~/.tomo`. Returns the release function.
  *
  * WHY. {@link sweepRestoreLeftovers} repairs a PREVIOUS run's interrupted
@@ -685,16 +697,25 @@ const LOCK_WRITE_GRACE_MS = 5_000;
  * rollback has nothing left to roll back to. The daemon-running check does not
  * serialize two CLIs. This does.
  *
+ * LINK, NOT OPEN(O_EXCL). The pid is written to a private file first and the
+ * lock is `link`ed from it, which is atomic and fails if the name exists. So a
+ * lock is never visible without its pid: there is no "empty because its
+ * creator is between open and write" state to guess the age of, and nothing
+ * a stopped process can later write through a descriptor to a name that has
+ * been taken from it.
+ *
  * STALENESS BY PID, DELIBERATELY. A restore of many gigabytes legitimately
  * runs for a long time, so no age is a safe threshold. A liveness check errs in
  * one direction only: a recycled pid reads as "alive" and the restore is
  * REFUSED, with the lock path in the message — the conservative outcome. It
  * cannot read a running restore as dead.
  *
- * TAKEOVER BY RENAME. Two takers judging the same lock stale must not both
- * "unlink and create": the second unlink would remove the first's fresh lock.
- * Renaming the stale file aside gives exactly one winner; the loser's create
- * then meets the winner's lock and refuses.
+ * TAKEOVER UNDER A CLAIM. Two takers judging the same lock stale must not both
+ * "remove and recreate": the second removal would take the first's fresh lock.
+ * So a takeover happens under a second lock of the same construction
+ * (`restore.lock.claim`), inside which the verdict is re-read before anything
+ * is removed. Two concurrent holders would need `kill(pid, 0)` to report a
+ * live process dead, which it does not do.
  */
 export function acquireRestoreLock(
   dir: string,
@@ -705,40 +726,63 @@ export function acquireRestoreLock(
   const isAlive = io.isAlive ?? defaultIsAlive;
   mkdirSync(dir, { recursive: true });
 
-  const tryCreate = (): boolean => {
-    let fd: number;
-    try {
-      fd = openSync(lockPath, "wx");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw err;
-    }
-    try {
-      writeSync(fd, `${pid}\n`);
-    } finally {
-      closeSync(fd);
-    }
-    return true;
-  };
-
-  if (!tryCreate()) {
-    const holder = readLockPid(lockPath);
-    if (holder !== null && isAlive(holder)) throw new RestoreLockHeldError(lockPath, holder);
-    if (holder === null && lockAgeMs(lockPath) < LOCK_WRITE_GRACE_MS) throw new RestoreLockHeldError(lockPath, null);
-
-    const claimed = `${lockPath}.stale-${pid}`;
-    try {
-      renameSync(lockPath, claimed);
-      rmSync(claimed, { force: true });
-    } catch { /* someone else claimed it first, or it vanished; the create below decides */ }
-    if (!tryCreate()) throw new RestoreLockHeldError(lockPath, readLockPid(lockPath));
-  }
-
-  return () => {
+  const release = (): void => {
     try {
       if (readLockPid(lockPath) === pid) unlinkSync(lockPath);
     } catch { /* already gone */ }
   };
+
+  if (linkLock(lockPath, pid)) return release;
+
+  const holder = readLockPid(lockPath);
+  if (holder !== null && isAlive(holder)) throw new RestoreLockHeldError(lockPath, holder);
+
+  // Holder gone (or the file is not something this module wrote). Take over,
+  // but only with the claim held, and only if the verdict still stands once it
+  // is: the lock may have changed hands while we were deciding.
+  const claimPath = `${lockPath}.claim`;
+  if (!linkLock(claimPath, pid)) {
+    const claimant = readLockPid(claimPath);
+    if (claimant !== null && isAlive(claimant)) throw new RestoreLockHeldError(lockPath, claimant);
+    try {
+      unlinkSync(claimPath); // its claimant is gone; a claim is held for microseconds.
+    } catch { /* already gone */ }
+    if (!linkLock(claimPath, pid)) throw new RestoreLockHeldError(lockPath, readLockPid(claimPath));
+  }
+  try {
+    const now = readLockPid(lockPath);
+    if (now !== holder && now !== null && isAlive(now)) throw new RestoreLockHeldError(lockPath, now);
+    try {
+      unlinkSync(lockPath);
+    } catch { /* already gone */ }
+    // Someone linking fresh between the unlink and this is a legitimate holder.
+    if (!linkLock(lockPath, pid)) throw new RestoreLockHeldError(lockPath, readLockPid(lockPath));
+  } finally {
+    try {
+      if (readLockPid(claimPath) === pid) unlinkSync(claimPath);
+    } catch { /* already gone */ }
+  }
+  return release;
+}
+
+/**
+ * Create `target` holding `pid`, atomically and only if it does not exist:
+ * write a private file, `link` it into place, remove the private file.
+ */
+function linkLock(target: string, pid: number): boolean {
+  const mine = `${target}.${pid}`;
+  writeFileSync(mine, `${pid}\n`);
+  try {
+    linkSync(mine, target);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  } finally {
+    try {
+      unlinkSync(mine);
+    } catch { /* nothing to do */ }
+  }
 }
 
 function readLockPid(lockPath: string): number | null {
@@ -747,14 +791,6 @@ function readLockPid(lockPath: string): number | null {
     return Number.isInteger(n) && n > 0 ? n : null;
   } catch {
     return null;
-  }
-}
-
-function lockAgeMs(lockPath: string): number {
-  try {
-    return Date.now() - lstatSync(lockPath).mtimeMs;
-  } catch {
-    return Number.POSITIVE_INFINITY;
   }
 }
 

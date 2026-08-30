@@ -229,7 +229,10 @@ function validated<T>(label: string, schema: Validator<T>, raw: unknown, fallbac
     .join("; ");
   const fallbackNote = typeof fallback === "object" && fallback !== null
     ? "using defaults"
-    : `using ${describeValue(fallback, label)}`;
+    // No label: the fallback is OURS, not the operator's secret, so describing
+    // it under a secret-named label would print `using "***"` for a plain
+    // `null` default and hide which default was applied.
+    : `using ${describeValue(fallback)}`;
   issues.push(`${label}: ${detail} (got ${describeValue(raw, label)}; ${fallbackNote})`);
   return fallback;
 }

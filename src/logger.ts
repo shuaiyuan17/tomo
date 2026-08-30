@@ -2,7 +2,7 @@ import pino from "pino";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { watchBus } from "./watch/bus.js";
-import { LOG_REDACT_PATHS } from "./redact.js";
+import { LOG_REDACT_PATHS, redactLogRecord, scrubSecretValues } from "./redact.js";
 
 const logFile = process.env.TOMO_LOG_FILE;
 
@@ -53,10 +53,44 @@ export const log = pino({
   // copied into bug reports. Paths are generated from the same field-name
   // rule; the censor is pino's default `[Redacted]`.
   redact: { paths: LOG_REDACT_PATHS },
+  formatters: {
+    // Second, general pass over the merged object. `redact.paths` is a ladder
+    // of literal paths and can always be out-nested — `{ config: { channels:
+    // { telegram: { token } } } }` is four levels deep, an MCP entry nests
+    // `mcpServers.<name>.headers.Authorization`. This matches the same names
+    // at any depth, and returns the object untouched (no clone) when there is
+    // nothing to redact, which is almost every line.
+    log: (record) => redactLogRecord(record),
+  },
+  serializers: {
+    // An error object is the other way a credential arrives: grammY puts the
+    // bot token in the request URL it echoes, an axios-shaped error carries
+    // `config.headers.Authorization`. Serialize first (so the stack survives),
+    // then redact by name, then scrub the message and stack by value — a token
+    // inside `err.message` is under no key that could be matched.
+    err: (err: unknown) => {
+      const serialized = redactLogRecord(pino.stdSerializers.err(err as Error)) as Record<string, unknown>;
+      for (const field of ["message", "stack", "type"]) {
+        const value = serialized[field];
+        if (typeof value === "string") serialized[field] = scrubSecretValues(value);
+      }
+      return serialized;
+    },
+  },
   hooks: {
     // Tap warn/error so the watch TUI's "last issue" pane works without
     // parsing the log file. The watch bus never logs, so this cannot recurse.
     logMethod(args, method, level) {
+      // The MESSAGE is the one part of a log record that no object-level
+      // redaction can reach, and it is where the real exposure lives:
+      // live-session.ts logs `summarizeToolResult(...)` — the first 500
+      // characters of every tool result — as the message at info, so a single
+      // `Read ~/.tomo/config.json` used to write the bot token into
+      // ~/.tomo/logs/tomo.log. There is no key to match on in a free-text
+      // string, so this matches on the shape of the value instead.
+      for (let i = 0; i < args.length; i++) {
+        if (typeof args[i] === "string") args[i] = scrubSecretValues(args[i] as string);
+      }
       if (level >= 40) {
         watchBus.publish({ type: "issue", level: level >= 50 ? "error" : "warn", msg: issueMessage(args) });
       }

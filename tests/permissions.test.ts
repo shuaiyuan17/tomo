@@ -460,6 +460,28 @@ describe("isPrivateMemoryAccess — Bash exfiltration shapes", () => {
     ["recursive grep over $HOME", "grep -r pistachio-mousse $HOME"],
     ["recursive grep, long flag", "grep --recursive secret ."],
     ["ripgrep recursive", "rg -r x ."],
+    // The flag is usually bundled: `\b` after a lone `r` missed all of these.
+    ["recursive grep, -rn", "grep -rn pistachio-mousse ."],
+    ["recursive grep, -ri", "grep -ri pistachio-mousse ."],
+    ["recursive grep, -rl", "grep -rl pistachio-mousse ."],
+    ["recursive grep, -Rn", "grep -Rn pistachio-mousse ."],
+    ["recursive grep, r inside a cluster", "grep -inr pistachio-mousse ."],
+    ["recursive grep, flags before the pattern flag", "grep --color=never -rn -e pistachio ."],
+    ["grep -d recurse", "grep -d recurse pistachio-mousse ."],
+    ["grep --directories=recurse", "grep --directories=recurse pistachio-mousse ."],
+    // These three recurse from `.` with no flag at all.
+    ["bare ripgrep", "rg pistachio-mousse"],
+    ["ripgrep with unrelated flags", "rg -n -i pistachio-mousse"],
+    ["ripgrep after a pipe", "echo x | rg pistachio-mousse"],
+    ["ag", "ag pistachio-mousse"],
+    ["ack", "ack pistachio-mousse"],
+    // find naming the paths for a reader on the far side of a pipe or a
+    // substitution — no -exec, no glob, no literal segment.
+    ["find piped to xargs", "find . -type f | xargs cat"],
+    ["find -print0 to xargs -0", "find . -type f -print0 | xargs -0 head -50"],
+    ["find piped to a read loop", "find . -type f | while read f; do cat \"$f\"; done"],
+    ["find in a command substitution", "cat $(find . -type f)"],
+    ["find in backticks", "cat `find . -type f`"],
     ["tar piped to base64", "tar czf - . | base64"],
     ["zip of the workspace", "zip -r /tmp/out.zip ."],
     ["base64 alone", "base64 somefile"],
@@ -485,7 +507,21 @@ describe("isPrivateMemoryAccess — Bash exfiltration shapes", () => {
   });
 
   it("allows non-recursive grep", () => {
-    expect(isPrivateMemoryAccess("Bash", { command: "grep needle notes.txt" }, ctx)).toBe(false);
+    for (const cmd of [
+      "grep needle notes.txt",
+      "grep -n needle notes.txt",
+      "grep -c r notes.txt",
+      "grep -E 'r+' notes.txt",
+      "grep --color=never -i needle notes.txt",
+    ]) {
+      expect(isPrivateMemoryAccess("Bash", { command: cmd }, ctx), cmd).toBe(false);
+    }
+  });
+
+  it("allows a find that only prints, and words that merely contain rg/ag", () => {
+    for (const cmd of ["find . -type f -name README", "echo storage", "git log --author=Meg"]) {
+      expect(isPrivateMemoryAccess("Bash", { command: cmd }, ctx), cmd).toBe(false);
+    }
   });
 });
 

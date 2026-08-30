@@ -436,9 +436,14 @@ function grepReachesPrivate(
  *     command is denied too. `ls sk*\/x` still works: "sk" is a prefix of
  *     neither.
  *  4. `find … -exec/-execdir/-ok`, which reads arbitrary files through a
- *     helper that names no path at all.
- *  5. Recursive grep/rg/ag/ack. The Grep TOOL is guarded precisely above;
- *     `grep -r <phrase> $HOME` is how you get around that.
+ *     helper that names no path at all — and `find` handing its results to a
+ *     reader some other way: `find … | xargs cat`, `find … | while read`,
+ *     `cat $(find …)`. The pipe or the substitution carries the paths.
+ *  5. Recursive grep. The Grep TOOL is guarded precisely above; `grep -r
+ *     <phrase> $HOME` is how you get around that, and so is `grep -rn` — the
+ *     flag is matched inside a bundled cluster, not only on its own. `rg`,
+ *     `ag` and `ack` recurse from `.` BY DEFAULT, so a bare `rg <phrase>` is
+ *     the recursive grep and every invocation of those three is refused.
  *  6. Archive and encode commands (tar/zip/base64/xxd/…), which turn "read a
  *     tree" into one command that names only `.`.
  *
@@ -454,7 +459,9 @@ function bashTouchesMemory(cmd: string, ctx: { cwd: string; memoryDir: string; p
   if (memorySegment.test(cmd)) return true;
   if (BULK_READ_COMMAND.test(cmd)) return true;
   if (FIND_EXEC.test(cmd)) return true;
+  if (FIND_FED_TO_READER.test(cmd)) return true;
   if (RECURSIVE_GREP.test(cmd)) return true;
+  if (RECURSIVE_BY_DEFAULT_GREP.test(cmd)) return true;
   return bashTokens(cmd).some(globCouldExpandToMemory);
 }
 
@@ -465,9 +472,23 @@ const BULK_READ_COMMAND = /(^|[\s'"`=()|&;></])(tar|zip|unzip|gzip|bzip2|xz|base
 /** `find … -exec cat {} +` — the path is named by the helper, not the find. */
 const FIND_EXEC = /(^|[\s'"`=()|&;></])find(\s|$)[\s\S]*?\s-(exec|execdir|ok|okdir)\b/i;
 
+/** `find … | xargs cat`, `find … | while read f; do cat "$f"; done`,
+ *  `cat $(find …)`, `` cat `find …` ``: the same shape as FIND_EXEC with the
+ *  helper on the other side of a pipe or a substitution. A `find` that only
+ *  prints (no pipe, no substitution) is left alone. */
+const FIND_FED_TO_READER = /(^|[\s'"`=()|&;></])find(\s|$)[^|;&]*\||(\$\(|`)\s*find(\s|$)/i;
+
 /** Recursive grep of anything. The Grep tool arm is the precise one; this is
- *  the shell route around it. */
-const RECURSIVE_GREP = /(^|[\s'"`=()|&;></])(grep|egrep|fgrep|rg|ag|ack)(?=\s)[^|;&]*?\s-{1,2}(r|R|recursive)\b/i;
+ *  the shell route around it. The `r`/`R` is matched anywhere inside a short
+ *  flag cluster (`-rn`, `-ri`, `-rl`, `-inR`) — a `\b` after a lone `r`
+ *  missed every one of those — and GNU grep's `-d recurse` /
+ *  `--directories=recurse` spellings are the same thing. */
+const RECURSIVE_GREP = /(^|[\s'"`=()|&;></])(grep|egrep|fgrep)(?=\s)[^|;&]*?\s(-[a-z]*r[a-z]*|--(dereference-)?recursive|-d\s*recurse|--directories=recurse)(\s|=|$)/i;
+
+/** `rg`, `ag` and `ack` recurse from the current directory by default, so a
+ *  bare `rg <term>` IS the recursive grep: any invocation is refused, flag or
+ *  no flag. */
+const RECURSIVE_BY_DEFAULT_GREP = /(^|[\s'"`=()|&;></])(rg|ag|ack)(\s|$)/i;
 
 /** Split a command into path-ish tokens: shell operators and whitespace are
  *  separators, and quoting is stripped rather than honoured (a quoted glob is

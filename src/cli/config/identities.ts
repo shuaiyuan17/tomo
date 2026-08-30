@@ -1,6 +1,7 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
-import { CronStore } from "../../cron/store.js";
+import { CronStore, CronStoreReadError } from "../../cron/store.js";
+import { cronStoreErrorMessage } from "../cron-errors.js";
 import { legacySessionKeysForBinding, rawSessionKeyForBinding } from "../../sessions/keys.js";
 import { loadConfig, saveConfig, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 
@@ -183,13 +184,22 @@ function migrateCronJobsToIdentity(identity: {
   const cronStore = new CronStore();
   const unified = `dm:${identity.name.toLowerCase()}`;
   let total = 0;
-  // Match the jobs' actual keys rather than rebuilding them from the config
-  // value: an iMessage binding is a handle, the job key a chat GUID.
-  const jobKeys = new Set(cronStore.list().map((job) => job.sessionKey));
-  for (const [ch, chatId] of Object.entries(identity.channels)) {
-    for (const oldKey of legacySessionKeysForBinding(jobKeys, ch, chatId)) {
-      total += cronStore.rewriteSessionKey(oldKey, unified);
+  try {
+    // Match the jobs' actual keys rather than rebuilding them from the config
+    // value: an iMessage binding is a handle, the job key a chat GUID.
+    const jobKeys = new Set(cronStore.list().map((job) => job.sessionKey));
+    for (const [ch, chatId] of Object.entries(identity.channels)) {
+      for (const oldKey of legacySessionKeysForBinding(jobKeys, ch, chatId)) {
+        total += cronStore.rewriteSessionKey(oldKey, unified);
+      }
     }
+  } catch (err) {
+    if (!(err instanceof CronStoreReadError)) throw err;
+    // The identity change itself is fine; only the job re-keying could not
+    // run. Report it instead of aborting the flow with a stack trace — and
+    // do not report a count, because nothing was migrated.
+    p.log.error(`${cronStoreErrorMessage(err)} — scheduled tasks were NOT re-keyed to this identity.`);
+    return 0;
   }
   return total;
 }
@@ -215,11 +225,17 @@ function restoreCronJobsFromIdentity(identity: {
   const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
   const fallbackKey = rawSessionKeyForBinding(ch, chatId, store.listAllSessions(), `dm:${identity.name.toLowerCase()}`);
   const cronStore = new CronStore();
-  const count = cronStore.rewriteSessionKey(
-    `dm:${identity.name.toLowerCase()}`,
-    fallbackKey,
-  );
-  return { count, fallbackKey };
+  try {
+    const count = cronStore.rewriteSessionKey(
+      `dm:${identity.name.toLowerCase()}`,
+      fallbackKey,
+    );
+    return { count, fallbackKey };
+  } catch (err) {
+    if (!(err instanceof CronStoreReadError)) throw err;
+    p.log.error(`${cronStoreErrorMessage(err)} — scheduled tasks were NOT re-keyed off this identity.`);
+    return { count: 0, fallbackKey };
+  }
 }
 
 /**

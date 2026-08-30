@@ -9,6 +9,28 @@ export function isDmSessionKey(key: string): boolean {
   return key.startsWith("dm:");
 }
 
+/** Canonical dm key: `dm:` + a slug. Deliberately narrow — see below. */
+const CANONICAL_DM_KEY_RE = /^dm:[a-z0-9_-]+$/;
+
+/**
+ * Strict form of `isDmSessionKey` for decisions where a `dm:` prefix grants
+ * *authority* rather than just routing — a caller that may administer another
+ * session's records, for instance (see `canManageJob`).
+ *
+ * `isDmSessionKey` itself stays a prefix test on purpose. Identity names are
+ * only validated as a non-empty string (`identitySchema` in src/config.ts) and
+ * `dmSessionKeyForIdentity` merely lowercases them, so a live install can
+ * legitimately hold `dm:shuai yuan`. Tightening the shared predicate would
+ * silently reclassify that session everywhere it decides routing, audience,
+ * summon handling and private-record visibility — a much larger blast radius
+ * than the check it would harden. So the strict test is opt-in, and callers
+ * that use it must fail CLOSED (deny the extra authority) rather than treat a
+ * non-canonical key as "not a DM".
+ */
+export function isCanonicalDmSessionKey(key: string): boolean {
+  return CANONICAL_DM_KEY_RE.test(key.trim().toLowerCase());
+}
+
 export function dmIdentityFromSessionKey(key: string): string | undefined {
   return isDmSessionKey(key) ? key.slice(3) : undefined;
 }

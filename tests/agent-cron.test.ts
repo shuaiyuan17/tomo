@@ -374,6 +374,51 @@ describe("cron message delivery", () => {
     await agent.stop();
   });
 
+  it("waitForHandoff resolves only after the summoned session's turn actually runs", async () => {
+    resetConfig({
+      identities: [
+        { name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" },
+      ],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const internals = agent as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+    };
+    internals.router.summonGroup("telegram", "-100271", "shuai");
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let turnStarted = false;
+    mockSdk.responseFn = async () => {
+      turnStarted = true;
+      await gate;
+      return "NO_REPLY";
+    };
+
+    // The cron scheduler advances nextRunAt (and DELETES a one-shot) on this
+    // boolean. Reporting "done" the moment the work is queued means the job is
+    // marked complete before it runs, and a daemon that stops in between loses
+    // the run with no interrupted-run trace to recover from.
+    let settled = false;
+    const run = agent
+      .handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })
+      .then((ok) => { settled = true; return ok; });
+
+    await waitFor(() => expect(turnStarted).toBe(true));
+    expect(settled).toBe(false);
+
+    release();
+    await expect(run).resolves.toBe(true);
+
+    const prompt = mockSdk.userContents.flat().map((block) => block.text ?? "").join("");
+    expect(prompt).toContain("Scheduled group task");
+    expect(prompt).toContain('type="summon-reminder"');
+
+    await agent.stop();
+  });
+
   it("runs group background work on the summoned dm session without reviving the group session", async () => {
     resetConfig({
       identities: [

@@ -1,7 +1,8 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { CronStore, parseScheduleString } from "../cron/store.js";
-import type { CronJob } from "../cron/types.js";
+import { CronStore, CronStoreReadError, computeNextRun, parseScheduleString } from "../cron/store.js";
+import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
+import type { CronJob, CronRunStatus } from "../cron/types.js";
 
 /**
  * MCP tool factories for the cron store. Registered onto the
@@ -18,7 +19,16 @@ import type { CronJob } from "../cron/types.js";
  * from the CLI, the scheduler, or external edits (the constructor calls
  * `load()` from disk). The on-disk JSON is the single source of truth.
  */
-export function buildCronTools(storePath?: string) {
+/**
+ * @param storePath  Override the jobs file (tests).
+ * @param callerSessionKey  The session this MCP server instance belongs to.
+ *   When set, `schedule_enable` is scoped by `canManageJob` (src/cron/scope.ts):
+ *   re-enabling is the one cron operation here that makes a *dormant* job run
+ *   again, so a group chat must not be able to restart a job that fires into
+ *   the owner's DM. Scoping of `schedule_list` / `schedule_create` /
+ *   `schedule_remove` is #319, which should adopt the same predicate.
+ */
+export function buildCronTools(storePath?: string, callerSessionKey?: string) {
   return [
     tool(
       "schedule_create",
@@ -57,13 +67,34 @@ export function buildCronTools(storePath?: string) {
         ),
       },
       async ({ name, schedule, message, session, once }) => {
-        // Wrap both the parse and the store.add: parseScheduleString accepts
-        // any unrecognized string as `kind: "cron"` (catch-all), and croner
-        // throws inside `computeNextRun` when the expression is malformed.
-        // Either path means "this isn't a usable schedule" — surface it the
-        // same way so the agent doesn't think the job was scheduled.
+        // Validate the schedule on its own. parseScheduleString accepts any
+        // unrecognized string as `kind: "cron"` (catch-all) and croner only
+        // throws when the expression is actually evaluated, so the validation
+        // is the trial computeNextRun — not `store.add`, whose failures are
+        // about the STORE and must not be reported as a bad schedule.
+        if (!isStorableSessionKey(session)) {
+          // Persisting a malformed target buys a job that can never deliver,
+          // found out days later when the reminder does not arrive.
+          return {
+            content: [{
+              type: "text" as const,
+              text: `schedule_create failed: "${session}" is not a session key. Use the session key from the system prompt — "dm:<identity>", or "<channel>:<chatId>" such as "telegram:-1001234567".`,
+            }],
+            isError: true,
+          };
+        }
+        let parsed;
         try {
-          const parsed = parseScheduleString(schedule);
+          parsed = parseScheduleString(schedule);
+          computeNextRun(parsed, Date.now());
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            isError: true,
+          };
+        }
+        try {
           const store = new CronStore(storePath);
           const job = store.add({
             name,
@@ -76,9 +107,13 @@ export function buildCronTools(storePath?: string) {
             content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
           };
         } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
+          // The schedule was fine; the store was not. Say so, or the agent
+          // rewrites a perfectly good schedule string forever.
+          const detail = err instanceof CronStoreReadError
+            ? `the schedule store could not be read (${err.path}) — the schedule itself is valid`
+            : err instanceof Error ? err.message : String(err);
           return {
-            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            content: [{ type: "text" as const, text: `schedule_create failed: ${detail}` }],
             isError: true,
           };
         }
@@ -92,7 +127,9 @@ export function buildCronTools(storePath?: string) {
       [
         "List every scheduled task in the store. Use to audit what reminders/recurring jobs exist before adding more, or to find a job's id for removal.",
         "",
-        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
+        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
+        "",
+        "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. Such a job is left disabled rather than re-fired; use `schedule_enable` to run it again, and only after checking whether the task actually completed.",
       ].join("\n"),
       {},
       async () => {
@@ -104,6 +141,51 @@ export function buildCronTools(storePath?: string) {
       },
       {
         searchHint: "list scheduled tasks reminders crons jobs audit",
+      },
+    ),
+    tool(
+      "schedule_enable",
+      [
+        "Enable or disable a scheduled task without deleting it.",
+        "",
+        "The main use is a job left disabled after an interrupted run (`lastStatus: \"interrupted\"` in `schedule_list`) — the daemon restarted mid-run, so the task may already have done its work. Check that first; enabling it runs it again. Enabling clears the interrupted state and recomputes the next run (a one-shot whose time has passed fires on the next poll).",
+        "",
+        "Pass `enabled: false` to park a job you want to keep but not run.",
+        "",
+        "Scoped: this conversation's own jobs always; from a DM, also jobs that deliver into a group chat or that carry no session. A group chat can only enable or disable its own jobs.",
+        "",
+        "Returns the updated job, or `not_found`.",
+      ].join("\n"),
+      {
+        id: z.string().min(1).describe("The job id from `schedule_list` (e.g. `f43d8a93`)."),
+        enabled: z.boolean().optional().describe("Target state. Defaults to true (enable)."),
+      },
+      async ({ id, enabled }) => {
+        const store = new CronStore(storePath);
+        const existing = store.get(id);
+        if (!existing) {
+          return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
+        }
+        if (!canManageJob(existing, callerSessionKey)) {
+          // Deliberately does not name the owning session.
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Job ${id} belongs to a different session; this session can only enable or disable its own scheduled tasks.`,
+            }],
+            isError: true,
+          };
+        }
+        const job = store.setEnabled(id, enabled ?? true);
+        if (!job) {
+          return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
+        }
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
+        };
+      },
+      {
+        searchHint: "enable disable resume pause reactivate scheduled task reminder cron job interrupted",
       },
     ),
     tool(
@@ -146,7 +228,8 @@ interface JobSummary {
   sessionKey: string;
   nextRunAt: string | null;
   lastRunAt: string | null;
-  lastStatus: "ok" | "error" | null;
+  lastStartedAt: string | null;
+  lastStatus: CronRunStatus | null;
 }
 
 function summarizeJob(job: CronJob): JobSummary {
@@ -160,6 +243,7 @@ function summarizeJob(job: CronJob): JobSummary {
     sessionKey: job.sessionKey,
     nextRunAt: job.nextRunAt ? new Date(job.nextRunAt).toISOString() : null,
     lastRunAt: job.lastRunAt ? new Date(job.lastRunAt).toISOString() : null,
+    lastStartedAt: job.lastStartedAt ? new Date(job.lastStartedAt).toISOString() : null,
     lastStatus: job.lastStatus,
   };
 }

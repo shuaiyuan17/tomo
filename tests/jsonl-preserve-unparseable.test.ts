@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { parseJsonl, isRawJsonlLine, serializeJsonlRecord } from "../src/jsonl.js";
+import { parseJsonl, isRawJsonlLine, serializeJsonlRecord, reportRawJsonlLines } from "../src/jsonl.js";
 import { compactSession } from "../src/lcm/compact.js";
 import { pruneTools } from "../src/lcm/prune-tools.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
@@ -50,11 +50,38 @@ describe("parseJsonl", () => {
     expect(records[2]).toEqual({ b: 2 });
   });
 
-  it("round-trips a carried line byte-for-byte", () => {
+  it("round-trips every content-bearing line exactly", () => {
     const out = parseJsonl(text, { preserveUnparseable: true })
       .map(serializeJsonlRecord)
       .join("\n") + "\n";
     expect(out).toBe(text);
+  });
+
+  it("drops blank lines in both modes (per-line fidelity, not whole-file)", () => {
+    // JSONL has no semantics for blank lines and the SDK never writes them.
+    // Documented rather than preserved.
+    const withBlanks = '{"a":1}\n\n' + TORN + "\n\n";
+    const out = parseJsonl(withBlanks, { preserveUnparseable: true })
+      .map(serializeJsonlRecord)
+      .join("\n") + "\n";
+    expect(out).toBe('{"a":1}\n' + TORN + "\n");
+  });
+
+  it("carries a line that is valid JSON but not an object", () => {
+    // `null` is the dangerous one: it parses, so it used to be handed out as a
+    // record, and every `evt.type` read on it throws. A bare number or string
+    // is equally un-rewritable. All are carried instead.
+    const scalars = 'null\n42\n"hello"\n{"real":true}\n';
+    const records = parseJsonl(scalars, { preserveUnparseable: true });
+    expect(records.map(isRawJsonlLine)).toEqual([true, true, true, false]);
+    expect(records.map(serializeJsonlRecord).join("\n") + "\n").toBe(scalars);
+    // Read-only mode is unchanged: it still hands `null` out, as before.
+    expect(parseJsonl(scalars)).toEqual([null, 42, "hello", { real: true }]);
+  });
+
+  it("reports each carried line and returns the count", () => {
+    expect(reportRawJsonlLines(parseJsonl(text, { preserveUnparseable: true }), { op: "test" })).toBe(1);
+    expect(reportRawJsonlLines(parseJsonl('{"a":1}\n'), { op: "test" })).toBe(0);
   });
 
   it("never lets a carried line stringify as an empty object", () => {
@@ -122,6 +149,49 @@ describe("compactSession preserves unparseable lines", () => {
     expect(readFileSync(archivePath, "utf-8")).not.toContain("torn-1");
     // Everything still parses, plus the one line that never did.
     expect(parseJsonl(readFileSync(path, "utf-8"))).toHaveLength(after.length - 1);
+  });
+
+  it("survives and preserves a bare `null` line mid-file", () => {
+    const events = [
+      mkUserEvent(null, "2026-04-01T00:00:00.000Z", "one"),
+      mkAssistantEvent(null, "2026-04-01T00:00:01.000Z", "two"),
+      mkUserEvent(null, "2026-04-01T00:00:02.000Z", "three"),
+    ];
+    for (let i = 1; i < events.length; i++) events[i].parentUuid = events[i - 1].uuid;
+    const lines = events.map((e) => JSON.stringify(e));
+    lines.splice(1, 0, "null");
+    writeFileSync(path, lines.join("\n") + "\n");
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 2,
+      expectedFirstUuid: events[1].uuid,
+      expectedLastUuid: events[2].uuid,
+      summary: "compacted",
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(true);
+    expect(readFileSync(path, "utf-8").trimEnd().split("\n")).toContain("null");
+  });
+
+  it("drops the torn line only when --drop-unparseable is asked for", () => {
+    const events = seed(2);
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      expectedFirstUuid: events[1].uuid,
+      expectedLastUuid: events[3].uuid,
+      summary: "compacted middle",
+      transcriptPath: archivePath,
+      dropUnparseable: true,
+    });
+    expect(result.success).toBe(true);
+    expect(readFileSync(path, "utf-8")).not.toContain("torn-1");
   });
 
   it("keeps a torn line that sits outside the compacted range", () => {

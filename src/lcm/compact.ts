@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
-import { isRawJsonlLine, parseJsonl, serializeJsonlRecord } from "../jsonl.js";
+import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine } from "../jsonl.js";
 
 /** Path to the compact trigger file for a given session */
 export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: string): string {
@@ -27,6 +27,13 @@ export function checkAndClearCompactTrigger(sdkSessionId: string, sdkSessionsDir
     throw err;
   }
 }
+
+/**
+ * One line of an SDK JSONL file as a rewriting caller sees it: either a parsed
+ * event, or an opaque carrier for a line that could not be parsed and is being
+ * preserved verbatim. Narrow with `isRawJsonlLine` before touching any field.
+ */
+export type SdkEntry = SdkEvent | RawJsonlLine;
 
 export interface CompactRequest {
   /** SDK session ID to compact */
@@ -49,6 +56,13 @@ export interface CompactRequest {
    * refresh, re-running a weekly rollup, etc).
    */
   blockTag?: string;
+  /**
+   * Drop lines that cannot be parsed instead of preserving them verbatim.
+   * Off by default, and there is no reason to turn it on except to deliberately
+   * discard corruption that is jamming a session — see `tomo lcm compact
+   * --drop-unparseable`. The dropped bytes are not archived anywhere.
+   */
+  dropUnparseable?: boolean;
   /**
    * Expected UUIDs of the events at fromIdx/toIdx, captured at range-resolution
    * time. If the file was rewritten between resolution and this call (e.g. two
@@ -123,14 +137,20 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // line that only the parser could not understand must still be in the
   // output. Carried lines have no `type`, so they never enter convIndices,
   // never anchor a range, and are never archived — they are only relocated.
-  const allEvents = parseJsonl<SdkEvent>(snapshot.text, { preserveUnparseable: true });
+  const allEvents: SdkEntry[] = req.dropUnparseable
+    ? parseJsonl<SdkEvent>(snapshot.text)
+    : parseJsonl<SdkEvent>(snapshot.text, { preserveUnparseable: true });
+  if (!req.dropUnparseable) {
+    reportRawJsonlLines(allEvents, { sessionId: req.sdkSessionId, op: "compact" });
+  }
 
   // Separate conversation events (user/assistant) from metadata events
   // We need to track the original indices so we can reconstruct
   const convIndices: number[] = []; // indices into allEvents for user/assistant
   for (let i = 0; i < allEvents.length; i++) {
-    const t = allEvents[i].type;
-    if (t === "user" || t === "assistant") {
+    const entry = allEvents[i];
+    if (isRawJsonlLine(entry)) continue;
+    if (entry.type === "user" || entry.type === "assistant") {
       convIndices.push(i);
     }
   }
@@ -146,18 +166,30 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   let removeStartGlobal = convIndices[req.fromIdx];
   let removeEndGlobal = convIndices[req.toIdx];
 
+  // convIndices only ever holds real events, so these two are never carriers;
+  // the guard is what tells the compiler that, and is a genuine abort if the
+  // invariant is ever broken.
+  const firstAnchor = allEvents[removeStartGlobal];
+  const lastAnchor = allEvents[removeEndGlobal];
+  if (isRawJsonlLine(firstAnchor) || isRawJsonlLine(lastAnchor)) {
+    return {
+      success: false, eventsRemoved: 0, eventsAfter: allEvents.length,
+      error: "Internal: compaction range anchor resolved to an unparseable line",
+    };
+  }
+
   if (
-    (req.expectedFirstUuid && allEvents[removeStartGlobal].uuid !== req.expectedFirstUuid) ||
-    (req.expectedLastUuid && allEvents[removeEndGlobal].uuid !== req.expectedLastUuid)
+    (req.expectedFirstUuid && firstAnchor.uuid !== req.expectedFirstUuid) ||
+    (req.expectedLastUuid && lastAnchor.uuid !== req.expectedLastUuid)
   ) {
     log.warn({
       sessionId: req.sdkSessionId,
       fromIdx: req.fromIdx,
       toIdx: req.toIdx,
       expectedFirstUuid: req.expectedFirstUuid,
-      actualFirstUuid: allEvents[removeStartGlobal].uuid,
+      actualFirstUuid: firstAnchor.uuid,
       expectedLastUuid: req.expectedLastUuid,
-      actualLastUuid: allEvents[removeEndGlobal].uuid,
+      actualLastUuid: lastAnchor.uuid,
     }, "Compact aborted: range anchors moved");
     return {
       success: false,
@@ -174,7 +206,9 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // the range to include it so the new summary replaces the old in place.
   if (req.blockTag) {
     for (let i = 0; i < allEvents.length; i++) {
-      if (allEvents[i].isCompactSummary && allEvents[i].blockTag === req.blockTag) {
+      const entry = allEvents[i];
+      if (isRawJsonlLine(entry)) continue;
+      if (entry.isCompactSummary && entry.blockTag === req.blockTag) {
         if (i < removeStartGlobal) removeStartGlobal = i;
         if (i > removeEndGlobal) removeEndGlobal = i;
       }
@@ -220,8 +254,15 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     removeSet.add(i);
   }
 
-  // Find the parentUuid chain endpoints
+  // Find the parentUuid chain endpoints. Expansion only ever moves the bounds
+  // onto an isCompactSummary event, so this is a real event too.
   const firstRemoved = allEvents[removeStartGlobal];
+  if (isRawJsonlLine(firstRemoved)) {
+    return {
+      success: false, eventsRemoved: 0, eventsAfter: allEvents.length,
+      error: "Internal: compaction range start resolved to an unparseable line",
+    };
+  }
   const parentBeforeRange = firstRemoved.parentUuid;
 
   // Create the summary event
@@ -257,11 +298,12 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // timestamp-based stitching, which skips the summary.
   const removedUuids = new Set<string>();
   for (const idx of removeSet) {
-    const u = allEvents[idx].uuid;
-    if (u) removedUuids.add(u);
+    const entry = allEvents[idx];
+    if (isRawJsonlLine(entry)) continue; // removeSet already excludes these
+    if (entry.uuid) removedUuids.add(entry.uuid);
   }
 
-  const newEvents: SdkEvent[] = [];
+  const newEvents: SdkEntry[] = [];
 
   for (let i = 0; i < removeStartGlobal; i++) {
     newEvents.push(allEvents[i]);
@@ -278,11 +320,12 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   }
 
   for (let i = removeEndGlobal + 1; i < allEvents.length; i++) {
-    if (isRawJsonlLine(allEvents[i])) {
-      newEvents.push(allEvents[i]);
+    const entry = allEvents[i];
+    if (isRawJsonlLine(entry)) {
+      newEvents.push(entry);
       continue;
     }
-    const event = { ...allEvents[i] };
+    const event = { ...entry };
     if (event.parentUuid && removedUuids.has(event.parentUuid)) {
       event.parentUuid = summaryUuid;
     }
@@ -419,7 +462,7 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
 }
 
 function findUnrelatedSummaryInExpansionGap(
-  events: SdkEvent[],
+  events: readonly SdkEntry[],
   blockTag: string,
   removeStartGlobal: number,
   removeEndGlobal: number,
@@ -438,10 +481,12 @@ function findUnrelatedSummaryInExpansionGap(
 }
 
 function unrelatedSummaryConflict(
-  event: SdkEvent,
+  event: SdkEntry,
   blockTag: string,
   index: number,
 ): { index: number; tag: string } | null {
+  // A line nobody could parse is not a summary block.
+  if (isRawJsonlLine(event)) return null;
   if (!event.isCompactSummary) return null;
   if (event.blockTag === blockTag) return null;
   return { index, tag: event.blockTag ?? "legacy" };
@@ -496,7 +541,7 @@ export function readWholeFile(path: string): {
 export function readSinceOffset(
   path: string,
   offset: number,
-): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
+): { events: SdkEntry[]; readUpTo: number; hasPartialTail: boolean } {
   const fd = openSync(path, "r");
   try {
     return readSinceOffsetFromFd(fd, offset);
@@ -535,7 +580,7 @@ export function readWholeFileFromFd(fd: number): {
 export function readSinceOffsetFromFd(
   fd: number,
   offset: number,
-): { events: SdkEvent[]; readUpTo: number; hasPartialTail: boolean } {
+): { events: SdkEntry[]; readUpTo: number; hasPartialTail: boolean } {
   const size = fstatSync(fd).size;
   if (size <= offset) return { events: [], readUpTo: offset, hasPartialTail: false };
   const buf = Buffer.alloc(size - offset);
@@ -556,7 +601,7 @@ export function readSinceOffsetFromFd(
   const completeBytes = buf.subarray(0, lastNl + 1).toString("utf-8");
   // preserveUnparseable: both callers splice these events straight back into
   // the file they are rewriting.
-  const events = parseJsonl<SdkEvent>(completeBytes, { preserveUnparseable: true });
+  const events: SdkEntry[] = parseJsonl<SdkEvent>(completeBytes, { preserveUnparseable: true });
   return {
     events,
     readUpTo: offset + lastNl + 1,
@@ -628,13 +673,16 @@ export function sleepMs(ms: number): void {
 }
 
 /** Archive removed events to a transcript JSONL file */
-function archiveEvents(transcriptPath: string, allEvents: SdkEvent[], removeSet: Set<number>): void {
+function archiveEvents(transcriptPath: string, allEvents: readonly SdkEntry[], removeSet: Set<number>): void {
   const dir = dirname(transcriptPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const archiveLines: string[] = [];
   for (const idx of Array.from(removeSet).sort((a, b) => a - b)) {
     const event = allEvents[idx];
+    // removeSet never contains a carrier — archiving one would write an
+    // `{_archived:true}` stub with no payload and claim it was summarized.
+    if (isRawJsonlLine(event)) continue;
     archiveLines.push(JSON.stringify({
       _archived: true,
       _archivedAt: new Date().toISOString(),

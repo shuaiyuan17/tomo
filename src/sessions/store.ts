@@ -6,7 +6,7 @@ import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
 import {
   parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
-  isRawJsonlLine, serializeJsonlRecord, type RawJsonlLine,
+  isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
 } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { watchBus } from "../watch/bus.js";
@@ -1300,6 +1300,7 @@ export class SessionStore {
       // file rather than being archived — its timestamp is exactly the thing
       // we could not read, so there is no month to file it under.
       const all = parseJsonl<SessionMessage>(text, { preserveUnparseable: true });
+      reportRawJsonlLines(all, { key, file, op: "transcript-rotate" });
       this.rotateFromSnapshot(key, file, currentMonth, fd, all, bytesRead, lock);
     } finally {
       closeSync(fd);

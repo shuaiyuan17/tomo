@@ -1,4 +1,5 @@
 import { readFileSync, openSync, closeSync, readSync, fstatSync } from "node:fs";
+import { log } from "./logger.js";
 
 /**
  * Carrier for a line that could not be parsed as JSON. A `Symbol` key, so it
@@ -21,8 +22,13 @@ export function isRawJsonlLine(value: unknown): value is RawJsonlLine {
 
 /**
  * Serialize one record from `parseJsonl(text, { preserveUnparseable: true })`.
- * Real records stringify; carried-through lines are emitted byte-for-byte as
- * they were read.
+ * Real records stringify; carried-through lines are emitted exactly as read,
+ * including any leading/trailing whitespace within the line.
+ *
+ * Note this is per-line fidelity, not whole-file fidelity: `parseJsonl` skips
+ * blank lines in every mode, so a file round-tripped through parse+serialize
+ * loses its blank lines (JSONL has no semantics for them and the SDK never
+ * writes them). Every line that carries content survives.
  */
 export function serializeJsonlRecord(value: unknown): string {
   return isRawJsonlLine(value) ? value[RAW_JSONL_LINE] : JSON.stringify(value);
@@ -48,27 +54,83 @@ export interface ParseJsonlOptions {
   preserveUnparseable?: boolean;
 }
 
-export function parseJsonl<T = unknown>(text: string, opts?: ParseJsonlOptions): T[] {
-  const records: T[] = [];
+// The two overloads are the point: asking to preserve widens the element type,
+// so a caller that opts in cannot then treat entries as plain `T` without
+// narrowing. A future rewriter gets a compile error instead of a `undefined`
+// field read on a carrier.
+export function parseJsonl<T = unknown>(
+  text: string,
+  opts: ParseJsonlOptions & { preserveUnparseable: true },
+): (T | RawJsonlLine)[];
+export function parseJsonl<T = unknown>(text: string, opts?: ParseJsonlOptions): T[];
+export function parseJsonl<T = unknown>(
+  text: string,
+  opts?: ParseJsonlOptions,
+): (T | RawJsonlLine)[] {
+  const records: (T | RawJsonlLine)[] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    let parsed: unknown;
     try {
-      records.push(JSON.parse(trimmed) as T);
+      parsed = JSON.parse(trimmed);
     } catch {
       // Tolerant by design: SDK JSONL files can contain partial or malformed
       // lines if inspected while another process is writing. Read-only
       // consumers skip them; rewriters carry them through verbatim.
-      if (opts?.preserveUnparseable) {
-        records.push({ [RAW_JSONL_LINE]: line } as RawJsonlLine as T);
-      }
+      if (opts?.preserveUnparseable) records.push({ [RAW_JSONL_LINE]: line });
+      continue;
     }
+    if (opts?.preserveUnparseable && (parsed === null || typeof parsed !== "object")) {
+      // A line that is valid JSON but not an object — `null`, a bare number, a
+      // quoted string — is not a record any rewriting caller can reason about,
+      // and `null` in particular makes every `evt.type` read throw. Carry it
+      // verbatim rather than handing it out as a `T`.
+      records.push({ [RAW_JSONL_LINE]: line });
+      continue;
+    }
+    records.push(parsed as T);
   }
   return records;
 }
 
-export function readJsonlFileSync<T = unknown>(path: string, opts?: ParseJsonlOptions): T[] {
-  return parseJsonl<T>(readFileSync(path, "utf-8"), opts);
+export function readJsonlFileSync<T = unknown>(
+  path: string,
+  opts: ParseJsonlOptions & { preserveUnparseable: true },
+): (T | RawJsonlLine)[];
+export function readJsonlFileSync<T = unknown>(path: string, opts?: ParseJsonlOptions): T[];
+export function readJsonlFileSync<T = unknown>(
+  path: string,
+  opts?: ParseJsonlOptions,
+): (T | RawJsonlLine)[] {
+  return parseJsonl<T>(readFileSync(path, "utf-8"), opts as ParseJsonlOptions & { preserveUnparseable: true });
+}
+
+/**
+ * Log every carrier in a parsed record list, one line each, and return how many
+ * there were. Carriers are rare by construction (a torn write, bit rot), so
+ * per-line logging is affordable and the byte offset is what a human needs to
+ * go and look at the file.
+ *
+ * Rewriting callers should call this once after parsing: a line nobody can
+ * read is worth surfacing even though it is being preserved rather than lost.
+ */
+export function reportRawJsonlLines(
+  records: readonly unknown[],
+  context: Record<string, unknown>,
+): number {
+  let count = 0;
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (!isRawJsonlLine(record)) continue;
+    count++;
+    const raw = record[RAW_JSONL_LINE];
+    log.warn(
+      { ...context, index, bytes: Buffer.byteLength(raw, "utf-8"), preview: raw.slice(0, 120) },
+      "Unparseable JSONL line preserved verbatim through a rewrite",
+    );
+  }
+  return count;
 }
 
 /**

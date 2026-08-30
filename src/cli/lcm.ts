@@ -232,6 +232,7 @@ lcmCommand
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
   .option("--block-tag <tag>", 'Optional block tag (e.g. "monthly 2026-04") so the resulting summary joins the rollup hierarchy')
+  .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
     // Resolve timestamps to indices using context_stats
@@ -267,6 +268,7 @@ lcmCommand
       summary: opts.summary,
       transcriptPath,
       ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
+      dropUnparseable: opts.dropUnparseable === true,
     });
 
     if (result.success) {
@@ -356,6 +358,7 @@ lcmCommand
   .option("--no-images", "Skip pruning base64 images")
   .option("--dry-run", "Preview what would be pruned without modifying")
   .option("--channel-key <key>", "Channel key for archiving originals")
+  .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
 
@@ -369,6 +372,7 @@ lcmCommand
       archivePath: opts.channelKey
         ? join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`)
         : undefined,
+      dropUnparseable: opts.dropUnparseable === true,
     });
 
     if (!result.success) {

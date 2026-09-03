@@ -190,6 +190,43 @@ export function loadPeople(opts: { includePrivate: boolean; dirs?: PeopleDirs })
   return records;
 }
 
+/**
+ * One registry read, shared by every consumer on one inbound message or batch.
+ *
+ * Handling a single group message used to load the whole registry three or
+ * more times — `formatGroupText` for the transcript line, again for the prompt
+ * line, and again to resolve the sender's time zone — each one a `readdir`
+ * plus a `stat` and a `readFile` per record, synchronously, on the message
+ * path. A batch multiplied that by its item count.
+ *
+ * REQUEST-SCOPED, NOT A CACHE. The snapshot is created at the top of an
+ * ingress path and dies with it, so there is nothing to invalidate and no way
+ * for it to serve a stale record to a later turn: an `upsert_person` during
+ * the turn is picked up by the next message, exactly as a fresh load would be.
+ *
+ * The read is lazy (a message that needs no lookup does none) and takes the
+ * WIDEST scope once, with the narrower one derived by filter — the same
+ * records `loadPeople({ includePrivate: false })` returns, since public
+ * records are read first and the file budget is applied in that order.
+ * Callers still say which scope they are entitled to; nothing here widens it.
+ */
+export interface PeopleSnapshot {
+  /** Records for this caller's scope — private records only when entitled. */
+  scoped(includePrivate: boolean): PersonRecord[];
+}
+
+export function createPeopleSnapshot(dirs?: PeopleDirs): PeopleSnapshot {
+  let all: PersonRecord[] | undefined;
+  let publicOnly: PersonRecord[] | undefined;
+  return {
+    scoped(includePrivate: boolean): PersonRecord[] {
+      all ??= loadPeople({ includePrivate: true, dirs });
+      if (includePrivate) return all;
+      return (publicOnly ??= all.filter((p) => !p.isPrivate));
+    },
+  };
+}
+
 export function findPersonByHandle(people: PersonRecord[], channel: string, senderId: string): PersonRecord | undefined {
   const target = normalizeHandle(channel, senderId);
   return people.find((p) => {

@@ -141,6 +141,30 @@ describe("people MCP tools", () => {
     expect(relisted[0].timezone).toBeUndefined();
   });
 
+  it("list_people marks a stored timezone the harness refuses to use", async () => {
+    // Hand-edited file: every other surface renders this record with no time
+    // zone at all, so handing the raw value back here — as `timezone`, next to
+    // valid ones — would make the tool the one place a refused value still
+    // reads as authoritative. It is named as invalid instead, because the
+    // model is who can repair it.
+    writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Example\ntimezone: Not/AZone\n---\n`);
+    writePerson(dirs.publicDir, "bob.md", `---\nname: Bob Example\ntimezone: Etc/GMT+8\n---\n`);
+    writePerson(dirs.publicDir, "carol.md", `---\nname: Carol Example\ntimezone: Asia/Tokyo\n---\n`);
+
+    const list = getTool(buildPeopleTools({ includePrivate: true, dirs }), "list_people");
+    const listed = JSON.parse((await list.handler({}, {})).content[0].text) as Array<{
+      name: string; timezone?: string; timezone_invalid?: string;
+    }>;
+    const byName = Object.fromEntries(listed.map((p) => [p.name, p]));
+
+    expect(byName["Alice Example"].timezone).toBeUndefined();
+    expect(byName["Alice Example"].timezone_invalid).toBe("Not/AZone");
+    expect(byName["Bob Example"].timezone).toBeUndefined();
+    expect(byName["Bob Example"].timezone_invalid).toBe("Etc/GMT+8");
+    expect(byName["Carol Example"].timezone).toBe("Asia/Tokyo");
+    expect(byName["Carol Example"].timezone_invalid).toBeUndefined();
+  });
+
   it("upsert_person reports an invalid timezone as a tool error, not a crash", async () => {
     const upsert = getTool(buildPeopleTools({ includePrivate: true, dirs }), "upsert_person");
     const result = await upsert.handler(

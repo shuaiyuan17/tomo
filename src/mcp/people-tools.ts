@@ -1,6 +1,6 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { loadPeople, upsertPerson, type PeopleDirs } from "../people.js";
+import { loadPeople, personTimeZone, upsertPerson, type PeopleDirs, type PersonRecord } from "../people.js";
 
 export interface PeopleToolDeps {
   /**
@@ -20,6 +20,25 @@ export interface PeopleToolDeps {
 const NOTES_EXCERPT_CHARS = 500;
 
 /**
+ * The timezone fields of a tool payload, VALIDATED on the way out.
+ *
+ * Every other surface (participants block, roster, message envelope) renders
+ * through the validator, so a hand-edited `timezone: Not/AZone` simply does
+ * not appear. Handing the raw field back here would have made the tools the
+ * one place a value the harness refuses to use still reaches the model — and
+ * it would read as authoritative.
+ *
+ * An unusable value is reported rather than hidden: `timezone_invalid` names
+ * it explicitly, because the model is exactly who can fix the record, and a
+ * field that silently vanished would invite writing it again.
+ */
+function timezoneFields(person: PersonRecord): Record<string, string> {
+  if (!person.timezone) return {};
+  const valid = personTimeZone(person);
+  return valid ? { timezone: valid } : { timezone_invalid: person.timezone };
+}
+
+/**
  * MCP tools over the people registry (see src/people.ts). The registry is
  * plain markdown the agent could edit directly — these tools exist so routine
  * updates ("kw is Kevin's nickname") keep the frontmatter well-formed and are
@@ -33,7 +52,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
     tool(
       "list_people",
       [
-        "List the people registry: everyone recorded in memory/people/ with their canonical name, aliases/nicknames, bound channel handles, time zone (when set), and a notes excerpt.",
+        "List the people registry: everyone recorded in memory/people/ with their canonical name, aliases/nicknames, bound channel handles, time zone (when set), and a notes excerpt. A record whose stored time zone is not a usable IANA identifier reports it as `timezone_invalid` — the harness ignores such a value everywhere else, so fix it with upsert_person.",
         "",
         "Use it before upsert_person (to check whether a person already exists under another name) and whenever you need to recall who a nickname refers to beyond what the system prompt roster shows.",
       ].join("\n"),
@@ -44,7 +63,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
           name: p.name,
           aliases: p.aliases,
           handles: p.handles,
-          ...(p.timezone ? { timezone: p.timezone } : {}),
+          ...timezoneFields(p),
           ...(p.isPrivate ? { private: true } : {}),
           file: p.filePath,
           notes: p.notes.length > NOTES_EXCERPT_CHARS
@@ -91,7 +110,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
           "iMessage handle (phone or email) to bind. Pass an empty string to clear the binding.",
         ),
         timezone: z.string().max(100).optional().describe(
-          "IANA time zone identifier for where this person is, e.g. \"Asia/Tokyo\" or \"America/New_York\". Pass an empty string to clear it. Fixed offsets like \"+09:00\" are rejected — they ignore daylight saving.",
+          "IANA region identifier for where this person is, e.g. \"Asia/Tokyo\" or \"America/New_York\" — always Continent/City. Pass an empty string to clear it. Fixed offsets (\"+09:00\"), the Etc/ zones (\"Etc/GMT+8\", \"Etc/UTC\") and the legacy abbreviations (\"EST\", \"UTC\", \"EST5EDT\") are rejected: they carry no daylight-saving rules, so they read an hour wrong for half the year.",
         ),
         notes: z.string().max(20000).optional().describe(
           "Freeform notes body — REPLACES the existing notes entirely, so include anything worth keeping from the old notes (see list_people first).",
@@ -126,7 +145,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
             name: record.name,
             aliases: record.aliases,
             handles: record.handles,
-            ...(record.timezone ? { timezone: record.timezone } : {}),
+            ...timezoneFields(record),
             ...(record.isPrivate ? { private: true } : {}),
             file: record.filePath,
           };

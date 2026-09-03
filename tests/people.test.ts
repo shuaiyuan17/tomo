@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   annotateSenderName,
   autoBindHandle,
+  createPeopleSnapshot,
   findPersonByDisplayName,
   findPersonByHandle,
   findPersonByName,
@@ -348,6 +349,55 @@ describe("people store", () => {
   });
 
   // -------------------------------------------------------------------------
+  // The request-scoped snapshot: one read shared by every consumer handling
+  // one inbound message, with the narrower scope derived rather than re-read.
+  // -------------------------------------------------------------------------
+  describe("createPeopleSnapshot", () => {
+    it("reads nothing until it is asked for records", () => {
+      // The public directory does not even exist yet; creating a snapshot must
+      // not care, because a message with no lookup to make should cost nothing.
+      const snapshot = createPeopleSnapshot({
+        publicDir: join(TEST_DIR, "never-created"),
+        privateDir: join(TEST_DIR, "never-created-private"),
+      });
+      expect(snapshot).toBeDefined();
+      expect(snapshot.scoped(false)).toEqual([]);
+    });
+
+    it("returns the same records loadPeople would, per scope", () => {
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Example\ntelegram: 7001\n---\n`);
+      writePerson(dirs.privateDir, "carol.md", `---\nname: Carol Example\ntelegram: 7002\n---\n`);
+      const snapshot = createPeopleSnapshot(dirs);
+
+      expect(snapshot.scoped(false).map((p) => p.name)).toEqual(
+        loadPeople({ includePrivate: false, dirs }).map((p) => p.name),
+      );
+      expect(snapshot.scoped(true).map((p) => p.name).sort()).toEqual(
+        loadPeople({ includePrivate: true, dirs }).map((p) => p.name).sort(),
+      );
+      // The narrow scope is a filter of the wide one, not a second read, and
+      // it must still exclude private records.
+      expect(snapshot.scoped(false).map((p) => p.name)).toEqual(["Alice Example"]);
+    });
+
+    it("serves later calls from the first read", () => {
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Example\n---\n`);
+      const snapshot = createPeopleSnapshot(dirs);
+      expect(snapshot.scoped(false).map((p) => p.name)).toEqual(["Alice Example"]);
+
+      // A write landing after the snapshot was taken is deliberately NOT
+      // visible to it: the snapshot's life is one message, and the next
+      // message takes a fresh one. This is what keeps it a scope, not a cache
+      // with invalidation to get wrong.
+      writePerson(dirs.publicDir, "bob.md", `---\nname: Bob Example\n---\n`);
+      expect(snapshot.scoped(false).map((p) => p.name)).toEqual(["Alice Example"]);
+      expect(createPeopleSnapshot(dirs).scoped(false).map((p) => p.name)).toEqual([
+        "Alice Example", "Bob Example",
+      ]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Optional `timezone` frontmatter. Everything the system prompt shows is the
   // STATIC identifier — no clock reading, no numeric offset — because that
   // block is prompt-cached; the live reading rides the message envelope
@@ -392,12 +442,15 @@ describe("people store", () => {
       expect(readFileSync(cleared.filePath, "utf-8")).not.toContain("timezone:");
     });
 
-    it("refuses an invalid identifier or a fixed offset instead of storing it", () => {
-      expect(() => upsertPerson({ name: "Alice Example", timezone: "Not/AZone" }, { includePrivate: true, dirs }))
-        .toThrow(/not a valid IANA time zone/);
-      // A fixed offset would ignore daylight saving for half the year.
-      expect(() => upsertPerson({ name: "Alice Example", timezone: "+09:00" }, { includePrivate: true, dirs }))
-        .toThrow(/not a valid IANA time zone/);
+    it("refuses anything that is not a region identifier instead of storing it", () => {
+      // Every one of these is accepted by Intl and every one of them behaves
+      // like a stored offset — the failure the feature exists to avoid.
+      for (const bad of ["Not/AZone", "+09:00", "EST", "EST5EDT", "Etc/GMT+8", "Etc/UTC", "UTC"]) {
+        expect(
+          () => upsertPerson({ name: "Alice Example", timezone: bad }, { includePrivate: true, dirs }),
+          `${bad} should be refused`,
+        ).toThrow(/not a valid IANA time zone/);
+      }
     });
 
     it("leaves the rest of the record untouched when the timezone is rejected", () => {

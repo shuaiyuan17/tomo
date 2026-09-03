@@ -13,7 +13,16 @@ import {
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { IdentityRouter, type SessionResolution } from "./router.js";
-import { annotateSenderName, autoBindHandle, loadPeople, renderParticipantLabels, resolveSenderTimeZone } from "./people.js";
+import {
+  annotateSenderName,
+  autoBindHandle,
+  createPeopleSnapshot,
+  findPersonByHandle,
+  loadPeople,
+  renderParticipantLabels,
+  resolveSenderTimeZone,
+  type PeopleSnapshot,
+} from "./people.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
@@ -1201,12 +1210,16 @@ export class Agent {
     const key = resolution.sessionKey;
     const destination = this.resolveReplyDestination(resolution, channel, message.chatId, isGroup);
 
-    const textForAgent = this.formatGroupText(channel, message, key);
+    // ONE registry read for this message, shared by every consumer below
+    // (sender annotation, handle auto-binding, the stamp's sender clock).
+    // Lazy, so a message that needs no lookup still reads nothing.
+    const people = createPeopleSnapshot();
+    const textForAgent = this.formatGroupText(channel, message, key, people);
 
     if (isGroup) {
       // Track group metadata under the raw group key even while summoned, so
       // the group's own session entry stays fresh for when it takes back over.
-      this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId);
+      this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId, people);
     }
     this.recordLatestInboundMessage(key, channel, message);
 
@@ -1251,7 +1264,7 @@ export class Agent {
       key,
       promptText,
       sourceChannelName: channel.name,
-      senderTimeZone: this.senderTimeZone(channel, message),
+      senderTimeZone: this.senderTimeZone(channel, message, people),
       replyChannel,
       // Reply-threading only makes sense when the reply lands in the chat the
       // message came from — not for summoned groups (reply goes to the DM).
@@ -1336,10 +1349,14 @@ export class Agent {
     const key = resolution.sessionKey;
     const destination = this.resolveReplyDestination(resolution, lastChannel, lastMessage.chatId, isGroup);
 
+    // ONE registry read for the WHOLE batch — shared by every item's
+    // transcript line, its prompt line, and the batch's sender clock below.
+    const people = createPeopleSnapshot();
+
     for (const { channel, message } of items) {
-      if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId);
+      if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId, people);
       this.recordLatestInboundMessage(key, channel, message);
-      const transcriptText = this.formatGroupText(channel, message, key);
+      const transcriptText = this.formatGroupText(channel, message, key, people);
       this.sessions.append(key, {
         role: "user",
         content: transcriptText,
@@ -1368,7 +1385,7 @@ export class Agent {
     // an un-normalised one would slip past an indent keyed only on "\n". This
     // is prompt framing only — the transcript keeps the message verbatim.
     const numbered = items.map((it, i) => {
-      const text = this.formatGroupText(it.channel, it.message, key);
+      const text = this.formatGroupText(it.channel, it.message, key, people);
       return `${i + 1}. ${text.replace(/\r\n|[\n\r\u2028\u2029]/g, "\n   ")}`;
     }).join("\n");
     const subject = isGroup
@@ -1392,7 +1409,7 @@ export class Agent {
     // when every message in it agrees — otherwise the reading would be
     // attributed to messages it does not describe. Disagreement (including one
     // sender with a time zone and one without) drops the segment entirely.
-    const senderZones = new Set(items.map((it) => this.senderTimeZone(it.channel, it.message)));
+    const senderZones = new Set(items.map((it) => this.senderTimeZone(it.channel, it.message, people)));
     const senderTimeZone = senderZones.size === 1 ? [...senderZones][0] : undefined;
 
     await this.runUserTurn({
@@ -1438,15 +1455,19 @@ export class Agent {
    * audience the message came from. Reply routing is covered by the per-turn
    * summonReminder, which is appended to the prompt but kept out of transcripts.
    */
-  private formatGroupText(channel: Channel, message: IncomingMessage, sessionKey: string): string {
+  private formatGroupText(
+    channel: Channel,
+    message: IncomingMessage,
+    sessionKey: string,
+    people: PeopleSnapshot,
+  ): string {
     if (!message.isGroup) return message.text;
     // Resolve the sender against the people registry so every group line
-    // carries the identity join inline: `kw 🚀 (Kevin Wang): ...`. Public
+    // carries the identity join inline: `ali ✨ (Alice Example): ...`. Public
     // records only, even when a summon routes this line into a dm: session —
     // the reply audience is still the group, and a harness-stitched private
     // canonical name would sit right next to the content being answered.
-    const people = loadPeople({ includePrivate: false });
-    const sender = annotateSenderName(people, channel.name, message.senderName, message.senderId);
+    const sender = annotateSenderName(people.scoped(false), channel.name, message.senderName, message.senderId);
     const prefixed = `${sender}: ${message.text}`;
     if (!isDmSessionKey(sessionKey)) return prefixed;
     const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
@@ -1465,11 +1486,10 @@ export class Agent {
    * Never throws: a registry that cannot be read costs the segment, not the
    * message.
    */
-  private senderTimeZone(channel: Channel, message: IncomingMessage): string | undefined {
+  private senderTimeZone(channel: Channel, message: IncomingMessage, people: PeopleSnapshot): string | undefined {
     try {
       const isGroup = message.isGroup ?? false;
-      const people = loadPeople({ includePrivate: !isGroup });
-      return resolveSenderTimeZone(people, channel.name, message.senderName, message.senderId);
+      return resolveSenderTimeZone(people.scoped(!isGroup), channel.name, message.senderName, message.senderId);
     } catch (err) {
       log.warn({ err, channel: channel.name }, "Could not resolve the sender's time zone");
       return undefined;
@@ -1480,14 +1500,26 @@ export class Agent {
    *  (passive listen, NO_REPLY guidance, participant snapshot) are now part of
    *  the system prompt — see SessionContext.group in sdkOptions — so they
    *  survive compaction. This stays as pure persistence; no LLM injection. */
-  private updateGroupContext(key: string, senderName: string, chatTitle?: string, senderId?: string): void {
+  private updateGroupContext(
+    key: string,
+    senderName: string,
+    chatTitle?: string,
+    senderId?: string,
+    people?: PeopleSnapshot,
+  ): void {
     this.sessions.addParticipant(key, senderName, senderId);
     if (chatTitle) this.sessions.setChatTitle(key, chatTitle);
     // Learn stable-id bindings for the people registry as senders appear —
     // no-op unless the display name unambiguously matches an unbound record.
     if (senderId) {
       const parsed = parseRawSessionKey(key);
-      if (parsed) autoBindHandle(parsed.channelName, senderId, senderName);
+      if (!parsed) return;
+      // autoBindHandle has to do its own (private-inclusive) load before it
+      // writes, so skip the call outright once this snapshot already shows the
+      // id bound — the steady state for every sender after their first
+      // message, and what keeps a message to one registry read.
+      if (people && findPersonByHandle(people.scoped(true), parsed.channelName, senderId)) return;
+      autoBindHandle(parsed.channelName, senderId, senderName);
     }
   }
 
@@ -2335,11 +2367,14 @@ export class Agent {
 
   /** Append `<user message>` + the not-processed marker for each item. */
   private recordInboundItems(pending: Map<string, InboundItem[]>): void {
+    // One read for the whole drain: this runs during shutdown, where every
+    // avoidable synchronous file read delays the exit.
+    const people = createPeopleSnapshot();
     for (const [key, items] of pending) {
       for (const { channel, message } of items) {
         this.sessions.append(key, {
           role: "user",
-          content: this.formatGroupText(channel, message, key),
+          content: this.formatGroupText(channel, message, key, people),
           channel: channel.name,
           senderName: message.senderName,
           timestamp: message.timestamp,

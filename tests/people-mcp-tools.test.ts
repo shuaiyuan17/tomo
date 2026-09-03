@@ -117,6 +117,40 @@ describe("people MCP tools", () => {
     expect(result.content[0].text).toContain("DM session");
   });
 
+  it("upsert_person writes, canonicalizes and clears a timezone, and list_people shows it", async () => {
+    const tools = buildPeopleTools({ includePrivate: true, dirs });
+    const upsert = getTool(tools, "upsert_person");
+    const list = getTool(tools, "list_people");
+
+    const created = await upsert.handler(
+      { name: "Alice Example", replace_aliases: false, timezone: "asia/tokyo" },
+      {},
+    );
+    expect(created.isError).toBeUndefined();
+    expect(created.content[0].text).toContain("\"timezone\": \"Asia/Tokyo\"");
+
+    const listed = JSON.parse((await list.handler({}, {})).content[0].text) as Array<{ name: string; timezone?: string }>;
+    expect(listed.find((p) => p.name === "Alice Example")?.timezone).toBe("Asia/Tokyo");
+
+    const cleared = await upsert.handler(
+      { name: "Alice Example", replace_aliases: false, timezone: "" },
+      {},
+    );
+    expect(cleared.content[0].text).not.toContain("timezone");
+    const relisted = JSON.parse((await list.handler({}, {})).content[0].text) as Array<{ timezone?: string }>;
+    expect(relisted[0].timezone).toBeUndefined();
+  });
+
+  it("upsert_person reports an invalid timezone as a tool error, not a crash", async () => {
+    const upsert = getTool(buildPeopleTools({ includePrivate: true, dirs }), "upsert_person");
+    const result = await upsert.handler(
+      { name: "Alice Example", replace_aliases: false, timezone: "Not/AZone" },
+      {},
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not a valid IANA time zone");
+  });
+
   it("upsert_person surfaces ambiguity errors instead of guessing", async () => {
     writePerson(dirs.publicDir, "a1.md", `---\nname: Alice Smith\naliases: alice\n---\n`);
     writePerson(dirs.publicDir, "a2.md", `---\nname: Alice Jones\naliases: alice\n---\n`);

@@ -13,7 +13,7 @@ import {
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { IdentityRouter, type SessionResolution } from "./router.js";
-import { annotateSenderName, autoBindHandle, loadPeople, renderParticipantLabels } from "./people.js";
+import { annotateSenderName, autoBindHandle, loadPeople, renderParticipantLabels, resolveSenderTimeZone } from "./people.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
@@ -60,6 +60,9 @@ interface UserTurnRequest {
   key: string;
   promptText: string;
   sourceChannelName: string;
+  /** The sender's IANA time zone for this turn's stamp, when one applies —
+   *  see Agent.senderTimeZone. Undefined for a batch whose senders disagree. */
+  senderTimeZone?: string;
   replyChannel: Channel;
   replyChatId: string;
   replyToMessageId?: string;
@@ -1129,6 +1132,7 @@ export class Agent {
       source: "user",
       prompt: req.promptText,
       stampChannelName: req.sourceChannelName,
+      stampSenderTimeZone: req.senderTimeZone,
       typing: { channel: req.replyChannel, chatId: req.replyChatId, passiveListen: req.passiveListen },
       delivery: {
         kind: "reply",
@@ -1247,6 +1251,7 @@ export class Agent {
       key,
       promptText,
       sourceChannelName: channel.name,
+      senderTimeZone: this.senderTimeZone(channel, message),
       replyChannel,
       // Reply-threading only makes sense when the reply lands in the chat the
       // message came from — not for summoned groups (reply goes to the DM).
@@ -1383,10 +1388,18 @@ export class Agent {
     const allImages = items.flatMap((it) => it.message.images ?? []);
     const allDocuments = items.flatMap((it) => it.message.documents ?? []);
 
+    // ONE stamp covers the whole batch, so a sender clock may only go on it
+    // when every message in it agrees — otherwise the reading would be
+    // attributed to messages it does not describe. Disagreement (including one
+    // sender with a time zone and one without) drops the segment entirely.
+    const senderZones = new Set(items.map((it) => this.senderTimeZone(it.channel, it.message)));
+    const senderTimeZone = senderZones.size === 1 ? [...senderZones][0] : undefined;
+
     await this.runUserTurn({
       key,
       promptText: combined,
       sourceChannelName: lastChannel.name,
+      senderTimeZone,
       replyChannel,
       replyChatId,
       replyToMessageId: isGroup && replyChatId === lastMessage.chatId ? lastMessage.id : undefined,
@@ -1438,6 +1451,29 @@ export class Agent {
     if (!isDmSessionKey(sessionKey)) return prefixed;
     const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
     return `${formatGroupTag(label)} ${prefixed}`;
+  }
+
+  /**
+   * The sender's own time zone for the inbound stamp, or undefined.
+   *
+   * Scope mirrors `formatGroupText`: a GROUP message resolves against PUBLIC
+   * records only — a summon runs the line on the owner's dm: session, but the
+   * message still came from the group, and a private record must not leak a
+   * fact about someone into it. A private (non-group) message may use the full
+   * registry, the same rule `loadPeopleSection` applies to the system prompt.
+   *
+   * Never throws: a registry that cannot be read costs the segment, not the
+   * message.
+   */
+  private senderTimeZone(channel: Channel, message: IncomingMessage): string | undefined {
+    try {
+      const isGroup = message.isGroup ?? false;
+      const people = loadPeople({ includePrivate: !isGroup });
+      return resolveSenderTimeZone(people, channel.name, message.senderName, message.senderId);
+    } catch (err) {
+      log.warn({ err, channel: channel.name }, "Could not resolve the sender's time zone");
+      return undefined;
+    }
   }
 
   /** Track participants and chat title for a group session. The actual rules

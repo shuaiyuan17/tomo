@@ -8,8 +8,10 @@ import {
   loadPeople,
   normalizeHandle,
   parsePersonFile,
+  personTimeZone,
   renderParticipantLabels,
   renderPeopleRoster,
+  resolveSenderTimeZone,
   serializePersonRecord,
   upsertPerson,
   type PeopleDirs,
@@ -342,6 +344,127 @@ describe("people store", () => {
       expect(roster).toEqual(["- Kevin Wang — aka: kw", "- Bob"]);
       expect(roster.join("\n")).not.toContain("secret");
       expect(roster.join("\n")).not.toContain("telegram");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Optional `timezone` frontmatter. Everything the system prompt shows is the
+  // STATIC identifier — no clock reading, no numeric offset — because that
+  // block is prompt-cached; the live reading rides the message envelope
+  // instead (tests/inbound-markers.test.ts).
+  // -------------------------------------------------------------------------
+  describe("timezone", () => {
+    it("parses the timezone and round-trips it with every other field", () => {
+      const source = `---\nname: Alice Example\naliases: ali\ntelegram: 1000\nimessage: +15550000000\ntimezone: Asia/Tokyo\nbirthday: 1990-04-01\n---\n\nSome notes.\n`;
+      const record = parsePersonFile(source, "/tmp/alice.md", false)!;
+      expect(record.timezone).toBe("Asia/Tokyo");
+
+      const reparsed = parsePersonFile(serializePersonRecord(record), "/tmp/alice.md", false)!;
+      expect(reparsed.timezone).toBe("Asia/Tokyo");
+      expect(reparsed.aliases).toEqual(["ali"]);
+      expect(reparsed.handles).toEqual({ telegram: "1000", imessage: "+15550000000" });
+      expect(reparsed.extra).toEqual({ birthday: "1990-04-01" });
+      expect(reparsed.notes).toBe("Some notes.");
+    });
+
+    it("keeps a record with an unusable timezone loadable", () => {
+      const record = parsePersonFile(`---\nname: Bob Example\naliases: bobby\ntimezone: Not/AZone\n---\n`, "/tmp/b.md", false)!;
+      expect(record.name).toBe("Bob Example");
+      expect(record.aliases).toEqual(["bobby"]);
+      // Held verbatim on the record, dropped at every point of use.
+      expect(record.timezone).toBe("Not/AZone");
+      expect(personTimeZone(record)).toBeUndefined();
+    });
+
+    it("writes, canonicalizes, and clears the timezone through upsertPerson", () => {
+      const { record } = upsertPerson(
+        { name: "Alice Example", timezone: "asia/tokyo" },
+        { includePrivate: true, dirs },
+      );
+      expect(record.timezone).toBe("Asia/Tokyo");
+      expect(readFileSync(record.filePath, "utf-8")).toContain("timezone: Asia/Tokyo");
+
+      const cleared = upsertPerson(
+        { name: "Alice Example", timezone: "" },
+        { includePrivate: true, dirs },
+      ).record;
+      expect(cleared.timezone).toBeUndefined();
+      expect(readFileSync(cleared.filePath, "utf-8")).not.toContain("timezone:");
+    });
+
+    it("refuses an invalid identifier or a fixed offset instead of storing it", () => {
+      expect(() => upsertPerson({ name: "Alice Example", timezone: "Not/AZone" }, { includePrivate: true, dirs }))
+        .toThrow(/not a valid IANA time zone/);
+      // A fixed offset would ignore daylight saving for half the year.
+      expect(() => upsertPerson({ name: "Alice Example", timezone: "+09:00" }, { includePrivate: true, dirs }))
+        .toThrow(/not a valid IANA time zone/);
+    });
+
+    it("leaves the rest of the record untouched when the timezone is rejected", () => {
+      upsertPerson({ name: "Alice Example", aliases: ["ali"], notes: "keep me" }, { includePrivate: true, dirs });
+      expect(() => upsertPerson(
+        { name: "Alice Example", aliases: ["second"], timezone: "Not/AZone" },
+        { includePrivate: true, dirs },
+      )).toThrow();
+      const [reloaded] = loadPeople({ includePrivate: true, dirs });
+      expect(reloaded.aliases).toEqual(["ali"]);
+      expect(reloaded.notes).toBe("keep me");
+    });
+
+    it("shows the identifier — never a clock or an offset — in participant labels", () => {
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Example\naliases: ali\ntelegram: 1000\ntimezone: Asia/Tokyo\n---\n`);
+      writePerson(dirs.publicDir, "bob.md", `---\nname: Bob Example\ntelegram: 2000\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      const labels = renderParticipantLabels({
+        channelName: "telegram",
+        participants: [],
+        participantIds: { "1000": ["Alice Example"], "2000": ["Bob Example"] },
+        people,
+      });
+      expect(labels).toEqual(["Alice Example (aka: ali; Asia/Tokyo)", "Bob Example"]);
+      expect(labels.join(" ")).not.toMatch(/\d{2}:\d{2}/);
+    });
+
+    it("omits an unusable timezone from labels and the roster, keeping the person", () => {
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Example\ntimezone: Not/AZone\n---\n`);
+      writePerson(dirs.publicDir, "bob.md", `---\nname: Bob Example\ntimezone: Europe/Berlin\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      expect(renderParticipantLabels({
+        channelName: "telegram",
+        participants: ["Alice Example", "Bob Example"],
+        people,
+      })).toEqual(["Alice Example", "Bob Example (Europe/Berlin)"]);
+      expect(renderPeopleRoster(people)).toEqual([
+        "- Alice Example",
+        "- Bob Example — tz: Europe/Berlin",
+      ]);
+    });
+
+    it("resolves a sender's timezone by handle and by alias", () => {
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Example\naliases: ali\ntelegram: 1000\ntimezone: Asia/Tokyo\n---\n`);
+      writePerson(dirs.publicDir, "bob.md", `---\nname: Bob Example\ntelegram: 2000\n---\n`);
+      const people = loadPeople({ includePrivate: false, dirs });
+      expect(resolveSenderTimeZone(people, "telegram", "whatever they renamed to", "1000")).toBe("Asia/Tokyo");
+      expect(resolveSenderTimeZone(people, "telegram", "ali")).toBe("Asia/Tokyo");
+      // Resolves to a record with no timezone, and to no record at all.
+      expect(resolveSenderTimeZone(people, "telegram", "Bob Example", "2000")).toBeUndefined();
+      expect(resolveSenderTimeZone(people, "telegram", "Stranger", "9999")).toBeUndefined();
+    });
+
+    it("never lets a private record's timezone reach a public-scope lookup", () => {
+      writePerson(dirs.privateDir, "private.md", `---\nname: Carol Example\naliases: carol\ntelegram: 3000\ntimezone: Asia/Tokyo\n---\n`);
+      const groupScope = loadPeople({ includePrivate: false, dirs });
+      expect(resolveSenderTimeZone(groupScope, "telegram", "Carol Example", "3000")).toBeUndefined();
+      expect(renderParticipantLabels({
+        channelName: "telegram",
+        participants: ["Carol Example"],
+        participantIds: { "3000": ["Carol Example"] },
+        people: groupScope,
+      })).toEqual(["Carol Example"]);
+
+      // Same registry, DM scope: the record is there, timezone and all.
+      const dmScope = loadPeople({ includePrivate: true, dirs });
+      expect(resolveSenderTimeZone(dmScope, "telegram", "Carol Example", "3000")).toBe("Asia/Tokyo");
     });
   });
 });

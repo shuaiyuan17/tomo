@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { join, basename, dirname } from "node:path";
 import { defaultRuntimePaths } from "./runtime-paths.js";
 import { log } from "./logger.js";
+import { canonicalTimeZone, validTimeZone } from "./timezone.js";
 
 /**
  * People registry — structured identity records for the humans in the user's
@@ -24,6 +25,13 @@ export interface PersonRecord {
   aliases: string[];
   /** channel name → stable sender id (telegram user id, imessage address). */
   handles: Record<string, string>;
+  /**
+   * IANA identifier for where this person keeps their clock (`Asia/Tokyo`).
+   * Optional, and kept exactly as the file spells it — validation happens at
+   * the point of use (see src/timezone.ts), so one unusable value can never
+   * cost the rest of the record.
+   */
+  timezone?: string;
   /** Unrecognized frontmatter keys, preserved verbatim on rewrite. */
   extra: Record<string, string>;
   /** Freeform notes below the frontmatter. Never injected into group prompts. */
@@ -42,7 +50,7 @@ export interface PeopleDirs {
 /** Channels whose frontmatter key is treated as a handle binding. */
 export const HANDLE_CHANNELS = ["telegram", "imessage"] as const;
 
-const RESERVED_KEYS = new Set(["name", "aliases", ...HANDLE_CHANNELS]);
+const RESERVED_KEYS = new Set(["name", "aliases", "timezone", ...HANDLE_CHANNELS]);
 /** Skip pathological files rather than pulling megabytes into every prompt build. */
 const MAX_PERSON_FILE_BYTES = 64 * 1024;
 const MAX_PEOPLE_FILES = 500;
@@ -113,7 +121,12 @@ export function parsePersonFile(content: string, filePath: string, isPrivate: bo
     const value = m[2];
     if (key === "name") record.name = stripQuotes(value);
     else if (key === "aliases") record.aliases = parseAliases(value);
-    else if ((HANDLE_CHANNELS as readonly string[]).includes(key)) {
+    else if (key === "timezone") {
+      // Stored verbatim; an unusable identifier is dropped where it is
+      // rendered, not here, so the rest of the record still loads.
+      const v = stripQuotes(value);
+      if (v) record.timezone = v;
+    } else if ((HANDLE_CHANNELS as readonly string[]).includes(key)) {
       const v = stripQuotes(value);
       if (v) record.handles[key] = v;
     } else if (value.trim()) record.extra[key] = value.trim();
@@ -130,6 +143,7 @@ export function serializePersonRecord(record: PersonRecord): string {
     const v = record.handles[channel];
     if (v) front.push(`${channel}: ${v}`);
   }
+  if (record.timezone) front.push(`timezone: ${record.timezone}`);
   for (const [key, value] of Object.entries(record.extra)) {
     if (!RESERVED_KEYS.has(key)) front.push(`${key}: ${value}`);
   }
@@ -244,6 +258,33 @@ export function resolveSender(
 }
 
 /**
+ * The time zone a record renders with, or undefined — the one gate every
+ * surface goes through. An unusable identifier is dropped here (logged once,
+ * see src/timezone.ts), so no caller has to think about bad data.
+ */
+export function personTimeZone(person: PersonRecord | undefined): string | undefined {
+  if (!person?.timezone) return undefined;
+  return validTimeZone(person.timezone, { person: person.name, file: person.filePath });
+}
+
+/**
+ * The sender's own time zone for this message, or undefined when they do not
+ * resolve to a record, the record has none, or its value is unusable.
+ *
+ * `people` decides the visibility scope, exactly as it does for
+ * `annotateSenderName`: a group caller passes a public-only list, so a private
+ * record can never contribute a time zone to a group's message envelope.
+ */
+export function resolveSenderTimeZone(
+  people: PersonRecord[],
+  channel: string,
+  senderName: string,
+  senderId?: string,
+): string | undefined {
+  return personTimeZone(resolveSender(people, channel, senderName, senderId));
+}
+
+/**
  * Sender prefix for group transcript lines: the wire display name, annotated
  * with the canonical name when they differ — `kw 🚀 (Kevin Wang)`. Keeps the
  * name the group actually sees first (that's who Tomo should address) while
@@ -280,6 +321,8 @@ export interface UpsertPersonInput {
   replaceAliases?: boolean;
   telegram?: string;
   imessage?: string;
+  /** IANA identifier; the empty string clears it, like the handles above. */
+  timezone?: string;
   /** Replaces the freeform notes body when provided. */
   notes?: string;
   /** Create the record under the private (DM-only) subtree. */
@@ -362,6 +405,22 @@ export function upsertPerson(
   for (const channel of HANDLE_CHANNELS) {
     if (record.handles[channel] === "") delete record.handles[channel];
   }
+  if (input.timezone !== undefined) {
+    const raw = input.timezone.trim();
+    if (!raw) {
+      delete record.timezone;
+    } else {
+      // Rejected rather than stored-and-ignored: the writer is a tool call the
+      // model can correct immediately, and a typo that silently never renders
+      // is the harder failure to notice. Stored canonicalized so the same zone
+      // spelled two ways renders identically.
+      const canonical = canonicalTimeZone(raw);
+      if (!canonical) {
+        throw new Error(`"${raw}" is not a valid IANA time zone identifier (e.g. "Asia/Tokyo", "America/New_York").`);
+      }
+      record.timezone = canonical;
+    }
+  }
   if (input.notes !== undefined) record.notes = input.notes.trim();
 
   savePersonRecord(record);
@@ -434,6 +493,13 @@ export function renderParticipantLabels(opts: {
     if (latest && normalizeName(latest) !== normalizeName(person.name)) {
       details.push(`appears as "${latest}"`);
     }
+    // The IANA NAME ONLY — never a clock reading, and never a numeric offset.
+    // This block is part of the prompt-cached system prompt; anything that
+    // moves with the wall clock (or with a DST transition) would invalidate
+    // the cache. The live reading rides the message envelope instead, which
+    // varies per message anyway (see agent/inbound-markers.ts).
+    const zone = personTimeZone(person);
+    if (zone) details.push(zone);
     return details.length > 0 ? `${person.name} (${details.join("; ")})` : person.name;
   };
 
@@ -463,9 +529,17 @@ export function renderParticipantLabels(opts: {
   return labels;
 }
 
-/** One roster line per person — names and aliases only, no handles or notes. */
+/**
+ * One roster line per person — names, aliases and time zone; no handles, no
+ * notes. Like the participant labels, the time zone appears as its IANA name
+ * only: this goes into the cached system prompt.
+ */
 export function renderPeopleRoster(people: PersonRecord[]): string[] {
-  return people.map((p) =>
-    p.aliases.length > 0 ? `- ${p.name} — aka: ${p.aliases.join(", ")}` : `- ${p.name}`,
-  );
+  return people.map((p) => {
+    const parts = [`- ${p.name}`];
+    if (p.aliases.length > 0) parts.push(`aka: ${p.aliases.join(", ")}`);
+    const zone = personTimeZone(p);
+    if (zone) parts.push(`tz: ${zone}`);
+    return parts.join(" — ");
+  });
 }

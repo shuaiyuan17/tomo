@@ -33,7 +33,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
     tool(
       "list_people",
       [
-        "List the people registry: everyone recorded in memory/people/ with their canonical name, aliases/nicknames, bound channel handles, and a notes excerpt.",
+        "List the people registry: everyone recorded in memory/people/ with their canonical name, aliases/nicknames, bound channel handles, time zone (when set), and a notes excerpt.",
         "",
         "Use it before upsert_person (to check whether a person already exists under another name) and whenever you need to recall who a nickname refers to beyond what the system prompt roster shows.",
       ].join("\n"),
@@ -44,6 +44,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
           name: p.name,
           aliases: p.aliases,
           handles: p.handles,
+          ...(p.timezone ? { timezone: p.timezone } : {}),
           ...(p.isPrivate ? { private: true } : {}),
           file: p.filePath,
           notes: p.notes.length > NOTES_EXCERPT_CHARS
@@ -67,6 +68,8 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
         "Use whenever you learn identity facts: a new nickname (\"kw is Kevin\"), a person's real name, or notes worth keeping about them. Aliases are merged into the existing list unless `replace_aliases` is set; `notes` replaces the record's freeform body when provided.",
         "",
         "Channel handles (telegram user id, imessage address) are bound automatically by the harness when a matching sender appears in a group chat — but only for public records. Pass `telegram`/`imessage` to correct a wrong binding or to bind a private record's handles (auto-binding never touches private records).",
+        "",
+        "Set `timezone` when you learn where someone keeps their clock (they moved, they travel, they mention a local time). It makes their local time show up on their incoming messages.",
       ].join("\n"),
       {
         name: z.string().min(1).max(200).describe(
@@ -87,6 +90,9 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
         imessage: z.string().max(200).optional().describe(
           "iMessage handle (phone or email) to bind. Pass an empty string to clear the binding.",
         ),
+        timezone: z.string().max(100).optional().describe(
+          "IANA time zone identifier for where this person is, e.g. \"Asia/Tokyo\" or \"America/New_York\". Pass an empty string to clear it. Fixed offsets like \"+09:00\" are rejected — they ignore daylight saving.",
+        ),
         notes: z.string().max(20000).optional().describe(
           "Freeform notes body — REPLACES the existing notes entirely, so include anything worth keeping from the old notes (see list_people first).",
         ),
@@ -94,7 +100,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
           "true moves/creates the record under memory/private/people/ (DM-only; invisible to group sessions). Only usable from DM sessions.",
         ),
       },
-      async ({ name, match, aliases, replace_aliases, telegram, imessage, notes, private: isPrivate }) => {
+      async ({ name, match, aliases, replace_aliases, telegram, imessage, timezone, notes, private: isPrivate }) => {
         if (isPrivate !== undefined && !includePrivate()) {
           return {
             content: [{ type: "text" as const, text: "upsert_person failed: the `private` flag can only be used from a DM session." }],
@@ -110,6 +116,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
               replaceAliases: replace_aliases,
               telegram,
               imessage,
+              timezone,
               notes,
               isPrivate,
             },
@@ -119,6 +126,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
             name: record.name,
             aliases: record.aliases,
             handles: record.handles,
+            ...(record.timezone ? { timezone: record.timezone } : {}),
             ...(record.isPrivate ? { private: true } : {}),
             file: record.filePath,
           };

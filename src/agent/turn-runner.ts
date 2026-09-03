@@ -162,6 +162,10 @@ export interface TurnSpec {
   /** Channel label for the timestamp stamp. When undefined the prompt is sent
    *  unstamped (continuity turns). */
   stampChannelName?: string;
+  /** The sender's IANA time zone, when they resolve to a person record that
+   *  has one. Adds their local clock to the stamp; ignored when the prompt is
+   *  unstamped, and dropped by the formatter when it matches the host's. */
+  stampSenderTimeZone?: string;
   /** Typing indicator for the turn; absent → no indicator. */
   typing?: { channel: Channel; chatId: string; passiveListen?: boolean };
   delivery: TurnDelivery;
@@ -208,14 +212,16 @@ export function originForSource(source: TurnSource): SDKMessageOrigin {
 }
 
 /**
- * Prefix `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]` onto a prompt.
+ * Prefix `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]` onto a prompt, plus a
+ * `· sender <mm/dd> <hh:mm> <tz>` segment when the sender keeps a different
+ * clock from the host (see `formatInboundStamp` for when it is omitted).
  *
  * The stamp itself is built by `formatInboundStamp` — one formatter shared
  * with the outlet-side guard that spots the model FABRICATING this shape (see
  * src/agent/inbound-markers.ts), so the two cannot drift apart.
  */
-export function injectTimestamp(text: string, channelName?: string): string {
-  return `${formatInboundStamp(channelName)} ${text}`;
+export function injectTimestamp(text: string, channelName?: string, senderTimeZone?: string): string {
+  return `${formatInboundStamp(channelName, new Date(), senderTimeZone)} ${text}`;
 }
 
 /**
@@ -245,7 +251,7 @@ export class TurnRunner {
     try {
       const prompt = this.deps.drainPendingNotes(spec.key)
         + (spec.stampChannelName !== undefined
-          ? injectTimestamp(spec.prompt, spec.stampChannelName)
+          ? injectTimestamp(spec.prompt, spec.stampChannelName, spec.stampSenderTimeZone)
           : spec.prompt);
 
       ok = await this.runDelivery(spec, prompt, stopTyping);

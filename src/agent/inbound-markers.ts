@@ -63,6 +63,7 @@
 
 import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
+import { formatZonedClock, validTimeZone } from "../timezone.js";
 import {
   LEGACY_BRACKETED_SYSTEM_PREFIX,
   LEGACY_SYSTEM_PREFIX,
@@ -71,6 +72,9 @@ import {
 
 /** Separates the channel name from the timestamp in an inbound stamp. */
 export const STAMP_SEPARATOR = " · ";
+
+/** Introduces the sender's own wall clock inside an inbound stamp. */
+export const SENDER_SEGMENT_LABEL = "sender";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 
@@ -83,16 +87,48 @@ function escapeRe(literal: string): string {
  * `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]`. The channel segment is
  * omitted when the caller has no channel to name.
  *
+ * With `senderTimeZone`, the sender's own wall clock is appended as a second
+ * segment — `[imessage · Wed 09/02 20:50 PDT · sender 09/03 11:50 GMT+8]`.
+ * This line is the right home for a live reading precisely because it already
+ * changes on every message: the system prompt's participants block is
+ * prompt-cached and carries the static IANA name only (see people.ts).
+ *
+ * The segment is dropped whenever it would be noise or wrong:
+ * - no time zone on the sender's record (or none resolved) — nothing to add;
+ * - an unusable identifier — validated by the caller, ignored here if it slips
+ *   through, since `formatZonedClock` would otherwise throw on the message path;
+ * - a reading identical to the host's — same zone, an alias of it, or simply
+ *   the same offset right now, all of which would repeat the first segment.
+ *
  * Single source of truth — turn-runner's injectTimestamp is a thin wrapper.
  */
-export function formatInboundStamp(channelName?: string, now: Date = new Date()): string {
+export function formatInboundStamp(channelName?: string, now: Date = new Date(), senderTimeZone?: string): string {
   const weekday = now.toLocaleDateString("en-US", { weekday: "short" });
   const mm = String(now.getMonth() + 1).padStart(2, "0");
   const dd = String(now.getDate()).padStart(2, "0");
   const time = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
   const tz = now.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
   const prefix = channelName ? `${channelName}${STAMP_SEPARATOR}` : "";
-  return `[${prefix}${weekday} ${mm}/${dd} ${time} ${tz}]`;
+  return `[${prefix}${weekday} ${mm}/${dd} ${time} ${tz}${senderSegment(now, senderTimeZone)}]`;
+}
+
+/** `" · sender 09/03 11:50 GMT+8"`, or "" when there is nothing worth adding. */
+function senderSegment(now: Date, senderTimeZone?: string): string {
+  const zone = validTimeZone(senderTimeZone);
+  if (!zone) return "";
+  try {
+    const senderClock = formatZonedClock(now, zone);
+    // Compare RENDERINGS, not names: `US/Pacific` on a host in
+    // `America/Los_Angeles` is the same clock under a different spelling, and
+    // two distinct zones that agree right now read identically anyway.
+    if (senderClock === formatZonedClock(now)) return "";
+    return `${STAMP_SEPARATOR}${SENDER_SEGMENT_LABEL} ${senderClock}`;
+  } catch (err) {
+    // Belt and braces: this runs on the message path, and no formatting
+    // failure is worth losing a message over.
+    log.warn({ err, timezone: senderTimeZone }, "Failed to render the sender's local time; omitting it");
+    return "";
+  }
 }
 
 /**
@@ -122,17 +158,25 @@ export function formatGroupTag(label?: string): string {
  */
 const LINE_START = "^[\\s\\u00AD\\u200B-\\u200F\\u2060]*";
 
+/** `08:25 PDT` / `08:25 GMT+8` — a clock reading with its zone. The zone
+ *  tolerates both abbreviations (`PDT`, `UTC`) and the offset form ICU falls
+ *  back to for zones without an English abbreviation (`GMT+8`, `GMT+5:30`). */
+const CLOCK_RE = `\\d{1,2}:\\d{2}(?::\\d{2})? [A-Z]{2,5}(?:[+-]\\d{1,2}(?::\\d{2})?)?`;
+
 /**
- * `[imessage · Sat 08/29 08:25 PDT]` / `[Sat 08/29 08:25 PDT]`.
+ * `[imessage · Sat 08/29 08:25 PDT]` / `[Sat 08/29 08:25 PDT]`, optionally
+ * with the sender's own clock: `[imessage · Sat 08/29 08:25 PDT · sender
+ * 08/29 23:25 GMT+8]`.
  *
  * The channel segment is optional (injectTimestamp omits it without a channel
- * name) and the timezone tolerates both abbreviations (`PDT`, `UTC`) and the
- * offset form Node falls back to on some hosts (`GMT+8`).
+ * name); the sender segment is optional too (only senders with a time zone on
+ * their record get one). Both stay part of ONE shape, so a fabricated stamp is
+ * still caught whichever form the model imitates.
  */
 const STAMP_LINE_RE = new RegExp(
   `${LINE_START}\\[(?:[A-Za-z][A-Za-z0-9_-]*${escapeRe(STAMP_SEPARATOR)})?`
-  + `(?:${WEEKDAYS.join("|")}) \\d{2}/\\d{2} \\d{1,2}:\\d{2}(?::\\d{2})? `
-  + `[A-Z]{2,5}(?:[+-]\\d{1,2}(?::\\d{2})?)?\\]`,
+  + `(?:${WEEKDAYS.join("|")}) \\d{2}/\\d{2} ${CLOCK_RE}`
+  + `(?:${escapeRe(STAMP_SEPARATOR)}${escapeRe(SENDER_SEGMENT_LABEL)} \\d{2}/\\d{2} ${CLOCK_RE})?\\]`,
 );
 
 /** `[group "Family"] kw: …` / `[group] kw: …` — see formatGroupTag. */

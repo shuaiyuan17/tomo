@@ -16,7 +16,7 @@
  *      injectTimestamp's stamp or formatGroupText's tag ever changes shape,
  *      these fail.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -68,6 +68,15 @@ describe("detectFabricatedMarkers", () => {
 
     it("flags a hand-written stamp with a GMT-offset timezone", () => {
       expect(shapes("[imessage · Sat 08/29 08:25 GMT+8] hi")).toEqual(["stamp"]);
+    });
+
+    it("flags a stamp that carries the sender's local clock", () => {
+      // The producer's own output again, this time for a sender whose record
+      // has a time zone. A detector that only knew the shorter form would let
+      // the model fabricate this one freely.
+      expect(shapes(`${formatInboundStamp("imessage", new Date(), "Asia/Tokyo")} hi`)).toEqual(["stamp"]);
+      expect(shapes(injectTimestamp("hey", "imessage", "Asia/Tokyo"))).toEqual(["stamp"]);
+      expect(shapes("[imessage · Sat 08/29 08:25 PDT · sender 08/29 23:25 GMT+8] hi")).toEqual(["stamp"]);
     });
   });
 
@@ -453,5 +462,62 @@ describe("recordFabricatedMarkers", () => {
       expect.objectContaining({ type: "fabricated-marker", shape: "legacy-system" }),
     ]);
     expect((events[0] as { sessionKey?: string }).sessionKey).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The stamp itself, with the sender's local clock.
+//
+// The host zone is pinned so the expected bytes can be written out exactly
+// rather than derived from the code under test — assertions that recompute the
+// format would pass for any behaviour at all. TZ is restored afterwards.
+// ---------------------------------------------------------------------------
+describe("formatInboundStamp sender segment", () => {
+  const HOST_TZ = "America/Los_Angeles";
+  const originalTz = process.env.TZ;
+  /** 2026-09-03T03:50Z — 09/02 20:50 PDT for the host, next day in Asia. */
+  const NOW = new Date(Date.UTC(2026, 8, 3, 3, 50));
+
+  beforeEach(() => {
+    process.env.TZ = HOST_TZ;
+  });
+
+  afterAll(() => {
+    if (originalTz === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTz;
+  });
+
+  it("appends the sender's local clock when their record has a time zone", () => {
+    expect(formatInboundStamp("imessage", NOW, "Asia/Tokyo"))
+      .toBe("[imessage · Wed 09/02 20:50 PDT · sender 09/03 12:50 GMT+9]");
+  });
+
+  it("is byte-identical to the old stamp when the sender has no time zone", () => {
+    const unchanged = "[imessage · Wed 09/02 20:50 PDT]";
+    expect(formatInboundStamp("imessage", NOW)).toBe(unchanged);
+    expect(formatInboundStamp("imessage", NOW, undefined)).toBe(unchanged);
+    expect(formatInboundStamp("imessage", NOW, "")).toBe(unchanged);
+    expect(formatInboundStamp(undefined, NOW)).toBe("[Wed 09/02 20:50 PDT]");
+  });
+
+  it("omits the segment for an unusable time zone rather than throwing", () => {
+    expect(formatInboundStamp("imessage", NOW, "Not/AZone")).toBe("[imessage · Wed 09/02 20:50 PDT]");
+    expect(formatInboundStamp("imessage", NOW, "+09:00")).toBe("[imessage · Wed 09/02 20:50 PDT]");
+  });
+
+  it("omits the segment when the sender's clock reads the same as the host's", () => {
+    // The zone itself, an alias of it, and a different zone that happens to
+    // agree right now — all pure noise next to the first segment.
+    expect(formatInboundStamp("imessage", NOW, HOST_TZ)).toBe("[imessage · Wed 09/02 20:50 PDT]");
+    expect(formatInboundStamp("imessage", NOW, "US/Pacific")).toBe("[imessage · Wed 09/02 20:50 PDT]");
+    expect(formatInboundStamp("imessage", NOW, "America/Tijuana")).toBe("[imessage · Wed 09/02 20:50 PDT]");
+  });
+
+  it("follows daylight saving on both sides of the stamp", () => {
+    // Winter: the host is on PST, and the gap to a zone that does not observe
+    // daylight saving widens by an hour.
+    const winter = new Date(Date.UTC(2026, 0, 15, 4, 50));
+    expect(formatInboundStamp("telegram", winter, "Asia/Tokyo"))
+      .toBe("[telegram · Wed 01/14 20:50 PST · sender 01/15 13:50 GMT+9]");
   });
 });

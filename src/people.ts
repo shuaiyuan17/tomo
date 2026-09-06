@@ -151,6 +151,39 @@ export function serializePersonRecord(record: PersonRecord): string {
   return `---\n${front.join("\n")}\n---\n${record.notes ? `\n${record.notes}\n` : ""}`;
 }
 
+/**
+ * The reason each path was last warned about, so a broken person file costs
+ * one log line rather than one per message.
+ *
+ * `loadPeople` runs on the INBOUND MESSAGE PATH — several times per message
+ * before the request-scoped snapshot, once per message after it — and a file
+ * that is malformed is malformed on every one of those loads. One
+ * hand-edited or half-written record therefore wrote the same warning
+ * forever, at a rate set by how busy the chat was, and drowned the log it was
+ * trying to be visible in. The warning is worth exactly one line: it names a
+ * file for a human to repair, and repeating it adds nothing.
+ *
+ * KEYED BY REASON, AND CLEARED ON A GOOD LOAD. A file that goes from oversized
+ * to unparseable is a different fact and is said once too, and a path that
+ * later parses forgets its warning — so a record repaired and then broken
+ * again is reported again instead of being silently ignored for the life of
+ * the daemon.
+ */
+const warnedPeoplePaths = new Map<string, string>();
+
+/** Emit `warn` for `path` unless the same reason was already reported for it.
+ *  See {@link warnedPeoplePaths}. */
+function warnOncePerPath(path: string, reason: string, emit: () => void): void {
+  if (warnedPeoplePaths.get(path) === reason) return;
+  // Bounded by the number of distinct paths seen. `MAX_PEOPLE_FILES` records
+  // plus their directories is the working set; anything past a generous
+  // multiple of it means paths are churning (renames, a scratch directory),
+  // and starting over costs one repeated warning rather than unbounded memory.
+  if (warnedPeoplePaths.size > MAX_PEOPLE_FILES * 4) warnedPeoplePaths.clear();
+  warnedPeoplePaths.set(path, reason);
+  emit();
+}
+
 function loadDir(dir: string, isPrivate: boolean, budget: { remaining: number }): PersonRecord[] {
   if (!existsSync(dir)) return [];
   const records: PersonRecord[] = [];
@@ -158,31 +191,36 @@ function loadDir(dir: string, isPrivate: boolean, budget: { remaining: number })
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
   } catch (err) {
-    log.warn({ err, dir }, "Failed to read people directory");
+    warnOncePerPath(dir, "unreadable-dir", () => log.warn({ err, dir }, "Failed to read people directory"));
     return [];
   }
+  warnedPeoplePaths.delete(dir);
   for (const file of files) {
     if (budget.remaining <= 0) break;
     const filePath = join(dir, file);
     try {
       if (statSync(filePath).size > MAX_PERSON_FILE_BYTES) {
-        log.warn({ filePath }, "Skipping oversized person file");
+        warnOncePerPath(filePath, "oversized", () => log.warn({ filePath }, "Skipping oversized person file"));
         continue;
       }
       const parsed = parsePersonFile(readFileSync(filePath, "utf-8"), filePath, isPrivate);
       if (parsed) {
         records.push(parsed);
         budget.remaining--;
+        warnedPeoplePaths.delete(filePath);
       } else {
         // A `.md` file in the people directory with no usable `name:` is
         // either hand-written wrong or TORN — the shape a half-finished write
         // leaves behind. Either way the person stops being recognised, and
         // before this the only symptom was that they quietly stopped being
-        // recognised. Say so, once per load, naming the file to repair.
-        log.warn({ filePath }, "Person file has no usable frontmatter; skipping");
+        // recognised. Say so, ONCE PER PROCESS, naming the file to repair:
+        // this runs on every inbound message, and the second copy of the line
+        // tells a reader nothing the first did not.
+        warnOncePerPath(filePath, "no-frontmatter", () =>
+          log.warn({ filePath }, "Person file has no usable frontmatter; skipping"));
       }
     } catch (err) {
-      log.warn({ err, filePath }, "Failed to read person file");
+      warnOncePerPath(filePath, "unreadable", () => log.warn({ err, filePath }, "Failed to read person file"));
     }
   }
   return records;

@@ -1741,4 +1741,59 @@ describe("McpOAuthManager — rejected refreshes", () => {
     const stored = JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.github;
     expect(stored.expiresAt).toBe(clock + 60 * 60 * 1000);
   });
+
+  it("replaces an expiry that is in the future but inside the refresh skew", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    let clock = 1_000_000;
+    // In the future, so the old `previous > now` test kept it — and inside the
+    // 5-minute skew, so `isExpiring` said "refresh me" the moment it was
+    // written back. Each sweep re-posted the refresh token and stored the same
+    // near-expiry reading again, for as many sweeps as the skew window holds.
+    const nearExpiry = clock + 60_000;
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(oauthPath, JSON.stringify({
+      mcpOAuth: {
+        github: {
+          accessToken: "old-access",
+          refreshToken: "refresh-token",
+          tokenType: "Bearer",
+          expiresAt: nearExpiry,
+          clientId: "client-123",
+          tokenEndpoint: "https://auth.example/token",
+          updatedAt: clock - 1_000,
+        },
+      },
+    }));
+
+    let exchanges = 0;
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      now: () => clock,
+      fetchImpl: async () => {
+        exchanges++;
+        return new Response(JSON.stringify({
+          access_token: "fresh-access",
+          token_type: "Bearer",
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    });
+    const servers = {
+      github: {
+        server: { type: "http" as const, url: "https://api.githubcopilot.com/mcp/" },
+        oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "github" },
+      },
+    };
+
+    await expect(manager.refreshServerToken("github", servers)).resolves.toBe("refreshed");
+
+    const stored = JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.github;
+    expect(stored.expiresAt).toBe(clock + 60 * 60 * 1000);
+    // The point of replacing it: the record the sweep reads back is not one it
+    // immediately wants to refresh again.
+    expect(manager.isExpiring(stored)).toBe(false);
+    clock += 60_000;
+    await manager.refreshExpiringTokens(servers);
+    expect(exchanges).toBe(1);
+  });
 });

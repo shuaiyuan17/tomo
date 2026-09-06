@@ -1009,18 +1009,29 @@ function normalizeToken(
  * The expiry to store for a refreshed token.
  *
  * Never erases: an omitted `expires_in` means "the issuer did not say", not
- * "this token is immortal". A stored expiry that is still in the future is
- * kept as the best evidence available. One already in the PAST cannot be kept
- * — the token was just issued, and a stale reading would leave the record
+ * "this token is immortal". A stored expiry that is still usefully in the
+ * future is kept as the best evidence available. One that is not cannot be
+ * kept — the token was just issued, and a stale reading would leave the record
  * permanently inside the refresh skew window, re-refreshed every sweep — so
  * the conservative default TTL stands in. Undefined stays undefined: the
  * issuer has never told us, and inventing an expiry would start refreshing a
  * token that was working.
+ *
+ * "USEFULLY IN THE FUTURE" IS `now + SKEW`, NOT `now`. The cutoff has to be
+ * the one {@link McpOAuthManager.isExpiring} uses, because that is what reads
+ * the value back: an expiry one minute out is in the future and is ALSO
+ * already inside the skew window, so keeping it hands the sweep a record it
+ * immediately judges expiring, refreshes, and stores the same near-expiry
+ * reading onto again. Up to five minutes of 60s sweeps — around five pointless
+ * exchanges against the issuer per refresh, each one a chance to trip a rate
+ * limit — before the value finally aged past `now` and the default took over.
+ * The same test the past-expiry case gets: anything the sweep would call
+ * expiring is replaced rather than carried.
  */
 function carryForwardExpiry(fresh: number | undefined, previous: number | undefined, now: number): number | undefined {
   if (fresh !== undefined) return fresh;
   if (previous === undefined) return undefined;
-  return previous > now ? previous : now + DEFAULT_ACCESS_TOKEN_TTL_MS;
+  return previous > now + TOKEN_REFRESH_SKEW_MS ? previous : now + DEFAULT_ACCESS_TOKEN_TTL_MS;
 }
 
 function supportsHeaders(server: McpServerConfig): server is Extract<McpServerConfig, { type: "http" | "sse" }> {

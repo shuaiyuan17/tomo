@@ -243,6 +243,19 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
     it("denies absolute paths into the memory tree", () => {
       expect(isPrivateMemoryAccess("Bash", { command: "cd /ws/memory" }, ctx)).toBe(true);
     });
+
+    // The token dequoter stripped `"`, `'` and backticks and left the fourth
+    // quoting operator in place. Both commands below were ALLOWED on a barred
+    // turn and both really print the file in bash: `\` quotes the one
+    // character after it, so the shell opens `memory/private/x.md` while the
+    // segment rule was looking at `mem\ory`.
+    it("denies backslash-quoted spellings of the memory segment", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cat mem\\ory/priv\\ate/x.md" }, ctx)).toBe(true);
+    });
+
+    it("denies a backslash-quoted cd into memory followed by a read", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cd mem\\ory && cat priv\\ate/x.md" }, ctx)).toBe(true);
+    });
   });
 
   describe("unknown tools", () => {

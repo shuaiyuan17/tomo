@@ -562,6 +562,9 @@ function grepReachesPrivate(
  *     raw command AND on each token with its quotes stripped, because
  *     adjacent-string concatenation (`cat "mem""ory"/private/x.md`) spells
  *     neither name at a word boundary until the shell glues the halves.
+ *     "Quotes" INCLUDES the backslash, which quotes one character rather than
+ *     a run: `cat mem\ory/priv\ate/x.md` reads the file in real bash and
+ *     spells neither name until the token is dequoted. See {@link bashTokens}.
  *  3. A GLOB whose literal prefix could expand into either name —
  *     `mem*\/priv*`, `memor?/privat?`, `m[e]mory`. A segment whose glob prefix
  *     is a prefix of "memory"/"private" is denied, and the empty prefix (`*`,
@@ -647,11 +650,19 @@ const RECURSIVE_BY_DEFAULT_GREP = /(^|[\s'"`=()|&;></])(rg|ag|ack)(\s|$)/i;
 
 /** Split a command into path-ish tokens: shell operators and whitespace are
  *  separators, and quoting is stripped rather than honoured (a quoted glob is
- *  still a glob to us — we are not modelling when the shell expands it). */
+ *  still a glob to us — we are not modelling when the shell expands it).
+ *
+ *  BACKSLASH IS A QUOTING OPERATOR TOO — and it was the one left in the token.
+ *  `\` quotes the single character that follows it, so `cat mem\ory/priv\ate/x.md`
+ *  and `cd mem\ory && cat priv\ate/x.md` open exactly the files those two names
+ *  spell (real bash prints the contents), while {@link MEMORY_SEGMENT} was
+ *  handed `mem\ory` and found neither name at a word border. It is stripped
+ *  alongside the quotes so every rule below runs on the word the shell will
+ *  build rather than the one the caller typed. */
 function bashTokens(cmd: string): string[] {
   return cmd
     .split(/[\s;|&()<>]+/)
-    .map((t) => t.replace(/["'`]/g, ""))
+    .map((t) => t.replace(/["'`\\]/g, ""))
     .filter((t) => t.length > 0);
 }
 

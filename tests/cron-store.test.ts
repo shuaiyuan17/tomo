@@ -515,6 +515,38 @@ describe("CronStore interrupted-run recovery", () => {
     expect(after.interruptedAt ?? null).toBeNull();
   });
 
+  it("disables an interrupted at-job kept as a record (once: false) instead of re-firing it", () => {
+    // `schedule_create ... once: false` on an "at" schedule means "keep the
+    // job around after it fires", NOT "run it repeatedly". markRun already
+    // treats kind "at" as single-fire (no recomputed nextRunAt), so recovery
+    // must park it too — resuming leaves the job due with an unacknowledged
+    // token, i.e. one extra fire per daemon restart, forever.
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "keep-the-record",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "place the order",
+      sessionKey: "dm:alice",
+      deleteAfterRun: false,
+    });
+    expect(job.deleteAfterRun).toBe(false);
+    store.markStarted(job.id);
+
+    const { resumed, skipped } = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(resumed).toHaveLength(0);
+    expect(skipped.map((s) => s.job.id)).toEqual([job.id]);
+    expect(skipped[0].reason).toBe("once");
+
+    const after = new CronStore(TEST_PATH).list()[0];
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt).toBeNull();
+
+    // And it stays parked across the next restart rather than coming back due.
+    const second = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(second.resumed).toHaveLength(0);
+    expect(second.skipped).toHaveLength(0);
+  });
+
   it("leaves completed and never-run jobs untouched", () => {
     const store = new CronStore(TEST_PATH);
     const done = addRecurring(store);

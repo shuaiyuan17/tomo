@@ -285,10 +285,11 @@ export class CronStore {
    *   disk, so they fire on the next scan — with `interruptedAt` set so the
    *   scheduler marks that fire as a resume in the event body, telling the
    *   model to check state before repeating anything with side effects.
-   * - `skipped` with reason `"once"`: one-shot (`deleteAfterRun`) jobs. Their
-   *   whole point is a single fire, and that fire already happened; whether it
-   *   finished is unknowable. Disabled with `lastStatus: "interrupted"` so a
-   *   human/agent can inspect and re-enable — never fired twice.
+   * - `skipped` with reason `"once"`: single-fire jobs — `deleteAfterRun`, and
+   *   every `at` schedule regardless of that flag. Their whole point is a
+   *   single fire, and that fire already happened; whether it finished is
+   *   unknowable. Disabled with `lastStatus: "interrupted"` so a human/agent
+   *   can inspect and re-enable — never fired twice.
    * - `skipped` with reason `"resume-cap"`: a recurring job that has been
    *   resumed MAX_RESUME_ATTEMPTS times since its last successful run. A turn
    *   that reliably takes the daemon down (or a crash loop) would otherwise
@@ -314,7 +315,14 @@ export class CronStore {
         job.interruptedAt = null;
         skipped.push({ job: { ...job }, reason });
       };
-      if (job.deleteAfterRun) {
+      // One-shot is a property of the SCHEDULE, not just the lifecycle flag.
+      // `deleteAfterRun: false` on an "at" job only means "keep the record
+      // after it fires" (schedule_create's `once: false`) — it is still a
+      // single-fire job, and markRun treats it as one (kind "at" never gets a
+      // recomputed nextRunAt). Resuming it here would re-fire it on THIS
+      // restart, and, because the resumed run leaves the same unacknowledged
+      // token behind if it is interrupted again, on every restart after that.
+      if (job.deleteAfterRun || job.schedule.kind === "at") {
         park("once");
         continue;
       }

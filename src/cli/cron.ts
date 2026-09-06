@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { CronStore, parseScheduleString } from "../cron/store.js";
+import { CronStore, parseScheduleString, unschedulableReason } from "../cron/store.js";
 import { formatSchedule, formatRelative } from "../cron/format.js";
 import { withCronStore } from "./cron-errors.js";
 
@@ -18,6 +18,14 @@ cronCommand
   .option("--once", "Delete after successful run (default: true for one-time 'at' schedules, false for recurring)")
   .action((opts) => withCronStore(() => {
     const schedule = parseScheduleString(opts.schedule);
+    // Same refusal the MCP tool makes: a schedule with no future occurrence
+    // would be stored enabled with `nextRunAt: null` and never fire, and
+    // "Next run: never" under a "Created job" line is not a no.
+    const unschedulable = unschedulableReason(schedule, Date.now());
+    if (unschedulable) {
+      console.error(`Cannot schedule "${opts.schedule}": ${unschedulable}, so the job could never fire.`);
+      process.exit(1);
+    }
     // Pass opts.once through as-is (undefined when not provided). The store
     // defaults deleteAfterRun=true for "at" schedules, false otherwise — so
     // one-time schedules ("in 20m", "2026-05-01", etc.) auto-clean after firing.

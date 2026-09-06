@@ -637,6 +637,35 @@ export function isInterrupted(job: CronJob): boolean {
   return (job.lastCompletedRunId ?? null) !== runId;
 }
 
+/**
+ * Why this schedule can never fire, or null when it can — the check every
+ * job-CREATION surface owes its caller.
+ *
+ * `computeNextRun` returning null is not an error condition on an existing
+ * job (a fired one-shot has no next run, and that is the point), but at
+ * creation time it means the job would land `enabled: true` with
+ * `nextRunAt: null`: a task the store reports as scheduled, the scan never
+ * picks up, and the user finds out about when the reminder does not arrive.
+ * `croner` only throws for a syntactically bad expression, so a try/catch
+ * around `computeNextRun` does not catch this — hence a separate check.
+ *
+ * Deliberately NOT enforced inside `add()`: the store primitive has to be able
+ * to represent a one-shot whose time has passed (that is every fired `at` job
+ * still on disk, and what `setEnabled` re-arms). The refusal belongs where a
+ * human or the model is asking for a NEW job.
+ *
+ * May throw for a malformed cron expression — callers already handle that.
+ */
+export function unschedulableReason(schedule: CronSchedule, fromMs: number): string | null {
+  if (computeNextRun(schedule, fromMs) !== null) return null;
+  if (schedule.kind === "at") {
+    return Number.isNaN(parseAtSchedule(schedule.at))
+      ? `"${schedule.at}" is not a date/time that can be parsed`
+      : `${schedule.at} is in the past`;
+  }
+  return "it has no future occurrence";
+}
+
 export function computeNextRun(schedule: CronSchedule, fromMs: number): number | null {
   switch (schedule.kind) {
     case "at": {

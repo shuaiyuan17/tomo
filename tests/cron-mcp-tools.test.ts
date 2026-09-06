@@ -330,25 +330,37 @@ describe("cron MCP tools", () => {
       session: "dm:alice",
     }, {});
 
-    // parseScheduleString falls through unknown strings to kind: "cron",
-    // so the explicit catch in the handler may or may not fire depending
-    // on whether croner rejects the expression at computeNextRun time.
-    // Either path is acceptable — what matters is that the tool never
-    // produces a job that the agent could mistake for "successfully
-    // scheduled and ready to fire".
-    if (result.isError) {
-      // Handler caught the parse failure and surfaced it cleanly.
-      expect(result.content[0].text).toMatch(/invalid schedule/i);
-      const list = findTool("schedule_list");
-      const listResult = await list.handler({}, {});
-      expect(JSON.parse(listResult.content[0].text)).toHaveLength(0);
-    } else {
-      // croner accepted the string but couldn't compute a next run — the
-      // job exists in the store but will never fire. Surface the latent
-      // dead-job state so the agent doesn't pretend it's scheduled.
-      const summary = JSON.parse(result.content[0].text);
-      expect(summary.nextRunAt).toBeNull();
-    }
+    // parseScheduleString falls through unknown strings to kind: "cron", so
+    // croner may reject it at evaluation (a throw) or accept it and report no
+    // future occurrence (null). Both are refusals now: a job the tool reports
+    // as scheduled must be one the scan can actually pick up.
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/invalid schedule/i);
+    const list = findTool("schedule_list");
+    const listResult = await list.handler({}, {});
+    expect(JSON.parse(listResult.content[0].text)).toHaveLength(0);
+  });
+
+  it("schedule_create — a time that has already passed is refused, not stored dead", async () => {
+    // The shape that used to succeed: a perfectly parseable ISO date/time in
+    // the past. computeNextRun returns null (not a throw), so the old trial
+    // waved it through and `add` stored `enabled: true, nextRunAt: null` — a
+    // task reported as scheduled that no scan can ever pick up. The user finds
+    // out when the reminder does not arrive.
+    const create = findTool("schedule_create");
+    const result = await create.handler({
+      name: "yesterday",
+      schedule: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      message: "water the airplant",
+      session: "dm:alice",
+    }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/invalid schedule/i);
+    expect(result.content[0].text).toMatch(/in the past/i);
+
+    // Nothing landed — not even a disabled record.
+    expect(new CronStore(TEST_PATH).list()).toHaveLength(0);
   });
 
   it("MCP and CronStore see the same on-disk state (no in-memory drift)", async () => {

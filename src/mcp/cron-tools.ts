@@ -1,6 +1,6 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { CronStore, CronStoreReadError, computeNextRun, parseScheduleString } from "../cron/store.js";
+import { CronStore, CronStoreReadError, parseScheduleString, unschedulableReason } from "../cron/store.js";
 import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
 import { MIXED_AUDIENCE_KEY } from "../agent/audience.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
@@ -140,16 +140,33 @@ export function buildCronTools(
         // Validate the schedule on its own. parseScheduleString accepts any
         // unrecognized string as `kind: "cron"` (catch-all) and croner only
         // throws when the expression is actually evaluated, so the validation
-        // is the trial computeNextRun — not `store.add`, whose failures are
-        // about the STORE and must not be reported as a bad schedule.
+        // is the trial run below — not `store.add`, whose failures are about
+        // the STORE and must not be reported as a bad schedule.
+        //
+        // A THROW is only half of it: a well-formed schedule with no future
+        // occurrence (a date/time that has already passed, a cron pattern that
+        // can never come round again) does not throw, it returns null — and
+        // `add` would then store `enabled: true, nextRunAt: null`, a job this
+        // tool reports as successfully scheduled and the scan never picks up.
+        // The user finds out when the reminder does not arrive.
         let parsed;
+        let unschedulable: string | null;
         try {
           parsed = parseScheduleString(schedule);
-          computeNextRun(parsed, Date.now());
+          unschedulable = unschedulableReason(parsed, Date.now());
         } catch (err) {
           const detail = err instanceof Error ? err.message : String(err);
           return {
             content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            isError: true,
+          };
+        }
+        if (unschedulable) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `schedule_create failed: invalid schedule "${schedule}": ${unschedulable}, so the task could never fire. Pick a future time.`,
+            }],
             isError: true,
           };
         }

@@ -985,6 +985,15 @@ export class Agent {
   private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessionManager.lastResult(key)): void {
     if (!usesLcmCompact(key)) return;
     if (!ctx || ctx.contextMax <= 0) return;
+    // A turn whose context reading failed carries an approximation of its OWN
+    // tokens over the last known window — a small fraction of a full session.
+    // Acting on it would read as "the session just emptied", clear the latch,
+    // and re-issue housekeeping that has already run. An unknown reading is
+    // not a low one: skip the turn and leave the latch where it is.
+    if (ctx.contextEstimated) {
+      log.debug({ key }, "Context nudge skipped (usage reading unavailable this turn)");
+      return;
+    }
 
     const usedFrac = ctx.contextUsed / ctx.contextMax;
     const nudged = this.contextNudged.get(key);

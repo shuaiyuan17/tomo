@@ -781,6 +781,36 @@ describe("compact nudges", () => {
     await agent.stop();
   });
 
+  it("does not re-issue housekeeping after a turn whose context reading failed", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    // The next turn cannot read context usage at all. The fallback measures
+    // only that turn's own tokens; divided by a hard-coded 1M window it used
+    // to land under nudgeResetPct on a 200k model — i.e. an unreadable
+    // session was indistinguishable from one that had just been emptied, so
+    // the latch cleared and the compact was asked for a second time.
+    mockSdk.contextUsageFails = true;
+    await tg.simulateMessage(makeMsg({ text: "Hi again" }));
+    await drainQueue(agent);
+    await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    // A real reading, still over the threshold: the latch survived, so this
+    // is not a fresh nudge either.
+    mockSdk.contextUsageFails = false;
+    await tg.simulateMessage(makeMsg({ text: "and again" }));
+    await drainQueue(agent);
+    await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    await agent.stop();
+  });
+
   it("runs the context-pressure check on a turn recovered by the session-error retry", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

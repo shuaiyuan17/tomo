@@ -60,6 +60,9 @@ export const mockSdk = {
   steerEcho: false,
   /** Context usage reported by the mock SDK's getContextUsage() after each turn. */
   contextUsage: { totalTokens: 5000, maxTokens: 200000 },
+  /** When true, getContextUsage() rejects — the transient-failure path that
+   *  makes LiveSession fall back to an approximation. */
+  contextUsageFails: false,
   /** When set, the next query created fails its event stream with this error
    *  message (one-shot) — simulates SDK session errors like "No conversation
    *  found" that trip runWithRetry's reset-and-retry branch. */
@@ -87,6 +90,7 @@ export function resetMockSdk(): void {
   mockSdk.userContents = [];
   mockSdk.steerEcho = false;
   mockSdk.contextUsage = { totalTokens: 5000, maxTokens: 200000 };
+  mockSdk.contextUsageFails = false;
   mockSdk.failNextQuery = null;
   mockSdk.nextResult = null;
   mockSdk.queryControllers = [];
@@ -285,6 +289,7 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
       wakeConsumer();
     },
     async getContextUsage() {
+      if (mockSdk.contextUsageFails) throw new Error("context usage unavailable");
       const { totalTokens, maxTokens } = mockSdk.contextUsage;
       return {
         totalTokens,

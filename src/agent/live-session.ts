@@ -463,6 +463,13 @@ export interface QueryResult {
   contextUsed: number;
   contextMax: number;
   contextBreakdown?: { name: string; tokens: number }[];
+  /**
+   * The SDK could not report context usage for this turn, so `contextUsed` is
+   * a crude approximation from the turn's own token counts and `contextMax` is
+   * the last reading that WAS real (0 if there has never been one). Anything
+   * that acts on the ratio — the context-nudge ladder — must skip instead.
+   */
+  contextEstimated?: boolean;
 }
 
 /**
@@ -588,6 +595,12 @@ export class LiveSession {
   private sessionId: string | null = null;
   private alive = true;
   lastResult: QueryResult | null = null;
+  /**
+   * The last context window the SDK actually reported, carried across turns so
+   * a transient `getContextUsage()` failure reports the real window rather
+   * than a guess. 0 until the first successful reading.
+   */
+  private lastContextMax = 0;
   private prevTotalCost = 0;
   /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
   private prevModelTokens: TokenTotals | null = null;
@@ -1360,6 +1373,7 @@ export class LiveSession {
       try {
         const ctx = await this.q.getContextUsage();
         const pct = Math.round(ctx.percentage);
+        this.lastContextMax = ctx.maxTokens;
         if (this.lastResult) {
           this.lastResult.contextUsed = ctx.totalTokens;
           this.lastResult.contextMax = ctx.maxTokens;
@@ -1372,12 +1386,21 @@ export class LiveSession {
         }
         return `${ctx.totalTokens}/${ctx.maxTokens} (${pct}%)`;
       } catch {
+        // The SDK could not tell us. `approx` counts only this turn's own
+        // tokens, so it is far below the real total — and the window it is
+        // divided by used to be a hard-coded 1M. On a 200k model that reads as
+        // a session that has just been emptied: the nudge ladder's latch
+        // clears, and the next real reading re-issues housekeeping that has
+        // already been done. Keep the last window we actually saw (0 if we
+        // never saw one) and mark the reading estimated, so consumers can tell
+        // "low" from "unknown".
         const approx = input + cacheRead + cacheCreated;
         if (this.lastResult) {
           this.lastResult.contextUsed = approx;
-          this.lastResult.contextMax = 1_000_000;
+          this.lastResult.contextMax = this.lastContextMax;
+          this.lastResult.contextEstimated = true;
         }
-        return `~${approx}/1000000`;
+        return `~${approx}/${this.lastContextMax || "unknown"} (estimated)`;
       }
     })();
 

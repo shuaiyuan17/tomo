@@ -16,6 +16,10 @@
 
 - **The watch feed's `issue` events no longer carry an unscrubbed error message.** `logger.ts` reads `err.message` straight off the Error to build the one-line summary published to `tomo watch` and written to `logs/activity.ndjson` — a path the `err` serializer and the `formatters.log` pass never touch. grammY echoes the request URL in its error text, so a failed Telegram call put the bot token on the watch feed and into a file on disk that gets attached to bug reports. The summary now goes through the same `scrubSecretValues` every string log argument already gets, before it is clipped to 300 characters so a credential cannot survive by sitting past the cut.
 
+### Internal
+
+- **`npm test` no longer prints 15 stray confirmation prompts and a listener-leak warning.** `rl.question` echoes its prompt to the readline interface's `output`, which `tomo backup restore`'s `confirm()` hard-wired to `process.stdout` — the restore tests fake `process.stdin` but had no seam for the other half, so "Proceed? [y/N] " landed in the middle of the suite's output with nothing to say which test it came from. The prompt stream is now injectable and the tests capture it. Separately, each pino *transport* is a worker thread with its own `process.on("exit")` teardown hook, and vitest evaluates `logger.ts` once per test file inside a single worker process — the eleventh tripped `MaxListenersExceededWarning: 11 exit listeners added to [process]`, with a hundred-odd worker threads behind it. Under test the logger writes through a direct destination instead; every formatter, serializer and hook is unchanged, and `TOMO_LOG_FILE` is still honoured.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

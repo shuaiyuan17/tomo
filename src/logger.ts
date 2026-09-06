@@ -8,23 +8,56 @@ import { LOG_REDACT_PATHS, redactLogRecord, redactSerializedError, scrubSecretVa
 // would have opened a whitespace-named file in the working directory.
 const logFile = process.env.TOMO_LOG_FILE?.trim() || undefined;
 
+/**
+ * UNDER TEST, DO NOT BUILD A TRANSPORT.
+ *
+ * Every pino transport is a worker thread, and pino registers a
+ * `process.on("exit")` teardown hook per transport (`pino/lib/transport.js`
+ * buildStream). Vitest gives each test file a fresh module registry inside
+ * ONE worker process, so this module is evaluated once per file: the eleventh
+ * evaluation tripped `MaxListenersExceededWarning: 11 exit listeners added to
+ * [process]`, with a hundred-odd worker threads and their hooks behind it.
+ *
+ * A direct destination has neither. Everything that shapes a record —
+ * `redact.paths`, the `formatters.log` pass, the `err` serializer, the
+ * logMethod hook that feeds the watch bus — lives in the options below and is
+ * untouched by this, so what the tests exercise is the same logger; only
+ * where the bytes land differs. `TOMO_LOG_FILE` is still honoured (the
+ * redaction tests read the file back), and without it the records are
+ * discarded, which is what already happened in practice: the transport worker
+ * is torn down at the end of a file before it flushes.
+ */
+const underTest = process.env.VITEST !== undefined;
+
 // When running as daemon, log to file; otherwise pretty-print to stdout
-const transport = logFile
-  ? (() => {
-      mkdirSync(dirname(logFile), { recursive: true });
-      return {
-        target: "pino/file",
-        options: { destination: logFile, mkdir: true },
+const transport = underTest
+  ? undefined
+  : logFile
+    ? (() => {
+        mkdirSync(dirname(logFile), { recursive: true });
+        return {
+          target: "pino/file",
+          options: { destination: logFile, mkdir: true },
+        };
+      })()
+    : {
+        target: "pino-pretty",
+        options: {
+          colorize: true,
+          ignore: "pid,hostname",
+          translateTime: "HH:MM:ss",
+        },
       };
-    })()
-  : {
-      target: "pino-pretty",
-      options: {
-        colorize: true,
-        ignore: "pid,hostname",
-        translateTime: "HH:MM:ss",
-      },
-    };
+
+/** In-process stand-in for the transport, used only when `underTest`. */
+const destination: pino.DestinationStream | undefined = !underTest
+  ? undefined
+  : logFile
+    ? (() => {
+        mkdirSync(dirname(logFile), { recursive: true });
+        return pino.destination({ dest: logFile, sync: true });
+      })()
+    : { write: () => { /* discard */ } };
 
 /** Flatten a pino call's args into one short line for the watch feed. */
 function issueMessage(args: unknown[]): string {
@@ -57,7 +90,9 @@ export const log = pino({
   // which kills the daemon before it can say why. (config.ts envVar has the
   // same rule; this module cannot import it.)
   level: process.env.LOG_LEVEL?.trim() || "debug",
-  transport,
+  // Mutually exclusive with the `destination` stream below — pino refuses
+  // both at once.
+  ...(transport ? { transport } : {}),
   // Second line of defence for credentials. `configIssues` is the surface that
   // actually leaked one (a bad `allowlist` stringified the whole channel entry
   // into `tomo status` and the launchd error log), and that is fixed at the
@@ -105,4 +140,4 @@ export const log = pino({
       return method.apply(this, args);
     },
   },
-});
+}, destination);

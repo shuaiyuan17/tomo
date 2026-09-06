@@ -107,3 +107,24 @@ describe("logger issue tap", () => {
     expect(issues[0].msg).toContain("***");
   });
 });
+
+describe("logger module hygiene", () => {
+  it("does not add a process 'exit' listener per evaluation", async () => {
+    // Each pino TRANSPORT is a worker thread, and pino registers a
+    // `process.on("exit")` teardown hook for it. Vitest gives every test file
+    // a fresh module registry inside one worker process, so logger.ts is
+    // evaluated once per file: the eleventh evaluation printed
+    // `MaxListenersExceededWarning: 11 exit listeners added to [process]`
+    // into the middle of `npm test`, with a hundred-odd worker threads behind
+    // it. Under test the logger writes through a direct destination instead.
+    const before = process.listenerCount("exit");
+
+    for (let i = 0; i < 12; i++) {
+      vi.resetModules();
+      await import("../src/logger.js");
+    }
+
+    expect(process.listenerCount("exit")).toBe(before);
+    vi.resetModules();
+  });
+});

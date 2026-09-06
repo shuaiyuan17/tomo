@@ -163,8 +163,30 @@ function pruneOldBackups(): number {
   return removed;
 }
 
+/**
+ * Where `confirm()` draws its prompt.
+ *
+ * `rl.question` echoes the prompt to the interface's `output` stream, and the
+ * restore tests drive the real command through commander with only
+ * `process.stdin` faked — so every one of them printed a stray
+ * "Proceed? [y/N] " into the middle of `npm test`'s output, 15 in all, with
+ * nothing to say which test it came from. `process.stdin` is read at call
+ * time (the tests swap it with `Object.defineProperty`), but the output side
+ * has no such seam, and the tests cannot pass an argument through commander.
+ * Hence a module-level one.
+ */
+let promptOutput: NodeJS.WritableStream = process.stdout;
+
+/** Redirect the confirmation prompt; returns the previous stream so a caller
+ *  can put it back. Exists for the tests — nothing in the CLI moves it. */
+export function setPromptOutput(stream: NodeJS.WritableStream): NodeJS.WritableStream {
+  const previous = promptOutput;
+  promptOutput = stream;
+  return previous;
+}
+
 async function confirm(prompt: string): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutput });
   return new Promise((resolve) => {
     rl.question(`${prompt} [y/N] `, (answer) => {
       rl.close();

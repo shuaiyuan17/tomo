@@ -12,6 +12,8 @@
 
 - **An iMessage sticker that cannot be sent is reported instead of silently dropped.** `sendSticker`'s two pre-flight refusals — a value that is not a path (a Telegram `file_id`, which means nothing on this channel) and a path that does not exist — logged a warning and returned normally, so the caller was told the send succeeded. Unlike a captioned photo there is nothing left over to salvage: the sticker *is* the message, and the recipient got nothing while the transcript recorded a delivered turn. Both now raise the same typed, definite `AttachmentUnreadableError` `sendAttachment` has raised since 0.9.0, which is what lets the delivery pipeline react without risking a double-send.
 
+- **A `send_message` attachment that fails no longer makes the model send the text twice.** Direct mode ships the text first and the photos and stickers after it, and any failure on the second half propagated out of the tool: the transcript append never ran, the caller saw an error, and a model reading "the send failed" reasonably sent the whole thing again — so the reader got the text twice and the picture never. The text cannot be unsent, so each attachment is now attempted on its own (one bad path does not cancel the ones behind it), the delivered text is recorded, and the tool returns a partial success naming exactly what did not arrive and saying not to re-send. A `MEDIA:` path that does not exist is named the same way instead of being dropped in silence.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

@@ -108,6 +108,8 @@ export class ProactiveSendService {
     // nothing ever leaks into visible text.
     let effect: string | undefined;
     let effectNote: string | undefined;
+    /** Set when a photo/sticker failed after the text had already gone out. */
+    let attachmentNote: string | undefined;
     if (options?.effect !== undefined) {
       const normalized = options.effect.trim().toLowerCase();
       if (!(IMESSAGE_SEND_EFFECTS as readonly string[]).includes(normalized)) {
@@ -138,20 +140,36 @@ export class ProactiveSendService {
       } else if (effect) {
         effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
       }
-      const validPaths = mediaPaths.filter((p) => existsSync(p));
-      for (const path of validPaths) {
-        await channel.send({
-          chatId: replyTarget.chatId,
-          photo: path,
-          text: "",
-        });
+      // AN ATTACHMENT THAT FAILS MUST NOT UNSEND THE TEXT. The text send
+      // above has already happened and cannot be taken back, so letting a
+      // photo or sticker failure propagate produced the worst outcome
+      // available: no transcript append (the code below never ran), a tool
+      // error, and a model that reasonably reads "the send failed" as "send
+      // it again" — so the reader got the text twice and the picture never.
+      // Each attachment is attempted on its own and its failure recorded, so
+      // one bad path does not cancel the ones behind it; what actually
+      // happened comes back as a partial success with the names in it.
+      const missing = mediaPaths.filter((p) => !existsSync(p));
+      const failed: string[] = [...missing];
+      for (const path of mediaPaths) {
+        if (missing.includes(path)) continue;
+        try {
+          await channel.send({ chatId: replyTarget.chatId, photo: path, text: "" });
+        } catch (err) {
+          log.warn({ err, sessionKey, path }, "Direct send: attachment failed after the text was delivered");
+          failed.push(path);
+        }
       }
       for (const stickerId of stickerIds) {
-        await channel.send({
-          chatId: replyTarget.chatId,
-          sticker: stickerId,
-          text: "",
-        });
+        try {
+          await channel.send({ chatId: replyTarget.chatId, sticker: stickerId, text: "" });
+        } catch (err) {
+          log.warn({ err, sessionKey, sticker: stickerId }, "Direct send: sticker failed after the text was delivered");
+          failed.push(stickerId);
+        }
+      }
+      if (failed.length > 0) {
+        attachmentNote = `Note: ${failed.length === 1 ? "one attachment" : `${failed.length} attachments`} could not be sent (${failed.join(", ")}). ${cleanText ? "The message text WAS delivered — do not send it again" : "Nothing was delivered"}; fix the path or send the attachment separately.`;
       }
     } else {
       // No attachments: verbatim text (direct-mode contract), behind the
@@ -184,7 +202,7 @@ export class ProactiveSendService {
         : `Tomo from another session sent the following message to this conversation earlier: "${text}"`));
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
-    const note = [fabricatedNote, effectNote].filter((n): n is string => n !== undefined).join(" ");
+    const note = [fabricatedNote, effectNote, attachmentNote].filter((n): n is string => n !== undefined).join(" ");
     return { ok: true, ...(note ? { note } : {}) };
   }
 

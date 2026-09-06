@@ -46,6 +46,84 @@ describe("send_message direct mode", () => {
     await agent.stop();
   });
 
+  // An attachment that fails AFTER the text has gone out. The failure used to
+  // propagate: no transcript append, a tool error, and a model that reads
+  // "the send failed" as "send it again" — so the reader saw the text twice
+  // and the picture never. The text cannot be unsent, so the only honest
+  // outcome is a partial success that says exactly what did not arrive.
+  it("keeps the delivered text and reports the photo that failed", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "doomed.jpg");
+    writeFileSync(imagePath, "fake image");
+    const passThrough = tg.send.bind(tg);
+    vi.spyOn(tg, "send").mockImplementation(async (msg) => {
+      if (msg.photo) throw new Error("EPIPE: the channel died mid-send");
+      await passThrough(msg);
+    });
+
+    const result = await agent.sendToSession("telegram:12345", `here you go MEDIA:"${imagePath}"`);
+
+    expect(result.ok).toBe(true);
+    const note = (result as { note?: string }).note ?? "";
+    expect(note).toContain(imagePath);
+    expect(note).toContain("do not send it again");
+    // The text really was delivered...
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "here you go", photo: undefined, sticker: undefined },
+    ]);
+    // ...and recorded, which is what stops the next turn re-sending it.
+    const messages = new SessionStore(
+      mockConfig.sessionsDir,
+      20,
+      mockConfig.sdkSessionsDir,
+    ).get("telegram:12345").messages;
+    expect(messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: `[proactive] here you go MEDIA:"${imagePath}"`,
+      channel: "telegram",
+    });
+
+    await agent.stop();
+  });
+
+  it("keeps going past a failed sticker and names it in the result", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "fine.jpg");
+    writeFileSync(imagePath, "fake image");
+    const passThrough = tg.send.bind(tg);
+    vi.spyOn(tg, "send").mockImplementation(async (msg) => {
+      if (msg.sticker) throw new Error("sticker send refused");
+      await passThrough(msg);
+    });
+
+    const result = await agent.sendToSession(
+      "telegram:12345",
+      `two of these MEDIA:"${imagePath}" STICKER:CAACAgQAAxkBAAE123`,
+    );
+
+    expect(result.ok).toBe(true);
+    const note = (result as { note?: string }).note ?? "";
+    expect(note).toContain("CAACAgQAAxkBAAE123");
+    expect(note).not.toContain(imagePath);
+    // One attachment failing does not cancel the one that worked.
+    expect(tg.delivered).toEqual([
+      { chatId: "12345", text: "two of these", photo: undefined, sticker: undefined },
+      { chatId: "12345", text: "", photo: imagePath, sticker: undefined },
+    ]);
+    const messages = new SessionStore(
+      mockConfig.sessionsDir,
+      20,
+      mockConfig.sdkSessionsDir,
+    ).get("telegram:12345").messages;
+    expect(messages.at(-1)).toMatchObject({ role: "assistant", channel: "telegram" });
+
+    await agent.stop();
+  });
+
   it("preserves verbatim direct text when there are no attachment tags", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

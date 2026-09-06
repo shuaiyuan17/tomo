@@ -710,6 +710,38 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
     if (existsSync(transcriptPath)) unlinkSync(transcriptPath);
   });
 
+  it("does NOT promote a week while one of its days is itself due for a rebuild", () => {
+    // The day has a block AND 8 aged-out raw events behind it (≥ the
+    // with-block floor), so `daily 2026-04-08` is due for a rebuild. Promoting
+    // the week first consumes that half-finished block; the leftover raw then
+    // re-creates `daily 2026-04-08`, which can never reach the week again
+    // because `weekly 2026-W15` already exists — the week's summary is
+    // permanently short of that day, and every pass burns a model turn
+    // rewriting a daily block that goes nowhere.
+    const day = "2026-04-08";
+    const laterDay = "2026-04-18";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly` },
+    }];
+    for (let i = 0; i < 8; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    // Newer candidates, so the day's own raw is aged out of the warm window.
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent(laterDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "daily" && d.period === day)).toBeDefined();
+    expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeUndefined();
+  });
+
   it("does NOT deadlock: aged-out sub-floor leftover still lets the week promote", () => {
     // Block for 2026-04-08 + 2 raw on that day, but 4 NEWER candidates push those
     // 2 out of the newest-4 window. Aged-out + sub-floor (2<8) → daily not due,

@@ -624,7 +624,29 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
     }
   }
 
+  // A week whose own daily children are still due cannot be rolled up yet.
+  //
+  // The weekly candidate list is built from daily BLOCKS, and a day can own a
+  // block and still be due: the block covers part of the day and enough raw
+  // has aged out behind it to clear FLOOR_WITH_BLOCK, so the day needs a
+  // rebuild. Promote the week first and `resolveBlockRange("weekly")` consumes
+  // that half-finished block; the day's leftover raw then re-creates
+  // `daily D`, which can never be promoted again because `haveTags` now
+  // contains `weekly W` — so the week's summary is permanently missing the
+  // rest of that day, and every pass spends a model turn re-writing a daily
+  // block that goes nowhere. Waiting costs one heartbeat: the daily sorts
+  // first (LEVEL_ORDER in runner.ts), and once it lands the week is due with a
+  // complete child. This is the aged-out counterpart of the warm-suffix
+  // `warmPeriods.weeks` gate above, which only covers raw kept warm by design.
+  const weeksWithDueDaily = new Set(
+    due.filter((d) => d.level === "daily")
+      .map((d) => isoWeekTag(new Date(`${d.period}T12:00:00`))),
+  );
+  const promotable = due.filter(
+    (d) => !(d.level === "weekly" && weeksWithDueDaily.has(d.period)),
+  );
+
   // Oldest-first so the agent works chronologically
-  due.sort((a, b) => a.period.localeCompare(b.period));
-  return due;
+  promotable.sort((a, b) => a.period.localeCompare(b.period));
+  return promotable;
 }

@@ -79,11 +79,91 @@ describe("send_message direct mode", () => {
       20,
       mockConfig.sdkSessionsDir,
     ).get("telegram:12345").messages;
+    // ...and recorded WITH THE FAILED PIECE MARKED. The transcript is what
+    // recall reads back, so an entry that keeps the raw `MEDIA:` tag claims
+    // the reader saw a photo that never left the machine. Same convention as
+    // failedDeliveryEntry (delivery-pipeline.ts) uses for a partly-shipped
+    // block.
     expect(messages.at(-1)).toMatchObject({
       role: "assistant",
-      content: `[proactive] here you go MEDIA:"${imagePath}"`,
+      content: `[proactive] here you go\n[delivery failed] MEDIA:"${imagePath}"`,
       channel: "telegram",
     });
+    // And the note the target session is handed describes only what landed.
+    const notes = peekPendingNotes(agent, "telegram:12345").join("\n");
+    expect(notes).toContain("here you go");
+    expect(notes).not.toContain(imagePath);
+
+    await agent.stop();
+  });
+
+  // EVERYTHING failed and there was no text to carry: the conversation
+  // received nothing at all. Reporting `ok: true` had internal-server.ts
+  // render "OK (direct)" over a send that never happened, wrote the composed
+  // text into the target's transcript as if it had been said, and queued a
+  // pending note telling that session a message had arrived.
+  it("reports a failure and records nothing when nothing was delivered", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "doomed-alone.jpg");
+    writeFileSync(imagePath, "fake image");
+    vi.spyOn(tg, "send").mockImplementation(async () => {
+      throw new Error("EPIPE: the channel died mid-send");
+    });
+
+    const result = await agent.sendToSession("telegram:12345", `MEDIA:"${imagePath}" STICKER:CAACAgQAAxkBAAE123`);
+
+    expect(result.ok).toBe(false);
+    const error = (result as { error?: string }).error ?? "";
+    expect(error).toContain("Nothing was delivered");
+    expect(error).toContain(imagePath);
+    expect(error).toContain("CAACAgQAAxkBAAE123");
+    // No transcript entry: recall must not read back a message nobody got.
+    const messages = new SessionStore(
+      mockConfig.sessionsDir,
+      20,
+      mockConfig.sdkSessionsDir,
+    ).get("telegram:12345").messages;
+    expect(messages).toEqual([]);
+    // And no pending note telling the target session a message arrived.
+    expect(peekPendingNotes(agent, "telegram:12345")).toEqual([]);
+
+    await agent.stop();
+  });
+
+  // The other half of the same rule: text delivered, the picture not. This
+  // one IS a partial success — the text cannot be unsent — so it is recorded,
+  // with the piece that did not ship marked.
+  it("marks only the failed piece when the sticker fails after the text", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const imagePath = join(agentEnv.tmpDir, "ok.jpg");
+    writeFileSync(imagePath, "fake image");
+    const passThrough = tg.send.bind(tg);
+    vi.spyOn(tg, "send").mockImplementation(async (msg) => {
+      if (msg.sticker) throw new Error("sticker send refused");
+      await passThrough(msg);
+    });
+
+    const result = await agent.sendToSession(
+      "telegram:12345",
+      `look MEDIA:"${imagePath}" STICKER:CAACAgQAAxkBAAE123`,
+    );
+
+    expect(result.ok).toBe(true);
+    const messages = new SessionStore(
+      mockConfig.sessionsDir,
+      20,
+      mockConfig.sdkSessionsDir,
+    ).get("telegram:12345").messages;
+    expect(messages.at(-1)?.content).toBe(
+      `[proactive] look\nMEDIA:"${imagePath}"\n[delivery failed] STICKER:CAACAgQAAxkBAAE123`,
+    );
+    const notes = peekPendingNotes(agent, "telegram:12345").join("\n");
+    expect(notes).toContain(`MEDIA:"${imagePath}"`);
+    expect(notes).not.toContain("CAACAgQAAxkBAAE123");
 
     await agent.stop();
   });

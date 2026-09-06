@@ -10,6 +10,8 @@ import {
   replyTargetFromRawSessionKey,
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
+import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
+import type { DeliverySegment } from "./delivery-pipeline.js";
 import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
 import { normalizeSendTarget } from "./send-target.js";
 import { formatTomoEvent } from "../tomo-event.js";
@@ -131,12 +133,16 @@ export class ProactiveSendService {
       replyToId = found.message.id;
     }
 
+    /** Per-piece outcome in model order, set only when something failed. */
+    let segments: DeliverySegment[] | undefined;
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
     if (mediaPaths.length > 0 || stickerIds.length > 0) {
       // Send text first (matches assistant response ordering). The effect
       // rides the text send — it modifies delivery of text, not attachments.
+      let textDelivered = false;
       if (cleanText) {
         await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+        textDelivered = true;
       } else if (effect) {
         effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
       }
@@ -149,33 +155,80 @@ export class ProactiveSendService {
       // Each attachment is attempted on its own and its failure recorded, so
       // one bad path does not cancel the ones behind it; what actually
       // happened comes back as a partial success with the names in it.
-      const missing = mediaPaths.filter((p) => !existsSync(p));
-      const failed: string[] = [...missing];
+      //
+      // The outcome is kept PER PIECE, in model order, for the same reason
+      // delivery-pipeline.ts keeps `DeliverySegment` for a block: the
+      // transcript below has to record exactly what the reader is known to
+      // have received, and "the photo failed" is not "the caption failed".
+      const attachments: Array<{ label: string; segment: DeliverySegment }> = [];
+      const missing = new Set(mediaPaths.filter((p) => !existsSync(p)));
       for (const path of mediaPaths) {
-        if (missing.includes(path)) continue;
+        const segment: DeliverySegment = { text: `MEDIA:"${path}"`, delivered: false };
+        attachments.push({ label: path, segment });
+        if (missing.has(path)) continue;
         try {
           await channel.send({ chatId: replyTarget.chatId, photo: path, text: "" });
+          segment.delivered = true;
         } catch (err) {
           log.warn({ err, sessionKey, path }, "Direct send: attachment failed after the text was delivered");
-          failed.push(path);
         }
       }
       for (const stickerId of stickerIds) {
+        const segment: DeliverySegment = { text: `STICKER:${stickerId}`, delivered: false };
+        attachments.push({ label: stickerId, segment });
         try {
           await channel.send({ chatId: replyTarget.chatId, sticker: stickerId, text: "" });
+          segment.delivered = true;
         } catch (err) {
           log.warn({ err, sessionKey, sticker: stickerId }, "Direct send: sticker failed after the text was delivered");
-          failed.push(stickerId);
         }
       }
+      const failed = attachments.filter((a) => !a.segment.delivered).map((a) => a.label);
       if (failed.length > 0) {
-        attachmentNote = `Note: ${failed.length === 1 ? "one attachment" : `${failed.length} attachments`} could not be sent (${failed.join(", ")}). ${cleanText ? "The message text WAS delivered — do not send it again" : "Nothing was delivered"}; fix the path or send the attachment separately.`;
+        // NOTHING GOT THROUGH — this is a failure, not a partial success.
+        // With no text to carry and every attachment refused, the
+        // conversation received nothing at all; reporting `ok: true` had the
+        // MCP renderer print "OK (direct)" over a send that never happened,
+        // wrote the composed text into the target's transcript as though it
+        // had been said, and queued a pending note telling that session a
+        // message had arrived. All three are lies about the same event. The
+        // caller can and should retry, so say so and stop here, before any
+        // of the persistence below.
+        if (!textDelivered && !attachments.some((a) => a.segment.delivered)) {
+          log.warn({ sessionKey, channel: replyTarget.channelName, failed: failed.length }, "Direct send delivered nothing");
+          return {
+            ok: false,
+            error: `Nothing was delivered: the message had no text to send and ${failed.length === 1 ? "its one attachment" : `all ${failed.length} attachments`} failed (${failed.join(", ")}). Nothing reached the conversation — fix the path(s) and send again.`,
+          };
+        }
+        const deliveredCount = attachments.filter((a) => a.segment.delivered).length;
+        attachmentNote = `Note: ${failed.length === 1 ? "one attachment" : `${failed.length} attachments`} could not be sent (${failed.join(", ")}). ${textDelivered
+          ? "The message text WAS delivered — do not send it again"
+          : `${deliveredCount === 1 ? "One attachment WAS" : `${deliveredCount} attachments WERE`} delivered — do not send ${deliveredCount === 1 ? "it" : "those"} again`}; fix the path or send the attachment separately.`;
+        segments = [
+          ...(textDelivered ? [{ text: cleanText, delivered: true }] : []),
+          ...attachments.map((a) => a.segment),
+        ];
       }
     } else {
       // No attachments: verbatim text (direct-mode contract), behind the
       // advisory only when the guard fired.
       await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
     }
+
+    // What the transcript records, and what the pending note describes. On a
+    // clean send both are the model's text verbatim, tags and all. On a
+    // partial one they diverge: the transcript keeps every piece and marks
+    // the ones not known to have shipped with the same `DELIVERY_FAILED_MARKER`
+    // `failedDeliveryEntry` uses, so recall does not read a photo that never
+    // arrived back as something the reader saw; the note — which is the
+    // target session's own account of the event — names only what did land.
+    const transcriptText = segments
+      ? segments.map((s) => (s.delivered ? s.text : `${DELIVERY_FAILED_MARKER}${s.text}`)).join("\n")
+      : text;
+    const deliveredText = segments
+      ? segments.filter((s) => s.delivered).map((s) => s.text).join("\n")
+      : text;
 
     // Attribute the send in the target session's record. Only claim it came
     // from the summoning identity's main session when the caller actually IS
@@ -186,7 +239,7 @@ export class ProactiveSendService {
     try {
       this.deps.appendAssistantTranscript(
         sessionKey,
-        fromSummoner ? `[via dm:${summoned} (summoned)] ${text}` : `[proactive] ${text}`,
+        fromSummoner ? `[via dm:${summoned} (summoned)] ${transcriptText}` : `[proactive] ${transcriptText}`,
         replyTarget.channelName,
       );
     } catch (err) {
@@ -196,10 +249,10 @@ export class ProactiveSendService {
     }
 
     this.deps.queuePendingNote(sessionKey, formatTomoEvent("direct-send", fromSummoner
-      ? `Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${text}"`
+      ? `Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${deliveredText}"`
       : callerSessionKey === sessionKey
-        ? `You sent the following message to this conversation earlier as a direct send: "${text}"`
-        : `Tomo from another session sent the following message to this conversation earlier: "${text}"`));
+        ? `You sent the following message to this conversation earlier as a direct send: "${deliveredText}"`
+        : `Tomo from another session sent the following message to this conversation earlier: "${deliveredText}"`));
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
     const note = [fabricatedNote, effectNote, attachmentNote].filter((n): n is string => n !== undefined).join(" ");

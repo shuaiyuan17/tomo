@@ -6,7 +6,7 @@ import {
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import {
   writeFileSync, mkdirSync, unlinkSync, existsSync, appendFileSync, readFileSync, statSync,
-  openSync, writeSync, closeSync, rmSync,
+  openSync, writeSync, closeSync, rmSync, readdirSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -223,9 +223,12 @@ describe("compactSession", () => {
   afterEach(() => {
     rmSync(sdkSessionsDir, { recursive: true, force: true });
     if (existsSync(archivePath)) unlinkSync(archivePath);
-    const tmp = path + ".compacting.tmp";
-    if (existsSync(tmp)) unlinkSync(tmp);
   });
+
+  /** Any staging file left beside the session file — the name is per-call. */
+  const stagingLeftovers = () =>
+    (existsSync(dirname(path)) ? readdirSync(dirname(path)) : [])
+      .filter((f) => f.includes(".compacting.tmp"));
 
   it("writes atomically via rename — no .compacting.tmp leftover on success", () => {
     const events: any[] = [];
@@ -254,7 +257,7 @@ describe("compactSession", () => {
 
     expect(result.success).toBe(true);
     expect(result.eventsAfter).toBe(3);
-    expect(existsSync(path + ".compacting.tmp")).toBe(false);
+    expect(stagingLeftovers()).toEqual([]);
 
     const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
     expect(out).toHaveLength(3);
@@ -449,8 +452,80 @@ describe("compactSession", () => {
     expect(statSync(path).size).toBe(sizeBefore);
     expect(readFileSync(path, "utf-8").endsWith(partial)).toBe(true);
     // No leftover tmp file from a failed rename attempt.
-    expect(existsSync(path + ".compacting.tmp")).toBe(false);
+    expect(stagingLeftovers()).toEqual([]);
     // No archive side effect — caller can retry without duplicate transcript.
+    expect(existsSync(archivePath)).toBe(false);
+  });
+
+  it("stages under a per-call temp name, so a parallel compact cannot clobber the rename", () => {
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0
+        ? mkUserEvent(parent, ts, `msg ${i}`)
+        : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    const sharedName = path + ".compacting.tmp";
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      summary: "compacted middle",
+      transcriptPath: archivePath,
+      // A second `tomo lcm` staging its own output at the same instant. With
+      // one fixed staging name it writes into the very file this call is about
+      // to rename into place, and the rename publishes the OTHER process's
+      // bytes over the session — losing the whole conversation.
+      beforeRenameForTest: () => {
+        writeFileSync(sharedName, JSON.stringify({ clobbered: true }) + "\n");
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(out).toHaveLength(3);
+    expect(out.some((e) => e.clobbered)).toBe(false);
+    expect(out[1].isCompactSummary).toBe(true);
+    if (existsSync(sharedName)) unlinkSync(sharedName);
+  });
+
+  it("archives nothing when the rewrite fails after the archive point", () => {
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0
+        ? mkUserEvent(parent, ts, `msg ${i}`)
+        : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    // The session directory disappears between staging and rename (the shape
+    // of any late failure: ENOSPC, EACCES, a cleanup racing the write). The
+    // compact never commits — so nothing may have been archived, or the retry
+    // writes those events into the transcript a second time.
+    expect(() => compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      summary: "never committed",
+      transcriptPath: archivePath,
+      beforeRenameForTest: () => {
+        rmSync(sdkSessionsDir, { recursive: true, force: true });
+      },
+    })).toThrow();
+
     expect(existsSync(archivePath)).toBe(false);
   });
 

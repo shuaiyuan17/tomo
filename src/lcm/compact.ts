@@ -397,23 +397,37 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     };
   }
 
-  // Archive removed events to transcript. Done after the abort check so a
-  // failed compact leaves no side effects (no duplicate archive lines on
-  // retry).
-  archiveEvents(req.transcriptPath, allEvents, removeSet);
-
   // Atomic write: stage the new content in a sibling temp file and rename
   // into place. The rename is atomic at the filesystem level, so the SDK's
   // appender (which re-opens the path on each append) either sees the old
   // file fully or the new file fully — never a half-written state. The
   // post-rename drain below covers appends that land on the old inode after
   // this final tail read.
+  //
+  // The temp name carries pid + uuid (as prune-tools and writeFileAtomicSync
+  // do): `tomo lcm` is a CLI, so two invocations — an agent-triggered compact
+  // and a hand-run one, or two sessions' housekeeping turns — can be staging
+  // over the same session file at once, and a shared `.compacting.tmp` means
+  // one writes into the file the other is about to publish. And a staging that
+  // throws unlinks its own corpse instead of leaving it beside the transcript.
   const output = newEvents.map(serializeJsonlRecord).join("\n") + "\n";
-  const tmp = path + ".compacting.tmp";
-  writeFileSync(tmp, output);
-  req.beforeRenameForTest?.();
-  renameSync(tmp, path);
+  const tmp = `${path}.${process.pid}.${randomUUID()}.compacting.tmp`;
+  try {
+    writeFileSync(tmp, output);
+    req.beforeRenameForTest?.();
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
   req.afterRenameForTest?.();
+
+  // Archive removed events to the transcript only once the rename has
+  // COMMITTED. Done earlier — as it was — a compact that then failed to stage
+  // or publish its output left the archive holding events that are still in
+  // the session file, and the retry archived them a second time. Everything
+  // above this line is still undone by simply not renaming.
+  archiveEvents(req.transcriptPath, allEvents, removeSet);
 
   // The final pre-rename tail read still has a tiny race: the SDK can open
   // the old path just before our rename and complete an append to that old

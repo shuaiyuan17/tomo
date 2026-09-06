@@ -666,6 +666,24 @@ describe("skillsCanUseTool", () => {
     expect(await allow("Bash", { command: "ls /tmp" })).toBe("deny");
   });
 
+  it("denies a Bash command that moves the working directory", async () => {
+    // Every relative token here is resolved against the WORKSPACE, so the
+    // `cd` was invisible: `../settings.local.json` read as `/settings.local.json`,
+    // which is in no protected tree, and the command was ALLOWED. Run for real
+    // it deletes `/ws/.claude/settings.local.json`.
+    expect(await allow("Bash", { command: "cd /ws/.claude/skills && rm -rf ../settings.local.json" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "cd /ws/.claude/skills && rm -rf tomo-x" })).toBe("deny");
+  });
+
+  it("denies a Bash token with a .. segment", async () => {
+    expect(await allow("Bash", { command: "rm -rf /ws/.claude/skills/../agents" })).toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md ../a.md" })).toBe("deny");
+    // `..` as a SEGMENT, not as a substring — an ordinary name that merely
+    // contains dots is still housekeeping.
+    expect(await allow("Bash", { command: "touch /ws/.claude/skills/a..b.md" })).toBe("allow");
+  });
+
   it("denies a Bash command whose target the shell would construct", async () => {
     expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md $DEST" })).toBe("deny");
     expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md ~/.claude/settings.json" })).toBe("deny");

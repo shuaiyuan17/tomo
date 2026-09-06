@@ -86,6 +86,18 @@ function landsInProtectedNonSkills(p: string): boolean {
   return PROTECTED_ROOTS.some((root) => isInsideExact(real, realDir(root, config.workspaceDir) ?? root));
 }
 
+/** Words that move the shell's working directory. Every relative token after
+ *  one of these is resolved against a cwd this predicate does not know, so a
+ *  command containing any of them is refused outright — the same call `$`,
+ *  backtick and `~` already get. */
+const CHANGES_DIRECTORY = new Set(["cd", "pushd", "popd", "chdir"]);
+
+/** A token with `..` as a path SEGMENT — `../x`, `a/../../b`, a bare `..`.
+ *  Not a substring test: `..foo` and `a..b` are ordinary names. */
+function hasDotDotSegment(token: string): boolean {
+  return token.split("/").includes("..");
+}
+
 /**
  * May this Bash command be auto-approved as skill-library housekeeping?
  *
@@ -97,11 +109,30 @@ function landsInProtectedNonSkills(p: string): boolean {
  * how a mention of the skills path smuggles a `~/.claude/...` target past a
  * token scan. Everything else is denied, which costs the caller a permission
  * prompt rather than a capability.
+ *
+ * TWO MORE WORDS THIS CANNOT SEE, and they belong in that same list.
+ *
+ * `cd` moves the cwd, and every relative token is resolved here against the
+ * WORKSPACE — a fixed root that has nothing to do with where the command will
+ * actually run. `cd /ws/.claude/skills && rm -rf ../settings.local.json` was
+ * ALLOWED: the first token lands in skills, and `../settings.local.json`
+ * resolved against `/ws` is `/settings.local.json`, which is in no protected
+ * tree at all. Run for real it deletes the permissions file the SDK routed
+ * this callback here to protect. Any `cd`/`pushd`/`popd` is now refused.
+ *
+ * And `..` in any token, whatever the cwd turns out to be. A traversal that
+ * happens to land back inside a protected tree is already caught by
+ * `landsInProtectedNonSkills`, but that check only answers for the one root
+ * this predicate guessed; a `..` token is by construction a path whose target
+ * depends on a directory this code does not know, which is exactly the class
+ * of word the paragraph above refuses.
  */
 function bashStaysInSkills(cmd: string): boolean {
   if (/[$`~]/.test(cmd)) return false;
   let touchesSkills = false;
   for (const token of bashTokens(cmd)) {
+    if (CHANGES_DIRECTORY.has(token)) return false;
+    if (hasDotDotSegment(token)) return false;
     // Flags and comment markers name no path.
     if (token.startsWith("-") || token === "#") continue;
     if (landsInSkills(token)) {

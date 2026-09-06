@@ -903,6 +903,21 @@ export class ImsgChannel implements Channel {
       const line = chunk.trim();
       if (line) log.debug({ imsg: line }, "imsg rpc stderr");
     });
+    // THE WRITE SIDE NEEDS A LISTENER TOO. A pipe to a dead child emits
+    // 'error' (EPIPE/ERR_STREAM_DESTROYED) on `stdin`, and an 'error' with no
+    // listener on a stream is an uncaughtException — which, since the daemon
+    // installs process-level handlers, logs and exits 1. The race is ordinary:
+    // `killChild`/`recoverFromGap` tear the child down while a read receipt or
+    // a typing tick is mid-write, and the whole daemon dies because one
+    // fire-and-forget write lost a race with a restart it caused.
+    //
+    // Nothing to recover here: `enqueueWrite`'s write callback already fails
+    // the owning request, and `handleChildDown` rejects everything still
+    // pending, so this listener exists purely to keep the emitter handled.
+    // Debug, not warn: a broken pipe to a child we just killed is expected.
+    child.stdin.on("error", (err) => {
+      log.debug({ err }, "imsg rpc stdin error (write to a closed child pipe)");
+    });
     child.on("error", (err) => {
       log.error({ err }, "imsg rpc child failed to spawn");
       this.handleChildDown(child, `spawn error: ${err.message}`);

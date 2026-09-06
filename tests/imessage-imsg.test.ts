@@ -3002,6 +3002,33 @@ describe("imsg outbound RPC param-name contract", () => {
 // --- Child lifecycle --------------------------------------------------------------
 
 describe("imsg rpc child lifecycle", () => {
+  it("survives an 'error' on the child's stdin instead of taking the daemon down", async () => {
+    // A write onto the pipe of a child that has just died — `killChild` or
+    // gap recovery racing an in-flight read receipt or typing tick — emits
+    // 'error' on `child.stdin`. Nothing listened on that stream, and an
+    // unhandled 'error' on an EventEmitter throws: as an uncaughtException it
+    // reaches the daemon's process handler, which logs and exits 1. The whole
+    // assistant went down because one fire-and-forget write lost a race with
+    // a restart it had itself provoked.
+    const debugSpy = vi.spyOn(log, "debug");
+    const { channel, children } = makeChannel();
+    await channel.start();
+
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    // `emit("error")` on an emitter with no 'error' listener throws here, the
+    // same way the real stream's does inside Node's I/O callback.
+    expect(() => children[0].stdin.emit("error", epipe)).not.toThrow();
+    expect(debugSpy.mock.calls.some(
+      ([obj, msg]) => msg === "imsg rpc stdin error (write to a closed child pipe)"
+        && (obj as { err?: unknown }).err === epipe,
+    )).toBe(true);
+
+    // And the channel is still usable: the listener swallows the pipe error,
+    // it does not tear anything down on its own.
+    await channel.send({ chatId: DM_GUID, text: "still here" });
+    await channel.stop();
+  });
+
   it("restarts the child with backoff after a crash and resubscribes from the cursor", async () => {
     vi.useFakeTimers();
     const { channel, children, spawnFn } = makeChannel({ config: { restartDelaysMs: [1_000, 5_000] } });

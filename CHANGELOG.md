@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- **A write to the `imsg` rpc child's pipe after it died no longer takes the daemon down.** `spawnChildAndSubscribe` wired `stdout`, `stderr`, `exit` and `error` on the child but nothing on `child.stdin`, and a pipe to a dead child emits `'error'` (EPIPE, ERR_STREAM_DESTROYED) on the write side. An unhandled `'error'` on a stream is an uncaughtException, which the daemon's process handler logs and exits 1 on — so `killChild` or gap recovery racing an in-flight read receipt or typing tick killed every channel. The stream now carries a debug-level listener; nothing else changes, because `enqueueWrite`'s write callback already fails the owning request and `handleChildDown` rejects the rest.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

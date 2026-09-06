@@ -1950,6 +1950,12 @@ describe("imsg sticker sends", () => {
 
     await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" }))
       .rejects.toThrow(AttachmentUnreadableError);
+    // ...and says what is actually wrong. The default "Attachment file not
+    // found: CAACAgIAAxk…" reads as a missing PATH and sends whoever is
+    // holding the log hunting for a file that was never named; a channel-bound
+    // Telegram id is not a path at all.
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" }))
+      .rejects.toThrow("Sticker reference is not a file path: CAACAgIAAxkBAAIBOWX1abc123");
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
     await channel.stop();
@@ -1966,6 +1972,10 @@ describe("imsg sticker sends", () => {
     // risking a double-send.
     await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
       .rejects.toMatchObject({ code: "ENOENT", path: "/nonexistent/sticker.png" });
+    // A path that isn't there keeps the default wording — that one IS a
+    // missing file.
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
+      .rejects.toThrow("Attachment file not found: /nonexistent/sticker.png");
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
     await channel.stop();

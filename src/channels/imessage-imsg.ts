@@ -2136,7 +2136,7 @@ export class ImsgChannel implements Channel {
     // delivery-pipeline.ts fall back without risking a double-send.
     if (!sticker.startsWith("/") && !sticker.startsWith("~")) {
       log.warn({ chatId: chatGuid }, "Non-path sticker value on iMessage channel (Telegram file_ids are channel-bound)");
-      throw new AttachmentUnreadableError(sticker);
+      throw new AttachmentUnreadableError(sticker, `Sticker reference is not a file path: ${sticker}`);
     }
     // Expand a leading `~` ourselves: imsg's send.sticker expands it too, but
     // the fallback plain `send` may not, and our own existence check below

@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, renameSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
+import { writeFileAtomicSync } from "./fs-utils.js";
 import { defaultRuntimePaths } from "./runtime-paths.js";
 import { log } from "./logger.js";
 import { canonicalTimeZone, validTimeZone } from "./timezone.js";
@@ -172,6 +173,13 @@ function loadDir(dir: string, isPrivate: boolean, budget: { remaining: number })
       if (parsed) {
         records.push(parsed);
         budget.remaining--;
+      } else {
+        // A `.md` file in the people directory with no usable `name:` is
+        // either hand-written wrong or TORN — the shape a half-finished write
+        // leaves behind. Either way the person stops being recognised, and
+        // before this the only symptom was that they quietly stopped being
+        // recognised. Say so, once per load, naming the file to repair.
+        log.warn({ filePath }, "Person file has no usable frontmatter; skipping");
       }
     } catch (err) {
       log.warn({ err, filePath }, "Failed to read person file");
@@ -343,9 +351,23 @@ function slugForName(name: string): string {
   return slug || "person";
 }
 
+/**
+ * Write a person record, ATOMICALLY.
+ *
+ * This runs on the MESSAGE path — `upsert_person` from a turn, and the
+ * auto-binding that happens the first time a group sender's display name
+ * matches an unbound record — so it is racing every reader of the same file:
+ * `loadDir` on the next inbound message, another `upsert_person`, `tomo`
+ * itself restarting. A plain `writeFileSync` truncates first and fills after,
+ * so a reader landing in that window sees a file with no frontmatter, or half
+ * of it: `parsePersonFile` returns undefined and the person silently stops
+ * being recognised — and a crash in the same window leaves the record in that
+ * state permanently, with nothing but the ambient "Failed to read person file"
+ * silence to say so. Write-then-rename makes the swap indivisible.
+ */
 export function savePersonRecord(record: PersonRecord): void {
   mkdirSync(dirname(record.filePath), { recursive: true });
-  writeFileSync(record.filePath, serializePersonRecord(record), "utf-8");
+  writeFileAtomicSync(record.filePath, serializePersonRecord(record));
 }
 
 export interface UpsertPersonInput {

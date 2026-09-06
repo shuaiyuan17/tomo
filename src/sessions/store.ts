@@ -999,7 +999,15 @@ export class SessionStore {
 
     if (expired.length > 0) {
       this.registry = this.registry.filter((e) => e.expiresAt === null || e.expiresAt > now);
-      this.saveRegistry();
+      // BEST-EFFORT, because of the header above: this runs from the
+      // constructor, and a bare `saveRegistry()` throws on any write failure
+      // (ENOSPC, EACCES, a read-only volume) — which means `new
+      // SessionStore()` throws, which means the daemon does not start and
+      // cannot receive a message on any channel, over housekeeping that was
+      // never urgent. The SDK files are already unlinked at this point, so
+      // the entries left on disk name transcripts that no longer exist:
+      // harmless, and swept again on the next start once the write works.
+      this.saveRegistryBestEffort("cleanupExpired");
       log.info({ count: expired.length }, "Cleaned up expired sessions");
     }
   }

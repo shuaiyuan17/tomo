@@ -135,7 +135,9 @@ interface ParsedEvent {
   /** "text" | "tool_use" | "tool_result" | "thinking" */
   activity: "conversation" | "tool";
   tokens: number;
-  toolName?: string;
+  /** Every tool this ONE message called. An assistant message can carry
+   *  several tool_use blocks; it is still one message with one token count. */
+  toolNames?: string[];
 }
 
 /**
@@ -168,6 +170,7 @@ export function computeContextStats(
 
       const hasToolUse = content.some((c: any) => c?.type === "tool_use");
       const hasText = content.some((c: any) => c?.type === "text" && c.text?.trim());
+      const hasThinking = content.some((c: any) => c?.type === "thinking" && c.thinking?.trim());
 
       // Estimate tokens from content
       let tokens = 0;
@@ -181,17 +184,24 @@ export function computeContextStats(
         else if (c?.type === "thinking") tokens += estimateTokens(c.thinking ?? "");
       }
 
+      // ONE event per message, whatever it contains. Pushing one per tool_use
+      // — each carrying the WHOLE message's token count — multiplied a
+      // parallel-tool turn's tokens by its tool count and inflated its share
+      // of every section it touched, so `tomo lcm stats` reported tool-heavy
+      // ranges as far bigger than they are and pointed compaction at the
+      // wrong ones. The per-tool detail lives in `toolNames`, which is what
+      // the section's tool tally reads.
       if (hasToolUse) {
-        for (const name of toolNames) {
-          events.push({
-            type: "assistant",
-            timestamp,
-            activity: "tool",
-            tokens,
-            toolName: name,
-          });
-        }
-      } else if (hasText) {
+        events.push({
+          type: "assistant",
+          timestamp,
+          activity: "tool",
+          tokens,
+          toolNames,
+        });
+      } else if (hasText || hasThinking) {
+        // Thinking-only assistant messages used to be dropped entirely — real
+        // tokens, sitting in the window, missing from every section's total.
         events.push({
           type: "assistant",
           timestamp,
@@ -258,8 +268,8 @@ export function computeContextStats(
 
     for (const ev of slice) {
       totalTokens += ev.tokens;
-      if (ev.toolName) {
-        toolNames.set(ev.toolName, (toolNames.get(ev.toolName) || 0) + 1);
+      for (const name of ev.toolNames ?? []) {
+        toolNames.set(name, (toolNames.get(name) || 0) + 1);
         toolCallCount++;
       }
     }

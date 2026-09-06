@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { estimateTokens, resolveTimeRange } from "../src/lcm/stats.js";
+import { computeContextStats, estimateTokens, resolveTimeRange } from "../src/lcm/stats.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -110,5 +110,82 @@ describe("resolveTimeRange", () => {
   it("returns null when no events fall inside the range", () => {
     writeEvents([mkEvent("user", new Date(2026, 3, 30, 10, 0), "hi")]);
     expect(resolveTimeRange(sessionId, "2026-05-02", "2026-05-03", sdkSessionsDir)).toBeNull();
+  });
+});
+
+describe("computeContextStats", () => {
+  let sessionId: string;
+  let sdkSessionsDir: string;
+  let path: string;
+
+  beforeEach(() => {
+    sessionId = `test-ctxstats-${randomUUID()}`;
+    sdkSessionsDir = join(tmpdir(), `tomo-test-ctxstats-${randomUUID()}`);
+    path = getSdkSessionPath(sessionId, sdkSessionsDir);
+    mkdirSync(dirname(path), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(sdkSessionsDir, { recursive: true, force: true });
+  });
+
+  const write = (events: object[]) =>
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  it("counts a parallel-tool message once, not once per tool call", () => {
+    // One assistant message that fires three tools at once — the shape of any
+    // parallel Read/Grep fan-out. It is ONE message holding ~300 tokens of
+    // tool input; counting it once per tool_use tripled it, and `tomo lcm
+    // stats` then reported tool-heavy ranges as far bigger than they are.
+    const ts = new Date(2026, 3, 30, 12, 0, 0).toISOString();
+    const input = { pattern: "x".repeat(380) }; // ~100 tokens of JSON per call
+    write([
+      {
+        type: "assistant",
+        uuid: randomUUID(),
+        timestamp: ts,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "t1", name: "Read", input },
+            { type: "tool_use", id: "t2", name: "Grep", input },
+            { type: "tool_use", id: "t3", name: "Read", input },
+          ],
+        },
+      },
+    ]);
+
+    const stats = computeContextStats(sessionId, sdkSessionsDir)!;
+    expect(stats).not.toBeNull();
+
+    const oneMessage = estimateTokens(JSON.stringify(input)) * 3;
+    expect(stats.totalMessages).toBe(1);
+    expect(stats.totalTokens).toBe(oneMessage);
+    expect(stats.sections).toHaveLength(1);
+    expect(stats.sections[0].tokens).toBe(oneMessage);
+    expect(stats.sections[0].messageCount).toBe(1);
+    // The per-tool detail is still there — it just isn't a token multiplier.
+    expect(stats.sections[0].toolCallCount).toBe(3);
+    expect(stats.sections[0].toolsUsed.sort()).toEqual(["Grep:1", "Read:2"]);
+  });
+
+  it("counts a thinking-only assistant message instead of dropping it", () => {
+    // Extended thinking with no text and no tool call: real tokens sitting in
+    // the window that every section total used to omit.
+    const ts = new Date(2026, 3, 30, 12, 0, 0).toISOString();
+    const thinking = "reasoning ".repeat(100);
+    write([
+      {
+        type: "assistant",
+        uuid: randomUUID(),
+        timestamp: ts,
+        message: { role: "assistant", content: [{ type: "thinking", thinking }] },
+      },
+    ]);
+
+    const stats = computeContextStats(sessionId, sdkSessionsDir)!;
+    expect(stats.totalMessages).toBe(1);
+    expect(stats.totalTokens).toBe(estimateTokens(thinking));
+    expect(stats.sections[0].type).toBe("conversation");
   });
 });

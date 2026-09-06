@@ -33,9 +33,21 @@ const TRANSCRIPT_ROTATE_BYTES = 2 * 1024 * 1024;
  * one caller is rotation, which runs inside `get()`, which every inbound
  * message goes through — so "this record has no month" has to be a value the
  * caller can keep, not an exception that stops the session from receiving.
+ *
+ * A STRING IS A SHAPE THIS HAS TO ARCHIVE, not one to give up on. An ISO
+ * timestamp is exactly what the older-writer case above names, `new Date(x)`
+ * has always parsed it, and rejecting it on type alone moved those records
+ * from "archived under their real month" to "undated, kept in the active
+ * file forever" — a transcript that can never shrink below the rows a former
+ * version of Tomo wrote. Numbers and parseable strings both resolve; only a
+ * missing, non-finite or unparseable value is null.
  */
 function monthOf(timestamp: unknown): string | null {
-  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return null;
+  if (typeof timestamp === "number") {
+    if (!Number.isFinite(timestamp)) return null;
+  } else if (typeof timestamp !== "string") {
+    return null;
+  }
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return null;
   return date.toISOString().slice(0, 7);
@@ -1644,7 +1656,19 @@ export class SessionStore {
     // is how one of them ends up renaming a path the other already moved.
     // pid + random matches writeFileAtomicSync (fs-utils.ts) and pruneTools.
     const tmp = `${file}.rotate-tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
-    writeFileSync(tmp, keep.length > 0 ? keep.map(serializeJsonlRecord).join("\n") + "\n" : "");
+    // A FAILED WRITE STILL LEAVES A FILE. ENOSPC/EACCES/EIO can throw after
+    // the path has been created, and with a unique name per pass nothing ever
+    // overwrites the corpse — every failing rotation drops another
+    // `.rotate-tmp.<pid>.<uuid>` beside the transcript. The caller's catch
+    // (see `rotateTranscript`) turns the throw into "don't rotate", so this
+    // is the only place that still knows the name. Every other abandon path
+    // below unlinks; so does this one, then rethrows unchanged.
+    try {
+      writeFileSync(tmp, keep.length > 0 ? keep.map(serializeJsonlRecord).join("\n") + "\n" : "");
+    } catch (err) {
+      try { unlinkSync(tmp); } catch { /* best-effort */ }
+      throw err;
+    }
 
     // SPLICE LATE APPENDS. Everything appended between our read and this line
     // is not in `tmp` — on the old code the rename below erased it,

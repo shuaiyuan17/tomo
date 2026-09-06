@@ -35,6 +35,10 @@ const env = vi.hoisted(() => {
       failLockOpen: null as string | null,
       /** Make renameSync of the rewritten temp file fail. */
       failTempRename: false,
+      /** Make writeFileSync of the rewritten temp file fail, AFTER the path
+       *  has been created — which is what a real ENOSPC/EIO mid-write looks
+       *  like on disk. */
+      failTempWrite: false,
       /** Make appendFileSync onto the rewritten temp file fail. */
       failTempAppend: false,
       /** Make appendFileSync onto a month archive fail. */
@@ -57,6 +61,14 @@ vi.mock("node:fs", async (orig) => {
     // but before it is renamed into place — the window a concurrent appender
     // or a second rotator lives in.
     writeFileSync: ((path: unknown, data: unknown, opts?: unknown) => {
+      if (env.hooks.failTempWrite && typeof path === "string" && path.includes(".rotate-tmp")) {
+        // Create the file, then fail: a write that dies partway leaves the
+        // path behind, and the corpse is the whole point of the test.
+        (actual.writeFileSync as (...a: unknown[]) => unknown)(path, "");
+        const err = new Error(`ENOSPC: no space left on device, write '${path}'`);
+        (err as NodeJS.ErrnoException).code = "ENOSPC";
+        throw err;
+      }
       const result = (actual.writeFileSync as (...a: unknown[]) => unknown)(path, data, opts);
       if (typeof path === "string" && path.includes(".rotate-tmp")) env.hooks.onRotateTempWritten?.();
       return result;
@@ -170,6 +182,7 @@ function resetHooks(): void {
   env.hooks.onRenamed = null;
   env.hooks.failLockOpen = null;
   env.hooks.failTempRename = false;
+  env.hooks.failTempWrite = false;
   env.hooks.failTempAppend = false;
   env.hooks.failArchiveAppend = false;
   logLines.warn.length = 0;
@@ -548,6 +561,51 @@ describe("transcript rotation never blocks the inbound path", () => {
     // Rotation still did its job for the records that *do* have a month.
     expect(existsSync(BIG_ARCHIVE_JAN)).toBe(true);
     expect(active.some((c) => c.startsWith("jan "))).toBe(false);
+    expect(logLines.warn.join("\n")).toContain("without a usable timestamp");
+  });
+
+  it("leaves no temp file behind when the rewrite itself fails", () => {
+    // `writeFileSync(tmp, ...)` is a bare call: ENOSPC on a full disk, EIO on
+    // a failing volume — and it can die AFTER the path exists. The outer
+    // catch turns the throw into "don't rotate", so nothing downstream ever
+    // learns the name; with a unique tmp name per pass, every failing
+    // rotation used to drop another `.rotate-tmp.<pid>.<uuid>` beside the
+    // transcript, forever. Every other abandon path unlinks; so must this one.
+    env.hooks.failTempWrite = true;
+    const before = readFileSync(TRANSCRIPT, "utf-8");
+
+    expect(() => store().get("test")).not.toThrow();
+    expect(() => store().append("test", msg({ content: "inbound during the outage" }))).not.toThrow();
+
+    expect(readFileSync(TRANSCRIPT, "utf-8").startsWith(before)).toBe(true);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-"))).toEqual([]);
+    expect(logLines.warn.join("\n")).toContain("Transcript rotation failed");
+
+    // And the next pass, with the disk back, rotates normally.
+    env.hooks.failTempWrite = false;
+    store().get("test");
+    expect(contentsOf(activeLines())).toEqual(["now one", "inbound during the outage"]);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-"))).toEqual([]);
+  });
+
+  it("archives a record whose timestamp is an ISO string, not a number", () => {
+    // `monthOf` names an older writer's shape in its own doc comment, and
+    // `new Date(x)` has always parsed an ISO string. Rejecting one on type
+    // alone moved those records from "archived under their real month" to
+    // "undated, kept in the active file" — a transcript that can never shrink
+    // below the rows a former version of Tomo wrote.
+    mkdirSync(env.dir, { recursive: true });
+    const stringDated = { ...msg({ content: "jan as a string", seq: 1 }), timestamp: new Date(JAN).toISOString() };
+    const unparseable = { ...msg({ content: "not a date at all", seq: 2 }), timestamp: "last thursday-ish" };
+    writeFileSync(TRANSCRIPT, [stringDated, unparseable, msg({ content: "now one", seq: 3 })]
+      .map((m) => JSON.stringify(m)).join("\n") + "\n");
+
+    expect(() => store().get("test")).not.toThrow();
+
+    // The parseable string was filed under its real month...
+    expect(contentsOf(linesOf(ARCHIVE_JAN))).toEqual(["jan as a string"]);
+    // ...and only the genuinely unreadable one stayed behind as undated.
+    expect(contentsOf(activeLines())).toEqual(["not a date at all", "now one"]);
     expect(logLines.warn.join("\n")).toContain("without a usable timestamp");
   });
 

@@ -915,8 +915,22 @@ export class ImsgChannel implements Channel {
     // the owning request, and `handleChildDown` rejects everything still
     // pending, so this listener exists purely to keep the emitter handled.
     // Debug, not warn: a broken pipe to a child we just killed is expected.
+    // THE READ SIDES TOO. Same class, same consequence: `stdout`/`stderr` are
+    // streams, an unhandled 'error' on either is an uncaughtException, and a
+    // child torn down mid-read (killChild, recoverFromGap, a crash) is the
+    // ordinary way EPIPE/ECONNRESET arrives on a pipe we are still reading.
+    // Only `stdin` was covered, so the same race on the other two pipes still
+    // took the daemon down. Nothing to recover here either — `handleChildDown`
+    // (via 'error'/'exit' below) owns the restart; these keep the emitters
+    // handled so the process survives long enough for it to run.
     child.stdin.on("error", (err) => {
       log.debug({ err }, "imsg rpc stdin error (write to a closed child pipe)");
+    });
+    child.stdout.on("error", (err) => {
+      log.debug({ err }, "imsg rpc stdout error (read from a closed child pipe)");
+    });
+    child.stderr.on("error", (err) => {
+      log.debug({ err }, "imsg rpc stderr error (read from a closed child pipe)");
     });
     child.on("error", (err) => {
       log.error({ err }, "imsg rpc child failed to spawn");

@@ -6,7 +6,7 @@ import {
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import {
   writeFileSync, mkdirSync, unlinkSync, existsSync, appendFileSync, readFileSync, statSync,
-  openSync, writeSync, closeSync, rmSync, readdirSync,
+  openSync, writeSync, closeSync, rmSync, readdirSync, utimesSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -228,7 +228,7 @@ describe("compactSession", () => {
   /** Any staging file left beside the session file — the name is per-call. */
   const stagingLeftovers = () =>
     (existsSync(dirname(path)) ? readdirSync(dirname(path)) : [])
-      .filter((f) => f.includes(".compacting.tmp"));
+      .filter((f) => f.endsWith(".tmp"));
 
   it("writes atomically via rename — no .compacting.tmp leftover on success", () => {
     const events: any[] = [];
@@ -496,7 +496,8 @@ describe("compactSession", () => {
     if (existsSync(sharedName)) unlinkSync(sharedName);
   });
 
-  it("archives nothing when the rewrite fails after the archive point", () => {
+  /** Five linked events written to `path`; events 1..3 are the compact range. */
+  const seedFiveEvents = (): any[] => {
     const events: any[] = [];
     let parent: string | null = null;
     for (let i = 0; i < 5; i++) {
@@ -509,24 +510,123 @@ describe("compactSession", () => {
     }
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    return events;
+  };
 
-    // The session directory disappears between staging and rename (the shape
-    // of any late failure: ENOSPC, EACCES, a cleanup racing the write). The
-    // compact never commits — so nothing may have been archived, or the retry
-    // writes those events into the transcript a second time.
+  const archiveLines = () =>
+    (existsSync(archivePath) ? readFileSync(archivePath, "utf-8") : "")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+  it("reports an archive failure instead of throwing, and leaves the session untouched", () => {
+    seedFiveEvents();
+    const before = readFileSync(path, "utf-8");
+
+    // The transcript's parent is a regular file, so appending to it raises
+    // ENOTDIR — standing in for the real shapes (ENOSPC, EACCES, a transcript
+    // directory that got replaced). Archiving AFTER the rename would have
+    // committed the rewrite first: the events would be in neither the session
+    // nor the archive, the post-rename drain and the compact trigger would be
+    // skipped, and the caller would get a raw stack instead of a result it
+    // could print as {"status":"error"}.
+    const notADir = join(tmpdir(), `not-a-dir-${randomUUID()}`);
+    writeFileSync(notADir, "i am a file\n");
+    try {
+      const result = compactSession({
+        sdkSessionId: sessionId,
+        sdkSessionsDir,
+        fromIdx: 1,
+        toIdx: 3,
+        summary: "never committed",
+        transcriptPath: join(notADir, "archive.jsonl"),
+      });
+
+      expect(result.success).toBe(false);            // → CLI prints {"status":"error"}
+      expect(result.error).toMatch(/could not archive/i);
+      // The session file is byte-identical: nothing was removed, so nothing
+      // needed archiving in the first place.
+      expect(readFileSync(path, "utf-8")).toBe(before);
+      expect(stagingLeftovers()).toEqual([]);
+      // No trigger either — there is nothing for the harness to reload.
+      expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(false);
+    } finally {
+      rmSync(notADir, { force: true });
+    }
+  });
+
+  it("re-running a compact over an already-archived range does not duplicate transcript lines", () => {
+    const events = seedFiveEvents();
+    const before = readFileSync(path, "utf-8");
+
+    // First attempt: the archive lands, then publishing the rewrite fails
+    // (ENOSPC/EACCES/a cleanup racing the write). The session file still holds
+    // events 1..3, so the retry below asks for exactly the same range again.
     expect(() => compactSession({
       sdkSessionId: sessionId,
       sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
-      summary: "never committed",
+      summary: "never published",
       transcriptPath: archivePath,
-      beforeRenameForTest: () => {
-        rmSync(sdkSessionsDir, { recursive: true, force: true });
-      },
-    })).toThrow();
+      beforeRenameForTest: () => { throw new Error("ENOSPC: no space left on device"); },
+    })).toThrow(/ENOSPC/);
 
-    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe(before);
+    expect(stagingLeftovers()).toEqual([]);
+    const afterFirst = archiveLines();
+    expect(afterFirst.map((e) => e.uuid)).toEqual([events[1].uuid, events[2].uuid, events[3].uuid]);
+
+    // The retry. Every one of these uuids is already in the archive tail, so
+    // the transcript must be unchanged — without the dedupe the same three
+    // events land a second time and the archive says the conversation
+    // happened twice.
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      summary: "published this time",
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(true);
+    const afterRetry = archiveLines();
+    expect(afterRetry.map((e) => e.uuid)).toEqual([events[1].uuid, events[2].uuid, events[3].uuid]);
+    // And the session itself did get compacted.
+    const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(out).toHaveLength(3);
+    expect(out[1].isCompactSummary).toBe(true);
+  });
+
+  it("sweeps staging corpses older than an hour, and leaves fresh ones alone", () => {
+    seedFiveEvents();
+
+    // A full copy of the session left behind by a compact that was SIGKILLed
+    // between the write and the rename. Nothing will ever read it again.
+    const corpse = `${path}.99999.${randomUUID()}.compacting.tmp`;
+    const oldAtomic = `${path}.99998.${randomUUID()}.tmp`;
+    const fresh = `${path}.99997.${randomUUID()}.tmp`;
+    for (const f of [corpse, oldAtomic, fresh]) writeFileSync(f, "stale copy\n");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(corpse, twoHoursAgo, twoHoursAgo);
+    utimesSync(oldAtomic, twoHoursAgo, twoHoursAgo);
+
+    const result = compactSession({
+      sdkSessionId: sessionId,
+      sdkSessionsDir,
+      fromIdx: 1,
+      toIdx: 3,
+      summary: "compacted middle",
+      transcriptPath: archivePath,
+    });
+
+    expect(result.success).toBe(true);
+    expect(existsSync(corpse)).toBe(false);
+    expect(existsSync(oldAtomic)).toBe(false);
+    // A concurrent compact's staging file is seconds old — never sweep that.
+    expect(existsSync(fresh)).toBe(true);
+    // The session file is not a `.jsonl.<something>.tmp`, so it is untouched.
+    expect(existsSync(path)).toBe(true);
+    unlinkSync(fresh);
   });
 
   it("re-stitches parentUuid on post-range events whose parent was removed", () => {

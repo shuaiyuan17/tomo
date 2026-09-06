@@ -1,10 +1,11 @@
 import {
   writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
-  openSync, fstatSync, readSync, closeSync, renameSync,
+  openSync, fstatSync, readSync, closeSync, readdirSync, statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine } from "../jsonl.js";
 
@@ -105,6 +106,14 @@ interface SdkEvent {
  * summary message, fixes the parentUuid chain, and archives the originals.
  */
 export function compactSession(req: CompactRequest): CompactResult {
+  // Before anything else: clear out staging corpses. A compact/prune killed
+  // between writing its temp file and renaming it (SIGKILL, an OOM, a laptop
+  // lid) leaves a FULL COPY of the session file behind under a name nothing
+  // will ever look at again, and these sessions run to tens of megabytes. The
+  // in-process error paths already unlink their own, so anything still here
+  // after an hour belongs to a process that is not coming back.
+  sweepStaleStagingFiles(req.sdkSessionsDir);
+
   const path = getSdkSessionPath(req.sdkSessionId, req.sdkSessionsDir);
   if (!existsSync(path)) {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
@@ -397,6 +406,44 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     };
   }
 
+  // Archive the removed events to the transcript BEFORE the rewrite is
+  // published. The ordering picks between two failure modes and this is the
+  // recoverable one:
+  //
+  //   archive-after-rename: the rename commits, then the archive throws
+  //     (ENOSPC, EACCES, a transcript directory that is not a directory) —
+  //     and the events are gone. They are not in the session file any more
+  //     and they never reached `_archive_<sdkSessionId>.jsonl`. The throw
+  //     also skips the post-rename old-inode drain and the trigger file, and
+  //     escapes `compactSession` as a raw stack rather than a result the CLI
+  //     can print as `{"status":"error"}`. Nothing recovers that.
+  //
+  //   archive-before-rename: the archive lands, the rewrite then fails, and
+  //     the transcript holds events that are still in the session too. The
+  //     retry used to append them a second time — which is why this moved.
+  //     `archiveEvents` now skips uuids already present in the archive tail,
+  //     so the retry is a no-op and the duplicate never happens.
+  //
+  // A failure here is therefore reported, not thrown, and leaves the session
+  // file exactly as it was: everything above this line is undone by simply
+  // not renaming.
+  try {
+    archiveEvents(req.transcriptPath, allEvents, removeSet);
+  } catch (err) {
+    log.warn({
+      err,
+      sessionId: req.sdkSessionId,
+      transcriptPath: req.transcriptPath,
+    }, "Compact aborted: could not archive the removed events");
+    return {
+      success: false,
+      eventsRemoved: 0,
+      eventsAfter: allEvents.length,
+      error: `Could not archive removed events to ${req.transcriptPath}: ` +
+        `${err instanceof Error ? err.message : String(err)}; session left unchanged`,
+    };
+  }
+
   // Atomic write: stage the new content in a sibling temp file and rename
   // into place. The rename is atomic at the filesystem level, so the SDK's
   // appender (which re-opens the path on each append) either sees the old
@@ -404,30 +451,16 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // post-rename drain below covers appends that land on the old inode after
   // this final tail read.
   //
-  // The temp name carries pid + uuid (as prune-tools and writeFileAtomicSync
-  // do): `tomo lcm` is a CLI, so two invocations — an agent-triggered compact
-  // and a hand-run one, or two sessions' housekeeping turns — can be staging
-  // over the same session file at once, and a shared `.compacting.tmp` means
-  // one writes into the file the other is about to publish. And a staging that
-  // throws unlinks its own corpse instead of leaving it beside the transcript.
+  // `writeFileAtomicSync` is that staging, and its temp name carries pid +
+  // uuid: `tomo lcm` is a CLI, so two invocations — an agent-triggered
+  // compact and a hand-run one, or two sessions' housekeeping turns — can be
+  // staging over the same session file at once, and one fixed staging name
+  // means one writes into the file the other is about to publish. It also
+  // unlinks its own corpse on failure instead of leaving a full copy of the
+  // session beside it, and preserves the file's mode across the rename.
   const output = newEvents.map(serializeJsonlRecord).join("\n") + "\n";
-  const tmp = `${path}.${process.pid}.${randomUUID()}.compacting.tmp`;
-  try {
-    writeFileSync(tmp, output);
-    req.beforeRenameForTest?.();
-    renameSync(tmp, path);
-  } catch (err) {
-    try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
-    throw err;
-  }
+  writeFileAtomicSync(path, output, { beforeRename: req.beforeRenameForTest });
   req.afterRenameForTest?.();
-
-  // Archive removed events to the transcript only once the rename has
-  // COMMITTED. Done earlier — as it was — a compact that then failed to stage
-  // or publish its output left the archive holding events that are still in
-  // the session file, and the retry archived them a second time. Everything
-  // above this line is still undone by simply not renaming.
-  archiveEvents(req.transcriptPath, allEvents, removeSet);
 
   // The final pre-rename tail read still has a tiny race: the SDK can open
   // the old path just before our rename and complete an append to that old
@@ -686,17 +719,131 @@ export function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Archive removed events to a transcript JSONL file */
+/** A staging corpse is stale once it is older than this. */
+const STAGING_CORPSE_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Names every session-rewrite staging file this codebase produces:
+ * `<sessionId>.jsonl` plus a per-call suffix and `.tmp` — the
+ * `.<pid>.<uuid>.tmp` of `writeFileAtomicSync`, prune-tools' `.pruning.tmp`,
+ * and the `.compacting.tmp` compact used to write (both the historical fixed
+ * name and the pid+uuid one). Anchored on `.jsonl.` so it can never match a
+ * session file itself.
+ */
+const STAGING_TMP_RE = /\.jsonl\..+\.tmp$/;
+
+/**
+ * Delete session-rewrite staging files older than `maxAgeMs` from `dir`.
+ *
+ * Best-effort and never throws: this is housekeeping in front of the real
+ * work, and a compact must not fail because a directory listing did.
+ * Returns the number of files removed (for logging and tests).
+ */
+export function sweepStaleStagingFiles(
+  dir: string,
+  now: number = Date.now(),
+  maxAgeMs: number = STAGING_CORPSE_MAX_AGE_MS,
+): number {
+  let removed = 0;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return 0; // no directory yet, or unreadable — nothing to sweep
+  }
+  for (const name of entries) {
+    if (!STAGING_TMP_RE.test(name)) continue;
+    const full = join(dir, name);
+    try {
+      // mtime, not ctime: a corpse is never touched again after it is written,
+      // so its last write IS its age.
+      if (now - statSync(full).mtimeMs < maxAgeMs) continue;
+      unlinkSync(full);
+      removed++;
+    } catch { /* raced with another sweep, or not ours to delete */ }
+  }
+  if (removed > 0) log.info({ dir, removed }, "Swept stale session staging files");
+  return removed;
+}
+
+/**
+ * How much of the archive tail to scan for uuids that are already there.
+ *
+ * The duplicate this guards against is a retry of a compact that archived its
+ * range and then failed to publish the rewrite, so the lines it would repeat
+ * are the newest ones in the file — a bounded tail is enough, and the whole
+ * transcript (which grows without limit) is not something to parse on every
+ * compact. Both caps apply; whichever bites first wins.
+ */
+const ARCHIVE_DEDUPE_TAIL_BYTES = 4 * 1024 * 1024;
+const ARCHIVE_DEDUPE_TAIL_LINES = 5000;
+
+/**
+ * uuids of the events in the tail of an existing archive file.
+ *
+ * Best-effort by construction: an unreadable or unparseable archive yields an
+ * empty set, which only means the caller archives the range as it always did.
+ */
+function archivedUuidsInTail(transcriptPath: string): Set<string> {
+  const uuids = new Set<string>();
+  if (!existsSync(transcriptPath)) return uuids;
+  let fd: number | null = null;
+  try {
+    fd = openSync(transcriptPath, "r");
+    const size = fstatSync(fd).size;
+    if (size === 0) return uuids;
+    const want = Math.min(size, ARCHIVE_DEDUPE_TAIL_BYTES);
+    const start = size - want;
+    const buf = Buffer.allocUnsafe(want);
+    let read = 0;
+    while (read < want) {
+      const n = readSync(fd, buf, read, want - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    const lines = buf.subarray(0, read).toString("utf-8").split("\n");
+    // A byte-offset start almost never lands on a line boundary, so the first
+    // chunk is half a line. Drop it rather than fail to parse it.
+    if (start > 0) lines.shift();
+    for (const line of lines.slice(-ARCHIVE_DEDUPE_TAIL_LINES)) {
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as { uuid?: unknown };
+        if (typeof parsed?.uuid === "string") uuids.add(parsed.uuid);
+      } catch { /* a line we cannot read is a line we cannot dedupe on */ }
+    }
+  } catch (err) {
+    log.debug({ err, transcriptPath }, "Could not read the archive tail for dedupe");
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+  return uuids;
+}
+
+/**
+ * Archive removed events to a transcript JSONL file.
+ *
+ * Idempotent over the archive's tail: an event whose uuid is already there is
+ * not written again. That is what lets the archive run BEFORE the session
+ * rewrite is published (see the call site) — a compact that archives and then
+ * fails to publish can simply be re-run, instead of leaving the events in
+ * neither place if the ordering were reversed and the archive threw.
+ */
 function archiveEvents(transcriptPath: string, allEvents: readonly SdkEntry[], removeSet: Set<number>): void {
   const dir = dirname(transcriptPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
+  const alreadyArchived = archivedUuidsInTail(transcriptPath);
   const archiveLines: string[] = [];
+  let skipped = 0;
   for (const idx of Array.from(removeSet).sort((a, b) => a - b)) {
     const event = allEvents[idx];
     // removeSet never contains a carrier — archiving one would write an
     // `{_archived:true}` stub with no payload and claim it was summarized.
     if (isRawJsonlLine(event)) continue;
+    // An event with no uuid cannot be recognised on a retry; archiving it
+    // twice is better than losing it.
+    if (event.uuid && alreadyArchived.has(event.uuid)) { skipped++; continue; }
     archiveLines.push(JSON.stringify({
       _archived: true,
       _archivedAt: new Date().toISOString(),
@@ -705,5 +852,9 @@ function archiveEvents(transcriptPath: string, allEvents: readonly SdkEntry[], r
     }));
   }
 
+  if (skipped > 0) {
+    log.info({ transcriptPath, skipped, archived: archiveLines.length }, "Archive skipped events already in the transcript");
+  }
+  if (archiveLines.length === 0) return;
   appendFileSync(transcriptPath, archiveLines.join("\n") + "\n");
 }

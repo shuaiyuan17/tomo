@@ -35,8 +35,14 @@ const env = vi.hoisted(() => {
       failLockOpen: null as string | null,
       /** Make renameSync of the rewritten temp file fail. */
       failTempRename: false,
+      /** Make writeFileSync of the rewritten temp file fail, AFTER the path
+       *  has been created — which is what a real ENOSPC/EIO mid-write looks
+       *  like on disk. */
+      failTempWrite: false,
       /** Make appendFileSync onto the rewritten temp file fail. */
       failTempAppend: false,
+      /** Make appendFileSync onto a month archive fail. */
+      failArchiveAppend: false,
     },
   };
 });
@@ -55,6 +61,14 @@ vi.mock("node:fs", async (orig) => {
     // but before it is renamed into place — the window a concurrent appender
     // or a second rotator lives in.
     writeFileSync: ((path: unknown, data: unknown, opts?: unknown) => {
+      if (env.hooks.failTempWrite && typeof path === "string" && path.includes(".rotate-tmp")) {
+        // Create the file, then fail: a write that dies partway leaves the
+        // path behind, and the corpse is the whole point of the test.
+        (actual.writeFileSync as (...a: unknown[]) => unknown)(path, "");
+        const err = new Error(`ENOSPC: no space left on device, write '${path}'`);
+        (err as NodeJS.ErrnoException).code = "ENOSPC";
+        throw err;
+      }
       const result = (actual.writeFileSync as (...a: unknown[]) => unknown)(path, data, opts);
       if (typeof path === "string" && path.includes(".rotate-tmp")) env.hooks.onRotateTempWritten?.();
       return result;
@@ -85,6 +99,11 @@ vi.mock("node:fs", async (orig) => {
       if (env.hooks.failTempAppend && typeof path === "string" && path.includes(".rotate-tmp")) {
         const err = new Error(`ENOSPC: no space left on device, write '${String(path)}'`);
         (err as NodeJS.ErrnoException).code = "ENOSPC";
+        throw err;
+      }
+      if (env.hooks.failArchiveAppend && typeof path === "string" && path.includes("_archive_")) {
+        const err = new Error(`EACCES: permission denied, open '${String(path)}'`);
+        (err as NodeJS.ErrnoException).code = "EACCES";
         throw err;
       }
       return (actual.appendFileSync as (...a: unknown[]) => unknown)(path, data, opts);
@@ -163,7 +182,9 @@ function resetHooks(): void {
   env.hooks.onRenamed = null;
   env.hooks.failLockOpen = null;
   env.hooks.failTempRename = false;
+  env.hooks.failTempWrite = false;
   env.hooks.failTempAppend = false;
+  env.hooks.failArchiveAppend = false;
   logLines.warn.length = 0;
   logLines.error.length = 0;
   logLines.info.length = 0;
@@ -479,5 +500,134 @@ describe("transcript rotation under concurrency", () => {
     expect(contentsOf(activeLines())).toEqual(["now one"]);
     expect(statSync(ARCHIVE_JAN).size).toBeGreaterThan(0);
     expect(existsSync(lockPath)).toBe(false);
+  });
+});
+
+/**
+ * Rotation must degrade to "don't rotate", never to "don't receive" — the
+ * contract written at the top of `acquireRotationLock`. It was only honoured
+ * for the failures the body anticipated one at a time; the ones below escaped
+ * through `get()` and `append()`, so a single unusable record or one ENOSPC
+ * dropped every inbound message for that session until the file was
+ * hand-fixed.
+ */
+function linesOf(path: string): string[] {
+  return readFileSync(path, "utf-8").trim().split("\n").filter(Boolean);
+}
+
+describe("transcript rotation never blocks the inbound path", () => {
+  const BIG = join(env.dir, "big.jsonl");
+  const BIG_ARCHIVE_JAN = join(env.dir, "_archive_big_2020-01.jsonl");
+
+  /** A store on the REAL 2 MB threshold, so the size gate is exercised too. */
+  function defaultStore(): InstanceType<typeof SessionStore> {
+    return new SessionStore(env.dir, 20, join(env.dir, "sdk-sessions"));
+  }
+
+  /** >2 MB of prior-month history, one record whose timestamp is missing
+   *  entirely, and one current-month record. */
+  function seedBigTranscript(): void {
+    mkdirSync(env.dir, { recursive: true });
+    const padding = "x".repeat(4096);
+    const lines: string[] = [];
+    for (let i = 0; i < 600; i++) {
+      lines.push(JSON.stringify(msg({ content: `jan ${i} ${padding}`, seq: i + 1, timestamp: JAN + i })));
+    }
+    // The record that used to end the session: `new Date(undefined)` is an
+    // Invalid Date and `.toISOString()` on it throws RangeError.
+    const undated = msg({ content: "no timestamp", seq: 601 }) as Record<string, unknown>;
+    delete undated.timestamp;
+    lines.push(JSON.stringify(undated));
+    lines.push(JSON.stringify(msg({ content: "now one", seq: 602 })));
+    writeFileSync(BIG, lines.join("\n") + "\n");
+    expect(statSync(BIG).size).toBeGreaterThan(2 * 1024 * 1024);
+  }
+
+  it("keeps receiving when a record has no usable timestamp", () => {
+    seedBigTranscript();
+    const s = defaultStore();
+
+    // `get()` is on the inbound path for every message on this key.
+    expect(() => s.get("big")).not.toThrow();
+    // ...and so is `append()`, which calls it.
+    expect(() => s.append("big", msg({ content: "inbound after the bad record" }))).not.toThrow();
+
+    const active = contentsOf(linesOf(BIG));
+    // The undated record survives the rewrite: it has no month to file it
+    // under, so it stays put rather than being dropped on the floor.
+    expect(active).toContain("no timestamp");
+    expect(active).toContain("now one");
+    expect(active).toContain("inbound after the bad record");
+    // Rotation still did its job for the records that *do* have a month.
+    expect(existsSync(BIG_ARCHIVE_JAN)).toBe(true);
+    expect(active.some((c) => c.startsWith("jan "))).toBe(false);
+    expect(logLines.warn.join("\n")).toContain("without a usable timestamp");
+  });
+
+  it("leaves no temp file behind when the rewrite itself fails", () => {
+    // `writeFileSync(tmp, ...)` is a bare call: ENOSPC on a full disk, EIO on
+    // a failing volume — and it can die AFTER the path exists. The outer
+    // catch turns the throw into "don't rotate", so nothing downstream ever
+    // learns the name; with a unique tmp name per pass, every failing
+    // rotation used to drop another `.rotate-tmp.<pid>.<uuid>` beside the
+    // transcript, forever. Every other abandon path unlinks; so must this one.
+    env.hooks.failTempWrite = true;
+    const before = readFileSync(TRANSCRIPT, "utf-8");
+
+    expect(() => store().get("test")).not.toThrow();
+    expect(() => store().append("test", msg({ content: "inbound during the outage" }))).not.toThrow();
+
+    expect(readFileSync(TRANSCRIPT, "utf-8").startsWith(before)).toBe(true);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-"))).toEqual([]);
+    expect(logLines.warn.join("\n")).toContain("Transcript rotation failed");
+
+    // And the next pass, with the disk back, rotates normally.
+    env.hooks.failTempWrite = false;
+    store().get("test");
+    expect(contentsOf(activeLines())).toEqual(["now one", "inbound during the outage"]);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-"))).toEqual([]);
+  });
+
+  it("archives a record whose timestamp is an ISO string, not a number", () => {
+    // `monthOf` names an older writer's shape in its own doc comment, and
+    // `new Date(x)` has always parsed an ISO string. Rejecting one on type
+    // alone moved those records from "archived under their real month" to
+    // "undated, kept in the active file" — a transcript that can never shrink
+    // below the rows a former version of Tomo wrote.
+    mkdirSync(env.dir, { recursive: true });
+    const stringDated = { ...msg({ content: "jan as a string", seq: 1 }), timestamp: new Date(JAN).toISOString() };
+    const unparseable = { ...msg({ content: "not a date at all", seq: 2 }), timestamp: "last thursday-ish" };
+    writeFileSync(TRANSCRIPT, [stringDated, unparseable, msg({ content: "now one", seq: 3 })]
+      .map((m) => JSON.stringify(m)).join("\n") + "\n");
+
+    expect(() => store().get("test")).not.toThrow();
+
+    // The parseable string was filed under its real month...
+    expect(contentsOf(linesOf(ARCHIVE_JAN))).toEqual(["jan as a string"]);
+    // ...and only the genuinely unreadable one stayed behind as undated.
+    expect(contentsOf(activeLines())).toEqual(["not a date at all", "now one"]);
+    expect(logLines.warn.join("\n")).toContain("without a usable timestamp");
+  });
+
+  it("keeps receiving when the archive append fails", () => {
+    // A bare appendFileSync onto the month archive: ENOSPC on a full disk,
+    // EACCES on a sessions directory that lost its permissions. It used to
+    // come straight out of `get()`.
+    env.hooks.failArchiveAppend = true;
+    const before = readFileSync(TRANSCRIPT, "utf-8");
+
+    expect(() => store().get("test")).not.toThrow();
+    expect(() => store().append("test", msg({ content: "inbound during the outage" }))).not.toThrow();
+
+    // Nothing was rotated, nothing was lost, and the failure is on the record.
+    expect(contentsOf(activeLines())).toEqual(["jan one", "jan two", "now one", "inbound during the outage"]);
+    expect(readFileSync(TRANSCRIPT, "utf-8").startsWith(before)).toBe(true);
+    expect(readdirSync(env.dir).filter((n) => n.includes(".rotate-"))).toEqual([]);
+    expect(logLines.warn.join("\n")).toContain("Transcript rotation failed");
+
+    // And once the disk comes back, the next pass rotates normally.
+    env.hooks.failArchiveAppend = false;
+    store().get("test");
+    expect(contentsOf(activeLines())).toEqual(["now one", "inbound during the outage"]);
   });
 });

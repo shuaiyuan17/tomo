@@ -586,8 +586,16 @@ export class TelegramChannel implements Channel {
   }
 
   private async sendUnmarked(message: OutgoingMessage): Promise<void> {
+    // `allow_sending_without_reply` makes the thread a PREFERENCE, not a
+    // precondition. Without it the Bot API answers 400
+    // "message to be replied not found" when the target is gone — the user
+    // deleted it, or it aged out — and that failure is not scoped to the
+    // threading: it fails the whole send, so the block never arrives and the
+    // reply the target was pointing at is lost. Threading is cosmetic and the
+    // message is not; with the flag Telegram falls back to an unthreaded send
+    // and delivers.
     const replyParams = message.replyTo
-      ? { reply_parameters: { message_id: Number(message.replyTo) } }
+      ? { reply_parameters: { message_id: Number(message.replyTo), allow_sending_without_reply: true } }
       : {};
 
     // Send photo if provided

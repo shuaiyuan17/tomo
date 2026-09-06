@@ -903,6 +903,35 @@ export class ImsgChannel implements Channel {
       const line = chunk.trim();
       if (line) log.debug({ imsg: line }, "imsg rpc stderr");
     });
+    // THE WRITE SIDE NEEDS A LISTENER TOO. A pipe to a dead child emits
+    // 'error' (EPIPE/ERR_STREAM_DESTROYED) on `stdin`, and an 'error' with no
+    // listener on a stream is an uncaughtException — which, since the daemon
+    // installs process-level handlers, logs and exits 1. The race is ordinary:
+    // `killChild`/`recoverFromGap` tear the child down while a read receipt or
+    // a typing tick is mid-write, and the whole daemon dies because one
+    // fire-and-forget write lost a race with a restart it caused.
+    //
+    // Nothing to recover here: `enqueueWrite`'s write callback already fails
+    // the owning request, and `handleChildDown` rejects everything still
+    // pending, so this listener exists purely to keep the emitter handled.
+    // Debug, not warn: a broken pipe to a child we just killed is expected.
+    // THE READ SIDES TOO. Same class, same consequence: `stdout`/`stderr` are
+    // streams, an unhandled 'error' on either is an uncaughtException, and a
+    // child torn down mid-read (killChild, recoverFromGap, a crash) is the
+    // ordinary way EPIPE/ECONNRESET arrives on a pipe we are still reading.
+    // Only `stdin` was covered, so the same race on the other two pipes still
+    // took the daemon down. Nothing to recover here either — `handleChildDown`
+    // (via 'error'/'exit' below) owns the restart; these keep the emitters
+    // handled so the process survives long enough for it to run.
+    child.stdin.on("error", (err) => {
+      log.debug({ err }, "imsg rpc stdin error (write to a closed child pipe)");
+    });
+    child.stdout.on("error", (err) => {
+      log.debug({ err }, "imsg rpc stdout error (read from a closed child pipe)");
+    });
+    child.stderr.on("error", (err) => {
+      log.debug({ err }, "imsg rpc stderr error (read from a closed child pipe)");
+    });
     child.on("error", (err) => {
       log.error({ err }, "imsg rpc child failed to spawn");
       this.handleChildDown(child, `spawn error: ${err.message}`);
@@ -2112,17 +2141,24 @@ export class ImsgChannel implements Channel {
    * wanted it needs its own surface, not a half-wiring of this one.
    */
   private async sendSticker(chatGuid: string, sticker: string): Promise<void> {
+    // BOTH PRE-FLIGHT REFUSALS THROW, the same way `sendAttachment` does.
+    // They used to log and return, which reports "delivered" to the caller
+    // about a sticker that never left the machine — and the sticker IS the
+    // message here, so the recipient gets nothing at all and the pipeline
+    // records a turn that landed. `AttachmentUnreadableError` is definite by
+    // construction (nothing was dispatched), which is exactly what lets
+    // delivery-pipeline.ts fall back without risking a double-send.
     if (!sticker.startsWith("/") && !sticker.startsWith("~")) {
-      log.warn({ chatId: chatGuid }, "Ignoring non-path sticker value on iMessage channel (Telegram file_ids are channel-bound)");
-      return;
+      log.warn({ chatId: chatGuid }, "Non-path sticker value on iMessage channel (Telegram file_ids are channel-bound)");
+      throw new AttachmentUnreadableError(sticker, `Sticker reference is not a file path: ${sticker}`);
     }
     // Expand a leading `~` ourselves: imsg's send.sticker expands it too, but
     // the fallback plain `send` may not, and our own existence check below
     // certainly doesn't.
     const filePath = sticker.replace(/^~(?=$|\/)/, homedir());
     if (!existsSync(filePath)) {
-      log.warn({ path: filePath, chatId: chatGuid }, "Sticker file not found; nothing sent");
-      return;
+      log.warn({ path: filePath, chatId: chatGuid }, "Sticker file not found");
+      throw new AttachmentUnreadableError(filePath);
     }
 
     // send.sticker is bridge-only; a bare handle with no known conversation

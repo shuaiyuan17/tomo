@@ -151,8 +151,13 @@ export function isDefiniteFailure(err: unknown): boolean {
  */
 export class AttachmentUnreadableError extends Error {
   readonly code = "ENOENT";
-  constructor(readonly path: string) {
-    super(`Attachment file not found: ${path}`);
+  /** `message` overrides the default for a value that is unreadable for a
+   *  reason other than "not on disk" — a channel-bound sticker id handed to
+   *  a channel that can only send files, say, where "Attachment file not
+   *  found: CAACAgQ…" reads as a missing path and sends the reader hunting
+   *  for a file that was never named. */
+  constructor(readonly path: string, message?: string) {
+    super(message ?? `Attachment file not found: ${path}`);
     this.name = "AttachmentUnreadableError";
     markDefiniteFailure(this);
   }

@@ -1938,21 +1938,44 @@ describe("imsg sticker sends", () => {
     }
   });
 
-  it("drops a Telegram file_id-shaped sticker value (channel-bound id)", async () => {
+  // Both pre-flight refusals REPORT, they do not report success. These two
+  // used to assert the silent-drop behaviour: nothing was sent and `send`
+  // resolved, so the delivery pipeline recorded a turn that landed while the
+  // recipient got nothing — and unlike a caption-bearing photo, a sticker is
+  // the whole message, so there was nothing left to salvage. Same typed,
+  // definite error `sendAttachment` raises for the identical situation.
+  it("reports a Telegram file_id-shaped sticker value instead of dropping it (channel-bound id)", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
     await channel.start();
 
-    await channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" });
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" }))
+      .rejects.toThrow(AttachmentUnreadableError);
+    // ...and says what is actually wrong. The default "Attachment file not
+    // found: CAACAgIAAxk…" reads as a missing PATH and sends whoever is
+    // holding the log hunting for a file that was never named; a channel-bound
+    // Telegram id is not a path at all.
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" }))
+      .rejects.toThrow("Sticker reference is not a file path: CAACAgIAAxkBAAIBOWX1abc123");
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
     await channel.stop();
   });
 
-  it("sends nothing when the sticker path does not exist", async () => {
+  it("reports a sticker path that does not exist instead of dropping it", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
     await channel.start();
 
-    await channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" });
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
+      .rejects.toThrow(AttachmentUnreadableError);
+
+    // Definite by construction, which is what lets the pipeline react without
+    // risking a double-send.
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
+      .rejects.toMatchObject({ code: "ENOENT", path: "/nonexistent/sticker.png" });
+    // A path that isn't there keeps the default wording — that one IS a
+    // missing file.
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
+      .rejects.toThrow("Attachment file not found: /nonexistent/sticker.png");
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
     await channel.stop();
@@ -3002,6 +3025,33 @@ describe("imsg outbound RPC param-name contract", () => {
 // --- Child lifecycle --------------------------------------------------------------
 
 describe("imsg rpc child lifecycle", () => {
+  it("survives an 'error' on the child's stdin instead of taking the daemon down", async () => {
+    // A write onto the pipe of a child that has just died — `killChild` or
+    // gap recovery racing an in-flight read receipt or typing tick — emits
+    // 'error' on `child.stdin`. Nothing listened on that stream, and an
+    // unhandled 'error' on an EventEmitter throws: as an uncaughtException it
+    // reaches the daemon's process handler, which logs and exits 1. The whole
+    // assistant went down because one fire-and-forget write lost a race with
+    // a restart it had itself provoked.
+    const debugSpy = vi.spyOn(log, "debug");
+    const { channel, children } = makeChannel();
+    await channel.start();
+
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    // `emit("error")` on an emitter with no 'error' listener throws here, the
+    // same way the real stream's does inside Node's I/O callback.
+    expect(() => children[0].stdin.emit("error", epipe)).not.toThrow();
+    expect(debugSpy.mock.calls.some(
+      ([obj, msg]) => msg === "imsg rpc stdin error (write to a closed child pipe)"
+        && (obj as { err?: unknown }).err === epipe,
+    )).toBe(true);
+
+    // And the channel is still usable: the listener swallows the pipe error,
+    // it does not tear anything down on its own.
+    await channel.send({ chatId: DM_GUID, text: "still here" });
+    await channel.stop();
+  });
+
   it("restarts the child with backoff after a crash and resubscribes from the cursor", async () => {
     vi.useFakeTimers();
     const { channel, children, spawnFn } = makeChannel({ config: { restartDelaysMs: [1_000, 5_000] } });

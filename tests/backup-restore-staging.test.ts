@@ -117,7 +117,7 @@ function errno(code: string, message: string): NodeJS.ErrnoException {
 const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } =
   await import("node:fs");
 const actualCopy = (from: string, to: string): void => cpSync(from, to, { recursive: true, dereference: false });
-const { backupCommand } = await import("../src/cli/backup.js");
+const { backupCommand, setPromptOutput } = await import("../src/cli/backup.js");
 const { acquireRestoreLock, RestoreLockHeldError, restoreLegsStaged, StagedRestoreError, sweepRestoreLeftovers } =
   await import("../src/cli/backup-restore.js");
 
@@ -381,7 +381,15 @@ function cliFixture(): void {
   writeFileSync(join(paths.tomoHome, "config.json"), '{"from":"live"}');
 }
 
-interface RunResult { logs: string[]; errors: string[]; exitCodes: number[]; threw: Error | null }
+interface RunResult { logs: string[]; errors: string[]; exitCodes: number[]; threw: Error | null; prompts: string }
+
+/** Collects what `confirm()` writes, so the prompt does not land in the
+ *  middle of `npm test`'s own output. */
+function promptSink(): { stream: NodeJS.WritableStream; text: () => string } {
+  let text = "";
+  const stream = { write: (chunk: string | Uint8Array) => { text += String(chunk); return true; } };
+  return { stream: stream as unknown as NodeJS.WritableStream, text: () => text };
+}
 
 let restoreStdin: (() => void) | undefined;
 afterEach(() => { restoreStdin?.(); restoreStdin = undefined; });
@@ -390,7 +398,12 @@ async function runRestore(arg: string, answer: string[] = ["y\n"]): Promise<RunR
   const original = process.stdin;
   const fake = Readable.from(answer) as unknown as NodeJS.ReadStream;
   Object.defineProperty(process, "stdin", { value: fake, configurable: true });
-  restoreStdin = () => Object.defineProperty(process, "stdin", { value: original, configurable: true });
+  const sink = promptSink();
+  const originalPrompt = setPromptOutput(sink.stream);
+  restoreStdin = () => {
+    Object.defineProperty(process, "stdin", { value: original, configurable: true });
+    setPromptOutput(originalPrompt);
+  };
 
   const logs: string[] = [];
   const errors: string[] = [];
@@ -408,7 +421,7 @@ async function runRestore(arg: string, answer: string[] = ["y\n"]): Promise<RunR
   } catch (err) {
     if ((err as Error).message !== "__exit__") threw = err as Error;
   }
-  return { logs, errors, exitCodes, threw };
+  return { logs, errors, exitCodes, threw, prompts: sink.text() };
 }
 
 describe("tomo backup restore — a leg fails to copy", () => {
@@ -452,6 +465,25 @@ describe("tomo backup restore — a leg fails to copy", () => {
     expect(readFileSync(join(paths.tomoHome, "sdk-sessions", "s.jsonl"), "utf-8")).toBe("backup session");
     expect(readFileSync(join(paths.tomoHome, "workspace", "SOUL.md"), "utf-8")).toBe("backup soul");
     expect(leftovers(paths.tomoHome)).toEqual([]);
+  });
+
+  it("asks for confirmation on the injected stream, not on the suite's stdout", async () => {
+    // `rl.question` echoes its prompt to the readline interface's `output`.
+    // That was `process.stdout` unconditionally, so every restore test wrote
+    // a stray "Proceed? [y/N] " into the middle of `npm test`'s own output —
+    // 15 of them, none attributable to a test.
+    const stdoutWrites: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    }) as never);
+
+    const { prompts } = await runRestore(VALID);
+
+    // The question was really asked...
+    expect(prompts).toContain("Proceed?");
+    // ...and it went nowhere near the suite's stdout.
+    expect(stdoutWrites.join("")).not.toContain("Proceed?");
   });
 });
 

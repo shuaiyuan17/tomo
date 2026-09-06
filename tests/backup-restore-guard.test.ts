@@ -41,7 +41,7 @@ vi.mock("../src/runtime-paths.js", () => ({
   },
 }));
 
-const { backupCommand } = await import("../src/cli/backup.js");
+const { backupCommand, setPromptOutput } = await import("../src/cli/backup.js");
 
 const VALID = "2026-08-30_0142";
 const validDir = join(paths.backups, VALID);
@@ -113,7 +113,15 @@ beforeEach(() => {
 
 afterEach(() => { restoreStdin?.(); vi.restoreAllMocks(); });
 
-interface RunResult { logs: string[]; errors: string[]; exitCodes: number[] }
+interface RunResult { logs: string[]; errors: string[]; exitCodes: number[]; prompts: string }
+
+/** Collects what `confirm()` writes, so the prompt does not land in the
+ *  middle of `npm test`'s own output. */
+function promptSink(): { stream: NodeJS.WritableStream; text: () => string } {
+  let text = "";
+  const stream = { write: (chunk: string | Uint8Array) => { text += String(chunk); return true; } };
+  return { stream: stream as unknown as NodeJS.WritableStream, text: () => text };
+}
 
 /**
  * Run the real `restore` action.
@@ -130,7 +138,12 @@ async function runRestore(
   const original = process.stdin;
   const fake = Readable.from(answer) as unknown as NodeJS.ReadStream;
   Object.defineProperty(process, "stdin", { value: fake, configurable: true });
-  restoreStdin = () => Object.defineProperty(process, "stdin", { value: original, configurable: true });
+  const sink = promptSink();
+  const originalPrompt = setPromptOutput(sink.stream);
+  restoreStdin = () => {
+    Object.defineProperty(process, "stdin", { value: original, configurable: true });
+    setPromptOutput(originalPrompt);
+  };
 
   const logs: string[] = [];
   const errors: string[] = [];
@@ -149,7 +162,7 @@ async function runRestore(
   } catch (err) {
     if ((err as Error).message !== "__exit__") throw err;
   }
-  return { logs, errors, exitCodes };
+  return { logs, errors, exitCodes, prompts: sink.text() };
 }
 
 /** The line restore prints once it has accepted the argument. */

@@ -280,6 +280,10 @@ export class Agent {
           costUsd: result.costUsd,
           contextUsed: result.contextUsed,
           contextMax: result.contextMax,
+          // Carried so a consumer can mark the reading rather than render a
+          // turn's own token count over the window as the session's pressure —
+          // which is a plausible-looking low percentage, not a missing one.
+          ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
       getSessionMessages: (key) => this.sessions.get(key).messages,

@@ -188,6 +188,13 @@ export function describeResultFailure(result: SdkResultLike): SdkResultError | n
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
 
 /**
+ * Consecutive failed context readings before we say so out loud. One or two
+ * is a blip worth ignoring; three in a row means the pressure nudges are off
+ * for this session and nobody would otherwise find out.
+ */
+export const ESTIMATED_READING_WARN_AFTER = 3;
+
+/**
  * How long ONE block's delivery may take before we give up on it.
  *
  * Separate from the inactivity timeout on purpose, and much shorter. The
@@ -601,6 +608,8 @@ export class LiveSession {
    * than a guess. 0 until the first successful reading.
    */
   private lastContextMax = 0;
+  /** Consecutive turns whose context reading failed. Reset by any real one. */
+  private estimatedReadingStreak = 0;
   private prevTotalCost = 0;
   /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
   private prevModelTokens: TokenTotals | null = null;
@@ -1374,6 +1383,13 @@ export class LiveSession {
         const ctx = await this.q.getContextUsage();
         const pct = Math.round(ctx.percentage);
         this.lastContextMax = ctx.maxTokens;
+        if (this.estimatedReadingStreak >= ESTIMATED_READING_WARN_AFTER) {
+          log.info(
+            { session: this.sessionKey, afterTurns: this.estimatedReadingStreak },
+            "Context usage readings recovered",
+          );
+        }
+        this.estimatedReadingStreak = 0;
         if (this.lastResult) {
           this.lastResult.contextUsed = ctx.totalTokens;
           this.lastResult.contextMax = ctx.maxTokens;
@@ -1399,6 +1415,20 @@ export class LiveSession {
           this.lastResult.contextUsed = approx;
           this.lastResult.contextMax = this.lastContextMax;
           this.lastResult.contextEstimated = true;
+        }
+        // Skipping the nudge ladder on an estimated reading is the right call
+        // per turn and the wrong thing to do in silence forever: a
+        // getContextUsage() that has stopped working for good disables the
+        // prune / daily / compact pressure nudges entirely, and the only
+        // outward sign is a `tomo status` percentage that looks plausible and
+        // low. Say so once the failure is clearly not transient.
+        this.estimatedReadingStreak++;
+        if (this.estimatedReadingStreak === ESTIMATED_READING_WARN_AFTER) {
+          log.warn(
+            { session: this.sessionKey, turns: this.estimatedReadingStreak },
+            "Context usage unreadable for %d turns running — context-pressure nudges are suspended for this session",
+            this.estimatedReadingStreak,
+          );
         }
         return `~${approx}/${this.lastContextMax || "unknown"} (estimated)`;
       }

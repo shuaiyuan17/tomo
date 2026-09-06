@@ -6,6 +6,9 @@ import { getCompactTriggerPath } from "../src/lcm/compact.js";
 import { CONTINUITY_DELIVERY_NOTE } from "../src/continuity-defaults.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { isWarmTailCandidate } from "../src/lcm/blocks.js";
+import { ESTIMATED_READING_WARN_AFTER } from "../src/agent/live-session.js";
+import { watchBus } from "../src/watch/bus.js";
+import type { WatchEvent } from "../src/watch/protocol.js";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -24,6 +27,7 @@ import {
   resetConfig,
   waitFor,
 } from "./helpers/agent-harness.js";
+import { log } from "../src/logger.js";
 
 installAgentTestHooks();
 
@@ -845,6 +849,81 @@ describe("compact nudges", () => {
     await tg.simulateMessage(makeMsg({ text: "and again" }));
     await drainQueue(agent);
     await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    await agent.stop();
+  });
+
+  it("warns once the context reading has failed N turns running", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const unreadableWarnings = () => vi.mocked(log.warn).mock.calls
+      .filter((c) => typeof c[1] === "string" && c[1].startsWith("Context usage unreadable"));
+
+    mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    // Skipping the ladder on an estimated reading is right per turn and
+    // silent forever: a getContextUsage() that has stopped working for good
+    // disables the prune/daily/compact nudges for this session, and the only
+    // outward sign is a `tomo status` percentage that looks plausible and low
+    // (this turn's own tokens over the window). A blip must stay quiet; a
+    // standing failure must not.
+    mockSdk.contextUsageFails = true;
+    for (let turn = 1; turn < ESTIMATED_READING_WARN_AFTER; turn++) {
+      await tg.simulateMessage(makeMsg({ text: `turn ${turn}` }));
+      await drainQueue(agent);
+      expect(unreadableWarnings()).toHaveLength(0);
+    }
+
+    await tg.simulateMessage(makeMsg({ text: "threshold" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(unreadableWarnings()).toHaveLength(1));
+    expect(unreadableWarnings()[0][0]).toMatchObject({ turns: ESTIMATED_READING_WARN_AFTER });
+
+    // Once, not once per turn — a broken session should not drown the log.
+    await tg.simulateMessage(makeMsg({ text: "still broken" }));
+    await drainQueue(agent);
+    await expectNoChangeFor(() => expect(unreadableWarnings()).toHaveLength(1));
+
+    // And the nudge really was suppressed throughout.
+    expect(nudgePrompts()).toHaveLength(1);
+
+    await agent.stop();
+  });
+
+  it("marks the turn.stats watch event when the reading was only estimated", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    const stats: Extract<WatchEvent, { type: "turn.stats" }>[] = [];
+    const unsubscribe = watchBus.subscribe((e) => {
+      if (e.type === "turn.stats") stats.push(e);
+    });
+    try {
+      mockSdk.contextUsage = { totalTokens: 40_000, maxTokens: 200_000 };
+      await tg.simulateMessage(makeMsg({ text: "Hi" }));
+      await drainQueue(agent);
+      await waitFor(() => expect(stats).toHaveLength(1));
+      expect(stats[0].contextUsed).toBe(40_000);
+      expect(stats[0].contextEstimated).toBeUndefined();
+
+      // Now the reading fails. `contextUsed` becomes this turn's OWN tokens
+      // over the last real window — a number a watcher would otherwise read as
+      // "the session is nearly empty". The flag is what lets it say "unknown".
+      mockSdk.contextUsageFails = true;
+      await tg.simulateMessage(makeMsg({ text: "Hi again" }));
+      await drainQueue(agent);
+      await waitFor(() => expect(stats).toHaveLength(2));
+      expect(stats[1].contextEstimated).toBe(true);
+      expect(stats[1].contextMax).toBe(200_000); // the last window we really saw
+    } finally {
+      unsubscribe();
+    }
 
     await agent.stop();
   });

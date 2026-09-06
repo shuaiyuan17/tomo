@@ -33,7 +33,14 @@ export type WatchEvent =
   | { type: "turn.start"; ts: number; sessionKey: string; source: TurnSource }
   | { type: "turn.end"; ts: number; sessionKey: string; source: TurnSource; ok: boolean; durationMs: number }
   /** Per-query stats from the SDK result (cost, context) — follows turn.end. */
-  | { type: "turn.stats"; ts: number; sessionKey: string; costUsd: number; contextUsed: number; contextMax: number }
+  | {
+    type: "turn.stats"; ts: number; sessionKey: string; costUsd: number;
+    contextUsed: number; contextMax: number;
+    /** The SDK could not report usage this turn: `contextUsed` is a crude
+     *  approximation of the turn's OWN tokens over the last real window, so a
+     *  consumer must not present the ratio as the session's actual pressure. */
+    contextEstimated?: boolean;
+  }
   | { type: "tool.start"; ts: number; sessionKey?: string; tool: string; agent?: string; detail?: string }
   | { type: "tool.end"; ts: number; sessionKey?: string; tool: string; ok: boolean; durationMs?: number; agent?: string }
   | { type: "cron.fired"; ts: number; jobId: string; name: string }

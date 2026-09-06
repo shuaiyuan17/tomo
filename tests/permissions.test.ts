@@ -492,6 +492,21 @@ describe("isPrivateMemoryAccess — Bash exfiltration shapes", () => {
     ["zip of the workspace", "zip -r /tmp/out.zip ."],
     ["base64 alone", "base64 somefile"],
     ["xxd", "xxd somefile"],
+    // Brace expansion is not globbing: it fires with no matching file, and
+    // neither name is spelled anywhere in the command. Executed by the
+    // reviewer against the live guard before the fix.
+    ["brace expansion over both names", "cat {m,}emory/{p,}rivate/x.md"],
+    ["brace expansion over one name", "cat memory{,}/private/x.md"],
+    ["brace alternation naming private", "cat notes/{public,private}/x.md"],
+    // The shell writes the word; the hook only ever sees the recipe.
+    ["command substitution", "cat $(echo bWVtb3J5 | tr a-z a-z)/x.md"],
+    ["backtick substitution", "cat `printf notes`/x.md"],
+    ["parameter expansion assembled from pieces", "d=notes e=stuff; cat $d/$e/x.md"],
+    ["braced parameter expansion", "cat ${d}/x.md"],
+    // Adjacent quoted runs: one word to the shell, two quoted fragments to a
+    // regex reading the raw command, so neither name sat at a word border.
+    ["adjacent-quote concatenation", 'cat "mem""ory"/x.md'],
+    ["quote split inside a name", "cat me''mory/x.md"],
   ] as const;
 
   for (const [label, cmd] of denied) {

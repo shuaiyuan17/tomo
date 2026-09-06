@@ -424,11 +424,14 @@ function grepReachesPrivate(
  * (MEMORY.md is in its prompt), and the Read/Glob/Grep arms above are the
  * precise ones.
  *
- * Six shapes are denied. The first two are the literal ones; the rest exist
+ * Eight shapes are denied. The first two are the literal ones; the rest exist
  * because a reviewer walked straight through the literal ones:
  *
  *  1. Any absolute reference to the memory or private dir.
- *  2. `memory` or `private` as a path segment, however quoted.
+ *  2. `memory` or `private` as a path segment, however quoted — tested on the
+ *     raw command AND on each token with its quotes stripped, because
+ *     adjacent-string concatenation (`cat "mem""ory"/private/x.md`) spells
+ *     neither name at a word boundary until the shell glues the halves.
  *  3. A GLOB whose literal prefix could expand into either name —
  *     `mem*\/priv*`, `memor?/privat?`, `m[e]mory`. A segment whose glob prefix
  *     is a prefix of "memory"/"private" is denied, and the empty prefix (`*`,
@@ -446,24 +449,46 @@ function grepReachesPrivate(
  *     the recursive grep and every invocation of those three is refused.
  *  6. Archive and encode commands (tar/zip/base64/xxd/…), which turn "read a
  *     tree" into one command that names only `.`.
+ *  7. BRACE EXPANSION — see {@link GLOB_META}. Not globbing, and it needs no
+ *     matching file to fire: `cat {m,}emory/{p,}rivate/x.md` expands to
+ *     `memory/private/x.md` and spells neither name anywhere.
+ *  8. `$` and backticks — the shell writes the path, the caller does not.
+ *     Command substitution runs arbitrary code to produce a word
+ *     (`cat $(echo memory/private/x)`, named in the paragraph above as
+ *     something this cannot parse), and parameter expansion assembles one out
+ *     of pieces no rule here can see (`d=memory e=private; cat $d/$e/x`).
+ *     Both are refused outright rather than modelled, which is the same call
+ *     shapes 3-6 make; `$HOME`-style conveniences are the cost.
  *
- * Shapes 3-6 are the accepted false-positive cost: on a barred turn they are
+ * Shapes 3-8 are the accepted false-positive cost: on a barred turn they are
  * not distinguishable from the exfiltration they enable.
  */
 function bashTouchesMemory(cmd: string, ctx: { cwd: string; memoryDir: string; privateDir: string }): boolean {
   if (cmd.includes(ctx.memoryDir) || cmd.includes(ctx.privateDir)) return true;
-  // `memory` or `private` as a path segment: bordered by /, quote, whitespace,
-  // shell operator, or string boundary. Catches `memory/x`, `./memory`,
-  // `cd memory`, `ls memory/private`, `cat private/foo`, etc.
-  const memorySegment = /(^|[\s'"`=()|&;></])(memory|private)(\/|$|[\s'"`=()|&;><])/i;
-  if (memorySegment.test(cmd)) return true;
+  if (MEMORY_SEGMENT.test(cmd)) return true;
+  if (SHELL_EXPANSION.test(cmd)) return true;
   if (BULK_READ_COMMAND.test(cmd)) return true;
   if (FIND_EXEC.test(cmd)) return true;
   if (FIND_FED_TO_READER.test(cmd)) return true;
   if (RECURSIVE_GREP.test(cmd)) return true;
   if (RECURSIVE_BY_DEFAULT_GREP.test(cmd)) return true;
-  return bashTokens(cmd).some(globCouldExpandToMemory);
+  const tokens = bashTokens(cmd);
+  // The SAME segment rule, re-applied to each token once its quotes are gone.
+  // `"mem""ory"/private/x.md` is one word to the shell and two quoted runs
+  // to the regex above, where neither `memory` nor `private` sits at a word
+  // border — dequoting the token puts them back at one.
+  if (tokens.some((token) => MEMORY_SEGMENT.test(token))) return true;
+  return tokens.some(globCouldExpandToMemory);
 }
+
+/** `memory` or `private` as a path segment: bordered by /, quote, whitespace,
+ *  shell operator, or string boundary. Catches `memory/x`, `./memory`,
+ *  `cd memory`, `ls memory/private`, `cat private/foo`, etc. */
+const MEMORY_SEGMENT = /(^|[\s'"`=()|&;></])(memory|private)(\/|$|[\s'"`=()|&;><])/i;
+
+/** Command substitution, backticks and parameter expansion: the word the shell
+ *  ends up with is not the word this hook was handed. Shape 8 above. */
+const SHELL_EXPANSION = /[$`]/;
 
 /** Archive/encode commands: one invocation reads a whole tree while naming
  *  only `.`, so no path-shaped rule sees it. */
@@ -500,7 +525,16 @@ function bashTokens(cmd: string): string[] {
     .filter((t) => t.length > 0);
 }
 
-const GLOB_META = /[*?[]/;
+/**
+ * Where a token stops being the path the shell will use.
+ *
+ * `{` is in here because BRACE EXPANSION is not globbing: it fires whether or
+ * not anything matches on disk, so `cat {m,}emory/{p,}rivate/x.md` reaches the
+ * file having spelled neither `memory` nor `private` anywhere in the command.
+ * A `{` yields an empty literal prefix for its segment, which is a prefix of
+ * everything — so, like a bare `*`, any brace in a path-ish token is denied.
+ */
+const GLOB_META = /[*?[{]/;
 
 /**
  * Could this token's glob expand into `memory` or `private`?

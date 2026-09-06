@@ -164,6 +164,11 @@ async function runLaunchctl(
   }
 }
 
+/** launchd's post-SIGTERM grace period, in whole seconds. The same bound
+ *  `tomo stop` gives the daemon, so a shutdown that launchd starts gets
+ *  exactly as long as one a human starts. */
+export const LAUNCH_AGENT_EXIT_TIMEOUT_SEC = Math.ceil(DAEMON_STOP_TIMEOUT_MS / 1000);
+
 export function buildPlist(): string {
   const nodePath = escapeXml(process.execPath);
   const cliPath = escapeXml(resolveCliPath());
@@ -173,6 +178,7 @@ export function buildPlist(): string {
   const tomoLogPath = escapeXml(join(logDir, "tomo.log"));
   const stdoutPath = escapeXml(join(logDir, "launchd.out.log"));
   const stderrPath = escapeXml(join(logDir, "launchd.err.log"));
+  const EXIT_TIMEOUT_SEC = LAUNCH_AGENT_EXIT_TIMEOUT_SEC;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -202,6 +208,16 @@ export function buildPlist(): string {
          burning CPU. 30s still recovers a real crash promptly. -->
     <key>ThrottleInterval</key>
     <integer>30</integer>
+
+    <!-- How long launchd waits after SIGTERM before SIGKILL. The default is
+         20s and Tomo's graceful shutdown is bounded well above that (~33s:
+         channel drains, a final registry save, the transcript flush), so the
+         default killed the daemon mid-flush on every "launchctl bootout",
+         every "tomo restart" through launchd, and every logout or reboot.
+         Derived from DAEMON_STOP_TIMEOUT_MS, which is the same bound
+         "tomo stop" waits for — the two must not drift apart. -->
+    <key>ExitTimeOut</key>
+    <integer>${EXIT_TIMEOUT_SEC}</integer>
 
     <key>EnvironmentVariables</key>
     <dict>

@@ -752,6 +752,35 @@ describe("compact nudges", () => {
     await agent.stop();
   });
 
+  it("re-nudges after a housekeeping turn that never ran, instead of latching on a failure", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // The nudge turn itself fails: the SDK answers with an error the agent
+    // classifies as a failed turn, so handleCronMessage RESOLVES FALSE (it
+    // never rejects). The compact was never written — but the latch had
+    // already been set before dispatch, so nothing asked for it again until
+    // usage fell back under nudgeResetPct, which is exactly what it cannot do
+    // while the context stays full.
+    mockSdk.responseFn = (text) =>
+      text.includes("Context usage is at") ? "API Error: 529 overloaded" : "seeded reply";
+
+    mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+
+    // Still over the threshold on the next turn, and the housekeeping still
+    // has not happened — so it is asked for again.
+    await tg.simulateMessage(makeMsg({ text: "Hi again" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(2));
+    expect(nudgePrompts()[1]).toContain("lcm compact skill");
+
+    await agent.stop();
+  });
+
   it("runs the context-pressure check on a turn recovered by the session-error retry", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

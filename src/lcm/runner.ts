@@ -182,11 +182,27 @@ export class RollupRunner {
         // moment it completes — long before the NO_REPLY that was supposed to
         // silence it. The prompt cannot retract a sent message, so silence
         // here must not depend on the model's cooperation.
-        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
-          showTyping: false,
-          suppressDelivery: true,
-        });
-        this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
+        const delivered = await this.agent.handleCronMessage(
+          nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
+            showTyping: false,
+            suppressDelivery: true,
+          },
+        );
+        // handleCronMessage resolves FALSE rather than rejecting when the turn
+        // never happened (no deliverable target for the session, the turn
+        // ended on an error result, the per-session queue threw). Starting a
+        // 6h cooldown on that answer buys nothing but a 6h hole: the rollup is
+        // still due, still un-nudged, and the next five heartbeats skip it.
+        // The cooldown is a debounce on work we asked for, so only arm it when
+        // we actually asked.
+        if (delivered) {
+          this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
+        } else {
+          log.warn(
+            { sessionKey, level: next.level, period: next.period },
+            "Rollup nudge turn failed; leaving it due for the next check",
+          );
+        }
       } catch (err) {
         log.warn({ err, sessionKey }, "Rollup check failed");
       }

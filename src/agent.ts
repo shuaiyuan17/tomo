@@ -1030,8 +1030,11 @@ export class Agent {
       return;
     }
 
-    if (decision.newLatch) {
-      this.contextNudged.set(key, decision.newLatch);
+    // Latched BEFORE dispatch (the nudge turn must not re-trigger itself) and
+    // rolled back below if the turn never happened — see the .then().
+    const latch = decision.newLatch;
+    if (latch) {
+      this.contextNudged.set(key, latch);
     }
 
     const pct = Math.round(usedFrac * 100);
@@ -1082,6 +1085,23 @@ export class Agent {
     this.handleCronMessage(nudge, key, {
       showTyping: false,
       suppressDelivery: true,
+    }).then((ok) => {
+      if (ok || !latch) return;
+      // handleCronMessage does not REJECT on failure — it resolves false (no
+      // deliverable target, the turn ended on an error result, the queue threw
+      // and was swallowed). Leaving the latch set on that answer means the
+      // housekeeping never ran AND nothing will ask for it again until usage
+      // falls back below nudgeResetPct, which is precisely what it cannot do
+      // with the rollup unwritten. Roll the latch back so the next completed
+      // turn re-evaluates the ladder from where it actually stands.
+      //
+      // Only if it is still OURS: a later turn may have escalated the latch
+      // (prune → daily → compact) while this nudge was in flight, and clearing
+      // that one would re-issue a rung the session has already moved past.
+      if (this.contextNudged.get(key) === latch) {
+        this.contextNudged.delete(key);
+        log.warn({ key, latch }, "Context nudge turn failed; latch cleared for a retry");
+      }
     }).catch((err) => {
       log.warn({ err, key }, "Compact nudge failed");
     });

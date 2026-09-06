@@ -47,11 +47,17 @@ const T0715 = new Date("2026-08-29T07:15:00").getTime();
 type Store = InstanceType<typeof NudgeCooldownStore>;
 
 /** A daemon lifetime: one runner over one store. */
-function bootRunner(store: Store): { runner: InstanceType<typeof RollupRunner>; nudges: string[] } {
+function bootRunner(
+  store: Store,
+  opts: { deliver?: boolean } = {},
+): { runner: InstanceType<typeof RollupRunner>; nudges: string[] } {
   const nudges: string[] = [];
   const agent = {
     listActiveSessions: () => [[SESSION, "sdk-session-1"]] as Array<[string, string]>,
-    handleCronMessage: async (text: string) => { nudges.push(text); return true; },
+    // `false` is how handleCronMessage reports a turn that never happened —
+    // no deliverable target, an error result, a throw inside the queue. It
+    // does not reject.
+    handleCronMessage: async (text: string) => { nudges.push(text); return opts.deliver ?? true; },
   };
   return { runner: new RollupRunner(agent as never, store), nudges };
 }
@@ -94,6 +100,27 @@ describe("rollup nudge cooldown persistence", () => {
     const later = bootRunner(new NudgeCooldownStore(FILE));
     await checkAll(later.runner);
     expect(later.nudges).toHaveLength(1);
+  });
+
+  it("arms no cooldown when the nudge turn never ran", async () => {
+    const store = new NudgeCooldownStore(FILE);
+    const failed = bootRunner(store, { deliver: false });
+    await checkAll(failed.runner);
+
+    // It asked...
+    expect(failed.nudges).toHaveLength(1);
+    // ...but the ask did not land, so nothing is debounced: a 6h cooldown here
+    // buys a 6h hole in which the rollup is due, un-nudged, and skipped by
+    // every heartbeat.
+    expect(store.size()).toBe(0);
+    expect(existsSync(FILE)).toBe(false);
+
+    // The very next hourly check — well inside the 6h window — tries again.
+    vi.setSystemTime(new Date("2026-08-29T08:15:00"));
+    const retry = bootRunner(store);
+    await checkAll(retry.runner);
+    expect(retry.nudges).toHaveLength(1);
+    expect(store.size()).toBe(1);
   });
 
   it("shares one store per path, so two runners in one process share one cooldown", async () => {

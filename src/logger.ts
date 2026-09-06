@@ -40,7 +40,15 @@ function issueMessage(args: unknown[]): string {
       else if (typeof err === "string") parts.push(err);
     }
   }
-  const msg = parts.join(" — ").trim();
+  // SCRUB BEFORE PUBLISHING. The string args have already been scrubbed in
+  // place by the logMethod hook below, but an Error's `message` has not: the
+  // `err` serializer only runs on the pino record, not on the value this
+  // function reads, and grammY's errors echo the request URL —
+  // `https://api.telegram.org/bot<token>/sendMessage` — verbatim. That went
+  // out to every `tomo watch` client and into metrics/activity.ndjson, which
+  // is a file on disk that ends up in bug reports. Scrub first, then clip, so
+  // a token cannot survive by sitting past the 300th character.
+  const msg = scrubSecretValues(parts.join(" — ").trim());
   return (msg || "(no message)").slice(0, 300);
 }
 

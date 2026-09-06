@@ -82,4 +82,28 @@ describe("logger issue tap", () => {
     expect((issues[0] as { msg: string }).msg).toContain("disk full");
     expect(issues[1]).toMatchObject({ level: "error", msg: "outright failure" });
   });
+
+  it("scrubs credentials out of the error message it publishes", async () => {
+    // grammY echoes the request URL in its error text, and the URL carries
+    // the bot token. `err.message` is read straight off the Error here — the
+    // pino `err` serializer never sees this value — so the token went out to
+    // every `tomo watch` client and into logs/activity.ndjson, a file on disk
+    // that ends up attached to bug reports.
+    const { log } = await import("../src/logger.js");
+    watchBus.reset();
+    const token = "8123456789:AAHfake-Token-Value_for-tests-01234567";
+
+    log.warn(
+      { err: new Error(`Call to 'sendMessage' failed! (https://api.telegram.org/bot${token}/sendMessage)`) },
+      "Telegram send failed",
+    );
+    // The same value arriving as a plain string arg, and as a bare Error.
+    log.error(new Error(`bot_token=${token} rejected`));
+
+    const issues = watchBus.recent().filter((e) => e.type === "issue") as Array<{ msg: string }>;
+    expect(issues).toHaveLength(2);
+    expect(issues.map((i) => i.msg).join("\n")).not.toContain(token);
+    expect(issues[0].msg).toContain("Telegram send failed");
+    expect(issues[0].msg).toContain("***");
+  });
 });

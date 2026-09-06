@@ -14,6 +14,8 @@
 
 - **A `send_message` attachment that fails no longer makes the model send the text twice.** Direct mode ships the text first and the photos and stickers after it, and any failure on the second half propagated out of the tool: the transcript append never ran, the caller saw an error, and a model reading "the send failed" reasonably sent the whole thing again — so the reader got the text twice and the picture never. The text cannot be unsent, so each attachment is now attempted on its own (one bad path does not cancel the ones behind it), the delivered text is recorded, and the tool returns a partial success naming exactly what did not arrive and saying not to re-send. A `MEDIA:` path that does not exist is named the same way instead of being dropped in silence.
 
+- **The watch feed's `issue` events no longer carry an unscrubbed error message.** `logger.ts` reads `err.message` straight off the Error to build the one-line summary published to `tomo watch` and written to `logs/activity.ndjson` — a path the `err` serializer and the `formatters.log` pass never touch. grammY echoes the request URL in its error text, so a failed Telegram call put the bot token on the watch feed and into a file on disk that gets attached to bug reports. The summary now goes through the same `scrubSecretValues` every string log argument already gets, before it is clipped to 300 characters so a credential cannot survive by sitting past the cut.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

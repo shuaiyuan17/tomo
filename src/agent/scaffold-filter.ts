@@ -31,11 +31,22 @@ const NARRATOR_PARAGRAPH_START = "Now the user turns to you";
 // Anchored to the start of a line so ordinary prose that merely mentions these
 // words is untouched: a sentence about "the system-reminder block" does not
 // begin a line with `<system-reminder>`.
+//
+// `<tomo-event>` IS NOT HERE, deliberately. It is a harness envelope like the
+// rest, but it is the one shape that has its own owner: inbound-markers.ts
+// lists it in MARKER_SHAPES and applies the policy CLAUDE.md and the changelog
+// state for a fabricated marker — MARK, DON'T TRUNCATE, and skip lines inside
+// a code fence. Both ran, in that order, on the same text: this filter cut at
+// the first `<tomo-event` line, so by the time detectFabricatedMarkers saw the
+// block the shape it was looking for had already been removed. Its tomo-event
+// arm was unreachable, and a pasted log or transcript excerpt inside a fence —
+// the case the fence rule exists for — was truncated at the fenced line
+// anyway. One shape, one owner; the fence-aware one wins.
 const ENVELOPE_LINE_RES = [
   // `user<system-reminder>`, `assistant[...]`, `user[imessage · ...]`
   /^\s*(?:user|assistant|human)\s*[<[]/i,
   // A bare harness tag opening a line.
-  /^\s*<\/?(?:system-reminder|task-notification|tomo-event|task-id|function_results)\b/i,
+  /^\s*<\/?(?:system-reminder|task-notification|task-id|function_results)\b/i,
   // The literal banner the harness puts on background-task events.
   /^\s*\[?SYSTEM NOTIFICATION - NOT USER INPUT\]?\s*$/i,
 ];

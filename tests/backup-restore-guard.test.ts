@@ -26,6 +26,10 @@ vi.mock("../src/config.js", () => ({
   config: {
     tomoHome: paths.tomoHome,
     workspaceDir: join(paths.tomoHome, "workspace"),
+    // The runtime default (no SESSIONS_DIR override), as `config.sessionsDir`
+    // is always a string in production — the restore reads it to decide where
+    // a backup's `sessions/` leg goes.
+    sessionsDir: join(paths.tomoHome, "data", "sessions"),
     sdkSessionsDir: join(paths.tomoHome, "sdk-sessions"),
   },
   CONFIG_PATH: join(paths.tomoHome, "config.json"),

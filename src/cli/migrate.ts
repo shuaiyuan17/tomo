@@ -1,9 +1,7 @@
 import { Command } from "commander";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
-
-const TOMO_HOME = join(homedir(), ".tomo");
+import { MEMORY_DIR } from "../workspace/index.js";
 
 interface OpenClawMessage {
   type: string;
@@ -95,8 +93,13 @@ migrateCommand
       return;
     }
 
-    // Write to memory
-    const memoryDir = join(TOMO_HOME, "workspace", "memory");
+    // Write to memory. `MEMORY_DIR` is derived from runtime-paths, so it
+    // honours `TOMO_WORKSPACE`; this used to re-derive
+    // `~/.tomo/workspace/memory` from `homedir()` and therefore imported the
+    // conversation into a directory the daemon does not read — the command
+    // then printed the path it had written and said Tomo would see it on the
+    // next message, which on any relocated workspace was simply untrue.
+    const memoryDir = MEMORY_DIR;
     mkdirSync(memoryDir, { recursive: true });
     const filename = `imported-openclaw-${Date.now()}.md`;
     const filepath = join(memoryDir, filename);

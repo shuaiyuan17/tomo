@@ -4,6 +4,7 @@ import {
   SessionRegistryReadError,
 } from "../src/sessions/store.js";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { SessionStore as RawSessionStore } from "../src/sessions/store.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -289,5 +290,64 @@ describe("session registry read failure", () => {
     // ...but nothing may be written from the empty state it starts with.
     expect(() => store.setSdkSessionId("telegram:1", "sdk-zzz")).toThrow(SessionRegistryReadError);
     expect(readFileSync(REGISTRY, "utf-8")).toBe("{{{");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The OTHER direction: the registry reads fine and cannot be WRITTEN. This one
+// runs from the constructor, where a throw is not a failed housekeeping pass —
+// it is a daemon that does not start.
+// ---------------------------------------------------------------------------
+
+describe("expired-session cleanup at construction", () => {
+  const SDK_DIR = join(TEST_DIR, "sdk");
+
+  beforeEach(() => {
+    mkdirSync(SDK_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { chmodSync(TEST_DIR, 0o755); } catch { /* may not exist */ }
+  });
+
+  it("does not stop the daemon starting when the cleanup cannot be persisted", () => {
+    const past = Date.now() - 60_000;
+    writeFileSync(join(SDK_DIR, "sdk-old.jsonl"), "{}\n");
+    writeFileSync(REGISTRY, JSON.stringify({
+      version: 1,
+      sessions: [{
+        sdkSessionId: "sdk-old",
+        channelKey: "telegram:1",
+        createdAt: past - 1_000,
+        lastActiveAt: past - 1_000,
+        unlinkedAt: past - 1_000,
+        expiresAt: past,
+        stats: {
+          totalQueries: 0,
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          contextUsed: 0,
+          contextMax: 0,
+        },
+      }],
+    }));
+    const before = readFileSync(REGISTRY, "utf-8");
+
+    // ENOSPC / EACCES / a read-only volume, whichever way it arrives: the
+    // atomic write cannot create its temp file next to the registry.
+    chmodSync(TEST_DIR, 0o555);
+
+    let store: RawSessionStore | undefined;
+    expect(() => { store = new RawSessionStore(TEST_DIR, 20, SDK_DIR); }).not.toThrow();
+
+    // It really did get as far as the unlink — this is the point the header
+    // on cleanupExpired is written about.
+    expect(existsSync(join(SDK_DIR, "sdk-old.jsonl"))).toBe(false);
+    // The failed write changed nothing on disk, and the store is usable.
+    expect(readFileSync(REGISTRY, "utf-8")).toBe(before);
+    expect(store?.getSdkSessionId("telegram:1")).toBeUndefined();
   });
 });

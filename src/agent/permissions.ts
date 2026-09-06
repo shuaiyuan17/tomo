@@ -11,27 +11,166 @@ import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../worksp
 
 const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;
 
+/** The same directory as {@link SKILLS_DIR} without its trailing slash — the
+ *  containment root, which `path.relative` needs unsuffixed. */
+const SKILLS_ROOT = `${config.workspaceDir}/.claude/skills`;
+
+/** The trees the SDK protects under `bypassPermissions`, and therefore the
+ *  ones a call routed here may be trying to reach. `skills/` is carved out of
+ *  the first of them; nothing else in either is ever auto-approved. */
+const PROTECTED_ROOTS = [`${config.workspaceDir}/.claude`, `${config.workspaceDir}/.git`];
+
 /** SDK canUseTool callback. The SDK auto-approves most tools under
  *  `bypassPermissions`, but writes to `.claude/`, `.git/`, etc. are protected
  *  and fall through to canUseTool. We narrowly re-allow `.claude/skills/` so
  *  tomo can manage its own skill library; every other protected path stays
- *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes. */
+ *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes.
+ *
+ *  CONTAINMENT, NOT `startsWith`/`includes`. This is an ALLOW predicate, so a
+ *  string test that over-matches hands back exactly what the SDK protected:
+ *  `<ws>/.claude/skills/../settings.local.json` starts with the skills prefix
+ *  and lands in `.claude/`, and a Bash command that merely MENTIONS the skills
+ *  path — in a comment, in an echo, after the `rm` that does the damage — was
+ *  approved whole. Paths go through {@link realResolve} (which collapses `..`
+ *  and follows symlinks, including a link whose target does not exist yet, the
+ *  normal case for a file about to be written) and then an exact containment
+ *  test. */
 export async function skillsCanUseTool(
   toolName: string,
   input: Record<string, unknown>,
 ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
   const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
-  if (filePath && filePath.startsWith(SKILLS_DIR)) {
+  if (filePath && landsInSkills(filePath)) {
     return { behavior: "allow", updatedInput: input };
   }
-  // Bash mkdir / touch / etc. — allow if command targets the skills dir.
-  if (toolName === "Bash" && typeof input.command === "string" && input.command.includes(SKILLS_DIR)) {
+  // Bash mkdir / touch / etc. — allow only if every path the command names is
+  // inside the skills dir. See bashStaysInSkills.
+  if (toolName === "Bash" && typeof input.command === "string" && bashStaysInSkills(input.command)) {
     return { behavior: "allow", updatedInput: input };
   }
   return {
     behavior: "deny",
     message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
   };
+}
+
+/**
+ * Containment, CASE-SENSITIVE — the opposite of {@link isInside}, deliberately.
+ *
+ * This side is an ALLOW predicate: a comparison that fails to establish
+ * containment DENIES, which is merely conservative, while one that over-matches
+ * grants a write the SDK had protected. So `.claude/SKILLS/` is not treated as
+ * `.claude/skills/`: on a case-sensitive volume it is a different directory
+ * that must not be auto-approved, and on a case-insensitive one the caller
+ * loses nothing by spelling it the way it is spelled on disk.
+ */
+function isInsideExact(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  const rel = relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** Does `p` really land at-or-inside `<ws>/.claude/skills`? Both sides are
+ *  real-resolved, since the workspace may sit under a symlinked prefix. */
+function landsInSkills(p: string): boolean {
+  const real = realResolve(p, config.workspaceDir);
+  if (real === null) return false;
+  return isInsideExact(real, realDir(SKILLS_ROOT, config.workspaceDir) ?? SKILLS_ROOT);
+}
+
+/** Does `p` really land in a protected tree OUTSIDE the skills carve-out? */
+function landsInProtectedNonSkills(p: string): boolean {
+  const real = realResolve(p, config.workspaceDir);
+  if (real === null) return false;
+  if (landsInSkills(p)) return false;
+  return PROTECTED_ROOTS.some((root) => isInsideExact(real, realDir(root, config.workspaceDir) ?? root));
+}
+
+/** Words that move the shell's working directory. Every relative token after
+ *  one of these is resolved against a cwd this predicate does not know, so a
+ *  command containing any of them is refused outright — the same call `$`,
+ *  backtick and `~` already get. */
+const CHANGES_DIRECTORY = new Set(["cd", "pushd", "popd", "chdir"]);
+
+/** A token with `..` as a path SEGMENT — `../x`, `a/../../b`, a bare `..`.
+ *  Not a substring test: `..foo` and `a..b` are ordinary names. */
+function hasDotDotSegment(token: string): boolean {
+  return token.split("/").includes("..");
+}
+
+/**
+ * May this Bash command be auto-approved as skill-library housekeeping?
+ *
+ * Three conditions, all required. At least one token has to really land inside
+ * the skills dir (otherwise there is nothing to re-allow), no token may land
+ * anywhere else in a protected tree (`.claude/skills/../settings.local.json`,
+ * `.git/config`), and the command must contain no `$`, no backtick and no `~`
+ * — each of which produces a word this cannot see, and the last of which is
+ * how a mention of the skills path smuggles a `~/.claude/...` target past a
+ * token scan. Everything else is denied, which costs the caller a permission
+ * prompt rather than a capability.
+ *
+ * TWO MORE WORDS THIS CANNOT SEE, and they belong in that same list.
+ *
+ * `cd` moves the cwd, and every relative token is resolved here against the
+ * WORKSPACE — a fixed root that has nothing to do with where the command will
+ * actually run. `cd /ws/.claude/skills && rm -rf ../settings.local.json` was
+ * ALLOWED: the first token lands in skills, and `../settings.local.json`
+ * resolved against `/ws` is `/settings.local.json`, which is in no protected
+ * tree at all. Run for real it deletes the permissions file the SDK routed
+ * this callback here to protect. Any `cd`/`pushd`/`popd` is now refused.
+ *
+ * And `..` in any token, whatever the cwd turns out to be. A traversal that
+ * happens to land back inside a protected tree is already caught by
+ * `landsInProtectedNonSkills`, but that check only answers for the one root
+ * this predicate guessed; a `..` token is by construction a path whose target
+ * depends on a directory this code does not know, which is exactly the class
+ * of word the paragraph above refuses.
+ */
+function bashStaysInSkills(cmd: string): boolean {
+  if (/[$`~]/.test(cmd)) return false;
+  let touchesSkills = false;
+  for (const word of bashTokens(cmd)) {
+    if (CHANGES_DIRECTORY.has(word)) return false;
+    for (const token of pathCandidates(word)) {
+      if (hasDotDotSegment(token)) return false;
+      if (landsInSkills(token)) {
+        touchesSkills = true;
+        continue;
+      }
+      if (landsInProtectedNonSkills(token)) return false;
+    }
+  }
+  return touchesSkills;
+}
+
+/**
+ * The path-ish parts of one shell word.
+ *
+ * "Starts with `-`, so it names no path" is true of `-r` and `--recursive` and
+ * false of the form every long option actually uses to carry an argument.
+ * `--flag=value` is ONE word, and the whole of it was skipped — so
+ * `tar -xf /ws/.claude/skills/x.tar --directory=/ws/.claude` and
+ * `cp /ws/.claude/skills/a.md --target-directory=/ws/.claude/agents` were
+ * ALLOWED on the strength of their source path alone, with the destination
+ * never looked at. The word is split at its first `=` and the right-hand side
+ * judged as a path like any other.
+ *
+ * The two-token form (`-C ../.claude`, `--directory /ws/.claude`) never needed
+ * this: the value is its own word, does not start with `-`, and the loop above
+ * has always judged it — the `..` spelling now on the strength of the segment
+ * rule, the absolute one on containment.
+ *
+ * A non-flag word is offered whole AND split, so a `NAME=path` assignment is
+ * judged on its value too rather than on the nonsense path `NAME=/x` resolves
+ * to. Extra candidates only ever make this ALLOW predicate stricter.
+ */
+function pathCandidates(word: string): string[] {
+  if (word === "#") return [];
+  const eq = word.indexOf("=");
+  const afterEq = eq === -1 ? [] : [word.slice(eq + 1)].filter((v) => v.length > 0);
+  if (word.startsWith("-")) return afterEq;
+  return [word, ...afterEq];
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +257,9 @@ export function privateMemoryGuardHooks(
  *  - Glob: deny when the search root is at-or-inside MEMORY_DIR, or when the
  *    pattern could match any path at-or-inside private/. Wildcard segments
  *    like `pri*` are evaluated by minimatch against synthetic probe paths, so
- *    `memory/pri*\/*.md` is denied just like `memory/private/*.md`. Probes are
+ *    `memory/pri*\/*.md` is denied just like `memory/private/*.md`. The root
+ *    is judged both as SPELLED and as it REALLY resolves — see
+ *    {@link searchFrames}. Probes are
  *    spelled both relatively and ABSOLUTELY, because an absolute pattern
  *    anchors itself and is reachable from a root that is not private/'s
  *    ancestor; a pattern containing `..` under a memory-reachable root is
@@ -160,16 +301,14 @@ export function isPrivateMemoryAccess(
       // A search rooted AT private/ (or reached through a symlink into it) is
       // denied on the root alone, whatever the pattern says.
       if (landsInPrivate(rootRaw, ctx)) return true;
-      const root = abs(rootRaw, ctx.cwd);
       const pattern = typeof ti.pattern === "string" ? ti.pattern : "";
-      return globReachesPrivate(root, pattern, ctx);
+      return globReachesPrivate(rootRaw, pattern, ctx);
     }
     case "Grep": {
       const rootRaw = typeof ti.path === "string" ? ti.path : ctx.cwd;
       if (landsInPrivate(rootRaw, ctx)) return true;
-      const root = abs(rootRaw, ctx.cwd);
       const glob = typeof ti.glob === "string" ? ti.glob : "";
-      return grepReachesPrivate(root, glob, ctx);
+      return grepReachesPrivate(rootRaw, glob, ctx);
     }
     case "Bash": {
       const cmd = ti.command;
@@ -195,10 +334,11 @@ function abs(p: string, cwd: string): string {
  * case-insensitive by default and `realpathSync` PRESERVES the caller's
  * spelling rather than normalising it — `realpathSync("<ws>/memory/PRIVATE")`
  * returns `.../PRIVATE`, so an exact compare against `.../private` failed and
- * `Read memory/PRIVATE/secret.md` read the file. (The `.claude/skills/`
- * re-allow in #305 folds the other way for the same reason: there a failed
- * comparison DENIES, so preserved casing is merely conservative. Same
- * observation, opposite consequence — hence the different treatment.)
+ * `Read memory/PRIVATE/secret.md` read the file. ({@link isInsideExact}, used
+ * by the `.claude/skills/` re-allow at the top of this file, folds the other
+ * way for the same reason: there a failed comparison DENIES, so preserved
+ * casing is merely conservative. Same observation, opposite consequence —
+ * hence the two helpers.)
  *
  * Folding over-matches on a case-SENSITIVE volume, where `memory/PRIVATE/` is
  * a genuinely different directory that would now be denied. That is the safe
@@ -227,10 +367,9 @@ function hasTraversalSegment(p: string): boolean {
  * Returns null when nothing resolves (which callers read as "no extra
  * evidence", never as "allowed").
  *
- * Same shape as the containment helper in the `.claude/skills/` re-allow
- * (PR #305) — copied rather than imported because that one is private to its
- * own arm and lives on an unmerged branch; when it lands, both should share
- * one helper.
+ * Shared with the `.claude/skills/` re-allow at the top of this file, which
+ * needs exactly the same "resolve a path that may not exist yet" behaviour on
+ * the allow side of the decision.
  *
  * `realpathSync` throws on a path that has not been created, and Write/Edit
  * name files that are about to exist — so realpath the deepest ancestor that
@@ -302,7 +441,8 @@ function landsInPrivate(p: string, ctx: { cwd: string; memoryDir: string; privat
 }
 
 /**
- * The real private dir, resolved once per distinct `privateDir`.
+ * The real path of a guard-relevant directory, resolved once per distinct
+ * spelling.
  *
  * `realResolve` walks the tree and can lstat several levels; it ran on every
  * guarded call for a value that does not change. Cached only once the
@@ -311,13 +451,55 @@ function landsInPrivate(p: string, ctx: { cwd: string; memoryDir: string; privat
  * the workspace, so caching then would pin a pre-creation guess for the life
  * of the process.
  */
-const realPrivateDirCache = new Map<string, string>();
-function realPrivateDir(ctx: { cwd: string; privateDir: string }): string | null {
-  const cached = realPrivateDirCache.get(ctx.privateDir);
+const realDirCache = new Map<string, string>();
+function realDir(dir: string, cwd: string): string | null {
+  const cached = realDirCache.get(dir);
   if (cached !== undefined) return cached;
-  const real = realResolve(ctx.privateDir, ctx.cwd);
-  if (real !== null && existsSync(ctx.privateDir)) realPrivateDirCache.set(ctx.privateDir, real);
+  const real = realResolve(dir, cwd);
+  if (real !== null && existsSync(dir)) realDirCache.set(dir, real);
   return real;
+}
+
+function realPrivateDir(ctx: { cwd: string; privateDir: string }): string | null {
+  return realDir(ctx.privateDir, ctx.cwd);
+}
+
+function realMemoryDir(ctx: { cwd: string; memoryDir: string }): string | null {
+  return realDir(ctx.memoryDir, ctx.cwd);
+}
+
+/**
+ * The (root, memoryDir, privateDir) triples a Glob/Grep call has to be judged
+ * in — the paths as SPELLED, and, when a symlink makes them differ, the paths
+ * the kernel will actually walk.
+ *
+ * The lexical frame alone fails open on a link that never spells either name.
+ * `landsInPrivate` real-resolves, but only against `private/`, so a link
+ * pointing at `memory/` ITSELF (`<ws>/notes -> <ws>/memory`) is not
+ * at-or-inside private/ and passes — and then every containment test below ran
+ * on the lexical root, for which `relative("<ws>/notes", "<ws>/memory/private")`
+ * is `../memory/private`, i.e. "private/ is not reachable from here". A
+ * recursive `Grep({ path: "notes" })` read the whole private tree.
+ *
+ * The two dirs are resolved ALONGSIDE the root rather than mixed with it: a
+ * real root has to be compared against real dirs, since the private dir may
+ * itself sit under a symlinked prefix (`/tmp` -> `/private/tmp` on macOS) and
+ * a mixed comparison would fail open in the other direction.
+ */
+interface SearchFrame {
+  root: string;
+  memoryDir: string;
+  privateDir: string;
+}
+
+function searchFrames(rootRaw: string, ctx: { cwd: string; memoryDir: string; privateDir: string }): SearchFrame[] {
+  const lexical: SearchFrame = { root: abs(rootRaw, ctx.cwd), memoryDir: ctx.memoryDir, privateDir: ctx.privateDir };
+  const real = realResolve(rootRaw, ctx.cwd);
+  if (real === null || real === lexical.root) return [lexical];
+  const realMemory = realMemoryDir(ctx);
+  const realPrivate = realPrivateDir(ctx);
+  if (realMemory === null || realPrivate === null) return [lexical];
+  return [lexical, { root: real, memoryDir: realMemory, privateDir: realPrivate }];
 }
 
 /** True when `rel` represents a non-empty path that doesn't escape upward —
@@ -335,11 +517,12 @@ function isRelativeDescendant(rel: string): boolean {
  *  `memory/private/...` at match time. We test the pattern against three
  *  synthetic probe paths anchored under private/ using minimatch. */
 function globReachesPrivate(
-  root: string,
+  rootRaw: string,
   pattern: string,
   ctx: { cwd: string; memoryDir: string; privateDir: string },
 ): boolean {
-  if (isInside(root, ctx.memoryDir)) return true;
+  const frames = searchFrames(rootRaw, ctx);
+  if (frames.some((frame) => isInside(frame.root, frame.memoryDir))) return true;
   if (!pattern) return false;
   // ABSOLUTE PATTERNS ARE CHECKED FIRST, AND INDEPENDENTLY OF THE ROOT. An
   // absolute pattern anchors itself: `Glob({ path: "/tmp", pattern:
@@ -347,14 +530,17 @@ function globReachesPrivate(
   // even an ancestor of it, so the root-relative probes below never see it and
   // the `isRelativeDescendant` short-circuit would return "unreachable".
   if (matchesAnyProbe(absolutePrivateProbes(ctx), pattern)) return true;
-  const relPrivate = relative(root, ctx.privateDir);
-  if (!isRelativeDescendant(relPrivate)) return false;
-  // A pattern that steers UPWARD out of the root can re-enter the memory tree
-  // by a route the probes cannot model (`../ws/memory/private/*.md` matches
-  // neither the relative nor the absolute probe). While private/ is reachable
-  // from the root at all, refuse rather than model it.
-  if (hasTraversalSegment(pattern)) return true;
-  return matchesAnyProbe(relativePrivateProbes(relPrivate), pattern);
+  for (const frame of frames) {
+    const relPrivate = relative(frame.root, frame.privateDir);
+    if (!isRelativeDescendant(relPrivate)) continue;
+    // A pattern that steers UPWARD out of the root can re-enter the memory tree
+    // by a route the probes cannot model (`../ws/memory/private/*.md` matches
+    // neither the relative nor the absolute probe). While private/ is reachable
+    // from the root at all, refuse rather than model it.
+    if (hasTraversalSegment(pattern)) return true;
+    if (matchesAnyProbe(relativePrivateProbes(relPrivate), pattern)) return true;
+  }
+  return false;
 }
 
 /** Synthetic paths standing in for "something at or under private/", relative
@@ -393,23 +579,27 @@ function matchesAnyProbe(probes: string[], pattern: string): boolean {
  *  - If the glob has `/`, it's a path-style pattern; use minimatch probes.
  *  Without a glob filter, treat the search as fully recursive. */
 function grepReachesPrivate(
-  root: string,
+  rootRaw: string,
   glob: string,
   ctx: { cwd: string; memoryDir: string; privateDir: string },
 ): boolean {
-  if (isInside(root, ctx.memoryDir)) return true;
+  const frames = searchFrames(rootRaw, ctx);
+  if (frames.some((frame) => isInside(frame.root, frame.memoryDir))) return true;
   // Absolute filters anchor themselves — see globReachesPrivate.
   if (glob && matchesAnyProbe(absolutePrivateProbes(ctx), glob)) return true;
-  const relPrivate = relative(root, ctx.privateDir);
-  if (!isRelativeDescendant(relPrivate)) return false;
-  // No glob filter ⇒ unrestricted recursion ⇒ reaches private/.
-  if (!glob) return true;
-  // Basename glob (no `/`) is anchored only by file basename; if private/ is
-  // reachable from root, ripgrep will scan it and apply the filter there too.
-  if (!glob.includes("/")) return true;
-  if (hasTraversalSegment(glob)) return true;
-  // Path-style glob: probe like Glob does.
-  return matchesAnyProbe(relativePrivateProbes(relPrivate), glob);
+  for (const frame of frames) {
+    const relPrivate = relative(frame.root, frame.privateDir);
+    if (!isRelativeDescendant(relPrivate)) continue;
+    // No glob filter ⇒ unrestricted recursion ⇒ reaches private/.
+    if (!glob) return true;
+    // Basename glob (no `/`) is anchored only by file basename; if private/ is
+    // reachable from root, ripgrep will scan it and apply the filter there too.
+    if (!glob.includes("/")) return true;
+    if (hasTraversalSegment(glob)) return true;
+    // Path-style glob: probe like Glob does.
+    if (matchesAnyProbe(relativePrivateProbes(relPrivate), glob)) return true;
+  }
+  return false;
 }
 
 /**
@@ -424,11 +614,17 @@ function grepReachesPrivate(
  * (MEMORY.md is in its prompt), and the Read/Glob/Grep arms above are the
  * precise ones.
  *
- * Six shapes are denied. The first two are the literal ones; the rest exist
+ * Eight shapes are denied. The first two are the literal ones; the rest exist
  * because a reviewer walked straight through the literal ones:
  *
  *  1. Any absolute reference to the memory or private dir.
- *  2. `memory` or `private` as a path segment, however quoted.
+ *  2. `memory` or `private` as a path segment, however quoted — tested on the
+ *     raw command AND on each token with its quotes stripped, because
+ *     adjacent-string concatenation (`cat "mem""ory"/private/x.md`) spells
+ *     neither name at a word boundary until the shell glues the halves.
+ *     "Quotes" INCLUDES the backslash, which quotes one character rather than
+ *     a run: `cat mem\ory/priv\ate/x.md` reads the file in real bash and
+ *     spells neither name until the token is dequoted. See {@link bashTokens}.
  *  3. A GLOB whose literal prefix could expand into either name —
  *     `mem*\/priv*`, `memor?/privat?`, `m[e]mory`. A segment whose glob prefix
  *     is a prefix of "memory"/"private" is denied, and the empty prefix (`*`,
@@ -446,24 +642,46 @@ function grepReachesPrivate(
  *     the recursive grep and every invocation of those three is refused.
  *  6. Archive and encode commands (tar/zip/base64/xxd/…), which turn "read a
  *     tree" into one command that names only `.`.
+ *  7. BRACE EXPANSION — see {@link GLOB_META}. Not globbing, and it needs no
+ *     matching file to fire: `cat {m,}emory/{p,}rivate/x.md` expands to
+ *     `memory/private/x.md` and spells neither name anywhere.
+ *  8. `$` and backticks — the shell writes the path, the caller does not.
+ *     Command substitution runs arbitrary code to produce a word
+ *     (`cat $(echo memory/private/x)`, named in the paragraph above as
+ *     something this cannot parse), and parameter expansion assembles one out
+ *     of pieces no rule here can see (`d=memory e=private; cat $d/$e/x`).
+ *     Both are refused outright rather than modelled, which is the same call
+ *     shapes 3-6 make; `$HOME`-style conveniences are the cost.
  *
- * Shapes 3-6 are the accepted false-positive cost: on a barred turn they are
+ * Shapes 3-8 are the accepted false-positive cost: on a barred turn they are
  * not distinguishable from the exfiltration they enable.
  */
 function bashTouchesMemory(cmd: string, ctx: { cwd: string; memoryDir: string; privateDir: string }): boolean {
   if (cmd.includes(ctx.memoryDir) || cmd.includes(ctx.privateDir)) return true;
-  // `memory` or `private` as a path segment: bordered by /, quote, whitespace,
-  // shell operator, or string boundary. Catches `memory/x`, `./memory`,
-  // `cd memory`, `ls memory/private`, `cat private/foo`, etc.
-  const memorySegment = /(^|[\s'"`=()|&;></])(memory|private)(\/|$|[\s'"`=()|&;><])/i;
-  if (memorySegment.test(cmd)) return true;
+  if (MEMORY_SEGMENT.test(cmd)) return true;
+  if (SHELL_EXPANSION.test(cmd)) return true;
   if (BULK_READ_COMMAND.test(cmd)) return true;
   if (FIND_EXEC.test(cmd)) return true;
   if (FIND_FED_TO_READER.test(cmd)) return true;
   if (RECURSIVE_GREP.test(cmd)) return true;
   if (RECURSIVE_BY_DEFAULT_GREP.test(cmd)) return true;
-  return bashTokens(cmd).some(globCouldExpandToMemory);
+  const tokens = bashTokens(cmd);
+  // The SAME segment rule, re-applied to each token once its quotes are gone.
+  // `"mem""ory"/private/x.md` is one word to the shell and two quoted runs
+  // to the regex above, where neither `memory` nor `private` sits at a word
+  // border — dequoting the token puts them back at one.
+  if (tokens.some((token) => MEMORY_SEGMENT.test(token))) return true;
+  return tokens.some(globCouldExpandToMemory);
 }
+
+/** `memory` or `private` as a path segment: bordered by /, quote, whitespace,
+ *  shell operator, or string boundary. Catches `memory/x`, `./memory`,
+ *  `cd memory`, `ls memory/private`, `cat private/foo`, etc. */
+const MEMORY_SEGMENT = /(^|[\s'"`=()|&;></])(memory|private)(\/|$|[\s'"`=()|&;><])/i;
+
+/** Command substitution, backticks and parameter expansion: the word the shell
+ *  ends up with is not the word this hook was handed. Shape 8 above. */
+const SHELL_EXPANSION = /[$`]/;
 
 /** Archive/encode commands: one invocation reads a whole tree while naming
  *  only `.`, so no path-shaped rule sees it. */
@@ -492,15 +710,32 @@ const RECURSIVE_BY_DEFAULT_GREP = /(^|[\s'"`=()|&;></])(rg|ag|ack)(\s|$)/i;
 
 /** Split a command into path-ish tokens: shell operators and whitespace are
  *  separators, and quoting is stripped rather than honoured (a quoted glob is
- *  still a glob to us — we are not modelling when the shell expands it). */
+ *  still a glob to us — we are not modelling when the shell expands it).
+ *
+ *  BACKSLASH IS A QUOTING OPERATOR TOO — and it was the one left in the token.
+ *  `\` quotes the single character that follows it, so `cat mem\ory/priv\ate/x.md`
+ *  and `cd mem\ory && cat priv\ate/x.md` open exactly the files those two names
+ *  spell (real bash prints the contents), while {@link MEMORY_SEGMENT} was
+ *  handed `mem\ory` and found neither name at a word border. It is stripped
+ *  alongside the quotes so every rule below runs on the word the shell will
+ *  build rather than the one the caller typed. */
 function bashTokens(cmd: string): string[] {
   return cmd
     .split(/[\s;|&()<>]+/)
-    .map((t) => t.replace(/["'`]/g, ""))
+    .map((t) => t.replace(/["'`\\]/g, ""))
     .filter((t) => t.length > 0);
 }
 
-const GLOB_META = /[*?[]/;
+/**
+ * Where a token stops being the path the shell will use.
+ *
+ * `{` is in here because BRACE EXPANSION is not globbing: it fires whether or
+ * not anything matches on disk, so `cat {m,}emory/{p,}rivate/x.md` reaches the
+ * file having spelled neither `memory` nor `private` anywhere in the command.
+ * A `{` yields an empty literal prefix for its segment, which is a prefix of
+ * everything — so, like a bare `*`, any brace in a path-ish token is denied.
+ */
+const GLOB_META = /[*?[{]/;
 
 /**
  * Could this token's glob expand into `memory` or `private`?

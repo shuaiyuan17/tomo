@@ -420,4 +420,18 @@ describe("LaunchAgent respawn throttle", () => {
     expect(plist).toContain("<key>KeepAlive</key>");
     expect(plist).toMatch(/<key>ThrottleInterval<\/key>\s*<integer>30<\/integer>/);
   });
+
+  it("gives the daemon its full bounded shutdown before launchd SIGKILLs it", async () => {
+    // launchd's default ExitTimeOut is 20s. Tomo's graceful shutdown is
+    // bounded at ~33s, so without this key every `launchctl bootout`, every
+    // restart through launchd, and every logout SIGKILLed the daemon
+    // mid-flush — after the registry save had started and before the
+    // transcript was written.
+    const { buildPlist, LAUNCH_AGENT_EXIT_TIMEOUT_SEC } = await import("../src/cli/service.js");
+    expect(LAUNCH_AGENT_EXIT_TIMEOUT_SEC).toBe(Math.ceil(DAEMON_STOP_TIMEOUT_MS / 1000));
+    expect(LAUNCH_AGENT_EXIT_TIMEOUT_SEC).toBeGreaterThanOrEqual(33);
+    expect(buildPlist()).toMatch(
+      new RegExp(`<key>ExitTimeOut</key>\\s*<integer>${LAUNCH_AGENT_EXIT_TIMEOUT_SEC}</integer>`),
+    );
+  });
 });

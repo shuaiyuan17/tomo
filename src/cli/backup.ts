@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { join, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import {
   cpSync,
@@ -79,6 +79,33 @@ function timestamp(): string {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+}
+
+/** True when `child` is `parent` or sits under it. Both resolved first. */
+function isInsideDir(child: string, parent: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * The session registry and transcripts, WHEN they are not already inside
+ * `~/.tomo/data`.
+ *
+ * `runtime-paths.ts` lets `SESSIONS_DIR` move them anywhere — onto a bigger
+ * disk, out of a synced folder — and the backup copied `TOMO_HOME/data` and
+ * nothing else. So on an overridden install the command printed "Backup
+ * complete" over an archive containing zero transcripts and no session
+ * registry, and a restore from it came back with no conversation history at
+ * all. The failure was silent in both directions, which is the worst shape a
+ * backup bug can have.
+ *
+ * Returns null on a default install, where `data/` already carries them and a
+ * second leg would only duplicate the copy.
+ */
+function externalSessionsDir(): string | null {
+  const sessionsDir = config.sessionsDir;
+  if (!sessionsDir) return null;
+  return isInsideDir(sessionsDir, join(TOMO_HOME, "data")) ? null : resolve(sessionsDir);
 }
 
 function copyIfExists(src: string, dest: string, opts?: { filter?: (src: string, dest: string) => boolean }): boolean {
@@ -265,7 +292,7 @@ export function resolveBackupPath(date: string): ResolvedBackup | null {
  * The top-level entries `restore` copies. Checked as a set before any of them
  * is acted on, so an aborted restore has not already half-overwritten.
  */
-const RESTORE_LEGS = ["config.json", "workspace", "data", "sdk-sessions"] as const;
+const RESTORE_LEGS = ["config.json", "workspace", "data", "sessions", "sdk-sessions"] as const;
 
 /** Same directory, not merely the same name. */
 function sameBackup(a: ResolvedBackup, b: ResolvedBackup | null): boolean {
@@ -329,6 +356,17 @@ backupCommand
       console.log("  [ok] data/");
     } else {
       console.log("  [--] data/ (not found)");
+    }
+
+    // 3b. sessions/ — only when SESSIONS_DIR has moved them out of data/,
+    // which the leg above already carries.
+    const externalSessions = externalSessionsDir();
+    if (externalSessions) {
+      if (copyIfExists(externalSessions, join(tmpDest, "sessions"))) {
+        console.log("  [ok] sessions/");
+      } else {
+        console.log("  [--] sessions/ (not found)");
+      }
     }
 
     // 4. SDK session files
@@ -433,6 +471,33 @@ backupCommand
       if (existsSync(dataSrc)) {
         legs.push({ label: "data/", src: dataSrc, dest: join(TOMO_HOME, "data") });
       }
+      // Restored to where THIS install keeps them, which is the only place
+      // the daemon will look — if SESSIONS_DIR has changed since the backup
+      // was taken, the transcripts follow the current setting.
+      //
+      // INCLUDING WHEN THIS INSTALL HAS NO OVERRIDE AT ALL. The dest used to be
+      // `externalSessionsDir()`, which answers null on a default install, and a
+      // null dest DROPPED the leg: restoring a backup taken with SESSIONS_DIR
+      // set onto an install without it printed "Restore complete." over zero
+      // transcripts, with nothing said about the `sessions/` directory sitting
+      // unread in the backup. That is the same silent-in-both-directions shape
+      // the backup half of this bug had. `config.sessionsDir` IS where this
+      // install reads them from — `<TOMO_HOME>/data/sessions` by default — so
+      // that is where they go.
+      const sessionsSrc = join(backup.path, "sessions");
+      const sessionsDest = externalSessionsDir() ?? config.sessionsDir;
+      const sessionsLeg: RestoreLeg | null = existsSync(sessionsSrc)
+        ? { label: "sessions/", src: sessionsSrc, dest: sessionsDest }
+        : null;
+      // NESTED LEGS CANNOT SHARE ONE TRANSACTION. restoreLegsStaged stages every
+      // leg BESIDE its destination and only then swaps them all, so a staging
+      // directory that lives inside another leg's destination is carried away
+      // when that outer leg swaps, and its own rename fails onto a path that no
+      // longer exists. The default sessions dir is inside `data/`, which is
+      // exactly that shape — so it runs as its own transaction, after the first
+      // one has put `data/` in place.
+      const sessionsNested = sessionsLeg !== null && isInsideDir(sessionsLeg.dest, join(TOMO_HOME, "data"));
+      if (sessionsLeg && !sessionsNested) legs.push(sessionsLeg);
       const sdkSrc = join(backup.path, "sdk-sessions");
       if (existsSync(sdkSrc)) {
         legs.push({ label: "sdk-sessions/", src: sdkSrc, dest: config.sdkSessionsDir });
@@ -448,6 +513,7 @@ backupCommand
         [
           { label: "config.json", dest: join(TOMO_HOME, "config.json") },
           { label: "data/", dest: join(TOMO_HOME, "data") },
+          { label: "sessions/", dest: sessionsDest },
           { label: "sdk-sessions/", dest: config.sdkSessionsDir },
         ],
       );
@@ -564,6 +630,27 @@ backupCommand
         return;
       }
 
+      // The nested sessions leg, as a second transaction — see sessionsNested.
+      // It runs here rather than with the others because `data/` has to be in
+      // place first; a failure leaves the staged legs restored and this one not,
+      // which is the same trade the workspace leg below makes and is stated
+      // rather than hidden.
+      if (sessionsLeg && sessionsNested) {
+        try {
+          restoreLegsStaged([sessionsLeg], {
+            onLegRestored: (leg) => console.log(`  [ok] ${leg.label}`),
+            onWarning: (message) => console.error(`  [warn] ${message}`),
+          });
+        } catch (err) {
+          console.error(`  [fail] sessions/: ${(err as Error).message}`);
+          console.error("\nRestore INCOMPLETE. The other components were restored; the transcripts were");
+          console.error(`not. The backup's copy is at ${sessionsSrc}; this install reads them from`);
+          console.error(`${sessionsDest}.`);
+          process.exit(1);
+          return;
+        }
+      }
+
       // workspace/ (preserve .claude/ which is populated by init/start).
       //
       // OUTSIDE THE TRANSACTION ABOVE, deliberately: restoreWorkspaceFromBackup
@@ -582,7 +669,7 @@ backupCommand
           console.error(
             done.length > 0
               ? `\nRestore INCOMPLETE. ${done.join(", ")} ${done.length === 1 ? "was" : "were"} restored;`
-              : "\nRestore INCOMPLETE. This backup carried no config.json, data/ or sdk-sessions/;",
+              : "\nRestore INCOMPLETE. This backup carried no config.json, data/, sessions/ or sdk-sessions/;",
           );
           console.error("the workspace was not. It is restored outside that transaction (its live");
           console.error(".claude/ is put back on failure; the rest of the live workspace may be partly");

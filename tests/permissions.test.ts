@@ -24,6 +24,7 @@ vi.mock("../src/workspace/index.js", () => ({
 const {
   isPrivateMemoryAccess,
   privateMemoryGuardHooks,
+  skillsCanUseTool,
   PRIVATE_MEMORY_GROUP_DENIAL,
   PRIVATE_MEMORY_SUMMONED_DENIAL,
 } = await import("../src/agent/permissions.js");
@@ -242,6 +243,19 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
     it("denies absolute paths into the memory tree", () => {
       expect(isPrivateMemoryAccess("Bash", { command: "cd /ws/memory" }, ctx)).toBe(true);
     });
+
+    // The token dequoter stripped `"`, `'` and backticks and left the fourth
+    // quoting operator in place. Both commands below were ALLOWED on a barred
+    // turn and both really print the file in bash: `\` quotes the one
+    // character after it, so the shell opens `memory/private/x.md` while the
+    // segment rule was looking at `mem\ory`.
+    it("denies backslash-quoted spellings of the memory segment", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cat mem\\ory/priv\\ate/x.md" }, ctx)).toBe(true);
+    });
+
+    it("denies a backslash-quoted cd into memory followed by a read", () => {
+      expect(isPrivateMemoryAccess("Bash", { command: "cd mem\\ory && cat priv\\ate/x.md" }, ctx)).toBe(true);
+    });
   });
 
   describe("unknown tools", () => {
@@ -352,6 +366,13 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
     symlinkSync(realCtx.privateDir, join(realCtx.memoryDir, "notes"));
     // ...and one whose TARGET does not exist yet, which realpath cannot see.
     symlinkSync(join(realCtx.privateDir, "planted.md"), join(realCtx.memoryDir, "planted"));
+    // A link to the memory tree ITSELF, planted OUTSIDE it. Nothing about it
+    // is at-or-inside private/, so the file-op rules have nothing to say —
+    // but a recursive search rooted here walks straight into private/.
+    symlinkSync(realCtx.memoryDir, join(root, "shortcut"));
+    // The control: a link of the same shape that lands nowhere near memory/.
+    mkdirSync(join(root, "elsewhere"), { recursive: true });
+    symlinkSync(join(root, "elsewhere"), join(root, "detour"));
   });
 
   afterAll(() => {
@@ -385,6 +406,25 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
 
   it("denies a Glob rooted on a symlink into private/", () => {
     expect(isPrivateMemoryAccess("Glob", { path: "memory/notes", pattern: "*.md" }, realCtx)).toBe(true);
+  });
+
+  it("denies a Grep rooted on a symlink to the memory tree itself", () => {
+    // The root is not at-or-inside private/, so landsInPrivate says nothing;
+    // the containment test then ran on the LEXICAL root, for which private/
+    // is `../memory/private` — "not reachable" — and ripgrep recursed through
+    // the link into the whole private tree.
+    expect(isPrivateMemoryAccess("Grep", { path: "shortcut", pattern: "owner-only" }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "shortcut", pattern: "x", glob: "private/*.md" }, realCtx)).toBe(true);
+  });
+
+  it("denies a Glob rooted on a symlink to the memory tree itself", () => {
+    expect(isPrivateMemoryAccess("Glob", { path: "shortcut", pattern: "private/*.md" }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess("Glob", { path: "shortcut", pattern: "pri*/*.md" }, realCtx)).toBe(true);
+  });
+
+  it("still allows a search rooted on a symlink that lands outside memory/", () => {
+    expect(isPrivateMemoryAccess("Grep", { path: "detour", pattern: "x" }, realCtx)).toBe(false);
+    expect(isPrivateMemoryAccess("Glob", { path: "detour", pattern: "private/*.md" }, realCtx)).toBe(false);
   });
 
   it("denies a case-permuted read that the filesystem itself resolves", () => {
@@ -492,6 +532,21 @@ describe("isPrivateMemoryAccess — Bash exfiltration shapes", () => {
     ["zip of the workspace", "zip -r /tmp/out.zip ."],
     ["base64 alone", "base64 somefile"],
     ["xxd", "xxd somefile"],
+    // Brace expansion is not globbing: it fires with no matching file, and
+    // neither name is spelled anywhere in the command. Executed by the
+    // reviewer against the live guard before the fix.
+    ["brace expansion over both names", "cat {m,}emory/{p,}rivate/x.md"],
+    ["brace expansion over one name", "cat memory{,}/private/x.md"],
+    ["brace alternation naming private", "cat notes/{public,private}/x.md"],
+    // The shell writes the word; the hook only ever sees the recipe.
+    ["command substitution", "cat $(echo bWVtb3J5 | tr a-z a-z)/x.md"],
+    ["backtick substitution", "cat `printf notes`/x.md"],
+    ["parameter expansion assembled from pieces", "d=notes e=stuff; cat $d/$e/x.md"],
+    ["braced parameter expansion", "cat ${d}/x.md"],
+    // Adjacent quoted runs: one word to the shell, two quoted fragments to a
+    // regex reading the raw command, so neither name sat at a word border.
+    ["adjacent-quote concatenation", 'cat "mem""ory"/x.md'],
+    ["quote split inside a name", "cat me''mory/x.md"],
   ] as const;
 
   for (const [label, cmd] of denied) {
@@ -561,5 +616,102 @@ describe("isPrivateMemoryAccess — self-anchoring Glob/Grep patterns", () => {
   it("still allows an absolute pattern that lands outside the memory tree", () => {
     expect(isPrivateMemoryAccess("Glob", { path: "/tmp", pattern: "/etc/hosts" }, ctx)).toBe(false);
     expect(isPrivateMemoryAccess("Glob", { path: "/tmp", pattern: "/ws/skills/*.md" }, ctx)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The `.claude/skills/` re-allow. This one is an ALLOW predicate, so the
+// failure mode is the mirror image of the guard above: a string test that
+// over-matches hands back the very paths the SDK protected.
+// ---------------------------------------------------------------------------
+
+describe("skillsCanUseTool", () => {
+  const allow = async (toolName: string, input: Record<string, unknown>) =>
+    (await skillsCanUseTool(toolName, input)).behavior;
+
+  it("allows a write inside the skills dir", async () => {
+    expect(await allow("Write", { file_path: "/ws/.claude/skills/tomo-x/SKILL.md", content: "x" })).toBe("allow");
+    expect(await allow("Read", { file_path: "/ws/.claude/skills/tomo-x/refs/a.md" })).toBe("allow");
+  });
+
+  it("denies a path that only STARTS with the skills prefix", async () => {
+    // `startsWith` said yes; the path lands in `.claude/`, which is exactly
+    // what the SDK routed here to protect.
+    expect(await allow("Write", { file_path: "/ws/.claude/skills/../settings.local.json", content: "x" }))
+      .toBe("deny");
+    expect(await allow("Edit", { file_path: "/ws/.claude/skills/a/../../settings.json", old_string: "a", new_string: "b" }))
+      .toBe("deny");
+  });
+
+  it("denies protected paths outside the carve-out", async () => {
+    expect(await allow("Write", { file_path: "/ws/.claude/settings.local.json", content: "x" })).toBe("deny");
+    expect(await allow("Write", { file_path: "/ws/.git/config", content: "x" })).toBe("deny");
+  });
+
+  it("allows Bash housekeeping whose only named path is inside skills", async () => {
+    expect(await allow("Bash", { command: "mkdir -p /ws/.claude/skills/tomo-x" })).toBe("allow");
+    expect(await allow("Bash", { command: "rm -rf /ws/.claude/skills/tomo-x" })).toBe("allow");
+  });
+
+  it("denies a Bash command that merely MENTIONS the skills dir", async () => {
+    // `includes(SKILLS_DIR)` approved the whole command on the strength of the
+    // trailing comment.
+    expect(await allow("Bash", { command: "rm -rf /ws/.claude/settings.local.json # /ws/.claude/skills/" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "echo /ws/.claude/skills/ && cat /ws/.git/config" })).toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md /ws/.claude/agents/a.md" })).toBe("deny");
+  });
+
+  it("denies a Bash command that names no skills path at all", async () => {
+    expect(await allow("Bash", { command: "ls /tmp" })).toBe("deny");
+  });
+
+  it("denies a Bash command that moves the working directory", async () => {
+    // Every relative token here is resolved against the WORKSPACE, so the
+    // `cd` was invisible: `../settings.local.json` read as `/settings.local.json`,
+    // which is in no protected tree, and the command was ALLOWED. Run for real
+    // it deletes `/ws/.claude/settings.local.json`.
+    expect(await allow("Bash", { command: "cd /ws/.claude/skills && rm -rf ../settings.local.json" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "cd /ws/.claude/skills && rm -rf tomo-x" })).toBe("deny");
+  });
+
+  it("denies a Bash token with a .. segment", async () => {
+    expect(await allow("Bash", { command: "rm -rf /ws/.claude/skills/../agents" })).toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md ../a.md" })).toBe("deny");
+    // `..` as a SEGMENT, not as a substring — an ordinary name that merely
+    // contains dots is still housekeeping.
+    expect(await allow("Bash", { command: "touch /ws/.claude/skills/a..b.md" })).toBe("allow");
+  });
+
+  it("denies a --flag=path whose value leaves the skills dir", async () => {
+    // The whole word starts with `-`, so it was skipped as a flag and the
+    // command was ALLOWED on the strength of its source path alone.
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar --directory=/ws/.claude" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md --target-directory=/ws/.claude/agents" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar --directory=../.claude" }))
+      .toBe("deny");
+    // A flag with no `=` still names no path.
+    expect(await allow("Bash", { command: "cp -r /ws/.claude/skills/a /ws/.claude/skills/b" })).toBe("allow");
+  });
+
+  it("denies the two-token flag form that escapes the skills dir", async () => {
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar -C ../.claude" })).toBe("deny");
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar -C /ws/.claude" })).toBe("deny");
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar -C /ws/.claude/skills/out" }))
+      .toBe("allow");
+  });
+
+  it("denies a Bash command whose target the shell would construct", async () => {
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md $DEST" })).toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md ~/.claude/settings.json" })).toBe("deny");
+  });
+
+  it("names the auto-approved prefix in the denial", async () => {
+    const result = await skillsCanUseTool("Write", { file_path: "/ws/.claude/settings.json", content: "x" });
+    expect(result.behavior).toBe("deny");
+    if (result.behavior === "deny") expect(result.message).toContain("/ws/.claude/skills/");
   });
 });

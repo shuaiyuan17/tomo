@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -62,6 +62,42 @@ describe("runContinuityScript", () => {
     expect(result).toContain("stderr:");
     expect(result).toContain("nope");
   });
+
+  it("returns as soon as the script exits, even with a background child on the pipes", async () => {
+    // `'close'` fires only when EVERY holder of the child's stdio has let go,
+    // and a backgrounded grandchild inherits them. Resolving on it meant one
+    // `sleep 30 &` in the user's status script stopped the heartbeat for
+    // thirty seconds — a daemon started the same way stopped it forever, and
+    // the timeout could not help because it only killed the direct child.
+    const path = writeScript("background.sh", "#!/bin/sh\nsleep 30 &\necho done-now\nexit 0\n");
+
+    const startedAt = Date.now();
+    const result = await runContinuityScript(scriptConfig(path, { timeoutMs: 20_000 }));
+    const elapsed = Date.now() - startedAt;
+
+    expect(result).toContain("status: completed successfully");
+    expect(result).toContain("done-now");
+    expect(elapsed).toBeLessThan(10_000);
+  });
+
+  it("kills the whole process group when the script times out", async () => {
+    // The timeout killed only the direct child, so anything the script had
+    // started survived it — and kept holding the pipes.
+    const pidFile = join(tmpDir, "grandchild.pid");
+    const path = writeScript(
+      "leaves-child.sh",
+      `#!/bin/sh\nsleep 30 &\necho $! > ${pidFile}\nsleep 30\n`,
+    );
+
+    const result = await runContinuityScript(scriptConfig(path, { timeoutMs: 500 }));
+
+    expect(result).toContain("status: timed out after 500ms");
+    const grandchild = Number(readFileSync(pidFile, "utf-8").trim());
+    expect(Number.isInteger(grandchild)).toBe(true);
+    // SIGKILL to the group is asynchronous; give the kernel a moment.
+    await new Promise((r) => setTimeout(r, 200));
+    expect(() => process.kill(grandchild, 0)).toThrow();
+  }, 15_000);
 
   it("bounds captured output", async () => {
     const path = writeScript("long.sh", "#!/bin/sh\nprintf abcdef\n");

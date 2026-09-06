@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { writeFileAtomicSync } from "../fs-utils.js";
+import { log } from "../logger.js";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { ExternalMcpServerConfig, McpOAuthConfig } from "./external-config.js";
 
@@ -1000,7 +1001,38 @@ function base64Url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-async function startCallbackServer(configuredRedirectUri?: string) {
+/**
+ * The fixed base the callback listener parses its request target against.
+ *
+ * NOT `req.headers.host`. That header is whatever the client sent — this
+ * listener answers on loopback, but anything that can open a socket to it can
+ * put an empty, spaced or bracketed value in there, and `new URL(path,
+ * \`http://\${host}\`)` throws `Invalid URL` on every one of them. The throw
+ * happened inside the 'request' listener, which makes it an uncaughtException:
+ * process-handlers.ts logs it and exits 1, so ONE malformed request to a
+ * transient OAuth callback port took the whole daemon down. The listener is
+ * bound to 127.0.0.1 and routes on the path alone, so the authority in the
+ * parse base is bookkeeping — pin it and the header stops mattering.
+ */
+const CALLBACK_URL_BASE = "http://127.0.0.1";
+
+/**
+ * The request target as a URL, or null when it is not one this listener will
+ * answer. Origin-form only (`/oauth/callback?...`): a target beginning `//` is
+ * protocol-relative and would silently move the authority onto whatever
+ * follows it, and absolute-form is a proxy shape that has no business here.
+ */
+function parseCallbackTarget(target: string | undefined): URL | null {
+  if (!target || !target.startsWith("/") || target.startsWith("//")) return null;
+  try {
+    return new URL(target, CALLBACK_URL_BASE);
+  } catch {
+    return null;
+  }
+}
+
+/** Exported for tests — nothing outside this module starts one. */
+export async function startCallbackServer(configuredRedirectUri?: string) {
   const configured = configuredRedirectUri ? new URL(configuredRedirectUri) : undefined;
   if (configured && configured.hostname !== "127.0.0.1" && configured.hostname !== "localhost") {
     throw new Error("Configured OAuth redirectUri must use localhost or 127.0.0.1 so Tomo can capture the callback");
@@ -1017,7 +1049,28 @@ async function startCallbackServer(configuredRedirectUri?: string) {
   });
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+    // NOTHING inside here may throw: an exception in a 'request' listener is
+    // an uncaughtException, and the daemon's handler for that exits.
+    try {
+      handleCallbackRequest(req, res);
+    } catch (err) {
+      log.warn({ err }, "MCP OAuth callback request failed");
+      try {
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      } catch {
+        // The socket is already gone; there is nowhere left to report.
+      }
+    }
+  });
+
+  const handleCallbackRequest = (req: IncomingMessage, res: ServerResponse): void => {
+    const url = parseCallbackTarget(req.url);
+    if (!url) {
+      res.writeHead(400);
+      res.end("Bad request");
+      return;
+    }
     if (url.pathname !== expectedPath) {
       res.writeHead(404);
       res.end("Not found");
@@ -1046,7 +1099,7 @@ async function startCallbackServer(configuredRedirectUri?: string) {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Tomo received the OAuth login. You can close this tab.");
     complete(code, url.searchParams.get("state"));
-  });
+  };
 
   const complete = (code: string, state: string | null): boolean => {
     if (callbackSettled) return false;

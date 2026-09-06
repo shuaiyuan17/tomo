@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { McpOAuthManager } from "../src/mcp/oauth.js";
+import { connect } from "node:net";
+import { McpOAuthManager, startCallbackServer } from "../src/mcp/oauth.js";
 import type { ExternalMcpServerConfig } from "../src/mcp/external-config.js";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-mcp-oauth");
@@ -1440,5 +1441,95 @@ describe("McpOAuthManager", () => {
       await expect(onDemand).resolves.toBe("refreshed");
       expect(exchanges).toBe(1);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The loopback callback listener. `req.headers.host` is whatever the client
+// sent, and `new URL(path, `http://${host}`)` throws on a malformed one —
+// inside a 'request' listener, which makes it an uncaughtException and takes
+// the daemon with it.
+// ---------------------------------------------------------------------------
+
+describe("OAuth callback listener", () => {
+  /** Speak raw HTTP so the Host header can be malformed on purpose — no
+   *  client library will send these. Resolves with the status line. */
+  function rawRequest(port: number, lines: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1", () => socket.write(lines));
+      let seen = "";
+      socket.setTimeout(5_000, () => {
+        socket.destroy();
+        reject(new Error("callback listener never answered"));
+      });
+      socket.on("data", (chunk: Buffer) => {
+        seen += chunk.toString();
+        socket.end();
+      });
+      socket.on("close", () => resolve(seen.split("\r\n")[0] ?? ""));
+      socket.on("error", reject);
+    });
+  }
+
+  function portOf(redirectUri: string): number {
+    return Number(new URL(redirectUri).port);
+  }
+
+  it("answers a request whose Host header cannot be parsed", async () => {
+    const callback = await startCallbackServer();
+    const port = portOf(callback.redirectUri);
+    try {
+      // Every one of these makes `new URL(url, `http://${host}`)` throw
+      // "Invalid URL" — including the empty value, which the old
+      // `?? "127.0.0.1"` fallback did not cover because "" is not nullish.
+      for (const host of ["]", "a b", "%%%", "", "x:99999999"]) {
+        const status = await rawRequest(
+          port,
+          `GET /oauth/callback?code=abc&state=xyz HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+        );
+        expect(status, host).toMatch(/^HTTP\/1\.1 200/);
+      }
+      // ...and the callback still resolved with the code, from the first one.
+      await expect(callback.waitForCallback("xyz")).resolves.toEqual({ code: "abc", state: "xyz" });
+    } finally {
+      await callback.close();
+    }
+  });
+
+  it("answers 400 for a request target it will not parse", async () => {
+    const callback = await startCallbackServer();
+    const port = portOf(callback.redirectUri);
+    try {
+      // Protocol-relative: `new URL("//evil/oauth/callback", base)` moves the
+      // authority onto `evil` and keeps the pathname, so it would otherwise
+      // route as a genuine callback.
+      const status = await rawRequest(
+        port,
+        "GET //evil/oauth/callback?code=abc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+      );
+      expect(status).toMatch(/^HTTP\/1\.1 400/);
+    } finally {
+      await callback.close();
+    }
+  });
+
+  it("still routes a well-formed callback", async () => {
+    const callback = await startCallbackServer();
+    const port = portOf(callback.redirectUri);
+    try {
+      const status = await rawRequest(
+        port,
+        "GET /oauth/callback?code=good&state=st HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+      );
+      expect(status).toMatch(/^HTTP\/1\.1 200/);
+      await expect(callback.waitForCallback("st")).resolves.toEqual({ code: "good", state: "st" });
+      const notFound = await rawRequest(
+        port,
+        "GET /nope HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+      );
+      expect(notFound).toMatch(/^HTTP\/1\.1 404/);
+    } finally {
+      await callback.close();
+    }
   });
 });

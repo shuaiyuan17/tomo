@@ -104,9 +104,14 @@ export function resolveTimeRange(
 export interface ContextSection {
   /** Section index (1-based) */
   id: number;
-  /** First message seq in this section (by position in JSONL) */
+  /**
+   * Bounds of the section, as indices into the MESSAGE sequence this report
+   * walks — the user/assistant messages with content, one entry per message.
+   * NOT line numbers in the JSONL, which also carries tool metadata, summary
+   * blocks and unparseable lines; and not the conversation indices
+   * `resolveTimeRange`/`compactSession` speak in either.
+   */
   fromIdx: number;
-  /** Last message seq in this section */
   toIdx: number;
   /** Estimated token count */
   tokens: number;

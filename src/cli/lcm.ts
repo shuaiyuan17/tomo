@@ -3,8 +3,9 @@ import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
 import { pruneTools } from "../lcm/prune-tools.js";
 import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
-import { SessionStore } from "../sessions/store.js";
+import { SessionStore, getSdkSessionPath } from "../sessions/store.js";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 
 async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string }> {
   const { config } = await import("../config.js");
@@ -168,8 +169,7 @@ lcmCommand
   .option("--full", "Show full summary content instead of a preview")
   .option("--preview <chars>", "Preview length in chars (default 160)", (v) => parseInt(v, 10), 160)
   .action(async (opts) => {
-    const { readFileSync, existsSync } = await import("node:fs");
-    const { getSdkSessionPath } = await import("../sessions/store.js");
+    const { readFileSync } = await import("node:fs");
     const paths = await getRuntimeDirs();
     const sessionPath = getSdkSessionPath(opts.sessionId, paths.sdkSessionsDir);
     if (!existsSync(sessionPath)) {
@@ -237,9 +237,11 @@ lcmCommand
   .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
-    // Resolve timestamps to indices using context_stats
-    const stats = computeContextStats(opts.sessionId, paths.sdkSessionsDir);
-    if (!stats) {
+    // Does the session exist? `computeContextStats` answered this by parsing
+    // and tokenising the whole JSONL — a session file's worth of work whose
+    // only use here was the null check. The range resolution below re-reads
+    // the file anyway.
+    if (!existsSync(getSdkSessionPath(opts.sessionId, paths.sdkSessionsDir))) {
       console.error(JSON.stringify({ status: "error", error: "Session not found" }));
       process.exit(1);
     }

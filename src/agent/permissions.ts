@@ -130,18 +130,47 @@ function hasDotDotSegment(token: string): boolean {
 function bashStaysInSkills(cmd: string): boolean {
   if (/[$`~]/.test(cmd)) return false;
   let touchesSkills = false;
-  for (const token of bashTokens(cmd)) {
-    if (CHANGES_DIRECTORY.has(token)) return false;
-    if (hasDotDotSegment(token)) return false;
-    // Flags and comment markers name no path.
-    if (token.startsWith("-") || token === "#") continue;
-    if (landsInSkills(token)) {
-      touchesSkills = true;
-      continue;
+  for (const word of bashTokens(cmd)) {
+    if (CHANGES_DIRECTORY.has(word)) return false;
+    for (const token of pathCandidates(word)) {
+      if (hasDotDotSegment(token)) return false;
+      if (landsInSkills(token)) {
+        touchesSkills = true;
+        continue;
+      }
+      if (landsInProtectedNonSkills(token)) return false;
     }
-    if (landsInProtectedNonSkills(token)) return false;
   }
   return touchesSkills;
+}
+
+/**
+ * The path-ish parts of one shell word.
+ *
+ * "Starts with `-`, so it names no path" is true of `-r` and `--recursive` and
+ * false of the form every long option actually uses to carry an argument.
+ * `--flag=value` is ONE word, and the whole of it was skipped — so
+ * `tar -xf /ws/.claude/skills/x.tar --directory=/ws/.claude` and
+ * `cp /ws/.claude/skills/a.md --target-directory=/ws/.claude/agents` were
+ * ALLOWED on the strength of their source path alone, with the destination
+ * never looked at. The word is split at its first `=` and the right-hand side
+ * judged as a path like any other.
+ *
+ * The two-token form (`-C ../.claude`, `--directory /ws/.claude`) never needed
+ * this: the value is its own word, does not start with `-`, and the loop above
+ * has always judged it — the `..` spelling now on the strength of the segment
+ * rule, the absolute one on containment.
+ *
+ * A non-flag word is offered whole AND split, so a `NAME=path` assignment is
+ * judged on its value too rather than on the nonsense path `NAME=/x` resolves
+ * to. Extra candidates only ever make this ALLOW predicate stricter.
+ */
+function pathCandidates(word: string): string[] {
+  if (word === "#") return [];
+  const eq = word.indexOf("=");
+  const afterEq = eq === -1 ? [] : [word.slice(eq + 1)].filter((v) => v.length > 0);
+  if (word.startsWith("-")) return afterEq;
+  return [word, ...afterEq];
 }
 
 // ---------------------------------------------------------------------------

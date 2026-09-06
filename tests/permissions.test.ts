@@ -684,6 +684,26 @@ describe("skillsCanUseTool", () => {
     expect(await allow("Bash", { command: "touch /ws/.claude/skills/a..b.md" })).toBe("allow");
   });
 
+  it("denies a --flag=path whose value leaves the skills dir", async () => {
+    // The whole word starts with `-`, so it was skipped as a flag and the
+    // command was ALLOWED on the strength of its source path alone.
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar --directory=/ws/.claude" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md --target-directory=/ws/.claude/agents" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar --directory=../.claude" }))
+      .toBe("deny");
+    // A flag with no `=` still names no path.
+    expect(await allow("Bash", { command: "cp -r /ws/.claude/skills/a /ws/.claude/skills/b" })).toBe("allow");
+  });
+
+  it("denies the two-token flag form that escapes the skills dir", async () => {
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar -C ../.claude" })).toBe("deny");
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar -C /ws/.claude" })).toBe("deny");
+    expect(await allow("Bash", { command: "tar -xf /ws/.claude/skills/x.tar -C /ws/.claude/skills/out" }))
+      .toBe("allow");
+  });
+
   it("denies a Bash command whose target the shell would construct", async () => {
     expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md $DEST" })).toBe("deny");
     expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md ~/.claude/settings.json" })).toBe("deny");

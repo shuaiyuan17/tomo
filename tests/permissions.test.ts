@@ -352,6 +352,13 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
     symlinkSync(realCtx.privateDir, join(realCtx.memoryDir, "notes"));
     // ...and one whose TARGET does not exist yet, which realpath cannot see.
     symlinkSync(join(realCtx.privateDir, "planted.md"), join(realCtx.memoryDir, "planted"));
+    // A link to the memory tree ITSELF, planted OUTSIDE it. Nothing about it
+    // is at-or-inside private/, so the file-op rules have nothing to say —
+    // but a recursive search rooted here walks straight into private/.
+    symlinkSync(realCtx.memoryDir, join(root, "shortcut"));
+    // The control: a link of the same shape that lands nowhere near memory/.
+    mkdirSync(join(root, "elsewhere"), { recursive: true });
+    symlinkSync(join(root, "elsewhere"), join(root, "detour"));
   });
 
   afterAll(() => {
@@ -385,6 +392,25 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
 
   it("denies a Glob rooted on a symlink into private/", () => {
     expect(isPrivateMemoryAccess("Glob", { path: "memory/notes", pattern: "*.md" }, realCtx)).toBe(true);
+  });
+
+  it("denies a Grep rooted on a symlink to the memory tree itself", () => {
+    // The root is not at-or-inside private/, so landsInPrivate says nothing;
+    // the containment test then ran on the LEXICAL root, for which private/
+    // is `../memory/private` — "not reachable" — and ripgrep recursed through
+    // the link into the whole private tree.
+    expect(isPrivateMemoryAccess("Grep", { path: "shortcut", pattern: "owner-only" }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "shortcut", pattern: "x", glob: "private/*.md" }, realCtx)).toBe(true);
+  });
+
+  it("denies a Glob rooted on a symlink to the memory tree itself", () => {
+    expect(isPrivateMemoryAccess("Glob", { path: "shortcut", pattern: "private/*.md" }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess("Glob", { path: "shortcut", pattern: "pri*/*.md" }, realCtx)).toBe(true);
+  });
+
+  it("still allows a search rooted on a symlink that lands outside memory/", () => {
+    expect(isPrivateMemoryAccess("Grep", { path: "detour", pattern: "x" }, realCtx)).toBe(false);
+    expect(isPrivateMemoryAccess("Glob", { path: "detour", pattern: "private/*.md" }, realCtx)).toBe(false);
   });
 
   it("denies a case-permuted read that the filesystem itself resolves", () => {

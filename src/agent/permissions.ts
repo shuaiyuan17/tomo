@@ -118,7 +118,9 @@ export function privateMemoryGuardHooks(
  *  - Glob: deny when the search root is at-or-inside MEMORY_DIR, or when the
  *    pattern could match any path at-or-inside private/. Wildcard segments
  *    like `pri*` are evaluated by minimatch against synthetic probe paths, so
- *    `memory/pri*\/*.md` is denied just like `memory/private/*.md`. Probes are
+ *    `memory/pri*\/*.md` is denied just like `memory/private/*.md`. The root
+ *    is judged both as SPELLED and as it REALLY resolves — see
+ *    {@link searchFrames}. Probes are
  *    spelled both relatively and ABSOLUTELY, because an absolute pattern
  *    anchors itself and is reachable from a root that is not private/'s
  *    ancestor; a pattern containing `..` under a memory-reachable root is
@@ -160,16 +162,14 @@ export function isPrivateMemoryAccess(
       // A search rooted AT private/ (or reached through a symlink into it) is
       // denied on the root alone, whatever the pattern says.
       if (landsInPrivate(rootRaw, ctx)) return true;
-      const root = abs(rootRaw, ctx.cwd);
       const pattern = typeof ti.pattern === "string" ? ti.pattern : "";
-      return globReachesPrivate(root, pattern, ctx);
+      return globReachesPrivate(rootRaw, pattern, ctx);
     }
     case "Grep": {
       const rootRaw = typeof ti.path === "string" ? ti.path : ctx.cwd;
       if (landsInPrivate(rootRaw, ctx)) return true;
-      const root = abs(rootRaw, ctx.cwd);
       const glob = typeof ti.glob === "string" ? ti.glob : "";
-      return grepReachesPrivate(root, glob, ctx);
+      return grepReachesPrivate(rootRaw, glob, ctx);
     }
     case "Bash": {
       const cmd = ti.command;
@@ -302,7 +302,8 @@ function landsInPrivate(p: string, ctx: { cwd: string; memoryDir: string; privat
 }
 
 /**
- * The real private dir, resolved once per distinct `privateDir`.
+ * The real path of a guard-relevant directory, resolved once per distinct
+ * spelling.
  *
  * `realResolve` walks the tree and can lstat several levels; it ran on every
  * guarded call for a value that does not change. Cached only once the
@@ -311,13 +312,55 @@ function landsInPrivate(p: string, ctx: { cwd: string; memoryDir: string; privat
  * the workspace, so caching then would pin a pre-creation guess for the life
  * of the process.
  */
-const realPrivateDirCache = new Map<string, string>();
-function realPrivateDir(ctx: { cwd: string; privateDir: string }): string | null {
-  const cached = realPrivateDirCache.get(ctx.privateDir);
+const realDirCache = new Map<string, string>();
+function realDir(dir: string, cwd: string): string | null {
+  const cached = realDirCache.get(dir);
   if (cached !== undefined) return cached;
-  const real = realResolve(ctx.privateDir, ctx.cwd);
-  if (real !== null && existsSync(ctx.privateDir)) realPrivateDirCache.set(ctx.privateDir, real);
+  const real = realResolve(dir, cwd);
+  if (real !== null && existsSync(dir)) realDirCache.set(dir, real);
   return real;
+}
+
+function realPrivateDir(ctx: { cwd: string; privateDir: string }): string | null {
+  return realDir(ctx.privateDir, ctx.cwd);
+}
+
+function realMemoryDir(ctx: { cwd: string; memoryDir: string }): string | null {
+  return realDir(ctx.memoryDir, ctx.cwd);
+}
+
+/**
+ * The (root, memoryDir, privateDir) triples a Glob/Grep call has to be judged
+ * in — the paths as SPELLED, and, when a symlink makes them differ, the paths
+ * the kernel will actually walk.
+ *
+ * The lexical frame alone fails open on a link that never spells either name.
+ * `landsInPrivate` real-resolves, but only against `private/`, so a link
+ * pointing at `memory/` ITSELF (`<ws>/notes -> <ws>/memory`) is not
+ * at-or-inside private/ and passes — and then every containment test below ran
+ * on the lexical root, for which `relative("<ws>/notes", "<ws>/memory/private")`
+ * is `../memory/private`, i.e. "private/ is not reachable from here". A
+ * recursive `Grep({ path: "notes" })` read the whole private tree.
+ *
+ * The two dirs are resolved ALONGSIDE the root rather than mixed with it: a
+ * real root has to be compared against real dirs, since the private dir may
+ * itself sit under a symlinked prefix (`/tmp` -> `/private/tmp` on macOS) and
+ * a mixed comparison would fail open in the other direction.
+ */
+interface SearchFrame {
+  root: string;
+  memoryDir: string;
+  privateDir: string;
+}
+
+function searchFrames(rootRaw: string, ctx: { cwd: string; memoryDir: string; privateDir: string }): SearchFrame[] {
+  const lexical: SearchFrame = { root: abs(rootRaw, ctx.cwd), memoryDir: ctx.memoryDir, privateDir: ctx.privateDir };
+  const real = realResolve(rootRaw, ctx.cwd);
+  if (real === null || real === lexical.root) return [lexical];
+  const realMemory = realMemoryDir(ctx);
+  const realPrivate = realPrivateDir(ctx);
+  if (realMemory === null || realPrivate === null) return [lexical];
+  return [lexical, { root: real, memoryDir: realMemory, privateDir: realPrivate }];
 }
 
 /** True when `rel` represents a non-empty path that doesn't escape upward —
@@ -335,11 +378,12 @@ function isRelativeDescendant(rel: string): boolean {
  *  `memory/private/...` at match time. We test the pattern against three
  *  synthetic probe paths anchored under private/ using minimatch. */
 function globReachesPrivate(
-  root: string,
+  rootRaw: string,
   pattern: string,
   ctx: { cwd: string; memoryDir: string; privateDir: string },
 ): boolean {
-  if (isInside(root, ctx.memoryDir)) return true;
+  const frames = searchFrames(rootRaw, ctx);
+  if (frames.some((frame) => isInside(frame.root, frame.memoryDir))) return true;
   if (!pattern) return false;
   // ABSOLUTE PATTERNS ARE CHECKED FIRST, AND INDEPENDENTLY OF THE ROOT. An
   // absolute pattern anchors itself: `Glob({ path: "/tmp", pattern:
@@ -347,14 +391,17 @@ function globReachesPrivate(
   // even an ancestor of it, so the root-relative probes below never see it and
   // the `isRelativeDescendant` short-circuit would return "unreachable".
   if (matchesAnyProbe(absolutePrivateProbes(ctx), pattern)) return true;
-  const relPrivate = relative(root, ctx.privateDir);
-  if (!isRelativeDescendant(relPrivate)) return false;
-  // A pattern that steers UPWARD out of the root can re-enter the memory tree
-  // by a route the probes cannot model (`../ws/memory/private/*.md` matches
-  // neither the relative nor the absolute probe). While private/ is reachable
-  // from the root at all, refuse rather than model it.
-  if (hasTraversalSegment(pattern)) return true;
-  return matchesAnyProbe(relativePrivateProbes(relPrivate), pattern);
+  for (const frame of frames) {
+    const relPrivate = relative(frame.root, frame.privateDir);
+    if (!isRelativeDescendant(relPrivate)) continue;
+    // A pattern that steers UPWARD out of the root can re-enter the memory tree
+    // by a route the probes cannot model (`../ws/memory/private/*.md` matches
+    // neither the relative nor the absolute probe). While private/ is reachable
+    // from the root at all, refuse rather than model it.
+    if (hasTraversalSegment(pattern)) return true;
+    if (matchesAnyProbe(relativePrivateProbes(relPrivate), pattern)) return true;
+  }
+  return false;
 }
 
 /** Synthetic paths standing in for "something at or under private/", relative
@@ -393,23 +440,27 @@ function matchesAnyProbe(probes: string[], pattern: string): boolean {
  *  - If the glob has `/`, it's a path-style pattern; use minimatch probes.
  *  Without a glob filter, treat the search as fully recursive. */
 function grepReachesPrivate(
-  root: string,
+  rootRaw: string,
   glob: string,
   ctx: { cwd: string; memoryDir: string; privateDir: string },
 ): boolean {
-  if (isInside(root, ctx.memoryDir)) return true;
+  const frames = searchFrames(rootRaw, ctx);
+  if (frames.some((frame) => isInside(frame.root, frame.memoryDir))) return true;
   // Absolute filters anchor themselves — see globReachesPrivate.
   if (glob && matchesAnyProbe(absolutePrivateProbes(ctx), glob)) return true;
-  const relPrivate = relative(root, ctx.privateDir);
-  if (!isRelativeDescendant(relPrivate)) return false;
-  // No glob filter ⇒ unrestricted recursion ⇒ reaches private/.
-  if (!glob) return true;
-  // Basename glob (no `/`) is anchored only by file basename; if private/ is
-  // reachable from root, ripgrep will scan it and apply the filter there too.
-  if (!glob.includes("/")) return true;
-  if (hasTraversalSegment(glob)) return true;
-  // Path-style glob: probe like Glob does.
-  return matchesAnyProbe(relativePrivateProbes(relPrivate), glob);
+  for (const frame of frames) {
+    const relPrivate = relative(frame.root, frame.privateDir);
+    if (!isRelativeDescendant(relPrivate)) continue;
+    // No glob filter ⇒ unrestricted recursion ⇒ reaches private/.
+    if (!glob) return true;
+    // Basename glob (no `/`) is anchored only by file basename; if private/ is
+    // reachable from root, ripgrep will scan it and apply the filter there too.
+    if (!glob.includes("/")) return true;
+    if (hasTraversalSegment(glob)) return true;
+    // Path-style glob: probe like Glob does.
+    if (matchesAnyProbe(relativePrivateProbes(relPrivate), glob)) return true;
+  }
+  return false;
 }
 
 /**

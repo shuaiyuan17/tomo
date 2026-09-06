@@ -624,7 +624,62 @@ export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string):
     }
   }
 
+  // A week whose own daily children are still due cannot be rolled up yet.
+  //
+  // The weekly candidate list is built from daily BLOCKS, and a day can own a
+  // block and still be due: the block covers part of the day and enough raw
+  // has aged out behind it to clear FLOOR_WITH_BLOCK, so the day needs a
+  // rebuild. Promote the week first and `resolveBlockRange("weekly")` consumes
+  // that half-finished block; the day's leftover raw then re-creates
+  // `daily D`, which can never be promoted again because `haveTags` now
+  // contains `weekly W` — so the week's summary is permanently missing the
+  // rest of that day, and every pass spends a model turn re-writing a daily
+  // block that goes nowhere. Waiting costs one heartbeat: the daily sorts
+  // first (LEVEL_ORDER in runner.ts), and once it lands the week is due with a
+  // complete child. This is the aged-out counterpart of the warm-suffix
+  // `warmPeriods.weeks` gate above, which only covers raw kept warm by design.
+  //
+  // And it has to be TRANSITIVE, or it only moves the gap up a level. A week
+  // withheld for a due daily usually has no block of its own yet, so it is not
+  // even in `due` — nothing stopped `monthly M` from being promoted in the
+  // same pass, consuming M's finished weeks and landing `monthly M` in
+  // haveTags. The withheld week is then written and can never reach its month:
+  // the same permanent gap, one level up. (Reproduced DUE, pre-fix:
+  // ["monthly 2026-04", "daily 2026-04-08"].) So a parent waits while any
+  // child of its is due OR withheld, all the way up: daily → weekly →
+  // monthly → yearly. Each wait costs one heartbeat, because the runner picks
+  // the lowest due level first (LEVEL_ORDER) and the chain drains bottom-up.
+  const weeksWithDueDaily = new Set(
+    due.filter((d) => d.level === "daily")
+      .map((d) => isoWeekTag(new Date(`${d.period}T12:00:00`))),
+  );
+  // Weeks that will not reach their month this pass — due ones and withheld
+  // ones alike. `monthForIsoWeekTag` is the same week→month mapping the
+  // candidate loop above uses, so a week is charged to exactly one month.
+  const unsettledWeeks = new Set(weeksWithDueDaily);
+  for (const d of due) if (d.level === "weekly") unsettledWeeks.add(d.period);
+  const monthsWithUnsettledWeek = new Set<string>();
+  for (const wk of unsettledWeeks) {
+    const month = monthForIsoWeekTag(wk);
+    if (month) monthsWithUnsettledWeek.add(month);
+  }
+  // Months that will not reach their year this pass, same two ways.
+  const unsettledMonths = new Set(monthsWithUnsettledWeek);
+  for (const d of due) if (d.level === "monthly") unsettledMonths.add(d.period);
+  const yearsWithUnsettledMonth = new Set(
+    Array.from(unsettledMonths, (m) => m.slice(0, 4)),
+  );
+
+  const promotable = due.filter((d) => {
+    switch (d.level) {
+      case "weekly": return !weeksWithDueDaily.has(d.period);
+      case "monthly": return !monthsWithUnsettledWeek.has(d.period);
+      case "yearly": return !yearsWithUnsettledMonth.has(d.period);
+      default: return true; // daily — nothing below it to wait for
+    }
+  });
+
   // Oldest-first so the agent works chronologically
-  due.sort((a, b) => a.period.localeCompare(b.period));
-  return due;
+  promotable.sort((a, b) => a.period.localeCompare(b.period));
+  return promotable;
 }

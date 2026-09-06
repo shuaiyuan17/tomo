@@ -280,6 +280,10 @@ export class Agent {
           costUsd: result.costUsd,
           contextUsed: result.contextUsed,
           contextMax: result.contextMax,
+          // Carried so a consumer can mark the reading rather than render a
+          // turn's own token count over the window as the session's pressure —
+          // which is a plausible-looking low percentage, not a missing one.
+          ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
       getSessionMessages: (key) => this.sessions.get(key).messages,
@@ -985,6 +989,15 @@ export class Agent {
   private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessionManager.lastResult(key)): void {
     if (!usesLcmCompact(key)) return;
     if (!ctx || ctx.contextMax <= 0) return;
+    // A turn whose context reading failed carries an approximation of its OWN
+    // tokens over the last known window — a small fraction of a full session.
+    // Acting on it would read as "the session just emptied", clear the latch,
+    // and re-issue housekeeping that has already run. An unknown reading is
+    // not a low one: skip the turn and leave the latch where it is.
+    if (ctx.contextEstimated) {
+      log.debug({ key }, "Context nudge skipped (usage reading unavailable this turn)");
+      return;
+    }
 
     const usedFrac = ctx.contextUsed / ctx.contextMax;
     const nudged = this.contextNudged.get(key);
@@ -1030,9 +1043,21 @@ export class Agent {
       return;
     }
 
-    if (decision.newLatch) {
-      this.contextNudged.set(key, decision.newLatch);
+    // Latched BEFORE dispatch (the nudge turn must not re-trigger itself) and
+    // rolled back below if the turn never happened — see the .then()/.catch().
+    const latch = decision.newLatch;
+    if (latch) {
+      this.contextNudged.set(key, latch);
     }
+    // Undo that arming — but only if the latch is still OURS: a later turn may
+    // have escalated it (prune → daily → compact) while this nudge was in
+    // flight, and clearing that one would re-issue a rung the session has
+    // already moved past.
+    const rollBackLatch = (why: string): void => {
+      if (!latch || this.contextNudged.get(key) !== latch) return;
+      this.contextNudged.delete(key);
+      log.warn({ key, latch }, why);
+    };
 
     const pct = Math.round(usedFrac * 100);
     const groupNote = isGroupSessionKey(key)
@@ -1082,8 +1107,24 @@ export class Agent {
     this.handleCronMessage(nudge, key, {
       showTyping: false,
       suppressDelivery: true,
+    }).then((ok) => {
+      if (ok) return;
+      // handleCronMessage does not REJECT on failure — it resolves false (no
+      // deliverable target, the turn ended on an error result, the queue threw
+      // and was swallowed). Leaving the latch set on that answer means the
+      // housekeeping never ran AND nothing will ask for it again until usage
+      // falls back below nudgeResetPct, which is precisely what it cannot do
+      // with the rollup unwritten. Roll the latch back so the next completed
+      // turn re-evaluates the ladder from where it actually stands.
+      rollBackLatch("Context nudge turn failed; latch cleared for a retry");
     }).catch((err) => {
+      // And a REJECTION is the same outcome with a louder failure mode. That
+      // handleCronMessage cannot currently reject is a property of ITS
+      // implementation (a terminal `.catch(() => false)`), not of this call
+      // site, and a latch stuck on for the rest of the session's life is too
+      // quiet a thing to leave resting on that.
       log.warn({ err, key }, "Compact nudge failed");
+      rollBackLatch("Context nudge turn threw; latch cleared for a retry");
     });
   }
 

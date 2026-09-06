@@ -1,7 +1,7 @@
 import { Command } from "commander";
-import { CronStore, parseScheduleString } from "../cron/store.js";
+import { CronStore, parseCreatableSchedule, unschedulableReason } from "../cron/store.js";
 import { formatSchedule, formatRelative } from "../cron/format.js";
-import { withCronStore } from "./cron-errors.js";
+import { cronAddRefusal, withCronStore } from "./cron-errors.js";
 
 const store = new CronStore();
 
@@ -17,7 +17,17 @@ cronCommand
   .requiredOption("--session <key>", "Session key to deliver to (see 'Session key' in the agent system prompt)")
   .option("--once", "Delete after successful run (default: true for one-time 'at' schedules, false for recurring)")
   .action((opts) => withCronStore(() => {
-    const schedule = parseScheduleString(opts.schedule);
+    // Same refusal the MCP tool makes, through the same function. A schedule
+    // with no future occurrence would be stored enabled with `nextRunAt: null`
+    // and never fire, and "Next run: never" under a "Created job" line is not
+    // a no. An expression croner cannot parse at all is one line here too —
+    // it used to come out as a raw croner stack trace at whoever typed it.
+    const parsed = parseCreatableSchedule(opts.schedule);
+    if (parsed.kind !== "ok") {
+      console.error(cronAddRefusal(opts.schedule, parsed));
+      process.exit(1);
+    }
+    const schedule = parsed.schedule;
     // Pass opts.once through as-is (undefined when not provided). The store
     // defaults deleteAfterRun=true for "at" schedules, false otherwise — so
     // one-time schedules ("in 20m", "2026-05-01", etc.) auto-clean after firing.
@@ -84,6 +94,16 @@ cronCommand
       console.error(`Job ${id} not found`);
       process.exit(1);
     }
+    if (job === "unschedulable") {
+      // Enabling would leave `enabled: true, nextRunAt: null` — a job this
+      // command would report as enabled and the scan would never pick up.
+      const existing = store.get(id)!;
+      console.error(
+        `Cannot enable job ${id}: ${unschedulableReason(existing.schedule, Date.now())}, ` +
+        "so it could never fire. Remove it, or recreate it with a schedule that still has a future run.",
+      );
+      process.exit(1);
+    }
     const next = job.nextRunAt ? formatRelative(job.nextRunAt) : "never";
     console.log(`Enabled job ${job.id}: "${job.name}" — next run ${next}`);
   }));
@@ -92,8 +112,9 @@ cronCommand
   .command("disable <id>")
   .description("Disable a task without deleting it")
   .action((id) => withCronStore(() => {
+    // Disabling never refuses — the sentinel is only reachable when enabling.
     const job = store.setEnabled(id, false);
-    if (!job) {
+    if (!job || job === "unschedulable") {
       console.error(`Job ${id} not found`);
       process.exit(1);
     }

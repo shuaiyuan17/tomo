@@ -98,6 +98,20 @@ export class NudgeCooldownStore {
     this.persist(now);
   }
 
+  /**
+   * Drop an entry.
+   *
+   * The runner arms a cooldown BEFORE the nudge turn it debounces (a turn can
+   * outlive the hourly tick, and an un-armed period would be re-nudged behind
+   * it), so it needs a way to take that back when the turn reports it never
+   * ran. A plain map delete is not enough: `persist` merges over the file, so
+   * the entry would come straight back from disk on the next write.
+   */
+  clear(key: string): void {
+    this.nudged.delete(key);
+    this.persist(Date.now(), key);
+  }
+
   /** Entry count — for tests and diagnostics. */
   size(): number {
     return this.nudged.size;
@@ -135,7 +149,7 @@ export class NudgeCooldownStore {
     }
   }
 
-  private persist(now: number): void {
+  private persist(now: number, drop?: string): void {
     if (!this.filePath) return;
     try {
       mkdirSync(dirname(this.filePath), { recursive: true });
@@ -148,6 +162,10 @@ export class NudgeCooldownStore {
         const disk = merged.get(key);
         if (disk === undefined || ts > disk) merged.set(key, ts);
       }
+      // Applied after the merge, or the disk copy of a cleared entry would
+      // resurrect it — the merge exists to protect entries this store never
+      // saw, and a clear is precisely a statement about one it did.
+      if (drop !== undefined) merged.delete(drop);
       this.nudged = merged;
       const data: NudgeCooldownFile = { version: FILE_VERSION, nudged: Object.fromEntries(merged) };
       writeJsonAtomicSync(this.filePath, data);

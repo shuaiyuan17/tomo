@@ -13,6 +13,7 @@ import {
   isWarmTailCandidate,
   globalFreshTailStartIdx,
   summaryBudgetCheck,
+  isoWeekTag,
   type BlockLevel,
 } from "../src/lcm/blocks.js";
 import { compactSession } from "../src/lcm/compact.js";
@@ -708,6 +709,102 @@ describe("resolveBlockRange + findDuePromotions — GLOBAL fresh tail", () => {
     expect(findDuePromotions(sessionId).find((d) => d.level === "daily" && d.period === day))
       .toBeUndefined();
     if (existsSync(transcriptPath)) unlinkSync(transcriptPath);
+  });
+
+  it("does NOT promote a week while one of its days is itself due for a rebuild", () => {
+    // The day has a block AND 8 aged-out raw events behind it (≥ the
+    // with-block floor), so `daily 2026-04-08` is due for a rebuild. Promoting
+    // the week first consumes that half-finished block; the leftover raw then
+    // re-creates `daily 2026-04-08`, which can never reach the week again
+    // because `weekly 2026-W15` already exists — the week's summary is
+    // permanently short of that day, and every pass burns a model turn
+    // rewriting a daily block that goes nowhere.
+    const day = "2026-04-08";
+    const laterDay = "2026-04-18";
+    const events: any[] = [{
+      type: "user",
+      uuid: randomUUID(),
+      timestamp: new Date(2026, 3, 8, 1, 0, 0).toISOString(),
+      isCompactSummary: true,
+      blockTag: `daily ${day}`,
+      message: { role: "user", content: `[daily ${day} — 40 events summarized]\n\nearly` },
+    }];
+    for (let i = 0; i < 8; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    // Newer candidates, so the day's own raw is aged out of the warm window.
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent(laterDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.find((d) => d.level === "daily" && d.period === day)).toBeDefined();
+    expect(due.find((d) => d.level === "weekly" && d.period === "2026-W15")).toBeUndefined();
+  });
+
+  /** A `<level> <period>` summary block event, timestamped inside the period. */
+  const mkBlock = (blockTag: string, at: Date) => ({
+    type: "user",
+    uuid: randomUUID(),
+    timestamp: at.toISOString(),
+    isCompactSummary: true,
+    blockTag,
+    message: { role: "user", content: `[${blockTag} — 40 events summarized]\n\nsummary` },
+  });
+
+  it("does NOT promote a MONTH while a week inside it is withheld for a due daily", () => {
+    // Withholding has to be transitive or it just moves the gap up a level.
+    // `daily 2026-04-08` is due for a rebuild, so `weekly 2026-W15` is
+    // withheld — but W15 has no block yet, so it is not in `due` at all, and
+    // `monthly 2026-04` (due off the OTHER April weeks) sailed straight past
+    // the weekly-only gate. Roll the month up first and it consumes those
+    // weekly blocks and lands `monthly 2026-04` in haveTags; W15 is then
+    // written and can never reach April. Reproduced DUE, pre-fix:
+    // ["monthly 2026-04", "daily 2026-04-08"].
+    const day = "2026-04-08";                       // ISO week 2026-W15
+    const events: any[] = [mkBlock(`daily ${day}`, new Date(2026, 3, 8, 1, 0, 0))];
+    for (let i = 0; i < 8; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    // A sibling week of the same month that IS finished — this is what makes
+    // `monthly 2026-04` a candidate.
+    events.push(mkBlock("weekly 2026-W16", new Date(2026, 3, 16, 9, 0, 0)));
+    // Warm tail in a LATER month, so April's raw is aged out and the existing
+    // warm-suffix gate (which keys on the warm events' own month) is inert.
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent("2026-05-18", 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.map((d) => `${d.level} ${d.period}`)).toEqual([`daily ${day}`]);
+  });
+
+  it("does NOT promote a YEAR while a month inside it is withheld", () => {
+    // Same argument one level up: the day withholds its week, the week
+    // withholds its month, and the month must withhold its year — otherwise
+    // `yearly 2025` consumes the finished months, and `monthly 2025-04` (once
+    // its week finally lands) has nowhere to go.
+    const day = "2025-04-08";
+    const dayWeek = isoWeekTag(new Date(2025, 3, 8, 12, 0, 0));
+    const siblingWeek = isoWeekTag(new Date(2025, 3, 16, 12, 0, 0));
+    expect(siblingWeek).not.toBe(dayWeek);
+
+    const events: any[] = [mkBlock(`daily ${day}`, new Date(2025, 3, 8, 1, 0, 0))];
+    for (let i = 0; i < 8; i++) {
+      events.push(mkTextEvent(day, 14, i % 2 === 0 ? "user" : "assistant", `[imessage · x] leftover ${i}`));
+    }
+    events.push(mkBlock(`weekly ${siblingWeek}`, new Date(2025, 3, 16, 9, 0, 0)));
+    // A finished month of the same year — what makes `yearly 2025` a candidate.
+    events.push(mkBlock("monthly 2025-07", new Date(2025, 6, 15, 9, 0, 0)));
+    for (let i = 0; i < 4; i++) {
+      events.push(mkTextEvent("2026-05-18", 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] new ${i}`));
+    }
+    archivePath = writeArchive(sessionId, events);
+
+    const due = findDuePromotions(sessionId);
+    expect(due.map((d) => `${d.level} ${d.period}`)).toEqual([`daily ${day}`]);
   });
 
   it("does NOT deadlock: aged-out sub-floor leftover still lets the week promote", () => {

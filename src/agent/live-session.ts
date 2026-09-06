@@ -188,6 +188,13 @@ export function describeResultFailure(result: SdkResultLike): SdkResultError | n
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
 
 /**
+ * Consecutive failed context readings before we say so out loud. One or two
+ * is a blip worth ignoring; three in a row means the pressure nudges are off
+ * for this session and nobody would otherwise find out.
+ */
+export const ESTIMATED_READING_WARN_AFTER = 3;
+
+/**
  * How long ONE block's delivery may take before we give up on it.
  *
  * Separate from the inactivity timeout on purpose, and much shorter. The
@@ -463,6 +470,13 @@ export interface QueryResult {
   contextUsed: number;
   contextMax: number;
   contextBreakdown?: { name: string; tokens: number }[];
+  /**
+   * The SDK could not report context usage for this turn, so `contextUsed` is
+   * a crude approximation from the turn's own token counts and `contextMax` is
+   * the last reading that WAS real (0 if there has never been one). Anything
+   * that acts on the ratio — the context-nudge ladder — must skip instead.
+   */
+  contextEstimated?: boolean;
 }
 
 /**
@@ -588,6 +602,14 @@ export class LiveSession {
   private sessionId: string | null = null;
   private alive = true;
   lastResult: QueryResult | null = null;
+  /**
+   * The last context window the SDK actually reported, carried across turns so
+   * a transient `getContextUsage()` failure reports the real window rather
+   * than a guess. 0 until the first successful reading.
+   */
+  private lastContextMax = 0;
+  /** Consecutive turns whose context reading failed. Reset by any real one. */
+  private estimatedReadingStreak = 0;
   private prevTotalCost = 0;
   /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
   private prevModelTokens: TokenTotals | null = null;
@@ -1360,6 +1382,14 @@ export class LiveSession {
       try {
         const ctx = await this.q.getContextUsage();
         const pct = Math.round(ctx.percentage);
+        this.lastContextMax = ctx.maxTokens;
+        if (this.estimatedReadingStreak >= ESTIMATED_READING_WARN_AFTER) {
+          log.info(
+            { session: this.sessionKey, afterTurns: this.estimatedReadingStreak },
+            "Context usage readings recovered",
+          );
+        }
+        this.estimatedReadingStreak = 0;
         if (this.lastResult) {
           this.lastResult.contextUsed = ctx.totalTokens;
           this.lastResult.contextMax = ctx.maxTokens;
@@ -1372,12 +1402,35 @@ export class LiveSession {
         }
         return `${ctx.totalTokens}/${ctx.maxTokens} (${pct}%)`;
       } catch {
+        // The SDK could not tell us. `approx` counts only this turn's own
+        // tokens, so it is far below the real total — and the window it is
+        // divided by used to be a hard-coded 1M. On a 200k model that reads as
+        // a session that has just been emptied: the nudge ladder's latch
+        // clears, and the next real reading re-issues housekeeping that has
+        // already been done. Keep the last window we actually saw (0 if we
+        // never saw one) and mark the reading estimated, so consumers can tell
+        // "low" from "unknown".
         const approx = input + cacheRead + cacheCreated;
         if (this.lastResult) {
           this.lastResult.contextUsed = approx;
-          this.lastResult.contextMax = 1_000_000;
+          this.lastResult.contextMax = this.lastContextMax;
+          this.lastResult.contextEstimated = true;
         }
-        return `~${approx}/1000000`;
+        // Skipping the nudge ladder on an estimated reading is the right call
+        // per turn and the wrong thing to do in silence forever: a
+        // getContextUsage() that has stopped working for good disables the
+        // prune / daily / compact pressure nudges entirely, and the only
+        // outward sign is a `tomo status` percentage that looks plausible and
+        // low. Say so once the failure is clearly not transient.
+        this.estimatedReadingStreak++;
+        if (this.estimatedReadingStreak === ESTIMATED_READING_WARN_AFTER) {
+          log.warn(
+            { session: this.sessionKey, turns: this.estimatedReadingStreak },
+            "Context usage unreadable for %d turns running — context-pressure nudges are suspended for this session",
+            this.estimatedReadingStreak,
+          );
+        }
+        return `~${approx}/${this.lastContextMax || "unknown"} (estimated)`;
       }
     })();
 

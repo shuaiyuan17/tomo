@@ -102,6 +102,8 @@ export class RollupRunner {
    * Reads stay in memory; only a nudge touches the disk.
    */
   private lastNudged: NudgeCooldownStore;
+  /** Guards against a second check starting while one is still awaiting a turn. */
+  private checking = false;
 
   constructor(agent: Agent, cooldowns?: NudgeCooldownStore) {
     this.agent = agent;
@@ -140,11 +142,37 @@ export class RollupRunner {
       log.debug("Rollup check deferred (outside daytime hours)");
       return;
     }
+    // One check at a time. A pass awaits a full model turn per session, which
+    // can run longer than the hour between ticks (and the 2-minute startup
+    // check overlaps the first interval tick by construction); a second pass
+    // walking the same sessions concurrently would interleave nudges with the
+    // first pass's cooldown writes and could put two rollup turns in flight —
+    // exactly the back-to-back compact the one-nudge-per-tick rule exists to
+    // avoid, since running two `tomo lcm` calls close together races the SDK's
+    // in-memory state.
+    if (this.checking) {
+      log.debug("Rollup check skipped (previous check still running)");
+      return;
+    }
+    this.checking = true;
+    try {
+      await this.checkAllSessions();
+    } finally {
+      this.checking = false;
+    }
+  }
+
+  private async checkAllSessions(): Promise<void> {
     const now = Date.now();
     for (const [sessionKey, sdkSessionId] of this.agent.listActiveSessions()) {
       // Skip sessions on SDK auto-compact (only groups with
       // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
       if (!usesLcmCompact(sessionKey)) continue;
+      // Held outside the try so the catch can give the cooldown back. It is
+      // armed before the nudge turn is awaited (see below), so an exception
+      // out of that await would otherwise leave a 6h debounce on work that
+      // was never asked for.
+      let cooldownKey: string | null = null;
       try {
         const due = findDuePromotions(sdkSessionId, config.sdkSessionsDir);
         if (due.length === 0) continue;
@@ -182,12 +210,43 @@ export class RollupRunner {
         // moment it completes — long before the NO_REPLY that was supposed to
         // silence it. The prompt cannot retract a sent message, so silence
         // here must not depend on the model's cooperation.
-        await this.agent.handleCronMessage(nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
-          showTyping: false,
-          suppressDelivery: true,
-        });
-        this.lastNudged.set(`${sessionKey}:${next.level}:${next.period}`, now);
+        // Armed BEFORE the await, not after. A rollup turn is a full model
+        // turn that queues behind whatever else the session is doing and can
+        // easily outlive the hourly tick; with the cooldown written only on
+        // completion, the next tick sees the same period still un-nudged and
+        // asks for it a second time — the duplicate lands the moment the first
+        // one finishes, and rewrites the whole period again.
+        cooldownKey = `${sessionKey}:${next.level}:${next.period}`;
+        this.lastNudged.set(cooldownKey, now);
+        const delivered = await this.agent.handleCronMessage(
+          nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
+            showTyping: false,
+            suppressDelivery: true,
+          },
+        );
+        // handleCronMessage resolves FALSE rather than rejecting when the turn
+        // never happened (no deliverable target for the session, the turn
+        // ended on an error result, the per-session queue threw). Holding a 6h
+        // cooldown on that answer buys nothing but a 6h hole: the rollup is
+        // still due, still un-nudged, and the next five heartbeats skip it.
+        // The cooldown is a debounce on work we asked for, so give it back
+        // when the ask did not land.
+        if (!delivered) {
+          this.lastNudged.clear(cooldownKey);
+          log.warn(
+            { sessionKey, level: next.level, period: next.period },
+            "Rollup nudge turn failed; leaving it due for the next check",
+          );
+        }
       } catch (err) {
+        // Same reasoning as the `!delivered` branch above, for the louder
+        // failure mode: whatever threw, the rollup did not happen, and a
+        // cooldown armed for a turn that never completed is a 6h hole in which
+        // the period stays due and every heartbeat skips it. That
+        // `handleCronMessage` cannot currently reject is a property of ITS
+        // implementation (a terminal `.catch(() => false)`) — this loop should
+        // not silently depend on that.
+        if (cooldownKey) this.lastNudged.clear(cooldownKey);
         log.warn({ err, sessionKey }, "Rollup check failed");
       }
     }

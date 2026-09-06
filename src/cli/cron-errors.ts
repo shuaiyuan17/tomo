@@ -1,4 +1,4 @@
-import { CronStoreReadError } from "../cron/store.js";
+import { CronStoreReadError, type CreatableSchedule } from "../cron/store.js";
 import type { CronJob } from "../cron/types.js";
 
 /**
@@ -53,4 +53,22 @@ export function readCronJobsSafely(store: { list(): CronJob[] }): SafeCronRead {
     if (!(err instanceof CronStoreReadError)) throw err;
     return { jobs: [], unreadablePath: err.path };
   }
+}
+
+/**
+ * The `tomo cron add` refusal line for a schedule that cannot be created.
+ *
+ * Both refusals are one line: `parseScheduleString` accepts anything it does
+ * not recognise as `kind: "cron"`, so a typo reaches croner, and croner throws
+ * only when the expression is evaluated — which used to surface as a raw
+ * stack trace under the user's command. The MCP tool has always formatted its
+ * half; this is the same shape for the CLI.
+ */
+export function cronAddRefusal(
+  scheduleText: string,
+  parsed: Exclude<CreatableSchedule, { kind: "ok" }>,
+): string {
+  return parsed.kind === "unparseable"
+    ? `Cannot schedule "${scheduleText}": not a schedule expression — ${parsed.detail}`
+    : `Cannot schedule "${scheduleText}": ${parsed.reason}, so the job could never fire.`;
 }

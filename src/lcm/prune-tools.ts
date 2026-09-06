@@ -236,8 +236,26 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
 
   // Archive the snapshot if requested (from the pinned read, not a re-read
   // of the file, which could race with further appends).
+  //
+  // Before the rewrite, for the same reason compactSession archives before its
+  // rename: a failure here (ENOSPC, EACCES, an archive directory that is not a
+  // directory) must leave the session file untouched and be reported as a
+  // result the caller can act on, rather than escape as a raw stack after the
+  // originals have already been dropped from the session.
   if (req.archivePath) {
-    archiveOriginals(req.archivePath, snapshot.text, req.sdkSessionId);
+    try {
+      archiveOriginals(req.archivePath, snapshot.text, req.sdkSessionId);
+    } catch (err) {
+      log.warn({ err, sessionId: req.sdkSessionId, archivePath: req.archivePath },
+        "Prune aborted: could not archive the pre-prune snapshot");
+      return {
+        success: false,
+        pruned: [],
+        totalCharsRemoved: 0,
+        error: `Could not archive the pre-prune snapshot to ${req.archivePath}: ` +
+          `${err instanceof Error ? err.message : String(err)}; session left unchanged`,
+      };
+    }
   }
 
   // Atomic write: stage in a sibling temp file and rename into place, so the

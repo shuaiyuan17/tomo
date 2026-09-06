@@ -137,15 +137,29 @@ export class CronStore {
    * the store was constructed misses anything another process wrote in
    * between, and `load()` here replaces that snapshot anyway. Returns
    * `"refused"` when the guard rejects, distinct from `undefined` (not found).
+   *
+   * Returns `"unschedulable"` — leaving the job as it was — when enabling it
+   * would produce the dead-job shape `enabled: true, nextRunAt: null`: a job
+   * every surface reports as scheduled and the 30s scan never picks up. Note
+   * this is NOT the same test as `unschedulableReason` alone: a one-shot whose
+   * time has passed is re-armed to fire on the next poll, which is the whole
+   * point of re-enabling one. It bites the recurring kinds — most obviously a
+   * `cron` expression with no future occurrence left, which `add`-time
+   * validation never saw because the job was created while it still had one.
+   * Callers wanting the WHY call `unschedulableReason(job.schedule, now)`.
    */
-  setEnabled(id: string, enabled: boolean): CronJob | undefined;
-  setEnabled(id: string, enabled: boolean, guard: (job: CronJob) => boolean): CronJob | undefined | "refused";
-  setEnabled(id: string, enabled: boolean, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" {
+  setEnabled(id: string, enabled: boolean): CronJob | undefined | "unschedulable";
+  setEnabled(id: string, enabled: boolean, guard: (job: CronJob) => boolean): CronJob | undefined | "refused" | "unschedulable";
+  setEnabled(id: string, enabled: boolean, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" | "unschedulable" {
     this.load();
     const job = this.get(id);
     if (!job) return undefined;
     if (guard && !guard(job)) return "refused";
     if (job.enabled === enabled) return job;
+    if (enabled) {
+      const next = computeNextRun(job.schedule, Date.now());
+      if (next === null && job.schedule.kind !== "at") return "unschedulable";
+    }
     job.enabled = enabled;
     if (enabled) {
       const now = Date.now();
@@ -285,10 +299,11 @@ export class CronStore {
    *   disk, so they fire on the next scan — with `interruptedAt` set so the
    *   scheduler marks that fire as a resume in the event body, telling the
    *   model to check state before repeating anything with side effects.
-   * - `skipped` with reason `"once"`: one-shot (`deleteAfterRun`) jobs. Their
-   *   whole point is a single fire, and that fire already happened; whether it
-   *   finished is unknowable. Disabled with `lastStatus: "interrupted"` so a
-   *   human/agent can inspect and re-enable — never fired twice.
+   * - `skipped` with reason `"once"`: single-fire jobs — `deleteAfterRun`, and
+   *   every `at` schedule regardless of that flag. Their whole point is a
+   *   single fire, and that fire already happened; whether it finished is
+   *   unknowable. Disabled with `lastStatus: "interrupted"` so a human/agent
+   *   can inspect and re-enable — never fired twice.
    * - `skipped` with reason `"resume-cap"`: a recurring job that has been
    *   resumed MAX_RESUME_ATTEMPTS times since its last successful run. A turn
    *   that reliably takes the daemon down (or a crash loop) would otherwise
@@ -314,7 +329,14 @@ export class CronStore {
         job.interruptedAt = null;
         skipped.push({ job: { ...job }, reason });
       };
-      if (job.deleteAfterRun) {
+      // One-shot is a property of the SCHEDULE, not just the lifecycle flag.
+      // `deleteAfterRun: false` on an "at" job only means "keep the record
+      // after it fires" (schedule_create's `once: false`) — it is still a
+      // single-fire job, and markRun treats it as one (kind "at" never gets a
+      // recomputed nextRunAt). Resuming it here would re-fire it on THIS
+      // restart, and, because the resumed run leaves the same unacknowledged
+      // token behind if it is interrupted again, on every restart after that.
+      if (job.deleteAfterRun || job.schedule.kind === "at") {
         park("once");
         continue;
       }
@@ -627,6 +649,71 @@ export function isInterrupted(job: CronJob): boolean {
   const runId = job.lastRunId;
   if (runId == null) return false;
   return (job.lastCompletedRunId ?? null) !== runId;
+}
+
+/**
+ * Why this schedule can never fire, or null when it can — the check every
+ * job-CREATION surface owes its caller.
+ *
+ * `computeNextRun` returning null is not an error condition on an existing
+ * job (a fired one-shot has no next run, and that is the point), but at
+ * creation time it means the job would land `enabled: true` with
+ * `nextRunAt: null`: a task the store reports as scheduled, the scan never
+ * picks up, and the user finds out about when the reminder does not arrive.
+ * `croner` only throws for a syntactically bad expression, so a try/catch
+ * around `computeNextRun` does not catch this — hence a separate check.
+ *
+ * Deliberately NOT enforced inside `add()`: the store primitive has to be able
+ * to represent a one-shot whose time has passed (that is every fired `at` job
+ * still on disk, and what `setEnabled` re-arms). The refusal belongs where a
+ * human or the model is asking for a NEW job.
+ *
+ * May throw for a malformed cron expression — callers already handle that.
+ */
+export function unschedulableReason(schedule: CronSchedule, fromMs: number): string | null {
+  if (computeNextRun(schedule, fromMs) !== null) return null;
+  if (schedule.kind === "at") {
+    return Number.isNaN(parseAtSchedule(schedule.at))
+      ? `"${schedule.at}" is not a date/time that can be parsed`
+      : `${schedule.at} is in the past`;
+  }
+  return "it has no future occurrence";
+}
+
+/**
+ * The outcome of validating a `--schedule` / `schedule` string on a surface
+ * that is CREATING a job: either the parsed schedule, or which of the two ways
+ * it is unusable. Both are refusals, and neither should reach the user as a
+ * croner stack trace.
+ */
+export type CreatableSchedule =
+  | { kind: "ok"; schedule: CronSchedule }
+  /** croner rejected the expression outright — `detail` is its message. */
+  | { kind: "unparseable"; detail: string }
+  /** Well-formed, but with no future occurrence — see `unschedulableReason`. */
+  | { kind: "unschedulable"; reason: string };
+
+/**
+ * Parse and validate a schedule string for a job-creation surface.
+ *
+ * `parseScheduleString` accepts any unrecognized string as `kind: "cron"`
+ * (catch-all) and croner only throws when the expression is actually
+ * evaluated, so the validation is this trial run — not `store.add`, whose
+ * failures are about the STORE and must not be reported as a bad schedule.
+ *
+ * Shared by `schedule_create` and `tomo cron add` so the two cannot drift on
+ * what they accept, and so neither prints a stack trace at whoever typed it.
+ */
+export function parseCreatableSchedule(text: string, fromMs = Date.now()): CreatableSchedule {
+  let schedule: CronSchedule;
+  let reason: string | null;
+  try {
+    schedule = parseScheduleString(text);
+    reason = unschedulableReason(schedule, fromMs);
+  } catch (err) {
+    return { kind: "unparseable", detail: err instanceof Error ? err.message : String(err) };
+  }
+  return reason === null ? { kind: "ok", schedule } : { kind: "unschedulable", reason };
 }
 
 export function computeNextRun(schedule: CronSchedule, fromMs: number): number | null {

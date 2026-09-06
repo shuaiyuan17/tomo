@@ -9,7 +9,8 @@ import { LOG_REDACT_PATHS, redactLogRecord, redactSerializedError, scrubSecretVa
 const logFile = process.env.TOMO_LOG_FILE?.trim() || undefined;
 
 /**
- * UNDER TEST, DO NOT BUILD A TRANSPORT.
+ * LOG INLINE — NO TRANSPORT WORKER. Set by `vitest.config.ts` for the test
+ * run; nothing sets it in production.
  *
  * Every pino transport is a worker thread, and pino registers a
  * `process.on("exit")` teardown hook per transport (`pino/lib/transport.js`
@@ -26,11 +27,18 @@ const logFile = process.env.TOMO_LOG_FILE?.trim() || undefined;
  * redaction tests read the file back), and without it the records are
  * discarded, which is what already happened in practice: the transport worker
  * is torn down at the end of a file before it flushes.
+ *
+ * The switch is OURS, not the runner's. Keying off `VITEST` made a foreign
+ * variable — one vitest sets, renames or drops on its own schedule, and one
+ * any other process is free to export — decide how the daemon logs. A
+ * project-owned name says who asked for it and can be set by anything else
+ * that wants an in-process logger (a debugger, an embedding host) without
+ * pretending to be a test runner.
  */
-const underTest = process.env.VITEST !== undefined;
+const logInline = process.env.TOMO_LOG_INLINE !== undefined;
 
 // When running as daemon, log to file; otherwise pretty-print to stdout
-const transport = underTest
+const transport = logInline
   ? undefined
   : logFile
     ? (() => {
@@ -49,8 +57,8 @@ const transport = underTest
         },
       };
 
-/** In-process stand-in for the transport, used only when `underTest`. */
-const destination: pino.DestinationStream | undefined = !underTest
+/** In-process stand-in for the transport, used only when `logInline`. */
+const destination: pino.DestinationStream | undefined = !logInline
   ? undefined
   : logFile
     ? (() => {

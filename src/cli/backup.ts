@@ -474,11 +474,30 @@ backupCommand
       // Restored to where THIS install keeps them, which is the only place
       // the daemon will look — if SESSIONS_DIR has changed since the backup
       // was taken, the transcripts follow the current setting.
+      //
+      // INCLUDING WHEN THIS INSTALL HAS NO OVERRIDE AT ALL. The dest used to be
+      // `externalSessionsDir()`, which answers null on a default install, and a
+      // null dest DROPPED the leg: restoring a backup taken with SESSIONS_DIR
+      // set onto an install without it printed "Restore complete." over zero
+      // transcripts, with nothing said about the `sessions/` directory sitting
+      // unread in the backup. That is the same silent-in-both-directions shape
+      // the backup half of this bug had. `config.sessionsDir` IS where this
+      // install reads them from — `<TOMO_HOME>/data/sessions` by default — so
+      // that is where they go.
       const sessionsSrc = join(backup.path, "sessions");
-      const sessionsDest = externalSessionsDir();
-      if (existsSync(sessionsSrc) && sessionsDest) {
-        legs.push({ label: "sessions/", src: sessionsSrc, dest: sessionsDest });
-      }
+      const sessionsDest = externalSessionsDir() ?? config.sessionsDir;
+      const sessionsLeg: RestoreLeg | null = existsSync(sessionsSrc)
+        ? { label: "sessions/", src: sessionsSrc, dest: sessionsDest }
+        : null;
+      // NESTED LEGS CANNOT SHARE ONE TRANSACTION. restoreLegsStaged stages every
+      // leg BESIDE its destination and only then swaps them all, so a staging
+      // directory that lives inside another leg's destination is carried away
+      // when that outer leg swaps, and its own rename fails onto a path that no
+      // longer exists. The default sessions dir is inside `data/`, which is
+      // exactly that shape — so it runs as its own transaction, after the first
+      // one has put `data/` in place.
+      const sessionsNested = sessionsLeg !== null && isInsideDir(sessionsLeg.dest, join(TOMO_HOME, "data"));
+      if (sessionsLeg && !sessionsNested) legs.push(sessionsLeg);
       const sdkSrc = join(backup.path, "sdk-sessions");
       if (existsSync(sdkSrc)) {
         legs.push({ label: "sdk-sessions/", src: sdkSrc, dest: config.sdkSessionsDir });
@@ -494,7 +513,7 @@ backupCommand
         [
           { label: "config.json", dest: join(TOMO_HOME, "config.json") },
           { label: "data/", dest: join(TOMO_HOME, "data") },
-          ...(sessionsDest ? [{ label: "sessions/", dest: sessionsDest }] : []),
+          { label: "sessions/", dest: sessionsDest },
           { label: "sdk-sessions/", dest: config.sdkSessionsDir },
         ],
       );
@@ -609,6 +628,27 @@ backupCommand
         }
         process.exit(1);
         return;
+      }
+
+      // The nested sessions leg, as a second transaction — see sessionsNested.
+      // It runs here rather than with the others because `data/` has to be in
+      // place first; a failure leaves the staged legs restored and this one not,
+      // which is the same trade the workspace leg below makes and is stated
+      // rather than hidden.
+      if (sessionsLeg && sessionsNested) {
+        try {
+          restoreLegsStaged([sessionsLeg], {
+            onLegRestored: (leg) => console.log(`  [ok] ${leg.label}`),
+            onWarning: (message) => console.error(`  [warn] ${message}`),
+          });
+        } catch (err) {
+          console.error(`  [fail] sessions/: ${(err as Error).message}`);
+          console.error("\nRestore INCOMPLETE. The other components were restored; the transcripts were");
+          console.error(`not. The backup's copy is at ${sessionsSrc}; this install reads them from`);
+          console.error(`${sessionsDest}.`);
+          process.exit(1);
+          return;
+        }
       }
 
       // workspace/ (preserve .claude/ which is populated by init/start).

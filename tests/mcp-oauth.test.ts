@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { connect } from "node:net";
 import { McpOAuthManager, startCallbackServer } from "../src/mcp/oauth.js";
+import { log } from "../src/logger.js";
 import type { ExternalMcpServerConfig } from "../src/mcp/external-config.js";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-mcp-oauth");
@@ -1531,5 +1532,213 @@ describe("OAuth callback listener", () => {
     } finally {
       await callback.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A refresh the issuer REJECTS. The sweep runs every minute and used to leave
+// no trace of one: a revoked refresh token was posted 1,440 times a day in
+// total silence.
+// ---------------------------------------------------------------------------
+
+describe("McpOAuthManager — rejected refreshes", () => {
+  const servers = (): Record<string, ExternalMcpServerConfig> => ({
+    github: {
+      server: { type: "http", url: "https://api.githubcopilot.com/mcp/" },
+      oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "github" },
+    },
+  });
+
+  function seedExpiringToken(oauthPath: string, now: number) {
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(oauthPath, JSON.stringify({
+      mcpOAuth: {
+        github: {
+          accessToken: "old-access",
+          refreshToken: "revoked-refresh-token",
+          tokenType: "Bearer",
+          expiresAt: now + 1_000,
+          clientId: "client-123",
+          tokenEndpoint: "https://auth.example/token",
+          updatedAt: now - 1_000,
+        },
+      },
+    }));
+  }
+
+  it("logs the failure and rests the key instead of posting every minute", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    let clock = 1_000_000;
+    seedExpiringToken(oauthPath, clock);
+
+    let exchanges = 0;
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: async () => {
+          exchanges++;
+          return new Response("revoked", { status: 400 });
+        },
+      });
+
+      // Twenty minutes of the real sweep interval.
+      for (let tick = 0; tick < 20; tick++) {
+        await manager.refreshExpiringTokens(servers());
+        clock += 60_000;
+      }
+
+      // Unbounded, this is one POST per tick.
+      expect(exchanges).toBeGreaterThan(0);
+      expect(exchanges).toBeLessThanOrEqual(6);
+      // ...and every one of them said so.
+      const refreshWarnings = warn.mock.calls.filter((c) => c[1] === "MCP OAuth token refresh failed");
+      expect(refreshWarnings).toHaveLength(exchanges);
+      expect(refreshWarnings[0][0]).toMatchObject({ storeKey: "github", server: "github", failures: 1 });
+      expect((refreshWarnings[0][0] as { retryInMs: number }).retryInMs).toBe(60_000);
+      // Exponential, capped at an hour.
+      const delays = refreshWarnings.map((c) => (c[0] as { retryInMs: number }).retryInMs);
+      expect(delays).toEqual([60_000, 120_000, 240_000, 480_000, 960_000].slice(0, delays.length));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still refreshes on a 401 backstop while the sweep is resting", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    let clock = 1_000_000;
+    seedExpiringToken(oauthPath, clock);
+
+    let exchanges = 0;
+    let reject = true;
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: async () => {
+          exchanges++;
+          if (reject) return new Response("revoked", { status: 400 });
+          return new Response(JSON.stringify({ access_token: "fresh", token_type: "Bearer", expires_in: 3600 }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+      });
+
+      await manager.refreshExpiringTokens(servers());
+      expect(exchanges).toBe(1);
+      // The sweep is resting...
+      clock += 1_000;
+      await manager.refreshExpiringTokens(servers());
+      expect(exchanges).toBe(1);
+      // ...but the 401 backstop is a user-visible event and always tries.
+      reject = false;
+      await expect(manager.refreshServerToken("github", servers())).resolves.toBe("refreshed");
+      expect(exchanges).toBe(2);
+      // A success clears the rest period: the very next sweep tries again
+      // rather than sitting out the remainder of the old backoff.
+      clock += 1_000;
+      reject = true;
+      const store = JSON.parse(readFileSync(oauthPath, "utf-8"));
+      store.mcpOAuth.github.expiresAt = clock + 1_000;
+      writeFileSync(oauthPath, JSON.stringify(store));
+      await manager.refreshExpiringTokens(servers());
+      expect(exchanges).toBe(3);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps the stored expiry when a refresh response omits expires_in", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    // Comfortably outside the 5-minute refresh skew, so a record that keeps
+    // it is not "expiring" and a record that loses it is not either — the
+    // assertion has to read the stored value, not just isExpiring().
+    const storedExpiry = clock + 10 * 60 * 1000;
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(oauthPath, JSON.stringify({
+      mcpOAuth: {
+        github: {
+          accessToken: "old-access",
+          refreshToken: "refresh-token",
+          tokenType: "Bearer",
+          expiresAt: storedExpiry,
+          clientId: "client-123",
+          tokenEndpoint: "https://auth.example/token",
+          updatedAt: clock - 1_000,
+        },
+      },
+    }));
+
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      now: () => clock,
+      fetchImpl: async () => new Response(JSON.stringify({
+        access_token: "fresh-access",
+        token_type: "Bearer",
+        // No expires_in — legal, and what spread `undefined` over the stored
+        // value. `isExpiring` then read the record as "never expires", the
+        // sweep stopped looking at it, and the access token died in silence.
+      }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    });
+
+    await expect(manager.refreshServerToken("github", {
+      github: {
+        server: { type: "http", url: "https://api.githubcopilot.com/mcp/" },
+        oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "github" },
+      },
+    })).resolves.toBe("refreshed");
+
+    const stored = JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.github;
+    expect(stored.accessToken).toBe("fresh-access");
+    expect(stored.expiresAt).toBe(storedExpiry);
+    expect(manager.isExpiring(stored)).toBe(false);
+  });
+
+  it("replaces an already-past expiry rather than keeping it", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(oauthPath, JSON.stringify({
+      mcpOAuth: {
+        github: {
+          accessToken: "old-access",
+          refreshToken: "refresh-token",
+          tokenType: "Bearer",
+          expiresAt: clock - 60_000,
+          clientId: "client-123",
+          tokenEndpoint: "https://auth.example/token",
+          updatedAt: clock - 1_000,
+        },
+      },
+    }));
+
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      now: () => clock,
+      fetchImpl: async () => new Response(JSON.stringify({
+        access_token: "fresh-access",
+        token_type: "Bearer",
+      }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    });
+
+    await expect(manager.refreshServerToken("github", {
+      github: {
+        server: { type: "http", url: "https://api.githubcopilot.com/mcp/" },
+        oauth: { clientId: "client-123", scopes: [], tokenStoreKey: "github" },
+      },
+    })).resolves.toBe("refreshed");
+
+    // Keeping the stale reading would leave it permanently inside the skew
+    // window; erasing it would make it immortal. Neither.
+    const stored = JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.github;
+    expect(stored.expiresAt).toBe(clock + 60 * 60 * 1000);
   });
 });

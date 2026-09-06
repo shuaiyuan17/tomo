@@ -17,6 +17,28 @@ const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
  * hour. Well under TOKEN_REFRESH_SKEW_MS so the skew window is never missed.
  */
 export const TOKEN_REFRESH_SWEEP_INTERVAL_MS = 60 * 1000;
+/**
+ * Backoff after a refresh that the issuer REJECTED, doubling from one sweep
+ * interval up to an hour.
+ *
+ * The sweep runs every minute and a rejected refresh left no trace at all: a
+ * refresh token that has been revoked (or rotated away by a login on another
+ * machine) is refused every single time, so the daemon posted the dead
+ * credential 1,440 times a day, forever, and said nothing. The failure is now
+ * logged and the key is rested, which turns that into roughly thirty attempts
+ * a day while still recovering on its own if the issuer was merely having a
+ * bad minute. Only the SWEEP backs off — a 401 from a live server and an
+ * explicit `/mcp login` are user-visible events and always try.
+ */
+const REFRESH_BACKOFF_BASE_MS = TOKEN_REFRESH_SWEEP_INTERVAL_MS;
+const REFRESH_BACKOFF_MAX_MS = 60 * 60 * 1000;
+/**
+ * Assumed lifetime for a refreshed access token whose response omitted
+ * `expires_in`. RFC 6749 §4.2.2 leaves that case to the client; an hour is the
+ * common issuer default and, unlike "unknown", it keeps the token inside the
+ * sweep's reach.
+ */
+const DEFAULT_ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
 const MCP_INITIALIZE_PROBE = {
   jsonrpc: "2.0",
   id: 1,
@@ -176,6 +198,11 @@ export class McpOAuthManager {
    * `/mcp login`s (or two sibling session builds) racing exactly that way.
    */
   private tokenRefreshes = new Map<string, Promise<TokenRefreshResult>>();
+  /** Per store key: how many refreshes in a row the issuer has rejected, and
+   *  the time the SWEEP may next spend the refresh token. Cleared by any
+   *  successful write to the key (see writeToken), which covers a refresh that
+   *  worked and an interactive login that replaced the credential. */
+  private refreshBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
 
   constructor(options: McpOAuthManagerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -486,6 +513,10 @@ export class McpOAuthManager {
       const existing = this.readStore().mcpOAuth?.[storeKey];
       if (!existing?.refreshToken) return "skipped";
       if (options.onlyIfExpiring && !this.isExpiring(existing)) return "skipped";
+      // Resting after a rejection is the sweep's business only: a 401 from a
+      // live server and a hand-run `/mcp login` are things someone is waiting
+      // on, and they pass onlyIfExpiring false.
+      if (options.onlyIfExpiring && this.isBackingOff(storeKey)) return "skipped";
       result = await this.refreshStoredToken(storeKey, existing, oauth);
     }
 
@@ -502,9 +533,32 @@ export class McpOAuthManager {
     if (result.outcome === "failed") {
       const message = errorMessage(result.error);
       for (const target of targets) this.serverFailures.set(target.name, { error: message, at: this.now() });
+      // Counted by the caller that RAN the exchange only. Siblings adopting
+      // one joined promise would otherwise multiply a single rejection by the
+      // number of servers sharing the key.
+      if (!joined) this.noteRefreshFailure(storeKey, serverName, message);
       return "failed";
     }
     return "superseded";
+  }
+
+  /** True while the sweep is resting this key after a rejection. */
+  private isBackingOff(storeKey: string): boolean {
+    const state = this.refreshBackoff.get(storeKey);
+    return state !== undefined && this.now() < state.nextAttemptAt;
+  }
+
+  /** Record and REPORT a rejected refresh. The log line is the only outward
+   *  sign a stored refresh token has died: nothing else on this path is
+   *  user-visible until a session build or a 401 surfaces it. */
+  private noteRefreshFailure(storeKey: string, serverName: string, message: string): void {
+    const failures = (this.refreshBackoff.get(storeKey)?.failures ?? 0) + 1;
+    const retryInMs = Math.min(REFRESH_BACKOFF_BASE_MS * 2 ** (failures - 1), REFRESH_BACKOFF_MAX_MS);
+    this.refreshBackoff.set(storeKey, { failures, nextAttemptAt: this.now() + retryInMs });
+    log.warn(
+      { server: serverName, storeKey, failures, retryInMs, reason: message },
+      "MCP OAuth token refresh failed",
+    );
   }
 
   /**
@@ -745,17 +799,24 @@ export class McpOAuthManager {
       ...(oauth.scopes.length > 0 ? { scope: oauth.scopes.join(" ") } : {}),
     });
 
+    const refreshed = normalizeToken(token, this.now(), {
+      clientId,
+      clientSecret: existing.clientSecret,
+      authorizationServer: existing.authorizationServer,
+      authorizationEndpoint: existing.authorizationEndpoint,
+      tokenEndpoint: existing.tokenEndpoint,
+      registrationEndpoint: existing.registrationEndpoint,
+      resource: existing.resource,
+    });
     return {
       ...existing,
-      ...normalizeToken(token, this.now(), {
-        clientId,
-        clientSecret: existing.clientSecret,
-        authorizationServer: existing.authorizationServer,
-        authorizationEndpoint: existing.authorizationEndpoint,
-        tokenEndpoint: existing.tokenEndpoint,
-        registrationEndpoint: existing.registrationEndpoint,
-        resource: existing.resource,
-      }),
+      ...refreshed,
+      // `normalizeToken` always CARRIES an `expiresAt` key, so a response
+      // without `expires_in` spread `undefined` over a perfectly good stored
+      // expiry — and `isExpiring` reads undefined as "never expires". The
+      // sweep then stopped looking at the key entirely and the access token
+      // died in silence, every call 401ing until the backstop noticed.
+      expiresAt: carryForwardExpiry(refreshed.expiresAt, existing.expiresAt, this.now()),
       refreshToken: String(token.refresh_token ?? existing.refreshToken),
     };
   }
@@ -876,6 +937,10 @@ export class McpOAuthManager {
   }
 
   private writeToken(key: string, token: OAuthTokenRecord): void {
+    // Any successful write clears the sweep's rest period: a refresh that
+    // worked, and an interactive login that replaced the credential the
+    // rejections were about.
+    this.refreshBackoff.delete(key);
     // Read-merge-write on the freshest copy, written atomically: a crash
     // mid-write must not truncate a file holding every server's refresh
     // token (readStore treats corrupt JSON as an empty store, so a torn
@@ -938,6 +1003,24 @@ function normalizeToken(
     ...extra,
     updatedAt: now,
   };
+}
+
+/**
+ * The expiry to store for a refreshed token.
+ *
+ * Never erases: an omitted `expires_in` means "the issuer did not say", not
+ * "this token is immortal". A stored expiry that is still in the future is
+ * kept as the best evidence available. One already in the PAST cannot be kept
+ * — the token was just issued, and a stale reading would leave the record
+ * permanently inside the refresh skew window, re-refreshed every sweep — so
+ * the conservative default TTL stands in. Undefined stays undefined: the
+ * issuer has never told us, and inventing an expiry would start refreshing a
+ * token that was working.
+ */
+function carryForwardExpiry(fresh: number | undefined, previous: number | undefined, now: number): number | undefined {
+  if (fresh !== undefined) return fresh;
+  if (previous === undefined) return undefined;
+  return previous > now ? previous : now + DEFAULT_ACCESS_TOKEN_TTL_MS;
 }
 
 function supportsHeaders(server: McpServerConfig): server is Extract<McpServerConfig, { type: "http" | "sse" }> {

@@ -35,3 +35,24 @@ describe("sdkOptions session env", () => {
     expect(opts.env).toBeUndefined();
   });
 });
+
+/**
+ * `allowedTools` names every tomo-internal tool explicitly, so a tool added to
+ * the MCP server and forgotten here is one the model is offered and then
+ * refused. `schedule_enable` and the five `pet_*` tools sat in that gap.
+ */
+describe("sdkOptions allowedTools", () => {
+  it("allows every tool the tomo-internal MCP server registers", async () => {
+    resetConfig();
+    const { createTomoInternalMcpServer } = await import("../src/mcp/internal-server.js");
+    // Handlers are never called here — only the registered names are read.
+    const server = createTomoInternalMcpServer({} as never, "dm:shuai");
+    const registered = (server as unknown as { tools: Array<{ name: string }> }).tools
+      .map((t) => t.name);
+    expect(registered.length).toBeGreaterThan(0);
+
+    const allowed = sdkOptions(internalServer).allowedTools;
+    const missing = registered.filter((name) => !allowed.includes(`mcp__tomo-internal__${name}`));
+    expect(missing).toEqual([]);
+  });
+});

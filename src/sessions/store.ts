@@ -22,8 +22,29 @@ const TRANSCRIPT_TAIL_MIN = 200;
 // _archive_<key>_<YYYY-MM>.jsonl siblings.
 const TRANSCRIPT_ROTATE_BYTES = 2 * 1024 * 1024;
 
-function monthOf(timestamp: number): string {
-  return new Date(timestamp).toISOString().slice(0, 7);
+/**
+ * `YYYY-MM` for a record's timestamp, or null when it does not have a usable
+ * one.
+ *
+ * `new Date(x).toISOString()` THROWS RangeError on an invalid date, and a
+ * transcript record's timestamp is not guaranteed to be a number: a partial
+ * write, a hand-edited file or an older writer can leave the field missing, a
+ * string, or out of the ±8.64e15 range JSON.parse will happily hand back. The
+ * one caller is rotation, which runs inside `get()`, which every inbound
+ * message goes through — so "this record has no month" has to be a value the
+ * caller can keep, not an exception that stops the session from receiving.
+ */
+function monthOf(timestamp: unknown): string | null {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return null;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 7);
+}
+
+/** The month the wall clock is in. Separate from `monthOf` so the caller that
+ *  cannot fail is not made to narrow a null it can never be handed. */
+function monthNow(): string {
+  return new Date().toISOString().slice(0, 7);
 }
 
 /** Ordering guard for rotation crash recovery: prefer the monotonic seq,
@@ -1470,7 +1491,7 @@ export class SessionStore {
     }
     if (size < this.rotateBytes) return;
 
-    const currentMonth = monthOf(Date.now());
+    const currentMonth = monthNow();
     if (this.rotateSkipMonth.get(key) === currentMonth) return;
 
     // SERIALIZE ROTATORS ACROSS PROCESSES. `get()` triggers rotation, and
@@ -1490,8 +1511,20 @@ export class SessionStore {
       log.debug({ key }, "Transcript rotation not started this pass (lock held elsewhere or unavailable)");
       return;
     }
+    // ROTATION MAY NOT THROW OUT OF HERE. The header above states the
+    // contract — degrade to "don't rotate", never to "don't receive" — but
+    // the body only honoured it for the failures it anticipated one at a
+    // time. The unguarded ones are ordinary: `appendFileSync` onto an archive
+    // and `writeFileSync` of the rewrite are bare calls (ENOSPC, EACCES,
+    // EROFS, EMFILE), and `monthOf` used to raise RangeError on a record with
+    // an unusable timestamp. Any of them escaped through `get()` and
+    // `append()`, so every inbound message for that key was dropped until
+    // someone hand-fixed the file. One catch around the whole pass, at the
+    // boundary the contract is written on.
     try {
       this.rotateTranscriptLocked(key, file, currentMonth, lock);
+    } catch (err) {
+      log.warn({ err, key }, "Transcript rotation failed; leaving the active transcript in place");
     } finally {
       lock.release();
     }
@@ -1557,12 +1590,23 @@ export class SessionStore {
     // for lines nobody could parse.
     const keep: (SessionMessage | RawJsonlLine)[] = [];
     const byMonth = new Map<string, SessionMessage[]>();
+    let undated = 0;
     for (const msg of all) {
       if (isRawJsonlLine(msg)) {
         keep.push(msg);
         continue;
       }
       const month = monthOf(msg.timestamp);
+      if (month === null) {
+        // No usable timestamp means no month to file it under — the same
+        // position a line nobody could parse is in, and it is kept for the
+        // same reason: rotation rewrites the active file, so anything not
+        // archived has to come back out of it. Counted so the file can be
+        // repaired rather than silently accumulating unarchivable records.
+        undated++;
+        keep.push(msg);
+        continue;
+      }
       if (month >= currentMonth) {
         keep.push(msg);
         continue;
@@ -1570,6 +1614,12 @@ export class SessionStore {
       let bucket = byMonth.get(month);
       if (!bucket) byMonth.set(month, bucket = []);
       bucket.push(msg);
+    }
+    if (undated > 0) {
+      log.warn(
+        { key, file, undated },
+        "Transcript records without a usable timestamp were kept in the active file; they cannot be archived",
+      );
     }
     if (byMonth.size === 0) {
       // Everything is current-month; nothing can roll until the month turns.

@@ -6,6 +6,8 @@
 
 - **A write to the `imsg` rpc child's pipe after it died no longer takes the daemon down.** `spawnChildAndSubscribe` wired `stdout`, `stderr`, `exit` and `error` on the child but nothing on `child.stdin`, and a pipe to a dead child emits `'error'` (EPIPE, ERR_STREAM_DESTROYED) on the write side. An unhandled `'error'` on a stream is an uncaughtException, which the daemon's process handler logs and exits 1 on — so `killChild` or gap recovery racing an in-flight read receipt or typing tick killed every channel. The stream now carries a debug-level listener; nothing else changes, because `enqueueWrite`'s write callback already fails the owning request and `handleChildDown` rejects the rest.
 
+- **A transcript rotation that fails no longer stops the session from receiving.** `acquireRotationLock`'s header promises rotation degrades to "don't rotate, never don't receive", but only the failures the body anticipated one at a time were caught. `monthOf` raised `RangeError: Invalid time value` on a record whose timestamp was missing or non-numeric (a partial write, a hand-edited file), and the `appendFileSync` onto a month archive and the `writeFileSync` of the rewrite were bare calls — ENOSPC, EACCES, EROFS. All of them escaped through `get()` and `append()`, so *every* inbound message for that session key was dropped until someone repaired the file by hand. The whole pass is now wrapped at the boundary the contract is written on (warn and leave the active file alone), and a record with no usable timestamp is kept in the active transcript — the same position a line nobody could parse is in — and counted in one warning so the file can be repaired.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

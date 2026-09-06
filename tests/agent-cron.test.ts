@@ -781,6 +781,44 @@ describe("compact nudges", () => {
     await agent.stop();
   });
 
+  it("re-nudges after a housekeeping turn that REJECTED, not just one that resolved false", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    // `handleCronMessage` funnels every failure into `false` through a
+    // terminal `.catch(() => false)`, so today it cannot reject — which is
+    // precisely the hidden dependency being removed here. The latch rollback
+    // lived only in the `.then(ok === false)` branch, so the correctness of
+    // this call site rested on an implementation detail of a method three
+    // layers down: give that catch a narrower predicate and the latch is
+    // stuck on for the rest of the session's life, with the compact never
+    // asked for again. Force the rejection directly.
+    const real = agent.handleCronMessage.bind(agent);
+    const spy = vi.spyOn(agent, "handleCronMessage").mockImplementation(
+      async (text, key, options) => {
+        if (text.includes("Context usage is at")) throw new Error("session queue exploded");
+        return real(text, key, options);
+      },
+    );
+
+    mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 }; // 85%
+    await tg.simulateMessage(makeMsg({ text: "Hi" }));
+    await drainQueue(agent);
+    // The nudge never reached the model at all.
+    await expectNoChangeFor(() => expect(nudgePrompts()).toHaveLength(0));
+
+    // Still over the threshold, and the compact still has not happened — so
+    // it is asked for again rather than latched out forever.
+    spy.mockRestore();
+    await tg.simulateMessage(makeMsg({ text: "Hi again" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
+    expect(nudgePrompts()[0]).toContain("lcm compact skill");
+
+    await agent.stop();
+  });
+
   it("does not re-issue housekeeping after a turn whose context reading failed", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

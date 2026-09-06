@@ -1040,11 +1040,20 @@ export class Agent {
     }
 
     // Latched BEFORE dispatch (the nudge turn must not re-trigger itself) and
-    // rolled back below if the turn never happened — see the .then().
+    // rolled back below if the turn never happened — see the .then()/.catch().
     const latch = decision.newLatch;
     if (latch) {
       this.contextNudged.set(key, latch);
     }
+    // Undo that arming — but only if the latch is still OURS: a later turn may
+    // have escalated it (prune → daily → compact) while this nudge was in
+    // flight, and clearing that one would re-issue a rung the session has
+    // already moved past.
+    const rollBackLatch = (why: string): void => {
+      if (!latch || this.contextNudged.get(key) !== latch) return;
+      this.contextNudged.delete(key);
+      log.warn({ key, latch }, why);
+    };
 
     const pct = Math.round(usedFrac * 100);
     const groupNote = isGroupSessionKey(key)
@@ -1095,7 +1104,7 @@ export class Agent {
       showTyping: false,
       suppressDelivery: true,
     }).then((ok) => {
-      if (ok || !latch) return;
+      if (ok) return;
       // handleCronMessage does not REJECT on failure — it resolves false (no
       // deliverable target, the turn ended on an error result, the queue threw
       // and was swallowed). Leaving the latch set on that answer means the
@@ -1103,16 +1112,15 @@ export class Agent {
       // falls back below nudgeResetPct, which is precisely what it cannot do
       // with the rollup unwritten. Roll the latch back so the next completed
       // turn re-evaluates the ladder from where it actually stands.
-      //
-      // Only if it is still OURS: a later turn may have escalated the latch
-      // (prune → daily → compact) while this nudge was in flight, and clearing
-      // that one would re-issue a rung the session has already moved past.
-      if (this.contextNudged.get(key) === latch) {
-        this.contextNudged.delete(key);
-        log.warn({ key, latch }, "Context nudge turn failed; latch cleared for a retry");
-      }
+      rollBackLatch("Context nudge turn failed; latch cleared for a retry");
     }).catch((err) => {
+      // And a REJECTION is the same outcome with a louder failure mode. That
+      // handleCronMessage cannot currently reject is a property of ITS
+      // implementation (a terminal `.catch(() => false)`), not of this call
+      // site, and a latch stuck on for the rest of the session's life is too
+      // quiet a thing to leave resting on that.
       log.warn({ err, key }, "Compact nudge failed");
+      rollBackLatch("Context nudge turn threw; latch cleared for a retry");
     });
   }
 

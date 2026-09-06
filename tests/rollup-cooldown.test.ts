@@ -49,7 +49,7 @@ type Store = InstanceType<typeof NudgeCooldownStore>;
 /** A daemon lifetime: one runner over one store. */
 function bootRunner(
   store: Store,
-  opts: { deliver?: boolean } = {},
+  opts: { deliver?: boolean; rejects?: boolean } = {},
 ): { runner: InstanceType<typeof RollupRunner>; nudges: string[] } {
   const nudges: string[] = [];
   const agent = {
@@ -57,7 +57,11 @@ function bootRunner(
     // `false` is how handleCronMessage reports a turn that never happened —
     // no deliverable target, an error result, a throw inside the queue. It
     // does not reject.
-    handleCronMessage: async (text: string) => { nudges.push(text); return opts.deliver ?? true; },
+    handleCronMessage: async (text: string) => {
+      nudges.push(text);
+      if (opts.rejects) throw new Error("session queue exploded");
+      return opts.deliver ?? true;
+    },
   };
   return { runner: new RollupRunner(agent as never, store), nudges };
 }
@@ -118,6 +122,31 @@ describe("rollup nudge cooldown persistence", () => {
     // mean the file no longer carries the entry, not merely that the map
     // does. The file may or may not exist at all, depending on whether
     // anything else has been written.
+    expect(existsSync(FILE) ? onDisk() : {}).toEqual({});
+
+    // The very next hourly check — well inside the 6h window — tries again.
+    vi.setSystemTime(new Date("2026-08-29T08:15:00"));
+    const retry = bootRunner(store);
+    await checkAll(retry.runner);
+    expect(retry.nudges).toHaveLength(1);
+    expect(store.size()).toBe(1);
+  });
+
+  it("arms no cooldown when the nudge turn THREW, not just when it resolved false", async () => {
+    // `handleCronMessage` funnels every failure into `false` through a
+    // terminal `.catch(() => false)`, so today it cannot reject — which is
+    // exactly the hidden dependency being removed. The cooldown giveback
+    // lived only in the `!delivered` branch, so this loop's correctness
+    // rested on an implementation detail of a method it does not own: narrow
+    // that catch and an exception leaves a 6h debounce on work nobody did,
+    // with the period due, un-nudged, and skipped by every heartbeat in the
+    // window. Force the rejection directly.
+    const store = new NudgeCooldownStore(FILE);
+    const threw = bootRunner(store, { rejects: true });
+    await checkAll(threw.runner);
+
+    expect(threw.nudges).toHaveLength(1);
+    expect(store.size()).toBe(0);
     expect(existsSync(FILE) ? onDisk() : {}).toEqual({});
 
     // The very next hourly check — well inside the 6h window — tries again.

@@ -168,6 +168,11 @@ export class RollupRunner {
       // Skip sessions on SDK auto-compact (only groups with
       // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
       if (!usesLcmCompact(sessionKey)) continue;
+      // Held outside the try so the catch can give the cooldown back. It is
+      // armed before the nudge turn is awaited (see below), so an exception
+      // out of that await would otherwise leave a 6h debounce on work that
+      // was never asked for.
+      let cooldownKey: string | null = null;
       try {
         const due = findDuePromotions(sdkSessionId, config.sdkSessionsDir);
         if (due.length === 0) continue;
@@ -211,7 +216,7 @@ export class RollupRunner {
         // completion, the next tick sees the same period still un-nudged and
         // asks for it a second time — the duplicate lands the moment the first
         // one finishes, and rewrites the whole period again.
-        const cooldownKey = `${sessionKey}:${next.level}:${next.period}`;
+        cooldownKey = `${sessionKey}:${next.level}:${next.period}`;
         this.lastNudged.set(cooldownKey, now);
         const delivered = await this.agent.handleCronMessage(
           nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
@@ -234,6 +239,14 @@ export class RollupRunner {
           );
         }
       } catch (err) {
+        // Same reasoning as the `!delivered` branch above, for the louder
+        // failure mode: whatever threw, the rollup did not happen, and a
+        // cooldown armed for a turn that never completed is a 6h hole in which
+        // the period stays due and every heartbeat skips it. That
+        // `handleCronMessage` cannot currently reject is a property of ITS
+        // implementation (a terminal `.catch(() => false)`) — this loop should
+        // not silently depend on that.
+        if (cooldownKey) this.lastNudged.clear(cooldownKey);
         log.warn({ err, sessionKey }, "Rollup check failed");
       }
     }

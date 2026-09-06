@@ -24,6 +24,7 @@ vi.mock("../src/workspace/index.js", () => ({
 const {
   isPrivateMemoryAccess,
   privateMemoryGuardHooks,
+  skillsCanUseTool,
   PRIVATE_MEMORY_GROUP_DENIAL,
   PRIVATE_MEMORY_SUMMONED_DENIAL,
 } = await import("../src/agent/permissions.js");
@@ -602,5 +603,64 @@ describe("isPrivateMemoryAccess — self-anchoring Glob/Grep patterns", () => {
   it("still allows an absolute pattern that lands outside the memory tree", () => {
     expect(isPrivateMemoryAccess("Glob", { path: "/tmp", pattern: "/etc/hosts" }, ctx)).toBe(false);
     expect(isPrivateMemoryAccess("Glob", { path: "/tmp", pattern: "/ws/skills/*.md" }, ctx)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The `.claude/skills/` re-allow. This one is an ALLOW predicate, so the
+// failure mode is the mirror image of the guard above: a string test that
+// over-matches hands back the very paths the SDK protected.
+// ---------------------------------------------------------------------------
+
+describe("skillsCanUseTool", () => {
+  const allow = async (toolName: string, input: Record<string, unknown>) =>
+    (await skillsCanUseTool(toolName, input)).behavior;
+
+  it("allows a write inside the skills dir", async () => {
+    expect(await allow("Write", { file_path: "/ws/.claude/skills/tomo-x/SKILL.md", content: "x" })).toBe("allow");
+    expect(await allow("Read", { file_path: "/ws/.claude/skills/tomo-x/refs/a.md" })).toBe("allow");
+  });
+
+  it("denies a path that only STARTS with the skills prefix", async () => {
+    // `startsWith` said yes; the path lands in `.claude/`, which is exactly
+    // what the SDK routed here to protect.
+    expect(await allow("Write", { file_path: "/ws/.claude/skills/../settings.local.json", content: "x" }))
+      .toBe("deny");
+    expect(await allow("Edit", { file_path: "/ws/.claude/skills/a/../../settings.json", old_string: "a", new_string: "b" }))
+      .toBe("deny");
+  });
+
+  it("denies protected paths outside the carve-out", async () => {
+    expect(await allow("Write", { file_path: "/ws/.claude/settings.local.json", content: "x" })).toBe("deny");
+    expect(await allow("Write", { file_path: "/ws/.git/config", content: "x" })).toBe("deny");
+  });
+
+  it("allows Bash housekeeping whose only named path is inside skills", async () => {
+    expect(await allow("Bash", { command: "mkdir -p /ws/.claude/skills/tomo-x" })).toBe("allow");
+    expect(await allow("Bash", { command: "rm -rf /ws/.claude/skills/tomo-x" })).toBe("allow");
+  });
+
+  it("denies a Bash command that merely MENTIONS the skills dir", async () => {
+    // `includes(SKILLS_DIR)` approved the whole command on the strength of the
+    // trailing comment.
+    expect(await allow("Bash", { command: "rm -rf /ws/.claude/settings.local.json # /ws/.claude/skills/" }))
+      .toBe("deny");
+    expect(await allow("Bash", { command: "echo /ws/.claude/skills/ && cat /ws/.git/config" })).toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md /ws/.claude/agents/a.md" })).toBe("deny");
+  });
+
+  it("denies a Bash command that names no skills path at all", async () => {
+    expect(await allow("Bash", { command: "ls /tmp" })).toBe("deny");
+  });
+
+  it("denies a Bash command whose target the shell would construct", async () => {
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md $DEST" })).toBe("deny");
+    expect(await allow("Bash", { command: "cp /ws/.claude/skills/a.md ~/.claude/settings.json" })).toBe("deny");
+  });
+
+  it("names the auto-approved prefix in the denial", async () => {
+    const result = await skillsCanUseTool("Write", { file_path: "/ws/.claude/settings.json", content: "x" });
+    expect(result.behavior).toBe("deny");
+    if (result.behavior === "deny") expect(result.message).toContain("/ws/.claude/skills/");
   });
 });

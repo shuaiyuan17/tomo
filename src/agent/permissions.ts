@@ -11,27 +11,106 @@ import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../worksp
 
 const SKILLS_DIR = `${config.workspaceDir}/.claude/skills/`;
 
+/** The same directory as {@link SKILLS_DIR} without its trailing slash — the
+ *  containment root, which `path.relative` needs unsuffixed. */
+const SKILLS_ROOT = `${config.workspaceDir}/.claude/skills`;
+
+/** The trees the SDK protects under `bypassPermissions`, and therefore the
+ *  ones a call routed here may be trying to reach. `skills/` is carved out of
+ *  the first of them; nothing else in either is ever auto-approved. */
+const PROTECTED_ROOTS = [`${config.workspaceDir}/.claude`, `${config.workspaceDir}/.git`];
+
 /** SDK canUseTool callback. The SDK auto-approves most tools under
  *  `bypassPermissions`, but writes to `.claude/`, `.git/`, etc. are protected
  *  and fall through to canUseTool. We narrowly re-allow `.claude/skills/` so
  *  tomo can manage its own skill library; every other protected path stays
- *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes. */
+ *  denied. See https://code.claude.com/docs/en/agent-sdk/permissions#permission-modes.
+ *
+ *  CONTAINMENT, NOT `startsWith`/`includes`. This is an ALLOW predicate, so a
+ *  string test that over-matches hands back exactly what the SDK protected:
+ *  `<ws>/.claude/skills/../settings.local.json` starts with the skills prefix
+ *  and lands in `.claude/`, and a Bash command that merely MENTIONS the skills
+ *  path — in a comment, in an echo, after the `rm` that does the damage — was
+ *  approved whole. Paths go through {@link realResolve} (which collapses `..`
+ *  and follows symlinks, including a link whose target does not exist yet, the
+ *  normal case for a file about to be written) and then an exact containment
+ *  test. */
 export async function skillsCanUseTool(
   toolName: string,
   input: Record<string, unknown>,
 ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> {
   const filePath = (input.file_path ?? input.notebook_path ?? input.path) as string | undefined;
-  if (filePath && filePath.startsWith(SKILLS_DIR)) {
+  if (filePath && landsInSkills(filePath)) {
     return { behavior: "allow", updatedInput: input };
   }
-  // Bash mkdir / touch / etc. — allow if command targets the skills dir.
-  if (toolName === "Bash" && typeof input.command === "string" && input.command.includes(SKILLS_DIR)) {
+  // Bash mkdir / touch / etc. — allow only if every path the command names is
+  // inside the skills dir. See bashStaysInSkills.
+  if (toolName === "Bash" && typeof input.command === "string" && bashStaysInSkills(input.command)) {
     return { behavior: "allow", updatedInput: input };
   }
   return {
     behavior: "deny",
     message: `Permission required for ${toolName}${filePath ? ` on ${filePath}` : ""} — only ${SKILLS_DIR}** is auto-approved at this step.`,
   };
+}
+
+/**
+ * Containment, CASE-SENSITIVE — the opposite of {@link isInside}, deliberately.
+ *
+ * This side is an ALLOW predicate: a comparison that fails to establish
+ * containment DENIES, which is merely conservative, while one that over-matches
+ * grants a write the SDK had protected. So `.claude/SKILLS/` is not treated as
+ * `.claude/skills/`: on a case-sensitive volume it is a different directory
+ * that must not be auto-approved, and on a case-insensitive one the caller
+ * loses nothing by spelling it the way it is spelled on disk.
+ */
+function isInsideExact(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  const rel = relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** Does `p` really land at-or-inside `<ws>/.claude/skills`? Both sides are
+ *  real-resolved, since the workspace may sit under a symlinked prefix. */
+function landsInSkills(p: string): boolean {
+  const real = realResolve(p, config.workspaceDir);
+  if (real === null) return false;
+  return isInsideExact(real, realDir(SKILLS_ROOT, config.workspaceDir) ?? SKILLS_ROOT);
+}
+
+/** Does `p` really land in a protected tree OUTSIDE the skills carve-out? */
+function landsInProtectedNonSkills(p: string): boolean {
+  const real = realResolve(p, config.workspaceDir);
+  if (real === null) return false;
+  if (landsInSkills(p)) return false;
+  return PROTECTED_ROOTS.some((root) => isInsideExact(real, realDir(root, config.workspaceDir) ?? root));
+}
+
+/**
+ * May this Bash command be auto-approved as skill-library housekeeping?
+ *
+ * Three conditions, all required. At least one token has to really land inside
+ * the skills dir (otherwise there is nothing to re-allow), no token may land
+ * anywhere else in a protected tree (`.claude/skills/../settings.local.json`,
+ * `.git/config`), and the command must contain no `$`, no backtick and no `~`
+ * — each of which produces a word this cannot see, and the last of which is
+ * how a mention of the skills path smuggles a `~/.claude/...` target past a
+ * token scan. Everything else is denied, which costs the caller a permission
+ * prompt rather than a capability.
+ */
+function bashStaysInSkills(cmd: string): boolean {
+  if (/[$`~]/.test(cmd)) return false;
+  let touchesSkills = false;
+  for (const token of bashTokens(cmd)) {
+    // Flags and comment markers name no path.
+    if (token.startsWith("-") || token === "#") continue;
+    if (landsInSkills(token)) {
+      touchesSkills = true;
+      continue;
+    }
+    if (landsInProtectedNonSkills(token)) return false;
+  }
+  return touchesSkills;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,10 +274,11 @@ function abs(p: string, cwd: string): string {
  * case-insensitive by default and `realpathSync` PRESERVES the caller's
  * spelling rather than normalising it — `realpathSync("<ws>/memory/PRIVATE")`
  * returns `.../PRIVATE`, so an exact compare against `.../private` failed and
- * `Read memory/PRIVATE/secret.md` read the file. (The `.claude/skills/`
- * re-allow in #305 folds the other way for the same reason: there a failed
- * comparison DENIES, so preserved casing is merely conservative. Same
- * observation, opposite consequence — hence the different treatment.)
+ * `Read memory/PRIVATE/secret.md` read the file. ({@link isInsideExact}, used
+ * by the `.claude/skills/` re-allow at the top of this file, folds the other
+ * way for the same reason: there a failed comparison DENIES, so preserved
+ * casing is merely conservative. Same observation, opposite consequence —
+ * hence the two helpers.)
  *
  * Folding over-matches on a case-SENSITIVE volume, where `memory/PRIVATE/` is
  * a genuinely different directory that would now be denied. That is the safe
@@ -227,10 +307,9 @@ function hasTraversalSegment(p: string): boolean {
  * Returns null when nothing resolves (which callers read as "no extra
  * evidence", never as "allowed").
  *
- * Same shape as the containment helper in the `.claude/skills/` re-allow
- * (PR #305) — copied rather than imported because that one is private to its
- * own arm and lives on an unmerged branch; when it lands, both should share
- * one helper.
+ * Shared with the `.claude/skills/` re-allow at the top of this file, which
+ * needs exactly the same "resolve a path that may not exist yet" behaviour on
+ * the allow side of the decision.
  *
  * `realpathSync` throws on a path that has not been created, and Write/Edit
  * name files that are about to exist — so realpath the deepest ancestor that

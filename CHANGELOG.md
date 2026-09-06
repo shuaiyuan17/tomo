@@ -10,6 +10,8 @@
 
 - **A Telegram reply whose target was deleted no longer fails the whole send.** `reply_parameters` carried only `message_id`, so the Bot API answered 400 "message to be replied not found" when the target had been deleted or aged out — and that refusal is not scoped to the threading, it kills the send, so the block never arrived at all. `allow_sending_without_reply: true` makes the thread a preference: Telegram delivers the message unthreaded instead of refusing it. Threading is cosmetic; the message is not.
 
+- **An iMessage sticker that cannot be sent is reported instead of silently dropped.** `sendSticker`'s two pre-flight refusals — a value that is not a path (a Telegram `file_id`, which means nothing on this channel) and a path that does not exist — logged a warning and returned normally, so the caller was told the send succeeded. Unlike a captioned photo there is nothing left over to salvage: the sticker *is* the message, and the recipient got nothing while the transcript recorded a delivered turn. Both now raise the same typed, definite `AttachmentUnreadableError` `sendAttachment` has raised since 0.9.0, which is what lets the delivery pipeline react without risking a double-send.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

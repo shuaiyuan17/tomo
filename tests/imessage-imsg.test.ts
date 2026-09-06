@@ -1938,21 +1938,34 @@ describe("imsg sticker sends", () => {
     }
   });
 
-  it("drops a Telegram file_id-shaped sticker value (channel-bound id)", async () => {
+  // Both pre-flight refusals REPORT, they do not report success. These two
+  // used to assert the silent-drop behaviour: nothing was sent and `send`
+  // resolved, so the delivery pipeline recorded a turn that landed while the
+  // recipient got nothing — and unlike a caption-bearing photo, a sticker is
+  // the whole message, so there was nothing left to salvage. Same typed,
+  // definite error `sendAttachment` raises for the identical situation.
+  it("reports a Telegram file_id-shaped sticker value instead of dropping it (channel-bound id)", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
     await channel.start();
 
-    await channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" });
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "CAACAgIAAxkBAAIBOWX1abc123" }))
+      .rejects.toThrow(AttachmentUnreadableError);
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
     await channel.stop();
   });
 
-  it("sends nothing when the sticker path does not exist", async () => {
+  it("reports a sticker path that does not exist instead of dropping it", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
     await channel.start();
 
-    await channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" });
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
+      .rejects.toThrow(AttachmentUnreadableError);
+
+    // Definite by construction, which is what lets the pipeline react without
+    // risking a double-send.
+    await expect(channel.send({ chatId: DM_GUID, text: "", sticker: "/nonexistent/sticker.png" }))
+      .rejects.toMatchObject({ code: "ENOENT", path: "/nonexistent/sticker.png" });
 
     expect(requests().filter((r) => r.method === "send" || r.method === "send.sticker")).toHaveLength(0);
     await channel.stop();

@@ -2127,17 +2127,24 @@ export class ImsgChannel implements Channel {
    * wanted it needs its own surface, not a half-wiring of this one.
    */
   private async sendSticker(chatGuid: string, sticker: string): Promise<void> {
+    // BOTH PRE-FLIGHT REFUSALS THROW, the same way `sendAttachment` does.
+    // They used to log and return, which reports "delivered" to the caller
+    // about a sticker that never left the machine — and the sticker IS the
+    // message here, so the recipient gets nothing at all and the pipeline
+    // records a turn that landed. `AttachmentUnreadableError` is definite by
+    // construction (nothing was dispatched), which is exactly what lets
+    // delivery-pipeline.ts fall back without risking a double-send.
     if (!sticker.startsWith("/") && !sticker.startsWith("~")) {
-      log.warn({ chatId: chatGuid }, "Ignoring non-path sticker value on iMessage channel (Telegram file_ids are channel-bound)");
-      return;
+      log.warn({ chatId: chatGuid }, "Non-path sticker value on iMessage channel (Telegram file_ids are channel-bound)");
+      throw new AttachmentUnreadableError(sticker);
     }
     // Expand a leading `~` ourselves: imsg's send.sticker expands it too, but
     // the fallback plain `send` may not, and our own existence check below
     // certainly doesn't.
     const filePath = sticker.replace(/^~(?=$|\/)/, homedir());
     if (!existsSync(filePath)) {
-      log.warn({ path: filePath, chatId: chatGuid }, "Sticker file not found; nothing sent");
-      return;
+      log.warn({ path: filePath, chatId: chatGuid }, "Sticker file not found");
+      throw new AttachmentUnreadableError(filePath);
     }
 
     // send.sticker is bridge-only; a bare handle with no known conversation

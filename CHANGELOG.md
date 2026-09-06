@@ -8,6 +8,8 @@
 
 - **A transcript rotation that fails no longer stops the session from receiving.** `acquireRotationLock`'s header promises rotation degrades to "don't rotate, never don't receive", but only the failures the body anticipated one at a time were caught. `monthOf` raised `RangeError: Invalid time value` on a record whose timestamp was missing or non-numeric (a partial write, a hand-edited file), and the `appendFileSync` onto a month archive and the `writeFileSync` of the rewrite were bare calls — ENOSPC, EACCES, EROFS. All of them escaped through `get()` and `append()`, so *every* inbound message for that session key was dropped until someone repaired the file by hand. The whole pass is now wrapped at the boundary the contract is written on (warn and leave the active file alone), and a record with no usable timestamp is kept in the active transcript — the same position a line nobody could parse is in — and counted in one warning so the file can be repaired.
 
+- **A Telegram reply whose target was deleted no longer fails the whole send.** `reply_parameters` carried only `message_id`, so the Bot API answered 400 "message to be replied not found" when the target had been deleted or aged out — and that refusal is not scoped to the threading, it kills the send, so the block never arrived at all. `allow_sending_without_reply: true` makes the thread a preference: Telegram delivers the message unthreaded instead of refusing it. Threading is cosmetic; the message is not.
+
 ## 0.9.0 (2026-09-02)
 
 ### Breaking changes

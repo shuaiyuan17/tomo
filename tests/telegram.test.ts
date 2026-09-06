@@ -300,30 +300,46 @@ describe("TelegramChannel.send photo captions", () => {
 describe("TelegramChannel.send threads photos and stickers", () => {
   function makeChannel() {
     const channel = new TelegramChannel("000000:test-token");
-    type Opts = { caption?: string; reply_parameters?: { message_id: number } };
-    const calls: Array<{ kind: string; replyToId?: number; caption?: string }> = [];
+    type Opts = { caption?: string; reply_parameters?: { message_id: number; allow_sending_without_reply?: boolean } };
+    const calls: Array<{ kind: string; replyToId?: number; caption?: string; withoutReply?: boolean }> = [];
     let nextId = 100;
     (channel as unknown as { bot: { api: unknown } }).bot.api = {
       sendPhoto: async (_chatId: string | number, _file: unknown, opts?: Opts) => {
-        calls.push({ kind: "photo", replyToId: opts?.reply_parameters?.message_id, caption: opts?.caption });
+        calls.push({ kind: "photo", replyToId: opts?.reply_parameters?.message_id, caption: opts?.caption, withoutReply: opts?.reply_parameters?.allow_sending_without_reply });
         return { message_id: nextId++ };
       },
       sendSticker: async (_chatId: string | number, _sticker: unknown, opts?: Opts) => {
-        calls.push({ kind: "sticker", replyToId: opts?.reply_parameters?.message_id });
+        calls.push({ kind: "sticker", replyToId: opts?.reply_parameters?.message_id, withoutReply: opts?.reply_parameters?.allow_sending_without_reply });
         return { message_id: nextId++ };
       },
       sendMessage: async (_chatId: string | number, _text: string, opts?: Opts) => {
-        calls.push({ kind: "text", replyToId: opts?.reply_parameters?.message_id });
+        calls.push({ kind: "text", replyToId: opts?.reply_parameters?.message_id, withoutReply: opts?.reply_parameters?.allow_sending_without_reply });
         return { message_id: nextId++ };
       },
     };
     return { channel, calls };
   }
 
+  it("sends without the reply when the target is gone, rather than failing the whole send", async () => {
+    // A reply target the user has since deleted makes the Bot API answer 400
+    // "message to be replied not found" — and that is not scoped to the
+    // threading, it fails the SEND. The block never arrives. Threading is
+    // cosmetic; the message is not, so every kind asks Telegram to fall back
+    // to an unthreaded send instead of refusing.
+    const { channel, calls } = makeChannel();
+
+    await channel.send({ chatId: "1", text: "hi", replyTo: "42" });
+    await channel.send({ chatId: "1", text: "cap", photo: PIC, replyTo: "42" });
+    await channel.send({ chatId: "1", text: "", sticker: "CAACAgIAAxkBAAIBOWX1", replyTo: "42" });
+
+    expect(calls.map((c) => c.kind)).toEqual(["text", "photo", "sticker"]);
+    expect(calls.every((c) => c.withoutReply === true)).toBe(true);
+  });
+
   it("forwards replyTo to sendPhoto and consumes the target", async () => {
     const { channel, calls } = makeChannel();
     const result = await channel.send({ chatId: "1", text: "cap", photo: PIC, replyTo: "42" });
-    expect(calls).toEqual([{ kind: "photo", replyToId: 42, caption: "cap" }]);
+    expect(calls).toEqual([{ kind: "photo", replyToId: 42, caption: "cap", withoutReply: true }]);
     // Nothing to report: the target really was applied.
     expect(result?.threaded).not.toBe(false);
   });
@@ -331,7 +347,7 @@ describe("TelegramChannel.send threads photos and stickers", () => {
   it("forwards replyTo to sendSticker", async () => {
     const { channel, calls } = makeChannel();
     const result = await channel.send({ chatId: "1", text: "", sticker: "CAACAgIAAxkBAAIBOWX1", replyTo: "42" });
-    expect(calls).toEqual([{ kind: "sticker", replyToId: 42 }]);
+    expect(calls).toEqual([{ kind: "sticker", replyToId: 42, withoutReply: true }]);
     expect(result?.threaded).not.toBe(false);
   });
 

@@ -147,6 +147,32 @@ describe("cron MCP tools", () => {
     expect(missing.content[0].text).toContain("not found");
   });
 
+  it("schedule_enable — refuses a recurring job that has run out of occurrences", async () => {
+    // `schedule_create` refuses the dead-job shape at creation; this is the
+    // same shape reached from the other side. February 30th parses fine and
+    // never comes round, so enabling used to write `enabled: true,
+    // nextRunAt: null` — a job `schedule_list` reports as scheduled and the
+    // 30s scan never picks up. The model then tells the user it is on.
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "feb 30th",
+      schedule: { kind: "cron", expr: "0 0 30 2 *" },
+      message: "never",
+      sessionKey: "dm:alice",
+    });
+    store.setEnabled(job.id, false);
+
+    const result = await findTool("schedule_enable").handler({ id: job.id }, {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/could never fire/);
+    expect(result.content[0].text).toMatch(/no future occurrence/);
+
+    // Nothing changed on disk — no half-enabled job left behind.
+    const after = new CronStore(TEST_PATH).get(job.id)!;
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt).toBeNull();
+  });
+
   it("schedule_list — surfaces the interrupted state and the dispatch time", async () => {
     const store = new CronStore(TEST_PATH);
     const job = store.add({

@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { CronStore, CronStoreReadError } from "../../cron/store.js";
+import { CronStore, CronStoreReadError, unschedulableReason } from "../../cron/store.js";
 import { cronStoreErrorMessage } from "../cron-errors.js";
 import type { CronJob } from "../../cron/types.js";
 import { formatSchedule, formatRelative } from "../../cron/format.js";
@@ -86,7 +86,14 @@ export async function configCron(): Promise<void> {
 
     if (action === "enable" || action === "disable") {
       const updated = store.setEnabled(job.id, action === "enable");
-      if (updated) {
+      if (updated === "unschedulable") {
+        // Enabling would leave `enabled: true, nextRunAt: null` — shown here
+        // as "next run never", which is not a thing this menu should offer.
+        p.log.error(
+          `"${job.name}" cannot be enabled: ${unschedulableReason(job.schedule, Date.now())}, ` +
+          "so it could never fire. Remove it, or recreate it with a live schedule.",
+        );
+      } else if (updated) {
         const next = updated.nextRunAt ? formatRelative(updated.nextRunAt) : "never";
         p.log.success(
           action === "enable"

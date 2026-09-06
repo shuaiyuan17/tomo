@@ -1,6 +1,6 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { CronStore, CronStoreReadError, parseScheduleString, unschedulableReason } from "../cron/store.js";
+import { CronStore, CronStoreReadError, parseCreatableSchedule, unschedulableReason } from "../cron/store.js";
 import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
 import { MIXED_AUDIENCE_KEY } from "../agent/audience.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
@@ -137,35 +137,29 @@ export function buildCronTools(
             isError: true,
           };
         }
-        // Validate the schedule on its own. parseScheduleString accepts any
-        // unrecognized string as `kind: "cron"` (catch-all) and croner only
-        // throws when the expression is actually evaluated, so the validation
-        // is the trial run below — not `store.add`, whose failures are about
-        // the STORE and must not be reported as a bad schedule.
-        //
-        // A THROW is only half of it: a well-formed schedule with no future
-        // occurrence (a date/time that has already passed, a cron pattern that
-        // can never come round again) does not throw, it returns null — and
-        // `add` would then store `enabled: true, nextRunAt: null`, a job this
-        // tool reports as successfully scheduled and the scan never picks up.
-        // The user finds out when the reminder does not arrive.
-        let parsed;
-        let unschedulable: string | null;
-        try {
-          parsed = parseScheduleString(schedule);
-          unschedulable = unschedulableReason(parsed, Date.now());
-        } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
+        // Validate the schedule on its own — not via `store.add`, whose
+        // failures are about the STORE and must not be reported as a bad
+        // schedule. `parseCreatableSchedule` is shared with `tomo cron add`
+        // so the two surfaces cannot drift on what they accept; it separates
+        // the two ways a schedule is unusable, because a THROW is only half of
+        // it. A well-formed schedule with no future occurrence (a date/time
+        // that has already passed, a cron pattern that can never come round
+        // again) does not throw, it returns null — and `add` would then store
+        // `enabled: true, nextRunAt: null`, a job this tool reports as
+        // successfully scheduled and the scan never picks up. The user finds
+        // out when the reminder does not arrive.
+        const parsed = parseCreatableSchedule(schedule);
+        if (parsed.kind === "unparseable") {
           return {
-            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${detail}` }],
+            content: [{ type: "text" as const, text: `schedule_create failed: invalid schedule "${schedule}": ${parsed.detail}` }],
             isError: true,
           };
         }
-        if (unschedulable) {
+        if (parsed.kind === "unschedulable") {
           return {
             content: [{
               type: "text" as const,
-              text: `schedule_create failed: invalid schedule "${schedule}": ${unschedulable}, so the task could never fire. Pick a future time.`,
+              text: `schedule_create failed: invalid schedule "${schedule}": ${parsed.reason}, so the task could never fire. Pick a future time.`,
             }],
             isError: true,
           };
@@ -174,7 +168,7 @@ export function buildCronTools(
           const store = new CronStore(storePath);
           const job = store.add({
             name,
-            schedule: parsed,
+            schedule: parsed.schedule,
             message,
             sessionKey: target,
             deleteAfterRun: once,
@@ -271,6 +265,25 @@ export function buildCronTools(
         }
         if (!job) {
           return { content: [{ type: "text" as const, text: `Job ${id} not found.` }] };
+        }
+        if (job === "unschedulable") {
+          // The same dead-job shape `schedule_create` refuses, reached from the
+          // other side: a recurring schedule that has run out of occurrences
+          // since the job was created would come back as `enabled: true,
+          // nextRunAt: null` — reported here as scheduled and never picked up
+          // by the scan. (A one-shot whose time has passed is NOT this: it is
+          // re-armed to fire on the next poll, which is the point of enabling
+          // it.) `store.get` is post-reload, so this is the on-disk schedule.
+          const existing = store.get(id);
+          const why = existing ? unschedulableReason(existing.schedule, Date.now()) : "it has no future occurrence";
+          return {
+            content: [{
+              type: "text" as const,
+              text: `schedule_enable failed: job ${id} cannot be enabled: ${why}, so it could never fire. ` +
+                "Remove it, or create a new task with a schedule that still has a future run.",
+            }],
+            isError: true,
+          };
         }
         return {
           content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],

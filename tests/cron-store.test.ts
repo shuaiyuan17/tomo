@@ -8,9 +8,11 @@ import {
   ONE_SHOT_MAX_RETRIES,
   ONE_SHOT_RETRY_DELAY_MS,
   parseScheduleString,
+  parseCreatableSchedule,
+  unschedulableReason,
 } from "../src/cron/store.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { readCronJobsSafely } from "../src/cli/cron-errors.js";
+import { cronAddRefusal, readCronJobsSafely } from "../src/cli/cron-errors.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -364,6 +366,48 @@ describe("CronStore", () => {
     expect(enabled.retryCount).toBeUndefined();
     expect(enabled.nextRunAt).toBeGreaterThanOrEqual(before);
     expect(enabled.nextRunAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("setEnabled refuses to re-arm a recurring job with no occurrence left", () => {
+    // The other half of the dead-job shape `schedule_create` refuses. `add` is
+    // deliberately permissive, and a recurring schedule can also run OUT of
+    // occurrences after the job was created — enabling it then wrote
+    // `enabled: true, nextRunAt: null`: a job every surface reports as
+    // scheduled that the 30s scan can never pick up.
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "feb 30th",
+      schedule: parseScheduleString("0 0 30 2 *"),
+      message: "never",
+      sessionKey: "dm:alice",
+    });
+    store.setEnabled(job.id, false);
+
+    expect(store.setEnabled(job.id, true)).toBe("unschedulable");
+    // And it is a true no-op: still disabled, on disk as well as in memory.
+    const after = new CronStore(TEST_PATH).get(job.id)!;
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt).toBeNull();
+  });
+
+  it("setEnabled still re-arms a past one-shot — that is not the same thing", () => {
+    // `unschedulableReason` calls a past `at` unschedulable, and for CREATION
+    // it is. Re-enabling one is the opposite: "run this again now" is exactly
+    // what the caller means, and setEnabled arms it for the next poll. The
+    // gate must not swallow that.
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "fired reminder",
+      schedule: { kind: "at", at: new Date(Date.now() - 60_000).toISOString() },
+      message: "again",
+      sessionKey: "dm:alice",
+    });
+    store.setEnabled(job.id, false);
+
+    const enabled = store.setEnabled(job.id, true);
+    expect(enabled).not.toBe("unschedulable");
+    expect((enabled as { enabled: boolean }).enabled).toBe(true);
+    expect((enabled as { nextRunAt: number }).nextRunAt).toBeLessThanOrEqual(Date.now());
   });
 
   it("setEnabled returns undefined for unknown ids and is a no-op when unchanged", () => {
@@ -1069,5 +1113,73 @@ describe("parseScheduleString", () => {
   it("parses ISO date", () => {
     const s = parseScheduleString("2026-12-25T00:00:00Z");
     expect(s.kind).toBe("at");
+  });
+});
+
+/** February 30th: a well-formed pattern croner accepts and never matches. */
+const NEVER_CRON = "0 0 30 2 *";
+
+describe("unschedulableReason", () => {
+  const now = Date.parse("2026-05-01T12:00:00Z");
+
+  it("passes a schedule that still has a future run", () => {
+    expect(unschedulableReason({ kind: "every", everyMs: 60_000 }, now)).toBeNull();
+    expect(unschedulableReason(parseScheduleString("0 9 * * *"), now)).toBeNull();
+    expect(unschedulableReason({ kind: "at", at: "2026-05-01T13:00:00Z" }, now)).toBeNull();
+  });
+
+  it("names the past one-shot — the shape the model produces off a stale clock", () => {
+    expect(unschedulableReason({ kind: "at", at: "2026-04-30T09:00:00Z" }, now))
+      .toMatch(/is in the past$/);
+  });
+
+  it("names an `at` string that is not a date at all", () => {
+    // `parseAtSchedule` returns NaN, which is neither > now nor a real time —
+    // a different failure from "already happened" and worth saying so.
+    expect(unschedulableReason({ kind: "at", at: "next tuesday-ish" }, now))
+      .toMatch(/not a date\/time that can be parsed/);
+  });
+
+  it("names a recurring pattern with no occurrence left", () => {
+    // The case a try/catch around computeNextRun cannot see: croner accepts
+    // the pattern and simply returns null forever.
+    expect(unschedulableReason(parseScheduleString(NEVER_CRON), now))
+      .toBe("it has no future occurrence");
+  });
+});
+
+describe("`tomo cron add` refusal", () => {
+  it("refuses a time that has already passed, in one line", () => {
+    const past = new Date(Date.now() - 86_400_000).toISOString();
+    const parsed = parseCreatableSchedule(past);
+    expect(parsed.kind).toBe("unschedulable");
+    expect(cronAddRefusal(past, parsed as Exclude<typeof parsed, { kind: "ok" }>))
+      .toMatch(/^Cannot schedule ".*": .* is in the past, so the job could never fire\.$/);
+  });
+
+  it("refuses a recurring pattern that can never come round again", () => {
+    const parsed = parseCreatableSchedule(NEVER_CRON);
+    expect(parsed.kind).toBe("unschedulable");
+    expect(cronAddRefusal(NEVER_CRON, parsed as Exclude<typeof parsed, { kind: "ok" }>))
+      .toBe(`Cannot schedule "${NEVER_CRON}": it has no future occurrence, so the job could never fire.`);
+  });
+
+  it("turns croner's throw into one line instead of a stack trace", () => {
+    // `parseScheduleString` funnels anything it does not recognise into
+    // `kind: "cron"`, so a typo reaches croner — which throws only when the
+    // expression is evaluated. The CLI used to print that stack at whoever
+    // typed the command.
+    const garbage = "whenever i feel like it";
+    const parsed = parseCreatableSchedule(garbage);
+    expect(parsed.kind).toBe("unparseable");
+    const line = cronAddRefusal(garbage, parsed as Exclude<typeof parsed, { kind: "ok" }>);
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).toMatch(/^Cannot schedule "whenever i feel like it": not a schedule expression — /);
+    expect(line).not.toMatch(/\bat Object\b|\bat Module\b/); // no stack frames
+  });
+
+  it("accepts a live schedule and hands back the parsed value", () => {
+    const parsed = parseCreatableSchedule("every 2h");
+    expect(parsed).toEqual({ kind: "ok", schedule: { kind: "every", everyMs: 7_200_000 } });
   });
 });

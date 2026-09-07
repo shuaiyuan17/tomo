@@ -354,6 +354,82 @@ Environment variables override config file values:
 | `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Override continuity script stdout/stderr cap (default: `8000`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
 
+### Per-Agent Permission Scoping (`agentProfiles`)
+
+Every session runs the Claude Agent SDK in `bypassPermissions` mode, and the SDK propagates that mode into subagents — so a subagent tomo dispatches inherits your whole machine. `AgentDefinition` scopes **tools** and has no notion of a **path**, which means `tools: Read, Grep, Glob, Bash` on an agent described as "read-only reviewer" is a full shell.
+
+`agentProfiles` fences that in, keyed by the agent type name (the `.claude/agents/<name>.md` filename). Enforcement is a `PreToolUse` hook, which the SDK consults *before* `canUseTool` and which a `bypassPermissions` session cannot skip.
+
+```json
+{
+  "agentProfiles": {
+    "ios-reviewer": {
+      "writeRoots": [
+        "~/.tomo/workspace/tmp",
+        "/tmp",
+        "/private/tmp",
+        "$TMPDIR",
+        "~/Library/Developer/Xcode/DerivedData",
+        "~/Library/Developer/CoreSimulator",
+        "~/Library/Caches"
+      ],
+      "denyPaths": [
+        "~/Library/LaunchAgents",
+        "/Applications",
+        "~/.ssh",
+        "~/.tomo/config.json",
+        "~/.tomo/workspace/memory/private",
+        "~/.claude",
+        "~/Developer/bloom",
+        "~/Developer/wayfound"
+      ],
+      "bash": "readonly"
+    },
+    "ios-implementer": {
+      "writeRoots": [
+        "~/.tomo/workspace/tmp",
+        "/tmp",
+        "/private/tmp",
+        "$TMPDIR",
+        "~/Library/Developer/Xcode/DerivedData",
+        "~/Library/Developer/CoreSimulator",
+        "~/Library/Caches"
+      ],
+      "denyPaths": [
+        "~/Library/LaunchAgents",
+        "/Applications",
+        "~/.ssh",
+        "~/.tomo/config.json",
+        "~/.tomo/workspace/memory/private",
+        "~/.claude"
+      ],
+      "bash": "worktree"
+    }
+  }
+}
+```
+
+The two profiles differ in exactly two places, and both differences are the point. The reviewer cannot write and cannot reach the shared checkouts under `~/Developer`; the implementer has to work in one of them, so those are off its denyPaths and its Bash mode is `worktree` rather than `readonly`. Both list `/tmp` **and** `/private/tmp` because `/tmp` is a symlink to the second on macOS, and both list `$TMPDIR` because `xcodebuild` and `simctl` write there constantly.
+
+| Field | Meaning |
+|-------|---------|
+| `writeRoots` | Absolute roots the agent may write into. Empty (or omitted) means it may write nowhere. |
+| `denyPaths` | Files or directories the agent may not touch at all. **Beats `writeRoots`** — a denyPath nested inside a writeRoot still denies. |
+| `bash` | `none` \| `readonly` \| `worktree` \| `full`. Defaults to `none`. |
+
+Bash modes:
+
+- **`none`** — the Bash tool is denied outright.
+- **`readonly`** — write *verbs* are denied (`rm`, `mv`, `cp`, `tee`, `dd`, `chmod`, `chown`, `ln`, `mkdir`, `touch`, `truncate`, `install`, `brew`, `launchctl`, `kill`/`killall`/`pkill`, `git push|commit|checkout|reset|rebase|stash|clean|merge`, `npm install|publish|ci`, `defaults write`, `simctl delete|erase|shutdown|boot`), as is a `>`/`>>` redirection onto a target outside `writeRoots`. Command substitution, backticks and pipes are **allowed** — see the note below.
+- **`worktree`** — the write verbs come back, but a path-shaped token on a write command must land inside `writeRoots`, and no token in any command may land inside a `denyPath`.
+- **`full`** — only `denyPaths` apply.
+
+Paths are expanded at config load: `~`, `~/x`, `$VAR` and `${VAR}`. A path that does not come out absolute is dropped **and reported in `configIssues`, which refuses daemon startup** — a silently dropped `denyPath` would widen the profile rather than narrow it.
+
+An agent type with **no profile is unconstrained**. That is the deliberate v1 default: the real tool surface of `general-purpose`, `Explore` and ad-hoc delegations is not known yet, and failing closed would break all of them on the first turn. Instead the daemon logs one `warn` per session per unprofiled agent type, and logs *every* subagent Bash call at `info` with the agent type and the first 120 characters of the command. Read those logs before tightening the default.
+
+> **This is policy, not a sandbox.** The checks run inside the tomo daemon; the thing they constrain is a CLI child process, which is the wrong side of a trust boundary for real isolation. `readonly` deliberately permits `$(…)`, backticks and pipes, because a reviewer's normal working command is `git log $(git merge-base main HEAD)` and refusing substitution refuses the reviewer. An agent that deliberately assembles `rm` out of a substitution will get out. What this closes is the *accident* — an agent that was told to review a PR deciding to delete a shared checkout, or to write into `/Applications` — which is the failure mode that actually happens.
+
 ### Anthropic Authentication
 
 Direct Claude models use your existing Claude Code subscription login by default. To use Anthropic API billing instead, run `tomo config`, choose **Anthropic authentication**, and enter an API key. Tomo stores the selected method under `auth` in `~/.tomo/config.json` and passes the key only to direct Claude Agent SDK child processes. `ANTHROPIC_API_KEY` remains supported and takes precedence over the saved setting.

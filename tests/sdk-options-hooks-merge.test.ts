@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeHooks } from "../src/agent/sdk-options.js";
+import { buildHooksOption, makeTurnBudget, mergeHooks } from "../src/agent/sdk-options.js";
 
 describe("mergeHooks", () => {
   it("concatenates entries when two producers register the same event", () => {
@@ -19,5 +19,39 @@ describe("mergeHooks", () => {
   it("ignores non-array values instead of throwing", () => {
     const merged = mergeHooks({}, { A: "nope" as unknown });
     expect(merged).toEqual({});
+  });
+});
+
+describe("buildHooksOption — the two PreToolUse guards coexist", () => {
+  it("registers the agent-profile guard ALONGSIDE the private-memory bar", () => {
+    const { hooks } = buildHooksOption({
+      turnBudget: makeTurnBudget(),
+      maxTurns: 50,
+      sessionKey: "dm:shuai",
+      privateMemoryBar: () => null,
+      agentProfile: () => undefined,
+    }) as { hooks: Record<string, Array<{ hooks: unknown[] }>> };
+
+    // The exact regression mergeHooks was introduced for: with the old
+    // Object.assign, adding this second producer would have left ONE entry
+    // here and the private-memory bar would have vanished in silence.
+    expect(hooks.PreToolUse).toHaveLength(2);
+    expect(hooks.PreToolUse.every((entry) => entry.hooks.length === 1)).toBe(true);
+    expect(hooks.PostToolBatch).toHaveLength(1);
+  });
+
+  it("installs neither guard when neither is asked for", () => {
+    const { hooks } = buildHooksOption({ turnBudget: makeTurnBudget(), maxTurns: 50 }) as {
+      hooks: Record<string, unknown[]>;
+    };
+    expect(hooks.PreToolUse).toBeUndefined();
+  });
+
+  it("installs the agent-profile guard on its own", () => {
+    const { hooks } = buildHooksOption({ maxTurns: 50, agentProfile: () => undefined }) as {
+      hooks: Record<string, unknown[]>;
+    };
+    expect(hooks.PreToolUse).toHaveLength(1);
+    expect(hooks.PostToolBatch).toBeUndefined();
   });
 });

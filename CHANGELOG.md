@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Per-agent permission scoping.** A new optional `agentProfiles` map in `~/.tomo/config.json` fences a subagent type into `writeRoots` / `denyPaths` and one of four Bash modes (`none` / `readonly` / `worktree` / `full`), enforced by a `PreToolUse` hook keyed off the SDK's `agent_type`. Every session runs `bypassPermissions` and the SDK propagates that into subagents, so until now an agent declared "read-only reviewer" had a full shell on the whole machine — `AgentDefinition` scopes tools and has no notion of a path. The main thread is untouched, an agent type with no profile is untouched (fail-open, with one `warn` per session per type and every subagent Bash call logged at `info`, so the real surface can be measured before that default is flipped), and `denyPaths` beat `writeRoots`. It is policy, not a sandbox: `readonly` allows `$(…)`, backticks and pipes on purpose, because refusing substitution refuses the reviewer. See the README section for the shape and the caveats.
 - `buildHooksOption` now merges producers per hook event (arrays concatenated) instead of `Object.assign`, which replaced a whole event key. Today's two producers use different events so behaviour is unchanged; a second `PreToolUse` guard would previously have silently dropped the private-memory bar.
 
 ### Bug fixes

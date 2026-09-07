@@ -6,7 +6,8 @@ import { isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
-import { privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
+import { agentProfileGuardHooks, privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
+import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 
@@ -96,6 +97,13 @@ export function sdkOptions(
     if (ownAudienceTurn && !ownAudienceTurn()) return "summoned-turn";
     return null;
   };
+
+  // Per-subagent-type permission scoping. Read from config PER TOOL CALL, not
+  // snapshotted here, for the same reason `privateMemoryBar` is a getter: these
+  // options are assembled once when the live session is created and live as
+  // long as the session does. The main thread is unaffected — the guard returns
+  // early when the SDK reports no `agent_id`.
+  const agentProfile = (agentType: string): AgentProfile | undefined => config.agentProfiles[agentType];
 
   // Inject the small amount of runtime context that cannot live in the
   // user-editable workspace prompt.
@@ -222,6 +230,7 @@ export function sdkOptions(
       maxTurns: config.maxTurns,
       sessionKey: sessionContext?.sessionKey,
       privateMemoryBar,
+      agentProfile,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -328,16 +337,24 @@ function buildSdkEnv(args: {
   return env;
 }
 
-/** Combine the turn-budget PostToolBatch hook and the private-memory
- *  PreToolUse guard into a single SDK `hooks` option. Returns
- *  an empty object when neither hook is needed so spread {} stays a no-op. */
-function buildHooksOption(args: {
+/** Combine the turn-budget PostToolBatch hook and the two PreToolUse guards
+ *  (private memory, per-agent profiles) into a single SDK `hooks` option.
+ *  Returns an empty object when no hook is needed so spread {} stays a no-op.
+ *
+ *  BOTH PreToolUse producers land in the same event array, which is exactly the
+ *  case `mergeHooks` exists for — the old `Object.assign` would have dropped
+ *  the private-memory bar the moment this second one was added. Exported so a
+ *  test can assert both entries are present. */
+export function buildHooksOption(args: {
   turnBudget?: TurnBudget;
   maxTurns: number;
   sessionKey?: string;
   /** Per-call reason this session may not reach `memory/private/`, or null
    *  when it may. Undefined ⇒ the guard is not installed. */
   privateMemoryBar?: () => PrivateMemoryBar | null;
+  /** Per-call profile lookup by SDK `agent_type`. Undefined ⇒ the guard is not
+   *  installed. */
+  agentProfile?: (agentType: string) => AgentProfile | undefined;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.turnBudget) {
@@ -345,6 +362,9 @@ function buildHooksOption(args: {
   }
   if (args.privateMemoryBar) {
     mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
+  }
+  if (args.agentProfile) {
+    mergeHooks(hooks, agentProfileGuardHooks(args.sessionKey, args.agentProfile));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve as pathResolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve as pathResolve } from "node:path";
 import { minimatch } from "minimatch";
-import { config } from "../config.js";
+import { config, type AgentProfile } from "../config.js";
 import { log } from "../logger.js";
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 
@@ -755,4 +756,371 @@ function globCouldExpandToMemory(token: string): boolean {
     const literalPrefix = segment.slice(0, meta.index).toLowerCase();
     return "memory".startsWith(literalPrefix) || "private".startsWith(literalPrefix);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent permission scoping (config `agentProfiles`)
+// ---------------------------------------------------------------------------
+
+/**
+ * POLICY, NOT A SANDBOX. Read this before trusting anything below.
+ *
+ * Every session runs `permissionMode: "bypassPermissions"` (sdk-options.ts) and
+ * the SDK propagates that mode into subagents, so a subagent inherits the
+ * daemon owner's entire machine. `AgentDefinition` scopes TOOLS but has no
+ * notion of a path, so `tools: Read, Grep, Glob, Bash` on a "read-only
+ * reviewer" is a full shell.
+ *
+ * These hooks close the accident-shaped part of that hole: an agent told to
+ * review a PR that decides to `rm -rf` a shared checkout, or to write into
+ * `/Applications`. They do NOT close the adversarial-shaped part. The checks run
+ * in the daemon and the thing they constrain is a CLI child process, which is
+ * the wrong side of a trust boundary for a real sandbox — and by deliberate
+ * decision (see AgentBashMode) `readonly` allows `$(…)`, backticks and pipes,
+ * any of which can assemble a command no token scan here can see. An agent that
+ * wants out gets out. The value is in the accidents, which are the failure mode
+ * that actually happens.
+ *
+ * Why PreToolUse and not `canUseTool`: `canUseTool` is handed an opaque
+ * `agentID` with no `agent_type` (sdk.d.ts), so it cannot tell WHICH profile
+ * applies — and a PreToolUse denial bypasses `canUseTool` anyway, the same
+ * property the private-memory bar above relies on.
+ */
+
+/** Tools whose whole job is to write one named file. */
+const AGENT_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/** `agent_type` stand-in for a subagent that reported an `agent_id` and no
+ *  type. Keeps the fail-open warning countable rather than crashing on it. */
+const UNKNOWN_AGENT_TYPE = "(unknown)";
+
+/** How much of a subagent's Bash command goes into the audit line. Enough to
+ *  identify the command, short enough that a log shipper is not carrying whole
+ *  heredocs. */
+const BASH_AUDIT_CHARS = 120;
+
+/** The shape of the PreToolUse payload this guard reads. `agent_id` is the
+ *  documented way to tell a subagent call from a main-thread one — it is
+ *  ABSENT on the main thread even in `--agent` sessions, while `agent_type` is
+ *  present in both — so the main-thread test keys off `agent_id` alone. */
+interface AgentHookInput {
+  tool_name: string;
+  tool_input: unknown;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+/**
+ * PreToolUse hook that applies the calling subagent's `agentProfiles` entry.
+ *
+ * Three populations, three outcomes:
+ *  - MAIN THREAD (no `agent_id`) — returns `{}` before anything else runs. The
+ *    owner's own turn is not scoped by this and never has been.
+ *  - A SUBAGENT WITH NO PROFILE — fail-OPEN, plus one `log.warn` per
+ *    (session, agent_type) naming the tool. The set lives in this closure and
+ *    the closure is built once per live session, so "once per session per type"
+ *    is structural rather than a counter someone has to maintain. The point of
+ *    the warning is measurement: nobody knows the real tool surface of
+ *    `general-purpose` / `Explore` / ad-hoc delegations, and fail-closed would
+ *    break all of them on turn one. Flip the default once the logs say what it
+ *    would cost.
+ *  - A SUBAGENT WITH A PROFILE — {@link agentProfileDenial} decides.
+ *
+ * Every subagent Bash call is logged at info regardless of the decision, so the
+ * audit trail covers the fail-open population too — that is where the surface
+ * being measured actually lives.
+ *
+ * `lookup` is a FUNCTION, not the map: it is resolved per tool call, so a
+ * profile change does not have to wait for every live session to be recycled.
+ */
+export function agentProfileGuardHooks(
+  sessionKey: string | undefined,
+  lookup: (agentType: string) => AgentProfile | undefined,
+) {
+  const cwd = config.workspaceDir;
+  const warnedTypes = new Set<string>();
+  return {
+    PreToolUse: [{
+      hooks: [async (input: AgentHookInput) => {
+        if (!input.agent_id) return {};
+        const agentType = input.agent_type ?? UNKNOWN_AGENT_TYPE;
+
+        if (input.tool_name === "Bash") {
+          const command = (input.tool_input as { command?: unknown } | null | undefined)?.command;
+          log.info(
+            {
+              key: sessionKey,
+              agentType,
+              agentId: input.agent_id,
+              command: typeof command === "string" ? command.slice(0, BASH_AUDIT_CHARS) : undefined,
+            },
+            "Subagent Bash call",
+          );
+        }
+
+        const profile = lookup(agentType);
+        if (!profile) {
+          if (!warnedTypes.has(agentType)) {
+            warnedTypes.add(agentType);
+            log.warn(
+              { key: sessionKey, agentType, tool: input.tool_name },
+              "Subagent has no agentProfiles entry — allowing unscoped (fail-open)",
+            );
+          }
+          return {};
+        }
+
+        const reason = agentProfileDenial(profile, input.tool_name, input.tool_input, cwd);
+        if (!reason) return {};
+        log.warn(
+          { key: sessionKey, agentType, tool: input.tool_name, reason },
+          "Blocked by agent permission profile",
+        );
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse" as const,
+            permissionDecision: "deny" as const,
+            permissionDecisionReason:
+              `Blocked by the "${agentType}" agent permission profile: ${reason}`,
+          },
+        };
+      }],
+    }],
+  };
+}
+
+/**
+ * Why this tool call is refused under `profile` — or null when it is allowed.
+ * Exported for testing.
+ *
+ * Only the write tools and Bash are judged. Read/Grep/Glob are deliberately
+ * untouched: a profile is a WRITE fence plus a small blast-radius list, and the
+ * one read restriction tomo has (`memory/private/`) is a separate hook with a
+ * separate reason, still installed alongside this one.
+ */
+export function agentProfileDenial(
+  profile: AgentProfile,
+  toolName: string,
+  toolInput: unknown,
+  cwd: string,
+): string | null {
+  if (!toolInput || typeof toolInput !== "object") return null;
+  const ti = toolInput as Record<string, unknown>;
+
+  if (AGENT_WRITE_TOOLS.has(toolName)) {
+    const p = toolName === "NotebookEdit" ? ti.notebook_path : ti.file_path;
+    if (typeof p !== "string") return null;
+    return writeDenial(profile, p, cwd, toolName);
+  }
+  if (toolName === "Bash") {
+    const cmd = ti.command;
+    if (typeof cmd !== "string") return null;
+    return bashDenial(profile, cmd, cwd);
+  }
+  return null;
+}
+
+/** A write tool's target: denied unless it lands inside a writeRoot and outside
+ *  every denyPath. denyPaths are tested FIRST so a path that is inside both
+ *  reports the reason that decided it. */
+function writeDenial(profile: AgentProfile, p: string, cwd: string, toolName: string): string | null {
+  if (landsInDeny(p, profile, cwd)) {
+    return `\`${p}\` is on this agent's denyPaths.`;
+  }
+  if (!landsInWriteRoot(p, profile, cwd)) {
+    return profile.writeRoots.length === 0
+      ? `this agent has no writeRoots, so ${toolName} is denied everywhere.`
+      : `\`${p}\` is outside this agent's writeRoots (${profile.writeRoots.join(", ")}).`;
+  }
+  return null;
+}
+
+/**
+ * Bash, by mode. NOT A SHELL PARSER — see the header above.
+ *
+ * `denyPaths` are checked in every mode, `full` included, and they are checked
+ * two ways: against each path-shaped token as it resolves (which catches a
+ * symlink and a `~`), and against the raw command text (which catches a path
+ * named somewhere the tokenizer does not look, such as inside a `--flag=…`
+ * cluster this splits differently or a heredoc body).
+ */
+function bashDenial(profile: AgentProfile, cmd: string, cwd: string): string | null {
+  if (profile.bash === "none") {
+    return "the Bash tool is not available to this agent type (bash: \"none\").";
+  }
+
+  const tokens = pathLikeTokens(cmd);
+  const redirects = redirectTargets(cmd);
+  const denied = [...tokens, ...redirects].find((token) => landsInDeny(token, profile, cwd));
+  if (denied) return `\`${denied}\` is on this agent's denyPaths.`;
+  const spelled = profile.denyPaths.find((deny) => cmd.includes(deny));
+  if (spelled) return `the command names \`${spelled}\`, which is on this agent's denyPaths.`;
+
+  if (profile.bash === "full") return null;
+
+  const verb = writeVerbIn(cmd);
+  if (profile.bash === "readonly" && verb) {
+    return `\`${verb}\` writes, and this agent's Bash mode is "readonly".`;
+  }
+
+  // A redirection is the write that no verb scan can see: `echo x > y` names
+  // no write command at all.
+  for (const target of redirects) {
+    if (HARMLESS_REDIRECT_TARGET.test(target)) continue;
+    if (!landsInWriteRoot(target, profile, cwd)) {
+      return `the redirection target \`${target}\` is outside this agent's writeRoots.`;
+    }
+  }
+
+  if (profile.bash === "worktree" && verb) {
+    const outside = tokens.find((token) => !landsInWriteRoot(token, profile, cwd));
+    if (outside !== undefined) {
+      return `\`${verb}\` writes and \`${outside}\` is outside this agent's writeRoots.`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Single-word commands that write. Matched as a whole TOKEN anywhere in the
+ * command, not only in command position — `echo x | tee /etc/hosts` puts the
+ * write on the far side of a pipe, and tracking command position would mean
+ * parsing the shell. The cost is that a command merely mentioning one of these
+ * words (`git log --grep rm`) is refused under `readonly`; on a mode whose
+ * whole promise is "this agent does not write", that is the right direction to
+ * be wrong in, and the agent can spell the search differently.
+ */
+const WRITE_VERBS = new Set([
+  "rm", "rmdir", "mv", "cp", "tee", "dd", "chmod", "chown", "ln", "mkdir",
+  "touch", "truncate", "install", "brew", "launchctl", "killall", "kill", "pkill",
+]);
+
+/**
+ * Commands that write only in some of their subcommands. Both the head and one
+ * of its subcommands must appear as tokens — adjacency is NOT required, because
+ * `git -C /repo push` puts a flag between them and `xcrun simctl erase` puts
+ * another command in front. That is why `git log $(git merge-base main HEAD)`
+ * survives: `git` is there, but `merge-base` is not `merge`.
+ */
+const WRITE_SUBCOMMANDS: Array<{ head: string; subs: string[] }> = [
+  { head: "git", subs: ["push", "commit", "checkout", "reset", "rebase", "stash", "clean", "merge"] },
+  { head: "npm", subs: ["install", "publish", "ci"] },
+  { head: "defaults", subs: ["write"] },
+  // `xcrun simctl …` and a bare `simctl …` are the same command.
+  { head: "simctl", subs: ["delete", "erase", "shutdown", "boot"] },
+];
+
+/** The first write verb this command names, or null. */
+function writeVerbIn(cmd: string): string | null {
+  const tokens = bashTokens(cmd);
+  const present = new Set(tokens);
+  const bare = tokens.find((token) => WRITE_VERBS.has(token));
+  if (bare !== undefined) return bare;
+  for (const { head, subs } of WRITE_SUBCOMMANDS) {
+    if (!present.has(head)) continue;
+    const sub = subs.find((s) => present.has(s));
+    if (sub !== undefined) return `${head} ${sub}`;
+  }
+  return null;
+}
+
+/**
+ * `>` / `>>` targets. `2>&1` and friends yield nothing (the character class
+ * excludes `&`, so a file-descriptor duplication has no target to match), and
+ * `>|` clobber is accepted. A `>` inside quotes (`echo "a > b"`) produces a
+ * spurious target and therefore a spurious denial — the safe direction for a
+ * deny rule.
+ */
+const REDIRECT_TARGET = /\d?>>?\s*\|?\s*([^\s;|&<>()]+)/g;
+
+/** Redirection targets that write nowhere a policy can care about. Without
+ *  these, `… > /dev/null` — the most common redirection there is — would need
+ *  `/dev` in every writeRoots list. */
+const HARMLESS_REDIRECT_TARGET = /^\/dev\/(null|stdout|stderr|tty|fd\/\d+)$/;
+
+function redirectTargets(cmd: string): string[] {
+  const targets: string[] = [];
+  for (const match of cmd.matchAll(REDIRECT_TARGET)) {
+    const target = match[1].replace(/["'`\\]/g, "");
+    if (target) targets.push(target);
+  }
+  return targets;
+}
+
+/**
+ * The tokens worth resolving as paths: absolute, home-relative, or containing a
+ * separator.
+ *
+ * A BARE NAME IS NOT JUDGED, and that is a deliberate limit rather than an
+ * oversight. `msg` in `git commit -m msg` and `build` in `rm -rf build` are
+ * indistinguishable here, and both resolve against a cwd this code does not
+ * know — a subagent under `isolation: "worktree"` runs somewhere the daemon is
+ * never told about. Judging them against the workspace root would deny
+ * `git commit -m msg` outright and make `worktree` mode unusable, while the
+ * thing it would "catch" (`rm -rf build` inside the agent's own worktree) is
+ * exactly what that mode exists to permit.
+ */
+function pathLikeTokens(cmd: string): string[] {
+  const out: string[] = [];
+  for (const word of bashTokens(cmd)) {
+    for (const token of pathCandidates(word)) {
+      if (token.startsWith("/") || token.startsWith("~") || token.includes("/")) out.push(token);
+    }
+  }
+  return out;
+}
+
+/** Leading `~` / `~/`, which the shell expands and `path.resolve` does not —
+ *  without this, `cat ~/.ssh/id_rsa` resolves to `<cwd>/~/.ssh/id_rsa` and
+ *  misses a `~/.ssh` denyPath entirely. `~user` is left alone: it is not a
+ *  form anything here produces, and mis-expanding it would be worse than
+ *  leaving it unresolved (the raw-text denyPath check still sees it). */
+function expandTilde(p: string): string {
+  if (p === "~") return homedir();
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}
+
+/**
+ * Both spellings of a configured root: as the operator wrote it, and as the
+ * kernel resolves it. `/tmp` is a symlink to `/private/tmp` on macOS and
+ * `$TMPDIR` sits under `/var` (itself a link to `/private/var`), so a root
+ * compared in one spelling against a path resolved in the other never matches
+ * — which fails OPEN on a writeRoot and fails open on a denyPath too.
+ */
+function rootSpellings(root: string, cwd: string): string[] {
+  const real = realDir(root, cwd);
+  return real !== null && real !== root ? [root, real] : [root];
+}
+
+/**
+ * Does `p` land on or inside one of the profile's denyPaths?
+ *
+ * A DENY predicate, so it uses the case-folded {@link isInside} and tests both
+ * the lexical path and the real one: a symlink into `~/.ssh` is denied even
+ * though nothing in the path spells it, and a path that cannot be resolved at
+ * all is still judged on its lexical form rather than passing for free.
+ */
+function landsInDeny(p: string, profile: AgentProfile, cwd: string): boolean {
+  if (profile.denyPaths.length === 0) return false;
+  const expanded = expandTilde(p);
+  const lexical = abs(expanded, cwd);
+  const real = realResolve(expanded, cwd);
+  return profile.denyPaths.some((deny) => rootSpellings(deny, cwd).some(
+    (d) => isInside(lexical, d) || (real !== null && isInside(real, d)),
+  ));
+}
+
+/**
+ * Does `p` land on or inside one of the profile's writeRoots?
+ *
+ * An ALLOW predicate, so it uses the case-SENSITIVE {@link isInsideExact} and
+ * an unresolvable path answers false — the same conservative fold the
+ * `.claude/skills/` re-allow at the top of this file makes, and for the same
+ * reason: a comparison that fails here costs a denial, while one that
+ * over-matches hands out a write.
+ */
+function landsInWriteRoot(p: string, profile: AgentProfile, cwd: string): boolean {
+  const real = realResolve(expandTilde(p), cwd);
+  if (real === null) return false;
+  return profile.writeRoots.some((root) => rootSpellings(root, cwd).some((r) => isInsideExact(real, r)));
 }

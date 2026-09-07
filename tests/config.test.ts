@@ -318,3 +318,82 @@ describe("config file validation", () => {
     expect(configIssues.join("\n")).toContain("must contain a JSON object");
   });
 });
+
+describe("agentProfiles", () => {
+  let home = "";
+
+  async function loadWithConfigFile(content: unknown): Promise<typeof import("../src/config.js")> {
+    home = join(tmpdir(), `tomo-profiles-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+    mkdirSync(join(home, ".tomo"), { recursive: true });
+    writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(content));
+    vi.resetModules();
+    vi.stubEnv("HOME", home);
+    return import("../src/config.js");
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    if (home) rmSync(home, { recursive: true, force: true });
+    home = "";
+  });
+
+  it("defaults to an empty map when the key is absent", async () => {
+    const { config, configIssues } = await loadWithConfigFile({ model: "claude-sonnet-5" });
+    expect(config.agentProfiles).toEqual({});
+    expect(configIssues).toEqual([]);
+  });
+
+  it("expands ~ and $VAR at load and strips $TMPDIR's trailing slash", async () => {
+    vi.stubEnv("TOMO_TEST_DD", "/var/tmp/dd/");
+    const { config, configIssues } = await loadWithConfigFile({
+      agentProfiles: {
+        "ios-reviewer": {
+          writeRoots: ["~/Library/Caches", "$TOMO_TEST_DD", "/tmp"],
+          denyPaths: ["~/.ssh", "/Applications"],
+          bash: "readonly",
+        },
+      },
+    });
+    expect(configIssues).toEqual([]);
+    expect(config.agentProfiles["ios-reviewer"]).toEqual({
+      writeRoots: [join(home, "Library", "Caches"), "/var/tmp/dd", "/tmp"],
+      denyPaths: [join(home, ".ssh"), "/Applications"],
+      bash: "readonly",
+    });
+  });
+
+  it("defaults bash to the NARROW mode when the field is omitted", async () => {
+    // Registering a profile is an act of narrowing; the omitted field must not
+    // hand back the shell the entry exists to take away.
+    const { config } = await loadWithConfigFile({
+      agentProfiles: { scribe: { writeRoots: ["/tmp"] } },
+    });
+    expect(config.agentProfiles.scribe).toEqual({ writeRoots: ["/tmp"], denyPaths: [], bash: "none" });
+  });
+
+  it("drops a path that does not expand to an absolute one, LOUDLY", async () => {
+    // A dropped denyPath WIDENS the profile, so this has to block startup
+    // rather than fall back quietly.
+    const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
+      agentProfiles: { "ios-reviewer": { writeRoots: ["relative/path"], denyPaths: ["$NOT_SET_ANYWHERE"], bash: "full" } },
+    });
+    expect(config.agentProfiles["ios-reviewer"]).toEqual({ writeRoots: [], denyPaths: [], bash: "full" });
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.writeRoots[0]");
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.denyPaths[0]");
+    expect(() => assertConfigValid()).toThrow(/agentProfiles/);
+  });
+
+  it("drops only the bad agent type, not the whole map", async () => {
+    // Falling the map back to {} would silently unscope every correctly
+    // configured agent beside the broken one.
+    const { config, configIssues } = await loadWithConfigFile({
+      agentProfiles: {
+        "ios-reviewer": { writeRoots: ["/tmp"], bash: "readonly" },
+        "ios-implementer": { writeRoots: ["/tmp"], bash: "sudo-everything" },
+      },
+    });
+    expect(Object.keys(config.agentProfiles)).toEqual(["ios-reviewer"]);
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-implementer");
+  });
+});

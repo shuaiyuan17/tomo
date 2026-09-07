@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { z } from "zod";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
 import type { PluginSpec } from "./agent/plugins.js";
@@ -61,6 +61,49 @@ export interface MetricsConfig {
   /** Include transcript message text in the activity log. Disable if the log
    *  is shipped off this machine. */
   includeMessageText: boolean;
+}
+
+/**
+ * How much of the Bash tool an agent type keeps.
+ *
+ *  - `none`     — no Bash at all.
+ *  - `readonly` — Bash minus the write VERBS (`rm`, `git commit`, `brew`, …)
+ *                 and minus `>`/`>>` onto a target outside `writeRoots`.
+ *                 Command substitution, backticks and pipes stay: a reviewer
+ *                 lives on `git log $(git merge-base main HEAD)`, and v1 is
+ *                 aimed at accidents, not at an agent deliberately assembling
+ *                 `rm` out of `$(…)`. That is a sandbox's job, not a policy
+ *                 layer's — see the "not a sandbox" note in the README.
+ *  - `worktree` — the write verbs are allowed again, but a path-shaped token
+ *                 on a write command has to land inside `writeRoots`, and no
+ *                 token anywhere may land inside a `denyPath`.
+ *  - `full`     — only `denyPaths` apply.
+ */
+export type AgentBashMode = "none" | "readonly" | "worktree" | "full";
+
+/**
+ * The permission envelope for one subagent type.
+ *
+ * ABSENCE IS NOT DENIAL. An agent type with no profile runs exactly as it does
+ * today (fail-open, one `log.warn` per session per type). This is the
+ * deliberate v1 posture: nobody knows the real tool surface of
+ * `general-purpose`/`Explore`/ad-hoc delegations yet, and a fail-closed default
+ * would break every one of them on the first turn. The warning is how that
+ * surface gets measured before the default is flipped.
+ *
+ * Paths are expanded at config load (`~`, `$VAR`, `${VAR}`) and must come out
+ * absolute; one that does not is dropped with a `configIssues` entry, which
+ * refuses daemon startup — a silently dropped `denyPath` would WIDEN a profile.
+ */
+export interface AgentProfile {
+  /** Absolute roots this agent may write into. Empty ⇒ it may write nowhere. */
+  writeRoots: string[];
+  /** Absolute paths (files or dirs) this agent may not touch at all. Beats
+   *  `writeRoots`: a denyPath nested inside a writeRoot still denies. */
+  denyPaths: string[];
+  /** How much of Bash survives. Defaults to `none` — registering a profile is
+   *  an act of narrowing, so the omitted field is the narrow one. */
+  bash: AgentBashMode;
 }
 
 export interface LiteLlmConfig {
@@ -164,6 +207,10 @@ export interface TomoConfig {
    *  ("./x", "~/x", "/x") or CLI-installed plugin refs ("name" or
    *  "name@marketplace" from `claude plugin install`). */
   plugins: PluginSpec[];
+  /** Per-subagent-type permission scoping, keyed by the SDK `agent_type` name
+   *  (`.claude/agents/<name>.md`). An agent type with no entry here is
+   *  UNCONSTRAINED — see {@link AgentProfile}. */
+  agentProfiles: Record<string, AgentProfile>;
   lcm: LcmConfig;
   metrics: MetricsConfig;
 }
@@ -446,14 +493,21 @@ function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig |
   };
 }
 
-function expandConfigPath(rawPath: string): string {
+/** `$VAR` / `${VAR}` / leading `~` expansion, with no opinion about what a
+ *  path that is still relative afterwards should mean — callers decide that.
+ *  An unset variable expands to the empty string, as a shell does. */
+function expandUserPath(rawPath: string): string {
   const withEnv = rawPath.replace(/\$(\w+)|\$\{([^}]+)\}/g, (_match, bare: string | undefined, braced: string | undefined) => {
     const name = bare ?? braced ?? "";
     return process.env[name] ?? "";
   });
-  const withHome = withEnv === "~"
+  return withEnv === "~"
     ? HOME
     : (withEnv.startsWith("~/") ? join(HOME, withEnv.slice(2)) : withEnv);
+}
+
+function expandConfigPath(rawPath: string): string {
+  const withHome = expandUserPath(rawPath);
   return isAbsolute(withHome) ? withHome : join(TOMO_HOME, withHome);
 }
 
@@ -562,6 +616,77 @@ function parsePlugins(raw: unknown): PluginSpec[] {
     }
   }
   return specs;
+}
+
+const agentProfileSchema = z.object({
+  writeRoots: z.array(z.string()).default([]),
+  denyPaths: z.array(z.string()).default([]),
+  // Narrowest default: see AgentProfile.bash.
+  bash: z.enum(["none", "readonly", "worktree", "full"]).default("none"),
+});
+
+/**
+ * Expand one profile's path list, dropping anything that does not come out
+ * absolute — with a `configIssues` entry, which refuses daemon startup.
+ *
+ * That severity is deliberate and it is asymmetric on purpose. A dropped
+ * `writeRoot` only narrows the agent (it loses a directory it may write to),
+ * but a dropped `denyPath` WIDENS it: the operator wrote down a path this
+ * agent must never touch and the daemon would run without it. Since both lists
+ * share this helper and neither is distinguishable at the point of failure, the
+ * loud outcome is the right one for both. The usual cause is an env var that
+ * is not set in the daemon's environment — `$TMPDIR` under a bare `launchctl
+ * load`, say — and the issue text names it.
+ */
+function expandProfilePaths(label: string, raw: string[]): string[] {
+  const out: string[] = [];
+  for (const [index, entry] of raw.entries()) {
+    const expanded = expandUserPath(entry).trim();
+    if (!expanded || !isAbsolute(expanded)) {
+      issues.push(
+        `${label}[${index}]: expected a path that expands to an absolute path `
+        + `(got ${describeValue(entry)}, expanded to ${describeValue(expanded)}; dropping the entry)`,
+      );
+      continue;
+    }
+    // `resolve` also strips the trailing slash `$TMPDIR` carries on macOS
+    // (`/var/folders/…/T/`), which every containment test below compares
+    // against an unsuffixed parent.
+    out.push(resolvePath(expanded));
+  }
+  return out;
+}
+
+/**
+ * Parse `agentProfiles` — per-subagent-type permission scoping, keyed by the
+ * SDK's `agent_type`.
+ *
+ * One bad entry drops only that agent type (the policy of `parseIdentities` and
+ * `parsePlugins`), because the alternative — falling the whole map back to `{}`
+ * — would silently unscope every OTHER agent that was configured correctly.
+ * Every drop still raises a `configIssues` entry, so the daemon refuses to
+ * start rather than running an agent the operator believes is fenced in.
+ */
+function parseAgentProfiles(raw: unknown): Record<string, AgentProfile> {
+  if (raw === undefined || raw === null) return {};
+  const record = validated("agentProfiles", z.record(z.string(), z.unknown()), raw, {});
+  const profiles: Record<string, AgentProfile> = {};
+  for (const [name, entry] of Object.entries(record)) {
+    const parsed = agentProfileSchema.safeParse(entry);
+    if (!parsed.success) {
+      const detail = parsed.error.issues
+        .map((issue) => (issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message))
+        .join("; ");
+      issues.push(`agentProfiles.${name}: ${detail} (got ${describeValue(entry)}; dropping the entry)`);
+      continue;
+    }
+    profiles[name] = {
+      writeRoots: expandProfilePaths(`agentProfiles.${name}.writeRoots`, parsed.data.writeRoots),
+      denyPaths: expandProfilePaths(`agentProfiles.${name}.denyPaths`, parsed.data.denyPaths),
+      bash: parsed.data.bash,
+    };
+  }
+  return profiles;
 }
 
 /**
@@ -735,6 +860,7 @@ function buildConfig(): TomoConfig {
     mcpServers,
     mcpAllowedTools,
     plugins: parsePlugins(file.plugins),
+    agentProfiles: parseAgentProfiles(file.agentProfiles),
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),
   };

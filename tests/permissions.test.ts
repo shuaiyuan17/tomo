@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, describe, it, expect, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, it, expect, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 // `permissions.ts` imports `config` at module load, which throws if no
@@ -20,8 +20,16 @@ vi.mock("../src/workspace/index.js", () => ({
   PRIVATE_MEMORY_DIR: "/ws/memory/private",
   PRIVATE_MEMORY_SUBDIR: "private",
 }));
+// Stubbed so the agent-profile tests can assert on the fail-open warning and
+// the Bash audit line without going through pino.
+vi.mock("../src/logger.js", () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 
+const { log } = await import("../src/logger.js");
 const {
+  agentProfileDenial,
+  agentProfileGuardHooks,
   isPrivateMemoryAccess,
   privateMemoryGuardHooks,
   skillsCanUseTool,
@@ -713,5 +721,272 @@ describe("skillsCanUseTool", () => {
     const result = await skillsCanUseTool("Write", { file_path: "/ws/.claude/settings.json", content: "x" });
     expect(result.behavior).toBe("deny");
     if (result.behavior === "deny") expect(result.message).toContain("/ws/.claude/skills/");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-agent permission scoping (config `agentProfiles`).
+//
+// The hole: every session runs `permissionMode: "bypassPermissions"` and the
+// SDK propagates that into subagents, so `ios-reviewer` — declared read-only,
+// with `tools: Read, Grep, Glob, Bash` — has a full shell on the owner's
+// machine. `AgentDefinition` scopes tools and has no notion of a path.
+// ---------------------------------------------------------------------------
+
+type AgentPreToolUseInput = {
+  tool_name: string;
+  tool_input: unknown;
+  agent_id?: string;
+  agent_type?: string;
+};
+type AgentPreToolUseHook = (input: AgentPreToolUseInput) => Promise<PreToolUseResult>;
+type Profile = Parameters<typeof agentProfileDenial>[0];
+
+function agentHookFor(profiles: Record<string, Profile>): AgentPreToolUseHook {
+  const hooks = agentProfileGuardHooks("dm:shuai", (type) => profiles[type]) as {
+    PreToolUse: Array<{ hooks: AgentPreToolUseHook[] }>;
+  };
+  return hooks.PreToolUse[0].hooks[0];
+}
+
+/** A real tree, because containment here has to survive `/var` -> `/private/var`
+ *  (every `mkdtemp` path on macOS is behind that symlink) and a link planted
+ *  inside a writeRoot that points at a denyPath. */
+const agentRoot = mkdtempSync(join(tmpdir(), "tomo-agent-prof-"));
+const worktree = join(agentRoot, "wt");
+const vault = join(agentRoot, "vault");
+
+beforeAll(() => {
+  mkdirSync(worktree, { recursive: true });
+  mkdirSync(vault, { recursive: true });
+  // The escape a lexical prefix check misses: nothing in `wt/out` spells
+  // `vault`, and writing through it lands in the denyPath.
+  if (!existsSync(join(worktree, "out"))) symlinkSync(vault, join(worktree, "out"));
+});
+
+afterAll(() => {
+  rmSync(agentRoot, { recursive: true, force: true });
+});
+
+const REVIEWER: Profile = {
+  writeRoots: [worktree, "/tmp", "/private/tmp"],
+  denyPaths: ["/Applications", vault, join(homedir(), ".ssh")],
+  bash: "readonly",
+};
+const IMPLEMENTER: Profile = { ...REVIEWER, bash: "worktree" };
+
+describe("agentProfileGuardHooks — who the guard applies to", () => {
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+    vi.mocked(log.info).mockClear();
+  });
+
+  it("leaves the MAIN THREAD alone — no agent_id, no opinion", async () => {
+    const hook = agentHookFor({ "ios-reviewer": REVIEWER });
+    // The same call is denied for the subagent two tests down.
+    expect(await hook({ tool_name: "Write", tool_input: { file_path: "/Applications/x", content: "x" } }))
+      .toEqual({});
+    expect(await hook({ tool_name: "Bash", tool_input: { command: "rm -rf /" } })).toEqual({});
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("leaves an UNREGISTERED agent type alone (fail-open) and warns once per type", async () => {
+    const hook = agentHookFor({ "ios-reviewer": REVIEWER });
+    const call = (tool_name: string, tool_input: unknown): AgentPreToolUseInput =>
+      ({ tool_name, tool_input, agent_id: "sub-1", agent_type: "general-purpose" });
+
+    expect(await hook(call("Write", { file_path: "/Applications/x", content: "x" }))).toEqual({});
+    expect(await hook(call("Bash", { command: "rm -rf /Applications/x" }))).toEqual({});
+
+    // Once per (session, agent_type) — the Set lives in the per-session closure.
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
+      key: "dm:shuai",
+      agentType: "general-purpose",
+      tool: "Write",
+    });
+
+    // ...but a DIFFERENT unprofiled type gets its own warning: the point of
+    // fail-open is measuring the surface, not muting it.
+    await hook({ tool_name: "Read", tool_input: { file_path: "/x" }, agent_id: "sub-2", agent_type: "Explore" });
+    expect(log.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("logs EVERY subagent Bash call at info, profiled or not, clipped to 120 chars", async () => {
+    const hook = agentHookFor({ "ios-reviewer": REVIEWER });
+    const long = `echo ${"a".repeat(400)}`;
+
+    await hook({ tool_name: "Bash", tool_input: { command: long }, agent_id: "s", agent_type: "general-purpose" });
+    await hook({ tool_name: "Bash", tool_input: { command: "git status" }, agent_id: "s", agent_type: "ios-reviewer" });
+
+    expect(log.info).toHaveBeenCalledTimes(2);
+    const first = vi.mocked(log.info).mock.calls[0][0] as { agentType: string; command: string };
+    expect(first.agentType).toBe("general-purpose");
+    expect(first.command).toHaveLength(120);
+    expect((vi.mocked(log.info).mock.calls[1][0] as { command: string }).command).toBe("git status");
+  });
+
+  it("denies a profiled agent through the hook, naming the agent type", async () => {
+    const hook = agentHookFor({ "ios-reviewer": REVIEWER });
+    const result = await hook({
+      tool_name: "Write",
+      tool_input: { file_path: "/Applications/x", content: "x" },
+      agent_id: "sub-1",
+      agent_type: "ios-reviewer",
+    });
+    expect(decision(result)).toBe("deny");
+    expect(result.hookSpecificOutput?.permissionDecisionReason).toContain("ios-reviewer");
+    expect(result.hookSpecificOutput?.permissionDecisionReason).toContain("denyPaths");
+  });
+});
+
+describe("agentProfileDenial — write tools", () => {
+  const denied = (p: string, profile = REVIEWER, tool = "Write") =>
+    agentProfileDenial(profile, tool, tool === "NotebookEdit" ? { notebook_path: p } : { file_path: p }, "/ws");
+
+  it("denies a write to /Applications", () => {
+    expect(denied("/Applications/Foo.app/x")).toContain("denyPaths");
+  });
+
+  it("allows a write inside the agent's own worktree root", () => {
+    expect(denied(join(worktree, "Sources", "New.swift"))).toBeNull();
+  });
+
+  it("denies a write outside every writeRoot, naming the roots", () => {
+    const reason = denied("/etc/hosts");
+    expect(reason).toContain("outside this agent's writeRoots");
+    expect(reason).toContain(worktree);
+  });
+
+  it("lets a denyPath BEAT a writeRoot it sits inside", () => {
+    const nested: Profile = { writeRoots: [agentRoot], denyPaths: [vault], bash: "none" };
+    // vault is inside agentRoot, which is a writeRoot.
+    expect(agentProfileDenial(nested, "Write", { file_path: join(agentRoot, "ok.txt") }, "/ws")).toBeNull();
+    expect(agentProfileDenial(nested, "Write", { file_path: join(vault, "secret.txt") }, "/ws"))
+      .toContain("denyPaths");
+  });
+
+  it("denies a write through a SYMLINK out of the writeRoot into a denyPath", () => {
+    // `wt/out` is inside a writeRoot and spells nothing about the vault.
+    expect(denied(join(worktree, "out", "leak.txt"))).toContain("denyPaths");
+  });
+
+  it("applies to Edit, MultiEdit and NotebookEdit too", () => {
+    expect(denied("/Applications/x", REVIEWER, "Edit")).toContain("denyPaths");
+    expect(denied("/Applications/x", REVIEWER, "MultiEdit")).toContain("denyPaths");
+    expect(denied("/Applications/x.ipynb", REVIEWER, "NotebookEdit")).toContain("denyPaths");
+  });
+
+  it("denies everywhere when the profile has no writeRoots at all", () => {
+    const nowhere: Profile = { writeRoots: [], denyPaths: [], bash: "none" };
+    expect(agentProfileDenial(nowhere, "Write", { file_path: join(worktree, "x") }, "/ws"))
+      .toContain("no writeRoots");
+  });
+
+  it("has nothing to say about Read, Grep or Glob", () => {
+    expect(agentProfileDenial(REVIEWER, "Read", { file_path: "/Applications/x" }, "/ws")).toBeNull();
+    expect(agentProfileDenial(REVIEWER, "Grep", { pattern: "x", path: "/Applications" }, "/ws")).toBeNull();
+  });
+});
+
+describe("agentProfileDenial — Bash by mode", () => {
+  const bash = (cmd: string, profile: Profile) =>
+    agentProfileDenial(profile, "Bash", { command: cmd }, "/ws");
+
+  it("bash: none denies every command", () => {
+    const none: Profile = { ...REVIEWER, bash: "none" };
+    expect(bash("ls", none)).toContain("not available");
+    expect(bash("echo hi", none)).toContain("not available");
+  });
+
+  describe("readonly", () => {
+    it("ALLOWS command substitution — a reviewer lives on it", () => {
+      // The v1 call: refuse by VERB, not by substitution. Denying `$(…)` would
+      // deny `git log $(git merge-base main HEAD)`, i.e. deny the reviewer.
+      expect(bash("git log $(git merge-base main HEAD)", REVIEWER)).toBeNull();
+      expect(bash("xcodebuild test | grep -c error", REVIEWER)).toBeNull();
+      expect(bash("git diff --stat `git merge-base main HEAD`", REVIEWER)).toBeNull();
+    });
+
+    it("denies write VERBS", () => {
+      expect(bash("rm -rf x", REVIEWER)).toContain("`rm` writes");
+      expect(bash("mv a b", REVIEWER)).toContain("writes");
+      expect(bash("echo x | tee /etc/hosts", REVIEWER)).toContain("writes");
+      expect(bash("brew install foo", REVIEWER)).toContain("writes");
+      expect(bash("launchctl load ~/Library/LaunchAgents/x.plist", REVIEWER)).toContain("writes");
+    });
+
+    it("denies write SUBCOMMANDS without needing them adjacent to the head", () => {
+      expect(bash("git push origin HEAD", REVIEWER)).toContain("git push");
+      expect(bash("git -C /repo commit -m wip", REVIEWER)).toContain("git commit");
+      expect(bash("npm publish", REVIEWER)).toContain("writes");
+      expect(bash("xcrun simctl erase all", REVIEWER)).toContain("simctl erase");
+      expect(bash("defaults write com.apple.finder X 1", REVIEWER)).toContain("defaults write");
+    });
+
+    it("allows read-only git and xcodebuild", () => {
+      expect(bash("git log --oneline -20", REVIEWER)).toBeNull();
+      expect(bash("git diff main...HEAD", REVIEWER)).toBeNull();
+      expect(bash("xcodebuild -derivedDataPath /tmp/foo-dd test", REVIEWER)).toBeNull();
+    });
+
+    it("allows a redirection INTO a writeRoot and denies one outside it", () => {
+      expect(bash("echo hi > /tmp/x", REVIEWER)).toBeNull();
+      const noTmp: Profile = { ...REVIEWER, writeRoots: [worktree] };
+      expect(bash("echo hi > /tmp/x", noTmp)).toContain("redirection target");
+      expect(bash("echo hi >> /etc/hosts", REVIEWER)).toContain("redirection target");
+      expect(bash(`xcodebuild test > ${join(worktree, "log.txt")}`, REVIEWER)).toBeNull();
+    });
+
+    it("leaves /dev/null and fd duplication alone", () => {
+      expect(bash("xcodebuild test 2>&1 > /dev/null", REVIEWER)).toBeNull();
+      expect(bash("swift build 2> /dev/null", REVIEWER)).toBeNull();
+    });
+
+    it("denies a denyPath even with no write verb in sight", () => {
+      expect(bash("cat /Applications/Foo.app/Contents/Info.plist", REVIEWER)).toContain("denyPaths");
+    });
+  });
+
+  describe("worktree", () => {
+    it("gives the write verbs back for paths inside a writeRoot", () => {
+      expect(bash(`mkdir -p ${join(worktree, "Sources")}`, IMPLEMENTER)).toBeNull();
+      expect(bash("git commit -m wip", IMPLEMENTER)).toBeNull();
+      expect(bash("npm install", IMPLEMENTER)).toBeNull();
+    });
+
+    it("still denies a write verb aimed OUTSIDE the writeRoots", () => {
+      expect(bash("rm -rf /Users/shared/checkout", IMPLEMENTER)).toContain("outside this agent's writeRoots");
+      expect(bash("cp x /etc/hosts", IMPLEMENTER)).toContain("outside this agent's writeRoots");
+    });
+
+    it("allows a non-write command naming a path outside the writeRoots", () => {
+      // The rule is about WRITES: reading around the machine is still fine.
+      expect(bash("xcodebuild -derivedDataPath /tmp/foo-dd test", IMPLEMENTER)).toBeNull();
+      expect(bash("cat /etc/hosts", IMPLEMENTER)).toBeNull();
+    });
+
+    it("denies any token that lands in a denyPath, write verb or not", () => {
+      expect(bash(`cat ${join(vault, "secret")}`, IMPLEMENTER)).toContain("denyPaths");
+      expect(bash(`cat ${join(worktree, "out", "secret")}`, IMPLEMENTER)).toContain("denyPaths");
+    });
+  });
+
+  describe("full", () => {
+    const FULL: Profile = { ...REVIEWER, bash: "full" };
+
+    it("allows the write verbs anywhere the denyPaths permit", () => {
+      expect(bash("rm -rf /Users/shared/scratch", FULL)).toBeNull();
+      expect(bash("git push origin HEAD", FULL)).toBeNull();
+      expect(bash("echo hi > /etc/hosts", FULL)).toBeNull();
+    });
+
+    it("still enforces denyPaths — `cat ~/.ssh/id_rsa` is refused", () => {
+      // `~` is expanded here because the shell would expand it; without that
+      // the token resolves to `<cwd>/~/.ssh/id_rsa` and misses the denyPath.
+      expect(bash("cat ~/.ssh/id_rsa", FULL)).toContain("denyPaths");
+      expect(bash(`cat ${join(homedir(), ".ssh", "id_rsa")}`, FULL)).toContain("denyPaths");
+      expect(bash("rm -rf /Applications/Xcode.app", FULL)).toContain("denyPaths");
+    });
   });
 });

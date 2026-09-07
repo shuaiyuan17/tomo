@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, it, expect, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -761,11 +761,28 @@ const agentRoot = mkdtempSync(join(tmpdir(), "tomo-agent-prof-"));
 const worktree = join(agentRoot, "wt");
 const vault = join(agentRoot, "vault");
 const sharedCheckout = join(agentRoot, "bloom");
+/**
+ * The profile's second writeRoot, and it lives INSIDE the fixture on purpose.
+ *
+ * It used to be the literal `/tmp`, and that quietly coupled every writeRoot
+ * assertion to where the host puts `os.tmpdir()`. On macOS that is
+ * `/var/folders/…/T`, comfortably outside `/tmp`; on Linux it IS `/tmp`, so
+ * the whole fixture — `wt`, `vault`, `bloom`, and the case-variant path the
+ * one failing test builds — sat inside a writeRoot and was allowed on a rule
+ * nobody wrote. Nothing about the guard was wrong; the fixture was describing
+ * a different machine than the one it ran on. A scratch dir under the fixture
+ * root is inside exactly one writeRoot on every platform: this one.
+ *
+ * `/tmp` is still exercised, once, by the rootSpellings test below — which is
+ * where that spelling actually matters.
+ */
+const scratch = join(agentRoot, "scratch");
 
 beforeAll(() => {
   mkdirSync(worktree, { recursive: true });
   mkdirSync(vault, { recursive: true });
   mkdirSync(sharedCheckout, { recursive: true });
+  mkdirSync(scratch, { recursive: true });
   // The escape a lexical prefix check misses: nothing in `wt/out` spells
   // `vault`, and writing through it lands in a fenced tree.
   if (!existsSync(join(worktree, "out"))) symlinkSync(vault, join(worktree, "out"));
@@ -776,7 +793,7 @@ afterAll(() => {
 });
 
 const REVIEWER: Profile = {
-  writeRoots: [worktree, "/tmp", "/private/tmp"],
+  writeRoots: [worktree, scratch],
   denyPaths: [
     "/Applications", sharedCheckout, "/ws/memory", "/ws/.claude",
     join(homedir(), "Library", "LaunchAgents"),
@@ -963,12 +980,49 @@ describe("agentProfileDenial — write tools", () => {
     expect(agentProfileDenial(FULL, "Write", { file_path: "/Applications/x" }, "/ws")).toContain("denyPaths");
   });
 
-  it("holds a CASE-VARIANT writeRoot to the writeRoots rule", () => {
+  it("holds a CASE-VARIANT writeRoot to the writeRoots rule, on EITHER filesystem", () => {
     // landsInWriteRoot is an ALLOW predicate and must use the case-SENSITIVE
-    // isInsideExact: swap it for the case-folded isInside and this write is
-    // waved through on a spelling that is a different directory on any
-    // case-sensitive volume.
+    // isInsideExact. The assertion is the same on both kinds of volume, and it
+    // is worth spelling out WHY, because the two reasons are different:
+    //
+    //  - case-SENSITIVE (Linux CI, a case-sensitive APFS image): `<root>/WT` is
+    //    a genuinely different directory that the profile never granted, so
+    //    allowing it would be a straightforward hole.
+    //  - case-INSENSITIVE (stock macOS): the write really would land in `wt`,
+    //    and it is refused anyway — the conservative fold an allow predicate
+    //    owes, and the reason isInsideExact exists next to isInside.
+    //
+    // The control below is what keeps this honest: the exact spelling must be
+    // ALLOWED, so a `null` here can never be "the fixture drifted outside the
+    // rule" — which is exactly the way this test failed on CI.
+    expect(denied(join(worktree, "New.swift"))).toBeNull();
     expect(denied(join(agentRoot, "WT", "New.swift"))).toContain("outside this agent's writeRoots");
+  });
+
+  it("keeps the fixture out of any writeRoot it did not mean to be in", () => {
+    // The r3 CI failure in one assertion. `os.tmpdir()` is `/var/folders/…/T`
+    // on macOS and `/tmp` on Linux; with `/tmp` in the profile's writeRoots,
+    // the whole fixture sat inside one on Linux and several tests passed —
+    // and one failed — for a reason that had nothing to do with what they
+    // assert. Anything under the fixture root must be governed by `worktree`
+    // and `scratch` alone.
+    expect(denied(join(agentRoot, "stray.txt"))).toContain("outside this agent's writeRoots");
+    expect(denied(join(worktree, "ok.txt"))).toBeNull();
+    expect(denied(join(scratch, "ok.txt"))).toBeNull();
+  });
+
+  it("matches a writeRoot through a SYMLINKED prefix (/tmp -> /private/tmp)", () => {
+    // The coverage the fixture change would otherwise have dropped, kept where
+    // it belongs: `/tmp` is a symlink to `/private/tmp` on macOS, so a root
+    // spelled one way and a path resolved the other must still match. On Linux
+    // the two spellings coincide and this degrades to a plain containment
+    // check, which is the right no-op.
+    const tmpProfile: Profile = { ...REVIEWER, writeRoots: ["/tmp"], bash: "readonly" };
+    const realTmp = realpathSync("/tmp");
+    expect(agentProfileDenial(tmpProfile, "Write", { file_path: "/tmp/x" }, "/ws")).toBeNull();
+    expect(agentProfileDenial(tmpProfile, "Write", { file_path: join(realTmp, "x") }, "/ws")).toBeNull();
+    expect(agentProfileDenial(tmpProfile, "Write", { file_path: "/etc/x" }, "/ws"))
+      .toContain("outside this agent's writeRoots");
   });
 
   it("has nothing to say about Read or Grep outside the secrets list", () => {
@@ -1060,12 +1114,12 @@ describe("agentProfileDenial — Bash by mode", () => {
       // allowed while these four were refused — the same write, to the same
       // granted directory, decided differently per surface. And the refusal
       // was not even a bar: `cat a > b` walked round it.
-      expect(bash("touch /tmp/marker", REVIEWER)).toBeNull();
-      expect(bash("mkdir -p /tmp/rev-dd", REVIEWER)).toBeNull();
-      expect(bash("cp /tmp/a /tmp/b", REVIEWER)).toBeNull();
-      expect(bash("rm -rf /tmp/rev-1", REVIEWER)).toBeNull();
-      expect(agentProfileDenial(REVIEWER, "Write", { file_path: "/tmp/ok" }, "/ws")).toBeNull();
-      expect(bash("echo hi > /tmp/ok", REVIEWER)).toBeNull();
+      expect(bash(`touch ${join(scratch, "marker")}`, REVIEWER)).toBeNull();
+      expect(bash(`mkdir -p ${join(scratch, "rev-dd")}`, REVIEWER)).toBeNull();
+      expect(bash(`cp ${join(scratch, "a")} ${join(scratch, "b")}`, REVIEWER)).toBeNull();
+      expect(bash(`rm -rf ${join(scratch, "rev-1")}`, REVIEWER)).toBeNull();
+      expect(agentProfileDenial(REVIEWER, "Write", { file_path: join(scratch, "ok") }, "/ws")).toBeNull();
+      expect(bash(`echo hi > ${join(scratch, "ok")}`, REVIEWER)).toBeNull();
     });
 
     it("still refuses a write that names no destination it can locate", () => {
@@ -1079,17 +1133,17 @@ describe("agentProfileDenial — Bash by mode", () => {
     });
 
     it("still refuses a write outside the writeRoots or onto a denyPath", () => {
-      expect(bash(`cp /tmp/a ${join(sharedCheckout, "b")}`, REVIEWER)).toContain("denyPaths");
+      expect(bash(`cp ${join(scratch, "a")} ${join(sharedCheckout, "b")}`, REVIEWER)).toContain("denyPaths");
       expect(bash(`rm -rf ${join(homedir(), "Library", "LaunchAgents", "x.plist")}`, REVIEWER))
         .toContain("denyPaths");
-      expect(bash("cp /tmp/a /etc/hosts", REVIEWER)).toContain("outside this agent's writeRoots");
+      expect(bash(`cp ${join(scratch, "a")} /etc/hosts`, REVIEWER)).toContain("outside this agent's writeRoots");
       expect(bash("touch /etc/marker", REVIEWER)).toContain("outside this agent's writeRoots");
     });
 
     it("allows a redirection INTO a writeRoot and denies one outside it", () => {
-      expect(bash("echo hi > /tmp/x", REVIEWER)).toBeNull();
-      const noTmp: Profile = { ...REVIEWER, writeRoots: [worktree] };
-      expect(bash("echo hi > /tmp/x", noTmp)).toContain("redirection target");
+      expect(bash(`echo hi > ${join(scratch, "x")}`, REVIEWER)).toBeNull();
+      const noScratch: Profile = { ...REVIEWER, writeRoots: [worktree] };
+      expect(bash(`echo hi > ${join(scratch, "x")}`, noScratch)).toContain("redirection target");
       expect(bash("echo hi >> /etc/hosts", REVIEWER)).toContain("redirection target");
       expect(bash(`xcodebuild test > ${join(worktree, "log.txt")}`, REVIEWER)).toBeNull();
     });
@@ -1112,9 +1166,9 @@ describe("agentProfileDenial — Bash by mode", () => {
     it("still judges a QUOTED redirection target — the mask blanks operators, not paths", () => {
       // Deleting the whole quoted run would have lost this target entirely,
       // which is why only the operator characters inside quotes are blanked.
-      expect(bash('echo hi > "/tmp/out.log"', REVIEWER)).toBeNull();
-      const noTmp: Profile = { ...REVIEWER, writeRoots: [worktree] };
-      expect(bash('echo hi > "/tmp/out.log"', noTmp)).toContain("redirection target");
+      expect(bash(`echo hi > "${join(scratch, "out.log")}"`, REVIEWER)).toBeNull();
+      const noScratch: Profile = { ...REVIEWER, writeRoots: [worktree] };
+      expect(bash(`echo hi > "${join(scratch, "out.log")}"`, noScratch)).toContain("redirection target");
     });
 
     it("leaves /dev/null and fd duplication alone", () => {

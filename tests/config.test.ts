@@ -318,3 +318,119 @@ describe("config file validation", () => {
     expect(configIssues.join("\n")).toContain("must contain a JSON object");
   });
 });
+
+describe("agentProfiles", () => {
+  let home = "";
+
+  async function loadWithConfigFile(content: unknown): Promise<typeof import("../src/config.js")> {
+    home = join(tmpdir(), `tomo-profiles-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+    mkdirSync(join(home, ".tomo"), { recursive: true });
+    writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(content));
+    vi.resetModules();
+    vi.stubEnv("HOME", home);
+    return import("../src/config.js");
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    if (home) rmSync(home, { recursive: true, force: true });
+    home = "";
+  });
+
+  it("defaults to an empty map when the key is absent", async () => {
+    const { config, configIssues } = await loadWithConfigFile({ model: "claude-sonnet-5" });
+    expect(config.agentProfiles).toEqual({});
+    expect(configIssues).toEqual([]);
+  });
+
+  it("expands ~ and $VAR at load and strips $TMPDIR's trailing slash", async () => {
+    vi.stubEnv("TOMO_TEST_DD", "/var/tmp/dd/");
+    const { config, configIssues } = await loadWithConfigFile({
+      agentProfiles: {
+        "ios-reviewer": {
+          writeRoots: ["~/Library/Caches", "$TOMO_TEST_DD", "/tmp"],
+          denyPaths: ["/Applications"],
+          denyReadPaths: ["~/.ssh"],
+          bash: "readonly",
+        },
+      },
+    });
+    expect(configIssues).toEqual([]);
+    expect(config.agentProfiles["ios-reviewer"]).toEqual({
+      writeRoots: [join(home, "Library", "Caches"), "/var/tmp/dd", "/tmp"],
+      denyPaths: ["/Applications"],
+      denyReadPaths: [join(home, ".ssh")],
+      bash: "readonly",
+    });
+  });
+
+  it("defaults bash to the NARROW mode when the field is omitted", async () => {
+    // Registering a profile is an act of narrowing; the omitted field must not
+    // hand back the shell the entry exists to take away.
+    const { config } = await loadWithConfigFile({
+      agentProfiles: { scribe: { writeRoots: ["/tmp"] } },
+    });
+    expect(config.agentProfiles.scribe)
+      .toEqual({ writeRoots: ["/tmp"], denyPaths: [], denyReadPaths: [], bash: "none" });
+  });
+
+  it("an unset $TMPDIR does not brick startup — a bad writeRoot only NARROWS", async () => {
+    // $TMPDIR is absent under a bare `launchctl load`. The right answer to
+    // "this machine has no TMPDIR" is a slightly narrower agent, not a daemon
+    // that refuses to start.
+    const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
+      agentProfiles: { "ios-reviewer": { writeRoots: ["$TMPDIR_NOT_SET", "relative/path", "/tmp"], bash: "readonly" } },
+    });
+    expect(config.agentProfiles["ios-reviewer"].writeRoots).toEqual(["/tmp"]);
+    expect(configIssues).toEqual([]);
+    expect(() => assertConfigValid()).not.toThrow();
+  });
+
+  it("a bad denyPath or denyReadPath is FATAL — it would widen the profile", async () => {
+    const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
+      agentProfiles: {
+        "ios-reviewer": {
+          writeRoots: ["/tmp"],
+          denyPaths: ["relative/path"],
+          denyReadPaths: ["$NOT_SET_ANYWHERE"],
+          bash: "full",
+        },
+      },
+    });
+    expect(config.agentProfiles["ios-reviewer"].denyPaths).toEqual([]);
+    expect(config.agentProfiles["ios-reviewer"].denyReadPaths).toEqual([]);
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.denyPaths[0]");
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.denyReadPaths[0]");
+    expect(() => assertConfigValid()).toThrow(/agentProfiles/);
+  });
+
+  it("drops only the bad agent type, not the whole map", async () => {
+    // Falling the map back to {} would silently unscope every correctly
+    // configured agent beside the broken one.
+    const { config, configIssues } = await loadWithConfigFile({
+      agentProfiles: {
+        "ios-reviewer": { writeRoots: ["/tmp"], bash: "readonly" },
+        "ios-implementer": { writeRoots: ["/tmp"], bash: "sudo-everything" },
+      },
+    });
+    expect(Object.keys(config.agentProfiles)).toEqual(["ios-reviewer"]);
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-implementer");
+  });
+
+  it("reports an EMPTY profile, whose meaning is the opposite of a missing one", async () => {
+    const { configIssues } = await loadWithConfigFile({ agentProfiles: { scribe: {} } });
+    expect(configIssues.join("\n")).toContain("agentProfiles.scribe");
+    expect(configIssues.join("\n")).toContain("neither write nor run commands");
+  });
+
+  it("rejects a profile under the reserved untyped-subagent key", async () => {
+    // The guard substitutes "(unknown)" for a subagent that reports no
+    // agent_type, so a profile under that key would quietly govern all of them.
+    const { config, configIssues } = await loadWithConfigFile({
+      agentProfiles: { "(unknown)": { writeRoots: ["/tmp"], bash: "full" } },
+    });
+    expect(config.agentProfiles).toEqual({});
+    expect(configIssues.join("\n")).toContain("reserved");
+  });
+});

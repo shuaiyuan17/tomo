@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve as pathResolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve as pathResolve } from "node:path";
 import { minimatch } from "minimatch";
-import { config } from "../config.js";
+import { config, RESERVED_AGENT_TYPE, type AgentProfile } from "../config.js";
 import { log } from "../logger.js";
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 
@@ -755,4 +756,663 @@ function globCouldExpandToMemory(token: string): boolean {
     const literalPrefix = segment.slice(0, meta.index).toLowerCase();
     return "memory".startsWith(literalPrefix) || "private".startsWith(literalPrefix);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent permission scoping (config `agentProfiles`)
+// ---------------------------------------------------------------------------
+
+/**
+ * POLICY, NOT A SANDBOX. Read this before trusting anything below.
+ *
+ * Every session runs `permissionMode: "bypassPermissions"` (sdk-options.ts) and
+ * the SDK propagates that mode into subagents, so a subagent inherits the
+ * daemon owner's entire machine. `AgentDefinition` scopes TOOLS but has no
+ * notion of a path, so `tools: Read, Grep, Glob, Bash` on a "read-only
+ * reviewer" is a full shell.
+ *
+ * These hooks close the accident-shaped part of that hole. They do NOT close
+ * the adversarial-shaped part. The checks run in the daemon and the thing they
+ * constrain is a CLI child process, which is the wrong side of a trust boundary
+ * for a real sandbox — and by deliberate decision `readonly` allows `$(…)`,
+ * backticks and pipes, any of which can assemble a command no token scan here
+ * can see. An agent that wants out gets out.
+ *
+ * THREE LIMITS WORTH KNOWING BEFORE YOU RELY ON THIS.
+ *
+ *  1. THE DAEMON DOES NOT KNOW A SUBAGENT'S CWD. The Agent tool's
+ *     `isolation: "worktree"` never reports the worktree path back, so a
+ *     RELATIVE token is a path whose destination is unknowable here. It is
+ *     therefore never judged on the ALLOW side — `mkdir -p Sources/New` and
+ *     `rm -rf build/Old` pass in `worktree` mode, which is the point of that
+ *     mode — and on the DENY side it is resolved against the WORKSPACE, which
+ *     is the cwd a subagent inherits when it has no worktree of its own. That
+ *     is what catches `rm -rf memory`, `rm -rf *` and `git clean -fdx`. What
+ *     it does not catch, and cannot, is an agent destroying its own worktree.
+ *  2. `denyPaths` IS A WRITE FENCE, NOT A READ FENCE. A reviewer's job is to
+ *     read the checkouts it must never modify. `denyReadPaths` is the separate,
+ *     blunter list for the paths where reading is itself the harm.
+ *  3. THE VERB LIST IS A LIST. It is long and it will still be incomplete;
+ *     every entry is a command someone noticed. Treat a gap as a bug report,
+ *     not as a security boundary that failed.
+ *  4. A REDIRECTION INSIDE A QUOTED SUB-SHELL IS INVISIBLE.
+ *     `sh -c 'cat x > /etc/passwd'` and `bash -c "… >> …"` put the whole
+ *     command inside one quoted run, and {@link maskQuotedOperators} blanks
+ *     shell operators inside quotes — which is exactly what it must do for
+ *     `awk '$1 > 5' f`, and exactly wrong here. The two are the same bytes;
+ *     telling them apart means knowing that `sh -c` re-parses its argument as
+ *     a command, i.e. writing the shell parser this file has declined to
+ *     write. `sh`/`bash`/`zsh` are not on the verb list either, so this is a
+ *     hole, and it is the same hole as `$(…)`: an agent that reaches for
+ *     `sh -c` to get a redirection past the guard is jailbreaking, which is
+ *     v2's problem (a real sandbox), not a token scan's.
+ *
+ * Why PreToolUse and not `canUseTool`: `canUseTool` is handed an opaque
+ * `agentID` with no `agent_type` (sdk.d.ts), so it cannot tell WHICH profile
+ * applies — and a PreToolUse denial bypasses `canUseTool` anyway, the same
+ * property the private-memory bar above relies on.
+ */
+
+/** Tools whose whole job is to write one named file. */
+const AGENT_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/** Tool-input fields that can name a path. `content` is deliberately absent:
+ *  prose that happens to quote a protected path is not an access. */
+const PATH_BEARING_INPUTS = ["file_path", "notebook_path", "path", "pattern", "glob", "command"] as const;
+
+/** How much of a subagent's Bash command goes into the audit line. Enough to
+ *  identify the command, short enough that a log shipper is not carrying whole
+ *  heredocs. */
+const BASH_AUDIT_CHARS = 120;
+
+/** The shape of the PreToolUse payload this guard reads. `agent_id` is the
+ *  documented way to tell a subagent call from a main-thread one — it is
+ *  ABSENT on the main thread even in `--agent` sessions, while `agent_type` is
+ *  present in both — so the main-thread test keys off `agent_id` alone. */
+interface AgentHookInput {
+  tool_name: string;
+  tool_input: unknown;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+/**
+ * PreToolUse hook that applies the calling subagent's `agentProfiles` entry.
+ *
+ * Three populations, three outcomes:
+ *  - MAIN THREAD (no `agent_id`) — returns `{}` before anything else runs. The
+ *    owner's own turn is not scoped by this and never has been.
+ *  - A SUBAGENT WITH NO PROFILE — fail-OPEN, plus one `log.warn` per
+ *    (session, agent_type) naming the tool. The set lives in this closure and
+ *    the closure is built once per live session, so "once per session per type"
+ *    is structural rather than a counter someone has to maintain. The point of
+ *    the warning is measurement: nobody knows the real tool surface of
+ *    `general-purpose` / `Explore` / ad-hoc delegations, and fail-closed would
+ *    break all of them on turn one. Flip the default once the logs say what it
+ *    would cost.
+ *  - A SUBAGENT WITH A PROFILE — {@link agentProfileDenial} decides.
+ *
+ * Every subagent Bash call is logged at info regardless of the decision, so the
+ * audit trail covers the fail-open population too — that is where the surface
+ * being measured actually lives.
+ *
+ * `lookup` is a FUNCTION, not the map: it is resolved per tool call, so a
+ * profile change does not have to wait for every live session to be recycled.
+ */
+export function agentProfileGuardHooks(
+  sessionKey: string | undefined,
+  lookup: (agentType: string) => AgentProfile | undefined,
+) {
+  const cwd = config.workspaceDir;
+  const warnedTypes = new Set<string>();
+  return {
+    PreToolUse: [{
+      hooks: [async (input: AgentHookInput) => {
+        if (!input.agent_id) return {};
+        const agentType = input.agent_type ?? RESERVED_AGENT_TYPE;
+
+        if (input.tool_name === "Bash") {
+          const command = (input.tool_input as { command?: unknown } | null | undefined)?.command;
+          log.info(
+            {
+              key: sessionKey,
+              agentType,
+              agentId: input.agent_id,
+              command: typeof command === "string" ? command.slice(0, BASH_AUDIT_CHARS) : undefined,
+            },
+            "Subagent Bash call",
+          );
+        }
+
+        const profile = lookup(agentType);
+        if (!profile) {
+          if (!warnedTypes.has(agentType)) {
+            warnedTypes.add(agentType);
+            log.warn(
+              { key: sessionKey, agentType, tool: input.tool_name },
+              "Subagent has no agentProfiles entry — allowing unscoped (fail-open)",
+            );
+          }
+          return {};
+        }
+
+        const reason = agentProfileDenial(profile, input.tool_name, input.tool_input, cwd);
+        if (!reason) return {};
+        log.warn(
+          { key: sessionKey, agentType, tool: input.tool_name, reason },
+          "Blocked by agent permission profile",
+        );
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse" as const,
+            permissionDecision: "deny" as const,
+            permissionDecisionReason:
+              `Blocked by the "${agentType}" agent permission profile: ${reason}`,
+          },
+        };
+      }],
+    }],
+  };
+}
+
+/**
+ * Why this tool call is refused under `profile` — or null when it is allowed.
+ * Exported for testing.
+ *
+ * `denyReadPaths` is checked for EVERY tool, including Read/Grep/Glob.
+ * Everything else is a write rule and only the write tools and Bash reach it.
+ */
+export function agentProfileDenial(
+  profile: AgentProfile,
+  toolName: string,
+  toolInput: unknown,
+  cwd: string,
+): string | null {
+  if (!toolInput || typeof toolInput !== "object") return null;
+  const ti = toolInput as Record<string, unknown>;
+
+  const secret = secretMentionDenial(profile, toolName, ti, cwd);
+  if (secret) return secret;
+
+  if (AGENT_WRITE_TOOLS.has(toolName)) {
+    const p = toolName === "NotebookEdit" ? ti.notebook_path : ti.file_path;
+    if (typeof p !== "string") return null;
+    return writeDenial(profile, p, cwd, toolName);
+  }
+  if (toolName === "Bash") {
+    const cmd = ti.command;
+    if (typeof cmd !== "string") return null;
+    return bashDenial(profile, cmd, cwd);
+  }
+  return null;
+}
+
+/**
+ * `denyReadPaths` — the secrets list. ANY mention by ANY tool.
+ *
+ * Two passes, because each catches what the other misses. The RAW SUBSTRING
+ * pass sees a path named somewhere the tokenizer does not look (inside a
+ * heredoc body, inside a `--flag=…` cluster split some other way). The
+ * RESOLUTION pass sees a path the raw text does not spell: `~/.ssh/id_rsa`,
+ * a symlink into the private memory tree, `memory/private/x` relative to the
+ * workspace the subagent inherited its cwd from.
+ */
+function secretMentionDenial(
+  profile: AgentProfile,
+  toolName: string,
+  ti: Record<string, unknown>,
+  cwd: string,
+): string | null {
+  if (profile.denyReadPaths.length === 0) return null;
+  for (const field of PATH_BEARING_INPUTS) {
+    const value = ti[field];
+    if (typeof value !== "string" || value.length === 0) continue;
+    const spelled = profile.denyReadPaths.find((deny) => value.includes(deny));
+    if (spelled) {
+      return `\`${spelled}\` is on this agent's denyReadPaths, and ${toolName}'s \`${field}\` names it.`;
+    }
+    const candidates = field === "command" ? pathishTokens(value) : [value];
+    const hit = candidates.find((c) => landsIn(c, profile.denyReadPaths, cwd, false));
+    if (hit !== undefined) return `\`${hit}\` is on this agent's denyReadPaths (not readable by this agent).`;
+  }
+  return null;
+}
+
+/**
+ * A write tool's target.
+ *
+ * `denyPaths` first, so a path inside both a denyPath and a writeRoot reports
+ * the rule that decided it. Then `writeRoots` — UNLESS the mode is `full`,
+ * which switches writeRoots off for the file tools exactly as it does for Bash:
+ * a profile that says "this agent may run any command anywhere except these
+ * paths" and then refuses its `Write` calls is incoherent, and the incoherence
+ * was invisible because the two halves lived in different functions.
+ */
+function writeDenial(profile: AgentProfile, p: string, cwd: string, toolName: string): string | null {
+  if (landsIn(p, profile.denyPaths, cwd, false)) {
+    return `\`${p}\` is on this agent's denyPaths (readable, but not writable by this agent).`;
+  }
+  if (profile.bash === "full") return null;
+  if (!landsInWriteRoot(p, profile, cwd)) {
+    return profile.writeRoots.length === 0
+      ? `this agent has no writeRoots, so ${toolName} is denied everywhere.`
+      : `\`${p}\` is outside this agent's writeRoots (${profile.writeRoots.join(", ")}).`;
+  }
+  return null;
+}
+
+/**
+ * Bash, by mode. NOT A SHELL PARSER — see the header above.
+ *
+ * The order matters and is not arbitrary:
+ *
+ *  1. `none` refuses everything, before any parsing.
+ *  2. `denyPaths` bind WRITES ONLY, so they are consulted only for a command
+ *     that names a write verb or carries a redirection. `cat`, `git log` and
+ *     `git -C <denyPath> worktree list` are reads and are allowed. (The read
+ *     fence is `denyReadPaths`, applied to every tool one level up.)
+ *  3. `full` stops here — the deny lists are its whole policy.
+ *  4. Redirections are the write no verb scan can see (`echo x > y` names no
+ *     write command at all), so they are checked against `writeRoots`.
+ *  5. A write VERB is held to the writeRoots by the same test in both surviving
+ *     modes, differing in one clause. See {@link writeVerbTargetDenial}.
+ *
+ * READONLY USED TO REFUSE THE VERB OUTRIGHT, AND CONTRADICTED ITSELF DOING IT.
+ * A `readonly` profile with `/tmp` in its writeRoots allowed
+ * `Write /tmp/ok` and `echo hi > /tmp/ok`, and refused `touch /tmp/marker`,
+ * `mkdir -p /tmp/dd`, `cp /tmp/a /tmp/b` and `rm -rf /tmp/scratch` — the same
+ * write, to the same permitted directory, decided three different ways
+ * depending on which surface expressed it. The bar was not even a bar: `cat a >
+ * b` walked round it, because a redirection names no verb. `readonly` now means
+ * what its writeRoots say it means.
+ */
+function bashDenial(profile: AgentProfile, cmd: string, cwd: string): string | null {
+  if (profile.bash === "none") {
+    return "the Bash tool is not available to this agent type (bash: \"none\").";
+  }
+
+  const verb = writeVerbIn(cmd);
+  const redirects = redirectTargets(cmd);
+
+  const blocked = writeTargets(cmd, verb, redirects, cwd)
+    .find((target) => landsIn(target.path, profile.denyPaths, cwd, true));
+  if (blocked) {
+    return `${blocked.why} \`${blocked.path}\`, which is on this agent's denyPaths (readable, but not writable by this agent).`;
+  }
+
+  if (profile.bash === "full") return null;
+
+  for (const target of redirects) {
+    if (HARMLESS_REDIRECT_TARGET.test(target)) continue;
+    // A relative target lands somewhere this code cannot know — not judged on
+    // the allow side. It was already judged on the deny side above.
+    if (!isAbsoluteish(target)) continue;
+    if (!landsInWriteRoot(target, profile, cwd)) {
+      return `the redirection target \`${target}\` is outside this agent's writeRoots.`;
+    }
+  }
+
+  return verb ? writeVerbTargetDenial(profile, cmd, verb, cwd) : null;
+}
+
+/**
+ * Hold a write verb's targets to the writeRoots. ONE TEST, TWO MODES, ONE
+ * CLAUSE OF DIFFERENCE.
+ *
+ * Both modes require every ABSOLUTE path token to land inside a writeRoot;
+ * relative tokens are not judged, because the daemon does not know the cwd they
+ * resolve against (limit 1 in the header).
+ *
+ * `readonly` adds the clause: at least one absolute token must be PRESENT. That
+ * is the whole of the distinction between the two modes, and it is the right
+ * shape for it. A `readonly` agent may write only where it can name the place
+ * out loud — `touch /tmp/marker` is a write to a directory its profile grants,
+ * while `rm -rf x` and `rm -rf *` name a destination nobody in this process can
+ * locate, so they stay refused. A `worktree` agent is trusted with its own
+ * unnamed cwd and keeps `rm -rf build/Old`.
+ */
+function writeVerbTargetDenial(
+  profile: AgentProfile,
+  cmd: string,
+  verb: string,
+  cwd: string,
+): string | null {
+  const absolute = absolutePathTokens(cmd);
+  if (profile.bash === "readonly" && absolute.length === 0) {
+    return `\`${verb}\` writes, and in "readonly" mode a write has to name an absolute path inside this agent's writeRoots (${profile.writeRoots.join(", ") || "none configured"}).`;
+  }
+  const outside = absolute.find((token) => !landsInWriteRoot(token, profile, cwd));
+  if (outside !== undefined) {
+    return `\`${verb}\` writes and \`${outside}\` is outside this agent's writeRoots.`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// The verb list.
+//
+// Every entry is a command that WRITES. It is long, it is still incomplete, and
+// it is matched by whole TOKEN anywhere in the command rather than in command
+// position — `echo x | tee /etc/hosts` puts the write on the far side of a
+// pipe, and tracking command position means parsing the shell. The cost is that
+// a command merely mentioning one of these words is refused under `readonly`;
+// on a mode whose whole promise is "this agent does not write", that is the
+// right direction to be wrong in.
+//
+// `kill`/`killall`/`pkill` are NOT here. They are how a reviewer clears a hung
+// simulator, and a signal is not a filesystem write.
+// ---------------------------------------------------------------------------
+
+/** Single-token commands that write. */
+const WRITE_VERBS = new Set([
+  "rm", "rmdir", "mv", "cp", "tee", "dd", "chmod", "chown", "ln", "mkdir",
+  "touch", "truncate", "install", "brew", "launchctl", "unlink", "shred",
+  "ditto", "chflags",
+  // wget writes its download to disk with no flag asked for.
+  "wget",
+]);
+
+/** A token this rule needs to see. A RegExp where the flag has spellings that
+ *  a literal compare misses — `sed -i.bak`, `sed -i''`. */
+type TokenMatch = string | RegExp;
+
+/**
+ * Rules of the form "all of these tokens are present ⇒ this command writes".
+ *
+ * ADJACENCY IS NOT REQUIRED, deliberately: `git -C /repo push` puts a flag
+ * between head and subcommand, `xcrun simctl erase` puts another command in
+ * front, and `curl -sSL -o out` separates the two by a cluster. That is also
+ * why `git log $(git merge-base main HEAD)` survives — `git` is present, but
+ * `merge-base` is not `merge`.
+ *
+ * The cost is over-matching on a command that merely names both tokens
+ * (`git log --grep merge`). Same call as the single-token list above.
+ */
+const WRITE_TOKEN_SETS: Array<{ label: string; tokens: TokenMatch[] }> = [
+  { label: "git push", tokens: ["git", "push"] },
+  { label: "git commit", tokens: ["git", "commit"] },
+  { label: "git checkout", tokens: ["git", "checkout"] },
+  { label: "git reset", tokens: ["git", "reset"] },
+  { label: "git rebase", tokens: ["git", "rebase"] },
+  { label: "git stash", tokens: ["git", "stash"] },
+  { label: "git clean", tokens: ["git", "clean"] },
+  { label: "git merge", tokens: ["git", "merge"] },
+  { label: "git apply", tokens: ["git", "apply"] },
+  { label: "git worktree remove", tokens: ["git", "worktree", "remove"] },
+  { label: "git worktree prune", tokens: ["git", "worktree", "prune"] },
+  { label: "git config --global", tokens: ["git", "config", "--global"] },
+  { label: "git config --system", tokens: ["git", "config", "--system"] },
+  { label: "npm install", tokens: ["npm", "install"] },
+  { label: "npm publish", tokens: ["npm", "publish"] },
+  { label: "npm ci", tokens: ["npm", "ci"] },
+  { label: "defaults write", tokens: ["defaults", "write"] },
+  // `xcrun simctl …` and a bare `simctl …` are the same command.
+  { label: "simctl delete", tokens: ["simctl", "delete"] },
+  { label: "simctl erase", tokens: ["simctl", "erase"] },
+  { label: "simctl shutdown", tokens: ["simctl", "shutdown"] },
+  { label: "simctl boot", tokens: ["simctl", "boot"] },
+  { label: "xcodebuild clean", tokens: ["xcodebuild", "clean"] },
+  { label: "swift package reset", tokens: ["swift", "package", "reset"] },
+  { label: "swift package clean", tokens: ["swift", "package", "clean"] },
+  { label: "find -delete", tokens: ["find", "-delete"] },
+  // `-i`, `-i.bak`, `-i''` are all in-place edits.
+  { label: "sed -i", tokens: ["sed", /^-i/] },
+  { label: "perl -i", tokens: ["perl", /^-i/] },
+  { label: "rsync --delete", tokens: ["rsync", /^--delete/] },
+  { label: "curl -o", tokens: ["curl", /^(-[a-zA-Z]*[oO]|--output)$/] },
+  { label: "gh pr merge", tokens: ["gh", "pr", "merge"] },
+  { label: "gh pr close", tokens: ["gh", "pr", "close"] },
+  { label: "xattr -w", tokens: ["xattr", "-w"] },
+  { label: "xattr -d", tokens: ["xattr", "-d"] },
+];
+
+/**
+ * Write verbs whose BARE (separator-free) arguments are usually paths.
+ *
+ * Only these resolve a bare token against the workspace for the deny check.
+ * The alternative — resolving bare tokens for EVERY write verb — denies
+ * `git commit -m memory`, because `memory` is then a path that lands on a
+ * denyPath. The four accidents this rule exists for (`rm -rf memory`,
+ * `rm -rf *`, `git clean -fdx`, `rm -rf .`) are all in here, and a token with
+ * a `/` in it is resolved for every write verb regardless.
+ */
+const BARE_ARG_IS_PATH = new Set([
+  "rm", "rmdir", "mv", "cp", "tee", "dd", "truncate", "shred", "unlink",
+  "ditto", "chmod", "chown", "ln", "touch", "mkdir", "install", "chflags",
+  "git clean", "git checkout", "git reset", "git apply",
+  "xcodebuild clean", "swift package clean", "swift package reset",
+  "find -delete", "sed -i", "perl -i", "rsync --delete", "curl -o",
+]);
+
+/** Tokens that mean "everything under the current directory". As the target of
+ *  a write verb they are the most destructive thing a confused agent types, and
+ *  they name no path at all — so for the deny check they stand in for the cwd
+ *  the subagent inherited, which is the workspace. */
+const CWD_TARGETS = new Set(["*", ".", "./", "..", "../", "*/", "*.*"]);
+
+/** The first write verb this command names, or null. */
+function writeVerbIn(cmd: string): string | null {
+  const tokens = bashTokens(cmd);
+  const bare = tokens.find((token) => WRITE_VERBS.has(token));
+  if (bare !== undefined) return bare;
+  const rule = WRITE_TOKEN_SETS.find(({ tokens: needed }) => needed.every(
+    (match) => tokens.some((token) => (typeof match === "string" ? token === match : match.test(token))),
+  ));
+  return rule ? rule.label : null;
+}
+
+/** A path a command is about to WRITE to, with the phrasing its denial needs. */
+interface WriteTarget {
+  path: string;
+  why: string;
+}
+
+/**
+ * Everything this command may write to, for the `denyPaths` check only.
+ *
+ * Relative tokens are included HERE and nowhere else: on the deny side they are
+ * resolved against the workspace, which is the cwd a subagent inherits when it
+ * has no worktree of its own, and that is what turns `rm -rf memory` — typed by
+ * an agent that thought it was somewhere else — into a denial instead of a
+ * restore-from-backup.
+ */
+function writeTargets(cmd: string, verb: string | null, redirects: string[], cwd: string): WriteTarget[] {
+  const targets: WriteTarget[] = redirects
+    .filter((target) => !HARMLESS_REDIRECT_TARGET.test(target))
+    .map((target) => ({ path: target, why: "the redirection target is" }));
+  if (!verb) return targets;
+
+  const bareArePaths = BARE_ARG_IS_PATH.has(verb);
+  for (const token of allPathCandidates(cmd)) {
+    if (CWD_TARGETS.has(token)) {
+      // `rm -rf *` names no path; the thing it destroys is the cwd.
+      targets.push({ path: cwd, why: `\`${verb}\` targets the working directory` });
+      continue;
+    }
+    if (token.includes("/") || token.startsWith("~") || bareArePaths) {
+      targets.push({ path: token, why: `\`${verb}\` writes to` });
+    }
+  }
+  // Two commands that destroy the tree while naming neither a path nor a `*`.
+  // `git reset --hard` is the twin of `git clean -fdx` and was missing: it
+  // throws away every uncommitted change under the cwd, which for a subagent
+  // that never moved is the workspace.
+  //
+  // Both push the cwd UNCONDITIONALLY, so `git -C /some/worktree clean -fdx` is
+  // refused too even though it names a directory of its own. That is a real
+  // false positive and it is the conservative direction: the alternative is
+  // deciding, from a token scan, which of several `-C`-shaped flags actually
+  // repointed the command — and being wrong there costs the tree.
+  if (verb === "git clean" && /(^|\s)-[a-zA-Z]*[xf]/.test(cmd)) {
+    targets.push({ path: cwd, why: "`git clean` targets the working directory" });
+  }
+  if (verb === "git reset" && /(^|\s)--(hard|merge)\b/.test(cmd)) {
+    targets.push({ path: cwd, why: "`git reset --hard` discards the working directory" });
+  }
+  return targets;
+}
+
+/**
+ * `>` / `>>` targets.
+ *
+ * Two guards, because each lets through what the other stops. QUOTED regions
+ * have their operators blanked, so `echo 'a > b'` and `awk '$1 > 5' f` carry no
+ * redirection — the `>` is data, not syntax. And the captured target must LOOK
+ * like a path, which stops `cmd 2>3` and any other numeric target from being
+ * read as a filename. `2>&1` yields nothing on its own: the character class
+ * excludes `&`, so a file-descriptor duplication has no target to match.
+ */
+const REDIRECT_TARGET = /\d?>>?\s*\|?\s*([^\s;|&<>()]+)/g;
+
+/** Redirection targets that write nowhere a policy can care about. Without
+ *  these, `… > /dev/null` — the most common redirection there is — would need
+ *  `/dev` in every writeRoots list. */
+const HARMLESS_REDIRECT_TARGET = /^\/dev\/(null|stdout|stderr|tty|fd\/\d+)$/;
+
+/**
+ * Contains a `/`, a `.` or a `~`, or starts with a letter or a `$`. `5` and
+ * `3` do not; `out.log`, `/tmp/x`, `outlog` and `$OUT` do.
+ *
+ * REDUNDANT WITH {@link maskQuotedOperators}, AND KEPT ANYWAY. Every
+ * non-path-shaped target this rejects (`awk '$1 > 5'`, `cmd 2>3`) is either
+ * already inside quotes, where the mask has blanked the operator, or relative,
+ * where the allow side declines to judge it. There is no test that goes red on
+ * this line alone, and that is the honest status of it: a second, cheap guard
+ * on a parse that is a regex over a shell grammar, not a parser.
+ */
+function looksLikeRedirectTarget(token: string): boolean {
+  return /[/.~]/.test(token) || /^[A-Za-z$]/.test(token);
+}
+
+/**
+ * Blank out shell OPERATORS that sit inside quotes, leaving the quoted text
+ * itself alone.
+ *
+ * Deleting the whole quoted run would lose `> "/tmp/out"`'s target; leaving the
+ * run untouched keeps `echo 'a > b'`'s `>` as a redirection. Blanking only the
+ * operator characters is the one option that gets both of those right.
+ *
+ * AND IT IS WRONG FOR A QUOTED SUB-SHELL, WHICH IS THE SAME BYTES.
+ * `sh -c 'cat x > /etc/passwd'` is a quoted run containing a `>` that IS a
+ * redirection, and this blanks it. There is no way to tell that from
+ * `awk '$1 > 5' f` without knowing that `sh -c` re-parses its argument as a
+ * command — a shell parser, which is the thing this file exists to avoid
+ * needing. Recorded as limit 4 in the header rather than papered over: it is
+ * the `$(…)` hole wearing different clothes, and it belongs to the sandbox
+ * that does not exist yet.
+ */
+function maskQuotedOperators(cmd: string): string {
+  let out = "";
+  let quote: string | null = null;
+  for (const ch of cmd) {
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      out += "<>|&;".includes(ch) ? " " : ch;
+      continue;
+    }
+    if (ch === "'" || ch === "\"") quote = ch;
+    out += ch;
+  }
+  return out;
+}
+
+function redirectTargets(cmd: string): string[] {
+  const targets: string[] = [];
+  for (const match of maskQuotedOperators(cmd).matchAll(REDIRECT_TARGET)) {
+    const target = match[1].replace(/["'`\\]/g, "");
+    if (target && looksLikeRedirectTarget(target)) targets.push(target);
+  }
+  return targets;
+}
+
+/** Absolute, or home-relative and therefore absolute once the shell expands it
+ *  — the only two shapes whose destination this code can know. */
+function isAbsoluteish(token: string): boolean {
+  return token.startsWith("/") || token.startsWith("~");
+}
+
+/** Every path-ish part of every word in the command. */
+function allPathCandidates(cmd: string): string[] {
+  const out: string[] = [];
+  for (const word of bashTokens(cmd)) {
+    for (const token of pathCandidates(word)) out.push(token);
+  }
+  return out;
+}
+
+/** Tokens that name a path relatively or absolutely — used by the read fence,
+ *  which is a deny rule and can afford to resolve a relative token against the
+ *  workspace. */
+function pathishTokens(cmd: string): string[] {
+  return allPathCandidates(cmd).filter((token) => isAbsoluteish(token) || token.includes("/"));
+}
+
+/** Tokens whose destination is knowable, and therefore the only ones the ALLOW
+ *  side may judge. See limit 1 in the header. */
+function absolutePathTokens(cmd: string): string[] {
+  return allPathCandidates(cmd).filter(isAbsoluteish);
+}
+
+/** Leading `~` / `~/`, which the shell expands and `path.resolve` does not —
+ *  without this, `cat ~/.ssh/id_rsa` resolves to `<cwd>/~/.ssh/id_rsa` and
+ *  misses a `~/.ssh` entry entirely. `~user` is left alone: it is not a form
+ *  anything here produces, and the raw-text pass still sees it. */
+function expandTilde(p: string): string {
+  if (p === "~") return homedir();
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}
+
+/**
+ * Both spellings of a configured root: as the operator wrote it, and as the
+ * kernel resolves it. `/tmp` is a symlink to `/private/tmp` on macOS and
+ * `$TMPDIR` sits under `/var` (itself a link to `/private/var`), so a root
+ * compared in one spelling against a path resolved in the other never matches
+ * — which fails OPEN on a writeRoot and fails open on a deny list too.
+ */
+function rootSpellings(root: string, cwd: string): string[] {
+  const real = realDir(root, cwd);
+  return real !== null && real !== root ? [root, real] : [root];
+}
+
+/**
+ * Does `p` land on or inside one of `roots`?
+ *
+ * A DENY predicate, so it uses the case-folded {@link isInside} and tests both
+ * the lexical path and the real one: a symlink into `~/.ssh` is denied even
+ * though nothing in the path spells it, and a path that cannot be resolved at
+ * all is still judged on its lexical form rather than passing for free.
+ *
+ * `includeAncestors` adds the containment the other way round, and it belongs
+ * only on the WRITE side. `rm -rf ~/Developer` is not "inside" the denyPath
+ * `~/Developer/bloom`, and it destroys it anyway; a `cat` of an ancestor
+ * directory does nothing of the kind.
+ */
+function landsIn(p: string, roots: string[], cwd: string, includeAncestors: boolean): boolean {
+  if (roots.length === 0) return false;
+  const expanded = expandTilde(p);
+  const lexical = abs(expanded, cwd);
+  const real = realResolve(expanded, cwd);
+  return roots.some((root) => rootSpellings(root, cwd).some((r) => {
+    if (isInside(lexical, r)) return true;
+    if (real !== null && isInside(real, r)) return true;
+    if (!includeAncestors) return false;
+    return isInside(r, lexical) || (real !== null && isInside(r, real));
+  }));
+}
+
+/**
+ * Does `p` land on or inside one of the profile's writeRoots?
+ *
+ * An ALLOW predicate, so it uses the case-SENSITIVE {@link isInsideExact} and
+ * an unresolvable path answers false — the same conservative fold the
+ * `.claude/skills/` re-allow at the top of this file makes, and for the same
+ * reason: a comparison that fails here costs a denial, while one that
+ * over-matches hands out a write. Folding the case here would accept
+ * `<root>/../OTHER` spellings on a case-sensitive volume that are genuinely
+ * different directories.
+ */
+function landsInWriteRoot(p: string, profile: AgentProfile, cwd: string): boolean {
+  const real = realResolve(expandTilde(p), cwd);
+  if (real === null) return false;
+  return profile.writeRoots.some((root) => rootSpellings(root, cwd).some((r) => isInsideExact(real, r)));
 }

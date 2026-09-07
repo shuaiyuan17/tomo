@@ -777,7 +777,10 @@ afterAll(() => {
 
 const REVIEWER: Profile = {
   writeRoots: [worktree, "/tmp", "/private/tmp"],
-  denyPaths: ["/Applications", sharedCheckout, "/ws/memory", "/ws/.claude"],
+  denyPaths: [
+    "/Applications", sharedCheckout, "/ws/memory", "/ws/.claude",
+    join(homedir(), "Library", "LaunchAgents"),
+  ],
   denyReadPaths: [vault, join(homedir(), ".ssh")],
   bash: "readonly",
 };
@@ -1007,16 +1010,17 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("sed -i '' 's/a/b/' File.swift", REVIEWER)).toContain("sed -i");
       expect(bash("sed -i.bak 's/a/b/' File.swift", REVIEWER)).toContain("sed -i");
       expect(bash("perl -i -pe 's/a/b/' File.swift", REVIEWER)).toContain("perl -i");
-      expect(bash("git worktree remove /tmp/wt", REVIEWER)).toContain("git worktree remove");
+      expect(bash(`git worktree remove ${join(sharedCheckout, "wt")}`, REVIEWER))
+        .toContain("denyPaths");
       expect(bash("git worktree prune", REVIEWER)).toContain("git worktree prune");
       expect(bash("rsync -a src/ dst/ --delete", REVIEWER)).toContain("rsync --delete");
       expect(bash("curl -sSL -o out.tar https://example.com/x", REVIEWER)).toContain("curl -o");
       expect(bash("curl -O https://example.com/x", REVIEWER)).toContain("curl -o");
       expect(bash("gh pr merge 12", REVIEWER)).toContain("gh pr merge");
       expect(bash("gh pr close 12", REVIEWER)).toContain("gh pr close");
-      expect(bash("git apply /tmp/p.patch", REVIEWER)).toContain("git apply");
+      expect(bash("git apply /etc/p.patch", REVIEWER)).toContain("git apply");
       expect(bash("git config --global user.name x", REVIEWER)).toContain("git config --global");
-      expect(bash("unlink /tmp/x", REVIEWER)).toContain("writes");
+      expect(bash("unlink /etc/x", REVIEWER)).toContain("writes");
       expect(bash("ditto a b", REVIEWER)).toContain("writes");
       expect(bash("xattr -d com.apple.quarantine App", REVIEWER)).toContain("xattr -d");
       expect(bash("chflags nouchg File", REVIEWER)).toContain("writes");
@@ -1049,6 +1053,37 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("gh pr diff 12", REVIEWER)).toBeNull();
       expect(bash("xcodebuild -derivedDataPath /tmp/foo-dd test", REVIEWER)).toBeNull();
       expect(bash("curl -sSL https://example.com/x", REVIEWER)).toBeNull();
+    });
+
+    it("lets a write verb write where the writeRoots say it may", () => {
+      // The r2 contradiction: `Write /tmp/ok` and `echo hi > /tmp/ok` were
+      // allowed while these four were refused — the same write, to the same
+      // granted directory, decided differently per surface. And the refusal
+      // was not even a bar: `cat a > b` walked round it.
+      expect(bash("touch /tmp/marker", REVIEWER)).toBeNull();
+      expect(bash("mkdir -p /tmp/rev-dd", REVIEWER)).toBeNull();
+      expect(bash("cp /tmp/a /tmp/b", REVIEWER)).toBeNull();
+      expect(bash("rm -rf /tmp/rev-1", REVIEWER)).toBeNull();
+      expect(agentProfileDenial(REVIEWER, "Write", { file_path: "/tmp/ok" }, "/ws")).toBeNull();
+      expect(bash("echo hi > /tmp/ok", REVIEWER)).toBeNull();
+    });
+
+    it("still refuses a write that names no destination it can locate", () => {
+      // This is the ONE clause that separates readonly from worktree: a
+      // readonly agent may write only where it can name the place out loud.
+      expect(bash("rm -rf x", REVIEWER)).toContain("has to name an absolute path");
+      expect(bash("rm -rf *", REVIEWER)).toBeTruthy();
+      expect(bash("mkdir build", REVIEWER)).toContain("has to name an absolute path");
+      // ...and the same command IS allowed for the worktree-mode agent.
+      expect(bash("rm -rf build/Old", IMPLEMENTER)).toBeNull();
+    });
+
+    it("still refuses a write outside the writeRoots or onto a denyPath", () => {
+      expect(bash(`cp /tmp/a ${join(sharedCheckout, "b")}`, REVIEWER)).toContain("denyPaths");
+      expect(bash(`rm -rf ${join(homedir(), "Library", "LaunchAgents", "x.plist")}`, REVIEWER))
+        .toContain("denyPaths");
+      expect(bash("cp /tmp/a /etc/hosts", REVIEWER)).toContain("outside this agent's writeRoots");
+      expect(bash("touch /etc/marker", REVIEWER)).toContain("outside this agent's writeRoots");
     });
 
     it("allows a redirection INTO a writeRoot and denies one outside it", () => {
@@ -1120,6 +1155,18 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("rm -rf .", IMPLEMENTER)).toContain("denyPaths");
       expect(bash("rm -rf ./", IMPLEMENTER)).toContain("denyPaths");
       expect(bash("git clean -fdx", IMPLEMENTER)).toContain("denyPaths");
+    });
+
+    it("refuses `git reset --hard`, the twin of `git clean -fdx`", () => {
+      // Both discard the tree under the cwd while naming neither a path nor a
+      // `*`; for a subagent that never moved, that cwd is the workspace.
+      expect(bash("git reset --hard", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("git reset --hard HEAD~1", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("git reset --merge", IMPLEMENTER)).toContain("denyPaths");
+      // readonly refuses it a step earlier, on the verb naming no destination.
+      expect(bash("git reset --hard", REVIEWER)).toBeTruthy();
+      // A soft reset moves a ref and touches no file.
+      expect(bash("git reset --soft HEAD~1", IMPLEMENTER)).toBeNull();
     });
 
     it("still denies a write verb aimed OUTSIDE the writeRoots, absolutely", () => {

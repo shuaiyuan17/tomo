@@ -795,6 +795,17 @@ function globCouldExpandToMemory(token: string): boolean {
  *  3. THE VERB LIST IS A LIST. It is long and it will still be incomplete;
  *     every entry is a command someone noticed. Treat a gap as a bug report,
  *     not as a security boundary that failed.
+ *  4. A REDIRECTION INSIDE A QUOTED SUB-SHELL IS INVISIBLE.
+ *     `sh -c 'cat x > /etc/passwd'` and `bash -c "… >> …"` put the whole
+ *     command inside one quoted run, and {@link maskQuotedOperators} blanks
+ *     shell operators inside quotes — which is exactly what it must do for
+ *     `awk '$1 > 5' f`, and exactly wrong here. The two are the same bytes;
+ *     telling them apart means knowing that `sh -c` re-parses its argument as
+ *     a command, i.e. writing the shell parser this file has declined to
+ *     write. `sh`/`bash`/`zsh` are not on the verb list either, so this is a
+ *     hole, and it is the same hole as `$(…)`: an agent that reaches for
+ *     `sh -c` to get a redirection past the guard is jailbreaking, which is
+ *     v2's problem (a real sandbox), not a token scan's.
  *
  * Why PreToolUse and not `canUseTool`: `canUseTool` is handed an opaque
  * `agentID` with no `agent_type` (sdk.d.ts), so it cannot tell WHICH profile
@@ -1001,12 +1012,19 @@ function writeDenial(profile: AgentProfile, p: string, cwd: string, toolName: st
  *     `git -C <denyPath> worktree list` are reads and are allowed. (The read
  *     fence is `denyReadPaths`, applied to every tool one level up.)
  *  3. `full` stops here — the deny lists are its whole policy.
- *  4. `readonly` refuses the verb itself.
- *  5. Redirections are the write no verb scan can see (`echo x > y` names no
- *     write command at all), so they are checked against `writeRoots` in both
- *     surviving modes.
- *  6. `worktree` lets the verbs through but holds their ABSOLUTE path tokens to
- *     the writeRoots.
+ *  4. Redirections are the write no verb scan can see (`echo x > y` names no
+ *     write command at all), so they are checked against `writeRoots`.
+ *  5. A write VERB is held to the writeRoots by the same test in both surviving
+ *     modes, differing in one clause. See {@link writeVerbTargetDenial}.
+ *
+ * READONLY USED TO REFUSE THE VERB OUTRIGHT, AND CONTRADICTED ITSELF DOING IT.
+ * A `readonly` profile with `/tmp` in its writeRoots allowed
+ * `Write /tmp/ok` and `echo hi > /tmp/ok`, and refused `touch /tmp/marker`,
+ * `mkdir -p /tmp/dd`, `cp /tmp/a /tmp/b` and `rm -rf /tmp/scratch` — the same
+ * write, to the same permitted directory, decided three different ways
+ * depending on which surface expressed it. The bar was not even a bar: `cat a >
+ * b` walked round it, because a redirection names no verb. `readonly` now means
+ * what its writeRoots say it means.
  */
 function bashDenial(profile: AgentProfile, cmd: string, cwd: string): string | null {
   if (profile.bash === "none") {
@@ -1024,10 +1042,6 @@ function bashDenial(profile: AgentProfile, cmd: string, cwd: string): string | n
 
   if (profile.bash === "full") return null;
 
-  if (profile.bash === "readonly" && verb) {
-    return `\`${verb}\` writes, and this agent's Bash mode is "readonly".`;
-  }
-
   for (const target of redirects) {
     if (HARMLESS_REDIRECT_TARGET.test(target)) continue;
     // A relative target lands somewhere this code cannot know — not judged on
@@ -1038,11 +1052,38 @@ function bashDenial(profile: AgentProfile, cmd: string, cwd: string): string | n
     }
   }
 
-  if (profile.bash === "worktree" && verb) {
-    const outside = absolutePathTokens(cmd).find((token) => !landsInWriteRoot(token, profile, cwd));
-    if (outside !== undefined) {
-      return `\`${verb}\` writes and \`${outside}\` is outside this agent's writeRoots.`;
-    }
+  return verb ? writeVerbTargetDenial(profile, cmd, verb, cwd) : null;
+}
+
+/**
+ * Hold a write verb's targets to the writeRoots. ONE TEST, TWO MODES, ONE
+ * CLAUSE OF DIFFERENCE.
+ *
+ * Both modes require every ABSOLUTE path token to land inside a writeRoot;
+ * relative tokens are not judged, because the daemon does not know the cwd they
+ * resolve against (limit 1 in the header).
+ *
+ * `readonly` adds the clause: at least one absolute token must be PRESENT. That
+ * is the whole of the distinction between the two modes, and it is the right
+ * shape for it. A `readonly` agent may write only where it can name the place
+ * out loud — `touch /tmp/marker` is a write to a directory its profile grants,
+ * while `rm -rf x` and `rm -rf *` name a destination nobody in this process can
+ * locate, so they stay refused. A `worktree` agent is trusted with its own
+ * unnamed cwd and keeps `rm -rf build/Old`.
+ */
+function writeVerbTargetDenial(
+  profile: AgentProfile,
+  cmd: string,
+  verb: string,
+  cwd: string,
+): string | null {
+  const absolute = absolutePathTokens(cmd);
+  if (profile.bash === "readonly" && absolute.length === 0) {
+    return `\`${verb}\` writes, and in "readonly" mode a write has to name an absolute path inside this agent's writeRoots (${profile.writeRoots.join(", ") || "none configured"}).`;
+  }
+  const outside = absolute.find((token) => !landsInWriteRoot(token, profile, cwd));
+  if (outside !== undefined) {
+    return `\`${verb}\` writes and \`${outside}\` is outside this agent's writeRoots.`;
   }
   return null;
 }
@@ -1192,9 +1233,21 @@ function writeTargets(cmd: string, verb: string | null, redirects: string[], cwd
       targets.push({ path: token, why: `\`${verb}\` writes to` });
     }
   }
-  // `git clean -fdx` names neither a path nor a `*`, and removes the tree.
+  // Two commands that destroy the tree while naming neither a path nor a `*`.
+  // `git reset --hard` is the twin of `git clean -fdx` and was missing: it
+  // throws away every uncommitted change under the cwd, which for a subagent
+  // that never moved is the workspace.
+  //
+  // Both push the cwd UNCONDITIONALLY, so `git -C /some/worktree clean -fdx` is
+  // refused too even though it names a directory of its own. That is a real
+  // false positive and it is the conservative direction: the alternative is
+  // deciding, from a token scan, which of several `-C`-shaped flags actually
+  // repointed the command — and being wrong there costs the tree.
   if (verb === "git clean" && /(^|\s)-[a-zA-Z]*[xf]/.test(cmd)) {
     targets.push({ path: cwd, why: "`git clean` targets the working directory" });
+  }
+  if (verb === "git reset" && /(^|\s)--(hard|merge)\b/.test(cmd)) {
+    targets.push({ path: cwd, why: "`git reset --hard` discards the working directory" });
   }
   return targets;
 }
@@ -1237,7 +1290,16 @@ function looksLikeRedirectTarget(token: string): boolean {
  *
  * Deleting the whole quoted run would lose `> "/tmp/out"`'s target; leaving the
  * run untouched keeps `echo 'a > b'`'s `>` as a redirection. Blanking only the
- * operator characters is the one option that gets both right.
+ * operator characters is the one option that gets both of those right.
+ *
+ * AND IT IS WRONG FOR A QUOTED SUB-SHELL, WHICH IS THE SAME BYTES.
+ * `sh -c 'cat x > /etc/passwd'` is a quoted run containing a `>` that IS a
+ * redirection, and this blanks it. There is no way to tell that from
+ * `awk '$1 > 5' f` without knowing that `sh -c` re-parses its argument as a
+ * command — a shell parser, which is the thing this file exists to avoid
+ * needing. Recorded as limit 4 in the header rather than papered over: it is
+ * the `$(…)` hole wearing different clothes, and it belongs to the sandbox
+ * that does not exist yet.
  */
 function maskQuotedOperators(cmd: string): string {
   let out = "";

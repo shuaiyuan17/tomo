@@ -68,19 +68,22 @@ export interface MetricsConfig {
  * How much of the Bash tool an agent type keeps.
  *
  *  - `none`     — no Bash at all.
- *  - `readonly` — Bash minus the write VERBS (`rm`, `git commit`, `sed -i`,
- *                 `curl -o`, …) and minus `>`/`>>` onto an ABSOLUTE target
- *                 outside `writeRoots`. Command substitution, backticks and
- *                 pipes stay: a reviewer lives on
- *                 `git log $(git merge-base main HEAD)`, and v1 is aimed at
- *                 accidents, not at an agent deliberately assembling `rm` out
- *                 of `$(…)`. That is a sandbox's job, not a policy layer's —
- *                 see the "not a sandbox" note in the README.
- *  - `worktree` — the write verbs come back. An ABSOLUTE path token on a write
- *                 command still has to land inside `writeRoots`; a RELATIVE one
- *                 is not judged for the allow side at all, because the daemon
- *                 is not told where a subagent's cwd is. See AgentProfile for
- *                 what that does and does not fence.
+ *  - `readonly` — a write has to NAME ITS DESTINATION, and that destination has
+ *                 to be inside `writeRoots`. `touch /tmp/marker` is fine when
+ *                 `/tmp` is a writeRoot; `rm -rf x` and `rm -rf *` are not,
+ *                 because nothing in this process can say where they land. So
+ *                 is `>`/`>>` onto an absolute target outside `writeRoots`.
+ *                 Command substitution, backticks and pipes stay: a reviewer
+ *                 lives on `git log $(git merge-base main HEAD)`, and v1 is
+ *                 aimed at accidents, not at an agent deliberately assembling
+ *                 `rm` out of `$(…)`. That is a sandbox's job, not a policy
+ *                 layer's — see the "not a sandbox" note in the README.
+ *  - `worktree` — `readonly` minus the must-name-it clause. An ABSOLUTE path
+ *                 token on a write command still has to land inside
+ *                 `writeRoots`; a RELATIVE one is not judged for the allow side
+ *                 at all, because the daemon is not told where a subagent's cwd
+ *                 is, so `rm -rf build/Old` works. See AgentProfile for what
+ *                 that does and does not fence.
  *  - `full`     — only `denyPaths` / `denyReadPaths` apply, to Bash AND to the
  *                 file-writing tools: `writeRoots` stop constraining the agent
  *                 entirely.

@@ -724,6 +724,7 @@ describe("skillsCanUseTool", () => {
   });
 });
 
+
 // ---------------------------------------------------------------------------
 // Per-agent permission scoping (config `agentProfiles`).
 //
@@ -731,6 +732,10 @@ describe("skillsCanUseTool", () => {
 // SDK propagates that into subagents, so `ios-reviewer` — declared read-only,
 // with `tools: Read, Grep, Glob, Bash` — has a full shell on the owner's
 // machine. `AgentDefinition` scopes tools and has no notion of a path.
+//
+// The two deny lists are NOT the same rule and the tests below are organised
+// around the difference: `denyPaths` fences WRITES (a reviewer must read the
+// repos it may not touch), `denyReadPaths` fences MENTIONS (secrets).
 // ---------------------------------------------------------------------------
 
 type AgentPreToolUseInput = {
@@ -751,16 +756,18 @@ function agentHookFor(profiles: Record<string, Profile>): AgentPreToolUseHook {
 
 /** A real tree, because containment here has to survive `/var` -> `/private/var`
  *  (every `mkdtemp` path on macOS is behind that symlink) and a link planted
- *  inside a writeRoot that points at a denyPath. */
+ *  inside a writeRoot that points at a deny list. */
 const agentRoot = mkdtempSync(join(tmpdir(), "tomo-agent-prof-"));
 const worktree = join(agentRoot, "wt");
 const vault = join(agentRoot, "vault");
+const sharedCheckout = join(agentRoot, "bloom");
 
 beforeAll(() => {
   mkdirSync(worktree, { recursive: true });
   mkdirSync(vault, { recursive: true });
+  mkdirSync(sharedCheckout, { recursive: true });
   // The escape a lexical prefix check misses: nothing in `wt/out` spells
-  // `vault`, and writing through it lands in the denyPath.
+  // `vault`, and writing through it lands in a fenced tree.
   if (!existsSync(join(worktree, "out"))) symlinkSync(vault, join(worktree, "out"));
 });
 
@@ -770,10 +777,12 @@ afterAll(() => {
 
 const REVIEWER: Profile = {
   writeRoots: [worktree, "/tmp", "/private/tmp"],
-  denyPaths: ["/Applications", vault, join(homedir(), ".ssh")],
+  denyPaths: ["/Applications", sharedCheckout, "/ws/memory", "/ws/.claude"],
+  denyReadPaths: [vault, join(homedir(), ".ssh")],
   bash: "readonly",
 };
 const IMPLEMENTER: Profile = { ...REVIEWER, bash: "worktree" };
+const FULL: Profile = { ...REVIEWER, bash: "full" };
 
 describe("agentProfileGuardHooks — who the guard applies to", () => {
   beforeEach(() => {
@@ -840,6 +849,71 @@ describe("agentProfileGuardHooks — who the guard applies to", () => {
   });
 });
 
+describe("agentProfileDenial — denyPaths fence WRITES, not reads", () => {
+  const bash = (cmd: string, profile = REVIEWER) =>
+    agentProfileDenial(profile, "Bash", { command: cmd }, "/ws");
+
+  it("lets a reviewer READ the checkout it may never write", () => {
+    // This is the whole point of splitting the two lists: reviewing bloom is
+    // the reviewer's job, and bloom is on its denyPaths.
+    expect(bash(`cat ${join(sharedCheckout, "App.swift")}`)).toBeNull();
+    expect(bash(`git -C ${sharedCheckout} log --oneline -20`)).toBeNull();
+    expect(bash(`git -C ${sharedCheckout} diff main...HEAD`)).toBeNull();
+    expect(bash(`git -C ${sharedCheckout} worktree list`)).toBeNull();
+    expect(bash(`cd ${sharedCheckout} && git log`)).toBeNull();
+    expect(agentProfileDenial(REVIEWER, "Read", { file_path: join(sharedCheckout, "App.swift") }, "/ws"))
+      .toBeNull();
+    expect(agentProfileDenial(REVIEWER, "Grep", { pattern: "x", path: sharedCheckout }, "/ws")).toBeNull();
+  });
+
+  it("still refuses to WRITE there, by tool or by verb", () => {
+    expect(agentProfileDenial(FULL, "Write", { file_path: join(sharedCheckout, "App.swift") }, "/ws"))
+      .toContain("denyPaths");
+    expect(bash(`rm -rf ${sharedCheckout}`, FULL)).toContain("denyPaths");
+    expect(bash(`git -C ${sharedCheckout} commit -m wip`, FULL)).toContain("denyPaths");
+    expect(bash(`echo x > ${join(sharedCheckout, "App.swift")}`, FULL)).toContain("denyPaths");
+  });
+
+  it("denies a destructive verb aimed at an ANCESTOR of a denyPath", () => {
+    // `rm -rf <parent>` is not "inside" the denyPath and takes it anyway.
+    expect(bash(`rm -rf ${agentRoot}`, FULL)).toContain("denyPaths");
+    // A read of the same ancestor is untouched.
+    expect(bash(`ls ${agentRoot}`, FULL)).toBeNull();
+  });
+});
+
+describe("agentProfileDenial — denyReadPaths fence every mention", () => {
+  const bash = (cmd: string, profile = REVIEWER) =>
+    agentProfileDenial(profile, "Bash", { command: cmd }, "/ws");
+
+  it("refuses a read, in every mode including full", () => {
+    for (const profile of [REVIEWER, IMPLEMENTER, FULL]) {
+      expect(bash("cat ~/.ssh/id_rsa", profile)).toContain("denyReadPaths");
+      expect(bash(`cat ${join(homedir(), ".ssh", "id_rsa")}`, profile)).toContain("denyReadPaths");
+    }
+  });
+
+  it("refuses Read, Grep and Glob too — not just Bash", () => {
+    expect(agentProfileDenial(REVIEWER, "Read", { file_path: join(vault, "secret") }, "/ws"))
+      .toContain("denyReadPaths");
+    expect(agentProfileDenial(REVIEWER, "Grep", { pattern: "key", path: vault }, "/ws"))
+      .toContain("denyReadPaths");
+    expect(agentProfileDenial(REVIEWER, "Glob", { pattern: "*", path: vault }, "/ws"))
+      .toContain("denyReadPaths");
+  });
+
+  it("follows a symlink out of a writeRoot into the secrets tree", () => {
+    // `wt/out` is inside a writeRoot and spells nothing about the vault.
+    expect(agentProfileDenial(REVIEWER, "Read", { file_path: join(worktree, "out", "secret") }, "/ws"))
+      .toContain("denyReadPaths");
+  });
+
+  it("is silent when the profile lists none", () => {
+    const open: Profile = { ...FULL, denyReadPaths: [] };
+    expect(bash("cat ~/.ssh/id_rsa", open)).toBeNull();
+  });
+});
+
 describe("agentProfileDenial — write tools", () => {
   const denied = (p: string, profile = REVIEWER, tool = "Write") =>
     agentProfileDenial(profile, tool, tool === "NotebookEdit" ? { notebook_path: p } : { file_path: p }, "/ws");
@@ -859,16 +933,10 @@ describe("agentProfileDenial — write tools", () => {
   });
 
   it("lets a denyPath BEAT a writeRoot it sits inside", () => {
-    const nested: Profile = { writeRoots: [agentRoot], denyPaths: [vault], bash: "none" };
-    // vault is inside agentRoot, which is a writeRoot.
+    const nested: Profile = { writeRoots: [agentRoot], denyPaths: [vault], denyReadPaths: [], bash: "none" };
     expect(agentProfileDenial(nested, "Write", { file_path: join(agentRoot, "ok.txt") }, "/ws")).toBeNull();
     expect(agentProfileDenial(nested, "Write", { file_path: join(vault, "secret.txt") }, "/ws"))
       .toContain("denyPaths");
-  });
-
-  it("denies a write through a SYMLINK out of the writeRoot into a denyPath", () => {
-    // `wt/out` is inside a writeRoot and spells nothing about the vault.
-    expect(denied(join(worktree, "out", "leak.txt"))).toContain("denyPaths");
   });
 
   it("applies to Edit, MultiEdit and NotebookEdit too", () => {
@@ -878,12 +946,29 @@ describe("agentProfileDenial — write tools", () => {
   });
 
   it("denies everywhere when the profile has no writeRoots at all", () => {
-    const nowhere: Profile = { writeRoots: [], denyPaths: [], bash: "none" };
+    const nowhere: Profile = { writeRoots: [], denyPaths: [], denyReadPaths: [], bash: "none" };
     expect(agentProfileDenial(nowhere, "Write", { file_path: join(worktree, "x") }, "/ws"))
       .toContain("no writeRoots");
   });
 
-  it("has nothing to say about Read, Grep or Glob", () => {
+  it("bash: full switches writeRoots off for the FILE TOOLS too", () => {
+    // A profile that says "run anything anywhere except these paths" and then
+    // refuses its Write calls is incoherent.
+    expect(agentProfileDenial(FULL, "Write", { file_path: "/etc/hosts" }, "/ws")).toBeNull();
+    expect(agentProfileDenial(FULL, "Edit", { file_path: "/etc/hosts" }, "/ws")).toBeNull();
+    // ...but the deny lists still bind.
+    expect(agentProfileDenial(FULL, "Write", { file_path: "/Applications/x" }, "/ws")).toContain("denyPaths");
+  });
+
+  it("holds a CASE-VARIANT writeRoot to the writeRoots rule", () => {
+    // landsInWriteRoot is an ALLOW predicate and must use the case-SENSITIVE
+    // isInsideExact: swap it for the case-folded isInside and this write is
+    // waved through on a spelling that is a different directory on any
+    // case-sensitive volume.
+    expect(denied(join(agentRoot, "WT", "New.swift"))).toContain("outside this agent's writeRoots");
+  });
+
+  it("has nothing to say about Read or Grep outside the secrets list", () => {
     expect(agentProfileDenial(REVIEWER, "Read", { file_path: "/Applications/x" }, "/ws")).toBeNull();
     expect(agentProfileDenial(REVIEWER, "Grep", { pattern: "x", path: "/Applications" }, "/ws")).toBeNull();
   });
@@ -913,7 +998,38 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("mv a b", REVIEWER)).toContain("writes");
       expect(bash("echo x | tee /etc/hosts", REVIEWER)).toContain("writes");
       expect(bash("brew install foo", REVIEWER)).toContain("writes");
-      expect(bash("launchctl load ~/Library/LaunchAgents/x.plist", REVIEWER)).toContain("writes");
+      expect(bash("wget https://example.com/x.tar", REVIEWER)).toContain("writes");
+      expect(bash("shred -u secrets.txt", REVIEWER)).toContain("writes");
+    });
+
+    it("denies the verbs the first pass missed", () => {
+      expect(bash("find . -name '*.o' -delete", REVIEWER)).toContain("find -delete");
+      expect(bash("sed -i '' 's/a/b/' File.swift", REVIEWER)).toContain("sed -i");
+      expect(bash("sed -i.bak 's/a/b/' File.swift", REVIEWER)).toContain("sed -i");
+      expect(bash("perl -i -pe 's/a/b/' File.swift", REVIEWER)).toContain("perl -i");
+      expect(bash("git worktree remove /tmp/wt", REVIEWER)).toContain("git worktree remove");
+      expect(bash("git worktree prune", REVIEWER)).toContain("git worktree prune");
+      expect(bash("rsync -a src/ dst/ --delete", REVIEWER)).toContain("rsync --delete");
+      expect(bash("curl -sSL -o out.tar https://example.com/x", REVIEWER)).toContain("curl -o");
+      expect(bash("curl -O https://example.com/x", REVIEWER)).toContain("curl -o");
+      expect(bash("gh pr merge 12", REVIEWER)).toContain("gh pr merge");
+      expect(bash("gh pr close 12", REVIEWER)).toContain("gh pr close");
+      expect(bash("git apply /tmp/p.patch", REVIEWER)).toContain("git apply");
+      expect(bash("git config --global user.name x", REVIEWER)).toContain("git config --global");
+      expect(bash("unlink /tmp/x", REVIEWER)).toContain("writes");
+      expect(bash("ditto a b", REVIEWER)).toContain("writes");
+      expect(bash("xattr -d com.apple.quarantine App", REVIEWER)).toContain("xattr -d");
+      expect(bash("chflags nouchg File", REVIEWER)).toContain("writes");
+      expect(bash("swift package reset", REVIEWER)).toContain("swift package reset");
+      expect(bash("xcodebuild clean test", REVIEWER)).toContain("xcodebuild clean");
+    });
+
+    it("ALLOWS killing a hung simulator — a signal is not a write", () => {
+      // kill/killall/pkill were on the first version of this list and had no
+      // business there: clearing a wedged simulator is routine reviewer work.
+      expect(bash("killall Simulator", REVIEWER)).toBeNull();
+      expect(bash("pkill -f xcodebuild", REVIEWER)).toBeNull();
+      expect(bash("kill -9 4242", REVIEWER)).toBeNull();
     });
 
     it("denies write SUBCOMMANDS without needing them adjacent to the head", () => {
@@ -924,10 +1040,15 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("defaults write com.apple.finder X 1", REVIEWER)).toContain("defaults write");
     });
 
-    it("allows read-only git and xcodebuild", () => {
+    it("allows read-only git, gh, config and xcodebuild", () => {
       expect(bash("git log --oneline -20", REVIEWER)).toBeNull();
       expect(bash("git diff main...HEAD", REVIEWER)).toBeNull();
+      expect(bash("git worktree list", REVIEWER)).toBeNull();
+      expect(bash("git config user.name", REVIEWER)).toBeNull();
+      expect(bash("gh pr view 12", REVIEWER)).toBeNull();
+      expect(bash("gh pr diff 12", REVIEWER)).toBeNull();
       expect(bash("xcodebuild -derivedDataPath /tmp/foo-dd test", REVIEWER)).toBeNull();
+      expect(bash("curl -sSL https://example.com/x", REVIEWER)).toBeNull();
     });
 
     it("allows a redirection INTO a writeRoot and denies one outside it", () => {
@@ -938,55 +1059,92 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash(`xcodebuild test > ${join(worktree, "log.txt")}`, REVIEWER)).toBeNull();
     });
 
+    it("does not read a `>` inside quotes as a redirection", () => {
+      // `awk '$1 > 5' f` and `echo 'a > b'` are the whole reason for the
+      // quote mask; without it the first "redirects to 5" and the second
+      // "redirects to b".
+      expect(bash("awk '$1 > 5' f", REVIEWER)).toBeNull();
+      expect(bash("echo 'a > b'", REVIEWER)).toBeNull();
+      expect(bash('grep "a > b" f', REVIEWER)).toBeNull();
+      // The one that only the MASK can save: an absolute path inside the
+      // quotes is path-shaped and outside the writeRoots, so without the mask
+      // this is a redirection onto /etc and gets refused.
+      expect(bash('grep "write > /etc/passwd" Notes.md', REVIEWER)).toBeNull();
+      // A numeric target is not a filename even unquoted.
+      expect(bash("cmd 2>3", REVIEWER)).toBeNull();
+    });
+
+    it("still judges a QUOTED redirection target — the mask blanks operators, not paths", () => {
+      // Deleting the whole quoted run would have lost this target entirely,
+      // which is why only the operator characters inside quotes are blanked.
+      expect(bash('echo hi > "/tmp/out.log"', REVIEWER)).toBeNull();
+      const noTmp: Profile = { ...REVIEWER, writeRoots: [worktree] };
+      expect(bash('echo hi > "/tmp/out.log"', noTmp)).toContain("redirection target");
+    });
+
     it("leaves /dev/null and fd duplication alone", () => {
       expect(bash("xcodebuild test 2>&1 > /dev/null", REVIEWER)).toBeNull();
       expect(bash("swift build 2> /dev/null", REVIEWER)).toBeNull();
     });
 
-    it("denies a denyPath even with no write verb in sight", () => {
-      expect(bash("cat /Applications/Foo.app/Contents/Info.plist", REVIEWER)).toContain("denyPaths");
+    it("does not judge a RELATIVE redirection target — the cwd is unknowable", () => {
+      expect(bash("xcodebuild test > build.log", REVIEWER)).toBeNull();
     });
   });
 
   describe("worktree", () => {
-    it("gives the write verbs back for paths inside a writeRoot", () => {
-      expect(bash(`mkdir -p ${join(worktree, "Sources")}`, IMPLEMENTER)).toBeNull();
-      expect(bash("git commit -m wip", IMPLEMENTER)).toBeNull();
+    it("gives an agent a normal shell inside its own worktree", () => {
+      // Every one of these is a relative token, and the daemon is not told
+      // where the subagent's worktree is. Judging them would make the mode
+      // unusable; see limit 1 in the module header.
+      expect(bash("mkdir -p Sources/New", IMPLEMENTER)).toBeNull();
+      expect(bash("rm -rf build/Old", IMPLEMENTER)).toBeNull();
+      expect(bash("git commit -m msg", IMPLEMENTER)).toBeNull();
+      expect(bash("git commit -m 'refactor the memory layer'", IMPLEMENTER)).toBeNull();
       expect(bash("npm install", IMPLEMENTER)).toBeNull();
+      expect(bash(`mkdir -p ${join(worktree, "Sources")}`, IMPLEMENTER)).toBeNull();
     });
 
-    it("still denies a write verb aimed OUTSIDE the writeRoots", () => {
+    it("catches the accident that hits the WORKSPACE it inherited its cwd from", () => {
+      // A relative write target is resolved against the workspace for the deny
+      // check only. `/ws/memory` and `/ws/.claude` are on the denyPaths.
+      expect(bash("rm -rf memory", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("rm -rf memory/private", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("rm -rf .claude", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("echo x > memory/MEMORY.md", IMPLEMENTER)).toContain("denyPaths");
+    });
+
+    it("catches the shapes that name no path at all", () => {
+      // `*`, `.` and `git clean -fdx` destroy the cwd while naming nothing.
+      expect(bash("rm -rf *", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("rm -rf .", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("rm -rf ./", IMPLEMENTER)).toContain("denyPaths");
+      expect(bash("git clean -fdx", IMPLEMENTER)).toContain("denyPaths");
+    });
+
+    it("still denies a write verb aimed OUTSIDE the writeRoots, absolutely", () => {
       expect(bash("rm -rf /Users/shared/checkout", IMPLEMENTER)).toContain("outside this agent's writeRoots");
       expect(bash("cp x /etc/hosts", IMPLEMENTER)).toContain("outside this agent's writeRoots");
     });
 
     it("allows a non-write command naming a path outside the writeRoots", () => {
-      // The rule is about WRITES: reading around the machine is still fine.
       expect(bash("xcodebuild -derivedDataPath /tmp/foo-dd test", IMPLEMENTER)).toBeNull();
       expect(bash("cat /etc/hosts", IMPLEMENTER)).toBeNull();
-    });
-
-    it("denies any token that lands in a denyPath, write verb or not", () => {
-      expect(bash(`cat ${join(vault, "secret")}`, IMPLEMENTER)).toContain("denyPaths");
-      expect(bash(`cat ${join(worktree, "out", "secret")}`, IMPLEMENTER)).toContain("denyPaths");
     });
   });
 
   describe("full", () => {
-    const FULL: Profile = { ...REVIEWER, bash: "full" };
-
-    it("allows the write verbs anywhere the denyPaths permit", () => {
+    it("allows the write verbs anywhere the deny lists permit", () => {
       expect(bash("rm -rf /Users/shared/scratch", FULL)).toBeNull();
       expect(bash("git push origin HEAD", FULL)).toBeNull();
       expect(bash("echo hi > /etc/hosts", FULL)).toBeNull();
     });
 
-    it("still enforces denyPaths — `cat ~/.ssh/id_rsa` is refused", () => {
-      // `~` is expanded here because the shell would expand it; without that
-      // the token resolves to `<cwd>/~/.ssh/id_rsa` and misses the denyPath.
-      expect(bash("cat ~/.ssh/id_rsa", FULL)).toContain("denyPaths");
-      expect(bash(`cat ${join(homedir(), ".ssh", "id_rsa")}`, FULL)).toContain("denyPaths");
+    it("still enforces both deny lists", () => {
+      expect(bash("cat ~/.ssh/id_rsa", FULL)).toContain("denyReadPaths");
       expect(bash("rm -rf /Applications/Xcode.app", FULL)).toContain("denyPaths");
+      // ...and still lets the reader through on a write-only fence.
+      expect(bash("cat /Applications/Xcode.app/Contents/Info.plist", FULL)).toBeNull();
     });
   });
 });

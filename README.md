@@ -376,12 +376,16 @@ Every session runs the Claude Agent SDK in `bypassPermissions` mode, and the SDK
       "denyPaths": [
         "~/Library/LaunchAgents",
         "/Applications",
-        "~/.ssh",
-        "~/.tomo/config.json",
-        "~/.tomo/workspace/memory/private",
         "~/.claude",
+        "~/.tomo/workspace/memory",
+        "~/.tomo/workspace/.claude",
         "~/Developer/bloom",
         "~/Developer/wayfound"
+      ],
+      "denyReadPaths": [
+        "~/.ssh",
+        "~/.tomo/config.json",
+        "~/.tomo/workspace/memory/private"
       ],
       "bash": "readonly"
     },
@@ -398,10 +402,14 @@ Every session runs the Claude Agent SDK in `bypassPermissions` mode, and the SDK
       "denyPaths": [
         "~/Library/LaunchAgents",
         "/Applications",
+        "~/.claude",
+        "~/.tomo/workspace/memory",
+        "~/.tomo/workspace/.claude"
+      ],
+      "denyReadPaths": [
         "~/.ssh",
         "~/.tomo/config.json",
-        "~/.tomo/workspace/memory/private",
-        "~/.claude"
+        "~/.tomo/workspace/memory/private"
       ],
       "bash": "worktree"
     }
@@ -409,26 +417,36 @@ Every session runs the Claude Agent SDK in `bypassPermissions` mode, and the SDK
 }
 ```
 
-The two profiles differ in exactly two places, and both differences are the point. The reviewer cannot write and cannot reach the shared checkouts under `~/Developer`; the implementer has to work in one of them, so those are off its denyPaths and its Bash mode is `worktree` rather than `readonly`. Both list `/tmp` **and** `/private/tmp` because `/tmp` is a symlink to the second on macOS, and both list `$TMPDIR` because `xcodebuild` and `simctl` write there constantly.
+The two profiles differ in exactly two places, and both differences are the point. The reviewer cannot write the shared checkouts under `~/Developer` — but it can and must **read** them, which is why they sit on `denyPaths` and not `denyReadPaths`. The implementer has to write in one of them, so they are off its list entirely, and its Bash mode is `worktree` rather than `readonly`.
+
+Both list `/tmp` **and** `/private/tmp` because `/tmp` is a symlink to the second on macOS, and both list `$TMPDIR` because `xcodebuild` and `simctl` write there constantly. Both fence `~/.tomo/workspace/memory` and `~/.tomo/workspace/.claude`, which is what makes `rm -rf memory` and `git clean -fdx` refusals rather than restore-from-backup — see "relative paths" below.
 
 | Field | Meaning |
 |-------|---------|
-| `writeRoots` | Absolute roots the agent may write into. Empty (or omitted) means it may write nowhere. |
-| `denyPaths` | Files or directories the agent may not touch at all. **Beats `writeRoots`** — a denyPath nested inside a writeRoot still denies. |
+| `writeRoots` | Absolute roots the agent may write into. Empty (or omitted) means it may write nowhere — unless `bash` is `full`, which switches `writeRoots` off entirely. |
+| `denyPaths` | A **write** fence: paths the agent may not write to, by file tool, write verb, or redirection. **Reads are unaffected.** Beats `writeRoots`, and a destructive verb aimed at an *ancestor* of one is denied too, because `rm -rf <parent>` takes the protected path with it. |
+| `denyReadPaths` | The **secrets** list: paths the agent may not *name at all*, by any tool including `Read`/`Grep`/`Glob`. Strictly stronger than `denyPaths`; a path here needs no entry there. |
 | `bash` | `none` \| `readonly` \| `worktree` \| `full`. Defaults to `none`. |
+
+**Why two deny lists.** A reviewer's whole job is to read the checkouts it must never modify. One combined list forces you to choose between "the reviewer cannot review bloom" and "the reviewer can `rm -rf` bloom". `denyPaths` fences the write; `denyReadPaths` is kept for the short list of paths where *reading* is itself the harm.
 
 Bash modes:
 
 - **`none`** — the Bash tool is denied outright.
-- **`readonly`** — write *verbs* are denied (`rm`, `mv`, `cp`, `tee`, `dd`, `chmod`, `chown`, `ln`, `mkdir`, `touch`, `truncate`, `install`, `brew`, `launchctl`, `kill`/`killall`/`pkill`, `git push|commit|checkout|reset|rebase|stash|clean|merge`, `npm install|publish|ci`, `defaults write`, `simctl delete|erase|shutdown|boot`), as is a `>`/`>>` redirection onto a target outside `writeRoots`. Command substitution, backticks and pipes are **allowed** — see the note below.
-- **`worktree`** — the write verbs come back, but a path-shaped token on a write command must land inside `writeRoots`, and no token in any command may land inside a `denyPath`.
-- **`full`** — only `denyPaths` apply.
+- **`readonly`** — write *verbs* are denied: `rm`, `rmdir`, `mv`, `cp`, `tee`, `dd`, `chmod`, `chown`, `ln`, `mkdir`, `touch`, `truncate`, `install`, `unlink`, `shred`, `ditto`, `chflags`, `brew`, `launchctl`, `wget`, `sed -i`, `perl -i`, `find … -delete`, `rsync … --delete`, `curl -o|-O|--output`, `xattr -w|-d`, `git push|commit|checkout|reset|rebase|stash|clean|merge|apply`, `git worktree remove|prune`, `git config --global|--system`, `gh pr merge|close`, `npm install|publish|ci`, `defaults write`, `simctl delete|erase|shutdown|boot`, `xcodebuild clean`, `swift package reset|clean`. So is a `>`/`>>` redirection onto an *absolute* target outside `writeRoots`. Command substitution, backticks and pipes are **allowed** — see the note below. `kill`/`killall`/`pkill` are **not** denied: a signal is not a filesystem write, and clearing a wedged simulator is routine reviewer work.
+- **`worktree`** — the write verbs come back. An *absolute* path token on a write command must land inside `writeRoots`.
+- **`full`** — only `denyPaths` and `denyReadPaths` apply, to Bash *and* to `Write`/`Edit`/`MultiEdit`/`NotebookEdit`.
 
-Paths are expanded at config load: `~`, `~/x`, `$VAR` and `${VAR}`. A path that does not come out absolute is dropped **and reported in `configIssues`, which refuses daemon startup** — a silently dropped `denyPath` would widen the profile rather than narrow it.
+**Relative paths, and what `worktree` mode does not fence.** The daemon is never told where a subagent's worktree is — the Agent tool's `isolation: "worktree"` does not report the path back — so a relative token is a path whose destination is unknowable here. It is therefore **never judged on the allow side**: `mkdir -p Sources/New`, `rm -rf build/Old` and `git commit -m msg` all pass, which is what makes the mode usable at all. On the **deny side** a relative write target *is* resolved, against the workspace directory, because that is the cwd a subagent inherits when it has no worktree of its own — so `rm -rf memory`, `rm -rf *`, `rm -rf .` and `git clean -fdx` are refused when the workspace's own trees are on `denyPaths`. The consequence to be clear about: **a `worktree`-mode agent is fenced from the workspace, not from its own worktree.** It can destroy its own working copy, by design, and no rule here can tell it apart from the work it was sent to do.
+
+Paths are expanded at config load: `~`, `~/x`, `$VAR` and `${VAR}`. What happens to one that does not come out absolute depends on which list it is in, and the asymmetry is deliberate — a dropped `writeRoot` only *narrows* the agent, while a dropped deny entry *widens* it:
+
+- a bad **`writeRoots`** entry is dropped with a `log.warn`. This is also what keeps an unset `$TMPDIR` (absent under a bare `launchctl load`) from bricking the daemon.
+- a bad **`denyPaths`/`denyReadPaths`** entry is dropped with a `configIssues` entry, which **refuses daemon startup**.
 
 An agent type with **no profile is unconstrained**. That is the deliberate v1 default: the real tool surface of `general-purpose`, `Explore` and ad-hoc delegations is not known yet, and failing closed would break all of them on the first turn. Instead the daemon logs one `warn` per session per unprofiled agent type, and logs *every* subagent Bash call at `info` with the agent type and the first 120 characters of the command. Read those logs before tightening the default.
 
-> **This is policy, not a sandbox.** The checks run inside the tomo daemon; the thing they constrain is a CLI child process, which is the wrong side of a trust boundary for real isolation. `readonly` deliberately permits `$(…)`, backticks and pipes, because a reviewer's normal working command is `git log $(git merge-base main HEAD)` and refusing substitution refuses the reviewer. An agent that deliberately assembles `rm` out of a substitution will get out. What this closes is the *accident* — an agent that was told to review a PR deciding to delete a shared checkout, or to write into `/Applications` — which is the failure mode that actually happens.
+> **This is policy, not a sandbox.** The checks run inside the tomo daemon; the thing they constrain is a CLI child process, which is the wrong side of a trust boundary for real isolation. `readonly` deliberately permits `$(…)`, backticks and pipes, because a reviewer's normal working command is `git log $(git merge-base main HEAD)` and refusing substitution refuses the reviewer. The verb list above is a *list*: it is long, it is still incomplete, and every entry is a command someone noticed. An agent that wants out gets out. What this closes is the *accident* — an agent that was told to review a PR deciding to delete a shared checkout, or to write into `/Applications` — which is the failure mode that actually happens.
 
 ### Anthropic Authentication
 

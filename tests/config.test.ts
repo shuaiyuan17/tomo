@@ -350,7 +350,8 @@ describe("agentProfiles", () => {
       agentProfiles: {
         "ios-reviewer": {
           writeRoots: ["~/Library/Caches", "$TOMO_TEST_DD", "/tmp"],
-          denyPaths: ["~/.ssh", "/Applications"],
+          denyPaths: ["/Applications"],
+          denyReadPaths: ["~/.ssh"],
           bash: "readonly",
         },
       },
@@ -358,7 +359,8 @@ describe("agentProfiles", () => {
     expect(configIssues).toEqual([]);
     expect(config.agentProfiles["ios-reviewer"]).toEqual({
       writeRoots: [join(home, "Library", "Caches"), "/var/tmp/dd", "/tmp"],
-      denyPaths: [join(home, ".ssh"), "/Applications"],
+      denyPaths: ["/Applications"],
+      denyReadPaths: [join(home, ".ssh")],
       bash: "readonly",
     });
   });
@@ -369,18 +371,37 @@ describe("agentProfiles", () => {
     const { config } = await loadWithConfigFile({
       agentProfiles: { scribe: { writeRoots: ["/tmp"] } },
     });
-    expect(config.agentProfiles.scribe).toEqual({ writeRoots: ["/tmp"], denyPaths: [], bash: "none" });
+    expect(config.agentProfiles.scribe)
+      .toEqual({ writeRoots: ["/tmp"], denyPaths: [], denyReadPaths: [], bash: "none" });
   });
 
-  it("drops a path that does not expand to an absolute one, LOUDLY", async () => {
-    // A dropped denyPath WIDENS the profile, so this has to block startup
-    // rather than fall back quietly.
+  it("an unset $TMPDIR does not brick startup — a bad writeRoot only NARROWS", async () => {
+    // $TMPDIR is absent under a bare `launchctl load`. The right answer to
+    // "this machine has no TMPDIR" is a slightly narrower agent, not a daemon
+    // that refuses to start.
     const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
-      agentProfiles: { "ios-reviewer": { writeRoots: ["relative/path"], denyPaths: ["$NOT_SET_ANYWHERE"], bash: "full" } },
+      agentProfiles: { "ios-reviewer": { writeRoots: ["$TMPDIR_NOT_SET", "relative/path", "/tmp"], bash: "readonly" } },
     });
-    expect(config.agentProfiles["ios-reviewer"]).toEqual({ writeRoots: [], denyPaths: [], bash: "full" });
-    expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.writeRoots[0]");
+    expect(config.agentProfiles["ios-reviewer"].writeRoots).toEqual(["/tmp"]);
+    expect(configIssues).toEqual([]);
+    expect(() => assertConfigValid()).not.toThrow();
+  });
+
+  it("a bad denyPath or denyReadPath is FATAL — it would widen the profile", async () => {
+    const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
+      agentProfiles: {
+        "ios-reviewer": {
+          writeRoots: ["/tmp"],
+          denyPaths: ["relative/path"],
+          denyReadPaths: ["$NOT_SET_ANYWHERE"],
+          bash: "full",
+        },
+      },
+    });
+    expect(config.agentProfiles["ios-reviewer"].denyPaths).toEqual([]);
+    expect(config.agentProfiles["ios-reviewer"].denyReadPaths).toEqual([]);
     expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.denyPaths[0]");
+    expect(configIssues.join("\n")).toContain("agentProfiles.ios-reviewer.denyReadPaths[0]");
     expect(() => assertConfigValid()).toThrow(/agentProfiles/);
   });
 
@@ -395,5 +416,21 @@ describe("agentProfiles", () => {
     });
     expect(Object.keys(config.agentProfiles)).toEqual(["ios-reviewer"]);
     expect(configIssues.join("\n")).toContain("agentProfiles.ios-implementer");
+  });
+
+  it("reports an EMPTY profile, whose meaning is the opposite of a missing one", async () => {
+    const { configIssues } = await loadWithConfigFile({ agentProfiles: { scribe: {} } });
+    expect(configIssues.join("\n")).toContain("agentProfiles.scribe");
+    expect(configIssues.join("\n")).toContain("neither write nor run commands");
+  });
+
+  it("rejects a profile under the reserved untyped-subagent key", async () => {
+    // The guard substitutes "(unknown)" for a subagent that reports no
+    // agent_type, so a profile under that key would quietly govern all of them.
+    const { config, configIssues } = await loadWithConfigFile({
+      agentProfiles: { "(unknown)": { writeRoots: ["/tmp"], bash: "full" } },
+    });
+    expect(config.agentProfiles).toEqual({});
+    expect(configIssues.join("\n")).toContain("reserved");
   });
 });

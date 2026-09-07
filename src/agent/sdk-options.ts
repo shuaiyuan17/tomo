@@ -339,14 +339,31 @@ function buildHooksOption(args: {
    *  when it may. Undefined ⇒ the guard is not installed. */
   privateMemoryBar?: () => PrivateMemoryBar | null;
 }) {
-  const hooks: Record<string, unknown> = {};
+  const hooks: Record<string, unknown[]> = {};
   if (args.turnBudget) {
-    Object.assign(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
+    mergeHooks(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
   }
   if (args.privateMemoryBar) {
-    Object.assign(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
+    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
+}
+
+/** Merge one producer's hooks into the accumulator PER EVENT, concatenating
+ *  the matcher arrays. The previous `Object.assign` replaced a whole event key,
+ *  so two producers registering the same event (e.g. two PreToolUse guards)
+ *  would silently drop the first one — the private-memory bar would vanish the
+ *  day a second PreToolUse hook was added. Today's producers use different
+ *  events, so this changes nothing yet; it removes the trap. Exported for tests. */
+export function mergeHooks(
+  into: Record<string, unknown[]>,
+  from: Record<string, unknown>,
+): Record<string, unknown[]> {
+  for (const [event, entries] of Object.entries(from)) {
+    if (!Array.isArray(entries)) continue;
+    into[event] = [...(into[event] ?? []), ...entries];
+  }
+  return into;
 }
 
 /** Build a PostToolBatch hook that increments `budget.count` once per tool

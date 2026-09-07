@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `buildHooksOption` now merges producers per hook event (arrays concatenated) instead of `Object.assign`, which replaced a whole event key. Today's two producers use different events so behaviour is unchanged; a second `PreToolUse` guard would previously have silently dropped the private-memory bar.
 
 ### Bug fixes
 

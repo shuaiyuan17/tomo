@@ -1,0 +1,58 @@
+name: ✨ Feature request
+description: Propose a new capability or an improvement to an existing one.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tomo is deliberately small. A request lands faster when it describes a concrete problem rather than a mechanism, and when it fits the existing shape (chat-only interface, one user, one machine).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What you are trying to do today and why the current behavior falls short. Lead with the pain, not the solution.
+      placeholder: I run Tomo on two Macs and each keeps its own memory. When I switch machines the assistant forgets what we discussed that morning.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you would like to happen. Config keys, chat commands, or example messages are welcome if you have them in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to get there, including workarounds you already use, and why they are weaker.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Telegram
+        - iMessage
+        - Memory / people registry
+        - Scheduling (cron, continuity)
+        - Context management (LCM)
+        - MCP / tools / permissions
+        - CLI / daemon / install
+        - Other
+  - type: dropdown
+    id: intent
+    attributes:
+      label: Do you plan to implement this?
+      options:
+        - Yes, I plan to open a PR
+        - Maybe, with some guidance
+        - No, proposing the idea only
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else
+      description: Prior art in other assistants, links, or constraints such as backward compatibility.

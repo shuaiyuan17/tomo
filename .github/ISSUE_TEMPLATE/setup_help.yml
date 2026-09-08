@@ -1,0 +1,75 @@
+name: 🔧 Setup help
+description: Trouble installing, configuring, or getting Tomo to answer for the first time.
+title: "[Setup]: "
+labels: ["setup"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, try:
+        - `tomo update`, then `tomo restart`
+        - `tomo status` and `tomo logs` to see whether the daemon is running and what it says
+        - The [Requirements](https://github.com/shuaiyuan17/tomo#requirements) and [Configuration](https://github.com/shuaiyuan17/tomo#configuration) sections of the README
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do, and where does it stop?
+      placeholder: I ran `tomo init`, picked Telegram, and `tomo start` reports running, but messaging the bot gets no reply.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Exact commands you ran
+      placeholder: |
+        1. `npm install -g tomo-ai`
+        2. `tomo init` (Telegram, pasted BotFather token)
+        3. `tomo start`
+        4. Sent "hi" to the bot
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - npm global (`npm install -g tomo-ai`)
+        - Source checkout
+        - launchd service
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Channel you are setting up
+      multiple: true
+      options:
+        - Telegram
+        - iMessage (imsg)
+        - Not channel-related
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS version, `node --version`, `tomo --version`, and whether Claude Code is installed and logged in.
+      placeholder: "macOS 15.4, Node 22.12.0, tomo 0.9.0, Claude Code 2.x logged in"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output of `tomo status` and the tail of `tomo logs`
+      description: Redact tokens, phone numbers, and chat IDs. Auto-formatted as code.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you already tried
+      placeholder: |
+        - Reissued the bot token from BotFather
+        - Granted Full Disk Access to Terminal for imsg

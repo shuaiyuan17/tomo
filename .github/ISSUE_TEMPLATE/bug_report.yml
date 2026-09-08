@@ -1,0 +1,136 @@
+name: 🐛 Bug report
+description: Something is broken, crashes, or behaves incorrectly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Keep it to one bug per issue and ground every section in what you actually observed.
+
+        Install or setup trouble? Use the **Setup help** form instead.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched [existing issues](https://github.com/shuaiyuan17/tomo/issues?q=is%3Aissue) and this is not a duplicate.
+          required: true
+        - label: This report covers a single bug.
+          required: true
+        - label: I am on the latest `tomo-ai` release (`tomo update`) or a current `main` checkout.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: One or two sentences on what is broken, based on what you saw. Include the exact error text if there is one.
+      placeholder: After updating to 0.9.0, Tomo stops replying in a Telegram group after the first @mention. DMs still work.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The shortest path that triggers it. Name the channel, the message you sent, and what you saw.
+      placeholder: |
+        1. `tomo start` with the config below (redacted).
+        2. In the Telegram group, send "@tomo what time is it".
+        3. Tomo replies once.
+        4. Send a second @mention. No reply, and `tomo logs` shows the line quoted below.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened. If it worked in an earlier version, say which one.
+    validations:
+      required: true
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Is this a regression?
+      options:
+        - "Yes, this worked in a previous version"
+        - "No, this never worked"
+        - "I don't know"
+    validations:
+      required: true
+  - type: input
+    id: last_working
+    attributes:
+      label: Last working version
+      description: If this is a regression, the last version where it worked.
+      placeholder: "0.8.2"
+  - type: input
+    id: version
+    attributes:
+      label: Tomo version
+      description: Output of `tomo --version`, or the commit SHA for a source checkout.
+      placeholder: "0.9.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - npm global (`npm install -g tomo-ai`)
+        - Source checkout (`npm run dev` / `tomo start -f`)
+        - launchd service (`tomo config` autostart)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Channel
+      description: Where the bug shows up. Pick all that apply.
+      multiple: true
+      options:
+        - Telegram DM
+        - Telegram group
+        - iMessage DM
+        - iMessage group
+        - Not channel-specific (CLI, cron, daemon, LCM, ...)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and Node version
+      description: OS with version, plus `node --version`.
+      placeholder: "macOS 15.4, Node 22.12.0"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and auth mode
+      description: The model in use and how Tomo authenticates. Do not paste keys or tokens.
+      placeholder: "claude-sonnet-5 via Claude subscription / API key / LiteLLM gateway"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant lines from `tomo logs` (file at `~/.tomo/logs/tomo.log`). Redact bot tokens, phone numbers, chat IDs, and anything private. Auto-formatted as code.
+      render: shell
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: The part of `~/.tomo/config.json` that matters for this bug, with secrets and allowlist entries redacted. Auto-formatted as code.
+      render: json
+  - type: textarea
+    id: additional
+    attributes:
+      label: Anything else
+      description: Workarounds you found, screenshots, related issues, or a root-cause guess if you dug into the code. File paths and line numbers speed things up.
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to fix this myself and open a PR.

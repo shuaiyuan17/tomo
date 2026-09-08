@@ -9,10 +9,20 @@ import {
   isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
 } from "../jsonl.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
+import { FileLockTimeoutError, isFileLockHeldSync, withFileLockSync, type FileLockOptions } from "../file-lock.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TRANSCRIPT_TEXT_LIMIT } from "../watch/protocol.js";
 
 const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/**
+ * Registry critical sections are a read, an in-memory edit and an atomic write
+ * — sub-millisecond. Two seconds is already far beyond any honest contention;
+ * past that the holder is wedged, and waiting longer just blocks an inbound
+ * message. A lock still held after 30s whose owner cannot be proven alive is
+ * reclaimed (see src/file-lock.ts).
+ */
+const REGISTRY_LOCK_OPTIONS: FileLockOptions = { timeoutMs: 2_000 };
 
 // Floor for the in-memory transcript tail: enough to cover historyLimit user
 // turns with generous margin (a turn is typically 2-3 messages) while keeping
@@ -444,6 +454,17 @@ export class SessionStore {
   /** A bookkeeping SAVE failed (ENOSPC, EROFS, EACCES on the directory…):
    *  logged once per streak, cleared by the next successful save. */
   private registryWriteErrorLogged = false;
+  /** Ditto for a bookkeeping write skipped because the registry lock was held
+   *  by another process for the whole wait budget. */
+  private registryLockErrorLogged = false;
+  /**
+   * A bookkeeping change is applied in memory but not on disk (the save failed
+   * — ENOSPC, EROFS, EACCES). While this is set, the forced re-read that
+   * `mutateRegistry` normally does is suppressed: it would discard the very
+   * change we are holding for the next attempt. Cleared by the next successful
+   * save, which is what publishes it.
+   */
+  private registryDirty = false;
   // Stat of the registry file as of the last read/write. loadRegistry() is
   // called on nearly every store operation to pick up external changes
   // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
@@ -752,44 +773,46 @@ export class SessionStore {
 
   /** Link a new SDK session to a channel key */
   setSdkSessionId(key: string, sessionId: string): void {
-    this.loadRegistry();
-    // Link change: refuse before mutating anything in memory.
-    this.assertRegistryLoaded();
+    // Link change: mutateRegistry refuses (throws) before anything is mutated
+    // in memory, both for an unreadable file and for a lock we could not take.
+    this.mutateRegistry("setSdkSessionId", "link", () => {
+      // A metadata-only stub (created by setChatTitle/addParticipant before any
+      // SDK session existed — e.g. a freshly summoned group) is upgraded in
+      // place so its title/participants survive the first real session.
+      const stub = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && !e.sdkSessionId);
+      if (stub) {
+        stub.sdkSessionId = sessionId;
+        stub.lastActiveAt = Date.now();
+        this.saveRegistry();
+        return;
+      }
 
-    // A metadata-only stub (created by setChatTitle/addParticipant before any
-    // SDK session existed — e.g. a freshly summoned group) is upgraded in
-    // place so its title/participants survive the first real session.
-    const stub = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && !e.sdkSessionId);
-    if (stub) {
-      stub.sdkSessionId = sessionId;
-      stub.lastActiveAt = Date.now();
+      // Unlink any existing session for this key. Nested inside our lock (which
+      // is re-entrant within one process) and nothing of ours is mutated yet,
+      // so its own save publishes a consistent state for us to build on.
+      this.clearSdkSessionId(key);
+
+      const now = Date.now();
+      this.registry.push({
+        sdkSessionId: sessionId,
+        channelKey: key,
+        createdAt: now,
+        lastActiveAt: now,
+        unlinkedAt: null,
+        expiresAt: null,
+        stats: {
+          totalQueries: 0,
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          contextUsed: 0,
+          contextMax: 0,
+        },
+      });
       this.saveRegistry();
-      return;
-    }
-
-    // Unlink any existing session for this key (reloads the registry first)
-    this.clearSdkSessionId(key);
-
-    const now = Date.now();
-    this.registry.push({
-      sdkSessionId: sessionId,
-      channelKey: key,
-      createdAt: now,
-      lastActiveAt: now,
-      unlinkedAt: null,
-      expiresAt: null,
-      stats: {
-        totalQueries: 0,
-        totalCostUsd: 0,
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalCacheReadTokens: 0,
-        totalCacheCreationTokens: 0,
-        contextUsed: 0,
-        contextMax: 0,
-      },
     });
-    this.saveRegistry();
   }
 
   /** Update session stats after a query */
@@ -803,50 +826,50 @@ export class SessionStore {
     contextMax: number;
     contextBreakdown?: { name: string; tokens: number }[];
   }): void {
-    // Reload before mutating: other processes (tomo sessions clear, tomo
-    // config) rewrite the registry; saving a stale in-memory copy would
-    // silently revert their changes.
-    this.loadRegistry();
     // Bookkeeping: this runs after the model has already answered. Skipping it
     // costs a stale stat line; throwing would fail a turn that succeeded.
-    if (!this.canWriteRegistry("updateStats")) return;
-    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    if (!entry) return;
+    // mutateRegistry re-reads under the lock first, so other processes (tomo
+    // sessions clear, tomo config) cannot have their changes reverted by the
+    // stale in-memory copy we would otherwise publish.
+    this.mutateRegistry("updateStats", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (!entry) return;
 
-    // Initialize stats if missing (migration from old format)
-    if (!entry.stats) {
-      entry.stats = {
-        totalQueries: 0, totalCostUsd: 0,
-        totalInputTokens: 0, totalOutputTokens: 0,
-        totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
-        contextUsed: 0, contextMax: 0,
-      };
-    }
+      // Initialize stats if missing (migration from old format)
+      if (!entry.stats) {
+        entry.stats = {
+          totalQueries: 0, totalCostUsd: 0,
+          totalInputTokens: 0, totalOutputTokens: 0,
+          totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+          contextUsed: 0, contextMax: 0,
+        };
+      }
 
-    entry.stats.totalQueries++;
-    entry.stats.totalCostUsd += update.costUsd;
-    entry.stats.totalInputTokens += update.inputTokens;
-    entry.stats.totalOutputTokens += update.outputTokens;
-    entry.stats.totalCacheReadTokens += update.cacheReadTokens;
-    entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
-    entry.stats.contextUsed = update.contextUsed;
-    entry.stats.contextMax = update.contextMax;
-    if (update.contextBreakdown) {
-      entry.stats.contextBreakdown = update.contextBreakdown;
-    }
-    entry.lastActiveAt = Date.now();
-    this.saveRegistryBestEffort("updateStats");
+      entry.stats.totalQueries++;
+      entry.stats.totalCostUsd += update.costUsd;
+      entry.stats.totalInputTokens += update.inputTokens;
+      entry.stats.totalOutputTokens += update.outputTokens;
+      entry.stats.totalCacheReadTokens += update.cacheReadTokens;
+      entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
+      entry.stats.contextUsed = update.contextUsed;
+      entry.stats.contextMax = update.contextMax;
+      if (update.contextBreakdown) {
+        entry.stats.contextBreakdown = update.contextBreakdown;
+      }
+      entry.lastActiveAt = Date.now();
+      this.saveRegistryBestEffort("updateStats");
+    });
   }
 
   /** Touch the active session (update lastActiveAt) */
   touchSession(key: string): void {
-    this.loadRegistry();
-    if (!this.canWriteRegistry("touchSession")) return;
-    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-    if (entry) {
-      entry.lastActiveAt = Date.now();
-      this.saveRegistryBestEffort("touchSession");
-    }
+    this.mutateRegistry("touchSession", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (entry) {
+        entry.lastActiveAt = Date.now();
+        this.saveRegistryBestEffort("touchSession");
+      }
+    });
   }
 
   /** List all SDK session entries */
@@ -879,27 +902,27 @@ export class SessionStore {
   /** Unlink a session (marks for deletion after TTL). Metadata-only stubs
    *  have no SDK file to TTL — they are removed outright. */
   clearSdkSessionId(key: string): void {
-    this.loadRegistry();
-    this.assertRegistryLoaded();
-    const now = Date.now();
-    this.registry = this.registry.filter((entry) => {
-      if (entry.channelKey === key && entry.unlinkedAt === null && !entry.sdkSessionId) {
-        log.info({ key }, "Metadata-only session entry removed");
-        return false;
+    this.mutateRegistry("clearSdkSessionId", "link", () => {
+      const now = Date.now();
+      this.registry = this.registry.filter((entry) => {
+        if (entry.channelKey === key && entry.unlinkedAt === null && !entry.sdkSessionId) {
+          log.info({ key }, "Metadata-only session entry removed");
+          return false;
+        }
+        return true;
+      });
+      for (const entry of this.registry) {
+        if (entry.channelKey === key && entry.unlinkedAt === null) {
+          entry.unlinkedAt = now;
+          entry.expiresAt = now + UNLINKED_TTL_MS;
+          log.info(
+            { key, sessionId: entry.sdkSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
+            "Session unlinked, will be deleted in 30 days",
+          );
+        }
       }
-      return true;
+      this.saveRegistry();
     });
-    for (const entry of this.registry) {
-      if (entry.channelKey === key && entry.unlinkedAt === null) {
-        entry.unlinkedAt = now;
-        entry.expiresAt = now + UNLINKED_TTL_MS;
-        log.info(
-          { key, sessionId: entry.sdkSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
-          "Session unlinked, will be deleted in 30 days",
-        );
-      }
-    }
-    this.saveRegistry();
   }
 
   /**
@@ -909,57 +932,62 @@ export class SessionStore {
    * the chat title, participants, and reply target are still valid.
    */
   retireSdkSessionId(key: string): string | undefined {
-    this.loadRegistry();
-    this.assertRegistryLoaded();
-    const now = Date.now();
-    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && e.sdkSessionId);
-    if (!entry) return undefined;
+    return this.mutateRegistry("retireSdkSessionId", "link", () => {
+      const now = Date.now();
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && e.sdkSessionId);
+      if (!entry) return undefined;
 
-    const retiredSessionId = entry.sdkSessionId;
-    entry.unlinkedAt = now;
-    entry.expiresAt = now + UNLINKED_TTL_MS;
+      const retiredSessionId = entry.sdkSessionId;
+      entry.unlinkedAt = now;
+      entry.expiresAt = now + UNLINKED_TTL_MS;
 
-    this.registry.push({
-      sdkSessionId: "",
-      channelKey: key,
-      createdAt: now,
-      lastActiveAt: now,
-      unlinkedAt: null,
-      expiresAt: null,
-      stats: {
-        totalQueries: 0,
-        totalCostUsd: 0,
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalCacheReadTokens: 0,
-        totalCacheCreationTokens: 0,
-        contextUsed: 0,
-        contextMax: 0,
-      },
-      ...(entry.replyTarget ? { replyTarget: entry.replyTarget } : {}),
-      ...(entry.chatTitle ? { chatTitle: entry.chatTitle } : {}),
-      ...(entry.participants ? { participants: [...entry.participants] } : {}),
-      ...(entry.participantIds ? { participantIds: structuredClone(entry.participantIds) } : {}),
-      // Routing provenance outlives the retired transcript: once the retired
-      // copy expires, this stub is all that remembers the raw key an
-      // identity's removal must restore cron jobs to.
-      ...(entry.migratedFrom ? { migratedFrom: entry.migratedFrom } : {}),
+      this.registry.push({
+        sdkSessionId: "",
+        channelKey: key,
+        createdAt: now,
+        lastActiveAt: now,
+        unlinkedAt: null,
+        expiresAt: null,
+        stats: {
+          totalQueries: 0,
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          contextUsed: 0,
+          contextMax: 0,
+        },
+        ...(entry.replyTarget ? { replyTarget: entry.replyTarget } : {}),
+        ...(entry.chatTitle ? { chatTitle: entry.chatTitle } : {}),
+        ...(entry.participants ? { participants: [...entry.participants] } : {}),
+        ...(entry.participantIds ? { participantIds: structuredClone(entry.participantIds) } : {}),
+        // Routing provenance outlives the retired transcript: once the retired
+        // copy expires, this stub is all that remembers the raw key an
+        // identity's removal must restore cron jobs to.
+        ...(entry.migratedFrom ? { migratedFrom: entry.migratedFrom } : {}),
+      });
+
+      this.saveRegistry();
+      log.warn(
+        { key, sessionId: retiredSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
+        "SDK session retired, metadata preserved",
+      );
+      return retiredSessionId;
     });
-
-    this.saveRegistry();
-    log.warn(
-      { key, sessionId: retiredSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
-      "SDK session retired, metadata preserved",
-    );
-    return retiredSessionId;
   }
 
   /** Delete expired unlinked sessions and their SDK JSONL files */
   private cleanupExpired(): void {
-    // Runs from the constructor, so it must not throw. It also unlinks SDK
-    // JSONL files, which is irreversible — never do that from a registry we
-    // could not read.
-    if (!this.canWriteRegistry("cleanupExpired")) return;
+    // Runs from the constructor, so it must not throw — hence "bookkeeping",
+    // which turns both an unreadable registry and an unavailable lock into a
+    // skip. It also unlinks SDK JSONL files, which is irreversible: never do
+    // that from a registry we could not read, or while another process might
+    // be re-linking one.
+    this.mutateRegistry("cleanupExpired", "bookkeeping", () => this.cleanupExpiredLocked());
+  }
+
+  private cleanupExpiredLocked(): void {
     const now = Date.now();
     const sdkDir = this.sdkSessionsDir;
     const expired = this.registry.filter((e) => e.expiresAt !== null && e.expiresAt <= now);
@@ -1024,55 +1052,55 @@ export class SessionStore {
 
   /** Set and persist the reply target for a session key. No-op if unchanged. */
   setReplyTarget(key: string, target: ReplyTarget): void {
-    this.loadRegistry();
-    // Checked BEFORE ensureActiveEntry, which would otherwise push a stub into
-    // the in-memory registry that we then could not persist.
-    if (!this.canWriteRegistry("setReplyTarget")) return;
-    const entry = this.ensureActiveEntry(key);
-    const prev = entry.replyTarget;
-    if (prev && prev.channelName === target.channelName && prev.chatId === target.chatId) return;
-    entry.replyTarget = target;
-    this.saveRegistryBestEffort("setReplyTarget");
+    // mutateRegistry's guards run BEFORE ensureActiveEntry, which would
+    // otherwise push a stub into the in-memory registry we cannot persist.
+    this.mutateRegistry("setReplyTarget", "bookkeeping", () => {
+      const entry = this.ensureActiveEntry(key);
+      const prev = entry.replyTarget;
+      if (prev && prev.channelName === target.channelName && prev.chatId === target.chatId) return;
+      entry.replyTarget = target;
+      this.saveRegistryBestEffort("setReplyTarget");
+    });
   }
 
   /** Persist a friendly chat title for a session (mainly groups). No-op if unchanged. */
   setChatTitle(key: string, title: string): void {
-    this.loadRegistry();
-    if (!this.canWriteRegistry("setChatTitle")) return;
-    const entry = this.ensureActiveEntry(key);
-    if (entry.chatTitle !== title) {
-      entry.chatTitle = title;
-      this.saveRegistryBestEffort("setChatTitle");
-    }
+    this.mutateRegistry("setChatTitle", "bookkeeping", () => {
+      const entry = this.ensureActiveEntry(key);
+      if (entry.chatTitle !== title) {
+        entry.chatTitle = title;
+        this.saveRegistryBestEffort("setChatTitle");
+      }
+    });
   }
 
   /** Add a participant name (and, when known, its stable sender id) to a
    *  session. No-op if nothing new was learned. */
   addParticipant(key: string, name: string, senderId?: string): void {
-    this.loadRegistry();
     // Bookkeeping, and on the INBOUND path: updateGroupContext calls this
     // before the message is appended to the transcript, and the rejection is
     // swallowed upstream — a throw here silently drops the message.
-    if (!this.canWriteRegistry("addParticipant")) return;
-    const entry = this.ensureActiveEntry(key);
-    let changed = false;
+    this.mutateRegistry("addParticipant", "bookkeeping", () => {
+      const entry = this.ensureActiveEntry(key);
+      let changed = false;
 
-    const list = entry.participants ?? [];
-    if (!list.includes(name)) {
-      entry.participants = [...list, name];
-      changed = true;
-    }
-
-    if (senderId) {
-      const byId = entry.participantIds ?? {};
-      const names = byId[senderId] ?? [];
-      if (!names.includes(name)) {
-        entry.participantIds = { ...byId, [senderId]: [...names, name] };
+      const list = entry.participants ?? [];
+      if (!list.includes(name)) {
+        entry.participants = [...list, name];
         changed = true;
       }
-    }
 
-    if (changed) this.saveRegistryBestEffort("addParticipant");
+      if (senderId) {
+        const byId = entry.participantIds ?? {};
+        const names = byId[senderId] ?? [];
+        if (!names.includes(name)) {
+          entry.participantIds = { ...byId, [senderId]: [...names, name] };
+          changed = true;
+        }
+      }
+
+      if (changed) this.saveRegistryBestEffort("addParticipant");
+    });
   }
 
   /** Active entry for a key, creating a metadata-only stub (empty sdkSessionId)
@@ -1109,8 +1137,10 @@ export class SessionStore {
 
   /** Migrate a session from one key to another (for identity-based session unification) */
   migrateSessionKey(oldKey: string, newKey: string): void {
-    this.loadRegistry();
-    this.assertRegistryLoaded();
+    this.mutateRegistry("migrateSessionKey", "link", () => this.migrateSessionKeyLocked(oldKey, newKey));
+  }
+
+  private migrateSessionKeyLocked(oldKey: string, newKey: string): void {
     const idx = this.registry.findIndex((e) => e.channelKey === oldKey && e.unlinkedAt === null);
     if (idx === -1) return;
     const entry = this.registry[idx];
@@ -1168,6 +1198,100 @@ export class SessionStore {
 
   private get registryPath(): string {
     return join(this.dir, "_sessions.json");
+  }
+
+  /** Advisory lock serializing registry read-modify-write against other processes. */
+  private get registryLockPath(): string {
+    return `${this.registryPath}.lock`;
+  }
+
+  /**
+   * Run one registry read-modify-write: lock, re-read, guard, mutate, save.
+   *
+   * Every mutator goes through here, because "load, change it in memory, write
+   * the whole snapshot back" is a read-modify-write with no concurrency control
+   * of its own, and this registry has short-lived writers (`tomo sessions
+   * clear`, the identity migration in `tomo config`) racing a daemon that
+   * writes on every inbound message. The daemon loading the file, the CLI
+   * clearing an SDK link, and the daemon then publishing its earlier snapshot
+   * restores the link the CLI just cleared — a lost update no atomic rename can
+   * prevent, since both writes are individually atomic.
+   *
+   * Two things close it. The lock keeps any other process out of its own
+   * read-modify-write for the whole cycle. And the read inside is FORCED past
+   * the mtime/size stat cache, so the snapshot we publish is the file we just
+   * read: same-size writes landing inside one mtime tick (a `sdkSessionId`
+   * swapped for another of equal length, say) used to be invisible.
+   *
+   * The mode is the existing split, extended to cover a lock we could not take:
+   * - `"link"` — changes WHICH SDK session a key resolves to. Throws
+   *   (`SessionRegistryReadError`, `FileLockTimeoutError`) before touching
+   *   anything, because inventing a link orphans a JSONL for good.
+   * - `"bookkeeping"` — stats, timestamps, titles, participants, reply target.
+   *   Logs and skips, never throws: these sit on the inbound and
+   *   turn-completion paths where a throw drops a message or fails a good turn.
+   *
+   * Re-entrant: `setSdkSessionId` calls `clearSdkSessionId`, and every
+   * `saveRegistry` takes the same lock. The nested frames skip the forced
+   * re-read — the outer frame already did it, and re-reading would discard the
+   * mutation the outer frame is in the middle of making.
+   */
+  private mutateRegistry<T>(op: string, mode: "link" | "bookkeeping", fn: () => T): T | undefined {
+    const strict = mode === "link";
+    const nested = isFileLockHeldSync(this.registryLockPath);
+    const body = (): T | undefined => {
+      if (!nested && !this.registryDirty) {
+        // Force a real read: the stat cache exists to skip re-parsing a file
+        // nothing has touched, and "nothing has touched it" is exactly what a
+        // concurrent writer falsifies (a same-size write inside one mtime tick
+        // is invisible to it). Skipped while we are holding a change that could
+        // not be saved yet — re-reading would drop it, and the next successful
+        // save is what publishes it.
+        this.registryStat = null;
+      }
+      this.loadRegistry();
+      if (strict) this.assertRegistryLoaded();
+      else if (!this.canWriteRegistry(op)) return undefined;
+      return fn();
+    };
+
+    let entered = false;
+    try {
+      return withFileLockSync(this.registryLockPath, () => {
+        entered = true;
+        this.registryLockErrorLogged = false;
+        return body();
+      }, REGISTRY_LOCK_OPTIONS);
+    } catch (err) {
+      // Anything `fn` itself threw keeps its existing meaning.
+      if (entered) throw err;
+      if (err instanceof FileLockTimeoutError) {
+        if (strict) throw err;
+        this.noteRegistryLockFailure(
+          op, err,
+          "Skipping session-registry bookkeeping write: another process is holding the registry lock",
+        );
+        return undefined;
+      }
+      // The lock could not be CREATED (EACCES/EROFS on the sessions directory,
+      // something occupying the lock path). Degrade to an unlocked cycle rather
+      // than refusing: the lock lives beside the registry, so a directory that
+      // will not take the lock will not take the atomic write's temp file
+      // either — the save fails the same way it did before this lock existed,
+      // and bookkeeping keeps its change in memory for the next attempt.
+      this.noteRegistryLockFailure(
+        op, err,
+        "Session-registry write proceeding without exclusion: the lock could not be created",
+      );
+      return body();
+    }
+  }
+
+  /** Log a lock failure once per streak, like the read/write failure paths. */
+  private noteRegistryLockFailure(op: string, err: unknown, msg: string): void {
+    if (this.registryLockErrorLogged) return;
+    this.registryLockErrorLogged = true;
+    log.warn({ err, file: this.registryPath, op }, msg);
   }
 
   private get pendingNotesPath(): string {
@@ -1345,6 +1469,8 @@ export class SessionStore {
         this.canWriteRegistry(op);
         return;
       }
+      // The change lives on in memory only — see `registryDirty`.
+      this.registryDirty = true;
       if (!this.registryWriteErrorLogged) {
         this.registryWriteErrorLogged = true;
         log.error(
@@ -1382,7 +1508,25 @@ export class SessionStore {
     // shipped, had no log line at all.
     if (this.registryLoadError !== null) throw this.registryLoadError;
     const data: SessionRegistry = { version: 1, sessions: this.registry };
-    writeJsonAtomicSync(this.registryPath, data);
+    // Normally a re-entry (mutateRegistry already holds it), so this costs
+    // nothing; it is here so that no path can publish the registry without the
+    // lock — `migrateOldFormat` saves straight out of `loadRegistry`. A lock
+    // that cannot be created falls through to the bare write, which then
+    // reports the real reason the directory is unusable.
+    let written = false;
+    try {
+      withFileLockSync(this.registryLockPath, () => {
+        written = true;
+        writeJsonAtomicSync(this.registryPath, data);
+      }, REGISTRY_LOCK_OPTIONS);
+    } catch (err) {
+      // Past the lock: the write itself failed, and that is the caller's news.
+      if (written) throw err;
+      // A live holder is a refusal, not a reason to publish anyway.
+      if (err instanceof FileLockTimeoutError) throw err;
+      writeJsonAtomicSync(this.registryPath, data);
+    }
+    this.registryDirty = false;
     if (this.registryWriteErrorLogged) {
       this.registryWriteErrorLogged = false;
       log.info({ file: this.registryPath }, "Session-registry writes succeeding again");

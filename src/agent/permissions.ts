@@ -1198,7 +1198,12 @@ function writeVerbTargetDenial(
   verb: string,
   cwd: string,
 ): string | null {
-  const absolute = absolutePathTokens(cmd);
+  // `/dev/null` and friends are sinks, not places: a compound command that
+  // says `… > /dev/null; rm -rf /tmp/scratch` names `/dev/null` as a token of
+  // the whole line, and the verb check used to hold `rm` to it — "`rm` writes
+  // and `/dev/null` is outside this agent's writeRoots". The redirect check
+  // already knows these targets are harmless; the verb check has to agree.
+  const absolute = absolutePathTokens(cmd).filter((token) => !HARMLESS_REDIRECT_TARGET.test(token));
   if (profile.bash === "readonly" && absolute.length === 0) {
     return `\`${verb}\` writes, and in "readonly" mode a write has to name an absolute path inside this agent's writeRoots (${profile.writeRoots.join(", ") || "none configured"}).`;
   }

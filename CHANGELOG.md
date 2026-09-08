@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Agent profiles: a write verb is no longer held to `/dev/null` (or `/dev/stdout`, `/dev/stderr`, `/dev/tty`, `/dev/fd/N`) appearing as a redirect target elsewhere on the same command line. `xcodebuild test > /dev/null 2>&1; rm -rf /tmp/scratch` was refused for a readonly agent as "`rm` writes and `/dev/null` is outside this agent's writeRoots"; the redirect check already treated these sinks as harmless and the verb check now agrees.
 - Pin `zod` to 4.4.3 (exact). zod 4.5 changed the internal `optin` marker of `.default()` schemas from `"optional"` to `"defaulted"`; the Agent SDK's bundled zod builds the in-process MCP tool object schemas and does not recognise the new marker, so every omitted defaulted argument (`react_to_message.remove`, `recall_conversation.limit`, `send_message.mode`, `upsert_person.replace_aliases`) failed with "expected nonoptional". Dependabot now ignores zod minor/major bumps until the SDK catches up.
 - **Per-agent permission scoping.** A new optional `agentProfiles` map in `~/.tomo/config.json` fences a subagent type into `writeRoots`, two deny lists and one of four Bash modes (`none` / `readonly` / `worktree` / `full`), enforced by a `PreToolUse` hook keyed off the SDK's `agent_type`. Every session runs `bypassPermissions` and the SDK propagates that into subagents, so until now an agent declared "read-only reviewer" had a full shell on the whole machine — `AgentDefinition` scopes tools and has no notion of a path.
 

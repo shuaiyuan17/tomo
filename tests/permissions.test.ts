@@ -1294,6 +1294,17 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("touch /etc/marker", REVIEWER)).toContain("outside this agent's writeRoots");
     });
 
+    it("does not hold a write verb to a /dev/null redirect elsewhere on the line", () => {
+      // Seen 9/8 on the first real readonly review: a compound command with
+      // `> /dev/null 2>&1` in one segment and `rm -rf /tmp/…` in another was
+      // refused as "`rm` writes and `/dev/null` is outside this agent's
+      // writeRoots". The sink is not a destination.
+      expect(bash(`xcodebuild test > /dev/null 2>&1; rm -rf ${join(scratch, "Logs")}`, REVIEWER)).toBeNull();
+      expect(bash(`cat ${join(scratch, "a")} > /dev/stderr && rm ${join(scratch, "a")}`, REVIEWER)).toBeNull();
+      // ...but a bare `rm x > /dev/null` still names no destination in readonly mode.
+      expect(bash("rm -rf x > /dev/null", REVIEWER)).toContain("has to name an absolute path");
+    });
+
     it("allows a redirection INTO a writeRoot and denies one outside it", () => {
       expect(bash(`echo hi > ${join(scratch, "x")}`, REVIEWER)).toBeNull();
       const noScratch: Profile = { ...REVIEWER, writeRoots: [worktree] };

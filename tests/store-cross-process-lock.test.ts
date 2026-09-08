@@ -78,10 +78,19 @@ describe("registry writes under the advisory lock", () => {
     const store = newSessionStore();
     store.setSdkSessionId("telegram:1", "sess-aaaa");
 
+    // Pin the mtime to a whole second before anything is compared: utimes
+    // takes seconds, and a sub-millisecond mtime (Linux keeps nanoseconds)
+    // does not survive the /1000 round trip exactly — CI failed on a 0.0003ms
+    // difference that had nothing to do with the stat cache. The read below
+    // makes the store re-stat the pinned file, so its cache matches `before`.
+    const pinnedSec = Math.floor(Date.now() / 1000) - 1;
+    utimesSync(REGISTRY(), pinnedSec, pinnedSec);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sess-aaaa");
+
     const before = statSync(REGISTRY());
     const swapped = readFileSync(REGISTRY(), "utf-8").replace("sess-aaaa", "sess-bbbb");
     writeFileSync(REGISTRY(), swapped);
-    utimesSync(REGISTRY(), before.atimeMs / 1000, before.mtimeMs / 1000);
+    utimesSync(REGISTRY(), pinnedSec, pinnedSec);
 
     // The write really is invisible to the stat cache — otherwise this test
     // would be passing for the wrong reason.

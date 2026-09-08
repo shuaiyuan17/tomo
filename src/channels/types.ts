@@ -234,6 +234,24 @@ export type MessageHandler = (message: IncomingMessage) => Promise<boolean>;
  */
 export type CommandHandler = (command: string, chatId: string, senderName: string, args?: string, senderId?: string) => Promise<void>;
 
+/**
+ * "Would the agent accept a message from this chat at all?" — asked by a
+ * channel BEFORE it does expensive work on an inbound message that the agent
+ * is going to throw away anyway.
+ *
+ * The allowlist decision itself stays where it has always been, in
+ * `Agent.enqueueMessage`: this predicate is an OPTIMISATION, not the gate. A
+ * channel that is told `false` must still dispatch the message (text-only,
+ * without whatever it declined to fetch) so the agent makes — and logs — the
+ * real custody decision. Skipping the dispatch would delete the audit trail
+ * and, for a group, the `groupSecret` activation path that runs through it.
+ *
+ * Deliberately conservative in both directions: `true` is not permission to
+ * deliver, and `false` is only a reason not to spend. Channels that register
+ * no predicate stay fully permissive.
+ */
+export type AdmissionPredicate = (chatId: string) => boolean;
+
 export interface Channel {
   /** Channel identifier (e.g. "telegram", "imessage") */
   readonly name: string;
@@ -243,6 +261,16 @@ export interface Channel {
 
   /** Register a handler for slash commands */
   onCommand(handler: CommandHandler): void;
+
+  /**
+   * Register the predicate a channel may consult before spending real
+   * resources (a remote download, a conversion, a write to disk) on an inbound
+   * message. Optional on both sides: the Agent registers one for every channel
+   * it adds, and a channel that does no such pre-dispatch work simply does not
+   * implement the method. See AdmissionPredicate — it never replaces the
+   * agent-side allowlist check.
+   */
+  onAdmission?(predicate: AdmissionPredicate): void;
 
   /**
    * Send a message through this channel.

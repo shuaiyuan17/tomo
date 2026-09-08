@@ -213,6 +213,34 @@ describe("allowlist enforcement", () => {
 
     await agent.stop();
   });
+
+  // Channels ask this BEFORE they download an attachment (Telegram's photo and
+  // document handlers), so an excluded chat cannot make the daemon spend
+  // bandwidth, CPU and disk on bytes enqueueMessage is about to drop anyway.
+  // The answer has to come from the same allowlist, not a second copy of it.
+  it("registers an admission predicate backed by the router allowlist", async () => {
+    resetConfig({ channelAllowlists: { telegram: ["12345"] } });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    expect(typeof tg.admissionPredicate).toBe("function");
+    expect(tg.admissionPredicate?.("12345")).toBe(true);
+    expect(tg.admissionPredicate?.("999")).toBe(false);
+
+    await agent.stop();
+  });
+
+  it("admits every chat on a channel with no allowlist", async () => {
+    resetConfig({ channelAllowlists: {} });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    expect(tg.admissionPredicate?.("anything")).toBe(true);
+
+    await agent.stop();
+  });
 });
 
 // ===== Group chat =====

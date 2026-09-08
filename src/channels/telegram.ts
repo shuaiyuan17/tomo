@@ -1,7 +1,7 @@
 import { Bot, GrammyError, type Context } from "grammy";
 import { existsSync } from "node:fs";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
-import type { Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
+import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
 import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
@@ -118,6 +118,8 @@ export class TelegramChannel implements Channel {
   private bot: Bot;
   private handlers: MessageHandler[] = [];
   private commandHandlers: CommandHandler[] = [];
+  /** Set by the Agent (onAdmission). Absent = every chat is admitted. */
+  private admissionPredicate: AdmissionPredicate | undefined;
   private botUsername: string | undefined;
   private stopping = false;
   private imageStoreBaseDir: string | undefined;
@@ -187,7 +189,13 @@ export class TelegramChannel implements Channel {
       const isMentioned = this.checkMentioned(ctx);
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
-      const image = await this.downloadPhoto(largest.file_id, String(ctx.chat.id));
+      // Anyone on Telegram can message a bot, and getFile + the file download
+      // happen long before the agent's allowlist gets a say. Ask first: a chat
+      // the agent will refuse gets no getFile, no fetch of up to 20 MB, no
+      // HEIC/JPEG normalisation and no write to the inbound image store.
+      const image = this.isAdmitted(String(ctx.chat.id))
+        ? await this.downloadPhoto(largest.file_id, String(ctx.chat.id))
+        : undefined;
 
       const caption = this.cleanMention(ctx.message.caption ?? "");
       const savedPaths = image?.savedPath ? [image.savedPath] : [];
@@ -236,13 +244,17 @@ export class TelegramChannel implements Channel {
         return;
       }
 
-      const document = await this.downloadDocument(
-        doc.file_id,
-        doc.mime_type as string,
-        doc.file_name,
-        doc.file_size,
-        String(ctx.chat.id),
-      );
+      // Same admission check as the photo path, and for the same reason —
+      // this one can pull a 20 MB PDF and persist it.
+      const document = this.isAdmitted(String(ctx.chat.id))
+        ? await this.downloadDocument(
+          doc.file_id,
+          doc.mime_type as string,
+          doc.file_name,
+          doc.file_size,
+          String(ctx.chat.id),
+        )
+        : undefined;
 
       const caption = this.cleanMention(ctx.message.caption ?? "");
       const savedPaths = document?.savedPath ? [document.savedPath] : [];
@@ -530,6 +542,36 @@ export class TelegramChannel implements Channel {
 
   onCommand(handler: CommandHandler): void {
     this.commandHandlers.push(handler);
+  }
+
+  onAdmission(predicate: AdmissionPredicate): void {
+    this.admissionPredicate = predicate;
+  }
+
+  /**
+   * May we spend on this chat's attachment? Only ever gates FETCHING — the
+   * message is dispatched either way (text-only when refused), so the agent
+   * still makes and logs the custody decision, and a group can still be
+   * activated by the `groupSecret` exactly as before.
+   *
+   * Fails CLOSED. A predicate that throws leaves admission unknown, and the
+   * cost of guessing wrong differs by a lot: not downloading costs a picture
+   * the agent may re-request, downloading for a chat that turns out to be
+   * excluded is the bandwidth and disk this guard exists to deny.
+   */
+  private isAdmitted(chatId: string): boolean {
+    if (!this.admissionPredicate) return true;
+    let admitted: boolean;
+    try {
+      admitted = this.admissionPredicate(chatId);
+    } catch (err) {
+      log.warn({ err: this.redactToken(err), chatId }, "Telegram admission check failed; skipping attachment download");
+      return false;
+    }
+    if (!admitted) {
+      log.debug({ chatId }, "Telegram attachment not downloaded (chat not in allowlist)");
+    }
+    return admitted;
   }
 
   startTyping(chatId: string): () => void {

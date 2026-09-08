@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
 import type { CronJob, CronSchedule, InterruptedSkip } from "./types.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
+import { log } from "../logger.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
 
@@ -19,6 +20,56 @@ export const ONE_SHOT_RETRY_DELAY_MS = 5 * 60_000;
  * (or a daemon in a crash loop) re-fires forever, once per restart.
  */
 export const MAX_RESUME_ATTEMPTS = 3;
+
+/**
+ * Floor for a recurring ("every") interval, in milliseconds. Kept equal to the
+ * scheduler's `POLL_INTERVAL_MS` (30s, `src/cron/scheduler.ts` — a test pins
+ * the two together): a job cannot fire more often than the scan that dispatches
+ * it, so a shorter interval is a cadence the scheduler cannot keep. Zero is
+ * worse than unkeepable — `computeNextRun` returns `fromMs + 0`, so the job is
+ * due again the instant `markRun` records the run it just finished, and fires
+ * on every poll forever.
+ */
+export const MIN_EVERY_MS = 30_000;
+
+/**
+ * Ceiling for a recurring interval (~1 year). Guards the other end of the
+ * range: `every 99999999999999d` multiplies past `Number.MAX_SAFE_INTEGER`, and
+ * the job would be stored `enabled: true` with a `nextRunAt` no clock ever
+ * reaches — scheduled as far as every surface can tell, and silently inert.
+ */
+export const MAX_EVERY_MS = 366 * 86_400_000;
+
+/**
+ * Why this recurring interval cannot be scheduled, or null when it is usable.
+ * The phrasing slots into the refusal templates both creation surfaces use
+ * (`Cannot schedule "...": <reason>, so the job could never fire.`).
+ */
+export function everyIntervalReason(everyMs: unknown): string | null {
+  if (typeof everyMs !== "number" || !Number.isSafeInteger(everyMs)) {
+    return "its interval is not a whole number of milliseconds";
+  }
+  if (everyMs < MIN_EVERY_MS) {
+    return `an interval of ${everyMs}ms is below the ${MIN_EVERY_MS / 1000}s minimum`;
+  }
+  if (everyMs > MAX_EVERY_MS) {
+    return `an interval of ${everyMs}ms is above the ${MAX_EVERY_MS / 86_400_000}-day maximum`;
+  }
+  return null;
+}
+
+/**
+ * A schedule no writer may store, as opposed to one that is merely spent (a
+ * fired one-shot). Thrown by `CronStore.add`; the creation surfaces refuse
+ * earlier and more politely via `parseCreatableSchedule`, so reaching this is
+ * a programming error or a caller that skipped validation.
+ */
+export class InvalidScheduleError extends Error {
+  constructor(reason: string) {
+    super(`invalid schedule: ${reason}`);
+    this.name = "InvalidScheduleError";
+  }
+}
 
 export class CronStore {
   private jobs: CronJob[] = [];
@@ -51,6 +102,8 @@ export class CronStore {
    * an empty store. Cleared by the next successful load.
    */
   private loadError: unknown = null;
+  /** Job ids already reported by `quarantineBadIntervals` — warn once, not per poll. */
+  private warnedBadInterval = new Set<string>();
   private path: string;
 
   constructor(path = DEFAULT_STORE_PATH) {
@@ -84,6 +137,15 @@ export class CronStore {
     sessionKey: string;
     deleteAfterRun?: boolean;
   }): CronJob {
+    // The one schedule check the store itself owes: an unusable `every`
+    // interval is not a state this store may represent at all (unlike a past
+    // `at` time, which every fired one-shot on disk is). A caller that skipped
+    // `parseCreatableSchedule` — an older CLI, a future surface — must not be
+    // able to write `every 0s` back in.
+    if (opts.schedule.kind === "every") {
+      const bad = everyIntervalReason(opts.schedule.everyMs);
+      if (bad !== null) throw new InvalidScheduleError(bad);
+    }
     // Reload before mutating (like markRun/remove): jobs added/removed by
     // separate CLI processes while this instance holds a stale snapshot
     // would otherwise be reverted by the save below.
@@ -425,8 +487,41 @@ export class CronStore {
       throw err;
     }
     this.jobs = disk.jobs;
+    this.quarantineBadIntervals();
     this.baseline = snapshot(this.jobs);
     this.loadError = null;
+  }
+
+  /**
+   * Neutralise jobs whose `every` interval could never be honoured — a
+   * hand-edited jobs.json, or a job written by a version that predates the
+   * bounds. Rejecting the whole file (`readStore`) would take the daemon's
+   * entire schedule down over one bad record, and firing it would spin the
+   * scheduler, so the job is held inert in memory: disabled, with no next run.
+   *
+   * Applied AFTER the disk read and BEFORE the baseline snapshot, so the change
+   * is invisible to `mergeWithDisk` and the user's file is left as they wrote
+   * it — this refuses to run a job, it does not silently rewrite one. Editing
+   * the interval and restarting is enough to bring it back; `setEnabled` alone
+   * is not, and says why (`unschedulableReason`).
+   */
+  private quarantineBadIntervals(): void {
+    for (const job of this.jobs) {
+      if (job.schedule.kind !== "every") continue;
+      const bad = everyIntervalReason(job.schedule.everyMs);
+      if (bad === null) continue;
+      if (job.enabled || job.nextRunAt !== null) {
+        job.enabled = false;
+        job.nextRunAt = null;
+      }
+      // Once per job per process: load() runs on every 30s poll.
+      if (this.warnedBadInterval.has(job.id)) continue;
+      this.warnedBadInterval.add(job.id);
+      log.warn(
+        { jobId: job.id, name: job.name, schedule: job.schedule, reason: bad, path: this.path },
+        "Cron job has an unusable interval; holding it disabled",
+      );
+    }
   }
 
   /**
@@ -666,11 +761,21 @@ export function isInterrupted(job: CronJob): boolean {
  * Deliberately NOT enforced inside `add()`: the store primitive has to be able
  * to represent a one-shot whose time has passed (that is every fired `at` job
  * still on disk, and what `setEnabled` re-arms). The refusal belongs where a
- * human or the model is asking for a NEW job.
+ * human or the model is asking for a NEW job. The one exception is an `every`
+ * interval outside `MIN_EVERY_MS`..`MAX_EVERY_MS`, which is not a spent
+ * schedule but an unrepresentable one — `add()` rejects that outright.
  *
  * May throw for a malformed cron expression — callers already handle that.
  */
 export function unschedulableReason(schedule: CronSchedule, fromMs: number): string | null {
+  // Checked ahead of computeNextRun so the caller gets the actual defect
+  // ("below the 30s minimum") rather than the generic no-occurrence line, and
+  // so `every 0s` — which computeNextRun would otherwise have answered with a
+  // perfectly good timestamp — is refused at all.
+  if (schedule.kind === "every") {
+    const bad = everyIntervalReason(schedule.everyMs);
+    if (bad !== null) return bad;
+  }
   if (computeNextRun(schedule, fromMs) !== null) return null;
   if (schedule.kind === "at") {
     return Number.isNaN(parseAtSchedule(schedule.at))
@@ -723,7 +828,11 @@ export function computeNextRun(schedule: CronSchedule, fromMs: number): number |
       return ts > fromMs ? ts : null;
     }
     case "every":
-      return fromMs + schedule.everyMs;
+      // An interval outside the bounds has no honourable next run: 0 means
+      // "due again immediately, forever", and a value past MAX_SAFE_INTEGER
+      // means "never". Both read as null here, which is what every caller
+      // already treats as "this cannot fire".
+      return everyIntervalReason(schedule.everyMs) === null ? fromMs + schedule.everyMs : null;
     case "cron": {
       const cron = new Cron(schedule.expr, { timezone: schedule.tz });
       const next = cron.nextRun();

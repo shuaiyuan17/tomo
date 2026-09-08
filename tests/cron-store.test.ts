@@ -2,7 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CronStore,
   CronStoreReadError,
+  InvalidScheduleError,
+  MAX_EVERY_MS,
   MAX_RESUME_ATTEMPTS,
+  MIN_EVERY_MS,
   isInterrupted,
   mergeWithDisk,
   ONE_SHOT_MAX_RETRIES,
@@ -11,6 +14,7 @@ import {
   parseCreatableSchedule,
   unschedulableReason,
 } from "../src/cron/store.js";
+import { POLL_INTERVAL_MS } from "../src/cron/scheduler.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { cronAddRefusal, readCronJobsSafely } from "../src/cli/cron-errors.js";
 import { join } from "node:path";
@@ -78,7 +82,7 @@ describe("CronStore", () => {
     // "every" job with nextRunAt set to the past
     store.add({
       name: "overdue",
-      schedule: { kind: "every", everyMs: 1000 },
+      schedule: { kind: "every", everyMs: 60_000 },
       message: "past",
     });
     store.add({
@@ -96,6 +100,67 @@ describe("CronStore", () => {
     const due = store.getDueJobs();
     expect(due).toHaveLength(1);
     expect(due[0].name).toBe("overdue");
+  });
+
+  it("does not make a completed `every` job due again immediately", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "hourly",
+      schedule: { kind: "every", everyMs: 3_600_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    store.markRun(job.id, "ok");
+    expect(store.getDueJobs()).toHaveLength(0);
+    expect(store.get(job.id)!.nextRunAt).toBeGreaterThan(Date.now());
+  });
+
+  it("refuses to store an interval the scheduler could never honour", () => {
+    const store = new CronStore(TEST_PATH);
+    for (const everyMs of [0, MIN_EVERY_MS - 1, Number.NaN, MAX_EVERY_MS + 1, 99999999999999 * 86_400_000]) {
+      expect(() => store.add({
+        name: "hot loop",
+        schedule: { kind: "every", everyMs },
+        message: "spin",
+        sessionKey: "dm:alice",
+      }), String(everyMs)).toThrow(InvalidScheduleError);
+    }
+    expect(store.list()).toHaveLength(0);
+    // The boundary itself is a legitimate schedule.
+    expect(() => store.add({
+      name: "every 30s",
+      schedule: { kind: "every", everyMs: MIN_EVERY_MS },
+      message: "ok",
+      sessionKey: "dm:alice",
+    })).not.toThrow();
+  });
+
+  it("holds a hand-edited zero-interval job disabled instead of firing it every poll", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "legacy",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "tick",
+      sessionKey: "dm:alice",
+    });
+    // What an older CLI or a text editor could leave behind.
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    const onDisk = raw.jobs.find((j: CronJobLike) => j.id === job.id);
+    onDisk.schedule = { kind: "every", everyMs: 0 };
+    onDisk.nextRunAt = Date.now() - 1000;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const reopened = new CronStore(TEST_PATH);
+    expect(reopened.getDueJobs()).toHaveLength(0);
+    const held = reopened.get(job.id)!;
+    expect(held.enabled).toBe(false);
+    expect(held.nextRunAt).toBeNull();
+    // Held, not rewritten: the user's file still says what they wrote.
+    const still = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    expect(still.jobs.find((j: CronJobLike) => j.id === job.id).enabled).toBe(true);
+    // And re-enabling it says why, instead of quietly re-arming a spin.
+    expect(unschedulableReason(held.schedule, Date.now())).toMatch(/below the 30s minimum$/);
   });
 
   it("marks run and updates state", () => {
@@ -1138,6 +1203,35 @@ describe("unschedulableReason", () => {
     // a different failure from "already happened" and worth saying so.
     expect(unschedulableReason({ kind: "at", at: "next tuesday-ish" }, now))
       .toMatch(/not a date\/time that can be parsed/);
+  });
+
+  it("refuses a zero interval — the schedule that is due again the moment it runs", () => {
+    expect(unschedulableReason({ kind: "every", everyMs: 0 }, now))
+      .toBe(`an interval of 0ms is below the ${MIN_EVERY_MS / 1000}s minimum`);
+    // The user-facing route into the same value.
+    expect(unschedulableReason(parseScheduleString("every 0s"), now)).not.toBeNull();
+  });
+
+  it("refuses an interval below the scheduler's poll and accepts exactly the minimum", () => {
+    expect(unschedulableReason({ kind: "every", everyMs: MIN_EVERY_MS - 1 }, now))
+      .toMatch(/below the 30s minimum$/);
+    expect(unschedulableReason({ kind: "every", everyMs: MIN_EVERY_MS }, now)).toBeNull();
+  });
+
+  it("refuses an interval so large it stops being a safe integer", () => {
+    // `every 99999999999999d` — Number gets an answer, the clock never does.
+    const huge = parseScheduleString("every 99999999999999d");
+    expect(huge).toEqual({ kind: "every", everyMs: 99999999999999 * 86_400_000 });
+    expect(unschedulableReason(huge, now)).toBe("its interval is not a whole number of milliseconds");
+    expect(unschedulableReason({ kind: "every", everyMs: MAX_EVERY_MS + 1 }, now))
+      .toMatch(/above the 366-day maximum$/);
+    expect(unschedulableReason({ kind: "every", everyMs: MAX_EVERY_MS }, now)).toBeNull();
+  });
+
+  it("keeps the floor pinned to the scheduler's poll interval", () => {
+    // A job cannot fire more often than the scan that dispatches it; if one
+    // of these moves, the other has to be looked at.
+    expect(MIN_EVERY_MS).toBe(POLL_INTERVAL_MS);
   });
 
   it("names a recurring pattern with no occurrence left", () => {

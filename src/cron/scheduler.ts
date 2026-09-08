@@ -5,7 +5,12 @@ import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { watchBus } from "../watch/bus.js";
 
-const POLL_INTERVAL_MS = 30_000; // Check every 30s
+/**
+ * Due-scan cadence. Exported because it is also the floor on how often a job
+ * can fire: `MIN_EVERY_MS` in store.ts mirrors it, and a test pins the two
+ * together so shortening one without the other cannot go unnoticed.
+ */
+export const POLL_INTERVAL_MS = 30_000; // Check every 30s
 /**
  * How many times an outcome write is retried before the job is parked. The
  * turn already ran; what is failing is bookkeeping, so retrying is cheap and

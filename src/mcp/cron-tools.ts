@@ -86,7 +86,8 @@ export function buildCronTools(
           "Short slug-style name for the job (e.g. `airplant-weekly-soak`). Used in logs and `cron list` output.",
         ),
         schedule: z.string().min(1).describe(
-          'Schedule string. Examples: "in 20m", "in 3d", "2026-05-01T19:00", "every 1h", "0 9 * * *".',
+          'Schedule string. Examples: "in 20m", "in 3d", "2026-05-01T19:00", "every 1h", "0 9 * * *". '
+            + "Recurring intervals must be at least 30s (the scan interval) and at most 366 days.",
         ),
         message: z.string().min(1).max(4000).describe(
           "The text the user (or scheduler) will receive when the job fires. Written as a system message into the target session.",

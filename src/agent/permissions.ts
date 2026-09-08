@@ -5,6 +5,7 @@ import { minimatch } from "minimatch";
 import { config, RESERVED_AGENT_TYPE, type AgentProfile } from "../config.js";
 import { log } from "../logger.js";
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
+import { extractAttachments } from "./text-utils.js";
 
 // ---------------------------------------------------------------------------
 // canUseTool: re-allow `.claude/skills/` under bypassPermissions
@@ -190,6 +191,28 @@ function pathCandidates(word: string): string[] {
  */
 export type PrivateMemoryBar = "group-session" | "summoned-turn";
 
+/**
+ * The ONE place the bar is decided, so every enforcement point agrees.
+ *
+ * Three enforcement points now read it: the PreToolUse hook (sdk-options.ts),
+ * the reply-delivery attachment check (delivery-pipeline.ts) and — through the
+ * hook — the `send_message` tool. A second, independently-written copy of this
+ * rule is how one of them ends up open while the others are shut.
+ *
+ * `isGroup` rather than the session key, deliberately: this module has no
+ * business parsing session keys (that is `sessions/keys.ts`), and taking the
+ * answer as a parameter keeps its import graph small enough that the guard can
+ * be unit-tested without booting the world.
+ */
+export function privateMemoryBarFor(
+  isGroup: boolean,
+  isOwnAudienceTurn?: () => boolean,
+): PrivateMemoryBar | null {
+  if (isGroup) return "group-session";
+  if (isOwnAudienceTurn && !isOwnAudienceTurn()) return "summoned-turn";
+  return null;
+}
+
 /** Denial text for a group session — the session is barred for its lifetime. */
 export const PRIVATE_MEMORY_GROUP_DENIAL =
   `\`memory/${PRIVATE_MEMORY_SUBDIR}/\` is DM-only and not accessible from group sessions. Scans rooted at \`memory/\` are also blocked — use Read on a specific public memory file.`;
@@ -206,6 +229,39 @@ export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
   return bar === "group-session" ? PRIVATE_MEMORY_GROUP_DENIAL : PRIVATE_MEMORY_SUMMONED_DENIAL;
 }
 
+/**
+ * Why the SHELL is gone for the whole of a barred turn, whatever the command
+ * says.
+ *
+ * Not a stricter filter — the end of filtering. {@link bashTouchesMemory} is a
+ * token scan over the text the model typed, and any interpreter writes a path
+ * that text never spells:
+ *
+ *     node -e 'process.stdout.write(require("node:fs")
+ *       .readFileSync("mem"+"ory/pri"+"vate/note.txt","utf8"))'
+ *
+ * — no `memory`, no `private`, no `$`, no backtick, no glob, nothing for a
+ * regex to find. `python -c`, `perl -e`, `osascript -e`, `bash ./script.sh`,
+ * and any script the agent wrote on an earlier turn are the same shape, and
+ * they are not a list that can be completed: the argument to an interpreter is
+ * a program, and deciding what a program reads is not a job for a regex.
+ *
+ * So on a barred turn Bash is denied OUTRIGHT. The comment on
+ * {@link bashTouchesMemory} already conceded the point — "on a barred turn Bash
+ * is a convenience the model does not need" — while the code kept trying to
+ * filter it. The model keeps Read/Glob/Grep on named PUBLIC files, which are
+ * the precise arms, and the reply says so rather than leaving it to retry the
+ * same command with a different spelling.
+ */
+export const PRIVATE_MEMORY_BASH_WITHHELD =
+  `The Bash tool is not available on this turn. A shell command cannot be scoped away from \`memory/${PRIVATE_MEMORY_SUBDIR}/\` — any interpreter (\`node -e\`, \`python -c\`, a script written on an earlier turn) can assemble a path that the command text never spells — so shell access is withheld whole rather than filtered. Use Read on a named public file (MEMORY.md is already in your prompt), or Glob/Grep outside the memory tree.`;
+
+/** The reason handed back for a denied Bash call: why the shell is gone, then
+ *  why this turn is barred at all (and, for a summoned turn, the way round). */
+export function privateMemoryBashDenial(bar: PrivateMemoryBar): string {
+  return `${PRIVATE_MEMORY_BASH_WITHHELD}\n\n${privateMemoryDenialReason(bar)}`;
+}
+
 /** PreToolUse hook that denies tool calls that could surface DM-only memory
  *  in a session that is not entitled to it. Per SDK docs, PreToolUse denies
  *  bypass canUseTool, so this enforces even in bypassPermissions mode. See
@@ -218,7 +274,18 @@ export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
  *  (live-session-manager.ts), but a dm: session's entitlement changes turn to
  *  turn while a group is summoned into it — a fixed boolean would either leave
  *  the summoned window open or lock the owner out of their own memory for the
- *  life of the session. */
+ *  life of the session.
+ *
+ *  BASH IS DENIED OUTRIGHT while the bar is up, before the per-tool predicate
+ *  runs at all — see {@link PRIVATE_MEMORY_BASH_WITHHELD} for why no filter can
+ *  do this job.
+ *
+ *  SUBAGENTS GO THROUGH HERE TOO. The SDK propagates the session's hooks into
+ *  Agent-tool children, so a delegated `Bash` call on a barred turn reaches
+ *  this same PreToolUse callback and is denied by the same arm. That matters:
+ *  `agentProfileGuardHooks` below fails OPEN for a subagent type with no
+ *  profile, so a subagent is not a way round the bar only because this guard is
+ *  not scoped to the main thread. */
 export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
@@ -231,16 +298,19 @@ export function privateMemoryGuardHooks(
         // can hit the filesystem. Order does not affect the outcome.
         const reason = bar();
         if (!reason) return {};
-        if (!isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) return {};
+        const isBash = input.tool_name === "Bash";
+        if (!isBash && !isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) return {};
         log.warn(
           { key: sessionKey, tool: input.tool_name, bar: reason },
-          "Blocked access to private memory",
+          isBash ? "Blocked Bash on a private-memory-barred turn" : "Blocked access to private memory",
         );
         return {
           hookSpecificOutput: {
             hookEventName: "PreToolUse" as const,
             permissionDecision: "deny" as const,
-            permissionDecisionReason: privateMemoryDenialReason(reason),
+            permissionDecisionReason: isBash
+              ? privateMemoryBashDenial(reason)
+              : privateMemoryDenialReason(reason),
           },
         };
       }],
@@ -267,10 +337,18 @@ export function privateMemoryGuardHooks(
  *    refused outright rather than modelled.
  *  - Grep: same logic against the `glob` filter when present, plus a root
  *    check that mirrors ripgrep's default-recursive behaviour.
- *  - Bash: see {@link bashTouchesMemory}. Deliberately over-broad, and the only
- *    arm that is DEFENCE IN DEPTH rather than a decision: shell expansion
- *    happens after the hook fires, so the tokens here are not the paths the
- *    command will touch.
+ *  - `send_message`: deny when a `MEDIA:` tag in the composed message names a
+ *    path that lands in private/. THE ATTACHMENT IS THE READ — the file is
+ *    opened by the channel and its contents go to the target chat, so a tool
+ *    that never touches `file_path` was the way to ship `memory/private/x` into
+ *    a group from a turn that could not Read it. Relative paths resolve against
+ *    the workspace, the same cwd the agent runs in.
+ *  - Bash: see {@link bashTouchesMemory}. NO LONGER THE DECIDING ARM — the hook
+ *    denies every Bash call while the bar is up (see
+ *    {@link PRIVATE_MEMORY_BASH_WITHHELD}), because shell expansion and, worse,
+ *    interpreter arguments happen after the hook fires, so the tokens here are
+ *    not the paths the command will touch. Kept as a described-shape predicate
+ *    for callers that want to ask the narrower question.
  *
  *  Containment is case-folded throughout — see {@link isInside}. False
  *  positives are tolerable because the agent always has an alternative path
@@ -316,9 +394,52 @@ export function isPrivateMemoryAccess(
       if (typeof cmd !== "string") return false;
       return bashTouchesMemory(cmd, ctx);
     }
+    case SEND_MESSAGE_TOOL: {
+      const message = ti.message;
+      if (typeof message !== "string") return false;
+      return mediaPathsIn(message).some((p) => landsInPrivate(p, ctx));
+    }
     default:
       return false;
   }
+}
+
+/**
+ * The `send_message` tool AS A HOOK SEES IT.
+ *
+ * Spelled out rather than imported from `mcp/internal-server.ts`: that module
+ * pulls the whole tool surface (the SDK, zod, the cron store, the people
+ * registry) into this file's import graph, and this file is loaded by the
+ * permission hooks and unit-tested against a stub config. `tests/permissions.
+ * test.ts` asserts this string against the real `TOMO_INTERNAL_MCP_NAME`, so
+ * the two cannot drift apart unnoticed.
+ */
+export const SEND_MESSAGE_TOOL = "mcp__tomo-internal__send_message";
+
+/** The `MEDIA:` paths a composed message would ship as attachments — the same
+ *  extraction the delivery paths run, so guard and sender agree on what counts
+ *  as a tag. */
+function mediaPathsIn(message: string): string[] {
+  return extractAttachments(message).mediaPaths;
+}
+
+/**
+ * Would attaching `p` surface private memory? For the outbound side, where the
+ * caller has already decided the turn is barred.
+ *
+ * Shares {@link landsInPrivate} with the tool guard — lexical containment, the
+ * `..`-anywhere-under-memory rule, AND the symlink-resolved comparison, so a
+ * link parked under a public directory that points into private/ is caught by
+ * the path it really opens rather than the one it is spelled with. The two
+ * sides of the fence must answer the same question the same way, or the model
+ * learns that what it cannot read it can still send.
+ */
+export function isPrivateAttachmentPath(p: string): boolean {
+  return landsInPrivate(p, {
+    cwd: config.workspaceDir,
+    memoryDir: MEMORY_DIR,
+    privateDir: PRIVATE_MEMORY_DIR,
+  });
 }
 
 /** Resolve `p` to an absolute, normalized path against `cwd` if relative. */

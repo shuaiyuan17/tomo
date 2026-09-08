@@ -12,6 +12,7 @@ import {
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
+import { privateMemoryBarFor } from "./agent/permissions.js";
 import { IdentityRouter, type SessionResolution } from "./router.js";
 import {
   annotateSenderName,
@@ -233,6 +234,7 @@ export class Agent {
       },
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
       startTurnTyping: (channel, chatId, passiveListen) => this.startTurnTyping(channel, chatId, passiveListen),
+      isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       delivery: this.delivery,
     });
     const summons = new SummonStore(
@@ -869,7 +871,11 @@ export class Agent {
     let settled = false;
     // One sender for the whole background turn, so its blocks ship as they
     // complete — same path as every other ingress.
-    const sender = this.delivery.createBlockSender(channel, chatId);
+    const sender = this.delivery.createBlockSender(channel, chatId, {
+      // A background turn ships through the same fence as an owned one: its
+      // audience is whatever is registered for the session at send time.
+      blockPrivateMedia: () => this.isPrivateMemoryBarred(key),
+    });
     // Ordered per-block transcript, same rule as every owned turn: the slot is
     // taken at dispatch and filled at settle, so an abandoned send cannot let a
     // later block's entry overtake it (see agent/block-transcript.ts).
@@ -1179,6 +1185,22 @@ export class Agent {
    */
   isOwnAudienceTurn(sessionKey: string): boolean {
     return this.turnAudiences.isOwnAudienceTurn(sessionKey);
+  }
+
+  /**
+   * Is `memory/private/` closed to the turn in flight on this session?
+   *
+   * The same question the PreToolUse guard asks per tool call, from the same
+   * function (`privateMemoryBarFor`) — asked here for the OUTBOUND side, where
+   * a `MEDIA:` path is a read the tool guard never sees: the channel opens the
+   * file and puts its contents in the chat. Resolved per call, never cached:
+   * `isOwnAudienceTurn` changes turn to turn while a group is summoned in.
+   */
+  isPrivateMemoryBarred(sessionKey: string): boolean {
+    return privateMemoryBarFor(
+      isGroupSessionKey(sessionKey),
+      () => this.isOwnAudienceTurn(sessionKey),
+    ) !== null;
   }
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {

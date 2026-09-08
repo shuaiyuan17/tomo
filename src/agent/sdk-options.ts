@@ -6,7 +6,7 @@ import { isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
-import { agentProfileGuardHooks, privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
+import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
 import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
@@ -91,12 +91,12 @@ export function sdkOptions(
   // session key alone — and `isGroupSessionKey("dm:owner")` is false for
   // exactly the turns a SUMMONED group is steering, so the guard was not
   // installed at all for them.
+  //
+  // The rule itself lives in `privateMemoryBarFor` so the outbound side
+  // (delivery-pipeline.ts, which drops private MEDIA: attachments on a barred
+  // turn) decides it from the same function rather than a second copy.
   const ownAudienceTurn = sessionContext?.isOwnAudienceTurn;
-  const privateMemoryBar = (): PrivateMemoryBar | null => {
-    if (isGroup) return "group-session";
-    if (ownAudienceTurn && !ownAudienceTurn()) return "summoned-turn";
-    return null;
-  };
+  const privateMemoryBar = (): PrivateMemoryBar | null => privateMemoryBarFor(isGroup, ownAudienceTurn);
 
   // Per-subagent-type permission scoping. Read from config PER TOOL CALL, not
   // snapshotted here, for the same reason `privateMemoryBar` is a getter: these

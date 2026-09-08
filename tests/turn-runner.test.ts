@@ -65,6 +65,7 @@ function makeHarness(respond: (req: RunWithRetryRequest) => Promise<string>): Ha
       typingStarts.push({ chatId, passiveListen });
       return (options) => { typingStops.push(options); };
     },
+    isPrivateMemoryBarred: () => false,
     delivery: new DeliveryPipeline({
       queuePendingErrorNote: (sessionKey, visibleError) => {
         errorNotes.push({ sessionKey, visibleError });

@@ -195,6 +195,13 @@ export interface TurnRunnerDeps {
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
   /** Typing indicator with per-channel start delay (Agent.startTurnTyping). */
   startTurnTyping(channel: Channel, chatId: string, passiveListen?: boolean): StopTyping;
+  /** Is `memory/private/` closed to the turn in flight on this session?
+   *  (Agent.isPrivateMemoryBarred.) Resolved at send time, not turn start: the
+   *  answer changes turn to turn while a group is summoned into a dm: session.
+   *  Drives the drop of private `MEDIA:` attachments in the delivery pipeline —
+   *  the outbound half of the fence whose inbound half is the PreToolUse guard
+   *  in agent/permissions.ts. */
+  isPrivateMemoryBarred(sessionKey: string): boolean;
   delivery: DeliveryPipeline;
 }
 
@@ -432,7 +439,10 @@ export class TurnRunner {
             target.chatId,
             deliverText,
             spec.silentMatcher,
-            reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+            {
+              ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
+              blockPrivateMedia: () => this.deps.isPrivateMemoryBarred(spec.key),
+            },
           );
           if (spec.transcript === "on-delivery") {
             this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
@@ -546,7 +556,10 @@ export class TurnRunner {
         sender = this.deps.delivery.createBlockSender(
           target.channel,
           target.chatId,
-          reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {},
+          {
+            ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
+            blockPrivateMedia: () => this.deps.isPrivateMemoryBarred(spec.key),
+          },
         );
       }
 

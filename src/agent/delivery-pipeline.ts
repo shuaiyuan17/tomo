@@ -10,6 +10,7 @@ import {
 } from "../channels/types.js";
 import { deliverText } from "../channels/delivery.js";
 import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
+import { isPrivateAttachmentPath } from "./permissions.js";
 import {
   endsWithTrailingNoReply,
   extractAttachments,
@@ -147,6 +148,22 @@ interface DeliveryPipelineDeps {
 export interface DeliverOptions {
   /** Thread the reply to this provider message id, if the channel supports it. */
   replyTo?: string;
+  /**
+   * Is `memory/private/` closed to the turn being delivered? A GETTER, and for
+   * the same reason the PreToolUse guard's is (permissions.ts): a dm: session's
+   * entitlement changes turn to turn while a group is summoned into it, and a
+   * sender outlives the moment it was opened.
+   *
+   * When it answers true, a `MEDIA:` path that lands in private/ is DROPPED
+   * before the send. THE ATTACHMENT IS THE READ: the channel opens the file and
+   * puts its contents in the chat, so a turn that the hook stopped from
+   * `Read`ing `memory/private/x` could still write `MEDIA:"memory/private/x"`
+   * and have the harness carry it into the group. The tool guard and this one
+   * ask {@link isPrivateAttachmentPath} the same question, symlinks resolved.
+   *
+   * Left undefined (tests, callers with no audience notion) nothing is dropped.
+   */
+  blockPrivateMedia?: () => boolean;
 }
 
 /**
@@ -303,7 +320,20 @@ export class DeliveryPipeline {
         // provablyUndelivered); it is left alone and recorded as not known.
         let captionState: "pending" | "sent" | "unknown" = captionSegment ? "pending" : "sent";
         let captionOffered = false;
+        // Resolved once per block, not once per path: the bar cannot change
+        // part-way through one block's delivery, and this keeps the getter off
+        // the hot path for the overwhelming majority of blocks that carry no
+        // media at all.
+        const barred = media.length > 0 && (options.blockPrivateMedia?.() ?? false);
         for (const { path, segment } of media) {
+          // Handled exactly like a file that is not there: never attempted, so
+          // the segment stays not-known-delivered and the transcript records
+          // the picture as unsent — while the caption falls through to
+          // `deliverText` below and the reader still gets the words.
+          if (barred && isPrivateAttachmentPath(path)) {
+            log.warn({ chatId, path }, "Dropped a private-memory attachment: this turn's audience may not read memory/private/");
+            continue;
+          }
           if (!existsSync(path)) continue;
           // The caption rides the first readable picture, once.
           const carriesCaption = captionState === "pending" && !captionOffered;

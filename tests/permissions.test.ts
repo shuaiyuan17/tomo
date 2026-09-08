@@ -31,8 +31,10 @@ const {
   agentProfileDenial,
   agentProfileGuardHooks,
   isPrivateMemoryAccess,
+  privateMemoryBashDenial,
   privateMemoryGuardHooks,
   skillsCanUseTool,
+  SEND_MESSAGE_TOOL,
   PRIVATE_MEMORY_GROUP_DENIAL,
   PRIVATE_MEMORY_SUMMONED_DENIAL,
 } = await import("../src/agent/permissions.js");
@@ -299,6 +301,19 @@ const PRIVATE_READ = { tool_name: "Read", tool_input: { file_path: "memory/priva
 const PRIVATE_CAT = { tool_name: "Bash", tool_input: { command: "cat memory/private/x" } };
 const PRIVATE_GLOB = { tool_name: "Glob", tool_input: { path: "memory/private", pattern: "*.md" } };
 const PUBLIC_READ = { tool_name: "Read", tool_input: { file_path: "memory/MEMORY.md" } };
+const INNOCUOUS_BASH = { tool_name: "Bash", tool_input: { command: "ls -la /tmp" } };
+// THE BYPASS THIS ARM EXISTS FOR. Spells neither `memory` nor `private` in the
+// raw text nor in any dequoted token, carries no `$`, no backtick, no glob and
+// no brace — every rule in `bashTouchesMemory` passes it, and the shell hands
+// node a program that reads the file anyway. `python -c`, `perl -e`,
+// `osascript -e` and a script written on an earlier turn are the same shape;
+// the list does not end, which is why the TOOL goes rather than the spelling.
+const NODE_E_BYPASS = {
+  tool_name: "Bash",
+  tool_input: {
+    command: `node -e 'process.stdout.write(require("node:fs").readFileSync("mem"+"ory/pri"+"vate/note.txt","utf8"))'`,
+  },
+};
 
 function decision(result: PreToolUseResult): string | undefined {
   return result.hookSpecificOutput?.permissionDecision;
@@ -308,7 +323,9 @@ describe("privateMemoryGuardHooks", () => {
   it("denies private-memory access on a summoned turn, naming the summon", async () => {
     const hook = hookFor(() => "summoned-turn");
 
-    for (const call of [PRIVATE_READ, PRIVATE_CAT, PRIVATE_GLOB]) {
+    // Bash is no longer in this list: on a barred turn it is denied outright,
+    // with its own reason. See the describe below.
+    for (const call of [PRIVATE_READ, PRIVATE_GLOB]) {
       const result = await hook(call);
       expect(decision(result), call.tool_name).toBe("deny");
       expect(result.hookSpecificOutput?.permissionDecisionReason).toBe(PRIVATE_MEMORY_SUMMONED_DENIAL);
@@ -319,7 +336,7 @@ describe("privateMemoryGuardHooks", () => {
   it("allows the owner's own turn through the same hook", async () => {
     const hook = hookFor(() => null);
 
-    for (const call of [PRIVATE_READ, PRIVATE_CAT, PRIVATE_GLOB, PUBLIC_READ]) {
+    for (const call of [PRIVATE_READ, PRIVATE_CAT, PRIVATE_GLOB, PUBLIC_READ, INNOCUOUS_BASH, NODE_E_BYPASS]) {
       expect(await hook(call), call.tool_name).toEqual({});
     }
   });
@@ -351,6 +368,124 @@ describe("privateMemoryGuardHooks", () => {
     expect(decision(await hook(PRIVATE_READ))).toBe("deny");
     bar = null;
     expect(await hook(PRIVATE_READ)).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The shell is withheld WHOLE on a barred turn. `bashTouchesMemory` is a token
+// scan over text the model chose, and an interpreter's argument is a program:
+// no spelling rule decides what it will read. So the decision moved off the
+// command and onto the turn.
+// ---------------------------------------------------------------------------
+
+describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
+  for (const bar of ["group-session", "summoned-turn"] as const) {
+    describe(bar, () => {
+      it("denies an innocuous command that names no path at all", async () => {
+        const result = await hookFor(() => bar)(INNOCUOUS_BASH);
+        expect(decision(result)).toBe("deny");
+        expect(result.hookSpecificOutput?.permissionDecisionReason)
+          .toBe(privateMemoryBashDenial(bar));
+      });
+
+      it("denies the node -e concatenation bypass", async () => {
+        const result = await hookFor(() => bar)(NODE_E_BYPASS);
+        expect(decision(result)).toBe("deny");
+      });
+
+      it("denies every other interpreter shape the token scan cannot see", async () => {
+        const hook = hookFor(() => bar);
+        for (const command of [
+          `python3 -c "print(open(chr(109)+'emory/pri'+'vate/x').read())"`,
+          "perl -e 'print <>' ./notes.txt",
+          "bash ./helper.sh",
+          "./written-on-an-earlier-turn.sh",
+          "cat notes.txt",
+        ]) {
+          expect(decision(await hook({ tool_name: "Bash", tool_input: { command } })), command)
+            .toBe("deny");
+        }
+      });
+
+      it("says why the shell is gone AND why this turn is barred", async () => {
+        const reason = (await hookFor(() => bar)(INNOCUOUS_BASH))
+          .hookSpecificOutput?.permissionDecisionReason ?? "";
+        expect(reason).toContain("The Bash tool is not available on this turn");
+        expect(reason).toContain(
+          bar === "group-session" ? "not accessible from group sessions" : "summoned turn",
+        );
+      });
+    });
+  }
+
+  it("leaves Bash alone on an unbarred turn", async () => {
+    const hook = hookFor(() => null);
+    for (const call of [INNOCUOUS_BASH, NODE_E_BYPASS, PRIVATE_CAT]) {
+      expect(await hook(call), String(call.tool_input.command)).toEqual({});
+    }
+  });
+
+  it("does not widen the bar to other tools - public Read still passes", async () => {
+    expect(await hookFor(() => "group-session")(PUBLIC_READ)).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// send_message: a MEDIA: tag is a read the file-path arms never see. The
+// channel opens the path and puts its contents in the target chat, so a barred
+// turn that cannot Read `memory/private/x` must not be able to attach it.
+// ---------------------------------------------------------------------------
+
+describe("isPrivateMemoryAccess - send_message MEDIA paths", () => {
+  const call = (message: unknown) =>
+    isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "group", message }, ctx);
+
+  it("denies a relative MEDIA path inside private/", () => {
+    expect(call('here you go MEDIA:"memory/private/diary.png"')).toBe(true);
+  });
+
+  it("denies an absolute MEDIA path inside private/", () => {
+    expect(call('MEDIA:"/ws/memory/private/diary.png"')).toBe(true);
+  });
+
+  it("denies an unquoted MEDIA path inside private/", () => {
+    expect(call("MEDIA:memory/private/diary.png")).toBe(true);
+  });
+
+  it("denies when only one of several MEDIA paths is private", () => {
+    expect(call('MEDIA:"memory/cat.png"\nMEDIA:"memory/private/diary.png"')).toBe(true);
+  });
+
+  it("denies a path that traverses back into the memory tree", () => {
+    expect(call('MEDIA:"memory/../memory/private/diary.png"')).toBe(true);
+  });
+
+  it("allows a public attachment", () => {
+    expect(call('look MEDIA:"memory/cat.png"')).toBe(false);
+    expect(call('MEDIA:"/tmp/screenshot.png"')).toBe(false);
+  });
+
+  it("allows a message with no MEDIA tag, however it talks about private/", () => {
+    expect(call("I can't reach memory/private/ from here")).toBe(false);
+  });
+
+  it("ignores a non-string message", () => {
+    expect(call(undefined)).toBe(false);
+    expect(call(42)).toBe(false);
+  });
+
+  it("leaves STICKER ids alone - they name no file", () => {
+    expect(call("STICKER:memory/private/x")).toBe(false);
+  });
+
+  it("is enforced by the hook, so a barred turn's direct send is refused", async () => {
+    const hook = hookFor(() => "group-session");
+    const send = (message: string) => ({
+      tool_name: SEND_MESSAGE_TOOL,
+      tool_input: { target: "telegram:-100", mode: "direct", message },
+    });
+    expect(decision(await hook(send('MEDIA:"memory/private/diary.png"')))).toBe("deny");
+    expect(await hook(send('MEDIA:"memory/cat.png"'))).toEqual({});
   });
 });
 
@@ -433,6 +568,25 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
   it("still allows a search rooted on a symlink that lands outside memory/", () => {
     expect(isPrivateMemoryAccess("Grep", { path: "detour", pattern: "x" }, realCtx)).toBe(false);
     expect(isPrivateMemoryAccess("Glob", { path: "detour", pattern: "private/*.md" }, realCtx)).toBe(false);
+  });
+
+  it("denies a send_message attachment reached through a symlink into private/", () => {
+    // The whole point of binding the outbound check to `landsInPrivate`: the
+    // path the model wrote spells neither `private` nor anything else the
+    // guard could pattern-match, and the channel would open `secret.md`.
+    expect(isPrivateMemoryAccess(
+      SEND_MESSAGE_TOOL,
+      { target: "g", message: 'MEDIA:"memory/notes/secret.md"' },
+      realCtx,
+    )).toBe(true);
+  });
+
+  it("still allows a send_message attachment through a link outside memory/", () => {
+    expect(isPrivateMemoryAccess(
+      SEND_MESSAGE_TOOL,
+      { target: "g", message: 'MEDIA:"detour/holiday.png"' },
+      realCtx,
+    )).toBe(false);
   });
 
   it("denies a case-permuted read that the filesystem itself resolves", () => {

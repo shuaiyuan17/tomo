@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { isPidAlive } from "../file-lock.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
@@ -23,7 +24,8 @@ const PID_FILE = defaultRuntimePaths.pidFile;
 export const DAEMON_STOP_TIMEOUT_MS = 60_000;
 
 /**
- * The single liveness predicate for the whole CLI.
+ * The single liveness predicate for the whole CLI, re-exported from
+ * `src/file-lock.ts` where the advisory file lock needs the same judgement.
  *
  * `kill(pid, 0)` fails with EPERM when the process exists but belongs to
  * another uid — which is ALIVE, not dead. Treating every error as dead (as
@@ -32,14 +34,7 @@ export const DAEMON_STOP_TIMEOUT_MS = 60_000;
  * and exited 0 while it kept polling, and `getRunningPid()` deleted its pid
  * file. Do not reintroduce a local copy of this.
  */
-export function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+export { isPidAlive };
 
 /**
  * An opaque fingerprint of the process currently holding `pid`: its start time

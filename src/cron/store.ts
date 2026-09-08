@@ -6,6 +6,7 @@ import { Cron } from "croner";
 import type { CronJob, CronSchedule, InterruptedSkip } from "./types.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
+import { withFileLockSync } from "../file-lock.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
 
@@ -492,6 +493,11 @@ export class CronStore {
     this.loadError = null;
   }
 
+  /** Advisory lock serializing the read-merge-write against other processes. */
+  private get lockPath(): string {
+    return `${this.path}.lock`;
+  }
+
   /**
    * Neutralise jobs whose `every` interval could never be honoured — a
    * hand-edited jobs.json, or a job written by a version that predates the
@@ -525,13 +531,22 @@ export class CronStore {
   }
 
   /**
-   * Publish our merged view. Optimistic concurrency, not a lock: the file
-   * carries a monotonic `revision`, we merge against the revision we just
-   * read, and we re-check that revision at the last possible moment — after
-   * the temp file is written, immediately before the rename. If another
-   * process published in between we re-read, re-merge and try again, so a
-   * write can only be lost inside the rename syscall itself instead of across
-   * the whole read-modify-write.
+   * Publish our merged view, with `jobs.json.lock` held for the whole
+   * read-merge-write.
+   *
+   * The lock is what makes this correct. The optimistic `revision` check below
+   * — re-read after the temp file is written, immediately before the rename —
+   * narrowed the race but could not close it: the check and the rename are two
+   * syscalls, so a process publishing between them was still lost. The concrete
+   * case was a `tomo cron add` passing the check while the daemon's
+   * `markStarted()` wrote a run token, and the CLI's rename erasing the only
+   * durable record that the run had been dispatched.
+   *
+   * With the lock held, no other process can be inside its own read-merge-write
+   * at all. The revision check stays as belt-and-braces (it still catches a
+   * writer that does not take the lock — a hand-edit, an older build) and the
+   * three-way merge still handles the wider window between this instance's
+   * `load()` and this save.
    */
   private save(): void {
     // Never publish from a state we could not read: that is how a transient
@@ -539,29 +554,31 @@ export class CronStore {
     this.assertLoaded();
     const dir = dirname(this.path);
     mkdirSync(dir, { recursive: true });
-    for (let attempt = 1; ; attempt++) {
-      const disk = readStore(this.path);
-      const merged = mergeWithDisk(this.baseline, this.jobs, disk.jobs);
-      try {
-        writeJsonAtomicSync(
-          this.path,
-          { version: STORE_SCHEMA_VERSION, revision: disk.revision + 1, jobs: merged },
-          {
-            beforeRename: () => {
-              if (readStore(this.path).revision !== disk.revision) {
-                throw new StaleWriteError(this.path);
-              }
+    withFileLockSync(this.lockPath, () => {
+      for (let attempt = 1; ; attempt++) {
+        const disk = readStore(this.path);
+        const merged = mergeWithDisk(this.baseline, this.jobs, disk.jobs);
+        try {
+          writeJsonAtomicSync(
+            this.path,
+            { version: STORE_SCHEMA_VERSION, revision: disk.revision + 1, jobs: merged },
+            {
+              beforeRename: () => {
+                if (readStore(this.path).revision !== disk.revision) {
+                  throw new StaleWriteError(this.path);
+                }
+              },
             },
-          },
-        );
-      } catch (err) {
-        if (err instanceof StaleWriteError && attempt < SAVE_MAX_ATTEMPTS) continue;
-        throw err;
+          );
+        } catch (err) {
+          if (err instanceof StaleWriteError && attempt < SAVE_MAX_ATTEMPTS) continue;
+          throw err;
+        }
+        this.jobs = merged;
+        this.baseline = snapshot(merged);
+        return;
       }
-      this.jobs = merged;
-      this.baseline = snapshot(merged);
-      return;
-    }
+    });
   }
 }
 

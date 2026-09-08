@@ -2,7 +2,7 @@ import { afterEach, beforeEach, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
+import type { AdmissionPredicate, Channel, IncomingMessage, MessageReaction, OutgoingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
 import { agentEnv, mockConfig, mockWorkspace, queryState, resetMockSdk } from "./agent-mocks.js";
 
 // ---------------------------------------------------------------------------
@@ -48,6 +48,10 @@ export class MockChannel implements Channel {
 
   onMessage(handler: MessageHandler) { this.messageHandler = handler; }
   onCommand(handler: CommandHandler) { this.commandHandler = handler; }
+  /** Whatever the Agent registered via onAdmission — exposed so tests can ask
+   *  it the same question a real channel would before downloading. */
+  admissionPredicate: AdmissionPredicate | null = null;
+  onAdmission(predicate: AdmissionPredicate) { this.admissionPredicate = predicate; }
 
   async send(msg: OutgoingMessage) {
     // A torn-down channel is a DEAD channel — imsg's rpc child is killed, and

@@ -454,6 +454,11 @@ export class Agent {
 
   addChannel(channel: Channel): void {
     channel.onMessage((msg) => this.enqueueMessage(channel, msg));
+    // Same allowlist the ingress path enforces, offered to the channel early
+    // so it can decline to DOWNLOAD what enqueueMessage is about to drop. It
+    // is advisory: the channel still dispatches, and the decision below is
+    // still the one that counts.
+    channel.onAdmission?.((chatId) => this.router.isAllowed(channel.name, chatId));
     channel.onCommand((cmd, chatId, senderName, args, senderId) =>
       this.commands.handle(channel, cmd, chatId, senderName, args, senderId));
     this.channels.push(channel);

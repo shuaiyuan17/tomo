@@ -1,8 +1,9 @@
-import { afterAll, describe, it, expect, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { GrammyError } from "grammy";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IncomingMessage } from "../src/channels/types.js";
 import {
   isMarkdownParseError,
   POLLING_HEALTHY_RUN_MS,
@@ -901,5 +902,154 @@ describe("inbound document with an unsupported MIME type", () => {
       mime_type: `text/${"a".repeat(100_000)}`,
     });
     expect(text.length).toBeLessThan(400);
+  });
+});
+
+/**
+ * ADMISSION — the allowlist decides before the bytes are fetched.
+ *
+ * Any Telegram user can message a bot. The agent's allowlist check lives in
+ * `Agent.enqueueMessage`, which only runs once the channel has already called
+ * getFile, downloaded up to 20 MB, normalised it and (with an image store
+ * configured) written it to disk. `onAdmission` hands the channel that same
+ * predicate up front, so a chat the agent will refuse costs nothing.
+ *
+ * It gates the DOWNLOAD only. The message is still dispatched, text-only, so
+ * the agent makes and logs the real custody decision — and so a group can
+ * still be activated by posting the groupSecret exactly as before.
+ */
+describe("TelegramChannel attachment admission", () => {
+  interface BotInternals {
+    botInfo: unknown;
+    api: Record<string, unknown>;
+    handleUpdate: (update: unknown) => Promise<void>;
+  }
+
+  const chat = { id: 42, type: "private" as const, first_name: "Alice" };
+  const from = { id: 7, is_bot: false, first_name: "Alice" };
+  const storeDirs: string[] = [];
+
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn(async () => new Response(new Uint8Array([137, 80, 78, 71])));
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  afterAll(() => {
+    for (const dir of storeDirs) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeChannel(admit?: (chatId: string) => boolean) {
+    const storeDir = mkdtempSync(join(tmpdir(), "tomo-telegram-inbound-"));
+    storeDirs.push(storeDir);
+    const channel = new TelegramChannel("123456:TEST-TOKEN", { imageStoreBaseDir: storeDir });
+    const bot = (channel as unknown as { bot: BotInternals }).bot;
+    bot.botInfo = {
+      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business_account: false,
+      has_main_web_app: false,
+    };
+    const getFileCalls: string[] = [];
+    bot.api.getFile = async (fileId: string) => {
+      getFileCalls.push(fileId);
+      return { file_id: fileId, file_unique_id: "u", file_path: "photos/file_1.png" };
+    };
+    if (admit) channel.onAdmission(admit);
+    const received: IncomingMessage[] = [];
+    channel.onMessage(async (msg) => { received.push(msg); return true; });
+    return { channel, bot, getFileCalls, received, storeDir };
+  }
+
+  const photoUpdate = (caption?: string) => ({
+    update_id: 1,
+    message: {
+      message_id: 5, date: 1_700_000_000, chat, from,
+      photo: [{ file_id: "photo-1", file_unique_id: "u1", width: 10, height: 10 }],
+      ...(caption === undefined ? {} : { caption }),
+    },
+  });
+
+  const documentUpdate = (caption?: string) => ({
+    update_id: 2,
+    message: {
+      message_id: 6, date: 1_700_000_000, chat, from,
+      ...(caption === undefined ? {} : { caption }),
+      document: {
+        file_id: "doc-1", file_unique_id: "u2",
+        file_name: "report.pdf", mime_type: "application/pdf", file_size: 1024,
+      },
+    },
+  });
+
+  it("does not fetch a photo from a chat the agent will refuse", async () => {
+    const { bot, getFileCalls, received, storeDir } = makeChannel(() => false);
+
+    await bot.handleUpdate(photoUpdate("look at this"));
+
+    expect(getFileCalls).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readdirSync(storeDir)).toEqual([]);
+
+    // Still dispatched, text-only: the agent's own allowlist branch is the
+    // audit trail (and the groupSecret path), and it must still run.
+    expect(received).toHaveLength(1);
+    expect(received[0].images).toBeUndefined();
+    expect(received[0].text).toBe("[Sent an image] look at this");
+  });
+
+  it("does not fetch a document from a chat the agent will refuse", async () => {
+    const { bot, getFileCalls, received, storeDir } = makeChannel(() => false);
+
+    await bot.handleUpdate(documentUpdate("the report"));
+
+    expect(getFileCalls).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readdirSync(storeDir)).toEqual([]);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].documents).toBeUndefined();
+    expect(received[0].text).toBe("[Sent a document] the report");
+  });
+
+  it("downloads and attaches a photo from an admitted chat", async () => {
+    const { bot, getFileCalls, received } = makeChannel((chatId) => chatId === "42");
+
+    await bot.handleUpdate(photoUpdate("look at this"));
+
+    expect(getFileCalls).toEqual(["photo-1"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(received).toHaveLength(1);
+    expect(received[0].images).toHaveLength(1);
+    expect(received[0].images?.[0].mediaType).toBe("image/png");
+    expect(received[0].images?.[0].savedPath).toBeTruthy();
+    expect(received[0].text).toContain("saved to:");
+  });
+
+  it("stays permissive when no predicate is registered", async () => {
+    const { bot, getFileCalls, received } = makeChannel();
+
+    await bot.handleUpdate(photoUpdate());
+
+    expect(getFileCalls).toEqual(["photo-1"]);
+    expect(received[0].images).toHaveLength(1);
+  });
+
+  it("fails closed when the predicate throws", async () => {
+    // Admission is unknown, and the two mistakes are not symmetric: skipping
+    // costs a picture the agent can ask for again; downloading for a chat that
+    // turns out to be excluded is exactly the spend this guard exists to deny.
+    const { bot, getFileCalls, received } = makeChannel(() => { throw new Error("router exploded"); });
+
+    await bot.handleUpdate(photoUpdate());
+
+    expect(getFileCalls).toEqual([]);
+    expect(received).toHaveLength(1);
+    expect(received[0].images).toBeUndefined();
   });
 });

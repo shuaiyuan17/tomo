@@ -1,5 +1,5 @@
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, readSync, fstatSync, linkSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
 import { isDmSessionKey } from "./keys.js";
@@ -23,6 +23,26 @@ const UNLINKED_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
  * reclaimed (see src/file-lock.ts).
  */
 const REGISTRY_LOCK_OPTIONS: FileLockOptions = { timeoutMs: 2_000 };
+
+/**
+ * The transcript-migration critical section is a handful of `rename`s that run
+ * once per key per process, so contention past a second means the holder is
+ * wedged — and waiting longer just blocks an inbound message for a migration
+ * the next start can redo.
+ */
+const TRANSCRIPT_LOCK_OPTIONS: FileLockOptions = { timeoutMs: 1_000 };
+
+/** Rename `from` onto `to`, treating "it is already gone" as done: another
+ *  process running the same migration is the expected reason. */
+function renameIfPresent(from: string, to: string): boolean {
+  try {
+    renameSync(from, to);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
 
 // Floor for the in-memory transcript tail: enough to cover historyLimit user
 // turns with generous margin (a turn is typically 2-3 messages) while keeping
@@ -432,6 +452,59 @@ export class SessionRegistryReadError extends Error {
   }
 }
 
+/**
+ * The filename stem Tomo used for a transcript before the collision fix, and
+ * the one it still uses for every key it safely can.
+ *
+ * MANY-TO-ONE, which is the whole problem: every character outside
+ * `[A-Za-z0-9_-]` becomes `_`, so `imessage:any;-;alex.smith@example.com` and
+ * `imessage:any;-;alex_smith@example.com` — two different people — name the
+ * same file. Kept as a named helper because the lazy migration in
+ * `SessionStore` has to be able to find files written under the old scheme.
+ */
+export function legacyTranscriptFileStem(key: string): string {
+  return key.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/**
+ * Keys made only of these characters keep their legacy stem. `_` is
+ * deliberately absent: a `_` in the key is indistinguishable from an encoded
+ * `:`, so `dm:a_b` and `dm:a:b` would still collide.
+ */
+const LEGACY_STABLE_KEY_CHAR = /[^A-Za-z0-9:-]/;
+
+/** Bits of SHA-256 kept as the disambiguating suffix — 48, i.e. ~16.7M keys
+ *  before a 50% birthday chance, against a personal assistant's dozens. */
+const KEY_HASH_HEX_CHARS = 12;
+
+/**
+ * The filename stem for a session key's transcript: `<stem>.jsonl` for the
+ * active file, `_archive_<stem>_<YYYY-MM>.jsonl` for rotation archives.
+ *
+ * INJECTIVE, which `legacyTranscriptFileStem` is not:
+ *
+ * - A key drawn only from `[A-Za-z0-9:-]` keeps its legacy stem, so `dm:alice`,
+ *   `telegram:123` and `telegram:-100123` name exactly the files they always
+ *   did and never need migrating. On that alphabet the legacy replacement is
+ *   `: → _` and identity elsewhere, and `_` is not in the alphabet — so it is
+ *   injective there.
+ * - Any other key gets `<legacy stem>.<hash of the FULL key>`. The hash is over
+ *   the key, not the stem, so the two iMessage addresses above differ.
+ * - The two sets cannot meet: `.` is outside the legacy safe set, so a legacy
+ *   stem never contains one, and a suffixed stem always does.
+ *
+ * The same disjointness keeps the archive prefix scheme working: for a
+ * suffixed archive to be picked up by an unsuffixed key's
+ * `_archive_<stem>_` prefix, that key's stem would have to contain the `.` —
+ * which it cannot.
+ */
+export function transcriptFileStem(key: string): string {
+  const legacy = legacyTranscriptFileStem(key);
+  if (!LEGACY_STABLE_KEY_CHAR.test(key)) return legacy;
+  const hash = createHash("sha256").update(key, "utf8").digest("hex").slice(0, KEY_HASH_HEX_CHARS);
+  return `${legacy}.${hash}`;
+}
+
 export class SessionStore {
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
@@ -477,6 +550,14 @@ export class SessionStore {
   // Month for which rotation already ran and found nothing to roll — skip
   // re-reading an all-current-month file until the month turns over.
   private rotateSkipMonth = new Map<string, string>();
+  /** Keys whose legacy-named transcript files have already been considered for
+   *  migration in this process (see `ensureTranscriptMigrated`). */
+  private transcriptMigrationChecked = new Set<string>();
+  /** Legacy stems already reported as shared by more than one key — one warn
+   *  per collision per process, not one per message. */
+  private transcriptCollisionWarned = new Set<string>();
+  /** Ditto for a migration skipped because the transcript lock was held. */
+  private transcriptLockWarned = new Set<string>();
 
   constructor(
     dir: string,
@@ -1145,6 +1226,13 @@ export class SessionStore {
     if (idx === -1) return;
     const entry = this.registry[idx];
 
+    // Settle the old key's filenames BEFORE the entry is re-keyed: the renames
+    // below move whatever `transcriptPath(oldKey)` names, and the ownership
+    // check wants to see the registry as it stands now, with `oldKey` still on
+    // its own entry. (`transcriptPath` would trigger this anyway; doing it here
+    // is what makes the order deliberate rather than incidental.)
+    this.ensureTranscriptMigrated(oldKey);
+
     // Re-key the entry in place: the data lives on under newKey, so there's no
     // need to keep a phantom unlinked entry that would confuse `sessions list`
     // and (pre-fix) trick cleanupExpired into deleting the shared SDK file.
@@ -1581,8 +1669,17 @@ export class SessionStore {
 
   // --- Transcripts ---
 
+  /**
+   * The filename stem for `key`, after making sure anything this key wrote
+   * under the old many-to-one scheme has been carried over to it.
+   *
+   * Every transcript path in the store is built here, so the migration cannot
+   * be forgotten at a call site; it is memoized per key, so after the first
+   * touch this is a `Set.has`.
+   */
   private safeKey(key: string): string {
-    return key.replace(/[^a-zA-Z0-9_-]/g, "_");
+    this.ensureTranscriptMigrated(key);
+    return transcriptFileStem(key);
   }
 
   private transcriptPath(key: string): string {
@@ -1595,7 +1692,13 @@ export class SessionStore {
 
   /** Monthly rotation archives for a key, newest month first. */
   private listTranscriptArchives(key: string): string[] {
-    const prefix = `_archive_${this.safeKey(key)}_`;
+    return this.archivesForStem(this.safeKey(key));
+  }
+
+  /** Monthly rotation archive paths for a filename stem, newest month first.
+   *  Stem-based (not key-based) so the migration can list the legacy set. */
+  private archivesForStem(stem: string): string[] {
+    const prefix = `_archive_${stem}_`;
     let names: string[];
     try {
       names = readdirSync(this.dir);
@@ -1607,6 +1710,141 @@ export class SessionStore {
       .sort()
       .reverse()
       .map((n) => join(this.dir, n));
+  }
+
+  /** Advisory lock serializing transcript renames against other processes. */
+  private get transcriptLockPath(): string {
+    return join(this.dir, "_transcripts.lock");
+  }
+
+  /**
+   * Carry `key`'s transcript and archives from the legacy filename to the
+   * collision-free one, once per key per process.
+   *
+   * Only keys whose stem actually changed have anything to do — `dm:*`,
+   * `telegram:*` and every other key drawn from `[A-Za-z0-9:-]` return
+   * immediately, so the common case never touches the disk.
+   *
+   * OWNERSHIP IS THE HARD PART. The legacy name is many-to-one, so a legacy
+   * file may hold one key's history or several keys' histories interleaved,
+   * and nothing on disk says which. So:
+   *
+   * - No other known key maps to that legacy stem → the files are
+   *   unambiguously this key's, and they are renamed.
+   * - Some other key does (from the registry — active or unlinked entries,
+   *   `channelKey` and `migratedFrom` alike — or from the in-memory session
+   *   cache) → AMBIGUOUS. Nothing is renamed and nothing is guessed: the
+   *   legacy file is the only record of the mixed history, so it is left
+   *   exactly where it is for manual inspection (`cat
+   *   ~/.tomo/data/sessions/<legacy>.jsonl`, whose records carry `channel`
+   *   and `senderName`), one warning names the colliding keys, and each key
+   *   starts fresh under its own new name.
+   *
+   * NEVER THROWS: this sits under `get()`/`append()`, i.e. under every inbound
+   * message. A lock we cannot take, an EACCES, a rename that races another
+   * process — all degrade to "don't migrate", logged once, retried on the next
+   * daemon start.
+   */
+  private ensureTranscriptMigrated(key: string): void {
+    if (this.transcriptMigrationChecked.has(key)) return;
+    // Marked BEFORE the work: everything below builds paths from the stems
+    // directly, but a future edit that reaches for `transcriptPath` here would
+    // otherwise recurse forever.
+    this.transcriptMigrationChecked.add(key);
+
+    const legacy = legacyTranscriptFileStem(key);
+    const stem = transcriptFileStem(key);
+    if (stem === legacy) return;
+
+    try {
+      this.migrateLegacyTranscript(key, legacy, stem);
+    } catch (err) {
+      log.warn({ err, key }, "Could not migrate legacy transcript files to the collision-free name");
+    }
+  }
+
+  private migrateLegacyTranscript(key: string, legacy: string, stem: string): void {
+    const legacyActive = join(this.dir, `${legacy}.jsonl`);
+    const legacyArchives = this.archivesForStem(legacy);
+    if (!existsSync(legacyActive) && legacyArchives.length === 0) return; // fresh key
+
+    const others = this.otherKeysSharingLegacyStem(key, legacy);
+    if (others.length > 0) {
+      if (!this.transcriptCollisionWarned.has(legacy)) {
+        this.transcriptCollisionWarned.add(legacy);
+        log.warn(
+          { file: legacyActive, keys: [key, ...others] },
+          "Transcript filename collision: this file was shared by more than one session key and cannot be "
+          + "split automatically. It is left in place for manual inspection; the sessions continue in "
+          + "separate files from now on",
+        );
+      }
+      return;
+    }
+
+    let renamed = 0;
+    try {
+      withFileLockSync(this.transcriptLockPath, () => {
+        // Re-check inside the lock: another process may have done all of this
+        // between our scan and here.
+        const newActive = join(this.dir, `${stem}.jsonl`);
+        if (existsSync(legacyActive)) {
+          if (existsSync(newActive)) {
+            log.warn(
+              { key, legacy: legacyActive, current: newActive },
+              "Legacy transcript left in place: the migrated file already exists",
+            );
+          } else if (renameIfPresent(legacyActive, newActive)) {
+            renamed++;
+          }
+        }
+        for (const archive of this.archivesForStem(legacy)) {
+          const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
+          if (!month) continue;
+          const target = join(this.dir, `_archive_${stem}_${month}.jsonl`);
+          if (existsSync(target)) continue;
+          if (renameIfPresent(archive, target)) renamed++;
+        }
+      }, TRANSCRIPT_LOCK_OPTIONS);
+    } catch (err) {
+      if (!(err instanceof FileLockTimeoutError)) throw err;
+      // Another process is mid-migration for this directory. Skipping is the
+      // only safe answer on a message path; the next daemon start retries.
+      if (!this.transcriptLockWarned.has(legacy)) {
+        this.transcriptLockWarned.add(legacy);
+        log.warn({ err, key }, "Skipping legacy transcript migration: another process holds the transcript lock");
+      }
+      return;
+    }
+
+    if (renamed > 0) {
+      log.info({ key, from: legacy, to: stem, files: renamed }, "Migrated transcript files to a collision-free name");
+    }
+  }
+
+  /**
+   * Every OTHER session key we know of that shares `legacy` as its legacy
+   * filename stem — i.e. every key whose history could be mixed into the same
+   * legacy file.
+   */
+  private otherKeysSharingLegacyStem(key: string, legacy: string): string[] {
+    const others = new Set<string>();
+    const consider = (candidate: string | undefined): void => {
+      if (!candidate || candidate === key) return;
+      if (legacyTranscriptFileStem(candidate) !== legacy) return;
+      others.add(candidate);
+    };
+
+    // Not while a registry critical section is open: `mutateRegistry` has
+    // already forced a fresh read, and re-reading would discard the in-memory
+    // mutation it is in the middle of making (`migrateSessionKey` reaches here).
+    if (!isFileLockHeldSync(this.registryLockPath)) this.loadRegistry();
+    for (const entry of this.registry) {
+      consider(entry.channelKey);
+      consider(entry.migratedFrom);
+    }
+    for (const cached of this.sessions.keys()) consider(cached);
+    return [...others].sort();
   }
 
   /** Load only the last tailLimit messages of the active transcript. */

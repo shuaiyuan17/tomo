@@ -76,6 +76,10 @@ Session keys determine conversation isolation:
 
 The `IdentityRouter` resolves (channel, chatId, isGroup) → sessionKey + replyTarget.
 
+**Transcript filenames** are derived from the key by `transcriptFileStem()` (`src/sessions/store.ts`) — `<stem>.jsonl` active, `_archive_<stem>_<YYYY-MM>.jsonl` rotated — and the mapping is INJECTIVE, which the old `key.replace(/[^a-zA-Z0-9_-]/g, "_")` was not (`imessage:any;-;alex.smith@x` and `imessage:any;-;alex_smith@x` shared one file). A key drawn only from `[A-Za-z0-9:-]` keeps that legacy stem, so `dm:*` and `telegram:*` files never move; anything else gets `<legacy stem>.<12 hex of sha256(key)>`, and since `.` is outside the legacy safe set the two families can never meet. Never build a transcript path from a key by hand — go through the store, or through the exported `transcriptFileStem` / `legacyTranscriptFileStem`.
+
+Files written under the old scheme are migrated **lazily, on the first touch of a key** (`ensureTranscriptMigrated`, memoized per key, renames under the `_transcripts.lock` advisory lock and never throws on the message path). Ownership decides: if no other key we know of — registry entries active *and* unlinked, `channelKey` and `migratedFrom`, plus the in-memory session cache — maps to the same legacy stem, the active file and every archive are renamed. If one does, the legacy file is AMBIGUOUS: it is left exactly where it is as the only record of the mixed history, one warn names the colliding keys, and each key starts fresh under its own new name.
+
 ### DM vs Group Detection
 
 Use the helpers in `src/sessions/keys.ts` — don't re-parse keys by hand:

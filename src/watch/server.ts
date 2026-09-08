@@ -4,6 +4,16 @@ import { log } from "../logger.js";
 import { watchBus, type WatchBus } from "./bus.js";
 import type { ClientFrame, ServerFrame, WatchSnapshot } from "./protocol.js";
 
+/**
+ * Shape gate for a decoded client line. Only a plain object with a string
+ * `kind` can be dispatched; `text` is still checked at the branch that uses it,
+ * because a `{ kind: "send" }` with no text is well-shaped and unusable.
+ */
+function isClientFrame(value: unknown): value is ClientFrame {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  return typeof (value as { kind?: unknown }).kind === "string";
+}
+
 export interface WatchServerDeps {
   /** Built fresh per client connect — includes vitals and feed backfill. */
   getSnapshot(): WatchSnapshot | Promise<WatchSnapshot>;
@@ -91,7 +101,14 @@ export class WatchServer {
       while ((idx = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
-        if (line) void this.handleClientLine(socket, line);
+        // A rejected handler must not become an unhandled rejection: this is
+        // a fire-and-forget dispatch off a socket event, so nothing else is
+        // holding the promise.
+        if (line) {
+          this.handleClientLine(socket, line).catch((err) => {
+            log.warn({ err }, "Watch client frame handling failed");
+          });
+        }
       }
     });
 
@@ -109,13 +126,21 @@ export class WatchServer {
   }
 
   private async handleClientLine(socket: Socket, line: string): Promise<void> {
-    let frame: ClientFrame;
+    let parsed: unknown;
     try {
-      frame = JSON.parse(line) as ClientFrame;
+      parsed = JSON.parse(line);
     } catch {
       this.write(socket, { kind: "send-result", ok: false, error: "invalid frame" });
       return;
     }
+    // JSON.parse succeeds for `null`, `42`, `[1]` and `"str"` as well, and the
+    // cast used to hand those straight to `frame.kind` — a TypeError on null,
+    // outside the try, from a fire-and-forget dispatch.
+    if (!isClientFrame(parsed)) {
+      this.write(socket, { kind: "send-result", ok: false, error: "invalid frame" });
+      return;
+    }
+    const frame: ClientFrame = parsed;
 
     if (frame.kind === "send" && typeof frame.text === "string" && frame.text.trim()) {
       try {

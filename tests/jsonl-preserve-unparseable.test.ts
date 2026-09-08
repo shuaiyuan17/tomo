@@ -370,7 +370,12 @@ describe("read-only consumers survive non-object lines", () => {
     ].join("\n"));
     const stats = computeContextStats(sid, dir);
     expect(stats?.totalMessages).toBe(2);
-    const range = resolveTimeRange(sid, "2026-03-28T00:00", "2026-03-28T23:59", dir);
+    // Explicit Z on both boundaries: the events are stamped in UTC, and
+    // `parseLocalTimeBoundary` reads a zoneless boundary as HOST-local — under
+    // TZ=Asia/Shanghai the 16:30Z event lands on Mar 29 and falls out of the
+    // range, failing this test for reasons that have nothing to do with the
+    // unparseable lines it is about.
+    const range = resolveTimeRange(sid, "2026-03-28T00:00:00Z", "2026-03-28T23:59:59Z", dir);
     expect(range).toEqual({ fromIdx: 0, toIdx: 1, firstUuid: u.uuid, lastUuid: a.uuid });
   });
 

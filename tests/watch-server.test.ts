@@ -142,6 +142,61 @@ describe("WatchServer", () => {
     expect(frames.find((f) => f.kind === "send-result")).toMatchObject({ ok: false, error: "invalid frame" });
   });
 
+  it("rejects valid JSON that is not a frame object", async () => {
+    // Each of these parses fine, so the old cast handed it straight to
+    // `frame.kind` — a TypeError on `null`, raised outside the try of a
+    // fire-and-forget handler and surfacing as an unhandled rejection.
+    for (const payload of ["null", "42", "[1]", '"str"', "true", '{"text":"no kind"}']) {
+      server?.stop();
+      server = new WatchServer(socketPath, {
+        getSnapshot: () => fakeSnapshot(),
+        sendChat: async () => { throw new Error("must not be called"); },
+      });
+      server.start();
+
+      const frames = await collectFrames(socketPath, 2, (socket) => {
+        socket.write(payload + "\n");
+      });
+      expect(frames.find((f) => f.kind === "send-result"), payload)
+        .toMatchObject({ ok: false, error: "invalid frame" });
+    }
+  });
+
+  it("answers a well-shaped frame of an unknown kind without dropping the client", async () => {
+    server = new WatchServer(socketPath, {
+      getSnapshot: () => fakeSnapshot(),
+      sendChat: async () => { throw new Error("must not be called"); },
+    });
+    server.start();
+
+    const frames = await collectFrames(socketPath, 2, (socket) => {
+      socket.write(JSON.stringify({ kind: "teleport" }) + "\n");
+    });
+
+    expect(frames.find((f) => f.kind === "send-result")).toMatchObject({ ok: false, error: "unsupported frame" });
+  });
+
+  it("destroys a client that streams a line past the 64KB cap", async () => {
+    server = new WatchServer(socketPath, {
+      getSnapshot: () => fakeSnapshot(),
+      sendChat: async () => {},
+    });
+    server.start();
+
+    const socket = createConnection(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      socket.on("connect", () => resolve());
+      socket.on("error", reject);
+    });
+    const closed = new Promise<void>((resolve) => socket.on("close", () => resolve()));
+    socket.on("error", () => {}); // the server's destroy() can land as ECONNRESET
+    socket.resume(); // drain the snapshot frame, or 'close' never fires
+    // No newline: the server buffers until the guard trips.
+    socket.write("x".repeat(70 * 1024));
+    await closed;
+    expect(socket.destroyed).toBe(true);
+  }, 10_000);
+
   it("supports multiple concurrent clients", async () => {
     server = new WatchServer(socketPath, {
       getSnapshot: () => fakeSnapshot(),

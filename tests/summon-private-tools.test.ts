@@ -36,7 +36,8 @@ import {
   resetConfig,
   waitFor,
 } from "./helpers/agent-harness.js";
-import { createTomoInternalMcpServer } from "../src/mcp/internal-server.js";
+import { createTomoInternalMcpServer, TOMO_INTERNAL_MCP_NAME } from "../src/mcp/internal-server.js";
+import { SEND_MESSAGE_TOOL } from "../src/agent/permissions.js";
 import type { Agent as AgentType } from "../src/agent.js";
 
 installAgentTestHooks();
@@ -352,5 +353,18 @@ describe("private tools during a summoned-group turn", () => {
     expect(prompt).not.toContain("recall_conversation");
 
     await agent.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The private-memory guard names `send_message` by its hook-visible tool name,
+// spelled out rather than imported (permissions.ts explains why). This is the
+// assertion that keeps the two spellings honest: rename the MCP server and
+// this fails here rather than silently unhooking the MEDIA: check.
+// ---------------------------------------------------------------------------
+
+describe("send_message tool name", () => {
+  it("is the name the private-memory guard matches on", () => {
+    expect(SEND_MESSAGE_TOOL).toBe(`mcp__${TOMO_INTERNAL_MCP_NAME}__send_message`);
   });
 });

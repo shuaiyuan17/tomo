@@ -229,6 +229,7 @@ function makeRig(settings: {
     appendAssistantTranscript: (_key, content) => { transcript.push(content); },
     queuePendingErrorNote: () => {},
     startTurnTyping: (): StopTyping => async () => {},
+    isPrivateMemoryBarred: () => false,
     delivery: new DeliveryPipeline({ queuePendingErrorNote: () => {} }),
   };
   const runner = new TurnRunner(deps);

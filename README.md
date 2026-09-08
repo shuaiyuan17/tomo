@@ -511,7 +511,7 @@ npm run dev    # Foreground with hot reload
 
 ## Contributing
 
-Issues and pull requests welcome at [github.com/shuaiyuan17/tomo](https://github.com/shuaiyuan17/tomo).
+Issues and pull requests welcome at [github.com/shuaiyuan17/tomo](https://github.com/shuaiyuan17/tomo). See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and what makes a PR easy to review, and [SECURITY.md](SECURITY.md) for the trust model and how to report a vulnerability privately.
 
 ## License
 

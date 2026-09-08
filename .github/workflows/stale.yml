@@ -1,0 +1,34 @@
+name: Stale
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    if: github.repository == 'shuaiyuan17/tomo'
+    steps:
+      - uses: actions/stale@v10
+        with:
+          days-before-stale: 45
+          days-before-close: 14
+          exempt-issue-labels: keep-open,enhancement,good first issue,help wanted
+          exempt-pr-labels: keep-open
+          exempt-draft-pr: true
+          stale-issue-label: stale
+          stale-pr-label: stale
+          stale-issue-message: |
+            This issue has had no activity for 45 days. It will close in 14 days unless there is an update.
+            Comment, or add the `keep-open` label, to keep it open.
+          stale-pr-message: |
+            This pull request has had no activity for 45 days. It will close in 14 days unless there is an update.
+            Push a commit, comment, or add the `keep-open` label to keep it open.
+          close-issue-message: Closed for inactivity. Reopen if this is still a problem on the latest release.
+          close-pr-message: Closed for inactivity. Reopen when you pick it back up.
+          operations-per-run: 100

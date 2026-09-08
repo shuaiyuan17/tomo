@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 README
+    url: https://github.com/shuaiyuan17/tomo#readme
+    about: Setup, configuration reference, and chat commands. Check here first.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/shuaiyuan17/tomo/security/advisories/new
+    about: Private report. Please do not open a public issue for a vulnerability.

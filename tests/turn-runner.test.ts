@@ -486,3 +486,46 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
     expect(thrown.channel.sent).toHaveLength(0);
   });
 });
+
+describe("undelivered reply at turn end", () => {
+  // The runner's half of the dropped-reply repair: when the session reports
+  // that the turn ended on a thinking block no text followed, ask for ONE
+  // restate turn on the same target — and never from a restate turn itself.
+  function rig(flag: boolean) {
+    const h = makeHarness(async () => "NO_REPLY");
+    const restates: Array<{ key: string; chatId: string | undefined }> = [];
+    let reads = 0;
+    const runner = new TurnRunner({
+      drainPendingNotes: () => "",
+      runWithRetry: (req) => { h.prompts.push(req); return Promise.resolve("NO_REPLY"); },
+      appendAssistantTranscript: () => {},
+      queuePendingErrorNote: () => {},
+      startTurnTyping: () => () => {},
+      isPrivateMemoryBarred: () => false,
+      delivery: new DeliveryPipeline({ queuePendingErrorNote: () => {} }),
+      undeliveredReplyAtTurnEnd: () => { reads++; return flag; },
+      requestRestate: (key, target) => { restates.push({ key, chatId: target?.chatId }); },
+    });
+    return { h, runner, restates, reads: () => reads };
+  }
+
+  it("requests one restate turn, to the turn's own target, when the flag reads true", async () => {
+    const r = rig(true);
+    await r.runner.runTurn(replySpec(r.h));
+    expect(r.restates).toEqual([{ key: "telegram:123", chatId: "123" }]);
+    expect(r.reads()).toBe(1);
+  });
+
+  it("asks for nothing when the flag reads false", async () => {
+    const r = rig(false);
+    await r.runner.runTurn(replySpec(r.h));
+    expect(r.restates).toEqual([]);
+  });
+
+  it("never chains: a restate turn does not read the flag, let alone request another", async () => {
+    const r = rig(true);
+    await r.runner.runTurn(replySpec(r.h, { restate: true }));
+    expect(r.restates).toEqual([]);
+    expect(r.reads()).toBe(0);
+  });
+});

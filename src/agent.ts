@@ -101,6 +101,9 @@ interface UserTurnRequest {
 interface CronTurnOptions {
   /** False for silent housekeeping turns such as LCM rollups. */
   showTyping?: boolean;
+  /** This turn restates a reply that was dropped as a thinking block; it
+   *  must not request another restate whatever it ends on. */
+  restate?: boolean;
   /** Never deliver this turn's model output to the chat. The turn still runs
    *  so housekeeping tools can complete; failures remain in logs/pending
    *  operational context. */
@@ -236,6 +239,8 @@ export class Agent {
       startTurnTyping: (channel, chatId, passiveListen) => this.startTurnTyping(channel, chatId, passiveListen),
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       delivery: this.delivery,
+      undeliveredReplyAtTurnEnd: (sessionKey) => this.liveSessionManager.takeUndeliveredReply(sessionKey),
+      requestRestate: (sessionKey, target) => this.restateUndeliveredReply(sessionKey, target),
     });
     const summons = new SummonStore(
       join(config.tomoHome, "data", "summons.json"),
@@ -1601,6 +1606,28 @@ export class Agent {
    *  handled here (logged, surfaced to the chat where appropriate), so the
    *  boolean is a status report for callers like CronScheduler.markRun, not
    *  something to retry on. Never rejects. */
+  /**
+   * A turn ended on a reply the model wrote in a thinking block, which is
+   * dropped under `showThinking: false` (live-session.ts header). Run one
+   * follow-up turn on the same session, to the same target, that tells the
+   * model so and lets it say the reply as text — or NO_REPLY if it was
+   * narration. `restate: true` keeps the follow-up from chaining.
+   */
+  private restateUndeliveredReply(sessionKey: string, target: { channel: Channel; chatId: string } | undefined): void {
+    const nudge = formatTomoEvent(
+      "undelivered-reply",
+      "Your last turn ended on a message written in a thinking block; it was NOT delivered to the user. " +
+      "If it was meant for them, say it now as plain text, verbatim. If it was internal narration, reply NO_REPLY.",
+    );
+    this.handleCronMessage(nudge, sessionKey, {
+      showTyping: false,
+      restate: true,
+      ...(target ? { deliveryTarget: { channelName: target.channel.name, chatId: target.chatId } } : {}),
+    }).catch((err) => {
+      log.error({ err, sessionKey }, "restate turn failed to queue");
+    });
+  }
+
   async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<boolean> {
     return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey, options))
       .catch((err) => {
@@ -1695,6 +1722,7 @@ export class Agent {
       return await this.turnRunner.runTurn({
         key,
         source: "cron",
+        ...(options.restate ? { restate: true } : {}),
         prompt,
         stampChannelName: deliveryChannel.name,
         ...(options.showTyping === false ? {} : {

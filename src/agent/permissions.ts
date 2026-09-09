@@ -1198,19 +1198,31 @@ function writeVerbTargetDenial(
   verb: string,
   cwd: string,
 ): string | null {
-  // `/dev/null` and friends are sinks, not places: a compound command that
-  // says `… > /dev/null; rm -rf /tmp/scratch` names `/dev/null` as a token of
-  // the whole line, and the verb check used to hold `rm` to it — "`rm` writes
-  // and `/dev/null` is outside this agent's writeRoots". The redirect check
-  // already knows these targets are harmless; the verb check has to agree.
-  const absolute = absolutePathTokens(cmd).filter((token) => !HARMLESS_REDIRECT_TARGET.test(token));
-  if (profile.bash === "readonly" && absolute.length === 0) {
-    return `\`${verb}\` writes, and in "readonly" mode a write has to name an absolute path inside this agent's writeRoots (${profile.writeRoots.join(", ") || "none configured"}).`;
+  for (const segment of commandSegments(cmd)) {
+    const segVerb = writeVerbIn(segment);
+    if (!segVerb) continue;
+    const tokens = bashTokens(segment);
+    const segCwd = segmentCwd(tokens, cwd);
+    // `/dev/null` and friends are sinks, not places: `… > /dev/null` in the
+    // same segment as `rm -rf /tmp/scratch` must not hold `rm` to `/dev/null`.
+    const absolute = tokens
+      .flatMap(pathCandidates)
+      .filter(isAbsoluteish)
+      .filter((token) => !HARMLESS_REDIRECT_TARGET.test(token));
+    // A git segment repointed at an absolute worktree names its place out loud
+    // even when its pathspecs are relative — that is what `-C` is for.
+    if (profile.bash === "readonly" && absolute.length === 0 && segCwd === cwd) {
+      return `\`${segVerb}\` writes, and in "readonly" mode a write has to name an absolute path inside this agent's writeRoots (${profile.writeRoots.join(", ") || "none configured"}).`;
+    }
+    const outside = absolute.find((token) => !landsInWriteRoot(token, profile, segCwd));
+    if (outside !== undefined) {
+      return `\`${segVerb}\` writes and \`${outside}\` is outside this agent's writeRoots.`;
+    }
+    if (segCwd !== cwd && !landsInWriteRoot(segCwd, profile, cwd)) {
+      return `\`${segVerb}\` writes under \`${segCwd}\` (git -C / --work-tree), which is outside this agent's writeRoots.`;
+    }
   }
-  const outside = absolute.find((token) => !landsInWriteRoot(token, profile, cwd));
-  if (outside !== undefined) {
-    return `\`${verb}\` writes and \`${outside}\` is outside this agent's writeRoots.`;
-  }
+  void verb;
   return null;
 }
 
@@ -1348,34 +1360,70 @@ function writeTargets(cmd: string, verb: string | null, redirects: string[], cwd
     .map((target) => ({ path: target, why: "the redirection target is" }));
   if (!verb) return targets;
 
-  const bareArePaths = BARE_ARG_IS_PATH.has(verb);
-  for (const token of allPathCandidates(cmd)) {
-    if (CWD_TARGETS.has(token)) {
-      // `rm -rf *` names no path; the thing it destroys is the cwd.
-      targets.push({ path: cwd, why: `\`${verb}\` targets the working directory` });
-      continue;
+  // Judged PER SEGMENT. The whole-line scan held `rm -rf /tmp/scratch` to every
+  // token of `xcodebuild … | sed 's/^/  /'` before it — and `sed`'s lone `/`
+  // is an ancestor of every denyPath, so the compound was refused as "`rm`
+  // writes to `/`". A verb's targets are the words of its own segment.
+  for (const segment of commandSegments(cmd)) {
+    const segVerb = writeVerbIn(segment);
+    if (!segVerb) continue;
+    const tokens = bashTokens(segment);
+    const segCwd = segmentCwd(tokens, cwd);
+    const bareArePaths = BARE_ARG_IS_PATH.has(segVerb);
+    for (const word of tokens) {
+      for (const token of pathCandidates(word)) {
+        if (CWD_TARGETS.has(token)) {
+          // `rm -rf *` names no path; the thing it destroys is the cwd.
+          targets.push({ path: segCwd, why: `\`${segVerb}\` targets the working directory` });
+          continue;
+        }
+        if (token.includes("/") || token.startsWith("~") || bareArePaths) {
+          targets.push({ path: isAbsoluteish(token) ? token : pathResolve(segCwd, token), why: `\`${segVerb}\` writes to` });
+        }
+      }
     }
-    if (token.includes("/") || token.startsWith("~") || bareArePaths) {
-      targets.push({ path: token, why: `\`${verb}\` writes to` });
+    // Two commands that destroy the tree while naming neither a path nor a `*`.
+    // `git reset --hard` is the twin of `git clean -fdx`: it throws away every
+    // uncommitted change under the cwd, which for a subagent that never moved
+    // is the workspace. Both push the segment's cwd — which `git -C <dir>` /
+    // `--work-tree=<dir>` may have repointed (segmentCwd); without that flag
+    // they push the process cwd, which is the conservative direction.
+    if (segVerb === "git clean" && /(^|\s)-[a-zA-Z]*[xf]/.test(segment)) {
+      targets.push({ path: segCwd, why: "`git clean` targets the working directory" });
     }
-  }
-  // Two commands that destroy the tree while naming neither a path nor a `*`.
-  // `git reset --hard` is the twin of `git clean -fdx` and was missing: it
-  // throws away every uncommitted change under the cwd, which for a subagent
-  // that never moved is the workspace.
-  //
-  // Both push the cwd UNCONDITIONALLY, so `git -C /some/worktree clean -fdx` is
-  // refused too even though it names a directory of its own. That is a real
-  // false positive and it is the conservative direction: the alternative is
-  // deciding, from a token scan, which of several `-C`-shaped flags actually
-  // repointed the command — and being wrong there costs the tree.
-  if (verb === "git clean" && /(^|\s)-[a-zA-Z]*[xf]/.test(cmd)) {
-    targets.push({ path: cwd, why: "`git clean` targets the working directory" });
-  }
-  if (verb === "git reset" && /(^|\s)--(hard|merge)\b/.test(cmd)) {
-    targets.push({ path: cwd, why: "`git reset --hard` discards the working directory" });
+    if (segVerb === "git reset" && /(^|\s)--(hard|merge)\b/.test(segment)) {
+      targets.push({ path: segCwd, why: "`git reset --hard` discards the working directory" });
+    }
   }
   return targets;
+}
+
+/**
+ * The command split at `;`, `|`, `&&`, `||` and newlines — outside quotes,
+ * since `maskQuotedOperators` has already blanked the operators inside them.
+ * Each piece is judged on its own verb and its own words.
+ */
+function commandSegments(cmd: string): string[] {
+  return maskQuotedOperators(cmd)
+    .split(/\|\||&&|[;|\n]/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
+
+/**
+ * The directory a git segment actually operates in: `git -C <dir>` and
+ * `--work-tree=<dir>` repoint it, and a worktree agent lives in exactly that
+ * shape (`git -C /tmp/wt commit`). Without the flag, the process cwd.
+ */
+function segmentCwd(tokens: string[], cwd: string): string {
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === "-C" && tokens[i + 1] !== undefined && isAbsoluteish(tokens[i + 1])) {
+      return expandTilde(tokens[i + 1]);
+    }
+    const wt = /^--work-tree=(.+)$/.exec(tokens[i]);
+    if (wt && isAbsoluteish(wt[1])) return expandTilde(wt[1]);
+  }
+  return cwd;
 }
 
 /**
@@ -1475,9 +1523,6 @@ function pathishTokens(cmd: string): string[] {
 
 /** Tokens whose destination is knowable, and therefore the only ones the ALLOW
  *  side may judge. See limit 1 in the header. */
-function absolutePathTokens(cmd: string): string[] {
-  return allPathCandidates(cmd).filter(isAbsoluteish);
-}
 
 /** Leading `~` / `~/`, which the shell expands and `path.resolve` does not —
  *  without this, `cat ~/.ssh/id_rsa` resolves to `<cwd>/~/.ssh/id_rsa` and

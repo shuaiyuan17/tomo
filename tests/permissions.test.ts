@@ -1305,6 +1305,32 @@ describe("agentProfileDenial — Bash by mode", () => {
       expect(bash("rm -rf x > /dev/null", REVIEWER)).toContain("has to name an absolute path");
     });
 
+    it("judges a write verb by the words of its own segment, not the whole line", () => {
+      // 9/8: `xcodebuild … | sed 's/^/  /'; rm -rf /tmp/scratch/dd` was refused
+      // as "`rm` writes to `/`" — sed's lone `/` is an ancestor of every
+      // denyPath. A verb's targets are its own segment's words.
+      expect(bash(`xcodebuild test | sed 's/^/  /'; rm -rf ${join(scratch, "dd")}`, REVIEWER)).toBeNull();
+      expect(bash(`cat ${join(sharedCheckout, "README.md")} && rm -rf ${join(scratch, "x")}`, REVIEWER)).toBeNull();
+      // ...while a genuine root wipe in the verb's own segment is still caught.
+      expect(bash("rm -rf /", REVIEWER)).toBeTruthy();
+      expect(bash(`echo hi; rm -rf ${join(sharedCheckout, "Sources")}`, IMPLEMENTER)).toContain("denyPaths");
+    });
+
+    it("resolves a git segment's relative pathspecs against its -C / --work-tree directory", () => {
+      // A worktree agent's process cwd is the shared checkout (a denyPath); its
+      // commits name the worktree with -C and their pathspecs relatively.
+      const wtProfile: Profile = { ...IMPLEMENTER, writeRoots: [worktree] };
+      const cwdIsCheckout = (cmd: string, profile: Profile) =>
+        agentProfileDenial(profile, "Bash", { command: cmd }, sharedCheckout);
+      expect(cwdIsCheckout(`git -C ${worktree} commit -m "fix Sources/A.swift" -- Sources/A.swift`, wtProfile)).toBeNull();
+      expect(cwdIsCheckout(`git --work-tree=${worktree} add Sources/A.swift`, wtProfile)).toBeNull();
+      // readonly: -C names the place out loud, so relative pathspecs are fine…
+      expect(bash(`git -C ${join(scratch, "wt")} commit -m x -- Sources/A.swift`, REVIEWER)).toBeNull();
+      // …and -C pointed outside the writeRoots is still a write outside them.
+      expect(bash("git -C /etc reset --hard", REVIEWER)).toBeTruthy();
+      expect(bash(`git -C ${sharedCheckout} clean -fdx`, IMPLEMENTER)).toContain("denyPaths");
+    });
+
     it("allows a redirection INTO a writeRoot and denies one outside it", () => {
       expect(bash(`echo hi > ${join(scratch, "x")}`, REVIEWER)).toBeNull();
       const noScratch: Profile = { ...REVIEWER, writeRoots: [worktree] };

@@ -6,6 +6,7 @@ import { buildCronTools } from "./cron-tools.js";
 import { buildPetTools } from "./pet-tools.js";
 import { buildRecallTools } from "./recall-tools.js";
 import { buildPeopleTools } from "./people-tools.js";
+import { buildLcmTools } from "./lcm-tools.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
@@ -295,6 +296,12 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       // dm: session, so the key alone would give the group the owner's scope.
       ...buildCronTools(undefined, () => agent.scopedCallerKey(callerSessionKey)),
       ...buildPetTools(),
+      ...buildLcmTools({
+        sdkSessionIdFor: () => agent.sdkSessionIdFor(callerSessionKey),
+        sdkSessionsDir: config.sdkSessionsDir,
+        sessionsDir: config.sessionsDir,
+        sessionKey: callerSessionKey,
+      }),
       // Group sessions never see private people records through these tools —
       // same boundary as the private memory subtree they live in.
       //

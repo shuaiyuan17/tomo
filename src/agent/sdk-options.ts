@@ -205,6 +205,7 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__recall_conversation`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__list_people`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__upsert_person`,
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__lcm_rollup`,
       ...externalMcpAllowedTools,
     ],
     // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path

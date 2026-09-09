@@ -466,6 +466,11 @@ export class Agent {
     this.channels.push(channel);
   }
 
+  /** The SDK session id behind a session key, or undefined before its first turn. */
+  sdkSessionIdFor(key: string): string | undefined {
+    return this.sessions.getSdkSessionId(key);
+  }
+
   /** Active sessions as [sessionKey, sdkSessionId] pairs (RollupRunner etc). */
   listActiveSessions(): [string, string][] {
     return this.sessions.listSdkSessionIds();

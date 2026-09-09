@@ -63,6 +63,7 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
     ] : []),
     "The source blocks are already visible in your context — read them and write the rollup summary in one turn. Run:",
     `  tomo lcm ${p.level} --session-id ${sdkSessionId} ${flag} ${p.period} --summary "<your text>"`,
+    `  (No shell here — group session or private-memory-barred turn? Call the \`lcm_rollup\` tool instead: level "${p.level}", period "${p.period}", and the same summary. Same effect, no Bash.)`,
     "",
     "Style: note-to-self, dated facts, key decisions/arcs/quotes over paragraphs of abstraction.",
     "When an elapsed interval carries meaning, write the interval next to the date, not just the date:",

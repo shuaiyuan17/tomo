@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Delivery: a turn that ENDS on a reply written in a thinking block (dropped under showThinking off, with no tool call after it for the PostToolBatch nudge to catch) now gets one follow-up turn — an `undelivered-reply` tomo-event on the same session and target asking the model to say it as text, or NO_REPLY if it was narration. Restate turns never chain.
 - Tests: vitest now excludes `.claude/worktrees/**`. A leftover agent worktree inside the repo carries its own `tests/`, and running both copies at once made the fixed-tmp-path suites (cron-store, rollup-cooldown, status-cron) race and fail nondeterministically.
 - LCM: new `lcm_rollup` internal MCP tool — the `tomo lcm <level>` command without a shell. Sessions that have no Bash (group sessions, private-memory-barred turns) can now answer the rollup nudge; same compaction, same archive, same reload trigger. The nudge text names the tool.
 - Delivery: when a non-empty thinking block is dropped (showThinking off) and a tool batch follows, a `PostToolBatch` hook tells the model its previous message was not delivered and to say it again as plain text if it was meant for the user. The flag is read-and-clear per episode and is cleared by any text block that ships. A dropped block with no tool call after it is not covered yet.

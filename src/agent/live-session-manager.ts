@@ -156,6 +156,11 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.isAlive() ?? false;
   }
 
+  /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */
+  takeUndeliveredReply(key: string): boolean {
+    return this.liveSessions.get(key)?.takeUndeliveredReply() ?? false;
+  }
+
   mountedExternalMcpServers(key: string): ReadonlySet<string> {
     return this.externalMcpServersBySession.get(key) ?? new Set();
   }

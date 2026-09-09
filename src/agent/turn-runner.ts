@@ -180,6 +180,12 @@ export interface TurnSpec {
    *  (#203). */
   transcript: "always" | "on-delivery";
   errors: TurnErrorPolicy;
+  /**
+   * This turn IS the restatement of a reply that was dropped as a thinking
+   * block (see `undeliveredReplyAtTurnEnd`). A restate turn never requests
+   * another one, whatever it ends on — one repair per episode, no chain.
+   */
+  restate?: boolean;
 }
 
 /**
@@ -203,6 +209,18 @@ export interface TurnRunnerDeps {
    *  in agent/permissions.ts. */
   isPrivateMemoryBarred(sessionKey: string): boolean;
   delivery: DeliveryPipeline;
+  /**
+   * Read-and-clear: did this session drop a non-empty thinking block that no
+   * text block followed? True at the end of a turn means the model's last
+   * words of that turn never left the process. Undefined ⇒ not wired.
+   */
+  undeliveredReplyAtTurnEnd?(sessionKey: string): boolean;
+  /**
+   * Ask for a follow-up turn on the session that restates the dropped reply
+   * as text, delivered to `target` (the turn's own delivery target, or
+   * undefined when it had none). Fire-and-forget; the runner does not wait.
+   */
+  requestRestate?(sessionKey: string, target: { channel: Channel; chatId: string } | undefined): void;
 }
 
 /**
@@ -416,6 +434,10 @@ export class TurnRunner {
     if (silent) {
       log.info(spec.silentLog ?? "Silent reply (no message sent)");
       await stopTyping({ clear: true });
+      // A turn whose only content was a dropped thinking block resolves as a
+      // bare NO_REPLY (live-session.ts) and exits HERE — so this is the path
+      // the turn-end repair most often has to run from.
+      this.maybeRequestRestate(spec, delivery);
       return true;
     }
 
@@ -460,6 +482,7 @@ export class TurnRunner {
       }
     }
     await stopTyping({ clear: true });
+    this.maybeRequestRestate(spec, delivery);
     return true;
   }
 
@@ -658,6 +681,24 @@ export class TurnRunner {
       await stopTyping({ clear: true });
     }
     return false;
+  }
+
+  /**
+   * The turn-end half of the dropped-reply repair. The mid-turn half is a
+   * PostToolBatch hook (sdk-options): a block dropped BEFORE a tool call is
+   * repaired on the next request. A block dropped with no tool call after it
+   * — the turn simply ended on it — reaches the end of the turn with the
+   * session's flag still set, and the only way to repair it is a new turn.
+   * Called from the two completion paths a dropped block can end on (silent,
+   * and delivered-then-dropped); not from suppressed or steer-merged turns,
+   * whose output was never going to reach the chat from here. Never from a
+   * restate turn itself: one repair per episode.
+   */
+  private maybeRequestRestate(spec: TurnSpec, delivery: TurnDelivery): void {
+    if (spec.restate) return;
+    if (!this.deps.undeliveredReplyAtTurnEnd?.(spec.key)) return;
+    log.info({ key: spec.key }, "turn ended on an undelivered reply: requesting a restate turn");
+    this.deps.requestRestate?.(spec.key, this.resolveSendTarget(delivery));
   }
 
   private resolveSendTarget(delivery: TurnDelivery): { channel: Channel; chatId: string } | undefined {

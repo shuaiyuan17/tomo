@@ -289,6 +289,9 @@ export class LiveSessionManager {
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
+      // Late-bound on purpose: the options are built before the session that
+      // owns the flag exists. Until it does, nothing was dropped.
+      undeliveredReply: () => session?.takeUndeliveredReply() ?? false,
     }, turnBudget, externalMcpServers);
 
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {

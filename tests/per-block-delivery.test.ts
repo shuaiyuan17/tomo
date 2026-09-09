@@ -206,6 +206,8 @@ interface Rig {
   order: string[];
   channel: OrderedChannel;
   transcript: string[];
+  /** The session under test — for state the hooks read (undelivered reply). */
+  session: InstanceType<typeof LiveSession>;
   run: (events: AnyEvent[], overrides?: Partial<TurnSpec>) => Promise<boolean>;
   close: () => void;
 }
@@ -267,7 +269,7 @@ function makeRig(settings: {
     return done;
   };
 
-  return { order, channel, transcript, run, close: () => session.close() };
+  return { order, channel, transcript, session, run, close: () => session.close() };
 }
 
 let rigs: Rig[] = [];
@@ -484,6 +486,37 @@ describe("NO_REPLY is enforced per block", () => {
  * shown as reasoning: it IS the message.
  */
 describe("thinking blocks", () => {
+  it("remembers a dropped reply until a text block ships, for the PostToolBatch nudge", async () => {
+    const r = rig({ showThinking: false });
+
+    await r.run([
+      assistant([thinkingBlock("the reply that never left")]),
+      assistant([toolUseBlock("Bash", "t1")]),
+      toolResult("t1"),
+      assistant([textBlock("said again, as text")]),
+      result(),
+    ]);
+
+    // The hook reads this after the batch that followed the dropped block.
+    // By the end of this turn the text block has shipped, so the flag is
+    // already clear — a shipped text block is the model having said it.
+    expect(r.session.takeUndeliveredReply()).toBe(false);
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["said again, as text"]);
+  });
+
+  it("reports a dropped reply once, then clears — and never for an empty block", async () => {
+    const r = rig({ showThinking: false });
+
+    await r.run([assistant([thinkingBlock("   ")]), assistant([textBlock("A")]), result()]);
+    expect(r.session.takeUndeliveredReply()).toBe(false);
+
+    await r.run([assistant([thinkingBlock("hello there")]), result()]);
+    // Nothing shipped after the drop, so the episode is still open…
+    expect(r.session.takeUndeliveredReply()).toBe(true);
+    // …and read-and-clear means the notice goes out once.
+    expect(r.session.takeUndeliveredReply()).toBe(false);
+  });
+
   it("drops a non-empty thinking block when showThinking is off — under `omitted` it is a summary, not the reply", async () => {
     const r = rig({ showThinking: false });
 

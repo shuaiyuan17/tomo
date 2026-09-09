@@ -1523,9 +1523,6 @@ function pathishTokens(cmd: string): string[] {
 
 /** Tokens whose destination is knowable, and therefore the only ones the ALLOW
  *  side may judge. See limit 1 in the header. */
-function absolutePathTokens(cmd: string): string[] {
-  return allPathCandidates(cmd).filter(isAbsoluteish);
-}
 
 /** Leading `~` / `~/`, which the shell expands and `path.resolve` does not —
  *  without this, `cat ~/.ssh/id_rsa` resolves to `<cwd>/~/.ssh/id_rsa` and

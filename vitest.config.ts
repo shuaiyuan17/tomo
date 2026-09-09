@@ -1,11 +1,17 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 /**
- * Deliberately minimal: everything but `env` is vitest's default, so adding
- * this file changed nothing about which tests run or how.
+ * Deliberately minimal: everything but `env` and one `exclude` entry is
+ * vitest's default.
  */
 export default defineConfig({
   test: {
+    // An agent's isolated worktree lives INSIDE the repo (`.claude/worktrees/
+    // <agent>/`) and carries a full copy of tests/. Left behind, it makes vitest
+    // run every suite twice, and the suites that pin a fixed tmp path
+    // (cron-store, rollup-cooldown, status-cron) then race each other and fail
+    // nondeterministically — which looked like flakiness for two days.
+    exclude: [...configDefaults.exclude, ".claude/worktrees/**"],
     env: {
       // Tell src/logger.ts to log through an in-process destination instead of
       // building a pino transport. A transport is a worker thread plus a

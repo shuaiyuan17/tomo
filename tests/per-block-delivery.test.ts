@@ -484,7 +484,7 @@ describe("NO_REPLY is enforced per block", () => {
  * shown as reasoning: it IS the message.
  */
 describe("thinking blocks", () => {
-  it("delivers a non-empty thinking block as text, in order, unmarked, when showThinking is off", async () => {
+  it("drops a non-empty thinking block when showThinking is off — under `omitted` it is a summary, not the reply", async () => {
     const r = rig({ showThinking: false });
 
     await r.run([
@@ -496,17 +496,17 @@ describe("thinking blocks", () => {
       result(),
     ]);
 
-    // Its own message, before the tool call, and with no 💭 — the marker says
-    // "this is reasoning", which is the one thing this block is not.
+    // Nothing ships for it: what arrives under `omitted` is a paraphrase of
+    // the block, and a paraphrase delivered as a reply is words the model did
+    // not write. The text block after the tool call still ships in order.
     expect(r.order).toEqual([
-      "send:hello there",
       "send:B",
       "TURN-ENDING",
       "TURN-RETURNED",
     ]);
   });
 
-  it("warns, with the delivered length, only for the block it actually delivered", async () => {
+  it("warns, with the dropped length, only for the non-empty block it dropped", async () => {
     const r = rig({ showThinking: false });
 
     await r.run([
@@ -516,7 +516,7 @@ describe("thinking blocks", () => {
     ]);
 
     const thinkingWarns = vi.mocked(log.warn).mock.calls.filter(
-      ([, msg]) => typeof msg === "string" && msg.includes("thinking block routed as text"),
+      ([, msg]) => typeof msg === "string" && msg.includes("non-empty thinking block dropped"),
     );
     expect(thinkingWarns).toHaveLength(1);
     expect(thinkingWarns[0]![0]).toMatchObject({ session: "test:session", chars: 11 });
@@ -826,15 +826,16 @@ describe("a turn's blocks belong to that turn alone", () => {
     const harness = harnessRef.current!;
 
     try {
-      // THE EXACT 2026-08-28 08:33 SHAPE: a ~700-char reply written inside a
+      // The 2026-08-28 08:33 shape: a ~700-char reply written inside a
       // thinking block, on an unowned turn, with showThinking off, followed by
-      // a seven-minute tool call. It used to be dropped by design and the owner
-      // simply never got his answer. It now goes to the session's default
-      // target, unmarked, as the message it is.
+      // a long tool call. It was shipped as a message between 2026-08-28 and
+      // 2026-09-09; since then it is dropped again, because under `omitted`
+      // the text that arrives is a summary of the block rather than the block
+      // (see the live-session header). Nothing reaches the default target.
       harness.enqueue([assistant([thinkingBlock("x".repeat(700))]), assistant([toolUseBlock("Bash", "t1")])]);
       await new Promise((r) => setTimeout(r, 5));
 
-      expect(unowned).toEqual(["x".repeat(700)]);
+      expect(unowned).toEqual([]);
       // The claim-time warn from #293 stays: this shape is worth seeing in the
       // log whatever we now do with it.
       expect(log.warn).toHaveBeenCalledWith(
@@ -1324,12 +1325,19 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
     expect(log.warn).not.toHaveBeenCalled();
   });
 
-  it("marks a thinking block routed as text too — same outlet, same guard", async () => {
+  it("never reaches the guard for a thinking block with showThinking off — the block is dropped first", async () => {
     const r = rig({ showThinking: false });
     const body = `${formatInboundStamp("imessage")} what about tomorrow?`;
 
     await r.run([assistant([thinkingBlock(body)]), result()]);
 
-    expect(r.channel.sent.map((m) => m.text)).toEqual([`${FABRICATED_MARKER_NOTICE}\n${body}`]);
+    // Nothing ships, marked or otherwise: a non-empty thinking block under
+    // `omitted` is dropped before delivery, so the marker guard has no outlet
+    // to protect here. The drop is the warn.
+    expect(r.channel.sent).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ chars: body.length }),
+      expect.stringContaining("non-empty thinking block dropped"),
+    );
   });
 });

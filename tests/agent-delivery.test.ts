@@ -206,7 +206,7 @@ describe("outbound delivery", () => {
   // own message, so the earlier block arrives BEFORE the answer rather than
   // glued to it.
   it.each([
-    { showThinking: false, expected: ["the user probably wants X", "public answer"] },
+    { showThinking: false, expected: ["public answer"] },
     { showThinking: true, expected: ["💭 the user probably wants X", "public answer"] },
   ])("renders a thinking + text turn by block type (showThinking=$showThinking)", async ({ showThinking, expected }) => {
     resetConfig({ showThinking });
@@ -223,10 +223,11 @@ describe("outbound delivery", () => {
     await drainQueue(agent);
 
     expect(tg.delivered.map((d) => d.text)).toEqual(expected);
-    // Spelled out both ways so the assertion cannot pass by coincidence: the
-    // words arrive either way, the marker only with the flag on.
+    // Spelled out both ways so the assertion cannot pass by coincidence: with
+    // the flag on the thinking block arrives, marked; with it off the block
+    // arrives nowhere — under `omitted` its text is a summary, not a reply.
     const all = tg.delivered.map((d) => d.text).join("\n");
-    expect(all.includes("the user probably wants X")).toBe(true);
+    expect(all.includes("the user probably wants X")).toBe(showThinking);
     expect(all.includes("💭 ")).toBe(showThinking);
 
     await agent.stop();

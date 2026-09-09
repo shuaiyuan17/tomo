@@ -787,7 +787,7 @@ describe("LiveSession thinking blocks", () => {
     await expect(p).resolves.toBe("Sure — here's X.");
   });
 
-  it("keeps a non-empty thinking block in the response, unmarked, when showThinking is off", async () => {
+  it("drops a non-empty thinking block from the response when showThinking is off — under `omitted` it is a summary", async () => {
     const { session, harness } = makeSession();
 
     const p = session.send("hi");
@@ -801,7 +801,7 @@ describe("LiveSession thinking blocks", () => {
     // It was DELIVERED as a message, so it must also be in the turn response
     // the transcript and the silence checks read — otherwise recall would not
     // hold a message the owner is looking at.
-    await expect(p).resolves.toBe("the user probably wants X\nSure — here's X.");
+    await expect(p).resolves.toBe("Sure — here's X.");
   });
 
   it("includes thinking blocks, marked, when showThinking is on", async () => {

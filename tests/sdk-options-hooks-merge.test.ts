@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildHooksOption, makeTurnBudget, mergeHooks } from "../src/agent/sdk-options.js";
+import { UNDELIVERED_REPLY_NOTICE, buildHooksOption, makeTurnBudget, mergeHooks } from "../src/agent/sdk-options.js";
 
 describe("mergeHooks", () => {
   it("concatenates entries when two producers register the same event", () => {
@@ -53,5 +53,35 @@ describe("buildHooksOption — the two PreToolUse guards coexist", () => {
     };
     expect(hooks.PreToolUse).toHaveLength(1);
     expect(hooks.PostToolBatch).toBeUndefined();
+  });
+});
+
+describe("undelivered-reply nudge", () => {
+  type Hook = () => Promise<{ hookSpecificOutput?: { additionalContext?: string } }>;
+  const postToolBatchHooks = (hooks: Record<string, unknown[]>): Hook[] =>
+    (hooks.PostToolBatch as Array<{ hooks: Hook[] }>).flatMap((entry) => entry.hooks);
+
+  it("is not installed when the session offers no flag", () => {
+    const { hooks } = buildHooksOption({ maxTurns: 50, turnBudget: makeTurnBudget() }) as { hooks: Record<string, unknown[]> };
+    expect(postToolBatchHooks(hooks)).toHaveLength(1);
+  });
+
+  it("sits beside the turn-budget hook and fires only while the flag reads true", async () => {
+    let pending = true;
+    const read = () => { const p = pending; pending = false; return p; };
+    const { hooks } = buildHooksOption({
+      maxTurns: 50,
+      turnBudget: makeTurnBudget(),
+      undeliveredReply: read,
+    }) as { hooks: Record<string, unknown[]> };
+    const batch = postToolBatchHooks(hooks);
+    // Both producers present — this is the case mergeHooks exists for.
+    expect(batch).toHaveLength(2);
+
+    const first = await batch[1]!();
+    expect(first.hookSpecificOutput?.additionalContext).toBe(UNDELIVERED_REPLY_NOTICE);
+    // Read-and-clear on the session side: the second batch says nothing.
+    const second = await batch[1]!();
+    expect(second).toEqual({});
   });
 });

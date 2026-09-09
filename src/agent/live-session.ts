@@ -625,6 +625,21 @@ export class LiveSession {
   private unownedTurnDropLogged = false;
   /** A non-empty thinking block was dropped this turn (showThinking off). */
   private droppedThinkingThisTurn = false;
+  /**
+   * A non-empty thinking block was dropped and no text block has shipped
+   * since. Read (and cleared) by the PostToolBatch hook in sdk-options, which
+   * tells the model its last message never left the process so it can say it
+   * again as text. Cleared by the next text block that ships, because a
+   * shipped text block is the model having said it.
+   */
+  private undeliveredReplyPending = false;
+
+  /** True once per dropped-thinking episode: the hook's read-and-clear. */
+  takeUndeliveredReply(): boolean {
+    const pending = this.undeliveredReplyPending;
+    this.undeliveredReplyPending = false;
+    return pending;
+  }
   private unownedTurnFactory: UnownedTurnFactory | undefined;
   private timeoutMs: number;
   private showThinking: boolean;
@@ -912,6 +927,7 @@ export class LiveSession {
       const chars = block.text.trim().length;
       if (chars > 0) {
         this.droppedThinkingThisTurn = true;
+        this.undeliveredReplyPending = true;
         log.warn(
           { session: this.sessionKey, chars },
           "non-empty thinking block dropped (showThinking off)",
@@ -964,6 +980,9 @@ export class LiveSession {
     }
 
 
+    // A text block reaching the sink is the model having said its piece; any
+    // earlier dropped-thinking episode is moot from here.
+    if (block.type === "text") this.undeliveredReplyPending = false;
     const outstanding: OutstandingDelivery = { req, abandoned: false };
     this.outstandingDelivery = outstanding;
     this.deliverySuspensions++;

@@ -69,6 +69,12 @@ export interface SessionContext {
    * session's own.
    */
   isOwnAudienceTurn?: () => boolean;
+  /**
+   * Read-and-clear: did the model's last message land in a thinking block and
+   * get dropped (see LiveSession.takeUndeliveredReply)? Consulted after every
+   * tool batch so the model can be told before its next step.
+   */
+  undeliveredReply?: () => boolean;
 }
 
 export function sdkOptions(
@@ -231,6 +237,7 @@ export function sdkOptions(
       sessionKey: sessionContext?.sessionKey,
       privateMemoryBar,
       agentProfile,
+      undeliveredReply: sessionContext?.undeliveredReply,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -355,10 +362,16 @@ export function buildHooksOption(args: {
   /** Per-call profile lookup by SDK `agent_type`. Undefined ⇒ the guard is not
    *  installed. */
   agentProfile?: (agentType: string) => AgentProfile | undefined;
+  /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
+   *  the nudge is not installed. */
+  undeliveredReply?: () => boolean;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.turnBudget) {
     mergeHooks(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
+  }
+  if (args.undeliveredReply) {
+    mergeHooks(hooks, undeliveredReplyHooks(args.undeliveredReply, args.sessionKey));
   }
   if (args.privateMemoryBar) {
     mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
@@ -384,6 +397,42 @@ export function mergeHooks(
     into[event] = [...(into[event] ?? []), ...entries];
   }
   return into;
+}
+
+/**
+ * What the model is told when its previous message was dropped. Reaches it
+ * with the next request, after the tool batch that followed the dropped block.
+ */
+export const UNDELIVERED_REPLY_NOTICE =
+  "Your previous message was written in a thinking block and was NOT delivered to the user. " +
+  "If it was meant for them, say it again now as plain text, verbatim. " +
+  "If it was internal narration, do not repeat it.";
+
+/**
+ * A PostToolBatch hook that fires only when the session reports a dropped
+ * reply. Why this event: with `showThinking` off a non-empty thinking block is
+ * dropped rather than delivered (live-session.ts header), and every such block
+ * seen so far sat directly before a tool call — so the batch that follows it
+ * is the earliest point at which the model can be told, and the next request
+ * is the one that can repair it. `read()` is read-and-clear on the session
+ * side, so the notice goes out once per episode. A block dropped with no tool
+ * call after it is not reached here; that is the turn-end path's problem.
+ */
+function undeliveredReplyHooks(read: () => boolean, sessionKey?: string) {
+  return {
+    PostToolBatch: [{
+      hooks: [async () => {
+        if (!read()) return {};
+        log.info({ key: sessionKey }, "undelivered reply: nudging the model to restate as text");
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PostToolBatch" as const,
+            additionalContext: UNDELIVERED_REPLY_NOTICE,
+          },
+        };
+      }],
+    }],
+  };
 }
 
 /** Build a PostToolBatch hook that increments `budget.count` once per tool

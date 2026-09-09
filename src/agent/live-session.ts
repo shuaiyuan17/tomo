@@ -343,23 +343,23 @@ export type BlockRender =
  *     tell reasoning from reply.
  *   - showThinking OFF → the SDK is running thinking `display: "omitted"`,
  *     which strips the reasoning and leaves a signature-only block whose text
- *     is EMPTY. An empty one is therefore the normal case and is dropped
- *     silently. A NON-EMPTY one under `omitted` is not reasoning that leaked;
- *     it is the model having written a message in the wrong block type, and it
- *     ships EXACTLY LIKE A `text` BLOCK — unmarked, through the same scaffold
- *     filter, the same bare-NO_REPLY rule and the same downstream attachment
- *     handling.
+ *     is EMPTY. An empty one is the normal case and is dropped silently. A
+ *     NON-EMPTY one is dropped too, with a warn that records its length; it
+ *     reaches neither the channel nor the transcript.
  *
- * WHERE THAT LAST RULE COMES FROM (owner decision, 2026-08-28). One session's
- * SDK transcript for the day, flag off, held 173 thinking blocks with a 0-char
- * `thinking` string — what `omitted` produces for real reasoning — and 21 with
- * non-empty text. Every one of the 21 was prose aimed at the owner (a reply
- * after a tool result, a progress line after a steer); six were answers he was
- * waiting for and never received, because dropping the block was the specified
- * behaviour. None was leaked reasoning. So the correct reading of a non-empty
- * thinking block under `omitted` is "misplaced message", and it is delivered
- * on that basis — deterministically, from type and length, with no round trip
- * and no look at what the prose says.
+ * WHY A NON-EMPTY ONE IS NOT DELIVERED (2026-09-09, reversing the 2026-08-28
+ * rule). On 2026-08-28 the non-empty thinking blocks seen under `omitted`
+ * were, every one, verbatim prose the model had aimed at the owner in the
+ * wrong block type, so they were shipped as messages. That reading stopped
+ * being true after the 2026-09-01 model change: under `omitted` the model now
+ * returns a SUMMARY of the block (short, paraphrased, punctuation-stripped)
+ * rather than what it wrote, and on 2026-09-09 four of those summaries went
+ * out as replies. Each replaced the reply the model had actually composed,
+ * and one asserted a next step the model never planned. A paraphrase the
+ * model did not write is worse than a lost message: the lost message is at
+ * least absent. The warn keeps the rate visible — a model that puts replies in thinking
+ * blocks needs a model-side fix (compose the reply as a text block, or send
+ * it through a tool), not delivery of whatever the API hands back.
  *
  * The two remaining rules are per block by design (#292) and now also per
  * block in TIME — they run as the block completes, because that is when it
@@ -375,6 +375,12 @@ export type BlockRender =
  *      transcript is untouched (src/agent/inbound-markers.ts).
  */
 export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockRender {
+  // With the flag off a thinking block contributes nothing anywhere — not
+  // to delivery, not to the transcript, not to the response string. Under
+  // `omitted` its text is a summary of what the model wrote, not the words
+  // (see the header); recording it would let recall read a paraphrase back
+  // as something the model said. shipBlock logs the drop with its length.
+  if (block.type === "thinking" && !showThinking) return { kind: "empty", scaffoldFiltered: false };
   const scaffold = filterScaffoldLeak(block.text);
   const scaffoldFiltered = scaffold.filtered;
   const text = scaffold.text.trim();
@@ -617,6 +623,8 @@ export class LiveSession {
   private sessionKey: string | undefined;
   private turnBudget: TurnBudget | undefined;
   private unownedTurnDropLogged = false;
+  /** A non-empty thinking block was dropped this turn (showThinking off). */
+  private droppedThinkingThisTurn = false;
   private unownedTurnFactory: UnownedTurnFactory | undefined;
   private timeoutMs: number;
   private showThinking: boolean;
@@ -891,6 +899,26 @@ export class LiveSession {
    * settled at all.
    */
   private async shipBlock(block: ResponseBlock): Promise<void> {
+    if (block.type === "thinking" && !this.showThinking) {
+      // DROPPED, with a warn that records the length. Under `omitted` a
+      // non-empty thinking block is a summary of what the model wrote, not
+      // the words themselves (see the header), and a summary delivered as a
+      // reply puts words in the model's mouth. Empty thinking blocks are the
+      // normal case and stay silent, so this cannot flood the log; the rate
+      // of these warns is the signal that the model is still composing
+      // replies in thinking blocks. Remembered for the end of the turn: a
+      // turn whose only content was a dropped thinking block must resolve
+      // silent, not to the "I'm not sure" fallback the runner would deliver.
+      const chars = block.text.trim().length;
+      if (chars > 0) {
+        this.droppedThinkingThisTurn = true;
+        log.warn(
+          { session: this.sessionKey, chars },
+          "non-empty thinking block dropped (showThinking off)",
+        );
+      }
+      return;
+    }
     // A scaffold leak is reported once per turn at `result`, over the same
     // per-block filter — not logged again here.
     const rendered = renderBlock(block, this.showThinking);
@@ -935,23 +963,6 @@ export class LiveSession {
       return;
     }
 
-    if (block.type === "thinking" && !this.showThinking) {
-      // WARN, once per block, and only once we have a sink to hand it to —
-      // the drop path above logs its own error and must not be preceded by a
-      // line claiming delivery. Nothing is broken here; this is the specified
-      // handling. But the model put a message where messages are not supposed
-      // to be, and the rate at which that happens is the only signal that
-      // would tell us this rule has stopped being the right one. Empty
-      // thinking blocks (the overwhelming majority under `omitted`) never
-      // reach this point, so it cannot flood the log. `chars` is the rendered
-      // length, so it matches the message as the transcript records it.
-      // Caveat: a suppressed turn's sink drops the block after this line —
-      // suppression is a property of the TURN and is decided there.
-      log.warn(
-        { session: this.sessionKey, chars: rendered.text.length },
-        "thinking block routed as text (showThinking off)",
-      );
-    }
 
     const outstanding: OutstandingDelivery = { req, abandoned: false };
     this.outstandingDelivery = outstanding;
@@ -1139,7 +1150,12 @@ export class LiveSession {
       if (rendered.scaffoldFiltered) {
         log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
       }
-      const response = rendered.text || "I'm not sure how to respond to that.";
+      // A turn whose only content was a dropped thinking block resolves as a
+      // bare NO_REPLY — silent to the channel, honest in the transcript —
+      // rather than the generic fallback, which the runner WOULD deliver.
+      const response = rendered.text
+        || (this.droppedThinkingThisTurn ? "NO_REPLY" : "I'm not sure how to respond to that.");
+      this.droppedThinkingThisTurn = false;
       this.parts = [];
       this.unownedTurnDropLogged = false;
       const req = this.currentRequest;

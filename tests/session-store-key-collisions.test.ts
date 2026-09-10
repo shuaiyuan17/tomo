@@ -1455,6 +1455,31 @@ describe("parking a shared family is not done until nothing readable is left", (
     expect(store.migrationStatus().settled).toBe(true);
   });
 
+  it("keeps withholding when a later probe cannot read its sources (`shared` never downgrades to `unknown`)", () => {
+    // The probe said `shared`, the park could not run, the key is withheld. Then
+    // the registry becomes unreadable: the probe answers `unknown`. Dropping the
+    // withheld cache on that answer reloaded the still-mixed file.
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("mixed history", Date.parse("2026-02-01T00:00:00Z")));
+    const store = newStore();
+    store.setSdkSessionId(SUFFIXED, "sdk-underscore");
+    const lockDir = holdTranscriptLockIn(testDir);
+    expect(store.get(STABLE).messages).toEqual([]);
+    expect(warningsMatching("Withholding this session's transcript")).toHaveLength(1);
+
+    // Corrupt the registry so the next probe cannot answer, then retry.
+    writeFileSync(join(testDir, "_sessions.json"), "{ this is not json");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 61_000);
+      expect(store.get(STABLE).messages).toEqual([]);
+      expect(store.searchTranscript(STABLE, {})).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(readFileSync(join(testDir, "dm_a_b.jsonl"), "utf-8")).toContain("mixed history");
+    rmSync(lockDir, { recursive: true, force: true });
+  });
+
   it("stops serving the withheld empty session when ANOTHER process completed the park", () => {
     // TWO PROCESSES OVER ONE DIRECTORY. A withholds (its park could not run) and
     // caches the empty session; B parks the family and writes the key's fresh
@@ -1635,6 +1660,24 @@ describe("one unreadable ledger row is not an unreadable ledger", () => {
     c.get("dm:a:b");
     expect(c.migrationStatus().deferred).toEqual([]);
     expect(c.migrationStatus().settled).toBe(true);
+  });
+
+  it("releases the hold when the `.corrupt-` row is repaired in place", () => {
+    // The documented alternative to deleting the copy: fix the row into a valid
+    // owner list. A row that parses as owners has nothing unreadable left in it.
+    writeFileSync(LEDGER(), JSON.stringify({ version: 1, stems: { dm_a_b: "not-an-array" } }));
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("possibly shared", Date.parse("2026-02-01T00:00:00Z"), 1));
+    const a = newStore();
+    a.get("dm:a:b");
+    expect(a.migrationStatus().deferred).toEqual(["dm:a:b"]);
+    expect(corruptFiles()).toHaveLength(1);
+
+    const corrupt = join(testDir, corruptFiles()[0]);
+    writeFileSync(corrupt, JSON.stringify({ version: 1, stems: { dm_a_b: ["dm:a:b"] } }));
+    const b = newStore();
+    b.get("dm:a:b");
+    expect(b.migrationStatus().deferred).toEqual([]);
+    expect(b.migrationStatus().settled).toBe(true);
   });
 
   it("refuses a partner it can still SEE rather than deferring on a `.corrupt-` copy", () => {

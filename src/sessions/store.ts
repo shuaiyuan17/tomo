@@ -2257,7 +2257,11 @@ export class SessionStore {
         unparseable ??= name;
         continue;
       }
-      for (const stem of Object.keys(rows)) {
+      for (const [stem, owners] of Object.entries(rows as Record<string, unknown>)) {
+        // A row that parses as a valid owner list has been REPAIRED in place
+        // (the documented recovery): it no longer holds anything. Only rows
+        // whose value is still unreadable name a stem to defer.
+        if (Array.isArray(owners) && owners.every((owner) => typeof owner === "string" && owner.length > 0)) continue;
         const folded = stem.toLowerCase();
         if (!stems.has(folded)) stems.set(folded, name);
       }
@@ -3590,12 +3594,18 @@ export class SessionStore {
     // REMEMBERED, because `get()` has to be able to tell the one deferral that
     // must not be served (a known-shared file under this key's own name) from
     // every other one. Keyed by session key and dropped when the key settles.
+    const previous = this.transcriptProbeAnswer.get(key);
     if (answer.kind === "sole") this.transcriptProbeAnswer.delete(key);
-    else this.transcriptProbeAnswer.set(key, answer.kind);
-    // `shared` is the only answer that withholds (see `servesMixedTranscript`),
-    // so anything else ends the withholding here too — not only on the settle
-    // path above it, which a key that stays unsettled never reaches.
-    if (answer.kind !== "shared") this.releaseWithheldSession(key);
+    else if (answer.kind === "unknown" && previous === "shared") {
+      // An unreadable source cannot un-share a file we already saw shared:
+      // `unknown` means "cannot tell", and the last thing we could tell was
+      // that another owner is in there. Keep withholding until a readable
+      // probe answers `sole` or the family is parked.
+    } else this.transcriptProbeAnswer.set(key, answer.kind);
+    // Only a readable `sole` answer ends the withholding here (the settle
+    // path above it is the other exit). `unknown` must not: dropping the
+    // withheld cache on it would reload the still-mixed file.
+    if (answer.kind === "sole") this.releaseWithheldSession(key);
     return answer;
   }
 

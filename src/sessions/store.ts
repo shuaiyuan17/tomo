@@ -8,7 +8,7 @@ import {
   parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
   isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
 } from "../jsonl.js";
-import { writeJsonAtomicSync } from "../fs-utils.js";
+import { backupFileIfExistsSync, writeFileAtomicSync, writeJsonAtomicSync } from "../fs-utils.js";
 import { FileLockTimeoutError, isFileLockHeldSync, withFileLockSync, type FileLockOptions } from "../file-lock.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TRANSCRIPT_TEXT_LIMIT } from "../watch/protocol.js";
@@ -31,6 +31,26 @@ const REGISTRY_LOCK_OPTIONS: FileLockOptions = { timeoutMs: 2_000 };
  * the next start can redo.
  */
 const TRANSCRIPT_LOCK_OPTIONS: FileLockOptions = { timeoutMs: 1_000 };
+
+/**
+ * The legacy-stem ledger critical section is a read, a set union and an atomic
+ * write of a file with one line per session key — the registry's own profile,
+ * so the registry's budget.
+ */
+const LEGACY_STEM_LEDGER_LOCK_OPTIONS: FileLockOptions = { timeoutMs: 2_000 };
+
+/**
+ * How long a key whose transcript migration could not be completed (the
+ * transcript lock was held elsewhere, a rename raced, the merge failed
+ * mid-way) waits before the next inbound message retries it.
+ *
+ * The key is deliberately NOT marked as checked in that case — marking it is
+ * what orphaned the legacy file permanently — but "not marked" must not mean
+ * "take a 1s lock timeout on every single message either". So the retry is
+ * throttled rather than abandoned, and the work still happens inside this
+ * process run instead of waiting for a restart.
+ */
+const TRANSCRIPT_MIGRATION_RETRY_MS = 60_000;
 
 /** Rename `from` onto `to`, treating "it is already gone" as done: another
  *  process running the same migration is the expected reason. */
@@ -394,6 +414,29 @@ interface PendingNotesFile {
   notes: Record<string, string[]>;
 }
 
+/**
+ * `_legacy_stems.json`: legacy transcript filename stem → every session key
+ * ever seen to own it.
+ *
+ * WHY A FILE AND NOT A DERIVATION. Deciding whether a legacy-named transcript
+ * belongs to one key or several is a question about the PAST, and the registry
+ * is a record of the present: `cleanupExpiredLocked` drops an unlinked entry
+ * 30 days on (the transcript file outlives it), `clearSdkSessionId` removes a
+ * metadata-only stub outright, and `migrateSessionKeyLocked` re-keys an entry
+ * in place, keeping `migratedFrom` only for a non-DM→DM unification. Every one
+ * of those erases the evidence that a second key ever shared the file, so an
+ * inference from the live registry alone answers "only this key" for a file
+ * that holds two people's messages — and `store.get()` then serves one
+ * person's history to the other with no warning at all. So each of those
+ * paths writes the key down here BEFORE forgetting it, and
+ * `otherKeysSharingLegacyStem` reads this as well as the registry.
+ */
+interface LegacyStemLedgerFile {
+  version: 1;
+  /** Legacy stem → session keys, sorted, deduplicated. */
+  stems: Record<string, string[]>;
+}
+
 /** Get the full path to an SDK session JSONL file */
 export function getSdkSessionPath(
   sessionId: string,
@@ -416,13 +459,63 @@ const MIN_PLAUSIBLE_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
 /**
  * A record's seq, or null when it has none we can order by.
  *
- * Stricter than `getLastSeq` / `isAfterMessage`, which accept any non-null
- * value: a hand-edited `seq: "12"` is invisible to a search bound here but
- * would still seed the next append there. Search must not order by a string;
- * the append path's leniency is pre-existing and left alone.
+ * Stricter than `isAfterMessage` and than `getLastSeq`'s archive fallback,
+ * which accept any non-null value: a hand-edited `seq: "12"` is invisible to a
+ * search bound here but would still seed the next append there. Nothing that
+ * has to ORDER by seq may accept a string (`"12" + 1` is `"121"`), so
+ * `getLastSeq`'s scan of the tail — where the next seq to hand out is decided
+ * — uses this; the remaining leniency is pre-existing and left alone.
  */
 function usableSeq(msg: SessionMessage): number | null {
   return typeof msg.seq === "number" && Number.isFinite(msg.seq) ? msg.seq : null;
+}
+
+/**
+ * Highest seq across a set of JSONL transcript files, or 0 when none of them
+ * carries one. Used as the shift applied when a legacy transcript is folded in
+ * front of a newer one (see `foldLegacyTranscriptFile`).
+ *
+ * A file that cannot be read contributes nothing rather than throwing: this
+ * runs on the inbound message path, and a too-small offset costs seq
+ * continuity, where an exception costs the message.
+ */
+function maxSeqInFiles(paths: readonly string[]): number {
+  let max = 0;
+  for (const path of paths) {
+    let records: (SessionMessage | RawJsonlLine)[];
+    try {
+      records = readJsonlFileSync<SessionMessage>(path, { preserveUnparseable: true });
+    } catch {
+      continue;
+    }
+    for (const record of records) {
+      if (isRawJsonlLine(record)) continue;
+      const seq = usableSeq(record);
+      if (seq !== null && seq > max) max = seq;
+    }
+  }
+  return max;
+}
+
+/**
+ * Re-emit JSONL transcript text with every usable `seq` raised by `offset`.
+ *
+ * preserveUnparseable, for the reason spelled out on the option itself: this
+ * rewrites the file it read, so a line nobody could parse has to come back out
+ * rather than be dropped. Such a line has no seq to shift, which is the honest
+ * outcome — it had no position in the sequence to begin with.
+ */
+function shiftJsonlSeq(text: string, offset: number): string {
+  if (offset === 0) return text;
+  const records = parseJsonl<SessionMessage>(text, { preserveUnparseable: true });
+  if (records.length === 0) return "";
+  return records
+    .map((record) => {
+      if (isRawJsonlLine(record)) return serializeJsonlRecord(record);
+      const seq = usableSeq(record);
+      return serializeJsonlRecord(seq === null ? record : { ...record, seq: seq + offset });
+    })
+    .join("\n") + "\n";
 }
 
 /** A record's timestamp, or null when it has none we can order by. */
@@ -467,11 +560,29 @@ export function legacyTranscriptFileStem(key: string): string {
 }
 
 /**
- * Keys made only of these characters keep their legacy stem. `_` is
- * deliberately absent: a `_` in the key is indistinguishable from an encoded
- * `:`, so `dm:a_b` and `dm:a:b` would still collide.
+ * Keys made only of these characters keep their legacy stem.
+ *
+ * `_` is deliberately absent: a `_` in the key is indistinguishable from an
+ * encoded `:`, so `dm:a_b` and `dm:a:b` would still collide.
+ *
+ * `A-Z` IS DELIBERATELY ABSENT TOO, and it is not a nicety. The sessions
+ * directory lives on whatever filesystem the user has, and the defaults on
+ * both platforms Tomo runs on — APFS on macOS, NTFS on Windows — are
+ * case-INSENSITIVE. Allowing uppercase into the unsuffixed family made
+ * `imessage:AbC` and `imessage:abc` name the stems `imessage_AbC` and
+ * `imessage_abc`, which are the same file there: the exact leak this whole
+ * scheme exists to close, reintroduced one letter at a time. Any key with an
+ * uppercase character therefore takes the hash suffix, and the hash is what
+ * separates it from its case-folded twin (hex digits are lowercase, so the
+ * suffix itself survives case folding intact).
+ *
+ * Nothing everyday moves because of this: `dm:*` keys are lowercased at
+ * construction (`dmSessionKeyForIdentity`), `telegram:-100…` and other numeric
+ * chat ids have no letters, and `heartbeat` is lowercase. The keys that gain a
+ * suffix are the ones that already had to — iMessage chat GUIDs, which carry
+ * `;`, `+` or `@` as well.
  */
-const LEGACY_STABLE_KEY_CHAR = /[^A-Za-z0-9:-]/;
+const LEGACY_STABLE_KEY_CHAR = /[^a-z0-9:-]/;
 
 /** Bits of SHA-256 kept as the disambiguating suffix — 48, i.e. ~16.7M keys
  *  before a 50% birthday chance, against a personal assistant's dozens. */
@@ -481,22 +592,27 @@ const KEY_HASH_HEX_CHARS = 12;
  * The filename stem for a session key's transcript: `<stem>.jsonl` for the
  * active file, `_archive_<stem>_<YYYY-MM>.jsonl` for rotation archives.
  *
- * INJECTIVE, which `legacyTranscriptFileStem` is not:
+ * INJECTIVE, which `legacyTranscriptFileStem` is not — and injective UP TO
+ * CASE FOLDING, because the filesystem underneath is usually case-insensitive
+ * (see `LEGACY_STABLE_KEY_CHAR`):
  *
- * - A key drawn only from `[A-Za-z0-9:-]` keeps its legacy stem, so `dm:alice`,
+ * - A key drawn only from `[a-z0-9:-]` keeps its legacy stem, so `dm:alice`,
  *   `telegram:123` and `telegram:-100123` name exactly the files they always
  *   did and never need migrating. On that alphabet the legacy replacement is
  *   `: → _` and identity elsewhere, and `_` is not in the alphabet — so it is
- *   injective there.
+ *   injective there; and every such stem is already lowercase, so folding
+ *   changes nothing.
  * - Any other key gets `<legacy stem>.<hash of the FULL key>`. The hash is over
- *   the key, not the stem, so the two iMessage addresses above differ.
+ *   the key, not the stem, so the two iMessage addresses above differ — and so
+ *   do two keys differing only in case, whose legacy stems would fold together.
  * - The two sets cannot meet: `.` is outside the legacy safe set, so a legacy
  *   stem never contains one, and a suffixed stem always does.
  *
- * The same disjointness keeps the archive prefix scheme working: for a
- * suffixed archive to be picked up by an unsuffixed key's
- * `_archive_<stem>_` prefix, that key's stem would have to contain the `.` —
- * which it cannot.
+ * ARCHIVE LISTING DOES NOT RELY ON ANY OF THAT. `_archive_<stem>_` is only a
+ * prefix, and `dm:a` is a prefix of `dm:ab` — what stops `dm:a` from claiming
+ * `dm:ab`'s archives is the strict remainder test in `archivesForStem`: after
+ * the prefix, the name must be exactly `YYYY-MM.jsonl`. A suffixed stem
+ * carrying a `.` is neither necessary nor sufficient for that.
  */
 export function transcriptFileStem(key: string): string {
   const legacy = legacyTranscriptFileStem(key);
@@ -550,9 +666,17 @@ export class SessionStore {
   // Month for which rotation already ran and found nothing to roll — skip
   // re-reading an all-current-month file until the month turns over.
   private rotateSkipMonth = new Map<string, string>();
-  /** Keys whose legacy-named transcript files have already been considered for
-   *  migration in this process (see `ensureTranscriptMigrated`). */
+  /** Keys whose legacy-named transcript files have been fully settled — carried
+   *  over, refused as ambiguous, or never there (see
+   *  `ensureTranscriptMigrated`). Never holds a key whose migration was merely
+   *  ATTEMPTED: that is the bug this set used to carry. */
   private transcriptMigrationChecked = new Set<string>();
+  /** Keys with a migration attempt on the stack, so a nested `transcriptPath`
+   *  cannot recurse into it. */
+  private transcriptMigrationInFlight = new Set<string>();
+  /** Keys whose last migration attempt did not complete, and the wall-clock
+   *  time from which the next inbound message may try again. */
+  private transcriptMigrationRetryAt = new Map<string, number>();
   /** Legacy stems already reported as shared by more than one key — one warn
    *  per collision per process, not one per message. */
   private transcriptCollisionWarned = new Set<string>();
@@ -580,6 +704,15 @@ export class SessionStore {
   /** Get or create a session, loading only the transcript tail from disk on
    *  first access. Older messages stay on disk (see searchTranscript). */
   get(key: string): Session {
+    // BEFORE the cache lookup, not after. A migration can replace the bytes
+    // behind this key's transcript (a fold renumbers seq — see
+    // `foldLegacyTranscriptFile`) and drops the cached session when it does, so
+    // running it first is what makes the reload below pick the new content up.
+    // Reaching it only through `safeKey` would instead let it fire midway
+    // through `append`, after the message's seq had been derived from the stale
+    // tail. Memoized per key, so for a settled key this is a `Set.has`.
+    this.ensureTranscriptMigrated(key);
+
     let session = this.sessions.get(key);
     if (session) return session;
 
@@ -794,9 +927,19 @@ export class SessionStore {
 
   /** Get the highest seq number in a session */
   private getLastSeq(session: Session): number {
+    // THE MAX OVER THE TAIL, not the last one in it. Normally identical — seq
+    // is handed out monotonically — but a transcript that had a legacy file
+    // folded into its head (see `foldLegacyTranscriptFile`) can hold a
+    // stretch of records whose seq is out of order, and taking the newest
+    // record's value there hands the SAME seq out twice. Rotation treats a seq
+    // it has already archived as "already archived" and drops the record, so a
+    // reused seq is data loss, not cosmetics.
+    let max: number | null = null;
     for (let i = session.messages.length - 1; i >= 0; i--) {
-      if (session.messages[i].seq != null) return session.messages[i].seq!;
+      const seq = usableSeq(session.messages[i]);
+      if (seq !== null && (max === null || seq > max)) max = seq;
     }
+    if (max !== null) return max;
     // No seq in the tail — rotation may have moved every active message into
     // monthly archives (e.g. a session idle across a month boundary).
     // Continue the sequence from the newest archived record so seq stays
@@ -987,6 +1130,10 @@ export class SessionStore {
       const now = Date.now();
       this.registry = this.registry.filter((entry) => {
         if (entry.channelKey === key && entry.unlinkedAt === null && !entry.sdkSessionId) {
+          // Removed outright, not TTL'd — so record the legacy-stem ownership
+          // before the entry goes (see LegacyStemLedgerFile). Best-effort for
+          // the same reason as migrateSessionKey: the unlink must still happen.
+          this.rememberLegacyStemOwners([key]);
           log.info({ key }, "Metadata-only session entry removed");
           return false;
         }
@@ -1107,6 +1254,18 @@ export class SessionStore {
     }
 
     if (expired.length > 0) {
+      // WRITE IT DOWN BEFORE FORGETTING IT. These entries are about to leave
+      // the registry for good, while their transcript files stay on disk — and
+      // for a legacy-named file shared with another key, the registry entry was
+      // the only thing that said so. Dropping the entry without recording the
+      // ownership is what let the surviving key silently adopt the other
+      // person's messages (see LegacyStemLedgerFile). If the ledger cannot be
+      // written, the entries stay: this whole pass is housekeeping that the
+      // next daemon start redoes, and the SDK files it already unlinked are
+      // TTL'd data, not history.
+      const forgotten = expired.flatMap((e) => [e.channelKey, ...(e.migratedFrom ? [e.migratedFrom] : [])]);
+      if (!this.rememberLegacyStemOwners(forgotten)) return;
+
       this.registry = this.registry.filter((e) => e.expiresAt === null || e.expiresAt > now);
       // BEST-EFFORT, because of the header above: this runs from the
       // constructor, and a bare `saveRegistry()` throws on any write failure
@@ -1232,6 +1391,16 @@ export class SessionStore {
     // its own entry. (`transcriptPath` would trigger this anyway; doing it here
     // is what makes the order deliberate rather than incidental.)
     this.ensureTranscriptMigrated(oldKey);
+
+    // Re-keying is the registry forgetting `oldKey`: the `migratedFrom`
+    // breadcrumb below is only kept for a non-DM→DM unification, so for every
+    // other re-key nothing would remember that `oldKey` once owned its legacy
+    // transcript name. Record it first (see LegacyStemLedgerFile) — and unlike
+    // cleanupExpired, do not abandon the migration if the ledger write fails:
+    // a session that cannot be unified is a visible, user-facing breakage,
+    // where a missing ledger row only costs the collision warning for a file
+    // `oldKey` no longer writes to. Warned inside `rememberLegacyStemOwners`.
+    this.rememberLegacyStemOwners([oldKey]);
 
     // Re-key the entry in place: the data lives on under newKey, so there's no
     // need to keep a phantom unlinked entry that would confuse `sessions list`
@@ -1399,6 +1568,92 @@ export class SessionStore {
     } catch (err) {
       log.warn({ err, file: this.pendingNotesPath }, "Could not load pending notes");
       return {};
+    }
+  }
+
+  // --- Legacy stem ownership ledger (see LegacyStemLedgerFile) ---
+
+  private get legacyStemLedgerPath(): string {
+    return join(this.dir, "_legacy_stems.json");
+  }
+
+  /** Advisory lock for the ledger's read-modify-write.
+   *
+   *  ALWAYS THE INNERMOST LOCK. The registry lock and the transcript lock are
+   *  both taken with this one still free, and nothing here reaches back for
+   *  either, so the acquisition order is fixed (registry → transcript →
+   *  ledger) and no two processes can build a cycle. */
+  private get legacyStemLedgerLockPath(): string {
+    return `${this.legacyStemLedgerPath}.lock`;
+  }
+
+  /** Legacy stem → owning keys, as recorded on disk. Tolerates a missing,
+   *  truncated or hand-mangled file the way `loadPendingNotes` does: this
+   *  backs a warning, not an invariant, and it must not throw under `get()`. */
+  private loadLegacyStemLedger(): Record<string, string[]> {
+    if (!existsSync(this.legacyStemLedgerPath)) return {};
+    try {
+      const data = JSON.parse(readFileSync(this.legacyStemLedgerPath, "utf-8")) as Partial<LegacyStemLedgerFile>;
+      if (!data.stems || typeof data.stems !== "object") return {};
+      return Object.fromEntries(
+        Object.entries(data.stems)
+          .filter((entry): entry is [string, string[]] =>
+            Array.isArray(entry[1]) && entry[1].every((key) => typeof key === "string")),
+      );
+    } catch (err) {
+      log.warn({ err, file: this.legacyStemLedgerPath }, "Could not load the legacy transcript stem ledger");
+      return {};
+    }
+  }
+
+  /**
+   * Record that `keys` have owned their legacy transcript stems, so a later
+   * migration can still see them after the registry has forgotten them.
+   *
+   * Returns false when nothing could be persisted — the caller is about to
+   * forget the key, so it should NOT: a lost record here is the silent
+   * cross-session leak this ledger exists to prevent, and every caller's work
+   * is bookkeeping that the next daemon start redoes for free.
+   *
+   * Only keys whose legacy stem is not already recorded cause a write, so the
+   * steady state is a read of a small JSON file.
+   */
+  private rememberLegacyStemOwners(keys: readonly string[]): boolean {
+    const wanted = new Map<string, Set<string>>();
+    for (const key of keys) {
+      if (!key) continue;
+      const stem = legacyTranscriptFileStem(key);
+      let bucket = wanted.get(stem);
+      if (!bucket) wanted.set(stem, bucket = new Set());
+      bucket.add(key);
+    }
+    if (wanted.size === 0) return true;
+
+    try {
+      return withFileLockSync(this.legacyStemLedgerLockPath, () => {
+        // Re-read inside the lock: another process may have recorded keys of
+        // its own since we last looked, and this is a read-modify-write.
+        const stems = this.loadLegacyStemLedger();
+        let changed = false;
+        for (const [stem, owners] of wanted) {
+          const existing = new Set(stems[stem] ?? []);
+          const before = existing.size;
+          for (const owner of owners) existing.add(owner);
+          if (existing.size === before) continue;
+          stems[stem] = [...existing].sort();
+          changed = true;
+        }
+        if (changed) {
+          writeJsonAtomicSync(this.legacyStemLedgerPath, { version: 1, stems } satisfies LegacyStemLedgerFile);
+        }
+        return true;
+      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+    } catch (err) {
+      log.warn(
+        { err, file: this.legacyStemLedgerPath, keys: [...keys] },
+        "Could not record legacy transcript stem ownership; keeping the session entries for the next pass",
+      );
+      return false;
     }
   }
 
@@ -1674,8 +1929,9 @@ export class SessionStore {
    * under the old many-to-one scheme has been carried over to it.
    *
    * Every transcript path in the store is built here, so the migration cannot
-   * be forgotten at a call site; it is memoized per key, so after the first
-   * touch this is a `Set.has`.
+   * be forgotten at a call site — a backstop rather than the main trigger,
+   * which is `get()`. Settled keys are memoized, so this is normally a
+   * `Set.has`.
    */
   private safeKey(key: string): string {
     this.ensureTranscriptMigrated(key);
@@ -1722,7 +1978,7 @@ export class SessionStore {
    * collision-free one, once per key per process.
    *
    * Only keys whose stem actually changed have anything to do — `dm:*`,
-   * `telegram:*` and every other key drawn from `[A-Za-z0-9:-]` return
+   * `telegram:*` and every other key drawn from `[a-z0-9:-]` return
    * immediately, so the common case never touches the disk.
    *
    * OWNERSHIP IS THE HARD PART. The legacy name is many-to-one, so a legacy
@@ -1730,43 +1986,72 @@ export class SessionStore {
    * and nothing on disk says which. So:
    *
    * - No other known key maps to that legacy stem → the files are
-   *   unambiguously this key's, and they are renamed.
-   * - Some other key does (from the registry — active or unlinked entries,
-   *   `channelKey` and `migratedFrom` alike — or from the in-memory session
-   *   cache) → AMBIGUOUS. Nothing is renamed and nothing is guessed: the
-   *   legacy file is the only record of the mixed history, so it is left
-   *   exactly where it is for manual inspection (`cat
-   *   ~/.tomo/data/sessions/<legacy>.jsonl`, whose records carry `channel`
-   *   and `senderName`), one warning names the colliding keys, and each key
-   *   starts fresh under its own new name.
+   *   unambiguously this key's, and they are carried over.
+   * - Some other key does (see `otherKeysSharingLegacyStem`: the on-disk
+   *   ownership ledger, the registry, and this process's session cache) →
+   *   AMBIGUOUS. Nothing is moved and nothing is guessed: the legacy file is
+   *   the only record of the mixed history, so it is left exactly where it is
+   *   for manual inspection (`cat ~/.tomo/data/sessions/<legacy>.jsonl`, whose
+   *   records carry `channel` and `senderName`), one warning names the
+   *   colliding keys, and each key starts fresh under its own new name.
    *
    * NEVER THROWS: this sits under `get()`/`append()`, i.e. under every inbound
    * message. A lock we cannot take, an EACCES, a rename that races another
-   * process — all degrade to "don't migrate", logged once, retried on the next
-   * daemon start.
+   * process — all degrade to "don't migrate", logged once, and RETRIED: see
+   * below for why "retried" is load-bearing.
+   *
+   * AN INCOMPLETE ATTEMPT MUST NOT BE RECORDED AS A CHECK. The first version
+   * of this marked the key before doing the work, so the one failure mode that
+   * actually happens in the field — the transcript lock held by a second
+   * process, `tomo config identities` running against a live daemon — marked
+   * the key, returned, and let the triggering message `append()` under the NEW
+   * stem. From then on both files existed, and the legacy one was never looked
+   * at again: `loadTranscript`, `searchTranscript`, `transcriptCreatedAt` and
+   * `getLastSeq` all resolve through the new stem, so every message before the
+   * failed migration was gone from the product while sitting intact on disk.
+   * So the key is marked only when the migration actually finished, and the
+   * retry is throttled (`TRANSCRIPT_MIGRATION_RETRY_MS`) rather than dropped.
    */
   private ensureTranscriptMigrated(key: string): void {
     if (this.transcriptMigrationChecked.has(key)) return;
-    // Marked BEFORE the work: everything below builds paths from the stems
-    // directly, but a future edit that reaches for `transcriptPath` here would
-    // otherwise recurse forever.
-    this.transcriptMigrationChecked.add(key);
+    // Re-entrancy, not memoization: `migrateLegacyTranscript` must be able to
+    // call anything on the store (it reaches the registry and the ledger)
+    // without a stray `transcriptPath` recursing back into here. Cleared in
+    // `finally`, so an incomplete attempt stays retryable.
+    if (this.transcriptMigrationInFlight.has(key)) return;
+    const retryAt = this.transcriptMigrationRetryAt.get(key);
+    if (retryAt !== undefined && Date.now() < retryAt) return;
 
-    const legacy = legacyTranscriptFileStem(key);
-    const stem = transcriptFileStem(key);
-    if (stem === legacy) return;
-
+    this.transcriptMigrationInFlight.add(key);
     try {
-      this.migrateLegacyTranscript(key, legacy, stem);
+      const legacy = legacyTranscriptFileStem(key);
+      const stem = transcriptFileStem(key);
+      if (stem === legacy) {
+        this.transcriptMigrationChecked.add(key);
+        return;
+      }
+      if (this.migrateLegacyTranscript(key, legacy, stem)) {
+        this.transcriptMigrationChecked.add(key);
+        this.transcriptMigrationRetryAt.delete(key);
+      } else {
+        this.transcriptMigrationRetryAt.set(key, Date.now() + TRANSCRIPT_MIGRATION_RETRY_MS);
+      }
     } catch (err) {
-      log.warn({ err, key }, "Could not migrate legacy transcript files to the collision-free name");
+      log.warn({ err, key }, "Could not migrate legacy transcript files to the collision-free name; will retry");
+      this.transcriptMigrationRetryAt.set(key, Date.now() + TRANSCRIPT_MIGRATION_RETRY_MS);
+    } finally {
+      this.transcriptMigrationInFlight.delete(key);
     }
   }
 
-  private migrateLegacyTranscript(key: string, legacy: string, stem: string): void {
+  /**
+   * One migration attempt. Returns true when the question is settled for this
+   * key — everything carried over, or deliberately refused — and false when it
+   * should be tried again.
+   */
+  private migrateLegacyTranscript(key: string, legacy: string, stem: string): boolean {
     const legacyActive = join(this.dir, `${legacy}.jsonl`);
-    const legacyArchives = this.archivesForStem(legacy);
-    if (!existsSync(legacyActive) && legacyArchives.length === 0) return; // fresh key
+    if (!existsSync(legacyActive) && this.archivesForStem(legacy).length === 0) return true; // fresh key
 
     const others = this.otherKeysSharingLegacyStem(key, legacy);
     if (others.length > 0) {
@@ -1779,53 +2064,188 @@ export class SessionStore {
           + "separate files from now on",
         );
       }
-      return;
+      // Settled, not postponed: ambiguity only ever grows (a second owner is
+      // never un-learned), so retrying would re-derive the same refusal once
+      // per message.
+      return true;
     }
 
-    let renamed = 0;
+    let carried: number;
     try {
-      withFileLockSync(this.transcriptLockPath, () => {
-        // Re-check inside the lock: another process may have done all of this
-        // between our scan and here.
-        const newActive = join(this.dir, `${stem}.jsonl`);
-        if (existsSync(legacyActive)) {
-          if (existsSync(newActive)) {
-            log.warn(
-              { key, legacy: legacyActive, current: newActive },
-              "Legacy transcript left in place: the migrated file already exists",
-            );
-          } else if (renameIfPresent(legacyActive, newActive)) {
-            renamed++;
-          }
-        }
-        for (const archive of this.archivesForStem(legacy)) {
-          const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
-          if (!month) continue;
-          const target = join(this.dir, `_archive_${stem}_${month}.jsonl`);
-          if (existsSync(target)) continue;
-          if (renameIfPresent(archive, target)) renamed++;
-        }
-      }, TRANSCRIPT_LOCK_OPTIONS);
+      carried = withFileLockSync(
+        this.transcriptLockPath,
+        () => this.carryLegacyTranscriptFamily(key, legacy, stem),
+        TRANSCRIPT_LOCK_OPTIONS,
+      );
     } catch (err) {
       if (!(err instanceof FileLockTimeoutError)) throw err;
       // Another process is mid-migration for this directory. Skipping is the
-      // only safe answer on a message path; the next daemon start retries.
+      // only safe answer on a message path — but NOT forgetting: see the header
+      // of `ensureTranscriptMigrated`.
       if (!this.transcriptLockWarned.has(legacy)) {
         this.transcriptLockWarned.add(legacy);
-        log.warn({ err, key }, "Skipping legacy transcript migration: another process holds the transcript lock");
+        log.warn({ err, key }, "Deferring legacy transcript migration: another process holds the transcript lock");
       }
-      return;
+      return false;
     }
 
-    if (renamed > 0) {
-      log.info({ key, from: legacy, to: stem, files: renamed }, "Migrated transcript files to a collision-free name");
+    if (carried > 0) {
+      log.info({ key, from: legacy, to: stem, files: carried }, "Migrated transcript files to a collision-free name");
+      // The bytes behind this key's paths changed underneath any cached
+      // session, and a fold renumbers seq. Drop the cache so the next `get()`
+      // reloads the tail (and `getLastSeq` re-derives) from what is on disk.
+      this.sessions.delete(key);
+      this.rotateSkipMonth.delete(key);
     }
+
+    // Settled only if nothing is left behind. A partially applied fold (one
+    // target written, the next throwing ENOSPC) leaves legacy files on disk,
+    // and every step below is idempotent, so the honest answer is "try again".
+    return !existsSync(legacyActive) && this.archivesForStem(legacy).length === 0;
+  }
+
+  /**
+   * Move `legacy`'s active transcript and monthly archives onto `stem`, with
+   * the transcript lock held. Returns how many files were carried over.
+   *
+   * A plain `rename` whenever the destination is free. When it is NOT free the
+   * legacy file is FOLDED INTO it rather than left behind: the both-exist state
+   * is reached by a migration that was deferred (lock held, EACCES) while the
+   * message that triggered it went on to `append()` under the new stem, so
+   * refusing here is what strands the whole pre-migration history — present on
+   * disk, unreachable from every read path. The legacy file is strictly the
+   * older of the two (the new stem only starts receiving once this store has
+   * resolved a path for the key), so the fold is a prepend.
+   */
+  private carryLegacyTranscriptFamily(key: string, legacy: string, stem: string): number {
+    // Re-listed inside the lock: another process may have done some or all of
+    // this between our scan and here.
+    const moves: { from: string; to: string }[] = [];
+    const legacyActive = join(this.dir, `${legacy}.jsonl`);
+    if (existsSync(legacyActive)) moves.push({ from: legacyActive, to: join(this.dir, `${stem}.jsonl`) });
+    for (const archive of this.archivesForStem(legacy)) {
+      const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
+      if (!month) continue;
+      moves.push({ from: archive, to: join(this.dir, `_archive_${stem}_${month}.jsonl`) });
+    }
+    if (moves.length === 0) return 0;
+
+    // One offset for the whole family, computed before anything is written, so
+    // the legacy seq run and the new-stem seq run concatenate into a single
+    // increasing sequence instead of two overlapping ones starting at 1. Both
+    // `getLastSeq` (the next seq to hand out) and rotation's `isAfterMessage`
+    // (which records are already archived) order by seq, so an overlap means
+    // reused seq numbers and, on the next rotation, records dropped as
+    // "already archived".
+    let offset: number | null = null;
+    const seqOffset = (): number => offset ??= maxSeqInFiles(moves.map((m) => m.from));
+
+    let carried = 0;
+    let foldedActive = false;
+    for (const { from, to } of moves) {
+      // Checked per file, immediately before acting on it: a directory-wide
+      // "does anything collide" test would leave a window in which the
+      // destination appears and a bare rename silently overwrites it.
+      if (existsSync(to)) {
+        if (from === legacyActive) foldedActive = true;
+        if (this.foldLegacyTranscriptFile(key, from, to, seqOffset())) carried++;
+      } else if (renameIfPresent(from, to)) {
+        carried++;
+      }
+    }
+
+    // KNOWN GAP, REPORTED RATHER THAN PAPERED OVER. Every record is reachable
+    // after a fold, but rotation's own dedupe (`isAfterMessage` against the
+    // last record already in a month's archive) assumes the active file is
+    // strictly newer than every archive — and folding puts OLDER records back
+    // into it. For a month whose archive came from a LEGACY archive that is
+    // fine: the fold prepended the legacy records and shifted the rest, so the
+    // ordering holds. For a month whose archive exists only under the new stem,
+    // a later rotation can read the oldest folded records as already archived
+    // and drop them. Reaching that state needs megabytes of traffic under the
+    // new stem, across a month boundary, inside the seconds-to-a-restart window
+    // before the fold — so it is logged for a human rather than solved by
+    // rewriting every archive in the family.
+    if (foldedActive) {
+      const carriedMonths = new Set(moves.map((m) => /_(\d{4}-\d{2})\.jsonl$/.exec(m.to)?.[1]));
+      const unpaired = this.archivesForStem(stem)
+        .filter((a) => !carriedMonths.has(/_(\d{4}-\d{2})\.jsonl$/.exec(a)?.[1]));
+      if (unpaired.length > 0) {
+        log.error(
+          { key, legacy, stem, archives: unpaired },
+          "Transcript folded while the migrated name already had rotation archives of its own: every record is "
+          + "readable now, but check these archives against the active file before the next rotation",
+        );
+      }
+    }
+    return carried;
+  }
+
+  /**
+   * Prepend `from`'s records to `to`, shifting `to`'s own seq numbers up by
+   * `offset`, then remove `from`. Returns true when `from` is gone.
+   *
+   * ORDER OF OPERATIONS IS THE CRASH SAFETY. `to` is replaced by an atomic
+   * rename whose content is a superset of both files, and only then is `from`
+   * unlinked — so every intermediate state still has every record reachable
+   * from some path, and a `.premerge-bak` copy of `to` survives until the fold
+   * is complete.
+   *
+   * RE-RUNNING IS SAFE. A crash between the rename and the unlink leaves `to`
+   * already folded and `from` still present, which the next pass would
+   * otherwise fold a second time and duplicate. `from`'s bytes are written
+   * verbatim at the head of `to`, so "does `to` start with `from`?" detects
+   * exactly that case, and the retry just finishes the unlink.
+   */
+  private foldLegacyTranscriptFile(key: string, from: string, to: string, offset: number): boolean {
+    const legacyText = readFileSync(from, "utf-8");
+    const currentText = readFileSync(to, "utf-8");
+
+    if (legacyText.length > 0 && !currentText.startsWith(legacyText)) {
+      const backup = `${to}.premerge-bak`;
+      backupFileIfExistsSync(to, backup);
+      // `_archive_<stem>_<YYYY-MM>.jsonl.premerge-bak` is not matched by
+      // `archivesForStem`'s strict remainder test and `<stem>.jsonl.premerge-bak`
+      // is not `<stem>.jsonl`, so a backup left behind by a crash is inert.
+      writeFileAtomicSync(to, legacyText + (legacyText.endsWith("\n") ? "" : "\n") + shiftJsonlSeq(currentText, offset));
+      unlinkSync(from);
+      try { unlinkSync(backup); } catch { /* best-effort */ }
+      log.warn(
+        { key, from, to, seqOffset: offset },
+        "Legacy transcript folded into the file written after a deferred migration: its records were on disk "
+        + "but unreachable, and are now at the head of the migrated file",
+      );
+      return true;
+    }
+
+    // Nothing to carry (an empty legacy file), or already folded by a pass that
+    // died before the unlink.
+    unlinkSync(from);
+    return true;
   }
 
   /**
    * Every OTHER session key we know of that shares `legacy` as its legacy
    * filename stem — i.e. every key whose history could be mixed into the same
    * legacy file.
+   *
+   * Three sources, because no one of them remembers enough:
+   *
+   * - THE LEDGER (`_legacy_stems.json`), which is the only source that survives
+   *   a key being forgotten. See `LegacyStemLedgerFile` for what erases the
+   *   other two.
+   * - THE REGISTRY, active and unlinked entries alike, `channelKey` and
+   *   `migratedFrom` — the live picture, and the only one that knows about a
+   *   key this process has never routed a message for.
+   * - THE IN-MEMORY SESSION CACHE, for a key touched in this process before the
+   *   registry had an entry for it.
+   *
+   * WHAT THIS STILL CANNOT SEE: a key whose registry entry aged out before the
+   * ledger existed — i.e. before this code first ran on the install — left no
+   * trace anywhere, so its partner's legacy file looks unambiguously
+   * single-owner and will be adopted. Nothing in the data can distinguish that
+   * from a genuinely single-owner file; the ledger closes the window from here
+   * on, it cannot reconstruct what was already discarded.
    */
   private otherKeysSharingLegacyStem(key: string, legacy: string): string[] {
     const others = new Set<string>();
@@ -1834,6 +2254,8 @@ export class SessionStore {
       if (legacyTranscriptFileStem(candidate) !== legacy) return;
       others.add(candidate);
     };
+
+    for (const recorded of this.loadLegacyStemLedger()[legacy] ?? []) consider(recorded);
 
     // Not while a registry critical section is open: `mutateRegistry` has
     // already forced a fresh read, and re-reading would discard the in-memory

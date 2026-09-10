@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -23,6 +23,7 @@ const { SessionStore, transcriptFileStem, legacyTranscriptFileStem } = await imp
 
 const warn = log.warn as unknown as ReturnType<typeof vi.fn>;
 const info = log.info as unknown as ReturnType<typeof vi.fn>;
+const debug = log.debug as unknown as ReturnType<typeof vi.fn>;
 
 const TEST_ROOT = join(tmpdir(), `tomo-test-key-collisions-${process.pid}`);
 let testDir: string;
@@ -43,11 +44,42 @@ function warningsMatching(needle: string): unknown[][] {
   return warn.mock.calls.filter((call) => String(call[1] ?? "").includes(needle));
 }
 
+function debugMatching(needle: string): unknown[][] {
+  return debug.mock.calls.filter((call) => String(call[1] ?? "").includes(needle));
+}
+
+/** One JSONL line, with an explicit seq when the test is about seq. */
+function record(content: string, timestamp: number, seq?: number): string {
+  return JSON.stringify({ ...msg(content, timestamp), ...(seq === undefined ? {} : { seq }) }) + "\n";
+}
+
+/** Another LIVE process inside the transcript critical section. */
+function holdTranscriptLockIn(dir: string): string {
+  const lockDir = join(dir, "_transcripts.lock");
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(
+    join(lockDir, "owner.other"),
+    `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
+  );
+  return lockDir;
+}
+
+/** `.ambiguous-` files in the test directory. */
+function quarantinedFiles(): string[] {
+  return readdirSync(testDir).filter((n) => /\.ambiguous-\d{8}-\d{6}(?:-\d+)?\.jsonl$/.test(n)).sort();
+}
+
+/** `.legacy-` sidecars in the test directory. */
+function sidecarFiles(): string[] {
+  return readdirSync(testDir).filter((n) => /\.legacy-\d{8}-\d{6}(?:-\d+)?\.jsonl$/.test(n)).sort();
+}
+
 beforeEach(() => {
   testDir = join(TEST_ROOT, `case-${counter++}`);
   mkdirSync(testDir, { recursive: true });
   warn.mockClear();
   info.mockClear();
+  debug.mockClear();
 });
 
 afterEach(() => {
@@ -483,21 +515,20 @@ describe("persisted legacy-stem ownership (_legacy_stems.json)", () => {
     expect(store.migrationStatus().settled).toBe(false);
   });
 
-  it("quarantines an unparseable ledger rather than overwriting it, and refuses meanwhile", () => {
+  it("moves an unreadable ROW aside and keeps writing the rest of the ledger", () => {
     writeFileSync(LEDGER(), '{"version":1,"stems":{"dm_a":"not-an-array"}}');
     const store = newStore();
-    // A forgetting path has to record an owner, which is what triggers the
-    // quarantine — the corrupt bytes may be the only record of an owner, so they
-    // are moved aside and never rewritten in place.
+    // A forgetting path has to record an owner. The bad row cannot be rewritten
+    // (it may be the only record of an owner) so it is moved aside verbatim and
+    // the good rows — here, the one being added — are written beside it.
     store.setChatTitle(ALEX_UNDERSCORE, "Alex");
     store.clearSdkSessionId(ALEX_UNDERSCORE);
 
     const quarantined = readdirSync(testDir).filter((n) => n.startsWith("_legacy_stems.json.corrupt-"));
     expect(quarantined).toHaveLength(1);
     expect(readFileSync(join(testDir, quarantined[0]), "utf-8")).toContain("not-an-array");
-    expect(warningsMatching("was quarantined")).toHaveLength(1);
+    expect(warningsMatching("Moved unreadable rows out of")).toHaveLength(1);
 
-    // Rebuilt from empty, and the owner we were recording is in it.
     const ledger = JSON.parse(readFileSync(LEDGER(), "utf-8")) as { stems: Record<string, string[]> };
     expect(ledger.stems[legacyTranscriptFileStem(ALEX_UNDERSCORE)]).toEqual([ALEX_UNDERSCORE]);
     expect(ledger.stems.dm_a).toBeUndefined();
@@ -589,7 +620,7 @@ describe("persisted legacy-stem ownership (_legacy_stems.json)", () => {
     expect(existsSync(join(testDir, "_transcripts.lock"))).toBe(false);
     expect(existsSync(LEDGER())).toBe(false);
     expect(store.migrationStatus())
-      .toEqual({ settled: true, deferred: [], ambiguous: [], sidecars: [] });
+      .toEqual({ settled: true, deferred: [], ambiguous: [], sidecars: [], orphans: [] });
 
     // And a second process over the same directory does no work either.
     info.mockClear();
@@ -1137,5 +1168,352 @@ describe("seq allocation over a transcript that is not monotonic", () => {
       .map((line) => (JSON.parse(line) as { seq: number }).seq);
     expect(seqs).toEqual([5, 3, 6]);
     expect(new Set(seqs).size).toBe(seqs.length);
+  });
+});
+
+describe("a sidecar is NOT ordered by the filename it sits beside", () => {
+  // The first version of the read set promised it was: "a sidecar is strictly
+  // older than the file beside it". Both reviewers found that false twice over —
+  // `migrateSessionKeyLocked` sidecars a transcript that ran IN PARALLEL with the
+  // one it lands beside (two live sessions being unified), and a legacy active
+  // file an unmigrated process kept appending to is newer than parts of the
+  // archive it ends up next to. Everything below is a reader that leaned on the
+  // promise.
+  const JUL = Date.parse("2026-07-15T00:00:00Z");
+  const AUG = Date.parse("2026-08-15T00:00:00Z");
+  const SEP = Date.parse("2026-09-15T00:00:00Z");
+
+  /** A September active file, a JULY sidecar beside it, an AUGUST archive behind
+   *  both: the layout the reviewers reproduced. */
+  function seedOutOfOrderFamily(): string {
+    const stem = transcriptFileStem(ALEX_DOT);
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("september", SEP, 6));
+    writeFileSync(join(testDir, `${stem}.legacy-20260901-000000.jsonl`), record("july", JUL, 1));
+    writeFileSync(join(testDir, `_archive_${stem}_2026-08.jsonl`), record("august", AUG, 5));
+    return stem;
+  }
+
+  it("does not abandon the files behind a sidecar when a lower bound is passed", () => {
+    // `recall_conversation`'s `after` is the live path: the July sidecar sits
+    // between the active file and the August archive, so a `break outer` on it
+    // returned NOTHING from August while the record sat on disk.
+    seedOutOfOrderFamily();
+    const store = newStore();
+
+    expect(store.searchTranscript(ALEX_DOT, { fromTime: AUG - 1 }).map((m) => m.content))
+      .toEqual(["august", "september"]);
+    expect(store.searchTranscript(ALEX_DOT, { fromTime: JUL, toTime: AUG }).map((m) => m.content))
+      .toEqual(["july", "august"]);
+    expect(store.searchTranscript(ALEX_DOT, {}).map((m) => m.content))
+      .toEqual(["july", "august", "september"]);
+  });
+
+  it("orders the loaded tail by the records, so updatedAt is the newest one", () => {
+    // The re-key shape: two sessions that were live at the same time, one of them
+    // now a sidecar. A positional merge put Thursday before Monday.
+    const stem = transcriptFileStem(ALEX_DOT);
+    const MON = Date.parse("2026-09-07T00:00:00Z");
+    const TUE = Date.parse("2026-09-08T00:00:00Z");
+    const WED = Date.parse("2026-09-09T00:00:00Z");
+    const THU = Date.parse("2026-09-10T00:00:00Z");
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("monday", MON, 1) + record("wednesday", WED, 2));
+    writeFileSync(
+      join(testDir, `${stem}.legacy-20260901-000000.jsonl`),
+      record("tuesday", TUE, 1) + record("thursday", THU, 2),
+    );
+
+    const session = newStore().get(ALEX_DOT);
+    expect(session.messages.map((m) => m.content)).toEqual(["monday", "tuesday", "wednesday", "thursday"]);
+    expect(session.messages.map((m) => m.timestamp)).toEqual([MON, TUE, WED, THU]);
+    expect(session.updatedAt).toBe(THU);
+    expect(session.createdAt).toBe(MON);
+  });
+
+  it("takes the oldest record across the whole family for createdAt", () => {
+    seedOutOfOrderFamily();
+    // Walking oldest-file-first and stopping at the first record it found read
+    // the August archive and reported August.
+    expect(newStore().get(ALEX_DOT).createdAt).toBe(JUL);
+  });
+
+  it("applies seq bounds to the active family only, and keeps sidecar records", () => {
+    // `seq` is unique inside the active file and its archives; a sidecar is a
+    // different run that no writer continues, so the two scales are not
+    // comparable. Bounds over them are therefore ignored rather than silently
+    // dropping the records — and a sidecar seq behind the bound must not end the
+    // scan, which is what used to lose the archive behind it.
+    seedOutOfOrderFamily(); // active seq 6, archive seq 5, sidecar seq 1
+    const store = newStore();
+
+    expect(store.searchTranscript(ALEX_DOT, { fromSeq: 6 }).map((m) => m.content))
+      .toEqual(["july", "september"]);
+    expect(store.searchTranscript(ALEX_DOT, { toSeq: 5 }).map((m) => m.content))
+      .toEqual(["july", "august"]);
+  });
+
+  it("reads an archive sidecar whose canonical archive is no longer there", () => {
+    // An interrupted re-key moves an archive before its sidecars, leaving
+    // `_archive_<stem>_<M>.legacy-<ts>.jsonl` with no `_archive_<stem>_<M>.jsonl`.
+    // Readers enumerated archive sidecars only inside the canonical-archive loop,
+    // so that month was invisible to every reader while `transcriptFamilyMoves`
+    // still knew about it.
+    const stem = transcriptFileStem(ALEX_DOT);
+    const orphan = `_archive_${stem}_2026-07.legacy-20260901-000000.jsonl`;
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("september", SEP, 2));
+    writeFileSync(join(testDir, orphan), record("july, sidecar only", JUL, 1));
+
+    const store = newStore();
+    expect(store.searchTranscript(ALEX_DOT, {}).map((m) => m.content))
+      .toEqual(["july, sidecar only", "september"]);
+    expect(store.searchTranscript(ALEX_DOT, { query: "sidecar only" })).toHaveLength(1);
+    expect(store.get(ALEX_DOT).createdAt).toBe(JUL);
+    // …and it is reported as an orphan, which is what an operator acts on.
+    expect(store.migrationStatus().orphans).toEqual([orphan]);
+  });
+
+  it("counts the active file and the NEWEST sidecar only", () => {
+    // Sidecars are never rotated, so counting all of them made this the one
+    // reader whose cost grows with every deferred migration the install ever had.
+    const stem = transcriptFileStem(ALEX_DOT);
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("live", SEP, 1));
+    writeFileSync(join(testDir, `${stem}.legacy-20260801-000000.jsonl`), record("older sidecar", AUG, 1));
+    writeFileSync(join(testDir, `${stem}.legacy-20260901-000000.jsonl`), record("newest sidecar", SEP - 1, 1));
+
+    expect(newStore().countRecentUserMessages(ALEX_DOT)).toBe(2);
+  });
+
+  it("reads a record that an interrupted rotation left in two files once", () => {
+    // A sidecar is never rewritten, so a record the rotation had already appended
+    // to an archive before it died is permanently in both files. The duplicate is
+    // collapsed in the search output, not on disk.
+    const stem = transcriptFileStem(ALEX_DOT);
+    const duplicate = record("rotated twice", AUG, 4);
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("september", SEP, 5));
+    writeFileSync(join(testDir, `${stem}.legacy-20260901-000000.jsonl`), duplicate);
+    writeFileSync(join(testDir, `_archive_${stem}_2026-08.jsonl`), duplicate);
+
+    expect(newStore().searchTranscript(ALEX_DOT, {}).map((m) => m.content))
+      .toEqual(["rotated twice", "september"]);
+    // Both copies are still on disk: nothing rewrites a sidecar.
+    expect(readFileSync(join(testDir, `${stem}.legacy-20260901-000000.jsonl`), "utf-8")).toBe(duplicate);
+    expect(readFileSync(join(testDir, `_archive_${stem}_2026-08.jsonl`), "utf-8")).toBe(duplicate);
+  });
+});
+
+describe("the migration's move cannot overwrite a live destination", () => {
+  const T1 = Date.parse("2026-02-01T00:00:00Z");
+
+  it("converges when a crash landed between the link and the unlink", () => {
+    // link+unlink leaves both names on ONE inode for an instant. Under
+    // check-then-rename the re-run read that as "the destination is taken" and
+    // made a SIDECAR out of the same bytes, so every record was read twice.
+    const legacy = legacyTranscriptFileStem(ALEX_DOT);
+    const stem = transcriptFileStem(ALEX_DOT);
+    const legacyPath = join(testDir, `${legacy}.jsonl`);
+    writeFileSync(legacyPath, record("legacy one", T1, 1));
+    linkSync(legacyPath, join(testDir, `${stem}.jsonl`));
+
+    const store = newStore();
+    store.setSdkSessionId(ALEX_DOT, "sdk-1");
+
+    expect(store.get(ALEX_DOT).messages.map((m) => m.content)).toEqual(["legacy one"]);
+    expect(existsSync(legacyPath)).toBe(false);
+    expect(sidecarFiles()).toEqual([]);
+    expect(store.searchTranscript(ALEX_DOT, {}).map((m) => m.content)).toEqual(["legacy one"]);
+    expect(store.migrationStatus().settled).toBe(true);
+    // And the mode in use is on the record exactly once.
+    expect(debugMatching("link+unlink")).toHaveLength(1);
+  });
+});
+
+describe("parking a shared family is not done until nothing readable is left", () => {
+  // `dm:a:b` keeps `dm_a_b.jsonl`, so the mixed file IS its own active name and
+  // the family has to be parked. The `.ambiguous-` marker records that the
+  // DECISION was taken — the first version read it as "the work finished", so one
+  // failed archive rename left mixed archives readable with the key settled.
+  const STABLE = "dm:a:b";
+  const SUFFIXED = "dm:a_b";
+  const DECIDED_AT = "20260301-120000";
+
+  it("parks a mixed archive a previous pass left behind, and leaves the fresh files alone", () => {
+    // The crash state: the active file was parked (the marker is the record of
+    // that) and the archive rename never ran.
+    writeFileSync(
+      join(testDir, `dm_a_b.ambiguous-${DECIDED_AT}.jsonl`),
+      record("mixed history", Date.parse("2026-02-01T00:00:00Z")),
+    );
+    writeFileSync(
+      join(testDir, "_archive_dm_a_b_2026-02.jsonl"),
+      record("mixed february", Date.parse("2026-02-05T00:00:00Z")),
+    );
+    // …and what this key has written since the decision, which must survive.
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("mine now", Date.parse("2026-03-05T00:00:00Z")));
+    writeFileSync(
+      join(testDir, "_archive_dm_a_b_2026-03.jsonl"),
+      record("mine, rotated", Date.parse("2026-03-02T00:00:00Z")),
+    );
+
+    const store = newStore();
+    store.setSdkSessionId(SUFFIXED, "sdk-underscore"); // the other owner is known
+
+    expect(store.get(STABLE).messages.map((m) => m.content)).toEqual(["mine now"]);
+    // The mixed archive is out of every readable name, and preserved.
+    expect(existsSync(join(testDir, "_archive_dm_a_b_2026-02.jsonl"))).toBe(false);
+    const parked = quarantinedFiles().filter((n) => n.startsWith("_archive_dm_a_b_2026-02.ambiguous-"));
+    expect(parked).toHaveLength(1);
+    expect(readFileSync(join(testDir, parked[0]), "utf-8")).toContain("mixed february");
+    // The post-decision files are untouched.
+    expect(readFileSync(join(testDir, "dm_a_b.jsonl"), "utf-8")).toContain("mine now");
+    expect(existsSync(join(testDir, "_archive_dm_a_b_2026-03.jsonl"))).toBe(true);
+    // Nothing mixed is readable any more, and only now is the key settled.
+    expect(store.searchTranscript(STABLE, {}).map((m) => m.content)).toEqual(["mine, rotated", "mine now"]);
+    expect(store.migrationStatus().settled).toBe(true);
+  });
+
+  it("withholds the session while the mixed file is still under the key's own name", () => {
+    // The probe said `shared` and the quarantine could not run (the transcript
+    // lock is held), so the key's own active filename still holds both histories.
+    // `get()` used to ignore the unsettled answer and load it.
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("mixed history", Date.parse("2026-02-01T00:00:00Z")));
+    const store = newStore();
+    store.setSdkSessionId(SUFFIXED, "sdk-underscore");
+    const lockDir = holdTranscriptLockIn(testDir);
+
+    expect(store.get(STABLE).messages).toEqual([]);
+    expect(store.searchTranscript(STABLE, {})).toEqual([]);
+    expect(store.migrationStatus().deferred).toEqual([STABLE]);
+    expect(warningsMatching("Withholding this session's transcript")).toHaveLength(1);
+
+    // An append still works — and lands in the mixed file, the one window in
+    // which that can happen. It is parked with the rest when the retry runs.
+    store.append(STABLE, msg("arrived while the quarantine was deferred", Date.parse("2026-03-02T00:00:00Z")));
+    expect(readFileSync(join(testDir, "dm_a_b.jsonl"), "utf-8")).toContain("arrived while the quarantine");
+    expect(store.get(STABLE).messages.map((m) => m.content))
+      .toEqual(["arrived while the quarantine was deferred"]);
+    expect(warningsMatching("Withholding this session's transcript")).toHaveLength(1);
+
+    rmSync(lockDir, { recursive: true, force: true });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 61_000);
+      expect(store.get(STABLE).messages).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(quarantinedFiles()).toHaveLength(1);
+    const parked = readFileSync(join(testDir, quarantinedFiles()[0]), "utf-8");
+    expect(parked).toContain("mixed history");
+    expect(parked).toContain("arrived while the quarantine");
+    expect(store.migrationStatus().settled).toBe(true);
+  });
+});
+
+describe("one unreadable ledger row is not an unreadable ledger", () => {
+  // Refusing the whole file for one bad row deferred EVERY key's migration, and
+  // the write path then quarantined the file and rebuilt from `{}` — throwing
+  // away the ownership evidence in every row that WAS readable. Rows are read
+  // one at a time now.
+  const LEDGER = () => join(testDir, "_legacy_stems.json");
+  const REGISTRY = () => join(testDir, "_sessions.json");
+
+  function corruptFiles(): string[] {
+    return readdirSync(testDir).filter((n) => n.startsWith("_legacy_stems.json.corrupt-")).sort();
+  }
+
+  function seedSharedLegacyFile(): string {
+    const legacyPath = join(testDir, `${legacyTranscriptFileStem(ALEX_DOT)}.jsonl`);
+    writeFileSync(legacyPath, JSON.stringify(msg("mixed history")) + "\n");
+    return legacyPath;
+  }
+
+  it("still refuses a shared file on a GOOD row while another row is malformed", () => {
+    // The partner is recorded in a perfectly readable row; a malformed row for an
+    // unrelated stem used to make the whole file unreadable, which deferred this
+    // key instead of refusing it — and the legacy file then looked adoptable to
+    // the next pass that got a readable ledger.
+    writeFileSync(LEDGER(), JSON.stringify({
+      version: 1,
+      stems: {
+        dm_a: "not-an-array",
+        [legacyTranscriptFileStem(ALEX_DOT)]: [ALEX_UNDERSCORE],
+      },
+    }));
+    const legacyPath = seedSharedLegacyFile();
+
+    const store = newStore();
+    expect(store.get(ALEX_DOT).messages).toEqual([]);
+    expect(existsSync(legacyPath)).toBe(true);
+    const collisions = warningsMatching("filename collision");
+    expect(collisions).toHaveLength(1);
+    expect((collisions[0][0] as { keys: string[] }).keys).toContain(ALEX_UNDERSCORE);
+  });
+
+  it("heals the ledger on the READ path, without waiting for a write", () => {
+    // The wedge used to clear only when some write path came along — and the
+    // write paths refuse while the ledger is unreadable, so "some write path"
+    // could be never.
+    writeFileSync(LEDGER(), JSON.stringify({
+      version: 1,
+      stems: { dm_a: "not-an-array", dm_b: ["dm:b"] },
+    }));
+    // A key with files of its own, so the ownership probe actually runs (a key
+    // with nothing on disk settles before it ever reads the ledger).
+    writeFileSync(join(testDir, "dm_alice.jsonl"), record("hello", Date.parse("2026-02-01T00:00:00Z"), 1));
+    const store = newStore();
+
+    // A pure read: one key's first touch.
+    expect(store.get("dm:alice").messages.map((m) => m.content)).toEqual(["hello"]);
+
+    expect(corruptFiles()).toHaveLength(1);
+    const quarantinedRows = JSON.parse(readFileSync(join(testDir, corruptFiles()[0]), "utf-8")) as
+      { stems: Record<string, unknown> };
+    expect(quarantinedRows.stems).toEqual({ dm_a: "not-an-array" });
+    const kept = JSON.parse(readFileSync(LEDGER(), "utf-8")) as { stems: Record<string, string[]> };
+    expect(kept.stems).toEqual({ dm_b: ["dm:b"] });
+    expect(warningsMatching("Moved unreadable rows out of")).toHaveLength(1);
+  });
+
+  it("defers only the stems whose own row was unreadable", () => {
+    writeFileSync(LEDGER(), JSON.stringify({ version: 1, stems: { dm_a_b: "not-an-array" } }));
+    // One key whose stem's row is fine and has a legacy file to migrate…
+    const legacy = legacyTranscriptFileStem(ALEX_DOT);
+    writeFileSync(join(testDir, `${legacy}.jsonl`), record("carried", Date.parse("2026-02-01T00:00:00Z"), 1));
+    // …and one whose stem is exactly the unreadable row.
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("unknown ownership", Date.parse("2026-02-02T00:00:00Z"), 1));
+
+    const store = newStore();
+    store.setSdkSessionId(ALEX_DOT, "sdk-1");
+    expect(store.get(ALEX_DOT).messages.map((m) => m.content)).toEqual(["carried"]);
+    expect(existsSync(join(testDir, `${legacy}.jsonl`))).toBe(false);
+
+    // The bad row's stem stays deferred — and keeps serving, because "unknown"
+    // here means an unreadable source, not a file known to be shared.
+    expect(store.get("dm:a:b").messages.map((m) => m.content)).toEqual(["unknown ownership"]);
+    expect(store.migrationStatus().deferred).toEqual(["dm:a:b"]);
+    expect(warningsMatching("ownership source could not be read")).toHaveLength(1);
+  });
+
+  it("quarantines a wholly unparseable ledger on the read path and keeps failing closed", () => {
+    writeFileSync(LEDGER(), "{not json at all");
+    const legacyPath = seedSharedLegacyFile();
+    const store = newStore();
+
+    // A pure read quarantines the bytes…
+    expect(store.get(ALEX_DOT).messages).toEqual([]);
+    expect(corruptFiles()).toHaveLength(1);
+    expect(readFileSync(join(testDir, corruptFiles()[0]), "utf-8")).toBe("{not json at all");
+    expect(warningsMatching("was quarantined")).toHaveLength(1);
+    // …and the ledger is NOT rebuilt from `{}` on top of them, so the legacy file
+    // is still not adoptable even though nothing is named as its owner any more.
+    expect(existsSync(LEDGER())).toBe(false);
+    expect(existsSync(legacyPath)).toBe(true);
+    expect(store.migrationStatus().deferred).toEqual([ALEX_DOT]);
+
+    // And a forgetting path refuses rather than recording into a fresh `{}`.
+    store.setChatTitle(ALEX_UNDERSCORE, "Alex");
+    store.clearSdkSessionId(ALEX_UNDERSCORE);
+    expect(readFileSync(REGISTRY(), "utf-8")).toContain(ALEX_UNDERSCORE);
+    expect(existsSync(LEDGER())).toBe(false);
+    expect(warningsMatching("Keeping the metadata-only session entry")).toHaveLength(1);
   });
 });

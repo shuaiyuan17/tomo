@@ -583,6 +583,81 @@ function usableTimestamp(msg: SessionMessage): number | null {
 }
 
 /**
+ * The instant a record is ORDERED BY when a read set mixes files whose relative
+ * order cannot be inferred from their names (see `transcriptReadSet`).
+ *
+ * A record with no usable timestamp sorts as older than every placeable one: it
+ * cannot be interleaved honestly, and the only alternative — dropping it —
+ * loses history. Ties (including a whole run of undated records) are broken by
+ * file order, so the result is deterministic.
+ */
+function orderTimestamp(msg: SessionMessage): number {
+  return usableTimestamp(msg) ?? -Infinity;
+}
+
+/**
+ * Sort records oldest-first by their own timestamps, ties by their position in
+ * the input.
+ *
+ * Index-tiebroken rather than trusting `Array.sort` to be stable, and it never
+ * SUBTRACTS the two keys: `-Infinity - -Infinity` is `NaN`, which makes a
+ * comparator inconsistent and the result unspecified.
+ */
+function sortByRecordTime(messages: readonly SessionMessage[]): SessionMessage[] {
+  return messages
+    .map((msg, index) => ({ msg, index }))
+    .sort((a, b) => {
+      const ta = orderTimestamp(a.msg);
+      const tb = orderTimestamp(b.msg);
+      if (ta !== tb) return ta < tb ? -1 : 1;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.msg);
+}
+
+/**
+ * The UTC instant encoded in a `-<YYYYMMDD-HHmmss>[-<n>].jsonl` suffix, or null
+ * when the name does not carry one. Second resolution, like the names.
+ */
+function suffixedNameTime(name: string): number | null {
+  const m = /-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-\d+)?\.jsonl$/.exec(name);
+  if (!m) return null;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+}
+
+/**
+ * Are these two names the SAME FILE — same device, same inode?
+ *
+ * This is what tells "the destination is another key's live transcript" from
+ * "the destination is the hard link this very migration created before it was
+ * interrupted" (see `moveWithoutClobber`).
+ */
+function sameFileOnDisk(from: string, to: string): "same" | "different" | "missing-source" {
+  let source: ReturnType<typeof statSync>;
+  try {
+    source = statSync(from);
+  } catch {
+    return "missing-source";
+  }
+  try {
+    const target = statSync(to);
+    return source.dev === target.dev && source.ino === target.ino ? "same" : "different";
+  } catch {
+    return "different";
+  }
+}
+
+/** Unlink `path`, treating "it is already gone" as success — the second half of
+ *  a link+unlink move is idempotent by construction. */
+function unlinkIfPresent(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
+
+/**
  * The registry file exists but could not be turned into a session list — a
  * JSON parse failure, a transient `EMFILE`/`EIO`, a half-restored file. Carries
  * the underlying error as `cause`.
@@ -676,6 +751,16 @@ export function transcriptFileStem(key: string): string {
   return `${legacy}.${hash}`;
 }
 
+/**
+ * One file in a key's read set, and whether it is a READ-ONLY LEGACY SIDECAR —
+ * a different seq run that no writer will touch again, and one whose position
+ * in time cannot be read off its filename.
+ */
+interface TranscriptReadFile {
+  path: string;
+  sidecar: boolean;
+}
+
 export class SessionStore {
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
@@ -737,6 +822,8 @@ export class SessionStore {
   private transcriptCollisionWarned = new Set<string>();
   /** Ditto for a migration skipped because the transcript lock was held. */
   private transcriptLockWarned = new Set<string>();
+  /** Ditto for a quarantine pass that left part of a shared family readable. */
+  private transcriptQuarantineIncompleteWarned = new Set<string>();
   /** Ditto for an ownership source (`_sessions.json`, `_legacy_stems.json`)
    *  that could not be read, which defers every key's migration. */
   private transcriptSourceWarned = new Set<string>();
@@ -745,6 +832,38 @@ export class SessionStore {
   private transcriptAmbiguousStems = new Set<string>();
   /** The ledger's read failure is logged once per streak, not once per key. */
   private legacyStemLedgerErrorLogged = false;
+  /**
+   * The last answer `probeLegacyStemOwnership` gave for a key, while its
+   * migration is unsettled. `shared` on a key that KEEPS its legacy stem is the
+   * one state in which reading the file would mix two sessions (see `get()`);
+   * dropped as soon as the key settles.
+   */
+  private transcriptProbeAnswer = new Map<string, "shared" | "unknown">();
+  /** Keys being served an empty session because their own transcript file is
+   *  known-mixed and not parked yet — tracked so an `append()` inside that
+   *  window keeps appending to one session rather than restarting it. */
+  private transcriptWithheld = new Set<string>();
+  /** One warn per key per streak for that withholding, and one for a deferral
+   *  we keep serving through. */
+  private transcriptWithheldWarned = new Set<string>();
+  private transcriptDeferredServeWarned = new Set<string>();
+  /** Case-folded legacy stems whose ledger ROW could not be parsed. Their
+   *  ownership is unknown, so only their migrations defer — the rest of the
+   *  ledger is still good evidence (see `loadLegacyStemLedger`). */
+  private legacyStemLedgerMalformedStems = new Set<string>();
+  /** The whole ledger file was unparseable and has been moved aside. Fail
+   *  closed for the rest of the streak: the file is ABSENT now, and "absent"
+   *  otherwise reads as "fresh install, nothing was ever shared". */
+  private legacyStemLedgerUnparseable = false;
+  /** One row-healing attempt per streak, not one per key touch. */
+  private legacyStemLedgerHealAttempted = false;
+  /**
+   * The move primitive the migration uses, once the FILESYSTEM has answered
+   * whether it can hard-link a transcript (see `moveWithoutClobber`). Null until
+   * then; `carryModeLogged` is only about saying it once.
+   */
+  private carryMode: "link" | "rename" | null = null;
+  private carryModeLogged: "link" | "rename" | null = null;
   /**
    * Messages loaded from a READ-ONLY LEGACY SIDECAR.
    *
@@ -786,7 +905,26 @@ export class SessionStore {
     // instead let it fire midway through `append`, after the message's seq had
     // been derived from the stale tail. Memoized per key, so for a settled key
     // this is a `Set.has`.
-    this.ensureTranscriptMigrated(key);
+    //
+    // AND ITS ANSWER IS USED. A `false` means "we do not yet know which files
+    // are this key's", and for one shape of that — a key whose own active
+    // filename is KNOWN to hold another key's history too, whose quarantine
+    // could not be completed (the ledger write failed, the transcript lock was
+    // held) — loading the file anyway serves one person's history to another,
+    // which is the whole defect this scheme exists to close. Such a key gets an
+    // EMPTY session until the quarantine lands; every other deferral keeps
+    // serving what is on disk, because there the alternative is losing sight of
+    // the key's own messages.
+    const settled = this.ensureTranscriptMigrated(key);
+    if (!settled) {
+      if (this.servesMixedTranscript(key)) return this.withheldSession(key);
+      this.warnOnce(this.transcriptDeferredServeWarned, key, () => log.warn(
+        { key },
+        "Serving this session from the files it names while its legacy transcript migration is deferred: the "
+        + "ownership sources could not be read, and the alternative — withholding the history — loses sight of "
+        + "messages that are almost certainly this key's own. Retried on the next message",
+      ));
+    }
 
     let session = this.sessions.get(key);
     if (session) return session;
@@ -870,6 +1008,16 @@ export class SessionStore {
    * Streams newest-first from disk with early exit, so the full transcript
    * is never materialized; continues into monthly rotation archives when the
    * active file doesn't fill the limit.
+   *
+   * THE EARLY EXIT IS ONLY SOUND WHILE THE READ SET IS CHRONOLOGICAL, i.e.
+   * while there is no read-only legacy sidecar in it (see
+   * `transcriptReadSet`). When there is one, the scan moves to
+   * `searchTranscriptUnordered` below: every file read in full, every record
+   * filtered on its own, and the merged result ordered by the records'
+   * timestamps. `recall_conversation`'s `after` was the live casualty — a
+   * `fromTime` lower bound ended the scan at the first record behind it and
+   * abandoned every file after that one, returning nothing while the records
+   * sat on disk.
    */
   searchTranscript(key: string, opts: {
     query?: string;
@@ -879,13 +1027,20 @@ export class SessionStore {
     toTime?: number;
     limit?: number;
   }): SessionMessage[] {
+    // WITHHELD FOR THE SAME REASON `get()` WITHHOLDS THE SESSION: while this
+    // key's own filename is known to hold another key's history too and the
+    // quarantine has not landed, a search of that file is a search of the other
+    // session's messages — and `recall_conversation` is the caller.
+    if (this.withholdsTranscript(key)) return [];
     const limit = opts.limit ?? 50;
     const results: SessionMessage[] = [];
     const queryLower = opts.query?.toLowerCase();
     // Sidecars included: a legacy file the migration could not rename is still
     // this key's history, and a search that cannot see it is the exact defect
     // the sidecar rule exists to avoid.
-    const files = this.transcriptReadFiles(key);
+    const readSet = this.transcriptReadSet(key);
+    if (readSet.hasSidecars) return this.searchTranscriptUnordered(readSet.files, opts, limit, queryLower);
+    const files = readSet.files.map((file) => file.path);
 
     // Records skipped for being unplaceable under a bound, per file. Said
     // once per file after its scan, not once per record: the degenerate case
@@ -949,6 +1104,98 @@ export class SessionStore {
     // The `break outer` paths leave the current file's count unreported.
     noteSkipped(files[files.length - 1] ?? "");
 
+    return results.reverse();
+  }
+
+  /**
+   * `searchTranscript` over a read set that contains a READ-ONLY LEGACY
+   * SIDECAR, whose position in time its filename does not give away.
+   *
+   * Three differences from the ordered path, all forced by that:
+   *
+   * - NO EARLY EXIT, across files or within one. A record behind the window's
+   *   lower bound says nothing about the records after it here, so every file
+   *   is read in full and every record is judged on its own. That costs a full
+   *   family scan per search — bounded by the transcript, paid only while a
+   *   sidecar exists, and the alternative is the silent truncation above.
+   * - THE MERGED RESULT IS ORDERED BY THE RECORDS, not by the files. Newest
+   *   first for the `limit`, ties broken by file order then by position inside
+   *   the file, then reversed into chronological order for the caller.
+   * - SEQ BOUNDS APPLY TO THE ACTIVE FAMILY ONLY. `seq` is unique inside the
+   *   active file and its rotation archives; a sidecar is a different run that
+   *   no writer will continue, so its numbers are not comparable with the
+   *   active family's at all. Comparing them would be arithmetic on two
+   *   different scales, so `fromSeq`/`toSeq` are IGNORED for sidecar records
+   *   (which therefore stay in the result) rather than quietly filtering them.
+   *   `fromTime`/`toTime` are absolute and apply everywhere.
+   */
+  private searchTranscriptUnordered(
+    files: readonly TranscriptReadFile[],
+    opts: { query?: string; fromSeq?: number; toSeq?: number; fromTime?: number; toTime?: number },
+    limit: number,
+    queryLower: string | undefined,
+  ): SessionMessage[] {
+    const hits: { msg: SessionMessage; fileIndex: number; position: number }[] = [];
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+      const { path, sidecar } = files[fileIndex];
+      let skipped = 0;
+      let position = 0;
+      for (const msg of iterateJsonlBackwardsSync<SessionMessage>(path)) {
+        position++;
+        const seq = usableSeq(msg);
+        const time = usableTimestamp(msg);
+        // A record that cannot be placed under a bound the caller asked for is
+        // skipped, never used to end the scan — same rule as the ordered path,
+        // with the seq bounds scoped to the active family.
+        if (!sidecar && opts.fromSeq != null) {
+          if (seq == null) { skipped++; continue; }
+          if (seq < opts.fromSeq) continue;
+        }
+        if (!sidecar && opts.toSeq != null) {
+          if (seq == null) { skipped++; continue; }
+          if (seq > opts.toSeq) continue;
+        }
+        if (opts.fromTime != null) {
+          if (time == null) { skipped++; continue; }
+          if (time < opts.fromTime) continue;
+        }
+        if (opts.toTime != null) {
+          if (time == null) { skipped++; continue; }
+          if (time > opts.toTime) continue;
+        }
+        if (typeof msg.content !== "string") continue;
+        if (queryLower && !msg.content.toLowerCase().includes(queryLower)) continue;
+        hits.push({ msg, fileIndex, position });
+      }
+      if (skipped > 0) {
+        log.debug({ file: path, skipped }, "Skipped transcript records that cannot be placed in the search window");
+      }
+    }
+
+    hits.sort((a, b) => {
+      const ta = orderTimestamp(a.msg);
+      const tb = orderTimestamp(b.msg);
+      if (ta !== tb) return ta < tb ? 1 : -1;
+      if (a.fileIndex !== b.fileIndex) return a.fileIndex - b.fileIndex;
+      return a.position - b.position;
+    });
+
+    // An interrupted rotation that a sidecar preserved can hold the SAME record
+    // in two files at once (the legacy active file and the archive the rotation
+    // had already appended it to). Sidecars are never rewritten — that is the
+    // whole rule — so the duplicate is permanent on disk; it is only collapsed
+    // here, in the output, on the full record rather than on `seq` alone: two
+    // distinct undated legacy records in the same millisecond would otherwise
+    // read as one.
+    const results: SessionMessage[] = [];
+    const seen = new Set<string>();
+    for (const hit of hits) {
+      const token = JSON.stringify([hit.msg.seq ?? null, hit.msg.timestamp ?? null, hit.msg.role ?? null, hit.msg.content]);
+      if (seen.has(token)) continue;
+      seen.add(token);
+      results.push(hit.msg);
+      if (results.length >= limit) break;
+    }
     return results.reverse();
   }
 
@@ -1550,7 +1797,7 @@ export class SessionStore {
     // had already received a message kept its own file and `oldKey`'s whole
     // history stayed on disk, reachable from no path. Same hole as the legacy
     // migration's, same answer: one more rename, no rewriting, and the bytes land
-    // where every reader of `newKey` picks them up (`transcriptReadFiles`).
+    // where every reader of `newKey` picks them up (`transcriptReadSet`).
     const oldStem = this.safeKey(oldKey);
     const newStem = this.safeKey(newKey);
     const sidecars: string[] = [];
@@ -1581,10 +1828,8 @@ export class SessionStore {
     // the new one's files just changed underneath it (it gained the old key's
     // active file, or a read-only sidecar beside its own). A cached session there
     // would keep serving the pre-unification tail.
-    this.sessions.delete(oldKey);
-    this.sessions.delete(newKey);
-    this.rotateSkipMonth.delete(oldKey);
-    this.rotateSkipMonth.delete(newKey);
+    this.dropCachedSession(oldKey);
+    this.dropCachedSession(newKey);
 
     this.saveRegistry();
     log.info({ oldKey, newKey, sdkSessionId: entry.sdkSessionId }, "Session migrated to unified key");
@@ -1735,9 +1980,29 @@ export class SessionStore {
    * exists and will not parse may name the very owner that makes a legacy
    * transcript ambiguous. So the second case says so, and every caller refuses
    * rather than proceeding on `{}`. Never throws — this runs under `get()`.
+   *
+   * A MALFORMED ROW IS NOT A MALFORMED FILE. The first version refused the whole
+   * file for one bad row, which deferred EVERY key's migration, and the write
+   * path then quarantined the file and rebuilt from `{}` — discarding the
+   * ownership evidence in all the rows that were perfectly readable. Rows are
+   * parsed one at a time now: the good ones are returned and used, the bad ones
+   * are reported in `malformed` so that only THEIR stems defer, and
+   * `healLegacyStemLedgerRows` moves them verbatim into a `.corrupt-<ts>`
+   * sibling so the wedge clears without waiting for a write.
+   *
+   * PURE, DELIBERATELY: callers may hold locks or be mid-cycle, so nothing is
+   * written from here. The read path triggers the healing explicitly.
    */
-  private loadLegacyStemLedger(): { ok: true; stems: Record<string, string[]> } | { ok: false } {
-    if (!existsSync(this.legacyStemLedgerPath)) return { ok: true, stems: {} };
+  private loadLegacyStemLedger():
+    { ok: true; stems: Record<string, string[]>; malformed: string[] } | { ok: false } {
+    if (this.legacyStemLedgerUnparseable && !existsSync(this.legacyStemLedgerPath)) {
+      // The bytes were moved to `.corrupt-<ts>` on the read path, so the file is
+      // absent now — and "absent" is the one answer we must not give here, since
+      // it reads as "nothing was ever recorded". Fail closed until a ledger that
+      // parses is back in place.
+      return { ok: false };
+    }
+    if (!existsSync(this.legacyStemLedgerPath)) return { ok: true, stems: {}, malformed: [] };
     let data: Partial<LegacyStemLedgerFile>;
     try {
       data = JSON.parse(readFileSync(this.legacyStemLedgerPath, "utf-8")) as Partial<LegacyStemLedgerFile>;
@@ -1750,16 +2015,160 @@ export class SessionStore {
       this.noteLegacyStemLedgerUnreadable(new Error("missing or malformed `stems` object"));
       return { ok: false };
     }
-    // A malformed ROW is refused like a malformed file rather than filtered out:
-    // dropping it silently is the same "I cannot read this owner, so there is no
-    // owner" step, one row at a time.
+    const good: Record<string, string[]> = {};
+    const malformed: string[] = [];
     for (const [stem, owners] of Object.entries(stems)) {
-      if (Array.isArray(owners) && owners.every((key) => typeof key === "string")) continue;
-      this.noteLegacyStemLedgerUnreadable(new Error(`malformed owner list for stem ${JSON.stringify(stem)}`));
-      return { ok: false };
+      if (Array.isArray(owners) && owners.every((key) => typeof key === "string")) {
+        good[stem] = owners as string[];
+        continue;
+      }
+      malformed.push(stem);
+      // Remembered for the rest of the process: the healing below takes the row
+      // out of the file, and after that nothing on disk says this stem's owners
+      // were once unreadable. Its migrations keep deferring here rather than
+      // adopting a file whose other owner may be exactly what that row held.
+      this.legacyStemLedgerMalformedStems.add(stem.toLowerCase());
     }
-    this.legacyStemLedgerErrorLogged = false;
-    return { ok: true, stems: stems as Record<string, string[]> };
+    if (malformed.length > 0) {
+      this.noteLegacyStemLedgerUnreadable(
+        new Error(`malformed owner list for ${malformed.length} stem(s): ${malformed.map((x) => JSON.stringify(x)).join(", ")}`),
+      );
+    } else {
+      this.legacyStemLedgerErrorLogged = false;
+      this.legacyStemLedgerHealAttempted = false;
+      this.legacyStemLedgerUnparseable = false;
+    }
+    return { ok: true, stems: good, malformed };
+  }
+
+  /**
+   * The ledger as the OWNERSHIP PROBE reads it: the same parse, plus the two
+   * repairs that can only safely be attempted from a path that is not already
+   * mid-write.
+   *
+   * This is the read path the brief calls for. A wedged ledger used to sit there
+   * until some write path happened to come along — and since the write paths
+   * refuse when the ledger is unreadable, "some write path" could be never.
+   */
+  private readLegacyStemLedger():
+    { ok: true; stems: Record<string, string[]>; malformed: string[] } | { ok: false } {
+    const loaded = this.loadLegacyStemLedger();
+    if (loaded.ok && loaded.malformed.length === 0) return loaded;
+    if (loaded.ok) {
+      if (!this.healLegacyStemLedgerRows()) return loaded;
+      const reread = this.loadLegacyStemLedger();
+      // The stems whose rows were bad stay in `legacyStemLedgerMalformedStems`,
+      // so they keep deferring even though the re-read no longer lists them.
+      return reread.ok ? { ...reread, malformed: loaded.malformed } : reread;
+    }
+    this.quarantineUnparseableLedger();
+    return { ok: false };
+  }
+
+  /**
+   * Move every unparseable ROW into a `.corrupt-<ts>` sibling and rewrite the
+   * good ones, atomically, under the ledger lock. Returns true when the file on
+   * disk no longer holds a bad row.
+   *
+   * ORDERED SO A CRASH CANNOT LOSE A ROW: the quarantine copy is written first,
+   * so the worst interruption leaves the bad rows in two places rather than
+   * none. One attempt per failure streak — it is reached from every key's first
+   * touch, and a lock we could not take is not a reason to try again per
+   * message.
+   */
+  private healLegacyStemLedgerRows(): boolean {
+    if (this.legacyStemLedgerHealAttempted) return false;
+    this.legacyStemLedgerHealAttempted = true;
+    try {
+      return withFileLockSync(this.legacyStemLedgerLockPath, () => {
+        // Re-read the RAW file inside the lock: another process may have
+        // repaired or replaced it while we waited.
+        let data: Partial<LegacyStemLedgerFile>;
+        try {
+          data = JSON.parse(readFileSync(this.legacyStemLedgerPath, "utf-8")) as Partial<LegacyStemLedgerFile>;
+        } catch {
+          return false;
+        }
+        const stems = data?.stems;
+        if (!stems || typeof stems !== "object" || Array.isArray(stems)) return false;
+        const good: Record<string, unknown> = {};
+        const bad: Record<string, unknown> = {};
+        for (const [stem, owners] of Object.entries(stems)) {
+          if (Array.isArray(owners) && owners.every((key) => typeof key === "string")) good[stem] = owners;
+          else bad[stem] = owners;
+        }
+        if (Object.keys(bad).length === 0) return true;
+        const to = this.freeLegacyStemLedgerCorruptName();
+        if (to === null) return false;
+        // Verbatim: whatever was in the row is what a human gets to look at.
+        writeJsonAtomicSync(to, { version: 1, stems: bad });
+        writeJsonAtomicSync(this.legacyStemLedgerPath, { version: 1, stems: good });
+        log.warn(
+          { file: this.legacyStemLedgerPath, to, stems: Object.keys(bad) },
+          "Moved unreadable rows out of the legacy transcript stem ledger into a `.corrupt-` sibling and kept the "
+          + "readable ones; only the sessions named by those rows stay deferred, and the quarantined copy is the "
+          + "only record of the owners they held",
+        );
+        return true;
+      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+    } catch (err) {
+      log.warn(
+        { err, file: this.legacyStemLedgerPath },
+        "Could not move the unreadable rows out of the legacy transcript stem ledger; every session named by a bad "
+        + "row stays deferred",
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Quarantine a ledger whose JSON is unparseable as a whole, from the READ
+   * path, and keep failing closed afterwards.
+   *
+   * The bytes are preserved (they may be the only record that some key owned a
+   * stem) and nothing is rebuilt from `{}` — `rememberLegacyStemOwners` refuses
+   * while `legacyStemLedgerUnparseable` is set, because a rebuild from `{}` here
+   * would turn "I cannot read the owners" into "there are no owners" with the
+   * evidence already moved aside. Within this process that means every migration
+   * stays deferred until a readable ledger is back; the `.corrupt-` file and the
+   * warning are what a human acts on.
+   */
+  private quarantineUnparseableLedger(): void {
+    if (this.legacyStemLedgerUnparseable) return;
+    try {
+      withFileLockSync(this.legacyStemLedgerLockPath, () => {
+        // Re-checked inside the lock: another process may have replaced the file
+        // with a good one, and quarantining THAT would throw away real rows.
+        try {
+          const data = JSON.parse(readFileSync(this.legacyStemLedgerPath, "utf-8")) as Partial<LegacyStemLedgerFile>;
+          const stems = data?.stems;
+          if (stems && typeof stems === "object" && !Array.isArray(stems)) return;
+        } catch {
+          // Still unparseable — go on.
+        }
+        if (!existsSync(this.legacyStemLedgerPath)) return;
+        this.legacyStemLedgerUnparseable = true;
+        this.quarantineLegacyStemLedger();
+      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+    } catch (err) {
+      log.warn(
+        { err, file: this.legacyStemLedgerPath },
+        "Could not quarantine the unparseable legacy transcript stem ledger; migrations stay deferred",
+      );
+    }
+  }
+
+  /** A free `_legacy_stems.json.corrupt-<ts>[-<n>]`, or null when a hundred of
+   *  them are taken. */
+  private freeLegacyStemLedgerCorruptName(): string | null {
+    const ts = fileTimestamp();
+    for (let n = 0; n < 100; n++) {
+      const to = n === 0
+        ? `${this.legacyStemLedgerPath}.corrupt-${ts}`
+        : `${this.legacyStemLedgerPath}.corrupt-${ts}-${n}`;
+      if (!existsSync(to)) return to;
+    }
+    return null;
   }
 
   /** One line per failure streak: the ledger is read on every key's first
@@ -1769,8 +2178,9 @@ export class SessionStore {
     this.legacyStemLedgerErrorLogged = true;
     log.warn(
       { err, file: this.legacyStemLedgerPath },
-      "Could not load the legacy transcript stem ledger; transcript migrations are deferred until it reads again, "
-      + "and it will be quarantined to a `.corrupt-<ts>` sibling the next time a key has to be recorded",
+      "Could not load the legacy transcript stem ledger; the migrations that depend on what it says are deferred "
+      + "until it reads again, and the part that could not be read is moved to a `.corrupt-<ts>` sibling from here "
+      + "— a whole unparseable file, or just the rows that would not parse",
     );
   }
 
@@ -1783,29 +2193,24 @@ export class SessionStore {
    * reader matches, and a failure to move them means nothing is written at all.
    */
   private quarantineLegacyStemLedger(): boolean {
-    const ts = fileTimestamp();
-    for (let n = 0; n < 100; n++) {
-      const to = n === 0
-        ? `${this.legacyStemLedgerPath}.corrupt-${ts}`
-        : `${this.legacyStemLedgerPath}.corrupt-${ts}-${n}`;
-      if (existsSync(to)) continue;
-      try {
-        renameSync(this.legacyStemLedgerPath, to);
-      } catch (err) {
-        log.warn(
-          { err, file: this.legacyStemLedgerPath },
-          "Could not quarantine the unparseable legacy transcript stem ledger; nothing was recorded",
-        );
-        return false;
-      }
+    const to = this.freeLegacyStemLedgerCorruptName();
+    if (to === null) return false;
+    try {
+      renameSync(this.legacyStemLedgerPath, to);
+    } catch (err) {
       log.warn(
-        { from: this.legacyStemLedgerPath, to },
-        "The legacy transcript stem ledger could not be parsed and was quarantined; it is rebuilt from here on, "
-        + "and the quarantined copy is the only record of any owner it still named",
+        { err, file: this.legacyStemLedgerPath },
+        "Could not quarantine the unparseable legacy transcript stem ledger; nothing was recorded",
       );
-      return true;
+      return false;
     }
-    return false;
+    log.warn(
+      { from: this.legacyStemLedgerPath, to },
+      "The legacy transcript stem ledger could not be parsed and was quarantined. NOTHING is rebuilt from `{}` on "
+      + "top of it — every transcript migration in this process stays deferred — and the quarantined copy is the "
+      + "only record of any owner it still named",
+    );
+    return true;
   }
 
   /**
@@ -1835,9 +2240,21 @@ export class SessionStore {
       return withFileLockSync(this.legacyStemLedgerLockPath, () => {
         // Re-read inside the lock: another process may have recorded keys of
         // its own since we last looked, and this is a read-modify-write.
-        const loaded = this.loadLegacyStemLedger();
-        if (!loaded.ok && !this.quarantineLegacyStemLedger()) return false;
-        const stems = loaded.ok ? loaded.stems : {};
+        let loaded = this.loadLegacyStemLedger();
+        // NEVER REBUILD FROM `{}`. That is what discarded the ownership evidence
+        // of every row that was readable, and the quarantined copy a human would
+        // have to restore it from does not come back on its own. An unreadable
+        // ledger means this write does not happen, and the caller keeps whatever
+        // it was about to forget.
+        if (!loaded.ok) return false;
+        if (loaded.malformed.length > 0) {
+          // Rewriting now would drop the bad rows silently — they are not in
+          // `stems`. Carry them to the `.corrupt-` sibling first.
+          if (!this.healLegacyStemLedgerRows()) return false;
+          loaded = this.loadLegacyStemLedger();
+          if (!loaded.ok || loaded.malformed.length > 0) return false;
+        }
+        const stems = loaded.stems;
         let changed = false;
         for (const [stem, owners] of wanted) {
           const existing = new Set(stems[stem] ?? []);
@@ -1881,7 +2298,7 @@ export class SessionStore {
       return [];
     }
     const before = this.loadLegacyStemLedger();
-    if (!before.ok) return [];
+    if (!before.ok || before.malformed.length > 0) return [];
     const candidates = Object.keys(before.stems).filter((stem) => !stemHasFilesOnDisk(stem, names));
     if (candidates.length === 0) return [];
 
@@ -1890,7 +2307,9 @@ export class SessionStore {
         // Re-read inside the lock for the same reason every other writer does,
         // and re-filter against it: another process may have added a row.
         const loaded = this.loadLegacyStemLedger();
-        if (!loaded.ok) return [];
+        // An unreadable row would be dropped by the rewrite below, and pruning is
+        // an optimization — it waits for the read path to carry the row aside.
+        if (!loaded.ok || loaded.malformed.length > 0) return [];
         const stems = loaded.stems;
         const dropped = candidates.filter((stem) => stem in stems);
         if (dropped.length === 0) return [];
@@ -2220,7 +2639,7 @@ export class SessionStore {
   /** Monthly rotation archive paths for a filename stem, newest month first.
    *  Stem-based (not key-based) so the migration can list the legacy set.
    *
-   *  THE WRITER'S LIST, and deliberately narrower than `transcriptReadFiles`.
+   *  THE WRITER'S LIST, and deliberately narrower than `transcriptReadSet`.
    *  The strict remainder test keeps three different things out of it: `dm:a`
    *  must not claim `dm:ab`'s archives (a prefix match alone would let it), and
    *  neither a `.legacy-<ts>.jsonl` sidecar nor an `.ambiguous-<ts>.jsonl`
@@ -2267,28 +2686,62 @@ export class SessionStore {
   }
 
   /**
-   * Every file a READ of `key`'s history covers, NEWEST FIRST: the active file,
-   * its read-only legacy sidecars, then each rotation archive (newest month
-   * first) with its own sidecars behind it.
+   * Every file a READ of `key`'s history covers, in FILENAME ORDER: the active
+   * file, its read-only legacy sidecars, then each rotation archive (newest
+   * month first) with its own sidecars behind it — each tagged with whether it
+   * is a sidecar.
    *
-   * A sidecar is strictly older than the file it sits beside — the legacy name
-   * stopped being written the moment the migrated name started — so this order
-   * is non-increasing in time, which is what `searchTranscript`'s lower-bound
-   * `break outer` needs and what makes `transcriptCreatedAt` a `reverse()`.
+   * FILENAME ORDER IS NOT TIME ORDER WHEN A SIDECAR IS PRESENT. The original
+   * version of this claimed it was ("a sidecar is strictly older than the file
+   * it sits beside"), and two reviewers found it false twice over:
+   *
+   * - `migrateSessionKeyLocked` sidecars a transcript that ran IN PARALLEL with
+   *   the one it lands beside — a `dm:alex` session and the `imessage:…` channel
+   *   session it unifies with were both live, so the sidecar's records interleave
+   *   with the active file's rather than preceding them.
+   * - A legacy active file that an unmigrated process kept appending to is newer
+   *   than parts of the archive it ends up beside.
+   *
+   * So callers must not assume it: `searchTranscript` gives up its cross-file
+   * early exit, `loadTranscript` sorts what it merged, and `transcriptCreatedAt`
+   * takes a minimum instead of the first hit. `hasSidecars` is what selects
+   * between that and the cheap ordered path — with no sidecar on disk the order
+   * IS chronological and nothing changes.
+   *
+   * THE MONTH SET IS THE UNION of canonical archives and archive sidecars. An
+   * interrupted re-key can leave `_archive_<stem>_<M>.legacy-<ts>.jsonl` with no
+   * `_archive_<stem>_<M>.jsonl` beside it (the archive moved on before its
+   * sidecars did), and enumerating sidecars only inside the canonical-archive
+   * loop made that month invisible to every reader while
+   * `transcriptFamilyMoves` still knew about it.
    *
    * THE WRITER-SIDE LIST IS `transcriptPath` + `archivesForStem`, and it must
    * stay strictly narrower than this one.
    */
-  private transcriptReadFiles(key: string): string[] {
+  private transcriptReadSet(key: string): { files: TranscriptReadFile[]; hasSidecars: boolean } {
     const stem = this.safeKey(key);
     // ONE listing for the whole family. Resolving each archive's sidecars with
     // its own `readdirSync` made this O(archives) directory scans per search.
     const names = this.dirNames();
-    const files = [join(this.dir, `${stem}.jsonl`), ...this.legacySidecarsFor(stem, names).reverse()];
-    for (const archive of this.archivesForStem(stem, names)) {
-      files.push(archive, ...this.legacySidecarsFor(basename(archive).replace(/\.jsonl$/, ""), names).reverse());
+    const files: TranscriptReadFile[] = [{ path: join(this.dir, `${stem}.jsonl`), sidecar: false }];
+    for (const sidecar of this.legacySidecarsFor(stem, names).reverse()) {
+      files.push({ path: sidecar, sidecar: true });
     }
-    return files;
+    const months = new Set<string>();
+    for (const archive of this.archivesForStem(stem, names)) {
+      const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
+      if (month) months.add(month);
+    }
+    for (const month of this.monthsWithArchiveSidecars(stem, names)) months.add(month);
+    for (const month of [...months].sort().reverse()) {
+      const base = `_archive_${stem}_${month}`;
+      const archive = join(this.dir, `${base}.jsonl`);
+      if (existsSync(archive)) files.push({ path: archive, sidecar: false });
+      for (const sidecar of this.legacySidecarsFor(base, names).reverse()) {
+        files.push({ path: sidecar, sidecar: true });
+      }
+    }
+    return { files, hasSidecars: files.some((file) => file.sidecar) };
   }
 
   /** The sessions directory, or `[]` when it cannot be listed. Every caller
@@ -2378,6 +2831,7 @@ export class SessionStore {
       if (this.migrateLegacyTranscript(key)) {
         this.transcriptMigrationChecked.add(key);
         this.transcriptMigrationRetryAt.delete(key);
+        this.transcriptProbeAnswer.delete(key);
         return true;
       }
       this.transcriptMigrationRetryAt.set(key, Date.now() + TRANSCRIPT_MIGRATION_RETRY_MS);
@@ -2389,6 +2843,65 @@ export class SessionStore {
     } finally {
       this.transcriptMigrationInFlight.delete(key);
     }
+  }
+
+  /**
+   * Is this key's OWN active filename known to hold more than one key's
+   * history, with the quarantine not yet done?
+   *
+   * Only a key that KEEPS its legacy stem can be in that state: a key whose stem
+   * changed leaves the mixed file behind under a name it no longer reads (see
+   * `refuseSharedLegacyStem`), so serving it is serving its own fresh file. The
+   * `.ambiguous-` marker means the decision was taken and the active name is the
+   * key's own fresh transcript from then on, so its presence ends the
+   * withholding even while `quarantineAmbiguousFamily` is still parking archives.
+   */
+  private withholdsTranscript(key: string): boolean {
+    return !this.ensureTranscriptMigrated(key) && this.servesMixedTranscript(key);
+  }
+
+  private servesMixedTranscript(key: string): boolean {
+    if (this.transcriptProbeAnswer.get(key) !== "shared") return false;
+    const stem = transcriptFileStem(key);
+    // Not `safeKey`: that would re-enter the migration we are reporting on.
+    if (stem !== legacyTranscriptFileStem(key)) return false;
+    return this.quarantinedNamesFor(stem).length === 0;
+  }
+
+  /**
+   * The empty session a key is served while its own transcript is known-mixed.
+   *
+   * CACHED, and remembered as withheld, so an `append()` in this window keeps
+   * appending to one session instead of restarting from an empty tail on every
+   * message. THE APPEND ITSELF STILL LANDS IN THE MIXED FILE — `append` writes
+   * `transcriptPath(key)`, which is that name — so this is the one window in
+   * which a file we know to be shared can still grow. It is bounded by
+   * `TRANSCRIPT_MIGRATION_RETRY_MS`, the records are parked with the rest of the
+   * family when the quarantine lands, and the alternative (dropping the
+   * message) is the one outcome worse than writing it somewhere awkward.
+   */
+  private withheldSession(key: string): Session {
+    const cached = this.sessions.get(key);
+    if (cached && this.transcriptWithheld.has(key)) return cached;
+    this.warnOnce(this.transcriptWithheldWarned, key, () => log.warn(
+      { key, file: this.transcriptPath(key) },
+      "Withholding this session's transcript: the file is shared with another session key and could not be parked "
+      + "yet, so reading it would serve another session's history. The session starts empty until the quarantine "
+      + "lands; new messages are still recorded, and are parked with the rest of the family when it does",
+    ));
+    const now = Date.now();
+    const session: Session = { key, messages: [], createdAt: now, updatedAt: now };
+    this.sessions.set(key, session);
+    this.transcriptWithheld.add(key);
+    return session;
+  }
+
+  /** Forget a cached session whose files moved underneath it, including the
+   *  withheld-session bookkeeping and the rotation skip. */
+  private dropCachedSession(key: string): void {
+    this.sessions.delete(key);
+    this.rotateSkipMonth.delete(key);
+    this.transcriptWithheld.delete(key);
   }
 
   /**
@@ -2457,8 +2970,7 @@ export class SessionStore {
       // The bytes behind this key's paths moved underneath any cached session.
       // Drop the cache so the next `get()` reloads the tail (and `getLastSeq`
       // re-derives) from what is on disk.
-      this.sessions.delete(key);
-      this.rotateSkipMonth.delete(key);
+      this.dropCachedSession(key);
     }
     if (outcome.sidecars.length > 0) {
       log.warn(
@@ -2522,35 +3034,45 @@ export class SessionStore {
    * THE PARKED FILE IS ALSO THE RECORD THAT THIS HAPPENED, and it has to be:
    * the fresh file this key opens next has the very same name as the mixed one,
    * so without a marker the next process start would park the fresh history
-   * too, and the one after that, forever. An existing `.ambiguous-` file for
-   * the stem therefore means "already decided, leave the active file alone".
+   * too, and the one after that, forever.
+   *
+   * BUT THE MARKER ONLY SAYS THE DECISION WAS TAKEN — NOT THAT THE WORK
+   * FINISHED. Treating it as "done" (which the first version did, on the first
+   * `.ambiguous-` name it found anywhere in the family) meant one failed archive
+   * rename, or a crash between two of them, left the remaining MIXED ARCHIVES
+   * under readable names with the key marked settled — a `searchTranscript` that
+   * still answers out of two people's history, and nothing left that would ever
+   * revisit it. So the family is RESCANNED on every attempt, and settled means
+   * "no file of this family is left under a name a reader resolves".
+   *
+   * What separates a mixed file from the fresh history this key has written
+   * since is the decision's own timestamp, which is in the marker's name: a file
+   * whose NEWEST record predates it is pre-decision and is parked, a file that
+   * has grown since is this key's own and is left alone. On the first attempt
+   * there is no marker and the whole family is pre-decision by definition. A
+   * file with nothing readable in it counts as pre-decision, which is the
+   * preserve-rather-than-serve direction this whole path errs in.
    */
   private quarantineAmbiguousFamily(key: string, stem: string, others: string[]): boolean {
-    if (this.quarantinedNamesFor(stem).length > 0) {
-      this.warnOnce(this.transcriptCollisionWarned, stem.toLowerCase(), () => log.warn(
-        { stem, keys: [key, ...others] },
-        "Transcript filename collision: this stem was shared by more than one session key and its mixed history "
-        + "is already parked beside it as `.ambiguous-*.jsonl`; the sessions continue in separate files",
-      ));
-      return true;
-    }
-
+    const decidedAt = this.quarantineDecisionTime(stem);
     let parked: string[];
     try {
       parked = withFileLockSync(this.transcriptLockPath, () => {
         const moved: string[] = [];
-        const targets: { from: string; base: string }[] = [];
-        const active = join(this.dir, `${stem}.jsonl`);
-        if (existsSync(active)) targets.push({ from: active, base: stem });
-        for (const archive of this.archivesForStem(stem)) {
-          const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
-          if (!month) continue;
-          targets.push({ from: archive, base: `_archive_${stem}_${month}` });
-        }
-        for (const { from, base } of targets) {
+        // Re-listed inside the lock, like every other mover here.
+        const targets = this.mixedFamilyTargets(stem, decidedAt);
+        for (const { from, base, active } of targets) {
           const to = freeSuffixedName(this.dir, base, "ambiguous");
-          if (!to) continue;
-          if (renameIfPresent(from, to)) moved.push(basename(to));
+          if (to && renameIfPresent(from, to)) {
+            moved.push(basename(to));
+            continue;
+          }
+          // THE ACTIVE FILE IS PARKED FIRST AND NOTHING ELSE MOVES IF IT CANNOT
+          // BE. A marker beside an archive while the mixed active file is still
+          // live would read as "the decision was taken" on the next attempt, and
+          // the active file — which has kept growing since — would then look
+          // post-decision and never be parked at all.
+          if (active) return moved;
         }
         return moved;
       }, TRANSCRIPT_LOCK_OPTIONS);
@@ -2562,16 +3084,99 @@ export class SessionStore {
       return false;
     }
 
-    if (parked.length === 0) return false;
-    this.sessions.delete(key);
-    this.rotateSkipMonth.delete(key);
+    if (parked.length > 0) this.dropCachedSession(key);
+    // Rescanned against the marker we have NOW: anything still readable and
+    // pre-decision means the work is unfinished, whatever the marker says.
+    const left = this.mixedFamilyTargets(stem, this.quarantineDecisionTime(stem));
+    if (left.length > 0) {
+      // Once per stem per process, like every other line on this path: the retry
+      // runs every `TRANSCRIPT_MIGRATION_RETRY_MS` until it lands.
+      this.warnOnce(this.transcriptQuarantineIncompleteWarned, stem.toLowerCase(), () => log.warn(
+        { stem, key, files: left.map((target) => basename(target.from)), parked },
+        "Deferring legacy transcript migration: part of a shared transcript family could not be parked as "
+        + "`.ambiguous-*.jsonl` and is still readable, so the collision is not settled yet",
+      ));
+      return false;
+    }
+    if (parked.length === 0 && decidedAt === null) return false;
     this.warnOnce(this.transcriptCollisionWarned, stem.toLowerCase(), () => log.warn(
       { stem, keys: [key, ...others], files: parked },
-      "Transcript filename collision: this stem was shared by more than one session key, and this key keeps that "
-      + "filename — so the mixed history was parked beside it as `.ambiguous-*.jsonl` for manual inspection "
-      + "rather than left where both keys would keep reading and appending to it. Every session involved starts "
-      + "fresh from here",
+      parked.length > 0
+        ? "Transcript filename collision: this stem was shared by more than one session key, and this key keeps that "
+          + "filename — so the mixed history was parked beside it as `.ambiguous-*.jsonl` for manual inspection "
+          + "rather than left where both keys would keep reading and appending to it. Every session involved starts "
+          + "fresh from here"
+        : "Transcript filename collision: this stem was shared by more than one session key and its mixed history "
+          + "is already parked beside it as `.ambiguous-*.jsonl`; the sessions continue in separate files",
     ));
+    return true;
+  }
+
+  /**
+   * When the decision to park `stem`'s family was FIRST taken, read off the
+   * OLDEST `.ambiguous-<ts>` name in it, or null when it has not been taken yet.
+   *
+   * Oldest, not newest, and that is the whole point: this is the line between
+   * "mixed history from before the decision" and "what this key has written
+   * since", so it has to be the same line on every attempt. Reading the newest
+   * marker instead moves the line forward to the moment of the latest rename —
+   * after which the key's own post-decision history looks older than the
+   * decision, and a retry would park it.
+   *
+   * Second resolution, like the names. The comparison it feeds is "older than
+   * the decision", so the truncation errs toward calling a file post-decision,
+   * i.e. toward leaving it alone.
+   */
+  private quarantineDecisionTime(stem: string): number | null {
+    let oldest: number | null = null;
+    for (const name of this.quarantinedNamesFor(stem)) {
+      const at = suffixedNameTime(name);
+      if (at !== null && (oldest === null || at < oldest)) oldest = at;
+    }
+    return oldest;
+  }
+
+  /**
+   * Every file of `stem`'s family that is still under a READABLE name and holds
+   * only pre-decision records — i.e. everything a quarantine attempt still owes.
+   * The active file comes first; see the caller for why that matters.
+   */
+  private mixedFamilyTargets(
+    stem: string,
+    decidedAt: number | null,
+  ): { from: string; base: string; active: boolean }[] {
+    const names = this.dirNames();
+    const targets: { from: string; base: string; active: boolean }[] = [];
+    const consider = (from: string, base: string, active = false): void => {
+      if (decidedAt !== null && !this.predatesQuarantine(from, decidedAt)) return;
+      targets.push({ from, base, active });
+    };
+    const active = join(this.dir, `${stem}.jsonl`);
+    if (existsSync(active)) consider(active, stem, true);
+    for (const sidecar of this.legacySidecarsFor(stem, names)) consider(sidecar, stem);
+    const months = new Set<string>();
+    for (const archive of this.archivesForStem(stem, names)) {
+      const month = /_(\d{4}-\d{2})\.jsonl$/.exec(archive)?.[1];
+      if (month) months.add(month);
+    }
+    for (const month of this.monthsWithArchiveSidecars(stem, names)) months.add(month);
+    for (const month of [...months].sort().reverse()) {
+      const base = `_archive_${stem}_${month}`;
+      const archive = join(this.dir, `${base}.jsonl`);
+      if (existsSync(archive)) consider(archive, base);
+      for (const sidecar of this.legacySidecarsFor(base, names)) consider(sidecar, base);
+    }
+    return targets;
+  }
+
+  /** Is every record in `file` older than the quarantine decision? Read from the
+   *  back, so it costs one chunk rather than the file. A record we cannot place
+   *  counts as older: preserved-and-unreachable beats readable-and-mixed. */
+  private predatesQuarantine(file: string, decidedAt: number): boolean {
+    for (const record of iterateJsonlBackwardsSync<SessionMessage>(file)) {
+      const newest = usableTimestamp(record);
+      return newest === null ? true : newest < decidedAt;
+    }
     return true;
   }
 
@@ -2619,7 +3224,7 @@ export class SessionStore {
   /**
    * Every file named after `from` that has to end up named after `to`: the
    * active file, its read-only sidecars, then each rotation archive and its own
-   * sidecars. Exactly `transcriptReadFiles`' coverage, which is the point — a
+   * sidecars. Exactly `transcriptReadSet`'s coverage, which is the point — a
    * file a reader can see and a migration cannot is a file that goes missing.
    */
   private transcriptFamilyMoves(from: string, to: string): { from: string; base: string; sidecarOnly: boolean }[] {
@@ -2690,21 +3295,109 @@ export class SessionStore {
   private carryOntoBase(from: string, base: string, sidecarOnly: boolean): string | null {
     if (!sidecarOnly) {
       const to = join(this.dir, `${base}.jsonl`);
-      // Checked immediately before the rename, per file: a directory-wide "does
-      // anything collide" test would leave a window in which the destination
-      // appears and a bare rename silently overwrites it.
-      if (!existsSync(to)) return renameIfPresent(from, to) ? basename(to) : null;
+      const outcome = this.moveWithoutClobber(from, to);
+      if (outcome === "moved") return basename(to);
+      if (outcome === "gone") return null;
+      // "taken" — fall through to the sidecar name.
     }
-    const sidecar = freeSuffixedName(this.dir, base, "legacy");
-    if (!sidecar) {
-      log.error(
-        { from, base },
-        "Could not find a free legacy-sidecar name beside the transcript; the file is left where it is and the "
-        + "migration will be retried",
+    // CLAIMED BY THE MOVE ITSELF, not picked and then used. A free name is only
+    // free until another process takes it, and every sidecar is the single copy
+    // of the history inside it.
+    const ts = fileTimestamp();
+    for (let n = 0; n < 100; n++) {
+      const name = n === 0 ? `${base}.legacy-${ts}.jsonl` : `${base}.legacy-${ts}-${n}.jsonl`;
+      const outcome = this.moveWithoutClobber(from, join(this.dir, name));
+      if (outcome === "moved") return name;
+      if (outcome === "gone") return null;
+    }
+    log.error(
+      { from, base },
+      "Could not find a free legacy-sidecar name beside the transcript; the file is left where it is and the "
+      + "migration will be retried",
+    );
+    return null;
+  }
+
+  /**
+   * Move `from` to `to` WITHOUT EVER OVERWRITING `to`, atomically.
+   *
+   * `existsSync(to)` then `renameSync(from, to)` is a check-then-act with a
+   * window in it, and the window is reachable: `append()` in another process
+   * (`tomo config identities` → `pickChatId` → `store.get()`, `tomo lcm search
+   * --channel-key`) creates `to` between the two calls, and `rename` then
+   * replaces that brand-new live transcript with the legacy file, silently. A
+   * `link` cannot do that — it fails with EEXIST if the name is taken — so the
+   * move is `link` then `unlink`, and the destination's existence is decided by
+   * the kernel rather than by a stat we took a moment ago.
+   *
+   * CRASHING BETWEEN THE TWO LEAVES BOTH NAMES ON ONE INODE, which is a state
+   * this converges on: the re-run's `link` fails EEXIST, the inodes match, and
+   * the only work left is the `unlink`. (Under the old rename it looked like
+   * "the destination is taken", so the re-run made a SIDECAR out of the same
+   * bytes and every record in the file was read twice.)
+   *
+   * Filesystems without hard links (FAT/exFAT over a fuse mount, some network
+   * mounts) report EPERM / ENOSYS / ENOTSUP / EOPNOTSUPP; EXDEV means the two
+   * names are not even on one filesystem. There the old check-then-rename is the
+   * only thing available, so it is used — and the whole-filesystem answers latch,
+   * so the fallback is decided once rather than probed per file. Which mode is
+   * in use is logged once, because the fallback carries the race the rest of this
+   * does not.
+   */
+  private moveWithoutClobber(from: string, to: string): "moved" | "taken" | "gone" {
+    if (this.carryMode !== "rename") {
+      try {
+        linkSync(from, to);
+        this.noteCarryMode("link", true);
+        unlinkIfPresent(from);
+        return "moved";
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return "gone";
+        if (code === "EEXIST") {
+          // Still the link path, and still proof that this filesystem links.
+          this.noteCarryMode("link", true);
+          const same = sameFileOnDisk(from, to);
+          if (same === "missing-source") return "gone";
+          if (same === "same") {
+            // Our own interrupted move. Finish it; nothing is copied or merged.
+            unlinkIfPresent(from);
+            return "moved";
+          }
+          return "taken";
+        }
+        if (code !== "EPERM" && code !== "ENOSYS" && code !== "EXDEV" && code !== "ENOTSUP" && code !== "EOPNOTSUPP") {
+          throw err;
+        }
+        // EPERM can be about this one file (an immutable flag, a restricted
+        // directory), so it does not latch; the rest are properties of the
+        // filesystem and do.
+        this.noteCarryMode("rename", code !== "EPERM");
+      }
+    }
+    if (existsSync(to)) return "taken";
+    return renameIfPresent(from, to) ? "moved" : "gone";
+  }
+
+  /** Say which move primitive is in use, once per mode. `latch` is for the
+   *  filesystem-wide answers only — a per-file EPERM must not disable hard links
+   *  for every other transcript in the directory. */
+  private noteCarryMode(mode: "link" | "rename", latch: boolean): void {
+    if (latch) this.carryMode = mode;
+    if (this.carryModeLogged === mode) return;
+    this.carryModeLogged = mode;
+    if (mode === "link") {
+      log.debug(
+        { dir: this.dir },
+        "Transcript migration moves files with link+unlink: a destination that appears mid-move cannot be overwritten",
       );
-      return null;
+      return;
     }
-    return renameIfPresent(from, sidecar) ? basename(sidecar) : null;
+    log.warn(
+      { dir: this.dir },
+      "Transcript migration is falling back to check-then-rename: this filesystem would not hard-link a transcript. "
+      + "A destination created by another process between the check and the rename can still be overwritten there",
+    );
   }
 
   /**
@@ -2740,6 +3433,16 @@ export class SessionStore {
    * on, it cannot reconstruct what was already discarded.
    */
   private probeLegacyStemOwnership(key: string, legacy: string): OwnershipProbe {
+    const answer = this.probeLegacyStemOwnershipUncached(key, legacy);
+    // REMEMBERED, because `get()` has to be able to tell the one deferral that
+    // must not be served (a known-shared file under this key's own name) from
+    // every other one. Keyed by session key and dropped when the key settles.
+    if (answer.kind === "sole") this.transcriptProbeAnswer.delete(key);
+    else this.transcriptProbeAnswer.set(key, answer.kind);
+    return answer;
+  }
+
+  private probeLegacyStemOwnershipUncached(key: string, legacy: string): OwnershipProbe {
     const others = new Set<string>();
     const target = legacy.toLowerCase();
     const consider = (candidate: string | undefined): void => {
@@ -2748,8 +3451,15 @@ export class SessionStore {
       others.add(candidate);
     };
 
-    const ledger = this.loadLegacyStemLedger();
+    const ledger = this.readLegacyStemLedger();
     if (!ledger.ok) return { kind: "unknown", source: this.legacyStemLedgerPath };
+    // ONE BAD ROW DEFERS ONE STEM. The rest of the ledger is evidence we can
+    // still act on, so only a key whose own stem's row could not be read is
+    // blind to its partners — and the warn token is per stem, so the line names
+    // the row rather than the file.
+    if (this.legacyStemLedgerMalformedStems.has(target)) {
+      return { kind: "unknown", source: `${this.legacyStemLedgerPath} (row ${target})` };
+    }
     for (const [stem, recorded] of Object.entries(ledger.stems)) {
       if (stem.toLowerCase() !== target) continue;
       for (const owner of recorded) consider(owner);
@@ -2780,15 +3490,30 @@ export class SessionStore {
   /**
    * What the legacy-transcript migration still owes, for an operator.
    *
-   * `deferred` is what this process could not settle (an unreadable ownership
-   * source, a transcript lock held elsewhere) and will retry; `ambiguous` and
-   * `sidecars` are read off the directory, so they are accurate before any key
-   * has been touched, which is when the daemon logs this.
+   * TWO HALVES WITH DIFFERENT LIFETIMES, and mixing them up is what made the
+   * daemon's start-up line misleading. `ambiguous`, `sidecars` and `orphans` are
+   * read off the DIRECTORY, so they are accurate before any key has been
+   * touched. `settled` and `deferred` are what THIS PROCESS tried and could not
+   * finish — necessarily empty until keys start arriving, which is why the
+   * daemon logs the disk half at start and the whole thing again a few minutes
+   * in (see `Agent.start`).
+   *
+   * `orphans` are sidecars with no canonical file beside them
+   * (`<base>.legacy-<ts>.jsonl` with no `<base>.jsonl`): the residue of a re-key
+   * interrupted between moving an archive and moving its sidecars. Readers do
+   * cover them — that is what the union month set in `transcriptReadSet` is for
+   * — so this is an operator hint about an unfinished pass, not lost history.
    *
    * TODO(tomo status): surface this as a `tomo status` field. Deliberately not
    * built here — the shape is what this PR owes, the CLI is a separate change.
    */
-  migrationStatus(): { settled: boolean; deferred: string[]; ambiguous: string[]; sidecars: string[] } {
+  migrationStatus(): {
+    settled: boolean;
+    deferred: string[];
+    ambiguous: string[];
+    sidecars: string[];
+    orphans: string[];
+  } {
     let names: string[];
     try {
       names = readdirSync(this.dir);
@@ -2803,54 +3528,96 @@ export class SessionStore {
       ambiguous.add((archive ? archive[1] : base).toLowerCase());
     }
     const deferred = [...this.transcriptMigrationRetryAt.keys()].sort();
+    const present = new Set(names);
+    const sidecars = names.filter((n) => LEGACY_SIDECAR_NAME_RE.test(n)).sort();
     return {
       settled: deferred.length === 0,
       deferred,
       ambiguous: [...ambiguous].sort(),
-      sidecars: names.filter((n) => LEGACY_SIDECAR_NAME_RE.test(n)).sort(),
+      sidecars,
+      orphans: sidecars.filter((n) => !present.has(`${n.replace(LEGACY_SIDECAR_NAME_RE, "")}.jsonl`)),
     };
   }
 
   /** Load only the last tailLimit messages of the active transcript, plus as
    *  much of its read-only legacy sidecars as the remaining room allows.
    *
-   *  Sidecars fill from the newest backwards and are PREPENDED: they are
-   *  strictly older than the active file, since the legacy name stopped being
-   *  written the moment the migrated one started. Each record is marked in
-   *  `sidecarMessages` so `getLastSeq` can tell history from the active seq run.
+   *  Sidecars fill from the newest backwards, and the merge is then ORDERED BY
+   *  THE RECORDS' OWN TIMESTAMPS rather than prepended wholesale: a sidecar is
+   *  not necessarily older than the file it sits beside (a re-key sidecars a
+   *  transcript that ran in parallel — see `transcriptReadSet`), and a
+   *  positional merge put a July record after a September one, which is what
+   *  `session.updatedAt` then read as the session's last activity. Each sidecar
+   *  record is marked in `sidecarMessages` so `getLastSeq` can tell history from
+   *  the active seq run. With no sidecar on disk this is byte-for-byte the old
+   *  path: one tail read, no sort.
    */
   private loadTranscript(key: string): SessionMessage[] {
     const stem = this.safeKey(key);
     const messages = readJsonlTailSync<SessionMessage>(join(this.dir, `${stem}.jsonl`), this.tailLimit);
     if (messages.length >= this.tailLimit) return messages;
-    for (const sidecar of this.legacySidecarsFor(stem).reverse()) {
-      if (messages.length >= this.tailLimit) break;
-      const older = readJsonlTailSync<SessionMessage>(sidecar, this.tailLimit - messages.length);
-      for (const msg of older) this.sidecarMessages.add(msg);
-      messages.unshift(...older);
+    const sidecarFiles = this.legacySidecarsFor(stem).reverse();
+    if (sidecarFiles.length === 0) return messages;
+    const older: SessionMessage[] = [];
+    for (const sidecar of sidecarFiles) {
+      const room = this.tailLimit - messages.length - older.length;
+      if (room <= 0) break;
+      const chunk = readJsonlTailSync<SessionMessage>(sidecar, room);
+      for (const msg of chunk) this.sidecarMessages.add(msg);
+      older.unshift(...chunk);
     }
-    return messages;
+    return sortByRecordTime([...older, ...messages]);
   }
 
   /** Timestamp of the oldest surviving message across archives, sidecars and
-   *  the active file. Walks oldest-first and stops at the first file that has a
-   *  record, so an empty archive (or an empty sidecar) does not read as "no
-   *  history at all". */
+   *  the active file.
+   *
+   *  Without a sidecar the read set is chronological, so this walks oldest-first
+   *  and stops at the first file that has a record — an empty archive (or an
+   *  empty sidecar) must not read as "no history at all". WITH a sidecar the
+   *  order is not time order, so it takes the MINIMUM over every file's first
+   *  record instead: a July sidecar sitting between a September active file and
+   *  an August archive used to hand back August. */
   private transcriptCreatedAt(key: string): number | undefined {
-    for (const file of this.transcriptReadFiles(key).reverse()) {
-      const timestamp = readFirstJsonlRecordSync<SessionMessage>(file)?.timestamp;
-      if (timestamp !== undefined) return timestamp;
+    const { files, hasSidecars } = this.transcriptReadSet(key);
+    const oldestFirst = [...files].reverse();
+    if (!hasSidecars) {
+      for (const file of oldestFirst) {
+        const timestamp = readFirstJsonlRecordSync<SessionMessage>(file.path)?.timestamp;
+        if (timestamp !== undefined) return timestamp;
+      }
+      return undefined;
     }
-    return undefined;
+    let oldest: number | undefined;
+    let unplaceable: number | undefined;
+    for (const file of oldestFirst) {
+      const first = readFirstJsonlRecordSync<SessionMessage>(file.path);
+      if (first === undefined) continue;
+      const usable = usableTimestamp(first);
+      if (usable === null) {
+        // Kept only as a fallback: a record we cannot place must not win a
+        // minimum (a `timestamp: 0` legacy row would always win it).
+        if (unplaceable === undefined && first.timestamp !== undefined) unplaceable = first.timestamp;
+        continue;
+      }
+      if (oldest === undefined || usable < oldest) oldest = usable;
+    }
+    return oldest ?? unplaceable;
   }
 
-  /** Count user messages in the active transcript and its read-only legacy
-   *  sidecars, without retaining them. Bounded by rotation; archived months are
-   *  not counted. */
+  /** Count user messages in the active transcript and the NEWEST of its
+   *  read-only legacy sidecars, without retaining them.
+   *
+   *  Bounded by rotation — which is the point of the cap. Archived months are
+   *  not counted, and a sidecar is never rotated either, so counting all of them
+   *  made this the one reader whose cost grows with every deferred migration
+   *  that ever happened on the install. `/status` shows an approximate recent
+   *  count; the newest sidecar is the one that approximates it. */
   countRecentUserMessages(key: string): number {
     let count = 0;
     const stem = this.safeKey(key);
-    for (const file of [join(this.dir, `${stem}.jsonl`), ...this.legacySidecarsFor(stem)]) {
+    const newestSidecar = this.legacySidecarsFor(stem).slice(-1);
+    for (const file of [join(this.dir, `${stem}.jsonl`), ...newestSidecar]) {
       for (const msg of iterateJsonlBackwardsSync<SessionMessage>(file)) {
         if (msg.role === "user") count++;
       }

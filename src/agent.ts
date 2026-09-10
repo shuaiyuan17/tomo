@@ -153,6 +153,18 @@ const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
 const MCP_SWEEP_SHUTDOWN_TIMEOUT_MS = 3_000;
 const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
 
+/**
+ * How long after start the full legacy-transcript migration status is logged
+ * again.
+ *
+ * `settled`/`deferred` only mean something once keys have been touched, and at
+ * start none have. Five minutes is past the inbound traffic that follows a
+ * restart (the continuity turn, the restart notice, whatever was queued) without
+ * being so late that an operator reading the log has moved on. A timer rather
+ * than a "first N keys" counter because it needs no hook on the message path.
+ */
+const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
+
 // Context-usage percentage at which the nudge escalates from a daily rollup
 // (config.lcm.nudgeAtPct) to a full lcm compact.
 const COMPACT_NUDGE_PCT = 80;
@@ -213,6 +225,9 @@ export class Agent {
   private readonly mcpOAuthManager: McpOAuthManager;
   /** Background sweep that refreshes OAuth tokens before they expire (start/stop). */
   private mcpTokenRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  /** Re-logs the full migration status once, after the first keys have been
+   *  touched (see `start`). Unref'd, and cleared by `stop`. */
+  private migrationStatusTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
   private mcpSweepInFlight: Promise<void> | undefined;
 
@@ -2234,6 +2249,26 @@ export class Agent {
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
+    // WHAT THE TRANSCRIPT MIGRATION STILL OWES. `ambiguous`, `sidecars` and
+    // `orphans` are read off the sessions directory, so they are accurate here,
+    // before any key has been touched. `settled` and `deferred` ARE NOT: they
+    // count what this process tried and could not finish, and at this point it
+    // has not tried anything — so logging them here always read "clean" no
+    // matter what state the directory was in. They are logged once, later, when
+    // the keys that receive traffic have actually been touched. The prune drops
+    // ledger rows whose stem has nothing left on disk.
+    // TODO(tomo status): surface `migrationStatus()` as a `tomo status` field.
+    this.sessions.pruneLegacyStemLedger();
+    const onDisk = this.sessions.migrationStatus();
+    log.info(
+      { ambiguous: onDisk.ambiguous, sidecars: onDisk.sidecars, orphans: onDisk.orphans },
+      "Legacy transcript migration: what is on disk",
+    );
+    this.migrationStatusTimer = setTimeout(() => {
+      log.info(this.sessions.migrationStatus(), "Legacy transcript migration status");
+    }, MIGRATION_STATUS_RELOG_MS);
+    this.migrationStatusTimer.unref();
+
     // Check for restart reason and notify via continuity-style message.
     // An attributed reason (the restart was initiated from a session — its
     // key rides in the reason file, stamped from TOMO_SESSION_KEY) routes to
@@ -2320,6 +2355,10 @@ export class Agent {
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
+    }
+    if (this.migrationStatusTimer) {
+      clearTimeout(this.migrationStatusTimer);
+      this.migrationStatusTimer = undefined;
     }
     this.commands.stop();
 

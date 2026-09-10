@@ -73,6 +73,9 @@ function renameIfPresent(from: string, to: string): boolean {
  */
 const SUFFIXED_FILE_TAIL = String.raw`-\d{8}-\d{6}(?:-\d+)?\.jsonl`;
 
+/** The ledger's own filename; its `.corrupt-<ts>` copies are siblings. */
+const LEGACY_STEM_LEDGER_FILENAME = "_legacy_stems.json";
+
 /**
  * `<base>.legacy-<ts>.jsonl` — a READ-ONLY LEGACY SIDECAR.
  *
@@ -530,6 +533,27 @@ type OwnershipProbe =
   | { kind: "shared"; others: string[] }
   | { kind: "unknown"; source: string };
 
+/**
+ * What the `_legacy_stems.json.corrupt-*` copies in the sessions directory
+ * still hold hostage.
+ *
+ * A QUARANTINE IS NOT A RESOLUTION, AND IT OUTLIVES THE PROCESS THAT MADE ONE.
+ * Healing a malformed row moves it into a `.corrupt-` copy and rewrites the
+ * ledger without it, so from then on the LEDGER looks clean while the fact that
+ * some stem's owners were once unreadable lives only in that copy — and a stem
+ * whose partner was named in the moved row would otherwise read as
+ * single-owner to the next process, which adopts the shared file. So the copies
+ * are part of the read path: `stems` maps every case-folded stem a copy still
+ * names to the copy naming it, and `unparseable` is a copy that could not be
+ * read row-wise at all (a crash mid-write, a mangled repair), which may name
+ * ANY stem and therefore holds every stem the healed ledger has no row for.
+ */
+type CorruptLedgerHold = { stems: Map<string, string>; unparseable: string | null };
+
+/** No `.corrupt-` copy on disk — the steady state, and the one the scan must
+ *  reach with a readdir and no file read. */
+const NO_CORRUPT_LEDGER_HOLD: CorruptLedgerHold = { stems: new Map(), unparseable: null };
+
 /** What one pass of `carryLegacyTranscriptFamily` did, with the lock held. */
 type CarryOutcome =
   /** `carried` files moved; `sidecars` of them became read-only sidecars. */
@@ -858,6 +882,18 @@ export class SessionStore {
   /** One row-healing attempt per streak, not one per key touch. */
   private legacyStemLedgerHealAttempted = false;
   /**
+   * The last `_legacy_stems.json.corrupt-*` scan, keyed by a signature over the
+   * copies' names, sizes and mtimes.
+   *
+   * DERIVED FROM THE DIRECTORY, NEVER REMEMBERED ACROSS THE FACT: the hold those
+   * copies place on a stem has to outlive the process that created them (see
+   * `corruptLegacyStemLedgerHold`), and it is released by an operator deleting
+   * or repairing the file — which the signature notices.
+   */
+  private legacyStemLedgerCorruptCache: { signature: string; hold: CorruptLedgerHold } | null = null;
+  /** One warn per (corrupt copy, stem) pair, not one per inbound message. */
+  private legacyStemLedgerCorruptWarned = new Set<string>();
+  /**
    * The move primitive the migration uses, once the FILESYSTEM has answered
    * whether it can hard-link a transcript (see `moveWithoutClobber`). Null until
    * then; `carryModeLogged` is only about saying it once.
@@ -1180,23 +1216,19 @@ export class SessionStore {
       return a.position - b.position;
     });
 
-    // An interrupted rotation that a sidecar preserved can hold the SAME record
-    // in two files at once (the legacy active file and the archive the rotation
-    // had already appended it to). Sidecars are never rewritten — that is the
-    // whole rule — so the duplicate is permanent on disk; it is only collapsed
-    // here, in the output, on the full record rather than on `seq` alone: two
-    // distinct undated legacy records in the same millisecond would otherwise
-    // read as one.
-    const results: SessionMessage[] = [];
-    const seen = new Set<string>();
-    for (const hit of hits) {
-      const token = JSON.stringify([hit.msg.seq ?? null, hit.msg.timestamp ?? null, hit.msg.role ?? null, hit.msg.content]);
-      if (seen.has(token)) continue;
-      seen.add(token);
-      results.push(hit.msg);
-      if (results.length >= limit) break;
-    }
-    return results.reverse();
+    // NO DEDUPE. An interrupted rotation that a sidecar preserved can hold the
+    // same record in two files at once (the legacy active file and the archive
+    // the rotation had already appended it to), and that duplicate is permanent
+    // on disk — sidecars are never rewritten. Collapsing it HERE cost more than
+    // it bought: the only key available is the record's own content, and two
+    // different senders' identical messages in the same millisecond (a group
+    // chat's "ok", a broadcast delivered to two people) are indistinguishable
+    // from one record read twice, so the filter deleted real messages from
+    // search results and from `recall_conversation`. It also applied WITHIN one
+    // file, where a duplicate is not a rotation artefact at all but two genuine
+    // identical messages. Reading a preserved duplicate twice is visible and
+    // harmless; dropping someone's message is neither.
+    return hits.slice(0, limit).map((hit) => hit.msg).reverse();
   }
 
   /** Search archive files (compacted SDK events) for a given session ID */
@@ -1958,7 +1990,7 @@ export class SessionStore {
   // --- Legacy stem ownership ledger (see LegacyStemLedgerFile) ---
 
   private get legacyStemLedgerPath(): string {
-    return join(this.dir, "_legacy_stems.json");
+    return join(this.dir, LEGACY_STEM_LEDGER_FILENAME);
   }
 
   /** Advisory lock for the ledger's read-modify-write.
@@ -2169,6 +2201,91 @@ export class SessionStore {
       if (!existsSync(to)) return to;
     }
     return null;
+  }
+
+  /**
+   * Which stems the `.corrupt-` copies of the ledger still hold, read off the
+   * DIRECTORY on every probe rather than off this process's memory.
+   *
+   * THIS IS WHAT MAKES THE QUARANTINE SURVIVE A RESTART. Row healing and
+   * whole-file quarantine both leave a ledger that parses cleanly and a copy of
+   * the unreadable part beside it; the "these stems' owners were unreadable"
+   * fact lived only in the healing process's fields, so a SECOND process read
+   * the healed ledger, saw no partner, answered `sole`, and adopted a file whose
+   * other owner was named in nothing but the quarantined rows. Reading the
+   * copies back closes that without a format change.
+   *
+   * CHEAP WHEN THERE IS NOTHING TO FIND, which is always, on every install that
+   * has never had a bad row: one `readdir` and a prefix filter, no file opened.
+   * When a copy does exist the parse is cached against a signature over the
+   * copies' names, sizes and mtimes — so an operator who DELETES or REPAIRS one
+   * releases the hold on the next message, which is the documented way out.
+   */
+  private corruptLegacyStemLedgerHold(): CorruptLedgerHold {
+    const prefix = `${LEGACY_STEM_LEDGER_FILENAME}.corrupt-`;
+    const files = this.dirNames().filter((name) => name.startsWith(prefix)).sort();
+    if (files.length === 0) {
+      this.legacyStemLedgerCorruptCache = null;
+      return NO_CORRUPT_LEDGER_HOLD;
+    }
+    const signature = files.map((name) => {
+      try {
+        const st = statSync(join(this.dir, name));
+        return `${name}:${st.size}:${st.mtimeMs}`;
+      } catch {
+        return `${name}:gone`;
+      }
+    }).join("|");
+    const cached = this.legacyStemLedgerCorruptCache;
+    if (cached !== null && cached.signature === signature) return cached.hold;
+
+    const stems = new Map<string, string>();
+    let unparseable: string | null = null;
+    for (const name of files) {
+      // ROW-WISE AND BEST EFFORT: a copy written by `healLegacyStemLedgerRows`
+      // is valid JSON whose VALUES are the unreadable part, so its keys are
+      // exactly the stems to hold. Anything we cannot get keys out of at all
+      // falls through to `unparseable`.
+      let rows: unknown;
+      try {
+        rows = (JSON.parse(readFileSync(join(this.dir, name), "utf-8")) as Partial<LegacyStemLedgerFile> | null)?.stems;
+      } catch {
+        unparseable ??= name;
+        continue;
+      }
+      if (!rows || typeof rows !== "object" || Array.isArray(rows)) {
+        unparseable ??= name;
+        continue;
+      }
+      for (const stem of Object.keys(rows)) {
+        const folded = stem.toLowerCase();
+        if (!stems.has(folded)) stems.set(folded, name);
+      }
+    }
+    const hold: CorruptLedgerHold = { stems, unparseable };
+    this.legacyStemLedgerCorruptCache = { signature, hold };
+    return hold;
+  }
+
+  /**
+   * The `.corrupt-` copy that makes `target` (a case-folded legacy stem)
+   * unknown, or null when none does.
+   *
+   * `stems` is the HEALED ledger's rows: a stem it still carries a row for has
+   * readable owners on disk, so even a copy we cannot read row-wise cannot make
+   * it ambiguous. Every other stem is held by such a copy, because "this copy
+   * might name your partner" is the only honest reading of bytes nobody can
+   * parse.
+   */
+  private legacyStemHeldByCorruptLedger(target: string, stems: Record<string, string[]>): string | null {
+    const hold = this.corruptLegacyStemLedgerHold();
+    const named = hold.stems.get(target);
+    if (named !== undefined) return named;
+    if (hold.unparseable === null) return null;
+    for (const stem of Object.keys(stems)) {
+      if (stem.toLowerCase() === target) return null;
+    }
+    return hold.unparseable;
   }
 
   /** One line per failure streak: the ledger is read on every key's first
@@ -2832,6 +2949,7 @@ export class SessionStore {
         this.transcriptMigrationChecked.add(key);
         this.transcriptMigrationRetryAt.delete(key);
         this.transcriptProbeAnswer.delete(key);
+        this.releaseWithheldSession(key);
         return true;
       }
       this.transcriptMigrationRetryAt.set(key, Date.now() + TRANSCRIPT_MIGRATION_RETRY_MS);
@@ -2894,6 +3012,24 @@ export class SessionStore {
     this.sessions.set(key, session);
     this.transcriptWithheld.add(key);
     return session;
+  }
+
+  /**
+   * Stop serving the EMPTY session a key was withheld, now that it is no longer
+   * withheld.
+   *
+   * THE CACHE IS WHAT MADE AN EXTERNALLY COMPLETED QUARANTINE INVISIBLE. Another
+   * process can park the family and write fresh history between two of this
+   * process's attempts; this one's retry then parks zero files, sees the marker,
+   * and settles — with the empty withheld session still in `this.sessions`. It
+   * kept serving that empty history, and because `getLastSeq` reads the cached
+   * tail, the next `append()` handed out seq 1 over a file that already had one.
+   * So every transition out of the withheld state drops the cache and the next
+   * `get()` reloads the tail (and re-derives seq) from disk.
+   */
+  private releaseWithheldSession(key: string): void {
+    if (!this.transcriptWithheld.has(key)) return;
+    this.dropCachedSession(key);
   }
 
   /** Forget a cached session whose files moved underneath it, including the
@@ -3300,6 +3436,23 @@ export class SessionStore {
       if (outcome === "gone") return null;
       // "taken" — fall through to the sidecar name.
     }
+    // OUR OWN INTERRUPTED CLAIM FIRST. `link` to `<base>.legacy-T1.jsonl`
+    // succeeding and the `unlink` of the source not running is a reachable crash
+    // point (and `moveWithoutClobber` only recognises it for the ONE name it was
+    // asked about), so a retry in a later second used to claim
+    // `<base>.legacy-T2.jsonl` and leave BOTH of them readable — every record in
+    // that file then read twice, forever, because sidecars are never rewritten.
+    // The source's device+inode identifies the sidecar it already landed on, and
+    // the only work left is the `unlink`.
+    for (const sidecar of this.legacySidecarsFor(base)) {
+      if (sidecar === from) continue;
+      const same = sameFileOnDisk(from, sidecar);
+      if (same === "missing-source") return null;
+      if (same !== "same") continue;
+      unlinkIfPresent(from);
+      return basename(sidecar);
+    }
+
     // CLAIMED BY THE MOVE ITSELF, not picked and then used. A free name is only
     // free until another process takes it, and every sidecar is the single copy
     // of the history inside it.
@@ -3439,6 +3592,10 @@ export class SessionStore {
     // every other one. Keyed by session key and dropped when the key settles.
     if (answer.kind === "sole") this.transcriptProbeAnswer.delete(key);
     else this.transcriptProbeAnswer.set(key, answer.kind);
+    // `shared` is the only answer that withholds (see `servesMixedTranscript`),
+    // so anything else ends the withholding here too — not only on the settle
+    // path above it, which a key that stays unsettled never reaches.
+    if (answer.kind !== "shared") this.releaseWithheldSession(key);
     return answer;
   }
 
@@ -3475,8 +3632,31 @@ export class SessionStore {
       consider(entry.migratedFrom);
     }
     for (const cached of this.sessions.keys()) consider(cached);
+    // A NAMED OWNER BEATS AN UNREADABLE ONE. Ambiguity only ever grows, so a
+    // partner we CAN see settles the question whatever else is unreadable — and
+    // `shared` is the answer that parks the family, while `unknown` would leave a
+    // stable-stem key reading the mixed file.
+    if (others.size > 0) return { kind: "shared", others: [...others].sort() };
 
-    return others.size === 0 ? { kind: "sole" } : { kind: "shared", others: [...others].sort() };
+    // AND A HEALED LEDGER IS NOT A CLEAN ONE. The `_legacy_stems.json.corrupt-*`
+    // copies beside it are the only record that some stem's owners were ever
+    // unreadable, and they outlive the process that made them — which is the
+    // whole point: the malformed-row set above is empty in every OTHER process,
+    // so without this, `sole` is exactly what the next process answers for a file
+    // whose partner was named in nothing but the rows that were moved aside.
+    const heldBy = this.legacyStemHeldByCorruptLedger(target, ledger.stems);
+    if (heldBy !== null) {
+      const file = join(this.dir, heldBy);
+      this.warnOnce(this.legacyStemLedgerCorruptWarned, `${heldBy}\u0000${target}`, () => log.warn(
+        { file, stem: target },
+        "Deferring legacy transcript migration: a quarantined copy of the legacy transcript stem ledger may name "
+        + "another owner of this transcript's stem, and the healed ledger no longer records that it ever did. "
+        + "RELEASE THE HOLD BY DELETING THAT `.corrupt-` FILE once its rows have been read (or by repairing it into "
+        + "valid JSON); until then every migration it covers stays deferred",
+      ));
+      return { kind: "unknown", source: file };
+    }
+    return { kind: "sole" };
   }
 
   /** Emit `body` the first time `token` is seen — one line per collision per

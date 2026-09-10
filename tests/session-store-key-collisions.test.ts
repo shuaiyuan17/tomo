@@ -1282,10 +1282,12 @@ describe("a sidecar is NOT ordered by the filename it sits beside", () => {
     expect(newStore().countRecentUserMessages(ALEX_DOT)).toBe(2);
   });
 
-  it("reads a record that an interrupted rotation left in two files once", () => {
+  it("reads a record that an interrupted rotation left in two files twice, rather than dropping a message", () => {
     // A sidecar is never rewritten, so a record the rotation had already appended
-    // to an archive before it died is permanently in both files. The duplicate is
-    // collapsed in the search output, not on disk.
+    // to an archive before it died is permanently in both files — and the search
+    // returns both copies. There is NO dedupe: the only key available is the
+    // record itself, so collapsing "duplicates" deleted distinct messages (see
+    // the case below). A duplicate read twice is visible and harmless.
     const stem = transcriptFileStem(ALEX_DOT);
     const duplicate = record("rotated twice", AUG, 4);
     writeFileSync(join(testDir, `${stem}.jsonl`), record("september", SEP, 5));
@@ -1293,10 +1295,29 @@ describe("a sidecar is NOT ordered by the filename it sits beside", () => {
     writeFileSync(join(testDir, `_archive_${stem}_2026-08.jsonl`), duplicate);
 
     expect(newStore().searchTranscript(ALEX_DOT, {}).map((m) => m.content))
-      .toEqual(["rotated twice", "september"]);
+      .toEqual(["rotated twice", "rotated twice", "september"]);
     // Both copies are still on disk: nothing rewrites a sidecar.
     expect(readFileSync(join(testDir, `${stem}.legacy-20260901-000000.jsonl`), "utf-8")).toBe(duplicate);
     expect(readFileSync(join(testDir, `_archive_${stem}_2026-08.jsonl`), "utf-8")).toBe(duplicate);
+  });
+
+  it("returns two senders' identical messages from the same millisecond, both of them", () => {
+    // THE REASON THE DEDUPE IS GONE. Its key was (seq, timestamp, role, content),
+    // which is exactly equal for two different people saying "ok" in the same
+    // millisecond of a group chat — so one of them was deleted from every search
+    // and from `recall_conversation`. It also applied WITHIN one file, where a
+    // repeated record is not a rotation artefact at all.
+    const stem = transcriptFileStem(ALEX_DOT);
+    const same = { role: "user" as const, content: "ok", channel: "imessage", timestamp: SEP, seq: 7 };
+    writeFileSync(
+      join(testDir, `${stem}.jsonl`),
+      `${JSON.stringify({ ...same, senderName: "Alex" })}\n${JSON.stringify({ ...same, senderName: "Sam" })}\n`,
+    );
+    // A sidecar on disk is what puts the search on the unordered path at all.
+    writeFileSync(join(testDir, `${stem}.legacy-20260801-000000.jsonl`), record("older", AUG, 1));
+
+    const found = newStore().searchTranscript(ALEX_DOT, { query: "ok" });
+    expect(found.map((m) => m.senderName)).toEqual(["Alex", "Sam"]);
   });
 });
 
@@ -1323,6 +1344,33 @@ describe("the migration's move cannot overwrite a live destination", () => {
     expect(store.migrationStatus().settled).toBe(true);
     // And the mode in use is on the record exactly once.
     expect(debugMatching("link+unlink")).toHaveLength(1);
+  });
+
+  it("finishes an interrupted SIDECAR claim instead of claiming a second one", () => {
+    // The destination was taken, so the claim was a link to
+    // `<stem>.legacy-<T1>.jsonl` — and its `unlink` of the source never ran. The
+    // retry runs in a LATER second, so it used to claim `<stem>.legacy-<T2>.jsonl`
+    // and leave two readable copies of the same history; sidecars are never
+    // rewritten, so that duplicate was permanent and every record in it was read
+    // twice.
+    const legacy = legacyTranscriptFileStem(ALEX_DOT);
+    const stem = transcriptFileStem(ALEX_DOT);
+    const legacyPath = join(testDir, `${legacy}.jsonl`);
+    const claimed = `${stem}.legacy-20260201-000000.jsonl`;
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("live", T1 + 1_000, 1));
+    writeFileSync(legacyPath, record("legacy one", T1, 1));
+    linkSync(legacyPath, join(testDir, claimed)); // the interrupted claim
+    expect(sidecarFiles()).toEqual([claimed]);
+
+    const store = newStore();
+    store.setSdkSessionId(ALEX_DOT, "sdk-1");
+
+    // The records are there once, and no second sidecar was claimed.
+    expect(store.get(ALEX_DOT).messages.map((m) => m.content)).toEqual(["legacy one", "live"]);
+    expect(sidecarFiles()).toEqual([claimed]);
+    expect(existsSync(legacyPath)).toBe(false);
+    expect(store.searchTranscript(ALEX_DOT, {}).map((m) => m.content)).toEqual(["legacy one", "live"]);
+    expect(store.migrationStatus().settled).toBe(true);
   });
 });
 
@@ -1405,6 +1453,43 @@ describe("parking a shared family is not done until nothing readable is left", (
     expect(parked).toContain("mixed history");
     expect(parked).toContain("arrived while the quarantine");
     expect(store.migrationStatus().settled).toBe(true);
+  });
+
+  it("stops serving the withheld empty session when ANOTHER process completed the park", () => {
+    // TWO PROCESSES OVER ONE DIRECTORY. A withholds (its park could not run) and
+    // caches the empty session; B parks the family and writes the key's fresh
+    // history; A's retry then parks nothing, sees B's marker and settles — and
+    // used to keep serving that cached empty session, with `getLastSeq` reading
+    // the empty tail, so its next append re-issued seq 1 over B's record.
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("mixed history", Date.parse("2026-02-01T00:00:00Z"), 4));
+    const a = newStore();
+    a.setSdkSessionId(SUFFIXED, "sdk-underscore"); // the other owner, visible to both
+    const lockDir = holdTranscriptLockIn(testDir);
+    expect(a.get(STABLE).messages).toEqual([]);
+    expect(warningsMatching("Withholding this session's transcript")).toHaveLength(1);
+    rmSync(lockDir, { recursive: true, force: true });
+
+    const b = newStore();
+    expect(b.get(STABLE).messages).toEqual([]);
+    expect(quarantinedFiles()).toHaveLength(1); // the mixed file is parked
+    // B's own fresh history, written AFTER the decision (so A's retry leaves it).
+    b.append(STABLE, msg("fresh from B"));
+    expect(b.get(STABLE).messages.map((m) => m.seq)).toEqual([1]);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 61_000);
+      expect(a.get(STABLE).messages.map((m) => m.content)).toEqual(["fresh from B"]);
+      expect(a.migrationStatus().settled).toBe(true);
+      a.append(STABLE, msg("after the retry"));
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(quarantinedFiles()).toHaveLength(1); // B's fresh file was not parked
+    const onDisk = readFileSync(join(testDir, "dm_a_b.jsonl"), "utf-8").trim().split("\n")
+      .map((line) => JSON.parse(line) as SessionMessage);
+    expect(onDisk.map((m) => m.content)).toEqual(["fresh from B", "after the retry"]);
+    expect(onDisk.map((m) => m.seq)).toEqual([1, 2]);
   });
 });
 
@@ -1515,5 +1600,77 @@ describe("one unreadable ledger row is not an unreadable ledger", () => {
     expect(readFileSync(REGISTRY(), "utf-8")).toContain(ALEX_UNDERSCORE);
     expect(existsSync(LEDGER())).toBe(false);
     expect(warningsMatching("Keeping the metadata-only session entry")).toHaveLength(1);
+  });
+
+  it("keeps a healed stem deferred in a SECOND process, until the `.corrupt-` copy is gone", () => {
+    // THE QUARANTINE HAS TO OUTLIVE THE PROCESS THAT MADE IT. Healing rewrites a
+    // ledger that parses cleanly, so the fact that this stem's owners were
+    // unreadable lived only in process A's fields — process B read the healed
+    // ledger, saw no partner, answered `sole` and adopted a file whose other owner
+    // was named in nothing but the rows A moved aside.
+    writeFileSync(LEDGER(), JSON.stringify({ version: 1, stems: { dm_a_b: "not-an-array" } }));
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("possibly shared", Date.parse("2026-02-01T00:00:00Z"), 1));
+
+    const a = newStore();
+    expect(a.get("dm:a:b").messages.map((m) => m.content)).toEqual(["possibly shared"]);
+    expect(a.migrationStatus().deferred).toEqual(["dm:a:b"]);
+    expect(corruptFiles()).toHaveLength(1);
+    // Nothing in the healed ledger says the row was ever there.
+    expect((JSON.parse(readFileSync(LEDGER(), "utf-8")) as { stems: Record<string, unknown> }).stems).toEqual({});
+
+    warn.mockClear();
+    const b = newStore();
+    b.get("dm:a:b");
+    expect(b.migrationStatus().deferred).toEqual(["dm:a:b"]);
+    expect(b.migrationStatus().settled).toBe(false);
+    const held = warningsMatching("quarantined copy of the legacy transcript stem ledger");
+    expect(held).toHaveLength(1);
+    expect((held[0][0] as { file: string }).file).toBe(join(testDir, corruptFiles()[0]));
+    // And the warn says how to release the hold.
+    expect(String(held[0][1])).toContain("DELETING THAT `.corrupt-` FILE");
+
+    // Which is exactly what an operator does, and the next process moves on.
+    rmSync(join(testDir, corruptFiles()[0]));
+    const c = newStore();
+    c.get("dm:a:b");
+    expect(c.migrationStatus().deferred).toEqual([]);
+    expect(c.migrationStatus().settled).toBe(true);
+  });
+
+  it("refuses a partner it can still SEE rather than deferring on a `.corrupt-` copy", () => {
+    // Ambiguity only ever grows, so an owner the registry still names settles the
+    // question whatever a quarantined copy holds — and `shared` is the answer that
+    // gets the mixed file out of the read paths, where `unknown` would only defer.
+    writeFileSync(`${LEDGER()}.corrupt-20260201-000000`, "{truncated mid-wri");
+    const store = newStore();
+    store.setSdkSessionId(ALEX_UNDERSCORE, "sdk-underscore");
+    const legacyPath = seedSharedLegacyFile();
+
+    expect(store.get(ALEX_DOT).messages).toEqual([]);
+    expect(existsSync(legacyPath)).toBe(true);
+    expect(warningsMatching("filename collision")).toHaveLength(1);
+    expect(warningsMatching("quarantined copy of the legacy transcript stem ledger")).toHaveLength(0);
+    expect(store.migrationStatus().settled).toBe(true);
+  });
+
+  it("holds every stem the healed ledger has no row for when a `.corrupt-` copy is itself unparseable", () => {
+    // A copy whose bytes nobody can parse (a crash mid-write, a mangled repair)
+    // may name ANY stem, so only a stem the healed ledger still carries a row for
+    // is provably not in it.
+    writeFileSync(LEDGER(), JSON.stringify({ version: 1, stems: { dm_a_b: ["dm:a:b", "dm:a_b"] } }));
+    writeFileSync(`${LEDGER()}.corrupt-20260201-000000`, "{truncated mid-wri");
+    writeFileSync(join(testDir, "dm_a_b.jsonl"), record("mixed history", Date.parse("2026-02-01T00:00:00Z"), 1));
+    const legacyPath = seedSharedLegacyFile();
+
+    const store = newStore();
+    // The stem WITH a row is decided on that row — here, refused as shared.
+    expect(store.get("dm:a:b").messages).toEqual([]);
+    expect(warningsMatching("filename collision")).toHaveLength(1);
+    // The stem with no row is held: its partner may be in the unreadable copy, so
+    // its legacy file is neither adopted nor touched.
+    expect(store.get(ALEX_DOT).messages).toEqual([]);
+    expect(readFileSync(legacyPath, "utf-8")).toContain("mixed history");
+    expect(store.migrationStatus().deferred).toEqual([ALEX_DOT]);
+    expect(warningsMatching("quarantined copy of the legacy transcript stem ledger")).toHaveLength(1);
   });
 });

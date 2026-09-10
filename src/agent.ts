@@ -2201,6 +2201,15 @@ export class Agent {
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
+    // WHAT THE TRANSCRIPT MIGRATION STILL OWES, once per start. `deferred` is
+    // what this process could not settle and will retry; `ambiguous` and
+    // `sidecars` are read off the sessions directory, so they are accurate
+    // before any key has been touched — which is exactly here. The prune drops
+    // ledger rows whose stem has nothing left on disk.
+    // TODO(tomo status): surface `migrationStatus()` as a `tomo status` field.
+    this.sessions.pruneLegacyStemLedger();
+    log.info(this.sessions.migrationStatus(), "Legacy transcript migration status");
+
     // Check for restart reason and notify via continuity-style message.
     // An attributed reason (the restart was initiated from a session — its
     // key rides in the reason file, stamped from TOMO_SESSION_KEY) routes to

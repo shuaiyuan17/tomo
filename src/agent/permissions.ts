@@ -6,6 +6,8 @@ import { config, RESERVED_AGENT_TYPE, type AgentProfile } from "../config.js";
 import { log } from "../logger.js";
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 import { extractAttachments } from "./text-utils.js";
+import { sandboxedBashCommand } from "./bash-sandbox.js";
+import { loadedSettingsFiles } from "./setting-sources.js";
 
 // ---------------------------------------------------------------------------
 // canUseTool: re-allow `.claude/skills/` under bypassPermissions
@@ -230,12 +232,12 @@ export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
 }
 
 /**
- * Why the SHELL is gone for the whole of a barred turn, whatever the command
- * says.
+ * Why the shell is withheld when it cannot be SANDBOXED — the fallback, no
+ * longer the rule.
  *
- * Not a stricter filter — the end of filtering. {@link bashTouchesMemory} is a
- * token scan over the text the model typed, and any interpreter writes a path
- * that text never spells:
+ * Filtering the command TEXT was never the answer, and still isn't.
+ * {@link bashTouchesMemory} is a token scan over what the model typed, and any
+ * interpreter writes a path that text never spells:
  *
  *     node -e 'process.stdout.write(require("node:fs")
  *       .readFileSync("mem"+"ory/pri"+"vate/note.txt","utf8"))'
@@ -246,15 +248,20 @@ export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
  * they are not a list that can be completed: the argument to an interpreter is
  * a program, and deciding what a program reads is not a job for a regex.
  *
- * So on a barred turn Bash is denied OUTRIGHT. The comment on
- * {@link bashTouchesMemory} already conceded the point — "on a barred turn Bash
- * is a convenience the model does not need" — while the code kept trying to
- * filter it. The model keeps Read/Glob/Grep on named PUBLIC files, which are
- * the precise arms, and the reply says so rather than leaving it to retry the
- * same command with a different spelling.
+ * The text was the wrong LAYER, though, not the only one. A barred turn now gets
+ * its shell, wrapped in a `sandbox-exec` profile that denies
+ * `memory/private/` in the kernel — see `./bash-sandbox.ts`. The assembled path
+ * above gets `EPERM` at `open(2)`, where the path is resolved and the spelling
+ * has stopped mattering.
+ *
+ * This text is what remains for the case where that wrap is unavailable (no
+ * `sandbox-exec`, an unwritable profile, a malformed tool input): the shell is
+ * withheld, exactly as before. The fallback is WITHHOLD, never an unsandboxed
+ * shell, so a host without the sandbox is no worse off than it was and a host
+ * with it is not trusted to have it.
  */
 export const PRIVATE_MEMORY_BASH_WITHHELD =
-  `The Bash tool is not available on this turn. A shell command cannot be scoped away from \`memory/${PRIVATE_MEMORY_SUBDIR}/\` — any interpreter (\`node -e\`, \`python -c\`, a script written on an earlier turn) can assemble a path that the command text never spells — so shell access is withheld whole rather than filtered. Use Read on a named public file (MEMORY.md is already in your prompt), or Glob/Grep outside the memory tree.`;
+  `The Bash tool is not available on this turn. It normally runs inside a \`sandbox-exec\` profile that makes \`memory/${PRIVATE_MEMORY_SUBDIR}/\` unreadable at the kernel level, but that sandbox could not be set up on this host — and an unsandboxed shell is not offered as a substitute, because no filter over command text can scope a shell away from a directory (any interpreter can assemble a path the text never spells). Use Read on a named public file (MEMORY.md is already in your prompt), or Glob/Grep outside the memory tree.`;
 
 /** The reason handed back for a denied Bash call: why the shell is gone, then
  *  why this turn is barred at all (and, for a summoned turn, the way round). */
@@ -276,21 +283,35 @@ export function privateMemoryBashDenial(bar: PrivateMemoryBar): string {
  *  the summoned window open or lock the owner out of their own memory for the
  *  life of the session.
  *
- *  BASH IS DENIED OUTRIGHT while the bar is up, before the per-tool predicate
- *  runs at all — see {@link PRIVATE_MEMORY_BASH_WITHHELD} for why no filter can
- *  do this job.
+ *  BASH IS REWRITTEN, NOT DENIED, while the bar is up. The command is wrapped in
+ *  a `sandbox-exec` profile that denies `memory/private/` in the kernel
+ *  (`./bash-sandbox.ts`) and handed back through the hook's `updatedInput`, so
+ *  the turn keeps its shell and the directory stays unreachable however the path
+ *  is spelled. `updatedInput` is the SDK's documented seam for this
+ *  ("`updatedInput` - Modified tool input (PreToolUse only)") and is returned
+ *  WITHOUT a `permissionDecision`: the CLI collects the rewritten input
+ *  independently of the decision, so a bare rewrite neither approves the call
+ *  nor suppresses the other PreToolUse guards — `deny` from any of them still
+ *  wins. Only when the wrap is unavailable does the old outright deny stand;
+ *  see {@link PRIVATE_MEMORY_BASH_WITHHELD}.
  *
  *  SUBAGENTS GO THROUGH HERE TOO. The SDK propagates the session's hooks into
  *  Agent-tool children, so a delegated `Bash` call on a barred turn reaches
- *  this same PreToolUse callback and is denied by the same arm. That matters:
+ *  this same PreToolUse callback and is sandboxed by the same arm. That matters:
  *  `agentProfileGuardHooks` below fails OPEN for a subagent type with no
  *  profile, so a subagent is not a way round the bar only because this guard is
  *  not scoped to the main thread. */
 export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
+  pluginDirs: () => readonly string[] = () => [],
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
+  // The settings files the query actually loads, so the Bash arm can refuse when
+  // one of them carries a PreToolUse hook that could undo the sandbox rewrite.
+  // Derived from the same constant the query option uses (setting-sources.ts) —
+  // the list must not be able to drift.
+  const settingsFiles = loadedSettingsFiles(config.workspaceDir);
   return {
     PreToolUse: [{
       hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
@@ -299,7 +320,26 @@ export function privateMemoryGuardHooks(
         const reason = bar();
         if (!reason) return {};
         const isBash = input.tool_name === "Bash";
-        if (!isBash && !isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) return {};
+        if (isBash) {
+          const sandboxed = sandboxedBashInput(input.tool_input, {
+            settingsFiles,
+            pluginDirs: pluginDirs(),
+          });
+          if (sandboxed) {
+            log.info(
+              { key: sessionKey, bar: reason },
+              "Sandboxed Bash on a private-memory-barred turn",
+            );
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                updatedInput: sandboxed,
+              },
+            };
+          }
+        } else if (!isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) {
+          return {};
+        }
         log.warn(
           { key: sessionKey, tool: input.tool_name, bar: reason },
           isBash ? "Blocked Bash on a private-memory-barred turn" : "Blocked access to private memory",
@@ -316,6 +356,33 @@ export function privateMemoryGuardHooks(
       }],
     }],
   };
+}
+
+/**
+ * A `Bash` tool input with its `command` rewritten to run sandboxed, or `null`
+ * to fall back to withholding the shell.
+ *
+ * The rest of the input is carried through unchanged (`description`, `timeout`,
+ * `run_in_background`): the CLI validates `updatedInput` against the tool's full
+ * schema and drops a rewrite that fails it, so returning `{ command }` alone
+ * would quietly lose whichever other fields the model set.
+ *
+ * A non-string `command` returns `null` rather than being coerced — a shape this
+ * code does not recognise is a shape it cannot prove it has sandboxed.
+ */
+export function sandboxedBashInput(
+  toolInput: unknown,
+  // Required, not optional: this is the production entry point, and the
+  // foreign-hook scan is a security check. An optional parameter would let a
+  // refactor drop the scan and leave the suite green; a required one makes
+  // that a type error.
+  scan: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
+): Record<string, unknown> | null {
+  if (!toolInput || typeof toolInput !== "object") return null;
+  const ti = toolInput as Record<string, unknown>;
+  if (typeof ti.command !== "string") return null;
+  const command = sandboxedBashCommand(ti.command, undefined, scan);
+  return command === null ? null : { ...ti, command };
 }
 
 /** Per-tool predicate for the private-memory guard. Exported for testing. The
@@ -343,12 +410,14 @@ export function privateMemoryGuardHooks(
  *    that never touches `file_path` was the way to ship `memory/private/x` into
  *    a group from a turn that could not Read it. Relative paths resolve against
  *    the workspace, the same cwd the agent runs in.
- *  - Bash: see {@link bashTouchesMemory}. NO LONGER THE DECIDING ARM — the hook
- *    denies every Bash call while the bar is up (see
- *    {@link PRIVATE_MEMORY_BASH_WITHHELD}), because shell expansion and, worse,
+ *  - Bash: see {@link bashTouchesMemory}. NOT THE DECIDING ARM — the hook
+ *    sandboxes every Bash call while the bar is up (`./bash-sandbox.ts`), and
+ *    withholds the shell only if it cannot (see
+ *    {@link PRIVATE_MEMORY_BASH_WITHHELD}). Shell expansion and, worse,
  *    interpreter arguments happen after the hook fires, so the tokens here are
- *    not the paths the command will touch. Kept as a described-shape predicate
- *    for callers that want to ask the narrower question.
+ *    not the paths the command will touch; the kernel sees those. Kept as a
+ *    described-shape predicate for callers that want to ask the narrower
+ *    question.
  *
  *  Containment is case-folded throughout — see {@link isInside}. False
  *  positives are tolerable because the agent always has an alternative path
@@ -731,10 +800,16 @@ function grepReachesPrivate(
  * the paths the command will touch: `cat memory/pri*\/*.md`,
  * `$(echo memory/private/x)` and `cd memory && cat private/x.md` all reach
  * private/ without spelling it. There is no version of this that is both
- * precise and safe, so it is not precise: on a barred turn Bash is a
- * convenience the model does not need. It can Read named public files
- * (MEMORY.md is in its prompt), and the Read/Glob/Grep arms above are the
- * precise ones.
+ * precise and safe, so it is not precise.
+ *
+ * It is also no longer what holds the line. A barred turn's shell runs inside a
+ * `sandbox-exec` profile that denies the private dir in the KERNEL
+ * (`./bash-sandbox.ts`), which is the precise arm a token scan can never be —
+ * the check lands on the resolved path at `open(2)`, after every expansion this
+ * function cannot model. What remains here is a described-shape predicate for
+ * callers asking the narrower "does this command MENTION the memory tree?"
+ * question, and the over-broad answers below cost nothing now that no tool call
+ * is decided by them.
  *
  * Eight shapes are denied. The first two are the literal ones; the rest exist
  * because a reviewer walked straight through the literal ones:

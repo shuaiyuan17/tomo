@@ -4,6 +4,13 @@ vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js"
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
+// Bash on a barred turn is REWRITTEN to run under `sandbox-exec`, not denied.
+// The wrap is stubbed so this suite stays about audience resolution: whether the
+// machine running it has `sandbox-exec` is tests/bash-sandbox.test.ts's subject,
+// not this one's.
+vi.mock("../src/agent/bash-sandbox.js", () => ({
+  sandboxedBashCommand: (cmd: string) => `SANDBOXED:${cmd}`,
+}));
 
 import {
   Agent,
@@ -47,16 +54,28 @@ const GROUP_SESSION = `telegram:${GROUP_CHAT_ID}`;
 const OWNER = { name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" as const };
 
 type PreToolUseResult = {
-  hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+  hookSpecificOutput?: {
+    permissionDecision?: string;
+    permissionDecisionReason?: string;
+    updatedInput?: Record<string, unknown>;
+  };
 };
 type PreToolUseHook = (input: { tool_name: string; tool_input: unknown }) => Promise<PreToolUseResult>;
 
-/** The PreToolUse hook the harness installed on `sessionKey`'s live session. */
+/** The private-memory PreToolUse hook the harness installed on `sessionKey`'s
+ *  live session.
+ *
+ *  The LAST PreToolUse entry, not the first: the guard is registered after
+ *  `agentProfileGuardHooks` on purpose, because the CLI takes the last
+ *  `updatedInput` when two hooks return one and the sandbox rewrite must be the
+ *  one that survives (see `buildHooksOption`). Reading index 0 here would test
+ *  the agent-profile guard and report its silence as the private-memory guard's. */
 function guardHookFor(sessionKey: string): PreToolUseHook {
   const entry = [...mockSdk.optionsBySession].reverse().find((o) => o.sessionKey === sessionKey);
   if (!entry) throw new Error(`no live session was built for ${sessionKey}`);
   const hooks = entry.options.hooks as { PreToolUse?: Array<{ hooks: PreToolUseHook[] }> } | undefined;
-  const pre = hooks?.PreToolUse?.[0]?.hooks?.[0];
+  const entries = hooks?.PreToolUse;
+  const pre = entries?.[entries.length - 1]?.hooks?.[0];
   if (!pre) throw new Error(`no PreToolUse guard installed for ${sessionKey}`);
   return pre;
 }
@@ -82,12 +101,19 @@ async function probe(hook: PreToolUseHook): Promise<Probe> {
 }
 
 function expectDeniedAsSummoned(probed: Probe): void {
-  for (const name of ["read", "bash", "glob"] as const) {
+  for (const name of ["read", "glob"] as const) {
     const out = probed[name];
     expect(out?.hookSpecificOutput?.permissionDecision, name).toBe("deny");
     expect(out?.hookSpecificOutput?.permissionDecisionReason, name)
       .toContain("unavailable during a summoned turn");
   }
+  // Bash is not denied — it is rewritten to run inside a sandbox profile that
+  // denies the private dir in the kernel. The command text is irrelevant to the
+  // decision, which is the whole point: `cat memory/private/x` is wrapped on
+  // exactly the same path an assembled one would be.
+  expect(probed.bash?.hookSpecificOutput?.updatedInput)
+    .toEqual({ command: `SANDBOXED:${PRIVATE_CALLS.bash.tool_input.command}` });
+  expect(probed.bash?.hookSpecificOutput?.permissionDecision).toBeUndefined();
   // Public memory is still readable — the bar is on private/, not on memory.
   expect(probed.publicRead).toEqual({});
 }
@@ -218,11 +244,14 @@ describe("private memory during a summoned-group turn", () => {
     // A group session is barred for its whole life, so the hook needs no turn
     // in flight to answer.
     const probed = await probe(guardHookFor(GROUP_SESSION));
-    for (const name of ["read", "bash", "glob"] as const) {
+    for (const name of ["read", "glob"] as const) {
       expect(probed[name]?.hookSpecificOutput?.permissionDecision, name).toBe("deny");
       expect(probed[name]?.hookSpecificOutput?.permissionDecisionReason, name)
         .toContain("not accessible from group sessions");
     }
+    // ...and Bash runs, sandboxed, for the whole life of a group session.
+    expect(probed.bash?.hookSpecificOutput?.updatedInput)
+      .toEqual({ command: `SANDBOXED:${PRIVATE_CALLS.bash.tool_input.command}` });
 
     await agent.stop();
   });

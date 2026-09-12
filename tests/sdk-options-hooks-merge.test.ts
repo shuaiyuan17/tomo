@@ -47,6 +47,67 @@ describe("buildHooksOption — the two PreToolUse guards coexist", () => {
     expect(hooks.PreToolUse).toBeUndefined();
   });
 
+  // LAST-WINS ON `updatedInput`, which is why the ORDER is now load-bearing.
+  //
+  // The private-memory guard returns `updatedInput` (the `sandbox-exec` rewrite).
+  // When two PreToolUse hooks both return one, the CLI keeps the LAST and says
+  // nothing — so a rewriting hook registered after this one would silently
+  // discard the sandbox wrap and hand the model an unsandboxed shell. Deny
+  // precedence is unaffected by order (any hook's `deny` wins), so the ordering
+  // exists purely to keep the rewrite final.
+  describe("the private-memory guard is the last PreToolUse producer", () => {
+    type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<{
+      hookSpecificOutput?: {
+        permissionDecision?: string;
+        permissionDecisionReason?: string;
+        updatedInput?: Record<string, unknown>;
+      };
+    }>;
+
+    const preToolUse = (): Hook[] => {
+      const { hooks } = buildHooksOption({
+        maxTurns: 50,
+        sessionKey: "dm:shuai",
+        privateMemoryBar: () => "group-session",
+        agentProfile: () => undefined,
+      }) as { hooks: Record<string, Array<{ hooks: Hook[] }>> };
+      return hooks.PreToolUse.flatMap((entry) => entry.hooks);
+    };
+
+    const PRIVATE_READ = {
+      tool_name: "Read",
+      tool_input: { file_path: "memory/private/secret.md" },
+    };
+
+    it("puts it at the END of the array, after the agent-profile guard", async () => {
+      const hooks = preToolUse();
+      expect(hooks).toHaveLength(2);
+      // Identified by behaviour rather than by index alone: only the
+      // private-memory guard denies a private Read on a barred turn, and the
+      // agent-profile guard says nothing for a main-thread call (no agent_id).
+      expect(await hooks[0]!(PRIVATE_READ)).toEqual({});
+      const last = await hooks[hooks.length - 1]!(PRIVATE_READ);
+      expect(last.hookSpecificOutput?.permissionDecision).toBe("deny");
+      expect(last.hookSpecificOutput?.permissionDecisionReason)
+        .toContain("not accessible from group sessions");
+    });
+
+    it("is the ONLY producer that returns updatedInput, so last-wins is safe", async () => {
+      const hooks = preToolUse();
+      const earlier = hooks.slice(0, -1);
+      expect(earlier).not.toHaveLength(0);
+      for (const hook of earlier) {
+        for (const call of [
+          { tool_name: "Bash", tool_input: { command: "ls -la" } },
+          { tool_name: "Bash", tool_input: { command: "cat memory/private/x" } },
+          PRIVATE_READ,
+        ]) {
+          expect((await hook(call)).hookSpecificOutput?.updatedInput).toBeUndefined();
+        }
+      }
+    });
+  });
+
   it("installs the agent-profile guard on its own", () => {
     const { hooks } = buildHooksOption({ maxTurns: 50, agentProfile: () => undefined }) as {
       hooks: Record<string, unknown[]>;

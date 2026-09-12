@@ -9,6 +9,7 @@ import { litellmRoutesModel } from "../litellm.js";
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
 import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
+import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -216,7 +217,7 @@ export function sdkOptions(
     skills: "all" as const,
     ...(plugins.length > 0 ? { plugins } : {}),
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
-    settingSources: ["project"] as ("project")[],
+    settingSources: [...SDK_SETTING_SOURCES],
     settings: {
       attribution: {
         commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
@@ -239,6 +240,10 @@ export function sdkOptions(
       privateMemoryBar,
       agentProfile,
       undeliveredReply: sessionContext?.undeliveredReply,
+      // Resolved at spawn (above) and handed to the guard as a getter, so the
+      // barred-turn Bash arm can spot a plugin that ships PreToolUse hooks
+      // without re-resolving install paths on every tool call.
+      pluginDirs: () => plugins.map((entry) => entry.path),
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -352,7 +357,8 @@ function buildSdkEnv(args: {
  *  BOTH PreToolUse producers land in the same event array, which is exactly the
  *  case `mergeHooks` exists for — the old `Object.assign` would have dropped
  *  the private-memory bar the moment this second one was added. Exported so a
- *  test can assert both entries are present. */
+ *  test can assert both entries are present, and that the private-memory guard
+ *  is the LAST of them (see the comment at its registration). */
 export function buildHooksOption(args: {
   turnBudget?: TurnBudget;
   maxTurns: number;
@@ -363,6 +369,10 @@ export function buildHooksOption(args: {
   /** Per-call profile lookup by SDK `agent_type`. Undefined ⇒ the guard is not
    *  installed. */
   agentProfile?: (agentType: string) => AgentProfile | undefined;
+  /** Directories of the plugins mounted on this session. The private-memory
+   *  guard scans them for PreToolUse hooks that could overwrite its Bash
+   *  rewrite. */
+  pluginDirs?: () => readonly string[];
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
@@ -374,11 +384,19 @@ export function buildHooksOption(args: {
   if (args.undeliveredReply) {
     mergeHooks(hooks, undeliveredReplyHooks(args.undeliveredReply, args.sessionKey));
   }
-  if (args.privateMemoryBar) {
-    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
-  }
   if (args.agentProfile) {
     mergeHooks(hooks, agentProfileGuardHooks(args.sessionKey, args.agentProfile));
+  }
+  // THE PRIVATE-MEMORY GUARD GOES LAST, and the order is load-bearing now that it
+  // returns `updatedInput` (the `sandbox-exec` rewrite, see permissions.ts).
+  // When two PreToolUse hooks both return `updatedInput` the CLI takes the LAST
+  // one and says nothing — verified against the SDK. Deny precedence is
+  // unaffected either way (a `deny` from any hook wins, whatever the order), so
+  // this costs nothing today: `agentProfileGuardHooks` only ever denies. It is
+  // insurance against the day a hook registered after it starts rewriting input
+  // and silently drops the sandbox wrap, which fails OPEN.
+  if (args.privateMemoryBar) {
+    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar, args.pluginDirs));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

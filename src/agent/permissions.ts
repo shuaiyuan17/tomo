@@ -7,6 +7,7 @@ import { log } from "../logger.js";
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 import { extractAttachments } from "./text-utils.js";
 import { sandboxedBashCommand } from "./bash-sandbox.js";
+import { loadedSettingsFiles } from "./setting-sources.js";
 
 // ---------------------------------------------------------------------------
 // canUseTool: re-allow `.claude/skills/` under bypassPermissions
@@ -303,8 +304,14 @@ export function privateMemoryBashDenial(bar: PrivateMemoryBar): string {
 export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
+  pluginDirs: () => readonly string[] = () => [],
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
+  // The settings files the query actually loads, so the Bash arm can refuse when
+  // one of them carries a PreToolUse hook that could undo the sandbox rewrite.
+  // Derived from the same constant the query option uses (setting-sources.ts) —
+  // the list must not be able to drift.
+  const settingsFiles = loadedSettingsFiles(config.workspaceDir);
   return {
     PreToolUse: [{
       hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
@@ -314,7 +321,10 @@ export function privateMemoryGuardHooks(
         if (!reason) return {};
         const isBash = input.tool_name === "Bash";
         if (isBash) {
-          const sandboxed = sandboxedBashInput(input.tool_input);
+          const sandboxed = sandboxedBashInput(input.tool_input, {
+            settingsFiles,
+            pluginDirs: pluginDirs(),
+          });
           if (sandboxed) {
             log.info(
               { key: sessionKey, bar: reason },
@@ -360,11 +370,14 @@ export function privateMemoryGuardHooks(
  * A non-string `command` returns `null` rather than being coerced — a shape this
  * code does not recognise is a shape it cannot prove it has sandboxed.
  */
-export function sandboxedBashInput(toolInput: unknown): Record<string, unknown> | null {
+export function sandboxedBashInput(
+  toolInput: unknown,
+  scan?: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
+): Record<string, unknown> | null {
   if (!toolInput || typeof toolInput !== "object") return null;
   const ti = toolInput as Record<string, unknown>;
   if (typeof ti.command !== "string") return null;
-  const command = sandboxedBashCommand(ti.command);
+  const command = sandboxedBashCommand(ti.command, undefined, scan);
   return command === null ? null : { ...ti, command };
 }
 

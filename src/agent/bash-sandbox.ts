@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join, sep } from "node:path";
 import { log } from "../logger.js";
 import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
 
@@ -42,11 +42,20 @@ import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
  * /tmp/p/note.txt` walks the files OUT of the denied subpath and reads them at a
  * path the profile says nothing about. Verified by running it.
  *
- * FAIL CLOSED. Anything that makes the wrap unavailable or its scope uncertain —
- * no `sandbox-exec`, no `/bin/zsh`, a non-string command, a private path whose
- * real location cannot be established — returns `null`, and the guard falls back
- * to the old behaviour: Bash withheld, with the existing denial text. Never to
- * an unsandboxed shell.
+ * THE REWRITE IS NOT THE LAST WORD, SO A FOREIGN HOOK WITHHOLDS THE SHELL. The
+ * CLI takes the last `updatedInput` any PreToolUse hook produces, and hooks from
+ * project settings and plugins arrive through its own merge rather than ours — a
+ * foreign hook that echoes `tool_input` back can restore the unsandboxed command
+ * after we have answered. Registering our rewrite last in our own array does not
+ * reach that. So `foreignPreToolUseHookSource` looks for any such hook and the
+ * guard withholds Bash when it finds one.
+ *
+ * FAIL CLOSED. Anything that makes the wrap unavailable, its scope uncertain, or
+ * its survival uncertain — no `sandbox-exec`, no `/bin/zsh`, a non-string
+ * command, a private path whose real location cannot be established, a foreign
+ * PreToolUse hook — returns `null`, and the guard falls back to the old
+ * behaviour: Bash withheld, with the existing denial text. Never to an
+ * unsandboxed shell.
  */
 
 /** Absolute by design: a PATH lookup for the thing enforcing the boundary is a
@@ -138,6 +147,42 @@ function isSymlink(p: string): boolean {
 }
 
 /**
+ * `realpath(3)`, NOT node's JS reimplementation.
+ *
+ * `fs.realpathSync` normalizes `..` LEXICALLY before traversing links, and
+ * `realpath(3)` applies it to wherever the traversal has actually arrived. With
+ * one `..` after a symlink the two disagree, and the kernel sides with
+ * `realpath(3)` — so the JS answer names a directory the sandbox would deny while
+ * `open(2)` goes somewhere else entirely. Measured on macOS 26:
+ *
+ *     hop           -> /w/target/deep
+ *     memory/private -> ../hop/../secret
+ *
+ *     fs.realpathSync        → /w/secret          (denied, and irrelevant)
+ *     fs.realpathSync.native → /w/target/secret   (what cat actually opens)
+ *
+ * The shorter demonstration of the same disagreement: `realpathSync("/tmp/..")`
+ * is `/`, `realpathSync.native("/tmp/..")` is `/private`.
+ *
+ * So the boundary is computed with the kernel's own resolver, everywhere. A deny
+ * predicate that resolves paths differently from the thing doing the opening is
+ * not a deny predicate.
+ */
+function realpathNative(p: string): string {
+  return realpathSync.native(p);
+}
+
+/** Does the spelled path contain a `..` segment? Such a path is refused outright
+ *  rather than resolved: the ancestor walk below is lexical (`dirname`), so a
+ *  `..` in a part of the path that does NOT exist yet would be folded by the
+ *  wrong rules — the same disagreement as above, reintroduced one level up.
+ *  Nothing in the harness spells `PRIVATE_MEMORY_DIR` with `..`, so refusing
+ *  costs nothing and removes the class. */
+function hasDotDotSegment(p: string): boolean {
+  return p.split(sep).includes("..");
+}
+
+/**
  * The private dir as the KERNEL will see it, or `null` when that cannot be
  * established — in which case the caller must withhold the shell.
  *
@@ -163,11 +208,12 @@ function isSymlink(p: string): boolean {
  * `EACCES`, or running out of path to walk.
  */
 export function resolvedDenyDir(privateDir: string): string | null {
+  if (hasDotDotSegment(privateDir)) return null;
   const tail: string[] = [];
   let cur = privateDir;
   for (;;) {
     try {
-      return join(realpathSync(cur), ...tail);
+      return join(realpathNative(cur), ...tail);
     } catch (err) {
       // A link whose target cannot be resolved names a place we cannot deny.
       if (isSymlink(cur)) return null;
@@ -178,6 +224,74 @@ export function resolvedDenyDir(privateDir: string): string | null {
       cur = parent;
     }
   }
+}
+
+/**
+ * A `PreToolUse` hook that is NOT ours and could rewrite the sandbox away, named
+ * for the log — or `null` when there is none.
+ *
+ * WHY THIS EXISTS. Registering our rewrite last in the hook array is not enough.
+ * The CLI merges every PreToolUse producer's result and takes the last
+ * `updatedInput` it sees; the hooks do not run strictly in array order, so a
+ * foreign hook that returns `updatedInput` — even just echoing `tool_input`
+ * back — can land after ours and restore the UNSANDBOXED command. Project
+ * settings and plugins both contribute PreToolUse hooks through the CLI's own
+ * merge, which our `mergeHooks` never sees.
+ *
+ * So on a barred turn, the presence of any foreign PreToolUse hook withholds the
+ * shell. This is the fail-closed reading of a boundary we cannot hold: we cannot
+ * prove a hook we did not write will not rewrite a Bash command, so we do not
+ * run one.
+ *
+ * DELIBERATELY COARSE, on two counts:
+ *
+ *  - Any `PreToolUse` entry counts, not only one whose `matcher` mentions Bash.
+ *    A matcher is a pattern, and deciding which patterns match "Bash" means
+ *    reimplementing the CLI's matching — the same class of mistake as filtering
+ *    command text. An empty or absent matcher already means "every tool".
+ *  - A plugin that ships a `hooks/` directory at all counts, without reading
+ *    what is in it.
+ *
+ *  An unreadable or unparseable settings file counts too: absence of a hook has
+ *  to be established, not assumed.
+ *
+ * RE-READ ON EVERY CALL, never memoized. The sandboxed shell runs under
+ * `(allow default)` and can therefore WRITE `.claude/settings.json` or drop a
+ * `hooks/` directory into a plugin. Caching this answer would mean command 1
+ * installs a racing hook and command 2 is still told there is none; re-reading
+ * means command 2 is withheld instead. The files are small and this runs once
+ * per Bash call on a barred turn only.
+ */
+export function foreignPreToolUseHookSource(scan: {
+  settingsFiles: readonly string[];
+  pluginDirs: readonly string[];
+}): string | null {
+  for (const file of scan.settingsFiles) {
+    if (!existsSync(file)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(file, "utf8"));
+    } catch {
+      return `${file} (unreadable, so its hooks cannot be ruled out)`;
+    }
+    const hooks = (parsed as { hooks?: Record<string, unknown> } | null)?.hooks;
+    const pre = hooks?.PreToolUse;
+    if (Array.isArray(pre) ? pre.length > 0 : pre !== undefined) {
+      return `${file} (hooks.PreToolUse)`;
+    }
+  }
+  for (const dir of scan.pluginDirs) {
+    if (existsSync(join(dir, "hooks"))) return `${dir}/hooks`;
+    const manifest = join(dir, ".claude-plugin", "plugin.json");
+    if (!existsSync(manifest)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(manifest, "utf8")) as { hooks?: unknown } | null;
+      if (parsed?.hooks !== undefined) return `${manifest} (hooks)`;
+    } catch {
+      return `${manifest} (unreadable, so its hooks cannot be ruled out)`;
+    }
+  }
+  return null;
 }
 
 /** One warning line per process for the fail-closed path, not one per call — a
@@ -220,9 +334,18 @@ export function resetBashSandboxForTests(): void {
 export function sandboxedBashCommand(
   command: string,
   privateDir: string = PRIVATE_MEMORY_DIR,
+  scan?: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
 ): string | null {
   if (!existsSync(SANDBOX_EXEC_PATH)) return warnOnce("sandbox-exec is not present on this host");
   if (!existsSync(SANDBOX_SHELL_PATH)) return warnOnce(`${SANDBOX_SHELL_PATH} is not present on this host`);
+
+  // A foreign PreToolUse hook can overwrite our rewrite — see
+  // `foreignPreToolUseHookSource`. Checked before the wrap is built, because the
+  // answer is "no shell", not "a different shell".
+  const foreign = scan ? foreignPreToolUseHookSource(scan) : null;
+  if (foreign) {
+    return warnOnce(`a foreign PreToolUse hook could rewrite the sandbox away: ${foreign}`);
+  }
 
   const denyDir = resolvedDenyDir(privateDir);
   if (denyDir === null) {

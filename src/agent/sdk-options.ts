@@ -9,6 +9,7 @@ import { litellmRoutesModel } from "../litellm.js";
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
 import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
+import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -216,7 +217,7 @@ export function sdkOptions(
     skills: "all" as const,
     ...(plugins.length > 0 ? { plugins } : {}),
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
-    settingSources: ["project"] as ("project")[],
+    settingSources: [...SDK_SETTING_SOURCES],
     settings: {
       attribution: {
         commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
@@ -239,6 +240,10 @@ export function sdkOptions(
       privateMemoryBar,
       agentProfile,
       undeliveredReply: sessionContext?.undeliveredReply,
+      // Resolved at spawn (above) and handed to the guard as a getter, so the
+      // barred-turn Bash arm can spot a plugin that ships PreToolUse hooks
+      // without re-resolving install paths on every tool call.
+      pluginDirs: () => plugins.map((entry) => entry.path),
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -364,6 +369,10 @@ export function buildHooksOption(args: {
   /** Per-call profile lookup by SDK `agent_type`. Undefined ⇒ the guard is not
    *  installed. */
   agentProfile?: (agentType: string) => AgentProfile | undefined;
+  /** Directories of the plugins mounted on this session. The private-memory
+   *  guard scans them for PreToolUse hooks that could overwrite its Bash
+   *  rewrite. */
+  pluginDirs?: () => readonly string[];
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
@@ -387,7 +396,7 @@ export function buildHooksOption(args: {
   // insurance against the day a hook registered after it starts rewriting input
   // and silently drops the sandbox wrap, which fails OPEN.
   if (args.privateMemoryBar) {
-    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
+    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar, args.pluginDirs));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

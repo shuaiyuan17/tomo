@@ -24,11 +24,15 @@ const PERIOD_HINT: Record<BlockLevel, string> = {
  * `lcm_rollup` — the `tomo lcm <level>` command as a tool, for sessions that
  * have no shell.
  *
- * Why it exists: a turn barred from `memory/private/` has no Bash at all
- * (permissions.ts — a shell cannot be scoped away from a directory), and
- * group sessions are barred for their whole life. The rollup nudge kept
+ * Why it exists: a turn barred from `memory/private/` used to have no Bash at
+ * all, and group sessions are barred for their whole life. The rollup nudge kept
  * arriving in those sessions anyway, asking for a CLI command they could not
- * run, and the periods piled up. This is the same compaction, in-process:
+ * run, and the periods piled up. A barred turn now DOES get a shell — wrapped in
+ * a `sandbox-exec` profile that makes the private dir unreadable in the kernel
+ * (`agent/bash-sandbox.ts`) — so `tomo lcm <level>` is reachable again, but this
+ * tool stays: it is the path that still works when the sandbox cannot be set up
+ * (the fallback is withholding Bash, not an unsandboxed shell), and it needs no
+ * shell to begin with. This is the same compaction, in-process:
  * it resolves the block range, writes the summary block and archives the
  * source events exactly as the CLI does, and leaves the same trigger file
  * the CLI leaves, so the live session reloads on the same path afterwards.
@@ -40,7 +44,7 @@ export function buildLcmTools(deps: LcmToolDeps) {
       [
         "Roll a completed period of this session's history up into one summary block (the `tomo lcm <level>` command, without a shell).",
         "",
-        "Use it when an lcm-rollup nudge arrives and Bash is unavailable (group sessions, private-memory-barred turns). Same effect as the CLI:",
+        "Use it when an lcm-rollup nudge arrives and you would rather not shell out, or Bash is unavailable. Same effect as the CLI:",
         "the period's events are replaced by your summary, the originals are archived, and the live session reloads after this turn.",
         "",
         "Pass the level and period named in the nudge, and the summary text you would have passed to `--summary`.",

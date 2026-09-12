@@ -97,6 +97,8 @@ During `tomo init`, you choose a name, your preferred name, and a tone (chill / 
 
 File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` index is injected into every conversation. Tomo reads and writes memory files autonomously — it remembers who you are, your preferences, and past context across sessions.
 
+Files under `memory/private/` are **DM-only**: they are stripped from the index a group session sees, and a `PreToolUse` guard blocks them from `Read`/`Grep`/`Glob` and from `MEDIA:` attachments for any turn a group is steering — a group session for its whole life, and your own DM session for the duration of a `/summon`. On those turns Bash still works, but every command is run through a macOS `sandbox-exec` profile that denies `memory/private/` at the kernel level, so a path assembled inside `python3 -c` fails with `EPERM` instead of succeeding the way it would against a filter over command text. If that sandbox cannot be set up (no `sandbox-exec`, unwritable profile), the Bash tool is withheld for the turn rather than run unsandboxed.
+
 Beyond memory files, the `recall_conversation` tool lets Tomo search a session's full message history — including everything compacted out of its context window or archived to monthly transcript files.
 
 ### People Registry
@@ -259,6 +261,7 @@ Structured logs via [pino](https://github.com/pinojs/pino):
     secrets/                  # Harness-managed credentials (e.g. MCP OAuth tokens, mode 0600)
     .claude/skills/           # Agent skills
   data/
+    bash-sandbox.sb           # sandbox-exec profile fencing memory/private/ off from Bash
     cron/jobs.json            # Scheduled tasks
     sessions/                 # Transcript logs and session registry
     pet.json                  # Virtual pet state

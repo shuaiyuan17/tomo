@@ -751,10 +751,12 @@ export class Agent {
    * system prompt for a dm: session is built once per live session and
    * already carries private people names. The PreToolUse private-memory guard
    * now DOES cover a summoned turn (see `agent/permissions.ts`, gated on
-   * `isOwnAudienceTurn`), so Read/Grep/Bash over memory/private are blocked
-   * too — but the norm is still the right thing to state, since it also covers
-   * what the model already has in context. "Off limits, by any route" is both
-   * the instruction we want and the honest description.
+   * `isOwnAudienceTurn`), so Read/Grep over memory/private are blocked by path
+   * and Bash runs inside a `sandbox-exec` profile that denies the directory in
+   * the kernel (`agent/bash-sandbox.ts`) — but the norm is still the right thing
+   * to state, since it also covers what the model already has in context. "Off
+   * limits, by any route" is both the instruction we want and the honest
+   * description.
    */
   private summonReminder(targets: string[]): string {
     const list = targets.map((t) => `"${t}"`).join(", ");

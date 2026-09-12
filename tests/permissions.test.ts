@@ -26,6 +26,17 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// The `sandbox-exec` wrap is stubbed and driven by hand. This file is about
+// WHICH turns the hook rewrites and what it hands back, and whether the host
+// running the suite happens to have `sandbox-exec` must not decide the answer —
+// `tests/bash-sandbox.test.ts` exercises the real wrap, kernel included.
+// `wrap` returning null is the fail-closed path: every reason the sandbox can be
+// unavailable arrives at the hook as exactly that.
+const sandbox = { wrap: (cmd: string): string | null => `SANDBOXED:${cmd}` };
+vi.mock("../src/agent/bash-sandbox.js", () => ({
+  sandboxedBashCommand: (cmd: string) => sandbox.wrap(cmd),
+}));
+
 const { log } = await import("../src/logger.js");
 const {
   agentProfileDenial,
@@ -286,7 +297,12 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
 // ---------------------------------------------------------------------------
 
 type PreToolUseResult = {
-  hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+  hookSpecificOutput?: {
+    hookEventName?: string;
+    permissionDecision?: string;
+    permissionDecisionReason?: string;
+    updatedInput?: Record<string, unknown>;
+  };
 };
 type PreToolUseHook = (input: { tool_name: string; tool_input: unknown }) => Promise<PreToolUseResult>;
 
@@ -319,12 +335,18 @@ function decision(result: PreToolUseResult): string | undefined {
   return result.hookSpecificOutput?.permissionDecision;
 }
 
+/** Put the sandbox stub back to "available" — the fail-closed tests set it to
+ *  null and nothing else should inherit that. */
+beforeEach(() => {
+  sandbox.wrap = (cmd: string) => `SANDBOXED:${cmd}`;
+});
+
 describe("privateMemoryGuardHooks", () => {
   it("denies private-memory access on a summoned turn, naming the summon", async () => {
     const hook = hookFor(() => "summoned-turn");
 
-    // Bash is no longer in this list: on a barred turn it is denied outright,
-    // with its own reason. See the describe below.
+    // Bash is not in this list: on a barred turn it is REWRITTEN to run
+    // sandboxed rather than denied. See the describe below.
     for (const call of [PRIVATE_READ, PRIVATE_GLOB]) {
       const result = await hook(call);
       expect(decision(result), call.tool_name).toBe("deny");
@@ -372,28 +394,42 @@ describe("privateMemoryGuardHooks", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The shell is withheld WHOLE on a barred turn. `bashTouchesMemory` is a token
-// scan over text the model chose, and an interpreter's argument is a program:
-// no spelling rule decides what it will read. So the decision moved off the
-// command and onto the turn.
+// The shell is SANDBOXED on a barred turn, and withheld only when it cannot be.
+//
+// `bashTouchesMemory` is a token scan over text the model chose, and an
+// interpreter's argument is a program: no spelling rule decides what it will
+// read. That was always true, and the old conclusion — take the tool away —
+// answered it at the wrong layer. The command now runs inside a `sandbox-exec`
+// profile that denies the private dir in the kernel, handed back through the
+// hook's `updatedInput`, so these tests assert a REWRITE where they used to
+// assert a denial. The denial text survives for the fail-closed path only.
 // ---------------------------------------------------------------------------
+
+/** The rewritten command the hook handed back, or undefined if it did not
+ *  rewrite. */
+function rewritten(result: PreToolUseResult): unknown {
+  return result.hookSpecificOutput?.updatedInput?.command;
+}
 
 describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
   for (const bar of ["group-session", "summoned-turn"] as const) {
     describe(bar, () => {
-      it("denies an innocuous command that names no path at all", async () => {
+      it("rewrites an innocuous command to run sandboxed instead of denying it", async () => {
         const result = await hookFor(() => bar)(INNOCUOUS_BASH);
-        expect(decision(result)).toBe("deny");
-        expect(result.hookSpecificOutput?.permissionDecisionReason)
-          .toBe(privateMemoryBashDenial(bar));
+        expect(rewritten(result)).toBe("SANDBOXED:ls -la /tmp");
+        // No permissionDecision: a bare rewrite must not approve the call, or it
+        // would suppress the other PreToolUse guards sharing this event.
+        expect(decision(result)).toBeUndefined();
+        expect(result.hookSpecificOutput?.hookEventName).toBe("PreToolUse");
       });
 
-      it("denies the node -e concatenation bypass", async () => {
+      it("sandboxes the node -e concatenation bypass rather than reading its text", async () => {
         const result = await hookFor(() => bar)(NODE_E_BYPASS);
-        expect(decision(result)).toBe("deny");
+        expect(rewritten(result)).toBe(`SANDBOXED:${NODE_E_BYPASS.tool_input.command}`);
+        expect(decision(result)).toBeUndefined();
       });
 
-      it("denies every other interpreter shape the token scan cannot see", async () => {
+      it("sandboxes every other interpreter shape the token scan cannot see", async () => {
         const hook = hookFor(() => bar);
         for (const command of [
           `python3 -c "print(open(chr(109)+'emory/pri'+'vate/x').read())"`,
@@ -401,24 +437,64 @@ describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
           "bash ./helper.sh",
           "./written-on-an-earlier-turn.sh",
           "cat notes.txt",
+          "cat memory/private/x",
         ]) {
-          expect(decision(await hook({ tool_name: "Bash", tool_input: { command } })), command)
-            .toBe("deny");
+          const result = await hook({ tool_name: "Bash", tool_input: { command } });
+          expect(rewritten(result), command).toBe(`SANDBOXED:${command}`);
         }
       });
 
-      it("says why the shell is gone AND why this turn is barred", async () => {
-        const reason = (await hookFor(() => bar)(INNOCUOUS_BASH))
-          .hookSpecificOutput?.permissionDecisionReason ?? "";
-        expect(reason).toContain("The Bash tool is not available on this turn");
-        expect(reason).toContain(
-          bar === "group-session" ? "not accessible from group sessions" : "summoned turn",
-        );
+      it("carries the rest of the tool input through the rewrite", async () => {
+        // The CLI validates `updatedInput` against the tool's whole schema and
+        // drops a rewrite that fails it, so returning `{ command }` alone would
+        // quietly lose whatever else the model set.
+        const result = await hookFor(() => bar)({
+          tool_name: "Bash",
+          tool_input: { command: "ls", description: "list", timeout: 5000, run_in_background: true },
+        });
+        expect(result.hookSpecificOutput?.updatedInput).toEqual({
+          command: "SANDBOXED:ls",
+          description: "list",
+          timeout: 5000,
+          run_in_background: true,
+        });
+      });
+
+      describe("fail closed", () => {
+        it("withholds the shell when the sandbox is unavailable", async () => {
+          sandbox.wrap = () => null;
+          const result = await hookFor(() => bar)(INNOCUOUS_BASH);
+          expect(decision(result)).toBe("deny");
+          expect(result.hookSpecificOutput?.permissionDecisionReason)
+            .toBe(privateMemoryBashDenial(bar));
+          expect(rewritten(result)).toBeUndefined();
+        });
+
+        it("withholds the shell for a tool input it does not recognise", async () => {
+          // A shape this code cannot read is a shape it cannot prove it has
+          // sandboxed, so it does not hand it through.
+          const hook = hookFor(() => bar);
+          for (const tool_input of [{ command: 42 }, {}, null, "ls"]) {
+            expect(decision(await hook({ tool_name: "Bash", tool_input })), String(tool_input))
+              .toBe("deny");
+          }
+        });
+
+        it("says the sandbox could not be set up AND why this turn is barred", async () => {
+          sandbox.wrap = () => null;
+          const reason = (await hookFor(() => bar)(INNOCUOUS_BASH))
+            .hookSpecificOutput?.permissionDecisionReason ?? "";
+          expect(reason).toContain("The Bash tool is not available on this turn");
+          expect(reason).toContain("that sandbox could not be set up on this host");
+          expect(reason).toContain(
+            bar === "group-session" ? "not accessible from group sessions" : "summoned turn",
+          );
+        });
       });
     });
   }
 
-  it("leaves Bash alone on an unbarred turn", async () => {
+  it("leaves Bash untouched on an unbarred turn", async () => {
     const hook = hookFor(() => null);
     for (const call of [INNOCUOUS_BASH, NODE_E_BYPASS, PRIVATE_CAT]) {
       expect(await hook(call), String(call.tool_input.command)).toEqual({});

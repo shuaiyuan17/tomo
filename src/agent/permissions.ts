@@ -372,7 +372,11 @@ export function privateMemoryGuardHooks(
  */
 export function sandboxedBashInput(
   toolInput: unknown,
-  scan?: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
+  // Required, not optional: this is the production entry point, and the
+  // foreign-hook scan is a security check. An optional parameter would let a
+  // refactor drop the scan and leave the suite green; a required one makes
+  // that a type error.
+  scan: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
 ): Record<string, unknown> | null {
   if (!toolInput || typeof toolInput !== "object") return null;
   const ti = toolInput as Record<string, unknown>;

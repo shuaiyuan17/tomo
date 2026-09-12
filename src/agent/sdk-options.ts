@@ -352,7 +352,8 @@ function buildSdkEnv(args: {
  *  BOTH PreToolUse producers land in the same event array, which is exactly the
  *  case `mergeHooks` exists for — the old `Object.assign` would have dropped
  *  the private-memory bar the moment this second one was added. Exported so a
- *  test can assert both entries are present. */
+ *  test can assert both entries are present, and that the private-memory guard
+ *  is the LAST of them (see the comment at its registration). */
 export function buildHooksOption(args: {
   turnBudget?: TurnBudget;
   maxTurns: number;
@@ -374,11 +375,19 @@ export function buildHooksOption(args: {
   if (args.undeliveredReply) {
     mergeHooks(hooks, undeliveredReplyHooks(args.undeliveredReply, args.sessionKey));
   }
-  if (args.privateMemoryBar) {
-    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
-  }
   if (args.agentProfile) {
     mergeHooks(hooks, agentProfileGuardHooks(args.sessionKey, args.agentProfile));
+  }
+  // THE PRIVATE-MEMORY GUARD GOES LAST, and the order is load-bearing now that it
+  // returns `updatedInput` (the `sandbox-exec` rewrite, see permissions.ts).
+  // When two PreToolUse hooks both return `updatedInput` the CLI takes the LAST
+  // one and says nothing — verified against the SDK. Deny precedence is
+  // unaffected either way (a `deny` from any hook wins, whatever the order), so
+  // this costs nothing today: `agentProfileGuardHooks` only ever denies. It is
+  // insurance against the day a hook registered after it starts rewriting input
+  // and silently drops the sandbox wrap, which fails OPEN.
+  if (args.privateMemoryBar) {
+    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

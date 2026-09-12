@@ -4,10 +4,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
-  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -41,12 +40,6 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-/** Real directory for the profile file, so the 0600 mode and the written text
- *  can be asserted rather than assumed. `realpathSync` because macOS makes
- *  `/tmp` a symlink to `/private/tmp`, and this suite is partly ABOUT that. */
-const TOMO_HOME = realpathSync(mkdtempSync(join(tmpdir(), "tomo-sbx-home-")));
-
-vi.mock("../src/config.js", () => ({ config: { workspaceDir: "/ws", tomoHome: TOMO_HOME } }));
 vi.mock("../src/workspace/index.js", () => ({
   MEMORY_DIR: "/ws/memory",
   PRIVATE_MEMORY_DIR: "/ws/memory/private",
@@ -60,7 +53,6 @@ const { log } = await import("../src/logger.js");
 const {
   SANDBOX_EXEC_PATH,
   SANDBOX_SHELL_PATH,
-  ensureSandboxProfile,
   resetBashSandboxForTests,
   resolvedDenyDir,
   sandboxProfileText,
@@ -69,7 +61,7 @@ const {
   wrapWithSandbox,
 } = await import("../src/agent/bash-sandbox.js");
 
-const scratch: string[] = [TOMO_HOME];
+const scratch: string[] = [];
 function scratchDir(prefix: string): string {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   scratch.push(dir);
@@ -91,31 +83,51 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
-  const PROFILE = "/tomo/data/bash-sandbox.sb";
+  // A stand-in for the real profile: short, and it still carries the newlines
+  // and double quotes that make the inline form worth testing.
+  const PROFILE = `(version 1)\n(deny file-read* (subpath "/ws/p"))\n`;
+  const QUOTED = `'(version 1)\n(deny file-read* (subpath "/ws/p"))\n'`;
 
-  it("wraps a simple command", () => {
-    expect(wrapWithSandbox("ls -la /tmp", PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -f '/tomo/data/bash-sandbox.sb' /bin/zsh -lc 'ls -la /tmp'`,
-    );
+  it("passes the profile INLINE with -p, so there is no file to tamper with", () => {
+    // The bypass this replaces: the profile used to be a FILE, sitting outside
+    // the deny set, owned by the same uid, under `(allow default)`. One
+    // `echo > …/bash-sandbox.sb` from the sandboxed shell and the next command
+    // of the same turn ran unsandboxed. `-p` puts the policy in this process's
+    // argv, where the sandboxed command cannot reach it at all.
+    const wrapped = wrapWithSandbox("ls -la /tmp", PROFILE);
+    expect(wrapped).toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'ls -la /tmp'`);
+    expect(wrapped).not.toContain("-f ");
+    expect(wrapped).not.toContain(".sb");
+  });
+
+  it("ends zsh's option list with -- so a dash-leading command still runs", () => {
+    // Without it, `zsh -lc '-n …'` is `zsh: bad option string` and the command
+    // never runs at all — zsh reads the leading dash as one of its own flags.
+    expect(wrapWithSandbox("-n true || echo fell-through", PROFILE))
+      .toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- '-n true || echo fell-through'`);
   });
 
   it("escapes single quotes by closing, quoting and reopening", () => {
     // `'` → `'\''`: the only character a single-quoted shell word cannot hold.
     expect(wrapWithSandbox(`echo 'hi there'`, PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -f '/tomo/data/bash-sandbox.sb' /bin/zsh -lc 'echo '\\''hi there'\\'''`,
+      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'echo '\\''hi there'\\'''`,
     );
   });
 
   it("carries a multi-line heredoc through unchanged", () => {
     const heredoc = ["cat <<'EOF'", "line one with 'quotes'", "  line two", "EOF"].join("\n");
     expect(wrapWithSandbox(heredoc, PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -f '/tomo/data/bash-sandbox.sb' /bin/zsh -lc `
+      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- `
       + `'cat <<'\\''EOF'\\''\nline one with '\\''quotes'\\''\n  line two\nEOF'`,
     );
   });
 
-  it("quotes a profile path containing a space", () => {
-    expect(wrapWithSandbox("true", "/Users/a b/data/p.sb")).toContain(`-f '/Users/a b/data/p.sb'`);
+  it("single-quotes the profile so its newlines survive as one shell word", () => {
+    // The rewrite is handed back as a command LINE, not an argv, so the whole
+    // multi-line profile has to reach the outer shell as a single word.
+    const wrapped = wrapWithSandbox("true", sandboxProfileText("/ws/memory/private"));
+    expect(wrapped).toContain(`-p '(version 1)\n(allow default)\n`);
+    expect(wrapped.split(`' ${SANDBOX_SHELL_PATH} `)).toHaveLength(2);
   });
 
   it("leaves $, backticks and backslashes for the inner shell, not the outer one", () => {
@@ -185,37 +197,30 @@ describe("resolvedDenyDir", () => {
     expect(resolvedDenyDir(join(root, "link", "memory", "private")))
       .toBe(join(root, "real", "memory", "private"));
   });
-});
 
-// ---------------------------------------------------------------------------
-// Profile file management
-// ---------------------------------------------------------------------------
-
-describe("ensureSandboxProfile", () => {
-  it("writes the profile under the tomo data dir, mode 0600", () => {
-    const dir = scratchDir("tomo-sbx-priv-");
-    const path = ensureSandboxProfile(dir);
-    expect(path).toBe(join(TOMO_HOME, "data", "bash-sandbox.sb"));
-    expect(readFileSync(path!, "utf8")).toBe(sandboxProfileText(dir));
-    expect(statSync(path!).mode & 0o777).toBe(0o600);
+  // THE FAIL-OPEN THIS CLOSES. A dangling symlink at `memory/private` used to be
+  // swallowed by the ancestor walk: the link resolved to nothing, the walk
+  // returned the LINK's own path, the profile denied a path no read would ever go
+  // through, and the target the files would land in was never denied at all — a
+  // background command spawned by the turn could just wait for it to appear.
+  it("fails closed when the private path is a symlink whose target does not exist", () => {
+    const root = scratchDir("tomo-sbx-dangling-");
+    symlinkSync(join(root, "nowhere"), join(root, "private"));
+    expect(resolvedDenyDir(join(root, "private"))).toBeNull();
   });
 
-  it("writes once per process for an unchanged deny dir", () => {
-    const dir = scratchDir("tomo-sbx-once-");
-    expect(ensureSandboxProfile(dir)).not.toBeNull();
-    expect(ensureSandboxProfile(dir)).not.toBeNull();
-    expect(ensureSandboxProfile(dir)).not.toBeNull();
-    expect(vi.mocked(log.info).mock.calls).toHaveLength(1);
+  it("fails closed on a symlink loop rather than walking up past it", () => {
+    const root = scratchDir("tomo-sbx-loop-");
+    symlinkSync(join(root, "b"), join(root, "a"));
+    symlinkSync(join(root, "a"), join(root, "b"));
+    expect(resolvedDenyDir(join(root, "a"))).toBeNull();
   });
 
-  it("regenerates when the private dir changes", () => {
-    const first = scratchDir("tomo-sbx-a-");
-    const second = scratchDir("tomo-sbx-b-");
-    const path = ensureSandboxProfile(first)!;
-    expect(readFileSync(path, "utf8")).toContain(first);
-    ensureSandboxProfile(second);
-    expect(readFileSync(path, "utf8")).toContain(second);
-    expect(readFileSync(path, "utf8")).not.toContain(first);
+  it("still resolves a symlink that points somewhere real", () => {
+    const root = scratchDir("tomo-sbx-livelink-");
+    mkdirSync(join(root, "target"), { recursive: true });
+    symlinkSync(join(root, "target"), join(root, "private"));
+    expect(resolvedDenyDir(join(root, "private"))).toBe(join(root, "target"));
   });
 });
 
@@ -234,16 +239,15 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-nosh-"))).toBeNull();
   });
 
-  it("returns null when the profile cannot be written", () => {
-    const blocked = join(TOMO_HOME, "data");
-    rmSync(blocked, { recursive: true, force: true });
-    // A FILE where the data directory should be: mkdirSync fails with EEXIST.
-    writeFileSync(blocked, "not a directory");
-    try {
-      expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-nowrite-"))).toBeNull();
-    } finally {
-      rmSync(blocked, { force: true });
-    }
+  it("returns null when the deny dir cannot be resolved", () => {
+    // Same dangling-symlink case, now at the level the guard actually calls:
+    // an unresolvable scope must withhold the shell, not sandbox it loosely.
+    const root = scratchDir("tomo-sbx-unresolvable-");
+    symlinkSync(join(root, "nowhere"), join(root, "private"));
+    expect(sandboxedBashCommand("ls", join(root, "private"))).toBeNull();
+    expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
+      reason: expect.stringContaining("cannot resolve the real path"),
+    });
   });
 
   it("logs the fallback exactly once, however many commands are refused", () => {
@@ -254,11 +258,26 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     expect(vi.mocked(log.warn).mock.calls[0][1]).toContain("withholding the shell instead");
   });
 
-  it("wraps when the sandbox is available", () => {
+  it("wraps when the sandbox is available, with the profile inline", () => {
     if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
     const dir = scratchDir("tomo-sbx-ok-");
-    const wrapped = sandboxedBashCommand("echo hi", dir);
-    expect(wrapped).toBe(wrapWithSandbox("echo hi", ensureSandboxProfile(dir)!));
+    expect(sandboxedBashCommand("echo hi", dir))
+      .toBe(wrapWithSandbox("echo hi", sandboxProfileText(dir)));
+  });
+
+  it("puts the whole policy in the command, and nothing on disk", () => {
+    if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
+    const dir = scratchDir("tomo-sbx-nofile-");
+    const wrapped = sandboxedBashCommand("echo hi", dir)!;
+    // Every deny clause travels in the argv, so there is no second place the
+    // policy could be read from — and therefore none to overwrite.
+    for (const clause of ["(allow default)", `(deny file-read* (subpath "${dir}"))`]) {
+      expect(wrapped).toContain(clause);
+    }
+    expect(wrapped).not.toContain(".sb");
+    // The file version logged once on write; nothing is written now.
+    expect(vi.mocked(log.info)).not.toHaveBeenCalled();
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
 
@@ -365,5 +384,56 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     const r = runSandboxed(`git --version && echo ok > /dev/null && echo fine`, priv);
     expect(r.code).toBe(0);
     expect(r.out).toContain("fine");
+  });
+
+  it("runs a command whose first word starts with a dash", () => {
+    // Without `--` the inner shell never runs this at all: `zsh: bad option
+    // string`. With it, the dash-leading word is the script's first command, so
+    // the `||` branch is reached and the turn is not silently broken.
+    const { priv } = workspace();
+    const r = runSandboxed("-n true || echo fell-through", priv);
+    expect(r.out).toContain("fell-through");
+    expect(r.out).not.toContain("bad option string");
+  });
+
+  // THE PROFILE-FILE BYPASS, AS AN END-TO-END CHECK.
+  //
+  // The earlier version wrote the profile to `<tomoHome>/data/bash-sandbox.sb`
+  // and memoized the path for the life of the process. That file was outside the
+  // deny set, owned by the same uid, writable under `(allow default)` — so
+  // command 1 could overwrite it with `(allow default)` and command 2, reusing
+  // the memo, ran with the policy the MODEL had written. `rm -f` on it was a
+  // denial of service by the same route. Each call now carries its own policy in
+  // argv, so a command that writes a permissive profile anywhere has written a
+  // file nothing reads.
+  it("cannot be escaped by writing a permissive profile to disk first", () => {
+    const { priv, dir } = workspace();
+    const oldPath = join(dir, "bash-sandbox.sb");
+    const permissive = "(version 1)\\n(allow default)\\n";
+
+    // Command 1: plant permissive profiles at the old path and at a path of the
+    // command's own choosing, and confirm the writes actually landed.
+    const planted = runSandboxed(
+      `printf '${permissive}' > ${oldPath}; printf '${permissive}' > ${join(dir, "mine.sb")}; echo planted`,
+      priv,
+    );
+    expect(planted.out).toContain("planted");
+    expect(existsSync(oldPath)).toBe(true);
+
+    // Command 2, same process, same private dir: still denied.
+    const after = runSandboxed(`cat ${join(priv, "note.txt")}`, priv);
+    expect(after.code).not.toBe(0);
+    expect(after.out).toMatch(/Operation not permitted/);
+    expect(after.out).not.toContain("SECRET");
+  });
+
+  it("cannot be denied service by deleting the profile the old version cached", () => {
+    // `rm -f <profile>` used to make every later call exit 65 — sandbox-exec
+    // could not open the file the memo still pointed at.
+    const { priv, dir } = workspace();
+    runSandboxed(`rm -f ${join(dir, "bash-sandbox.sb")}; echo removed`, priv);
+    const after = runSandboxed("echo still-working", priv);
+    expect(after.code).toBe(0);
+    expect(after.out).toContain("still-working");
   });
 });

@@ -1,6 +1,5 @@
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { config } from "../config.js";
 import { log } from "../logger.js";
 import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
 
@@ -24,6 +23,17 @@ import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
  * `EPERM`, because the check happens at `open(2)` on the resolved path rather
  * than on the string the model typed.
  *
+ * THE PROFILE IS PASSED INLINE (`-p`), NEVER AS A FILE. This is the whole of the
+ * reason: a profile FILE is a file, and the sandboxed shell runs as the same uid
+ * under `(allow default)`. An earlier version wrote the profile once per process
+ * to `<tomoHome>/data/bash-sandbox.sb`, which is outside the deny set, and
+ * trusted the memo on later calls — so three commands in one turn were enough to
+ * walk out: read denied, `echo '(version 1)(allow default)' > …/bash-sandbox.sb`,
+ * read succeeds. `rm -f` on the same path was a denial-of-service with the same
+ * root cause. Re-reading or re-writing the file per call would only narrow the
+ * race; the fix is to have no file at all. `-p` puts the policy in this
+ * process's argv, where the sandboxed command cannot reach it.
+ *
  * DENY SCOPE IS EXACTLY THE PRIVATE DIR — the same boundary the Read/Grep/Glob
  * arms of the guard already enforce, no wider. Both `file-read*` and
  * `file-write*` are denied, which is also what the file-tool arms do (they cover
@@ -32,10 +42,11 @@ import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
  * /tmp/p/note.txt` walks the files OUT of the denied subpath and reads them at a
  * path the profile says nothing about. Verified by running it.
  *
- * FAIL CLOSED. Anything that makes the wrap unavailable — no `sandbox-exec`, no
- * `/bin/zsh`, an unwritable profile path, a non-string command — returns `null`,
- * and the guard falls back to the old behaviour: Bash withheld, with the
- * existing denial text. Never to an unsandboxed shell.
+ * FAIL CLOSED. Anything that makes the wrap unavailable or its scope uncertain —
+ * no `sandbox-exec`, no `/bin/zsh`, a non-string command, a private path whose
+ * real location cannot be established — returns `null`, and the guard falls back
+ * to the old behaviour: Bash withheld, with the existing denial text. Never to
+ * an unsandboxed shell.
  */
 
 /** Absolute by design: a PATH lookup for the thing enforcing the boundary is a
@@ -94,116 +105,113 @@ export function shellSingleQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-/** `command`, rewritten to run under `profilePath`. Pure — the profile file's
- *  existence is the caller's problem, which is what makes this unit-testable. */
-export function wrapWithSandbox(command: string, profilePath: string): string {
+/**
+ * `command`, rewritten to run under `profileText`. Pure, and the profile travels
+ * as an ARGUMENT — there is no file for the sandboxed command to edit.
+ *
+ * `--` before the command is load-bearing. `zsh -lc '-n …'` is
+ * `zsh: bad option string` — zsh reads a leading `-` as its own flag, so any
+ * command whose first word starts with a dash died before it ran (verified).
+ * `--` ends zsh's option list, and everything after it is the script.
+ */
+export function wrapWithSandbox(command: string, profileText: string): string {
   return [
     SANDBOX_EXEC_PATH,
-    "-f",
-    shellSingleQuote(profilePath),
+    "-p",
+    shellSingleQuote(profileText),
     SANDBOX_SHELL_PATH,
     "-lc",
+    "--",
     shellSingleQuote(command),
   ].join(" ");
 }
 
+/** Is `p` itself a symlink? `lstatSync`, so the link is inspected rather than
+ *  followed — a dangling link exists as an entry even though `realpathSync`
+ *  cannot resolve it. A path that cannot be lstat'd at all is not a symlink. */
+function isSymlink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The private dir as the KERNEL will see it.
+ * The private dir as the KERNEL will see it, or `null` when that cannot be
+ * established — in which case the caller must withhold the shell.
  *
  * `realpathSync` because the sandbox matches resolved paths: with a symlinked
  * workspace (`~/.tomo` → somewhere else, or a `/tmp` workspace in a test, where
  * macOS makes `/tmp` a link to `/private/tmp`) a profile naming the spelled path
  * denies a subpath nothing resolves into, and the deny silently covers nothing.
  *
- * The directory need not exist yet — a fresh workspace has no `memory/private/`
+ * The directory need not EXIST yet — a fresh workspace has no `memory/private/`
  * until the first private note is written, and the boundary has to hold before
- * then. So resolve the deepest ancestor that does exist and re-append the tail,
- * walking up until something resolves. Denying a path that does not exist yet is
- * exactly right: it is the path the file will have.
+ * then. So a plain `ENOENT` on a path that is not a symlink walks up to the
+ * deepest existing ancestor, resolves that, and re-appends the tail. Denying a
+ * path that does not exist yet is exactly right: it is the path the file will
+ * have.
+ *
+ * EVERY OTHER FAILURE IS FATAL, and the distinction is the point. A DANGLING
+ * SYMLINK at `memory/private` used to be swallowed by the same walk: the link
+ * resolved to nothing, the ancestor walk returned the link's own path, the
+ * profile denied a path no read would ever go through, and the real target — the
+ * place the files would actually land the moment the link's target appeared —
+ * was never denied. A background command spawned by the turn could simply wait
+ * for it. So a symlink that will not resolve fails closed, as does `ELOOP`,
+ * `EACCES`, or running out of path to walk.
  */
-export function resolvedDenyDir(privateDir: string): string {
+export function resolvedDenyDir(privateDir: string): string | null {
   const tail: string[] = [];
   let cur = privateDir;
   for (;;) {
     try {
       return join(realpathSync(cur), ...tail);
-    } catch {
+    } catch (err) {
+      // A link whose target cannot be resolved names a place we cannot deny.
+      if (isSymlink(cur)) return null;
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
       const parent = dirname(cur);
-      if (parent === cur) return privateDir;
+      if (parent === cur) return null;
       tail.unshift(basename(cur));
       cur = parent;
     }
   }
 }
 
-/** Where the profile is written. `tomoHome` may be absent under a stubbed
- *  config (unit tests), in which case there is no tomo data dir to speak of and
- *  the OS temp dir is the honest answer. */
-function profileDir(): string {
-  const home = (config as { tomoHome?: string }).tomoHome;
-  return home ? join(home, "data") : join(process.env.TMPDIR || "/tmp", "tomo");
-}
-
-/** Written once per process, and again only if the resolved deny dir changes. */
-let cached: { denyDir: string; profilePath: string } | null = null;
 /** One warning line per process for the fail-closed path, not one per call — a
  *  turn that keeps reaching for the shell would otherwise fill the log with the
  *  same sentence. */
 let warned = false;
 
-function warnOnce(reason: string, err?: unknown): null {
+function warnOnce(reason: string): null {
   if (!warned) {
     warned = true;
     log.warn(
-      { err, reason, sandboxExec: SANDBOX_EXEC_PATH },
+      { reason, sandboxExec: SANDBOX_EXEC_PATH },
       "Cannot sandbox Bash for a private-memory-barred turn; withholding the shell instead",
     );
   }
   return null;
 }
 
-/** Forget the memoized profile and the warned-once latch. Tests only — the
- *  module is a process-lifetime singleton by design. */
+/** Forget the warned-once latch. Tests only — it is a process-lifetime latch by
+ *  design. */
 export function resetBashSandboxForTests(): void {
-  cached = null;
   warned = false;
-}
-
-/**
- * Path to a profile file denying the private memory dir, or `null` if one
- * cannot be had (see the fail-closed note in the module header).
- *
- * Mode `0600`: the file names a directory worth hiding, and it is the input to
- * the thing enforcing the boundary — a profile another user could rewrite is
- * not a boundary. Rewritten on every miss rather than trusted if present, so a
- * tampered or truncated file from an earlier process is replaced, not reused.
- */
-export function ensureSandboxProfile(privateDir: string = PRIVATE_MEMORY_DIR): string | null {
-  if (!existsSync(SANDBOX_EXEC_PATH)) return warnOnce("sandbox-exec is not present on this host");
-  if (!existsSync(SANDBOX_SHELL_PATH)) return warnOnce(`${SANDBOX_SHELL_PATH} is not present on this host`);
-
-  const denyDir = resolvedDenyDir(privateDir);
-  if (cached && cached.denyDir === denyDir) return cached.profilePath;
-
-  const dir = profileDir();
-  const profilePath = join(dir, "bash-sandbox.sb");
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(profilePath, sandboxProfileText(denyDir), { encoding: "utf8", mode: 0o600 });
-  } catch (err) {
-    return warnOnce(`could not write the sandbox profile to ${profilePath}`, err);
-  }
-  cached = { denyDir, profilePath };
-  log.info({ profilePath, denyDir }, "Wrote the Bash sandbox profile for private-memory-barred turns");
-  return profilePath;
 }
 
 /**
  * `command` rewritten to run sandboxed, or `null` to fall back to withholding
  * the shell. The one function the PreToolUse guard calls.
  *
+ * Recomputed from scratch on every call. There is nothing worth caching: the
+ * profile text is two string interpolations, and the thing an earlier version
+ * cached — a path to a file on disk — was the bypass.
+ *
  * No "is it already wrapped?" shortcut, on purpose. The model is free to type
- * its own `sandbox-exec -f <permissive profile>` prefix, and a shortcut keyed on
+ * its own `sandbox-exec -p <permissive profile>` prefix, and a shortcut keyed on
  * the text would hand it an unsandboxed shell for the price of a guess. Our wrap
  * always goes on the OUTSIDE, and a nested `sandbox_apply` inside an existing
  * sandbox fails (`sandbox-exec: sandbox_apply: Operation not permitted`) —
@@ -213,11 +221,16 @@ export function sandboxedBashCommand(
   command: string,
   privateDir: string = PRIVATE_MEMORY_DIR,
 ): string | null {
-  const profilePath = ensureSandboxProfile(privateDir);
-  if (!profilePath) return null;
+  if (!existsSync(SANDBOX_EXEC_PATH)) return warnOnce("sandbox-exec is not present on this host");
+  if (!existsSync(SANDBOX_SHELL_PATH)) return warnOnce(`${SANDBOX_SHELL_PATH} is not present on this host`);
+
+  const denyDir = resolvedDenyDir(privateDir);
+  if (denyDir === null) {
+    return warnOnce(`cannot resolve the real path of ${privateDir}, so its subpath cannot be denied`);
+  }
   try {
-    return wrapWithSandbox(command, profilePath);
-  } catch (err) {
-    return warnOnce("could not build the sandboxed command", err);
+    return wrapWithSandbox(command, sandboxProfileText(denyDir));
+  } catch {
+    return warnOnce("could not build the sandboxed command");
   }
 }

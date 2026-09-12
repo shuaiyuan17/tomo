@@ -62,12 +62,20 @@ type PreToolUseResult = {
 };
 type PreToolUseHook = (input: { tool_name: string; tool_input: unknown }) => Promise<PreToolUseResult>;
 
-/** The PreToolUse hook the harness installed on `sessionKey`'s live session. */
+/** The private-memory PreToolUse hook the harness installed on `sessionKey`'s
+ *  live session.
+ *
+ *  The LAST PreToolUse entry, not the first: the guard is registered after
+ *  `agentProfileGuardHooks` on purpose, because the CLI takes the last
+ *  `updatedInput` when two hooks return one and the sandbox rewrite must be the
+ *  one that survives (see `buildHooksOption`). Reading index 0 here would test
+ *  the agent-profile guard and report its silence as the private-memory guard's. */
 function guardHookFor(sessionKey: string): PreToolUseHook {
   const entry = [...mockSdk.optionsBySession].reverse().find((o) => o.sessionKey === sessionKey);
   if (!entry) throw new Error(`no live session was built for ${sessionKey}`);
   const hooks = entry.options.hooks as { PreToolUse?: Array<{ hooks: PreToolUseHook[] }> } | undefined;
-  const pre = hooks?.PreToolUse?.[0]?.hooks?.[0];
+  const entries = hooks?.PreToolUse;
+  const pre = entries?.[entries.length - 1]?.hooks?.[0];
   if (!pre) throw new Error(`no PreToolUse guard installed for ${sessionKey}`);
   return pre;
 }

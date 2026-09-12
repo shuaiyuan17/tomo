@@ -36,7 +36,7 @@ Tomo is a single-user daemon on a machine the user owns. It runs the Claude Agen
 | Boundary | Where |
 |---|---|
 | Per-channel sender allowlists, checked before any attachment is downloaded or any turn runs | `src/router.ts`, channel adapters |
-| Private memory (`memory/private/`) never enters a group flow: excluded from group prompts and tools, file reads denied by hook, Bash denied outright, `MEDIA:` attachments of private paths dropped before send | `src/agent/permissions.ts`, `src/agent/delivery-pipeline.ts` |
+| Private memory (`memory/private/`) never enters a group flow: excluded from group prompts and tools, file reads denied by hook, Bash run under a `sandbox-exec` profile that denies the directory in the kernel (and withheld outright if that sandbox cannot be set up), `MEDIA:` attachments of private paths dropped before send | `src/agent/permissions.ts`, `src/agent/bash-sandbox.ts`, `src/agent/delivery-pipeline.ts` |
 | Per-agent permission scoping (`agentProfiles`): write fences, secret paths, Bash modes, enforced by a `PreToolUse` hook that a bypass-permissions session cannot skip | `src/agent/permissions.ts` |
 | Harness envelopes are injection-escaped so user text cannot forge a `<tomo-event>`; model-authored inbound markers are flagged before delivery | `src/tomo-event.ts`, `src/agent/inbound-markers.ts` |
 | Secrets redacted from logs; config written `0600` | `src/logger.ts`, `src/config.ts` |

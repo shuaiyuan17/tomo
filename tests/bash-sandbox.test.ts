@@ -60,6 +60,8 @@ vi.mock("../src/logger.js", () => ({
 
 const { log } = await import("../src/logger.js");
 const {
+  AGENT_BROWSER_CHROME_FLAGS,
+  AGENT_BROWSER_ENV_INJECT,
   SANDBOX_EXEC_PATH,
   SANDBOX_SHELL_PATH,
   foreignPreToolUseHookSource,
@@ -98,6 +100,12 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
   const PROFILE = `(version 1)\n(deny file-read* (subpath "/ws/p"))\n`;
   const QUOTED = `'(version 1)\n(deny file-read* (subpath "/ws/p"))\n'`;
 
+  /** Build the expected single-quoted command: env inject + semicolon + the
+   *  original command, then single-quote the lot. */
+  function expectedCmd(cmd: string): string {
+    return shellSingleQuote(`${AGENT_BROWSER_ENV_INJECT}; ${cmd}`);
+  }
+
   it("passes the profile INLINE with -p, so there is no file to tamper with", () => {
     // The bypass this replaces: the profile used to be a FILE, sitting outside
     // the deny set, owned by the same uid, under `(allow default)`. One
@@ -105,7 +113,7 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
     // of the same turn ran unsandboxed. `-p` puts the policy in this process's
     // argv, where the sandboxed command cannot reach it at all.
     const wrapped = wrapWithSandbox("ls -la /tmp", PROFILE);
-    expect(wrapped).toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'ls -la /tmp'`);
+    expect(wrapped).toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- ${expectedCmd("ls -la /tmp")}`);
     expect(wrapped).not.toContain("-f ");
     expect(wrapped).not.toContain(".sb");
   });
@@ -113,22 +121,24 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
   it("ends zsh's option list with -- so a dash-leading command still runs", () => {
     // Without it, `zsh -lc '-n …'` is `zsh: bad option string` and the command
     // never runs at all — zsh reads the leading dash as one of its own flags.
+    // The env inject prefix now means the first character is never a dash.
     expect(wrapWithSandbox("-n true || echo fell-through", PROFILE))
-      .toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- '-n true || echo fell-through'`);
+      .toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- ${expectedCmd("-n true || echo fell-through")}`);
   });
 
   it("escapes single quotes by closing, quoting and reopening", () => {
     // `'` → `'\''`: the only character a single-quoted shell word cannot hold.
-    expect(wrapWithSandbox(`echo 'hi there'`, PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'echo '\\''hi there'\\'''`,
+    const wrapped = wrapWithSandbox(`echo 'hi there'`, PROFILE);
+    expect(wrapped).toBe(
+      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- ${expectedCmd("echo 'hi there'")}`,
     );
   });
 
   it("carries a multi-line heredoc through unchanged", () => {
     const heredoc = ["cat <<'EOF'", "line one with 'quotes'", "  line two", "EOF"].join("\n");
-    expect(wrapWithSandbox(heredoc, PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- `
-      + `'cat <<'\\''EOF'\\''\nline one with '\\''quotes'\\''\n  line two\nEOF'`,
+    const wrapped = wrapWithSandbox(heredoc, PROFILE);
+    expect(wrapped).toBe(
+      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- ${expectedCmd(heredoc)}`,
     );
   });
 
@@ -145,6 +155,14 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
     // sees the command byte for byte. A scheme that escaped `$` would change
     // the meaning of the command it is supposed to be transporting.
     expect(shellSingleQuote('echo $HOME `id -u` "a\\b"')).toBe(`'echo $HOME \`id -u\` "a\\b"'`);
+  });
+
+  it("injects AGENT_BROWSER_ARGS so Chrome runs inside sandbox-exec", () => {
+    // Chrome's own sandbox collides with sandbox-exec; the env var tells
+    // agent-browser to launch Chrome with --no-sandbox --disable-gpu.
+    const wrapped = wrapWithSandbox("echo hi", PROFILE);
+    expect(wrapped).toContain("AGENT_BROWSER_ARGS");
+    expect(wrapped).toContain(AGENT_BROWSER_CHROME_FLAGS);
   });
 });
 
@@ -570,6 +588,33 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     );
     expect(r.code).not.toBe(0);
     expect(r.out).not.toContain("SECRET");
+  });
+
+  it("sets AGENT_BROWSER_ARGS inside the sandbox so Chrome can launch", () => {
+    // Chrome's own sandbox conflicts with sandbox-exec; agent-browser reads
+    // AGENT_BROWSER_ARGS for extra launch flags. The wrapper injects
+    // --no-sandbox --disable-gpu so Chrome's internal sandbox is skipped.
+    const { priv } = workspace();
+    const r = runSandboxed("printf '%s' \"$AGENT_BROWSER_ARGS\"", priv);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("--no-sandbox");
+    expect(r.out).toContain("--disable-gpu");
+  });
+
+  it("appends to an existing AGENT_BROWSER_ARGS rather than overwriting", () => {
+    // A caller may already have flags in the env var; the injection must
+    // preserve them and append, not clobber.
+    const { priv } = workspace();
+    const r = runSandboxed(
+      'export AGENT_BROWSER_ARGS="--existing-flag"; '
+      + `${AGENT_BROWSER_ENV_INJECT}; `
+      + 'printf "%s" "$AGENT_BROWSER_ARGS"',
+      priv,
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("--existing-flag");
+    expect(r.out).toContain("--no-sandbox");
+    expect(r.out).toContain("--disable-gpu");
   });
 
   it("leaves the everyday toolchain working — this is one deny, not a jail", () => {

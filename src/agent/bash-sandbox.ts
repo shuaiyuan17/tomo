@@ -58,6 +58,29 @@ import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
  * unsandboxed shell.
  */
 
+/** Chrome launch flags that disable Chrome's own sandbox layers.
+ *
+ *  Chrome ships its own process sandbox (setuid on Linux, seatbelt on macOS).
+ *  Inside the outer `sandbox-exec` wrapper, Chrome's `sandbox_apply` call
+ *  collides with the already-active seatbelt policy and the GPU process exits
+ *  immediately (`exit_code=6`). The kernel sandbox still protects
+ *  `memory/private/`, so disabling Chrome's internal sandbox loses nothing that
+ *  the outer sandbox does not already enforce. `--disable-gpu` prevents the GPU
+ *  process from launching at all, which is the proximate crash site.
+ *
+ *  `agent-browser` reads the `AGENT_BROWSER_ARGS` env var (or `--args` flag)
+ *  for extra Chrome launch arguments. */
+export const AGENT_BROWSER_CHROME_FLAGS = "--no-sandbox --disable-gpu";
+
+/** Shell snippet injected at the start of every sandboxed command.
+ *
+ *  `${VAR:+$VAR }` appends to an existing value rather than overwriting it, so
+ *  flags the caller already placed in the env var survive. The snippet is
+ *  evaluated by the INNER shell (inside the single-quoted command), not by the
+ *  outer shell that launches `sandbox-exec`. */
+export const AGENT_BROWSER_ENV_INJECT =
+  `export AGENT_BROWSER_ARGS="\${AGENT_BROWSER_ARGS:+\$AGENT_BROWSER_ARGS }${AGENT_BROWSER_CHROME_FLAGS}"`;
+
 /** Absolute by design: a PATH lookup for the thing enforcing the boundary is a
  *  way round the boundary. */
 export const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
@@ -131,7 +154,7 @@ export function wrapWithSandbox(command: string, profileText: string): string {
     SANDBOX_SHELL_PATH,
     "-lc",
     "--",
-    shellSingleQuote(command),
+    shellSingleQuote(`${AGENT_BROWSER_ENV_INJECT}; ${command}`),
   ].join(" ");
 }
 

@@ -146,3 +146,28 @@ describe("undelivered-reply nudge", () => {
     expect(second).toEqual({});
   });
 });
+
+describe("buildHooksOption — groupShellAllowlist threaded to the guard", () => {
+  type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<{
+    hookSpecificOutput?: {
+      permissionDecision?: string;
+      updatedInput?: Record<string, unknown>;
+    };
+  }>;
+
+  it("passes the allowlist through to privateMemoryGuardHooks", async () => {
+    const KEY = "imessage:any;+;test";
+    const { hooks } = buildHooksOption({
+      maxTurns: 50,
+      sessionKey: KEY,
+      privateMemoryBar: () => "group-session" as const,
+      groupShellAllowlist: () => [KEY],
+    }) as { hooks: Record<string, Array<{ hooks: Hook[] }>> };
+
+    // The private-memory guard is the last PreToolUse entry.
+    const guard = hooks.PreToolUse[hooks.PreToolUse.length - 1].hooks[0];
+    const result = await guard({ tool_name: "Bash", tool_input: { command: "ls" } });
+    // Allowlisted session: no sandbox rewrite, no deny — just {}.
+    expect(result).toEqual({});
+  });
+});

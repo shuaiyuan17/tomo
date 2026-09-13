@@ -98,6 +98,13 @@ export interface LiveSessionManagerDeps {
    * and not a value snapshotted at session creation.
    */
   isOwnAudienceTurn(key: string): boolean;
+  /**
+   * The key the turn in flight on `key` is scoped to (`Agent.scopedCallerKey`),
+   * which is the steering group's key on a summoned turn. Read per tool call by
+   * the private-memory guard so a summoned turn inherits its group's
+   * `groupShellAllowlist` entry; a live query for the same reason as above.
+   */
+  scopedCallerKey(key: string): string;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
@@ -293,6 +300,7 @@ export class LiveSessionManager {
       sdkSessionId: resumeId ?? undefined,
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
+      scopedCallerKey: () => this.deps.scopedCallerKey(key),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
       // Late-bound on purpose: the options are built before the session that
       // owns the flag exists. Until it does, nothing was dropped.

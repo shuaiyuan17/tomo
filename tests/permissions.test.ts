@@ -49,6 +49,7 @@ const {
   PRIVATE_MEMORY_GROUP_DENIAL,
   PRIVATE_MEMORY_SUMMONED_DENIAL,
 } = await import("../src/agent/permissions.js");
+const { MIXED_AUDIENCE_KEY } = await import("../src/agent/audience.js");
 
 const ctx = {
   cwd: "/ws",
@@ -306,8 +307,21 @@ type PreToolUseResult = {
 };
 type PreToolUseHook = (input: { tool_name: string; tool_input: unknown }) => Promise<PreToolUseResult>;
 
-function hookFor(bar: () => "group-session" | "summoned-turn" | null): PreToolUseHook {
-  const hooks = privateMemoryGuardHooks("dm:shuai", bar) as {
+function hookFor(
+  bar: () => "group-session" | "summoned-turn" | null,
+  opts?: {
+    sessionKey?: string;
+    groupShellAllowlist?: () => readonly string[] | undefined;
+    scopedCallerKey?: () => string | undefined;
+  },
+): PreToolUseHook {
+  const hooks = privateMemoryGuardHooks(
+    opts?.sessionKey ?? "dm:shuai",
+    bar,
+    undefined,
+    opts?.groupShellAllowlist,
+    opts?.scopedCallerKey,
+  ) as {
     PreToolUse: Array<{ hooks: PreToolUseHook[] }>;
   };
   return hooks.PreToolUse[0].hooks[0];
@@ -503,6 +517,150 @@ describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
 
   it("does not widen the bar to other tools - public Read still passes", async () => {
     expect(await hookFor(() => "group-session")(PUBLIC_READ)).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// groupShellAllowlist: a whitelisted group session runs Bash unsandboxed.
+// ---------------------------------------------------------------------------
+
+describe("privateMemoryGuardHooks - groupShellAllowlist", () => {
+  const ALLOWLISTED_KEY = "imessage:any;+;allowlisted-group-test";
+  const OTHER_KEY = "imessage:any;+;other-group-test";
+  const OWNER_DM = "dm:shuai";
+  const SANDBOXED_LS = "SANDBOXED:ls -la /tmp";
+
+  it("skips sandboxing for an allowlisted group session", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    const result = await hook(INNOCUOUS_BASH);
+    // Returns {} — no rewrite, no deny.
+    expect(result).toEqual({});
+    expect(rewritten(result)).toBeUndefined();
+    expect(decision(result)).toBeUndefined();
+  });
+
+  it("still sandboxes a group session NOT in the allowlist", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: OTHER_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    const result = await hook(INNOCUOUS_BASH);
+    expect(rewritten(result)).toBe("SANDBOXED:ls -la /tmp");
+  });
+
+  it("still denies private-memory Read/Glob/Grep for an allowlisted session", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    // Only Bash is exempted; file-tool guards still apply.
+    for (const call of [PRIVATE_READ, PRIVATE_GLOB]) {
+      expect(decision(await hook(call)), call.tool_name).toBe("deny");
+    }
+  });
+
+  it("lets public reads through for an allowlisted session", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    expect(await hook(PUBLIC_READ)).toEqual({});
+  });
+
+  it("re-reads the allowlist on every call", async () => {
+    const list: string[] = [];
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => list,
+    });
+    // Not in the list yet — sandboxed.
+    expect(rewritten(await hook(INNOCUOUS_BASH))).toBe("SANDBOXED:ls -la /tmp");
+    // Add to list — unsandboxed.
+    list.push(ALLOWLISTED_KEY);
+    expect(await hook(INNOCUOUS_BASH)).toEqual({});
+  });
+
+  it("has no effect on a DM session (bar is null)", async () => {
+    const hook = hookFor(() => null, {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    // Unbarred turns pass through regardless.
+    expect(await hook(INNOCUOUS_BASH)).toEqual({});
+  });
+
+  it("logs when Bash is allowed unsandboxed", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    vi.mocked(log.info).mockClear();
+    await hook(INNOCUOUS_BASH);
+    expect(vi.mocked(log.info)).toHaveBeenCalledWith(
+      expect.objectContaining({ key: ALLOWLISTED_KEY, bar: "group-session" }),
+      expect.stringContaining("allowlisted"),
+    );
+  });
+
+  // --- Summoned turns: the STEERING group's key decides, not the dm: key. ---
+
+  it("skips sandboxing for a summoned turn steered by an allowlisted group", async () => {
+    const hook = hookFor(() => "summoned-turn", {
+      sessionKey: OWNER_DM,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+      scopedCallerKey: () => ALLOWLISTED_KEY,
+    });
+    expect(await hook(INNOCUOUS_BASH)).toEqual({});
+    // Only Bash is exempted: the file-tool denials still fire on the same turn.
+    for (const call of [PRIVATE_READ, PRIVATE_GLOB]) {
+      expect(decision(await hook(call)), call.tool_name).toBe("deny");
+    }
+  });
+
+  it("still sandboxes a summoned turn steered by a group NOT in the allowlist", async () => {
+    const hook = hookFor(() => "summoned-turn", {
+      sessionKey: OWNER_DM,
+      // The owner's own dm: key is listed too, so the session key cannot stand
+      // in for the steering group's.
+      groupShellAllowlist: () => [ALLOWLISTED_KEY, OWNER_DM],
+      scopedCallerKey: () => OTHER_KEY,
+    });
+    expect(rewritten(await hook(INNOCUOUS_BASH))).toBe(SANDBOXED_LS);
+  });
+
+  it("still sandboxes a summoned turn that no single group is steering", async () => {
+    // Every candidate key is allowlisted, so only the fail-closed rules keep
+    // these sandboxed: a mixed batch (several groups, or a group plus the
+    // owner's DM), a key that resolves back to the session itself, and no key.
+    const allowlist = () => [ALLOWLISTED_KEY, OWNER_DM, MIXED_AUDIENCE_KEY];
+    const cases: Array<[string, (() => string | undefined) | undefined]> = [
+      ["mixed batch", () => MIXED_AUDIENCE_KEY],
+      ["resolves to the session key", () => OWNER_DM],
+      ["getter returns undefined", () => undefined],
+      ["no getter", undefined],
+    ];
+    for (const [label, scopedCallerKey] of cases) {
+      const hook = hookFor(() => "summoned-turn", {
+        sessionKey: OWNER_DM,
+        groupShellAllowlist: allowlist,
+        scopedCallerKey,
+      });
+      expect(rewritten(await hook(INNOCUOUS_BASH)), label).toBe(SANDBOXED_LS);
+    }
+  });
+
+  it("treats a missing allowlist as empty: no throw, still sandboxed", async () => {
+    for (const bar of ["group-session", "summoned-turn"] as const) {
+      const hook = hookFor(() => bar, {
+        sessionKey: bar === "group-session" ? ALLOWLISTED_KEY : OWNER_DM,
+        groupShellAllowlist: () => undefined,
+        scopedCallerKey: () => ALLOWLISTED_KEY,
+      });
+      expect(rewritten(await hook(INNOCUOUS_BASH)), bar).toBe(SANDBOXED_LS);
+    }
   });
 });
 

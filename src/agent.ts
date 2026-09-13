@@ -321,6 +321,7 @@ export class Agent {
       ),
       buildGroupContext: (key) => this.buildGroupContext(key),
       isOwnAudienceTurn: (key) => this.isOwnAudienceTurn(key),
+      scopedCallerKey: (key) => this.scopedCallerKey(key),
       handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       handleToolResult: (key, toolName, content, isError) => {

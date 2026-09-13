@@ -7,6 +7,7 @@ import { log } from "../logger.js";
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 import { extractAttachments } from "./text-utils.js";
 import { sandboxedBashCommand } from "./bash-sandbox.js";
+import { MIXED_AUDIENCE_KEY } from "./audience.js";
 import { loadedSettingsFiles } from "./setting-sources.js";
 
 // ---------------------------------------------------------------------------
@@ -305,6 +306,8 @@ export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
   pluginDirs: () => readonly string[] = () => [],
+  groupShellAllowlist: () => readonly string[] | undefined = () => [],
+  scopedCallerKey: () => string | undefined = () => undefined,
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   // The settings files the query actually loads, so the Bash arm can refuse when
@@ -321,6 +324,19 @@ export function privateMemoryGuardHooks(
         if (!reason) return {};
         const isBash = input.tool_name === "Bash";
         if (isBash) {
+          // A turn belonging to an allowlisted group runs Bash UNSANDBOXED.
+          // That is full trust, not a narrower hole: the Read/Edit/Glob/Grep/
+          // MEDIA denials below still fire, but an unsandboxed shell can read
+          // the same paths, so allowlisting a group hands its participants the
+          // owner's private memory through Bash.
+          const allowlistedKey = shellAllowlistedKey(reason, sessionKey, groupShellAllowlist, scopedCallerKey);
+          if (allowlistedKey) {
+            log.info(
+              { key: sessionKey, allowlistedKey, bar: reason },
+              "Bash allowed unsandboxed for allowlisted group",
+            );
+            return {};
+          }
           const sandboxed = sandboxedBashInput(input.tool_input, {
             settingsFiles,
             pluginDirs: pluginDirs(),
@@ -356,6 +372,38 @@ export function privateMemoryGuardHooks(
       }],
     }],
   };
+}
+
+/**
+ * The allowlisted group key that exempts this barred turn's Bash from the
+ * sandbox, or `undefined` when the turn stays sandboxed.
+ *
+ * - `group-session`: the session IS the group, so its own key decides.
+ * - `summoned-turn`: the session key is the owner's `dm:` key and says nothing
+ *   about who is steering. The key comes from `scopedCallerKey`, the same
+ *   resolution session-scoped MCP tools are judged by (`Agent.scopedCallerKey`
+ *   over `scopedCallerKeyFor`), and counts only when it names exactly one
+ *   group. {@link MIXED_AUDIENCE_KEY} (several groups, or a group plus the
+ *   owner's DM), the session's own key (no group attributable at this instant)
+ *   and no key at all fail closed.
+ *
+ * Both getters are read per call. A missing list is an empty list, never a
+ * throw: a guard that throws on a barred turn is the wrong failure mode.
+ */
+function shellAllowlistedKey(
+  reason: PrivateMemoryBar,
+  sessionKey: string | undefined,
+  groupShellAllowlist: () => readonly string[] | undefined,
+  scopedCallerKey: () => string | undefined,
+): string | undefined {
+  if (!sessionKey) return undefined;
+  let key = sessionKey;
+  if (reason === "summoned-turn") {
+    const steering = scopedCallerKey();
+    if (!steering || steering === sessionKey || steering === MIXED_AUDIENCE_KEY) return undefined;
+    key = steering;
+  }
+  return (groupShellAllowlist() ?? []).includes(key) ? key : undefined;
 }
 
 /**

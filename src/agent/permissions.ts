@@ -305,6 +305,7 @@ export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
   pluginDirs: () => readonly string[] = () => [],
+  groupShellAllowlist: () => readonly string[] = () => [],
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   // The settings files the query actually loads, so the Bash arm can refuse when
@@ -321,6 +322,16 @@ export function privateMemoryGuardHooks(
         if (!reason) return {};
         const isBash = input.tool_name === "Bash";
         if (isBash) {
+          // A session in the groupShellAllowlist runs Bash unsandboxed — same as
+          // a DM session. The Read/Edit/Glob/Grep/MEDIA guards still apply;
+          // only the sandbox-exec wrapper is skipped.
+          if (sessionKey && groupShellAllowlist().includes(sessionKey)) {
+            log.info(
+              { key: sessionKey, bar: reason },
+              "Bash allowed unsandboxed for allowlisted group session",
+            );
+            return {};
+          }
           const sandboxed = sandboxedBashInput(input.tool_input, {
             settingsFiles,
             pluginDirs: pluginDirs(),

@@ -244,6 +244,9 @@ export function sdkOptions(
       // barred-turn Bash arm can spot a plugin that ships PreToolUse hooks
       // without re-resolving install paths on every tool call.
       pluginDirs: () => plugins.map((entry) => entry.path),
+      // Read from config per call, not snapshotted: a config reload mid-session
+      // takes effect on the next tool call rather than the next session.
+      groupShellAllowlist: () => config.groupShellAllowlist,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -373,6 +376,8 @@ export function buildHooksOption(args: {
    *  guard scans them for PreToolUse hooks that could overwrite its Bash
    *  rewrite. */
   pluginDirs?: () => readonly string[];
+  /** Group session keys whose Bash calls skip the sandbox-exec wrapper. */
+  groupShellAllowlist?: () => readonly string[];
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
@@ -396,7 +401,7 @@ export function buildHooksOption(args: {
   // insurance against the day a hook registered after it starts rewriting input
   // and silently drops the sandbox wrap, which fails OPEN.
   if (args.privateMemoryBar) {
-    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar, args.pluginDirs));
+    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar, args.pluginDirs, args.groupShellAllowlist));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

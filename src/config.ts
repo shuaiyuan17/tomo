@@ -253,6 +253,11 @@ export interface TomoConfig {
    *  (`.claude/agents/<name>.md`). An agent type with no entry here is
    *  UNCONSTRAINED — see {@link AgentProfile}. */
   agentProfiles: Record<string, AgentProfile>;
+  /** Group session keys whose Bash calls skip the `sandbox-exec` wrapper
+   *  entirely — they run unsandboxed, same as DM sessions. The
+   *  Read/Edit/Glob/Grep/MEDIA guards for `memory/private/` still apply;
+   *  only the Bash sandbox is bypassed. */
+  groupShellAllowlist: string[];
   lcm: LcmConfig;
   metrics: MetricsConfig;
 }
@@ -926,6 +931,7 @@ function buildConfig(): TomoConfig {
     mcpAllowedTools,
     plugins: parsePlugins(file.plugins),
     agentProfiles: parseAgentProfiles(file.agentProfiles),
+    groupShellAllowlist: validated("groupShellAllowlist", z.array(z.string()), file.groupShellAllowlist, []),
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),
   };

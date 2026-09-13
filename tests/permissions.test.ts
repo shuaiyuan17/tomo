@@ -306,8 +306,16 @@ type PreToolUseResult = {
 };
 type PreToolUseHook = (input: { tool_name: string; tool_input: unknown }) => Promise<PreToolUseResult>;
 
-function hookFor(bar: () => "group-session" | "summoned-turn" | null): PreToolUseHook {
-  const hooks = privateMemoryGuardHooks("dm:shuai", bar) as {
+function hookFor(
+  bar: () => "group-session" | "summoned-turn" | null,
+  opts?: { sessionKey?: string; groupShellAllowlist?: () => readonly string[] },
+): PreToolUseHook {
+  const hooks = privateMemoryGuardHooks(
+    opts?.sessionKey ?? "dm:shuai",
+    bar,
+    undefined,
+    opts?.groupShellAllowlist,
+  ) as {
     PreToolUse: Array<{ hooks: PreToolUseHook[] }>;
   };
   return hooks.PreToolUse[0].hooks[0];
@@ -503,6 +511,90 @@ describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
 
   it("does not widen the bar to other tools - public Read still passes", async () => {
     expect(await hookFor(() => "group-session")(PUBLIC_READ)).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// groupShellAllowlist: a whitelisted group session runs Bash unsandboxed.
+// ---------------------------------------------------------------------------
+
+describe("privateMemoryGuardHooks - groupShellAllowlist", () => {
+  const ALLOWLISTED_KEY = "imessage:any;+;f6a4a6d1ccf947dba838b16950bab8c3";
+  const OTHER_KEY = "imessage:any;+;other";
+
+  it("skips sandboxing for an allowlisted group session", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    const result = await hook(INNOCUOUS_BASH);
+    // Returns {} — no rewrite, no deny.
+    expect(result).toEqual({});
+    expect(rewritten(result)).toBeUndefined();
+    expect(decision(result)).toBeUndefined();
+  });
+
+  it("still sandboxes a group session NOT in the allowlist", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: OTHER_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    const result = await hook(INNOCUOUS_BASH);
+    expect(rewritten(result)).toBe("SANDBOXED:ls -la /tmp");
+  });
+
+  it("still denies private-memory Read/Glob/Grep for an allowlisted session", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    // Only Bash is exempted; file-tool guards still apply.
+    for (const call of [PRIVATE_READ, PRIVATE_GLOB]) {
+      expect(decision(await hook(call)), call.tool_name).toBe("deny");
+    }
+  });
+
+  it("lets public reads through for an allowlisted session", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    expect(await hook(PUBLIC_READ)).toEqual({});
+  });
+
+  it("re-reads the allowlist on every call", async () => {
+    const list: string[] = [];
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => list,
+    });
+    // Not in the list yet — sandboxed.
+    expect(rewritten(await hook(INNOCUOUS_BASH))).toBe("SANDBOXED:ls -la /tmp");
+    // Add to list — unsandboxed.
+    list.push(ALLOWLISTED_KEY);
+    expect(await hook(INNOCUOUS_BASH)).toEqual({});
+  });
+
+  it("has no effect on a DM session (bar is null)", async () => {
+    const hook = hookFor(() => null, {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    // Unbarred turns pass through regardless.
+    expect(await hook(INNOCUOUS_BASH)).toEqual({});
+  });
+
+  it("logs when Bash is allowed unsandboxed", async () => {
+    const hook = hookFor(() => "group-session", {
+      sessionKey: ALLOWLISTED_KEY,
+      groupShellAllowlist: () => [ALLOWLISTED_KEY],
+    });
+    vi.mocked(log.info).mockClear();
+    await hook(INNOCUOUS_BASH);
+    expect(vi.mocked(log.info)).toHaveBeenCalledWith(
+      expect.objectContaining({ key: ALLOWLISTED_KEY, bar: "group-session" }),
+      expect.stringContaining("allowlisted"),
+    );
   });
 });
 

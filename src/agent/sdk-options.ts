@@ -71,6 +71,15 @@ export interface SessionContext {
    */
   isOwnAudienceTurn?: () => boolean;
   /**
+   * The key the turn in flight is scoped to (`Agent.scopedCallerKey`): the
+   * session key for its own turns, the steering group's key on a summoned
+   * turn, `MIXED_AUDIENCE_KEY` for a mixed batch. A getter for the same reason
+   * as `isOwnAudienceTurn`. Read by the private-memory guard so a summoned turn
+   * inherits its group's `groupShellAllowlist` entry; undefined means it never
+   * does.
+   */
+  scopedCallerKey?: () => string;
+  /**
    * Read-and-clear: did the model's last message land in a thinking block and
    * get dropped (see LiveSession.takeUndeliveredReply)? Consulted after every
    * tool batch so the model can be told before its next step.
@@ -247,6 +256,9 @@ export function sdkOptions(
       // Read from config per call, not snapshotted: a config reload mid-session
       // takes effect on the next tool call rather than the next session.
       groupShellAllowlist: () => config.groupShellAllowlist,
+      // Which group is steering a summoned turn, so the allowlist is judged
+      // against that group's key rather than the owner's dm: key.
+      scopedCallerKey: sessionContext?.scopedCallerKey,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     ...(sdkEnv ? { env: sdkEnv } : {}),
@@ -376,8 +388,12 @@ export function buildHooksOption(args: {
    *  guard scans them for PreToolUse hooks that could overwrite its Bash
    *  rewrite. */
   pluginDirs?: () => readonly string[];
-  /** Group session keys whose Bash calls skip the sandbox-exec wrapper. */
-  groupShellAllowlist?: () => readonly string[];
+  /** Group session keys whose Bash calls skip the sandbox-exec wrapper. Read
+   *  per call; a missing list means none. */
+  groupShellAllowlist?: () => readonly string[] | undefined;
+  /** The key the turn in flight is scoped to (see SessionContext). Lets a
+   *  summoned turn inherit its steering group's allowlist entry. */
+  scopedCallerKey?: () => string;
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
@@ -401,7 +417,13 @@ export function buildHooksOption(args: {
   // insurance against the day a hook registered after it starts rewriting input
   // and silently drops the sandbox wrap, which fails OPEN.
   if (args.privateMemoryBar) {
-    mergeHooks(hooks, privateMemoryGuardHooks(args.sessionKey, args.privateMemoryBar, args.pluginDirs, args.groupShellAllowlist));
+    mergeHooks(hooks, privateMemoryGuardHooks(
+      args.sessionKey,
+      args.privateMemoryBar,
+      args.pluginDirs,
+      args.groupShellAllowlist,
+      args.scopedCallerKey,
+    ));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};
 }

@@ -342,6 +342,7 @@ export const mockConfig = {
   channelAllowlists: {} as Record<string, string[]>,
   passiveGroups: {} as Record<string, string[]>,
   groupSecret: null as string | null,
+  groupShellAllowlist: [] as string[],
   steering: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,

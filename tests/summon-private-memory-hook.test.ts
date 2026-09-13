@@ -317,3 +317,100 @@ describe("private memory during a summoned-group turn", () => {
     await agent.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// groupShellAllowlist on a summoned turn. The session key is the owner's dm:
+// key, so the exemption has to be judged against the key of the group steering
+// the turn, resolved by the same `Agent.scopedCallerKey` the scoped MCP tools
+// use, and only when exactly one group is steering.
+// ---------------------------------------------------------------------------
+
+describe("groupShellAllowlist during a summoned-group turn", () => {
+  /** Summon the group, run one group-steered turn, and probe the guard inside it. */
+  async function probeSummonedTurn(groupShellAllowlist: string[]): Promise<Probe> {
+    resetConfig({ identities: [OWNER], groupShellAllowlist });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await openOwnerSession(tg, agent);
+    summon(agent, GROUP_CHAT_ID, "shuai");
+
+    let probed: Probed | undefined;
+    mockSdk.responseFn = async () => {
+      probed = await probeDuringTurn(agent, OWNER_DM);
+      return "NO_REPLY";
+    };
+    await tg.simulateMessage(makeMsg({
+      chatId: GROUP_CHAT_ID,
+      text: "@tomo open the browser for us",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+    }));
+    await drainQueue(agent);
+
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toContain(OWNER_DM);
+    await agent.stop();
+    return unwrap(probed);
+  }
+
+  it("runs Bash unsandboxed when the steering group is allowlisted", async () => {
+    const probed = await probeSummonedTurn([GROUP_SESSION]);
+    expect(probed.bash).toEqual({});
+    // The exemption is Bash only: the file-tool denials still fire.
+    for (const name of ["read", "glob"] as const) {
+      expect(probed[name]?.hookSpecificOutput?.permissionDecision, name).toBe("deny");
+    }
+    expect(probed.publicRead).toEqual({});
+  });
+
+  it("stays sandboxed when a different group is allowlisted", async () => {
+    // The owner's dm: key is listed too, so matching the session key instead of
+    // the steering group's would open it.
+    expectDeniedAsSummoned(await probeSummonedTurn(["telegram:-100999", OWNER_DM]));
+  });
+
+  it("stays sandboxed when an owner DM steer mixes into an allowlisted group's turn", async () => {
+    resetConfig({ identities: [OWNER], steering: true, groupShellAllowlist: [GROUP_SESSION] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await openOwnerSession(tg, agent);
+    summon(agent, GROUP_CHAT_ID, "shuai");
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let groupProbe: Probed | undefined;
+    mockSdk.responseFn = async (text: string) => {
+      if (text.includes("from the group")) {
+        // Alone on the session the allowlisted group IS exempt, which proves
+        // the mixed case below is closed by the mix and not by a missing list.
+        groupProbe = await probeDuringTurn(agent, OWNER_DM);
+        await gate;
+        return "NO_REPLY";
+      }
+      return "ok";
+    };
+
+    const groupTurn = tg.simulateMessage(makeMsg({
+      chatId: GROUP_CHAT_ID,
+      text: "from the group: open the browser",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+    }));
+    await waitFor(() => expect(groupProbe).toBeDefined());
+    expect(unwrap(groupProbe).bash).toEqual({});
+
+    const steer = tg.simulateMessage(makeMsg({ chatId: "12345", text: "actually, hold on" }));
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).pendingSteers).toHaveLength(1));
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(MIXED_AUDIENCE_KEY);
+
+    expectDeniedAsSummoned(await probe(guardHookFor(OWNER_DM)));
+
+    release();
+    await Promise.all([groupTurn, steer]);
+    await drainQueue(agent);
+    await agent.stop();
+  });
+});

@@ -24,6 +24,14 @@ export default defineConfig({
       // decided by a name the test runner owns and can rename, and which any
       // process is free to export.
       TOMO_LOG_INLINE: "1",
+      // Blank the daemon's log file for the run. A test started from a shell
+      // the daemon spawned (an agent's, a cron's) inherits the launchd
+      // TOMO_LOG_FILE, and the inline destination honours it, so every test
+      // file's records landed in the production tomo.log: fake-clock
+      // timestamps, "tick failed" warnings from fixtures, test paths that
+      // later read as real events. logger.ts treats blank as unset; the
+      // redaction tests that need a file still set one with vi.stubEnv.
+      TOMO_LOG_FILE: "",
     },
   },
 });

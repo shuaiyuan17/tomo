@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository == 'shuaiyuan17/tomo'
     steps:
-      - uses: actions/stale@v10
+      - uses: actions/stale@v11
         with:
           days-before-stale: 45
           days-before-close: 14

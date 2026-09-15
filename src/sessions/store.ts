@@ -786,6 +786,7 @@ interface TranscriptReadFile {
 }
 
 export class SessionStore {
+  private readonly readOnly: boolean;
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
   /**
@@ -916,23 +917,53 @@ export class SessionStore {
     dir: string,
     historyLimit: number,
     sdkSessionsDir: string,
-    opts?: { tailMessages?: number; rotateBytes?: number },
+    opts?: { tailMessages?: number; rotateBytes?: number; readOnly?: boolean },
   ) {
     if (!sdkSessionsDir) {
       throw new Error("SessionStore requires an explicit SDK sessions directory");
     }
     this.dir = dir;
+    this.readOnly = opts?.readOnly === true;
     this.sdkSessionsDir = sdkSessionsDir;
     this.tailLimit = opts?.tailMessages ?? Math.max(TRANSCRIPT_TAIL_MIN, historyLimit * 10);
     this.rotateBytes = opts?.rotateBytes ?? TRANSCRIPT_ROTATE_BYTES;
-    mkdirSync(dir, { recursive: true });
+    if (!this.readOnly) mkdirSync(dir, { recursive: true });
     this.loadRegistry();
-    this.cleanupExpired();
+    if (!this.readOnly) this.cleanupExpired();
+  }
+
+  /** Fresh metadata for read services, without cleanup, migration, or writes. */
+  static readSnapshot(dir: string, sdkSessionsDir: string): SessionEntry[] {
+    const store = new SessionStore(dir, 20, sdkSessionsDir, { readOnly: true });
+    store.assertRegistryLoaded();
+    return store.registry.filter((entry) => entry.unlinkedAt === null);
+  }
+
+  /** Shared ownership/read-set rules for off-thread history readers. Paths
+   * stay internal; they must never be accepted from an HTTP request. */
+  static readHistoryFiles(dir: string, sdkSessionsDir: string, key: string): string[] {
+    const store = new SessionStore(dir, 20, sdkSessionsDir, { readOnly: true });
+    store.assertRegistryLoaded();
+    const legacy = legacyTranscriptFileStem(key);
+    const stem = transcriptFileStem(key);
+    const ownership = store.probeLegacyStemOwnership(key, legacy);
+    if (ownership.kind === "unknown") throw new Error("History ownership unavailable");
+    if (legacy === stem && ownership.kind === "shared" && store.quarantinedNamesFor(stem).length === 0) {
+      throw new Error("History ownership ambiguous");
+    }
+    const files = store.transcriptReadSet(key).files.map((file) => file.path);
+    // A read never migrates the old files. Sole-owner legacy families remain
+    // readable while the daemon has not yet touched this key.
+    if (legacy !== stem && ownership.kind === "sole") {
+      files.push(...store.readSetForStem(legacy).files.map((file) => file.path));
+    }
+    return [...new Set(files)];
   }
 
   /** Get or create a session, loading only the transcript tail from disk on
    *  first access. Older messages stay on disk (see searchTranscript). */
   get(key: string): Session {
+    if (this.readOnly) throw new Error("Use readSnapshot/readHistoryFiles for read-only access");
     // BEFORE the cache lookup, not after. A migration can move the bytes behind
     // this key's transcript (the active file arrives under a new name, or an
     // older file appears beside it as a read-only sidecar) and it drops the
@@ -979,6 +1010,7 @@ export class SessionStore {
 
   /** Append a message to the session and persist to disk */
   append(key: string, message: SessionMessage): void {
+    if (this.readOnly) throw new Error("Read-only session store");
     const session = this.get(key);
 
     // Auto-assign seq number if not present
@@ -1419,6 +1451,7 @@ export class SessionStore {
     cacheCreationTokens: number;
     contextUsed: number;
     contextMax: number;
+    contextEstimated?: boolean;
     contextBreakdown?: { name: string; tokens: number }[];
   }): void {
     // Bookkeeping: this runs after the model has already answered. Skipping it
@@ -1448,6 +1481,7 @@ export class SessionStore {
       entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
       entry.stats.contextUsed = update.contextUsed;
       entry.stats.contextMax = update.contextMax;
+      entry.stats.contextEstimated = update.contextEstimated ?? false;
       if (update.contextBreakdown) {
         entry.stats.contextBreakdown = update.contextBreakdown;
       }
@@ -1910,6 +1944,7 @@ export class SessionStore {
    * mutation the outer frame is in the middle of making.
    */
   private mutateRegistry<T>(op: string, mode: "link" | "bookkeeping", fn: () => T): T | undefined {
+    if (this.readOnly) throw new Error("Read-only session store");
     const strict = mode === "link";
     const nested = isFileLockHeldSync(this.registryLockPath);
     const body = (): T | undefined => {
@@ -2085,6 +2120,7 @@ export class SessionStore {
   private readLegacyStemLedger():
     { ok: true; stems: Record<string, string[]>; malformed: string[] } | { ok: false } {
     const loaded = this.loadLegacyStemLedger();
+    if (this.readOnly) return loaded;
     if (loaded.ok && loaded.malformed.length === 0) return loaded;
     if (loaded.ok) {
       if (!this.healLegacyStemLedgerRows()) return loaded;
@@ -2488,10 +2524,11 @@ export class SessionStore {
       this.clearRegistryLoadError();
       this.registryStat = null;
       // Migrate from old _sdk_sessions.json if it exists
-      this.migrateOldFormat();
+      if (!this.readOnly) this.migrateOldFormat();
       return;
     }
     if (stat.size === 0) {
+      if (this.readOnly) { this.onRegistryLoadFailure(new Error("Empty session registry")); return; }
       // A zero-byte registry is ambiguous, and JSON.parse("") throws — so
       // without this it would be a permanent refusal with no way to self-heal.
       // There is no `.bak` for the registry to arbitrate with, so prior good
@@ -2841,6 +2878,10 @@ export class SessionStore {
    */
   private transcriptReadSet(key: string): { files: TranscriptReadFile[]; hasSidecars: boolean } {
     const stem = this.safeKey(key);
+    return this.readSetForStem(stem);
+  }
+
+  private readSetForStem(stem: string): { files: TranscriptReadFile[]; hasSidecars: boolean } {
     // ONE listing for the whole family. Resolving each archive's sidecars with
     // its own `readdirSync` made this O(archives) directory scans per search.
     const names = this.dirNames();
@@ -2933,6 +2974,7 @@ export class SessionStore {
    * file becomes a READ-ONLY SIDECAR rather than being abandoned or merged.
    */
   private ensureTranscriptMigrated(key: string): boolean {
+    if (this.readOnly) return true;
     if (this.transcriptMigrationChecked.has(key)) return true;
     // Re-entrancy, not memoization: `migrateLegacyTranscript` must be able to
     // call anything on the store (it reaches the registry and the ledger)

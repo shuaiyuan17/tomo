@@ -4,6 +4,7 @@ import type { SessionStore } from "./sessions/store.js";
 import { extractImessageIdentifier, isDmSessionKey, legacySessionKeysForBinding, matchesChannelBinding } from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
+import { selectWebOwner } from "./web/owner.js";
 
 export interface SessionResolution {
   sessionKey: string;
@@ -29,6 +30,7 @@ export class IdentityRouter {
     // Groups temporarily routed to a dm:<identity> session via /summon,
     // keyed by raw "<channel>:<chatId>". Defaults to in-memory (tests).
     private summons: SummonStore = new SummonStore(null),
+    private webOwnerName?: string,
   ) {
     // Build fast lookup sets: explicit allowlist + all identity-bound chatIds per channel
     this.allowlists = {};
@@ -53,6 +55,7 @@ export class IdentityRouter {
 
   /** Check if a chatId is allowed on a channel. Returns true if no allowlist is configured (open). */
   isAllowed(channelName: string, chatId: string): boolean {
+    if (channelName === "web") return chatId === "owner" && this.webOwner() !== undefined;
     const allowlist = this.allowlists[channelName];
     if (!allowlist) return true; // No allowlist → open
     if (allowlist.has(chatId)) return true;
@@ -127,6 +130,16 @@ export class IdentityRouter {
 
   /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
   resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {
+    if (channelName === "web") {
+      const owner = this.webOwner();
+      if (!owner || chatId !== "owner" || isGroup) throw new Error("Web messages require the configured owner DM");
+      const key = `dm:${owner.name.toLowerCase()}`;
+      return {
+        sessionKey: this.maybeMigrate(owner, key),
+        replyTarget: { channelName: "web", chatId: "owner" },
+        identityName: owner.name,
+      };
+    }
     // Group chats: always separate sessions — unless summoned, in which case
     // the turn runs on the unified dm: session. The reply target stays the
     // identity's PRIVATE DM: direct turn output is a side-note to the owner
@@ -233,6 +246,11 @@ export class IdentityRouter {
 
   private findIdentity(channelName: string, chatId: string): IdentityConfig | undefined {
     return this.identities.find((id) => matchesChannelBinding(channelName, chatId, id.channels[channelName]));
+  }
+
+  /** A local UI must never silently select one of several owners. */
+  webOwner(): IdentityConfig | undefined {
+    return selectWebOwner(this.identities, this.webOwnerName);
   }
 
   private resolveReplyTarget(

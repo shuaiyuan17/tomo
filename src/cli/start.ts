@@ -210,6 +210,21 @@ async function startForeground(): Promise<void> {
     }));
   }
 
+  // Optional UI failures must not become a messaging startup prerequisite.
+  if (config.web?.enabled) {
+    try {
+      const { WebChannel } = await import("../channels/web.js");
+      const { WebSupervisor } = await import("../web/supervisor.js");
+      const web = new WebChannel(config.identities, config.web.ownerIdentity);
+      web.attach(new WebSupervisor(web, {
+        ...config.web, identities: config.identities,
+        sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir,
+        diagnostic: (message) => log.info(message),
+      }));
+      agent.addChannel(web);
+    } catch { log.warn("Web UI unavailable; messaging channels remain active."); }
+  }
+
   const { CronStore } = await import("../cron/store.js");
   const { readCronJobsSafely } = await import("./cron-errors.js");
   const cronStore = new CronStore();

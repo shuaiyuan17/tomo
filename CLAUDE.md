@@ -2,7 +2,7 @@
 
 ## What is Tomo
 
-Tomo is a personal AI assistant that lives in messaging apps (Telegram, iMessage). It runs as a long-running Node.js daemon on the user's machine, powered by the Claude Agent SDK. Users interact with it exclusively through chat — there is no web UI or terminal UI at runtime.
+Tomo is a personal AI assistant that lives in messaging apps (Telegram, iMessage). It runs as a long-running Node.js daemon on the user's machine, powered by the Claude Agent SDK. The optional local web channel shares the owner's DM session; group conversations are read-only in the browser. `tomo watch` also provides runtime observability.
 
 Published to npm as `tomo-ai`. Installed globally via `npm install -g tomo-ai`.
 
@@ -44,7 +44,8 @@ src/
   config.ts           # Config from ~/.tomo/config.json + env vars (zod-validated)
   tomo-event.ts       # <tomo-event> envelope for harness-composed messages
   auth.ts             # Anthropic auth resolution (env key > config; subscription or API key)
-  channels/           # Channel implementations (Telegram, iMessage via the imsg CLI)
+  channels/           # Channel implementations (Telegram, iMessage via imsg, local web)
+  web/                # Optional supervised HTTP/SSE process, bounded RPC, local security
   sessions/           # Persistence (store.ts), key helpers (keys.ts), summon-store.ts
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
                       #   (cron-, people-, recall-, pet-tools); external-config.ts, oauth.ts
@@ -66,6 +67,8 @@ src/
 ```
 
 Runtime data lives at `~/.tomo/` (config, sessions, cron jobs, logs, workspace, memory).
+
+The browser frontend lives in `web/` at the repository root, uses strict React/TypeScript and mockup-derived CSS tokens, and builds into `dist/web-assets`. See `docs/web-ui.md` for limits and development commands. The web child never owns another Agent or writes transcripts. Owner input goes through `Agent.addChannel`; reply outlets are bound to request IDs, and web/provider turns cannot steer into each other's delivery destination. Preserve the existing persistent notification target and transcript policy.
 
 ## Key Design Patterns
 

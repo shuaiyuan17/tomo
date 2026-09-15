@@ -258,6 +258,9 @@ export interface Channel {
 
   /** Register a handler for incoming messages */
   onMessage(handler: MessageHandler): void;
+  /** Optional custody feedback when accepted input cannot enter a turn.
+   * `unknown` must never trigger automatic transport resubmission. */
+  settleMessage?(messageId: string, outcome: "refused" | "unknown"): void;
 
   /** Register a handler for slash commands */
   onCommand(handler: CommandHandler): void;

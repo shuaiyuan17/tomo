@@ -15,6 +15,7 @@ import { defaultRuntimePaths } from "./runtime-paths.js";
 import { DEFAULT_MODEL } from "./models.js";
 import { redactSecrets } from "./redact.js";
 import { log } from "./logger.js";
+import { parseWebConfig, type WebConfig } from "./web/config.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -158,6 +159,7 @@ export interface LiteLlmConfig {
 }
 
 export interface TomoConfig {
+  web: WebConfig;
   /** Anthropic authentication used for direct Claude model sessions. */
   auth: AnthropicAuthConfig;
   telegramToken: string;
@@ -838,6 +840,7 @@ function buildConfig(): TomoConfig {
 
   return {
     auth: parseAnthropicAuthConfig(file.auth),
+    web: parseWebConfig(file.web, (message) => console.error(message)),
     telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",
     model,
     workspaceDir: paths.workspaceDir,

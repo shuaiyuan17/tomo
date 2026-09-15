@@ -27,6 +27,12 @@ tomo init       # Set up config, pick a name and personality
 tomo start      # Runs in background
 ```
 
+Open [the local web chat](http://127.0.0.1:9465) after starting. It shares the
+owner's DM session; existing groups are read-only. The UI is enabled by default
+and binds only to `127.0.0.1`. Configure `web.enabled`, `web.port`, and, when
+multiple identities exist, `web.ownerIdentity` in `config.json`.
+See [web UI setup, security, and limits](docs/web-ui.md).
+
 That's it. Open Telegram and message your bot.
 
 ## Requirements

@@ -27,6 +27,18 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm run test:coverage
+      - name: Install browser
+        if: matrix.node-version == 24
+        run: npx playwright install --with-deps chromium
+      - name: Browser chat tests
+        if: matrix.node-version == 24
+        run: npm run test:e2e
+      - name: Upload browser evidence
+        if: always() && matrix.node-version == 24
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-evidence
+          path: test-results/
       - name: Upload coverage
         if: matrix.node-version == '22.12.0'
         uses: actions/upload-artifact@v7

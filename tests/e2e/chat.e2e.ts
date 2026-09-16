@@ -208,25 +208,27 @@ it("shows an accepted queued message immediately and reconciles it without dupli
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Correction while waiting"); await page.getByRole("button", { name: "Send", exact: true }).click();
   const pending = page.locator(".message.pending").filter({ hasText: "Correction while waiting" });
   await browserExpect(pending).toBeVisible(); await browserExpect(pending).toContainText("Queued");
-  await page.reload(); await browserExpect(page.getByText("Correction while waiting", { exact: true })).toBeVisible();
+  await page.reload(); await browserExpect(page.getByLabel("Conversation history").getByText("Correction while waiting", { exact: true })).toBeVisible();
   release(); await browserExpect(page.getByText("Handled: correction", { exact: true })).toBeVisible();
-  await browserExpect(page.getByText("Correction while waiting", { exact: true })).toHaveCount(1); await browserExpect(page.locator(".message.pending")).toHaveCount(0);
+  await browserExpect(page.getByLabel("Conversation history").getByText("Correction while waiting", { exact: true })).toHaveCount(1); await browserExpect(page.locator(".message.pending")).toHaveCount(0);
 });
 
 it("injects a correction into the active web turn and displays the shared response once (#382)", async () => {
   mockSdk.steerEcho = true;
   let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
-  mockSdk.responseFn = async (text) => { if (text.includes("Start working")) { await gate; return "Started with your correction."; } return "Correction received."; };
+  let started = false;
+  mockSdk.responseFn = async (text) => { if (text.includes("Start working")) { started = true; await gate; return "Started with your correction."; } return "Correction received."; };
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Start working"); await page.getByRole("button", { name: "Send", exact: true }).click();
-  await browserExpect(page.getByText("Start working", { exact: true })).toBeVisible();
+  await browserExpect(page.getByLabel("Conversation history").getByText("Start working", { exact: true })).toBeVisible();
+  await expect.poll(() => started).toBe(true);
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Use the updated direction"); await page.getByRole("button", { name: "Send", exact: true }).click();
-  await browserExpect(page.getByText("Use the updated direction", { exact: true })).toBeVisible();
-  const pending = (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { pendingSteers: unknown[] }> } }).liveSessionManager.liveSessions.get("dm:owner")!.pendingSteers;
-  expect(pending).toHaveLength(1); // Assert before releasing the original turn.
+  await browserExpect(page.getByLabel("Conversation history").getByText("Use the updated direction", { exact: true })).toBeVisible();
+  const pending = () => (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { pendingSteers: unknown[] }> } }).liveSessionManager.liveSessions.get("dm:owner")!.pendingSteers.length;
+  await expect.poll(pending).toBe(1); // Assert before releasing the original turn.
   release(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
   await browserExpect(page.locator(".message.assistant .markdown")).toContainText("Correction received.");
   await page.reload(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
-  await browserExpect(page.getByText("Use the updated direction", { exact: true })).toHaveCount(1);
+  await browserExpect(page.getByLabel("Conversation history").getByText("Use the updated direction", { exact: true })).toHaveCount(1);
 });
 
 it("browses TODOs and memory, searches notes, and shows genuine context data", async () => {
@@ -337,7 +339,7 @@ it("reconciles a provider turn mirrored to its web correction by canonical turn 
   await browserExpect(page.getByText("Provider starts", { exact: true })).toBeVisible();
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Browser correction");
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  await browserExpect(page.getByText("Browser correction", { exact: true })).toBeVisible();
+  await browserExpect(page.getByLabel("Conversation history").getByText("Browser correction", { exact: true })).toBeVisible();
   release(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
   await browserExpect(page.locator(".message.assistant .markdown")).toContainText("Shared corrected reply.");
   await page.reload(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);

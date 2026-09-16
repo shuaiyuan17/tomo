@@ -14,15 +14,17 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p web/tsconfig.json && vite build --config web/vite.config.ts",
     "dev": "tsx watch src/cli.ts -- start",
     "start": "node dist/cli.js start",
     "tomo": "tsx src/cli.ts",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "lint": "eslint src/ tests/",
+    "lint": "eslint src/ tests/ web/",
     "prepublishOnly": "npm run build",
-    "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  First time?  tomo init\n  Start:       tomo start\n  Upgraded?    tomo restart\n  Help:        tomo --help\n'"
+    "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  First time?  tomo init\n  Start:       tomo start\n  Upgraded?    tomo restart\n  Help:        tomo --help\n'",
+    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
+    "test:web:mutations": "node scripts/test-web-mutations.mjs"
   },
   "keywords": [
     "ai",
@@ -55,19 +57,25 @@
     "pino": "^10.3.1",
     "pino-pretty": "^13.0.0",
     "prom-client": "^15.1.3",
-    "react": "^19.2.7",
+    "react": "^19.3.0",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "1.63.0",
     "@types/node": "22.12.0",
-    "@types/react": "^19.2.17",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "@vitest/coverage-v8": "^4.1.9",
     "dotenv": "^17.4.1",
     "eslint": "^10.6.0",
     "tsx": "^4.19.0",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.62.0",
-    "vitest": "^4.1.9"
+    "vite": "8.3.0",
+    "vitest": "^4.1.9",
+    "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   }
 }

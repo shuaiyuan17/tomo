@@ -27,6 +27,14 @@ tomo init       # Set up config, pick a name and personality
 tomo start      # Runs in background
 ```
 
+Open the private web access link with `cat ~/.tomo/web-access.log`. It shares
+the owner's DM session; existing groups are read-only. The UI is enabled by
+default and requires the access token stored in `~/.tomo/web-token` (`0600`).
+The listener binds to `127.0.0.1`; optional Tailscale Serve access uses one exact
+HTTPS `web.externalOrigin`. Configure `web.enabled`, `web.port`, and, when
+multiple identities exist, `web.ownerIdentity` in `config.json`.
+See [web UI setup, security, and limits](docs/web-ui.md).
+
 That's it. Open Telegram and message your bot.
 
 ## Requirements

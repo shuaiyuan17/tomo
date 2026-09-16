@@ -503,7 +503,12 @@ describe("logger redaction", () => {
       //    redaction can reach.
       log.info({ tool: "Read" }, `{"token":"${TOKEN}","allowlist":["123"]}`);
 
+      const webToken = "tomo_web_" + "a".repeat(64);
+      log.info(`Web UI: http://127.0.0.1:9465/?t=${webToken}`);
+      log.info({ tool: "Read" }, webToken);
+
       const contents = await readWhenReady(file, "grammy shaped");
+      expect(contents).not.toContain(webToken);
       expect(contents).toContain("deep config");
       expect(contents).toContain("axios shaped");
       expect(contents).toContain("grammy shaped");

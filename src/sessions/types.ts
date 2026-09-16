@@ -1,4 +1,6 @@
 export interface SessionMessage {
+  /** Web ingress correlation; absent in older/provider transcript records. */
+  requestId?: string;
   role: "user" | "assistant" | "tool_summary";
   content: string;
   channel: string;
@@ -43,6 +45,7 @@ export interface SessionStats {
   contextUsed: number;
   /** Context window max */
   contextMax: number;
+  contextEstimated?: boolean;
   /** Context window breakdown by category */
   contextBreakdown?: ContextCategory[];
 }

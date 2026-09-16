@@ -50,12 +50,14 @@ describe("lcm_rollup tool", () => {
     const events: unknown[] = [];
     let parent: string | null = null;
     for (const [ts, text] of [
-      ["2026-09-08T16:00:00.000Z", "morning"],
-      ["2026-09-08T16:01:00.000Z", "reply one"],
-      ["2026-09-08T23:00:00.000Z", "evening"],
-      ["2026-09-08T23:01:00.000Z", "reply two"],
-      ["2026-09-09T15:00:00.000Z", "next day"],
-      ["2026-09-09T15:01:00.000Z", "reply three"],
+      // Rollup periods are local calendar days. UTC literals moved all 9/8
+      // events into 9/9 on UTC+8 hosts, leaving the requested period empty.
+      [new Date(2026, 8, 8, 9, 0).toISOString(), "morning"],
+      [new Date(2026, 8, 8, 9, 1).toISOString(), "reply one"],
+      [new Date(2026, 8, 8, 17, 0).toISOString(), "evening"],
+      [new Date(2026, 8, 8, 17, 1).toISOString(), "reply two"],
+      [new Date(2026, 8, 9, 9, 0).toISOString(), "next day"],
+      [new Date(2026, 8, 9, 9, 1).toISOString(), "reply three"],
     ] as const) {
       const ev = mkEvent(text.startsWith("reply") ? "assistant" : "user", parent, ts, text);
       events.push(ev);

@@ -30,8 +30,8 @@ export type WatchEvent =
       sender?: string;
       text: string;
     }
-  | { type: "turn.start"; ts: number; sessionKey: string; source: TurnSource }
-  | { type: "turn.end"; ts: number; sessionKey: string; source: TurnSource; ok: boolean; durationMs: number }
+  | { type: "turn.start"; ts: number; sessionKey: string; source: TurnSource; requestId?: string }
+  | { type: "turn.end"; ts: number; sessionKey: string; source: TurnSource; ok: boolean; durationMs: number; requestId?: string }
   /** Per-query stats from the SDK result (cost, context) — follows turn.end. */
   | {
     type: "turn.stats"; ts: number; sessionKey: string; costUsd: number;

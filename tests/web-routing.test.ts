@@ -1,0 +1,155 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+
+vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
+vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
+vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
+
+import { Agent, MockChannel, SessionStore, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, waitFor } from "./helpers/agent-harness.js";
+import { WebChannel } from "../src/channels/web.js";
+import { watchBus } from "../src/watch/bus.js";
+import { WebData } from "../src/web/data.js";
+import { IdentityRouter } from "../src/router.js";
+import { webSessionId } from "../src/web/owner.js";
+import type { WebEvent } from "../src/web/protocol.js";
+
+installAgentTestHooks();
+let agent: Agent;
+let web: WebChannel;
+let provider: MockChannel;
+let events: WebEvent[];
+beforeEach(() => {
+  watchBus.reset();
+  mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner", imessage: "test-handle" }, replyPolicy: "last-active" }];
+  agent = new Agent(); web = new WebChannel(mockConfig.identities); provider = new MockChannel("telegram");
+  agent.addChannel(provider); agent.addChannel(web);
+  events = []; web.events.subscribe(({ event }) => events.push(event));
+});
+afterEach(async () => { await agent.stop(); });
+const store = () => new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+const sendProvider = (text: string) => provider.simulateMessage(makeMsg({ chatId: "test-owner", senderName: "Owner", text }));
+const webBlocks = () => events.filter((event) => event.type === "block");
+
+describe("web routing through the real Agent", () => {
+  it("defaults to owner DM, uses the ordered delivery pipeline, and appends one canonical assistant entry", async () => {
+    mockSdk.responseFn = () => ["First complete block", "Second complete block"];
+    const requestId = randomUUID();
+    await web.receive({ requestId, text: "A web question" }); await drainQueue(agent);
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner"]);
+    expect(webBlocks().map((b) => b.text)).toEqual(["First complete block", "Second complete block"]);
+    expect(webBlocks().every((b) => b.requestId === requestId)).toBe(true);
+    expect(provider.delivered).toEqual([]);
+    const messages = store().get("dm:owner").messages;
+    expect(messages.filter((m) => m.role === "user")).toEqual([expect.objectContaining({ content: "A web question", channel: "web", requestId })]);
+    expect(messages.filter((m) => m.role === "assistant")).toEqual([expect.objectContaining({ content: "First complete block\nSecond complete block", channel: "web", requestId })]);
+    expect(web.request(requestId).state).toBe("completed");
+    const catalog = new WebData(mockConfig).catalog();
+    expect(catalog.sessions.find((s) => s.kind === "dm")?.stats).toMatchObject({ contextUsed: 5000, contextMax: 200000, contextEstimated: false });
+  });
+  it("never changes the persistent notification target or provider reply policy", async () => {
+    await sendProvider("provider question"); await drainQueue(agent);
+    const previous = store().getReplyTarget("dm:owner");
+    await web.receive({ requestId: randomUUID(), text: "web question" }); await drainQueue(agent);
+    expect(store().getReplyTarget("dm:owner")).toEqual(previous);
+    expect(previous).toEqual({ channelName: "telegram", chatId: "test-owner" });
+    await agent.handleCronMessage("scheduled note", "dm:owner"); await drainQueue(agent);
+    expect(provider.delivered).toHaveLength(2);
+    expect(webBlocks()).toHaveLength(1);
+  });
+  it("rejects forged group input in the router and Agent while exposing group history read-only", async () => {
+    const sessions = store(); sessions.touchSession("telegram:-1"); sessions.setChatTitle("telegram:-1", "Test group");
+    sessions.append("telegram:-1", { role: "user", content: "Existing group text", timestamp: Date.now(), channel: "telegram" });
+    const router = new IdentityRouter(mockConfig.identities, sessions, {});
+    expect(() => router.resolve("web", "owner", true)).toThrow();
+    expect(() => router.resolve("web", "telegram:-1", false)).toThrow();
+    const forged = new MockChannel("web"); agent.addChannel(forged);
+    expect(await forged.simulateMessage(makeMsg({ chatId: "owner", isGroup: true, text: "forged", senderName: "Owner" }))).toBe(false);
+    expect(await forged.simulateMessage(makeMsg({ chatId: "telegram:-1", text: "forged", senderName: "Owner" }))).toBe(false);
+    await drainQueue(agent); expect(mockSdk.promptsBySession).toEqual([]);
+    const data = new WebData(mockConfig);
+    expect(data.catalog().sessions.find((s) => s.kind === "group")).toMatchObject({ id: webSessionId("telegram:-1"), writable: false });
+    expect((await data.history(webSessionId("telegram:-1"))).messages[0].content).toBe("Existing group text");
+  });
+  it.each(["web-first", "provider-first"])("keeps recipients separate for interleaved input (%s)", async (order) => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    mockSdk.responseFn = async (text) => {
+      calls++;
+      if (calls === 1) { entered(); await gate; }
+      return text.includes("browser prompt") ? "browser answer" : "provider answer";
+    };
+    const browser = () => web.receive({ requestId: randomUUID(), text: "browser prompt" });
+    const messaging = () => sendProvider("provider prompt");
+    await (order === "web-first" ? browser() : messaging());
+    await started;
+    await (order === "web-first" ? messaging() : browser());
+    // Let the provider's batcher attempt steering while the first query is busy.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Custody is accepted immediately, but incompatible input must wait in
+    // the canonical queue before it enters the transcript/active SDK turn.
+    expect(store().get("dm:owner").messages.filter((m) => m.role === "user").map((m) => m.content))
+      .toEqual([order === "web-first" ? "browser prompt" : "provider prompt"]);
+    release(); await drainQueue(agent);
+    expect(webBlocks().map((b) => b.text)).toEqual(["browser answer"]);
+    expect(provider.delivered.map((d) => d.text)).toEqual(["provider answer"]);
+    expect(mockSdk.promptsBySession).toHaveLength(2);
+    expect(new Set(mockSdk.promptsBySession.map((p) => p.sessionKey))).toEqual(new Set(["dm:owner"]));
+  });
+  it("keeps NO_REPLY and late silence filtering in the existing pipeline", async () => {
+    mockSdk.responseFn = () => ["Visible block", "NO_REPLY"];
+    await web.receive({ requestId: randomUUID(), text: "first" }); await drainQueue(agent);
+    expect(webBlocks().map((b) => b.text)).toEqual(["Visible block"]);
+    mockSdk.responseFn = () => "NO_REPLY";
+    await web.receive({ requestId: randomUUID(), text: "second" }); await drainQueue(agent);
+    expect(webBlocks()).toHaveLength(1);
+    // The transcript intentionally preserves the raw turn; only delivery
+    // filters silence. Web must not rewrite the session's existing policy.
+    expect(store().get("dm:owner").messages.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual(["Visible block\nNO_REPLY", "NO_REPLY"]);
+  });
+  it("does not retry a failed web delivery and preserves the existing raw transcript policy", async () => {
+    vi.spyOn(web, "send");
+    const reply = "x".repeat(260 * 1024);
+    mockSdk.responseFn = () => reply;
+    const requestId = randomUUID();
+    await web.receive({ requestId, text: "question" }); await drainQueue(agent);
+    expect(web.send).toHaveBeenCalledOnce();
+    const messages = store().get("dm:owner").messages.filter((m) => m.role === "assistant");
+    expect(messages).toHaveLength(1); expect(messages[0].content).toBe(reply);
+    expect(web.request(requestId).state).toBe("failed");
+    expect(webBlocks()).toEqual([]);
+  });
+  it("retains SDK estimated context metadata across a fresh reader", async () => {
+    mockSdk.contextUsageFails = true;
+    await web.receive({ requestId: randomUUID(), text: "context" }); await drainQueue(agent);
+    expect(new WebData(mockConfig).catalog().sessions[0].stats.contextEstimated).toBe(true);
+  });
+  it("reports a queued message refused if a restore starts before processing", async () => {
+    let release!: () => void;
+    mockSdk.responseFn = async () => { await new Promise<void>((resolve) => { release = resolve; }); return "First reply"; };
+    await web.receive({ requestId: randomUUID(), text: "first" });
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    const requestId = randomUUID();
+    await web.receive({ requestId, text: "queued before restore" });
+    const commands = (agent as unknown as { commands: { isRestoring: boolean } }).commands;
+    const restoring = vi.spyOn(commands, "isRestoring", "get").mockReturnValue(true);
+    release(); await drainQueue(agent);
+    expect(web.request(requestId).state).toBe("refused");
+    expect(mockSdk.promptsBySession).toHaveLength(1);
+    restoring.mockRestore();
+  });
+  it("preserves accepted input when shutdown interrupts the SDK and rejects later sends", async () => {
+    let release!: () => void;
+    mockSdk.responseFn = async () => { await new Promise<void>((resolve) => { release = resolve; }); return "Accepted reply"; };
+    const requestId = randomUUID(); await web.receive({ requestId, text: "before stop" });
+    await waitFor(() => expect(release).toBeTypeOf("function"));
+    const stopped = agent.stop();
+    await expect(web.receive({ requestId: randomUUID(), text: "after stop" })).rejects.toMatchObject({ status: 503 });
+    release(); await stopped;
+    expect(store().get("dm:owner").messages.some((m) => m.role === "user" && m.requestId === requestId && m.content === "before stop")).toBe(true);
+    expect(web.request(requestId).state).not.toBe("queued");
+  });
+});

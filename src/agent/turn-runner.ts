@@ -154,6 +154,7 @@ export interface TurnErrorPolicy {
 }
 
 export interface TurnSpec {
+  requestId?: string;
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
   source: TurnSource;
@@ -271,7 +272,7 @@ export class TurnRunner {
       : async () => {};
 
     const startedAt = Date.now();
-    watchBus.publish({ type: "turn.start", sessionKey: spec.key, source: spec.source });
+    watchBus.publish({ type: "turn.start", sessionKey: spec.key, source: spec.source, ...(spec.requestId ? { requestId: spec.requestId } : {}) });
     let ok = false;
     try {
       const prompt = this.deps.drainPendingNotes(spec.key)
@@ -287,6 +288,7 @@ export class TurnRunner {
     } finally {
       watchBus.publish({
         type: "turn.end",
+        ...(spec.requestId ? { requestId: spec.requestId } : {}),
         sessionKey: spec.key,
         source: spec.source,
         ok,

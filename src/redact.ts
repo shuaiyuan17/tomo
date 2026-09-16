@@ -466,6 +466,9 @@ const SECRET_KEY_NAMES = "access[_-]?token|refresh[_-]?token|id[_-]?token|client
  * than being half-caught by a looser rule.
  */
 const TEXT_SECRET_PATTERNS: Array<[RegExp, string]> = [
+  // Web access links and bare token-file contents must not enter ordinary
+  // logs, which may be readable by other users or shared in bug reports.
+  [/\btomo_web_[a-f0-9]{64}\b/g, "***"],
   // Telegram bot token: <numeric bot id>:<35-char secret>. NO leading \b —
   // bounded at 20 digits: an unbounded \d{6,} made this quadratic (32k digits
   // took 910ms of backtracking looking for the colon). Real bot ids are ~10.

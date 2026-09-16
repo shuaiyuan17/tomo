@@ -67,6 +67,7 @@ import { spawn } from "node:child_process";
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
 
 interface UserTurnRequest {
+  webRequestId?: string;
   key: string;
   promptText: string;
   sourceChannelName: string;
@@ -189,10 +190,12 @@ export class Agent {
   private queuedInbound = new Map<symbol, QueuedInboundWork>();
   /** Set once `recordUnprocessedInbound` has swept `queuedInbound`. */
   private inboundDrained = false;
+  private webRequestIds = new Map<string, string>();
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
     hasBusyLiveSession: (key) => this.liveSessionManager.isBusy(key),
+    canSteerIntoSession: (key) => !this.webRequestIds.has(key),
   });
   private commands: ChatCommandHandler;
   // /pause state: raw group keys whose inbound messages are dropped at receipt.
@@ -245,6 +248,7 @@ export class Agent {
       appendAssistantTranscript: (sessionKey, content, channelName) => {
         this.sessions.append(sessionKey, {
           role: "assistant",
+          ...(channelName === "web" ? { requestId: this.webRequestIds.get(sessionKey) } : {}),
           content,
           channel: channelName,
           timestamp: Date.now(),
@@ -261,7 +265,7 @@ export class Agent {
       join(config.tomoHome, "data", "summons.json"),
       config.summonExpiryMinutes * 60_000,
     );
-    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons);
+    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons, config.web?.ownerIdentity);
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
@@ -522,6 +526,7 @@ export class Agent {
    * batcher already drained for shutdown answers `false`.
    */
   private async enqueueMessage(channel: Channel, message: IncomingMessage): Promise<boolean> {
+    if (channel.name === "web" && (this.stopping || this.commands.isRestoring || message.isGroup || message.chatId !== "owner")) return false;
     const isGroup = message.isGroup ?? false;
 
     // Allowlist gate at receipt, BEFORE resolving: a disallowed chat must not
@@ -562,10 +567,13 @@ export class Agent {
     // processing time would let a /summon or /dismiss that lands while the
     // message waits (in-flight turn, iMessage settle window) re-route it.
     const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    if (channel.name === "web") resolution.replyTarget = { channelName: "web", chatId: message.id };
     const sessionKey = resolution.sessionKey;
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
-    const canCoalesce = !isGroup || isPassiveGroup;
+    // Web turns have their own outlet: never steer them into a provider turn.
+    // Provider batching stays intact; its steering guard refuses a live web turn.
+    const canCoalesce = (!isGroup || isPassiveGroup) && channel.name !== "web";
 
     if (!canCoalesce) {
       // Through processInboundItems (not handleMessage directly) so the
@@ -633,6 +641,9 @@ export class Agent {
     if (allowed.length < items.length) {
       log.debug({ dropped: items.length - allowed.length }, "Batched items dropped (no longer in allowlist, or group paused)");
     }
+    for (const item of items) {
+      if (!allowed.includes(item)) item.channel.settleMessage?.(item.message.id, "refused");
+    }
     if (allowed.length === 0) return;
 
     // Receipt-time routing remains stable in the ordinary direction: a
@@ -692,7 +703,11 @@ export class Agent {
       const work = this.queuedInbound.get(token);
       if (!work) return; // shutdown already recorded it
       this.queuedInbound.delete(token);
-      await this.processInboundItems(work.items, work.steer);
+      try { await this.processInboundItems(work.items, work.steer); }
+      catch (err) {
+        for (const item of work.items) item.channel.settleMessage?.(item.message.id, "unknown");
+        throw err;
+      }
     }).catch((err) => log.error({ err, sessionKey }, `Unhandled error ${action}`));
   }
 
@@ -1168,6 +1183,7 @@ export class Agent {
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
+    if (req.webRequestId) this.webRequestIds.set(req.key, req.webRequestId);
     // Published for the duration of the turn so session-scoped MCP tools can
     // see where this turn's input actually came from. Registered per TURN, not
     // per session: turns overlap under steering, and a per-key slot let the
@@ -1179,6 +1195,7 @@ export class Agent {
       await this.runUserTurnInner(req);
     } finally {
       this.turnAudiences.end(req.key, turnId);
+      if (req.webRequestId) this.webRequestIds.delete(req.key);
     }
   }
 
@@ -1233,6 +1250,7 @@ export class Agent {
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {
     await this.turnRunner.runTurn({
+      requestId: req.webRequestId,
       key: req.key,
       source: "user",
       prompt: req.promptText,
@@ -1268,7 +1286,10 @@ export class Agent {
     steer = false,
     receiptResolution?: SessionResolution,
   ): Promise<void> {
-    if (this.commands.isRestoring) return;
+    if (this.commands.isRestoring) {
+      channel.settleMessage?.(message.id, "refused");
+      return;
+    }
 
     const hasImages = message.images && message.images.length > 0;
     const hasDocuments = message.documents && message.documents.length > 0;
@@ -1323,6 +1344,7 @@ export class Agent {
       role: "user",
       content: textForAgent,
       channel: channel.name,
+      ...(channel.name === "web" ? { requestId: message.id } : {}),
       senderName: message.senderName,
       timestamp: message.timestamp,
     });
@@ -1374,6 +1396,7 @@ export class Agent {
       steer,
       steerAudience: audience,
       passiveListen: isPassiveGroup,
+      ...(channel.name === "web" ? { webRequestId: message.id } : {}),
     });
   }
 
@@ -2519,6 +2542,7 @@ export class Agent {
           role: "user",
           content: this.formatGroupText(channel, message, key, people),
           channel: channel.name,
+          ...(channel.name === "web" ? { requestId: message.id } : {}),
           senderName: message.senderName,
           timestamp: message.timestamp,
         });
@@ -2526,6 +2550,7 @@ export class Agent {
           role: "assistant",
           content: SHUTDOWN_NOT_PROCESSED,
           channel: channel.name,
+          ...(channel.name === "web" ? { requestId: message.id } : {}),
           timestamp: Date.now(),
         });
       }

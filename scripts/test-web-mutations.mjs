@@ -5,6 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { controlPanelCases } from "./control-panel-mutations.mjs";
+import { review383Cases } from "./review-383-mutations.mjs";
 
 const source = resolve(import.meta.dirname, "..");
 const temporary = mkdtempSync(join(tmpdir(), "tomo-web-mutations-"));
@@ -16,6 +17,7 @@ symlinkSync(join(source, "node_modules"), join(temporary, "node_modules"), "dir"
 
 const allCases = [
   ...controlPanelCases,
+  ...review383Cases,
   ["access-log-permissions","src/web/token-store.ts","const fd = openSync(temporary, \"wx\", 0o600);","const fd = openSync(temporary, \"wx\", 0o644);","tests/web-access.test.ts"],
   ["web-token-redaction","src/redact.ts","  [/\\btomo_web_[a-f0-9]{64}\\b/g, \"***\"],","","tests/web-access.test.ts"],
   ["unicode-body-limit","src/web/protocol.ts","MAX_BODY_BYTES = 128 * 1024","MAX_BODY_BYTES = 32 * 1024","tests/web-http.test.ts"],

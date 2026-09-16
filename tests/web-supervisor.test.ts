@@ -101,10 +101,11 @@ it("reaps a process whose event loop hangs after it reports ready", async () => 
 
 it("maps live MCP health through owner visibility and dispatches a restart only once", async () => {
   const reasons: string[] = [];
+  let workerExit!: (failed: boolean) => void;
   supervisor = new WebSupervisor(channel, { ...options(), mcpStatus: async () => [
     { key: "dm:owner", connections: [{ name: "example", status: "connected" }] },
     { key: "dm:someone-else", connections: [{ name: "private", status: "failed" }] },
-  ] }, { restart: async (reason) => { reasons.push(reason); } });
+  ] }, { restart: async (reason, onExit) => { reasons.push(reason); workerExit = onExit; } });
   await supervisor.start();
   const base = `http://127.0.0.1:${supervisor.status().port}`;
   const response = await fetch(`${base}/api/v1/bootstrap?t=${readFileSync(join(root, "web-token"), "utf8").trim()}`, { headers });
@@ -120,6 +121,10 @@ it("maps live MCP health through owner visibility and dispatches a restart only 
   expect((await restart(randomUUID())).status).toBe(409); expect(reasons).toEqual([]);
   expect((await restart(boot.epoch)).status).toBe(202); expect(reasons).toEqual(["Apply reviewed settings"]);
   expect((await restart(boot.epoch)).status).toBe(409); expect(reasons).toHaveLength(1);
+  expect(await read("restart")).toEqual({ epoch: boot.epoch, pending: true });
+  workerExit(true);
+  expect(await read("restart")).toEqual({ epoch: boot.epoch, pending: false });
+  expect((await restart(boot.epoch)).status).toBe(202); expect(reasons).toHaveLength(2);
 });
 
 it("independently rejects a stale mutation at the daemon IPC boundary", async () => {

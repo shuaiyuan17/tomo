@@ -6,9 +6,9 @@ Validated on 2026-09-16 with macOS 26.6.2 (arm64), Node 24.11.1, and Chromium 15
 
 - `npm run lint` — passed.
 - `npm run build` — strict backend and frontend TypeScript, plus packaged Vite assets, passed.
-- `npm run test:coverage -- --maxWorkers=4` — 2,650 tests in 145 files passed.
-- `npm run test:e2e` — 15 Chromium scenarios passed: chat/history/groups, token/CSRF, long input, recovery, queued bubbles, live web/provider steering, TODO/memory/context, confirmed cron/config/MCP changes, mobile controls and restart/reconnection.
-- `npm run test:web:mutations` plus targeted follow-up runs — 85 distinct implementation reversions produced behavioral failures; restored backend/browser suites passed. Compilation/import failures do not count. The complete 82-case run was followed by six affected steering checks (including the new system-turn guard), then three mailbox checks (including two new pending-text behaviors). All 85 cases are now available through the same runner.
+- `DEVELOPER_DIR=/Library/Developer/CommandLineTools npm run test:coverage -- --maxWorkers=1` — 2,671 tests in 147 files passed. On this Mac, the initial runs encountered the unaccepted Xcode selection and an existing one-second script timeout under four workers; using the installed Command Line Tools and a serial run passed without changing production code or test timeouts.
+- `npm run test:e2e` — 16 Chromium scenarios passed: chat/history/groups, token/CSRF, long input, recovery, queued bubbles, live web/provider steering, TODO/memory/context, confirmed cron/config/MCP changes, mobile controls, restart/reconnection and explicit retry after a failed restart worker.
+- `npm run test:web:mutations` plus targeted follow-up runs — 85 distinct implementation reversions produced behavioral failures; restored backend/browser suites passed. Compilation/import failures do not count. The complete 82-case run was followed by six affected steering checks (including the new system-turn guard), then three mailbox checks (including two new pending-text behaviors). The review follow-up adds 18 cases and reruns four affected existing cases: all 22 produce assertion failures, with restored backend and browser suites passing (103 distinct cases across the original delivery and follow-up).
 - `npm pack` followed by installation into a disposable directory — installed web process returned HTTP 200 for its page, JavaScript, and CSS without source-checkout dependencies; unauthenticated bootstrap returned 401, token bootstrap returned 200, and react-dom/react-markdown/remark-gfm were absent from the production installation.
 - `git diff --check` — passed.
 
@@ -19,6 +19,10 @@ CI runs the existing Node 22.12 / 24 / 26 matrix and browser tests on Node 24. C
 Tested at 1440 × 900 (light/dark), 768 × 1024 (light), and 390 × 844 (dark), with actual screenshots inspected. Verified bounded conversation layout without horizontal overflow, reachable composer/session/theme controls, safe Markdown, disabled read-only group input, Enter submission, checked/unchecked task rendering, reconnect state, and preserved uncertain drafts. Study checks cover real file search, disabled checkbox state, secret-safe review dialogs, confirmation cancellation, Escape/focus restoration, saved/running state, mobile controls, and waiting for a new epoch before reporting restart complete. Screenshots and raw test logs remain in ignored `test-results/` and are available as CI artifacts; fixtures contain only synthetic content.
 
 The transcript remains the source record rather than a delivery receipt: existing raw-response/NO_REPLY semantics are retained. Current request status indicates delivery failure separately. No real daemon, credentials, or chat data were used.
+
+## Review follow-up
+
+The five required fixes and smaller notes are mapped to code behavior and tests in [web-ui-review-383-response.md](web-ui-review-383-response.md). The follow-up adds 18 implementation-reversion cases and refreshes four existing cases affected by the refactoring.
 
 ## Reversion matrix
 
@@ -123,3 +127,28 @@ Tailscale coverage exercises an exact HTTPS Host/Origin pair through the real lo
 Full-suite validation selected the installed Command Line Tools using `DEVELOPER_DIR=/Library/Developer/CommandLineTools`; the host-selected Xcode app required license confirmation and could not run the existing git/python sandbox tests. No system selection or license acceptance was changed. Private access-log permissions and ordinary-log token redaction are covered by two additional behavioral reversions.
 
 Completion checks were strengthened where an initial reversion survived: merged-turn transcript ownership now exercises an SDK failure after partial delivery, and the daemon epoch guard is checked independently over child IPC (the HTTP guard otherwise masks its removal). The legacy MCP check explicitly asserts successful preview. The final steering guard inspects the actual current SDK turn, including when a provider correction already joined background work. Pending-text checks use escaped control characters to exercise serialized IPC bytes.
+
+### Review follow-up reversions
+
+Run with `MUTATIONS="^review-|^context-estimator$|^context-rollups$|^config-schema$|^management-epoch$" npm run test:web:mutations`.
+
+| Reverted behavior | Unchanged test | Evidence |
+| --- | --- | --- |
+| `review-cli-wait` | `tests/cli-config-concurrency.test.ts` | Behavioral failure; restored pass |
+| `review-cli-retain-latest` | `tests/cli-config-concurrency.test.ts` | Behavioral failure; restored pass |
+| `review-cli-confirm-conflict` | `tests/cli-config-concurrency.test.ts` | Behavioral failure; restored pass |
+| `review-cli-reference` | `tests/cli-config-concurrency.test.ts` | Behavioral failure; restored pass |
+| `review-mcp-tolerance` | `tests/external-mcp-config.test.ts` | Behavioral failure; restored pass |
+| `review-mcp-repair` | `tests/web-management.test.ts` | Behavioral failure; restored pass |
+| `review-mcp-repair-secrets` | `tests/web-management.test.ts` | Behavioral failure; restored pass |
+| `review-restart-worker` | `tests/web-restart.test.ts` | Behavioral failure; restored pass |
+| `review-restart-release` | `tests/web-supervisor.test.ts` | Behavioral failure; restored pass |
+| `review-restart-ui` | `e2e` | Behavioral failure; restored pass |
+| `review-cron-intent` | `tests/web-inspection.test.ts` | Behavioral failure; restored pass |
+| `review-steer-current-turn` | `tests/web-routing.test.ts` | Behavioral failure; restored pass |
+| `review-steer-current-audience` | `tests/web-routing.test.ts` | Behavioral failure; restored pass |
+| `review-small-epoch` | `tests/web-control-http.test.ts` | Behavioral failure; restored pass |
+| `review-inspection-concurrency` | `tests/web-control-http.test.ts` | Behavioral failure; restored pass |
+| `review-context-line-limit` | `tests/web-inspection.test.ts` | Behavioral failure; restored pass |
+| `review-context-event-limit` | `tests/web-inspection.test.ts` | Behavioral failure; restored pass |
+| `review-context-preview-limit` | `tests/web-inspection.test.ts` | Behavioral failure; restored pass |

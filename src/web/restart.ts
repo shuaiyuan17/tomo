@@ -10,10 +10,13 @@ export function restartArguments(reason: string, env: NodeJS.ProcessEnv = proces
   return { args: [...(entry.endsWith(".ts") ? ["--import", "tsx"] : []), entry, "restart", "--reason", reason], env: environment };
 }
 /** Uses the existing CLI drain/launchd restart path in a detached worker. */
-export function dispatchWebRestart(reason: string): Promise<void> {
+export function dispatchWebRestart(reason: string, onExit: (failed: boolean) => void): Promise<void> {
   const options = restartArguments(reason);
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, options.args, { env: options.env, detached: true, stdio: "ignore" });
+    // Spawn only acknowledges dispatch. A later stop/launchd failure must
+    // release the supervisor latch so the still-running daemon can retry.
+    child.once("exit", (code, signal) => onExit(code !== 0 || signal !== null));
     child.once("error", reject); child.once("spawn", () => { child.unref(); resolve(); });
   });
 }

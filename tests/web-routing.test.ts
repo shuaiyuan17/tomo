@@ -221,3 +221,41 @@ describe("web routing through the real Agent", () => {
     expect(web.request(requestId).state).not.toBe("queued");
   });
 });
+
+it.each(["background", "audience"])("rechecks web steering after async ingress preparation (%s changes)", async (change) => {
+  let releaseFirst!: () => void; let releaseBackground!: () => void; let releasePreparation!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const backgroundGate = new Promise<void>((resolve) => { releaseBackground = resolve; });
+  const preparationGate = new Promise<void>((resolve) => { releasePreparation = resolve; });
+  mockSdk.steerEcho = false;
+  mockSdk.responseFn = async (text) => {
+    if (text.includes("FIRST")) { await firstGate; return "Initial answer"; }
+    if (text.includes("BACKGROUND")) { await backgroundGate; return "Background answer"; }
+    return "Private browser answer";
+  };
+  await sendProvider("FIRST"); await waitFor(() => expect(mockSdk.promptsBySession).toHaveLength(1));
+  const internal = agent as unknown as { processInboundItems(...args: unknown[]): Promise<void> };
+  const original = internal.processInboundItems.bind(agent);
+  const preparation = vi.spyOn(internal, "processInboundItems").mockImplementationOnce(async (...args) => { await preparationGate; return original(...args); });
+  const id = randomUUID(); await web.receive({ requestId: id, text: "PRIVATE" });
+  await waitFor(() => expect(preparation).toHaveBeenCalled());
+  let background: Promise<unknown> | undefined;
+  let audience: ReturnType<typeof vi.spyOn> | undefined;
+  if (change === "background") {
+    background = agent.handleCronMessage("BACKGROUND", "dm:owner");
+    releaseFirst(); await waitFor(() => expect(mockSdk.promptsBySession).toHaveLength(2));
+  } else audience = vi.spyOn(agent, "isOwnAudienceTurn").mockReturnValue(false);
+  releasePreparation();
+  await waitFor(() => expect(store().get("dm:owner").messages.some((m) => m.content === "PRIVATE")).toBe(true));
+  const live = (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { pendingSteers: unknown[]; idleWaiters: unknown[] }> } }).liveSessionManager.liveSessions.get("dm:owner")!;
+  // Wait for send() to queue behind the current turn, rather than relying on
+  // a timer to guess whether asynchronous preparation has finished.
+  await waitFor(() => expect(live.idleWaiters).toHaveLength(1));
+  expect(live.pendingSteers).toHaveLength(0);
+  releaseFirst(); releaseBackground(); await background; await drainQueue(agent);
+  await waitFor(() => expect(web.request(id).state).toBe("completed"));
+  expect(web.request(id).joined).toBeUndefined();
+  expect(webBlocks().map((b) => b.text)).toEqual(["Private browser answer"]);
+  expect(store().get("dm:owner").messages.filter((m) => m.role === "assistant" && m.content === "Private browser answer")).toHaveLength(1);
+  audience?.mockRestore(); preparation.mockRestore();
+});

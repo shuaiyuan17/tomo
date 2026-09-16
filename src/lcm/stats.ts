@@ -160,7 +160,7 @@ export function computeContextStats(
 }
 
 /** Same estimator for CLI and bounded readers; no second counting method. */
-export function computeContextStatsFromEvents(sdkEvents: SdkEvent[]): ContextStatsResult {
+export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): ContextStatsResult {
   const events: ParsedEvent[] = [];
 
   for (const e of sdkEvents) {

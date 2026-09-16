@@ -85,3 +85,16 @@ describe("external MCP config", () => {
     });
   });
 });
+
+it("retains legacy MCP servers while dropping only malformed optional sub-values", () => {
+  const servers = parseExternalMcpServers({
+    example: { command: "node", enabled: "true", timeout: 0, env: { GOOD: "${VALUE}", BAD: null },
+      oauth: { scopes: ["a", 1] } },
+    remote: { type: "http", url: "https://example.invalid/mcp", tools: [null,
+      { name: "read", permission_policy: "always_ask" }, { name: "bad", permission_policy: "invalid" }] },
+  }, { VALUE: "expanded" });
+  expect(Object.keys(servers)).toEqual(["example", "remote"]);
+  expect(servers.example.server).toEqual({ command: "node", env: { GOOD: "expanded" } });
+  expect(servers.example.oauth?.scopes).toEqual(["a", "1"]);
+  expect(servers.remote.server).toMatchObject({ tools: [{ name: "read", permission_policy: "always_ask" }] });
+});

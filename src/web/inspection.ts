@@ -6,10 +6,14 @@ import { CronStore } from "../cron/store.js";
 import { formatSchedule } from "../cron/format.js";
 import type { CronJob } from "../cron/types.js";
 import { computeContextStatsFromEvents, type SdkEvent } from "../lcm/stats.js";
-import { summaryBlocksFromEvents } from "../lcm/summary-reader.js";
+import { summaryBlocksFromEvents, type SummaryBlock } from "../lcm/summary-reader.js";
 import type { SessionEntry } from "../sessions/types.js";
 import { WebError } from "./protocol.js";
-export function cronRevision(job: CronJob): string { return createHash("sha256").update(JSON.stringify(job)).digest("hex"); }
+/** Optimistic concurrency protects user intent, not scheduler bookkeeping. */
+export function cronRevision(job: CronJob): string {
+  const { id, name, schedule, message, sessionKey, enabled, deleteAfterRun } = job;
+  return createHash("sha256").update(JSON.stringify({ id, name, schedule, message, sessionKey, enabled, deleteAfterRun })).digest("hex");
+}
 export class WebCron {
   constructor(private readonly tomoHome: string) {}
   private store() { return new CronStore(join(this.tomoHome, "data", "cron", "jobs.json")); }
@@ -39,18 +43,42 @@ export async function readSessionContext(entry: SessionEntry | undefined, sdkSes
       if (!stat.isFile()) throw new WebError(503, "context_unavailable");
       if (stat.size > limit) return { ...base, analysis: null, summaries: [], analysisStatus: "too_large" as const };
       const bytes = Buffer.alloc(Math.min(stat.size + 1, limit + 1));
-      const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+      let bytesRead = 0;
+      while (bytesRead < bytes.length) {
+        const read = await file.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
+        if (!read.bytesRead) break;
+        bytesRead += read.bytesRead;
+      }
       if (bytesRead > limit) throw new WebError(413, "context_limit");
-      const events = bytes.subarray(0, bytesRead).toString("utf8").split("\n").flatMap((line): SdkEvent[] => {
-        try { return [JSON.parse(line) as SdkEvent]; } catch { return []; }
-      });
-      const analysis = computeContextStatsFromEvents(events);
-      const summaries = summaryBlocksFromEvents(events).sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      const summaries: Array<SummaryBlock & { truncated: boolean }> = []; let summaryCount = 0;
+      // Feed the shared estimator one JSON value at a time: never retain a
+      // full UTF-8 copy, split-line array, or parsed SDK event graph. Metadata
+      // limits also cover tiny-line / huge-object amplification within 16 MiB.
+      function* events(): Iterable<SdkEvent> {
+        let count = 0;
+        for (let start = 0; start < bytesRead;) {
+          const newline = bytes.indexOf(10, start);
+          const end = newline < 0 || newline > bytesRead ? bytesRead : newline;
+          if (end - start > 256 * 1024 || ++count > 20_000) throw new WebError(413, "context_limit");
+          let event: SdkEvent;
+          try { event = JSON.parse(bytes.toString("utf8", start, end)) as SdkEvent; }
+          catch { start = end + 1; continue; }
+          start = end + 1;
+          for (const block of summaryBlocksFromEvents([event])) {
+            summaryCount++;
+            summaries.push({ ...block, content: block.content.slice(0, 8000), truncated: block.content.length > 8000 });
+            summaries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+            if (summaries.length > 100) summaries.pop();
+          }
+          yield event;
+        }
+      }
+      const analysis = computeContextStatsFromEvents(events());
       return { ...base, analysis: { ...analysis, sections: analysis.sections.slice(-100), truncated: analysis.sections.length > 100 },
-        summaries: summaries.slice(0, 100).map((block) => ({ ...block, content: block.content.slice(0, 8000), truncated: block.content.length > 8000 })),
-        summariesTruncated: summaries.length > 100, analysisStatus: "available" as const };
+        summaries, summariesTruncated: summaryCount > 100, analysisStatus: "available" as const };
     } finally { await file.close(); }
   } catch (error) {
+    if (error instanceof WebError && error.code === "context_limit") return { ...base, analysis: null, summaries: [], analysisStatus: "too_large" as const };
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...base, analysis: null, summaries: [], analysisStatus: "unavailable" as const };
     throw error;
   }

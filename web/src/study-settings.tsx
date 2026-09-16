@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import type { ConfigPreview, ConfigView, SafeField, WebManagement } from "../../src/web/management.js";
 import type { WebMcpLiveSession } from "../../src/web/protocol.js";
-import { ApiError, mutate } from "./api.js";
+import { api, ApiError, mutate } from "./api.js";
 import type { WebState } from "./study.js";
 import { Dialog, failure, FieldEditor, fieldInput, ResourceState, useResource } from "./study-ui.js";
 
@@ -28,6 +28,23 @@ function RestartPanel({ revision, required, web }: { revision: string; required:
       setMessage("Restart complete. Connected to the new daemon."); setStartingEpoch(undefined); config.reload();
     }
   }, [startingEpoch, web.bootstrap?.epoch, web.connection]);
+  useEffect(() => {
+    if (!startingEpoch || busy) return;
+    let cancelled = false; let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      try {
+        const status = await api<{ epoch: string; pending: boolean }>("/restart");
+        if (!cancelled && status.epoch === startingEpoch && !status.pending) {
+          setStartingEpoch(undefined);
+          setMessage("Restart did not replace this daemon. Check Tomo’s logs, then retry when ready.");
+          return;
+        }
+      } catch { /* A disconnect is expected; never automatically retry a restart. */ }
+      if (!cancelled) timer = setTimeout(() => void check(), 2_000);
+    };
+    timer = setTimeout(() => void check(), 2_000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [startingEpoch, busy]);
   const restart = async () => {
     if (!web.bootstrap || !reason.trim()) return;
     setBusy(true); setMessage(""); setStartingEpoch(web.bootstrap.epoch);

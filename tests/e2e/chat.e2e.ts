@@ -23,7 +23,7 @@ let supervisor: WebSupervisor;
 let browser: Browser;
 let page: Page;
 let url: string;
-let restartHandler: ((reason: string) => Promise<void>) | undefined;
+let restartHandler: ((reason: string, onExit: (failed: boolean) => void) => Promise<void>) | undefined;
 beforeEach(async () => {
   restartHandler = undefined;
   watchBus.reset();
@@ -32,9 +32,9 @@ beforeEach(async () => {
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
   agent = new Agent(); channel = new WebChannel(mockConfig.identities); provider = new MockChannel("telegram");
-  supervisor = new WebSupervisor(channel, { ...mockConfig, port: 0 }, { restart: async (reason) => {
+  supervisor = new WebSupervisor(channel, { ...mockConfig, port: 0 }, { restart: async (reason, onExit) => {
     if (!restartHandler) throw new Error("Test restart handler is not installed");
-    await restartHandler(reason);
+    await restartHandler(reason, onExit);
   } });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
@@ -344,4 +344,20 @@ it("reconciles a provider turn mirrored to its web correction by canonical turn 
   await browserExpect(page.locator(".message.assistant .markdown")).toContainText("Shared corrected reply.");
   await page.reload(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
   expect(provider.delivered.filter((message) => message.text.includes("Shared corrected reply."))).toHaveLength(1);
+});
+
+it("allows an explicit restart retry after the dispatched worker fails without changing daemon epoch", async () => {
+  let exit!: (failed: boolean) => void; let calls = 0;
+  restartHandler = async (_reason, onExit) => { calls++; exit = onExit; };
+  await page.getByRole("button", { name: "Config", exact: true }).click();
+  await page.getByRole("button", { name: "Restart Tomo", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm restart", exact: true }).click();
+  await browserExpect(page.getByText("Restart requested. Waiting for Tomo to reconnect…")).toBeVisible();
+  exit(true);
+  await browserExpect(page.getByText("Restart did not replace this daemon. Check Tomo’s logs, then retry when ready.")).toBeVisible();
+  expect(calls).toBe(1);
+  await page.getByRole("button", { name: "Restart Tomo", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm restart", exact: true }).click();
+  await expect.poll(() => calls).toBe(2);
+  await browserExpect(page.getByText("Restart complete. Connected to the new daemon.")).toHaveCount(0);
 });

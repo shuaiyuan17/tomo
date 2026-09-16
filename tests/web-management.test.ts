@@ -112,3 +112,25 @@ it("restarts using the existing CLI with a reason and without turn deferral mark
   expect(result.args.slice(-3)).toEqual(["restart", "--reason", "Apply reviewed settings"]);
   expect(result.env).toEqual({ PATH: "/example/bin" });
 });
+
+it.each(["mcpServers", "mcp"])("repairs legacy MCP fields incrementally without blocking unrelated config saves (%s)", (key) => {
+  const servers = { example: { command: "node", enabled: "true", timeout: 0, env: { BAD: null }, oauth: { scopes: ["a", 1] } } };
+  const store = new ConfigStore(join(root, "config.json"));
+  store.replace({ model: "before", [key]: key === "mcp" ? { servers } : servers });
+  const web = new WebManagement(root);
+  let proposal!: ReturnType<WebManagement["previewConfig"]>;
+  expect(() => { proposal = web.previewConfig({ revision: web.config().revision, changes: [{ path: ["model"], value: "after" }] }, "browser"); }).not.toThrow();
+  web.apply({ id: proposal.id }, "browser");
+  expect(store.read().value.model).toBe("after");
+  expect(() => web.previewMcp({ revision: web.config().revision, name: "example", operation: "save", values: { timeout: -1 } }, "browser")).toThrow("invalid_config");
+  proposal = web.previewMcp({ revision: web.config().revision, name: "example", operation: "save", values: { timeout: 1000 } }, "browser");
+  web.apply({ id: proposal.id }, "browser");
+  const raw = store.read().value; const saved = (key === "mcp" ? (raw.mcp as { servers: typeof servers }).servers : raw.mcpServers) as typeof servers;
+  expect(saved.example).toEqual({ ...servers.example, timeout: 1000 });
+});
+it("hides malformed legacy MCP values when previewing their repair", () => {
+  store.replace({ mcpServers: { example: { command: "node", timeout: { credential: secret } } } });
+  const proposal = web.previewMcp({ revision: web.config().revision, name: "example", operation: "save", values: { timeout: 1000 } }, "browser");
+  expect(JSON.stringify(proposal)).not.toContain(secret);
+  expect(proposal.diff[0]).toMatchObject({ secret: true, before: "Set", after: "Replacement supplied" });
+});

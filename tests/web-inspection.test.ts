@@ -60,3 +60,39 @@ it("uses the CLI token estimator and summary-block parser, retaining reported us
   expect(await readSessionContext(undefined, root)).toMatchObject({ used: null, max: null });
   expect(await readSessionContext({ stats: { contextUsed: 0, contextMax: 0 } } as SessionEntry, root)).toMatchObject({ used: null, max: null });
 });
+
+it("lets a confirmed cron disable/delete survive scheduler bookkeeping but rejects intent edits", () => {
+  const store = new CronStore(join(root, "data", "cron", "jobs.json")); const web = new WebCron(root);
+  const job = store.add({ name: "Frequent task", schedule: { kind: "every", everyMs: 30_000 }, message: "Example", sessionKey: "dm:owner" });
+  const revision = web.list().jobs[0].revision;
+  store.markStarted(job.id); store.markRun(job.id, "ok"); store.markStarted(job.id);
+  expect(() => web.change(job.id, revision, false)).not.toThrow();
+  expect(web.list().jobs[0]).toMatchObject({ enabled: false, lastStatus: "ok" });
+  const disabledRevision = web.list().jobs[0].revision;
+  store.markRun(job.id, "error");
+  expect(() => web.change(job.id, disabledRevision)).not.toThrow();
+  expect(web.list().jobs).toEqual([]);
+});
+it("exposes private memory to the authenticated owner browser and limits TODOs to the documented root glob", async () => {
+  mkdirSync(join(root, "memory", "private"));
+  writeFileSync(join(root, "memory", "private", "note.md"), "Owner-only test note");
+  writeFileSync(join(root, "memory", "topics", "TODO-nested.md"), "- [ ] Nested note");
+  writeFileSync(join(root, "memory", "TODO.md"), "- [ ] Root note");
+  expect((await memory.tree()).entries.map((entry) => entry.path)).toContain("private/note.md");
+  expect((await memory.file("private/note.md")).content).toBe("Owner-only test note");
+  expect((await memory.search("Owner-only")).results[0].path).toBe("private/note.md");
+  expect((await memory.todos()).files.map((file) => file.path)).toEqual(["TODO.md"]);
+});
+it.each(["large line", "many lines"])("bounds context parser allocations for %s while retaining persisted window usage", async (kind) => {
+  writeFileSync(join(root, "bounded.jsonl"), kind === "large line"
+    ? JSON.stringify({ type: "user", message: { content: "x".repeat(256 * 1024) } }) : "{}\n".repeat(20_001));
+  const entry = { sdkSessionId: "bounded", stats: { contextUsed: 50, contextMax: 200000 } } as SessionEntry;
+  expect(await readSessionContext(entry, root)).toMatchObject({ used: 50, max: 200000, analysis: null, analysisStatus: "too_large" });
+});
+it("bounds rollup previews while retaining the most recent summaries", async () => {
+  const events = Array.from({ length: 105 }, (_, i) => ({ isCompactSummary: true, timestamp: String(i).padStart(3, "0"), message: { content: "s".repeat(9000) } }));
+  writeFileSync(join(root, "summaries.jsonl"), events.map((event) => JSON.stringify(event)).join("\n"));
+  const value = await readSessionContext({ sdkSessionId: "summaries" } as SessionEntry, root);
+  expect(value.summaries).toHaveLength(100); expect(value.summaries[0]).toMatchObject({ timestamp: "104", truncated: true });
+  expect(value.summaries[0].content).toHaveLength(8000);
+});

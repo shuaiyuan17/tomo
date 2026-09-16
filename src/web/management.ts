@@ -137,7 +137,8 @@ export class WebManagement {
       if (!values || Object.keys(values).some((key) => !mcpFields.some((f) => f.path[0] === key) && !(record(previous) && Object.hasOwn(previous, key)))) throw new WebError(400, "invalid_server");
       servers[name] = { ...(record(previous) ? previous : { enabled: true }), ...values };
       for (const [key, next] of Object.entries(values)) {
-        const secret = !SAFE_MCP.has(key);
+        const definition = mcpFields.find((field) => field.path[0] === key);
+        const secret = !SAFE_MCP.has(key) || !definition || !safeValue(definition, valueAt(previous, [key]));
         diff.push({ field: `${name}.${key}`, secret, before: secret ? isSet(valueAt(previous, [key])) ? "Set" : "Unset" : valueAt(previous, [key]) ?? "Default", after: secret ? "Replacement supplied" : next });
       }
     }
@@ -145,7 +146,7 @@ export class WebManagement {
     return this.propose(value, current.revision, diff, browser, false);
   }
   private propose(value: Record<string, unknown>, revision: string, diff: ConfigDiff[], browser: string, webChange: boolean): ConfigPreview {
-    try { validateFileConfig(value); }
+    try { validateFileConfig(value, this.store.read().value); }
     catch (err) { if (err instanceof ConfigValidationError) throw new WebValidationError(err.fields); throw err; }
     for (const [id, proposal] of this.proposals) if (proposal.preview.expiresAt <= this.now()) this.proposals.delete(id);
     if (this.proposals.size >= 16) throw new WebError(429, "preview_limit");
@@ -157,7 +158,9 @@ export class WebManagement {
     const proposal = this.proposals.get(parsed.data.id);
     if (!proposal || proposal.browser !== browser || proposal.preview.expiresAt <= this.now()) throw new WebError(409, "preview_expired");
     try {
-      const saved = this.store.update(() => proposal.value, proposal.preview.revision, validateFileConfig);
+      const saved = this.store.update((current) => {
+        validateFileConfig(proposal.value, current); return proposal.value;
+      }, proposal.preview.revision);
       this.proposals.delete(parsed.data.id); return { revision: saved.revision, restartRequired: true };
     } catch (error) {
       if (error instanceof ConfigConflictError) throw new WebError(409, "config_changed");

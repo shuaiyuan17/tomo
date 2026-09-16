@@ -551,7 +551,8 @@ export class LiveSessionManager {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
       return await this.runTurnOnSession(key, session, steer, () => (steer
-        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, req.replyContext, req.onJoined)
+        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, req.replyContext, req.onJoined,
+          () => this.deps.isOwnAudienceTurn(key))
         : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext)));
     } catch (err) {
       // A turn the CLI ended on an error result is NOT a session error:

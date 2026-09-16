@@ -49,6 +49,8 @@ export class WebError extends Error {
 export interface WebMcpLiveSession { sessionId: string; connections: import("../mcp/live-status.js").McpConnection[] | null }
 
 export const rpcSchema = z.discriminatedUnion("method", [
+  z.object({ method: z.literal("epoch") }).strict(),
+  z.object({ method: z.literal("restart-status") }).strict(),
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
   z.object({ method: z.literal("mcp-status") }).strict(),
   z.object({ method: z.literal("restart"), epoch: z.uuid(), reason: z.string().trim().min(1).max(240) }).strict(),

@@ -24,12 +24,16 @@ export function backupConfigIfParseableSync(path: string, backupPath: string): b
   backupFileIfExistsSync(path, backupPath, { mode: 0o600 }); return true;
 }
 export class ConfigStore {
-  // Daemon writers fail promptly on contention; only the isolated UI process waits.
+  // Daemon writers fail promptly; the separate web child and interactive CLI
+  // explicitly opt into a bounded wait without blocking the daemon event loop.
   constructor(readonly path: string, readonly backupPath: string = `${path}.bak`, private readonly lockTimeoutMs = 0) {}
   read() { const value = readConfigFile(this.path) ?? {}; return { value, revision: configRevision(value) }; }
   update(edit: (value: Record<string, unknown>) => Record<string, unknown>, expectedRevision?: string,
     validate?: (value: Record<string, unknown>) => void): ReturnType<ConfigStore["read"]> {
     return withFileLockSync(`${this.path}.lock`, () => {
+      // Re-read inside the lock, before backup or publish. Previously treating
+      // an unreadable config as {} destroyed settings and the good backup.
+      // A stale editor must also never overwrite another writer's changes.
       const current = this.read();
       if (expectedRevision !== undefined && current.revision !== expectedRevision) throw new ConfigConflictError();
       const value = edit(current.value); validate?.(value);

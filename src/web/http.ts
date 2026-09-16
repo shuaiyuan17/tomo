@@ -28,6 +28,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   const externalOrigin = webConfigSchema.shape.externalOrigin.parse(deps.externalOrigin);
   const streams = new Set<ServerResponse>();
   let active = 0;
+  let inspecting = false;
   let boundPort = port;
   const server = createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 10_000 }, (req, res) => {
     for (const [key, value] of Object.entries(securityHeaders)) res.setHeader(key, value);
@@ -58,6 +59,12 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       return;
     }
     if (active >= 8) throw new WebError(429, "request_limit");
+    // A single bounded workspace/context inspection at a time across clients.
+    // Chat, SSE and management remain available while disk inspection awaits.
+    const inspection = req.method === "GET" && (url.pathname === "/api/v1/todos"
+      || url.pathname.startsWith("/api/v1/memory/") || /^\/api\/v1\/sessions\/[^/]+\/context$/.test(url.pathname));
+    if (inspection && inspecting) throw new WebError(429, "inspection_busy");
+    if (inspection) inspecting = true;
     active++;
     try {
       if (!api) {
@@ -68,10 +75,14 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       if (req.method !== "GET") {
         csrf.verify(req, session!);
         const epoch = req.headers["x-tomo-epoch"];
-        const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
-        if (typeof epoch !== "string" || epoch !== snapshot.epoch) throw new WebError(409, "epoch_changed");
+        // Messages are checked at the authoritative daemon boundary; local
+        // mutations need only its epoch, never a multi-megabyte snapshot.
+        if (!(req.method === "POST" && url.pathname === "/api/v1/messages")) {
+          if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        }
       }
       if (req.method === "GET") {
+        if (url.pathname === "/api/v1/restart") { json(res, 200, await deps.rpc({ method: "restart-status" })); return; }
         if (url.pathname === "/api/v1/todos") { json(res, 200, await required(deps.data.memory).todos()); return; }
         if (url.pathname === "/api/v1/memory/tree") { json(res, 200, await required(deps.data.memory).tree()); return; }
         if (url.pathname === "/api/v1/memory/file") { json(res, 200, await required(deps.data.memory).file(url.searchParams.get("path") ?? "")); return; }
@@ -140,7 +151,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         return;
       }
       throw new WebError(404, "not_found");
-    } finally { active--; }
+    } finally { active--; if (inspection) inspecting = false; }
   }
 
   async function events(url: URL, req: IncomingMessage, res: ServerResponse, origin: string): Promise<void> {

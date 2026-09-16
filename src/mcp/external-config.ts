@@ -1,4 +1,4 @@
-import { mcpServerName, mcpServerSchema } from "../config/schema.js";
+import { mcpServerName } from "../config/schema.js";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 
 type Env = Record<string, string | undefined>;
@@ -38,7 +38,9 @@ export function parseExternalMcpServers(
     if (!mcpServerName.safeParse(name).success || !isRecord(value)) continue;
     if (value.enabled === false || value.disabled === true) continue;
 
-    if (!mcpServerSchema.safeParse(value).success) continue;
+    // Runtime parsing has always tolerated malformed optional sub-values.
+    // Strict validation belongs to newly edited config fields, not startup:
+    // one bad env entry or timeout must not silently remove a working server.
     const server = parseServer(value, env);
     if (server) {
       const oauth = parseOAuthConfig(value.oauth, name, env);

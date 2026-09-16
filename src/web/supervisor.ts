@@ -18,7 +18,7 @@ export interface WebSupervisorOptions extends WebDataOptions {
 }
 /** Internal timing/entry overrides allow real-process failure tests without
  * exposing executable paths or arbitrary process options in web config. */
-export interface SupervisorRuntime { childPath?: string; startupMs?: number; heartbeatMs?: number; maxRestarts?: number; restart?: (reason: string) => Promise<void> }
+export interface SupervisorRuntime { childPath?: string; startupMs?: number; heartbeatMs?: number; maxRestarts?: number; restart?: typeof dispatchWebRestart }
 
 export class WebSupervisor implements WebLifecycle {
   private child?: ChildProcess;
@@ -125,6 +125,8 @@ export class WebSupervisor implements WebLifecycle {
         activeRpc++;
         const run = async () => {
           const input = parsed.data;
+          if (input.method === "epoch") return this.channel.events.epoch;
+          if (input.method === "restart-status") return { epoch: this.channel.events.epoch, pending: this.restartPending };
           if (input.method === "snapshot") {
             const result = { snapshot: this.channel.snapshot(), replay: input.cursor ? this.channel.events.after(input.cursor) : null };
             // An overflowing replay is a gap, not a reason to kill a healthy
@@ -141,7 +143,13 @@ export class WebSupervisor implements WebLifecycle {
           if (input.method === "restart") {
             if (this.restartPending) throw new WebError(409, "restart_pending");
             this.restartPending = true;
-            try { await (this.runtime.restart ?? dispatchWebRestart)(input.reason); return { restarting: true }; }
+            try {
+              await (this.runtime.restart ?? dispatchWebRestart)(input.reason, (failed) => {
+                this.restartPending = false;
+                if (failed) this.report("Web-requested daemon restart failed; retry is available.");
+              });
+              return { restarting: true };
+            }
             catch { this.restartPending = false; throw new WebError(503, "restart_failed"); }
           }
           return this.channel.receive(input.input);

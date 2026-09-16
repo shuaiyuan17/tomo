@@ -11,6 +11,7 @@ import { CronStore } from "../src/cron/store.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
 let root: string; let service: Awaited<ReturnType<typeof startWebHttp>>; let channel: WebChannel; let cookie: string; let boot: WebBootstrap; let base: string;
 let restarts: ReturnType<typeof vi.fn>;
+let data: WebData; let rpcMethods: string[];
 const token = "tomo_web_" + "b".repeat(64);
 async function call(path: string, body?: unknown, method = "POST", headers: Record<string, string> = {}) {
   const response = await fetch(base + "/api/v1" + path, { method: body === undefined ? "GET" : method,
@@ -25,9 +26,14 @@ beforeEach(async () => {
   new ConfigStore(join(root, "config.json")).replace({ model: "test-model", auth: { apiKey: "synthetic-secret" } });
   const identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
   channel = new WebChannel(identities); channel.onMessage(async () => true); restarts = vi.fn(async () => ({ restarting: true })); cookie = "";
+  rpcMethods = [];
+  data = new WebData({ workspaceDir: root, tomoHome: root, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), identities });
   service = await startWebHttp(0, { accessToken: token, assetsDir: root,
-    data: new WebData({ workspaceDir: root, tomoHome: root, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), identities }),
+    data,
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (rpc) => {
+      rpcMethods.push(rpc.method);
+      if (rpc.method === "message") return channel.receive(rpc.input);
+      if (rpc.method === "epoch") return channel.events.epoch;
       if (rpc.method === "snapshot") return { snapshot: channel.snapshot(), replay: null };
       if (rpc.method === "mcp-status") return [];
       if (rpc.method === "context-events") return [];
@@ -74,4 +80,29 @@ it("requires confirmation for cron and restarts, then delegates to the existing 
   expect((await call("/restart", { revision, reason: "Reviewed settings", confirm: false })).status).toBe(400);
   expect((await call("/restart", { revision, reason: "Reviewed settings", confirm: true })).status).toBe(202);
   expect(restarts).toHaveBeenCalledExactlyOnceWith("Reviewed settings");
+});
+
+it("uses a small epoch RPC for local mutations and no snapshot round trip for messages", async () => {
+  rpcMethods.length = 0;
+  const current = (await call("/config")).value;
+  expect((await call("/config/preview", { revision: current.revision, changes: [{ path: ["model"], value: "changed" }] })).status).toBe(200);
+  expect(rpcMethods).toEqual(["epoch"]);
+  rpcMethods.length = 0;
+  expect((await call("/messages", { requestId: randomUUID(), text: "A test message" })).status).toBe(202);
+  expect(rpcMethods).toEqual(["message"]);
+});
+it("bounds concurrent inspections while keeping lightweight reads available and releases the slot on failure", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let started = false;
+  const spy = vi.spyOn(data.memory!, "search").mockImplementationOnce(async () => { started = true; await blocked; throw new Error("Synthetic read failure"); });
+  const pending = call("/memory/search?q=example");
+  await expect.poll(() => started).toBe(true);
+  try {
+    expect((await call(`/sessions/${boot.ownerId}/context`)).status).toBe(429);
+    expect((await call("/todos")).status).toBe(429);
+    expect((await call("/config")).status).toBe(200);
+  } finally { release(); }
+  expect((await pending).status).toBe(503);
+  expect((await call("/todos")).status).toBe(200); spy.mockRestore();
 });

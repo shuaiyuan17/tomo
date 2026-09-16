@@ -65,9 +65,28 @@ export const configFields: ConfigField[] = [
   field("metrics.activityLog", "boolean"), field("metrics.includeMessageText", "boolean"),
   field("web.enabled", "boolean"), field("web.port", "number"), field("web.ownerIdentity"), field("web.externalOrigin"),
 ];
-export function validateFileConfig(value: unknown): void {
+function valueAtPath(value: unknown, path: PropertyKey[]): unknown {
+  for (const part of path) {
+    if (!value || typeof value !== "object" || !Object.hasOwn(value, part)) return undefined;
+    value = (value as Record<PropertyKey, unknown>)[part];
+  }
+  return value;
+}
+/** Existing MCP files use a tolerant runtime parser. Preserve invalid legacy
+ * sub-values verbatim while unrelated edits / one-field repairs are reviewed;
+ * newly introduced or changed invalid values still fail the same Zod schema. */
+export function validateFileConfig(value: unknown, previous?: unknown): void {
   const parsed = fileConfigSchema.safeParse(value);
-  if (!parsed.success) throw new ConfigValidationError(parsed.error.issues.map((issue) => issue.path.map(String).join(".")));
+  if (parsed.success) return;
+  const prior = previous === undefined ? undefined : fileConfigSchema.safeParse(previous);
+  const issues = parsed.error.issues.filter((issue) => {
+    const path = issue.path;
+    const mcp = path[0] === "mcpServers" || (path[0] === "mcp" && path[1] === "servers");
+    return !(mcp && prior && !prior.success && prior.error.issues.some((old) =>
+      old.code === issue.code && JSON.stringify(old.path) === JSON.stringify(path))
+      && JSON.stringify(valueAtPath(value, path)) === JSON.stringify(valueAtPath(previous, path)));
+  });
+  if (issues.length) throw new ConfigValidationError(issues.map((issue) => issue.path.map(String).join(".")));
 }
 export class ConfigValidationError extends Error {
   constructor(readonly fields: string[]) { super("Invalid configuration fields"); }

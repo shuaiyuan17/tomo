@@ -1639,9 +1639,16 @@ export class LiveSession {
     audience?: string[],
     replyContext?: ReplyContext,
     onJoined?: TurnRequest["onJoined"],
+    canJoin?: () => boolean,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
     if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin, false, replyContext);
+    // Ingress may have observed a different turn before asynchronous prompt /
+    // session preparation. Check at injection, with no await before enqueue.
+    // Missing audience evidence fails closed for the owner's browser input.
+    if (replyContext?.channel === "web" && (!this.isInteractiveTurn() || canJoin?.() !== true)) {
+      return this.send(text, images, documents, onBlock, onBlockAbandoned, origin, false, replyContext);
+    }
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);

@@ -92,12 +92,79 @@ describe("web routing through the real Agent", () => {
     // Custody is accepted immediately, but incompatible input must wait in
     // the canonical queue before it enters the transcript/active SDK turn.
     expect(store().get("dm:owner").messages.filter((m) => m.role === "user").map((m) => m.content))
-      .toEqual([order === "web-first" ? "browser prompt" : "provider prompt"]);
+      .toEqual(order === "web-first" ? ["browser prompt"] : ["provider prompt", "browser prompt"]);
     release(); await drainQueue(agent);
-    expect(webBlocks().map((b) => b.text)).toEqual(["browser answer"]);
+    await waitFor(() => expect(webBlocks().map((b) => b.text)).toEqual(["browser answer"]));
     expect(provider.delivered.map((d) => d.text)).toEqual(["provider answer"]);
     expect(mockSdk.promptsBySession).toHaveLength(2);
     expect(new Set(mockSdk.promptsBySession.map((p) => p.sessionKey))).toEqual(new Set(["dm:owner"]));
+  });
+
+  it.each(["web", "provider"])("joins an active %s turn, keeps request receipts, and records the shared reply once", async (source) => {
+    mockSdk.steerEcho = true; mockSdk.steerEchoCount = 2;
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    mockSdk.responseFn = async (text) => { if (text.includes("FIRST")) { await gate; return "Shared first block"; } return "Shared correction block"; };
+    const first = randomUUID(); const second = randomUUID(); const third = randomUUID();
+    if (source === "web") await web.receive({ requestId: first, text: "FIRST" }); else await sendProvider("FIRST");
+    const live = () => (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { pendingSteers: unknown[]; isBusy(): boolean }> } }).liveSessionManager.liveSessions.get("dm:owner")!;
+    await waitFor(() => expect(live()?.isBusy()).toBe(true));
+    await web.receive({ requestId: second, text: "SECOND correction" });
+    await web.receive({ requestId: third, text: "THIRD correction" });
+    await waitFor(() => expect(live().pendingSteers).toHaveLength(2));
+    // The messages entered the running SDK input queue before its gate opens.
+    expect(store().get("dm:owner").messages.filter((m) => m.role === "user")).toHaveLength(3);
+    release();
+    await waitFor(() => expect(web.request(third).state).toBe("completed")); await drainQueue(agent);
+    expect(web.request(second)).toMatchObject({ state: "completed", joined: true });
+    expect(web.request(third)).toMatchObject({ state: "completed", joined: true, responseTurnId: web.request(second).responseTurnId });
+    expect(webBlocks().map((b) => b.text)).toEqual(["Shared first block", "Shared correction block", "Shared correction block"]);
+    expect(store().get("dm:owner").messages.filter((m) => m.role === "assistant")).toHaveLength(1);
+    const canonical = (await new WebData(mockConfig).history(web.ownerId!)).messages.find((m) => m.role === "assistant")!;
+    expect(canonical.turnId).toBe(web.request(second).responseTurnId);
+    expect(provider.delivered).toHaveLength(source === "provider" ? 3 : 0);
+  });
+  it("keeps new owner input out of a summoned group's active audience", async () => {
+    // This guard is separate from the read-only group API: a summoned group
+    // may be running on the very same canonical owner DM key.
+    const audience = vi.spyOn(agent, "isOwnAudienceTurn").mockReturnValue(false);
+    let release!: () => void; mockSdk.responseFn = async () => { await new Promise<void>((resolve) => { release = resolve; }); return "Reply"; };
+    await web.receive({ requestId: randomUUID(), text: "first" }); await waitFor(() => expect(release).toBeTypeOf("function"));
+    const second = randomUUID(); await web.receive({ requestId: second, text: "private correction" });
+    expect(web.request(second).state).toBe("queued"); expect(store().get("dm:owner").messages.filter((m) => m.role === "user")).toHaveLength(1);
+    mockSdk.responseFn = () => "Next reply"; release(); await drainQueue(agent); audience.mockRestore();
+  });
+  it("keeps web input queued behind system work even if provider input already steered into it", async () => {
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    mockSdk.responseFn = async (text) => { if (text.includes("BACKGROUND")) { await gate; return "System reply"; } return "User reply"; };
+    // Establish the provider target before dispatching system work.
+    await sendProvider("Initial user turn"); await drainQueue(agent);
+    mockSdk.steerEcho = true;
+    const work = agent.handleCronMessage("BACKGROUND", "dm:owner");
+    await waitFor(() => expect(mockSdk.promptsBySession).toHaveLength(2));
+    await sendProvider("Provider correction");
+    await waitFor(() => expect(store().get("dm:owner").messages.filter((m) => m.role === "user" && m.content === "Provider correction")).toHaveLength(1));
+    const requestId = randomUUID(); await web.receive({ requestId, text: "Private browser request" });
+    expect(web.request(requestId).state).toBe("queued");
+    expect(store().get("dm:owner").messages.some((m) => m.content === "Private browser request")).toBe(false);
+    release(); await work; await drainQueue(agent);
+    expect(web.request(requestId)).toMatchObject({ state: "completed" });
+    expect(web.request(requestId).joined).toBeUndefined();
+  });
+  it("settles a joined web request on SDK failure without retrying or duplicating partial transcripts", async () => {
+    mockSdk.steerEcho = true;
+    mockSdk.nextResult = { subtype: "error_max_turns", is_error: true, errors: ["Synthetic turn failure"] };
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    mockSdk.responseFn = async (text) => { if (text.includes("ROOT")) { await gate; return "Partial root reply"; } return "Partial shared reply"; };
+    await sendProvider("ROOT");
+    await waitFor(() => expect(mockSdk.promptsBySession).toHaveLength(1));
+    const requestId = randomUUID(); await web.receive({ requestId, text: "Correction" });
+    await waitFor(() => expect(store().get("dm:owner").messages.filter((m) => m.role === "user")).toHaveLength(2));
+    release(); await waitFor(() => expect(web.request(requestId).state).toBe("failed")); await drainQueue(agent);
+    expect(mockSdk.promptsBySession).toHaveLength(1);
+    expect(web.request(requestId).joined).toBe(true);
+    const assistant = store().get("dm:owner").messages.filter((m) => m.role === "assistant");
+    expect(assistant.filter((m) => m.content.includes("Partial shared reply"))).toHaveLength(1);
+    expect(assistant.filter((m) => m.content.includes("ran out of steps"))).toHaveLength(1);
   });
   it("keeps NO_REPLY and late silence filtering in the existing pipeline", async () => {
     mockSdk.responseFn = () => ["Visible block", "NO_REPLY"];
@@ -128,6 +195,7 @@ describe("web routing through the real Agent", () => {
     expect(new WebData(mockConfig).catalog().sessions[0].stats.contextEstimated).toBe(true);
   });
   it("reports a queued message refused if a restore starts before processing", async () => {
+    mockConfig.steering = false;
     let release!: () => void;
     mockSdk.responseFn = async () => { await new Promise<void>((resolve) => { release = resolve; }); return "First reply"; };
     await web.receive({ requestId: randomUUID(), text: "first" });

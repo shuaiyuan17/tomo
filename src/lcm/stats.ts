@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { readJsonlFileSync } from "../jsonl.js";
 
-interface SdkEvent {
+export interface SdkEvent {
   type?: string;
   uuid?: string;
   timestamp?: string;
@@ -156,7 +156,11 @@ export function computeContextStats(
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return null;
 
-  const sdkEvents = readJsonlFileSync<SdkEvent>(path);
+  return computeContextStatsFromEvents(readJsonlFileSync<SdkEvent>(path));
+}
+
+/** Same estimator for CLI and bounded readers; no second counting method. */
+export function computeContextStatsFromEvents(sdkEvents: SdkEvent[]): ContextStatsResult {
   const events: ParsedEvent[] = [];
 
   for (const e of sdkEvents) {

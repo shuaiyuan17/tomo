@@ -1,3 +1,6 @@
+import { MemoryReader } from "../workspace/memory-reader.js";
+import { WebCron, readSessionContext } from "./inspection.js";
+import { WebManagement, type RunningConfig } from "./management.js";
 import type { IdentityConfig } from "../config.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
@@ -6,6 +9,9 @@ import { selectWebOwner, webSessionId } from "./owner.js";
 import { WebError, type WebCatalog } from "./protocol.js";
 
 export interface WebDataOptions {
+  workspaceDir?: string;
+  tomoHome?: string;
+  runningConfig?: RunningConfig;
   sessionsDir: string;
   sdkSessionsDir: string;
   identities: IdentityConfig[];
@@ -14,7 +20,23 @@ export interface WebDataOptions {
 
 /** Runs in the web process. Never imports the live Agent or starts services. */
 export class WebData {
-  constructor(private readonly options: WebDataOptions) {}
+  readonly memory?: MemoryReader;
+  readonly cron?: WebCron;
+  readonly management?: WebManagement;
+  constructor(private readonly options: WebDataOptions) {
+    if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
+    if (options.tomoHome) {
+      this.cron = new WebCron(options.tomoHome);
+      this.management = new WebManagement(options.tomoHome, options.runningConfig);
+    }
+  }
+  async context(id: string) {
+    const key = this.catalog().keys.get(id);
+    if (!key) throw new WebError(404, "session_not_found");
+    const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).find((item) => item.channelKey === key);
+    return readSessionContext(entry, this.options.sdkSessionsDir);
+  }
+
 
   catalog(): WebCatalog & { keys: Map<string, string> } {
     const entries = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir);

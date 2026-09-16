@@ -35,7 +35,7 @@ import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudg
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
-import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
+import { ChatCommandHandler } from "./agent/commands.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
@@ -59,8 +59,7 @@ import { pruneTools } from "./lcm/index.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
-import { writeJsonAtomicSync } from "./fs-utils.js";
+import { ConfigStore } from "./config/store.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
 import { spawn } from "node:child_process";
 
@@ -190,7 +189,7 @@ export class Agent {
   private queuedInbound = new Map<symbol, QueuedInboundWork>();
   /** Set once `recordUnprocessedInbound` has swept `queuedInbound`. */
   private inboundDrained = false;
-  private webRequestIds = new Map<string, string>();
+  private webRequestIds = new Map<string, Set<string>>();
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
@@ -245,10 +244,10 @@ export class Agent {
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
       runWithRetry: (req) => this.runWithRetry(req),
-      appendAssistantTranscript: (sessionKey, content, channelName) => {
+      appendAssistantTranscript: (sessionKey, content, channelName, correlation) => {
         this.sessions.append(sessionKey, {
           role: "assistant",
-          ...(channelName === "web" ? { requestId: this.webRequestIds.get(sessionKey) } : {}),
+          ...correlation,
           content,
           channel: channelName,
           timestamp: Date.now(),
@@ -459,19 +458,18 @@ export class Agent {
         await channel.send({ chatId, text: "Tomo is already active in this group." });
         return;
       }
-      const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-      const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
-      if (!channels[channel.name]) channels[channel.name] = {};
-      const allowlist = ((channels[channel.name].allowlist ?? []) as string[]);
-      if (!allowlist.includes(chatId)) {
-        allowlist.push(chatId);
-        channels[channel.name].allowlist = allowlist;
-        cfg.channels = channels;
-        backupConfigFile();
-        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
-        // Update the router's in-memory allowlist
-        this.router.addToAllowlist(channel.name, chatId);
-      }
+      new ConfigStore(CONFIG_PATH).update((cfg) => {
+        const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
+        if (!channels[channel.name]) channels[channel.name] = {};
+        const allowlist = ((channels[channel.name].allowlist ?? []) as string[]);
+        if (!allowlist.includes(chatId)) {
+          allowlist.push(chatId);
+          channels[channel.name].allowlist = allowlist;
+          cfg.channels = channels;
+        }
+        return cfg;
+      });
+      this.router.addToAllowlist(channel.name, chatId);
       log.info({ channel: channel.name, chatId }, "Group chat activated via secret");
       await channel.send({ chatId, text: "Tomo activated in this group." });
     } catch (err) {
@@ -571,8 +569,15 @@ export class Agent {
     const sessionKey = resolution.sessionKey;
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
-    // Web turns have their own outlet: never steer them into a provider turn.
-    // Provider batching stays intact; its steering guard refuses a live web turn.
+    // Owner web input can join an active private user turn. Shared replies
+    // use request-bound outlets; group/silent/background work stays queued.
+    if (channel.name === "web" && config.steering && this.liveSessionManager.isBusy(sessionKey)
+      && this.isOwnAudienceTurn(sessionKey) && this.liveSessionManager.isInteractiveTurn(sessionKey)) {
+      void this.processInboundItems([{ channel, message, resolution }], true).catch((err) => {
+        channel.settleMessage?.(message.id, "unknown"); log.error({ err }, "Web steering failed");
+      });
+      return true;
+    }
     const canCoalesce = (!isGroup || isPassiveGroup) && channel.name !== "web";
 
     if (!canCoalesce) {
@@ -1183,7 +1188,10 @@ export class Agent {
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
-    if (req.webRequestId) this.webRequestIds.set(req.key, req.webRequestId);
+    if (req.webRequestId) {
+      const requests = this.webRequestIds.get(req.key) ?? new Set<string>();
+      requests.add(req.webRequestId); this.webRequestIds.set(req.key, requests);
+    }
     // Published for the duration of the turn so session-scoped MCP tools can
     // see where this turn's input actually came from. Registered per TURN, not
     // per session: turns overlap under steering, and a per-key slot let the
@@ -1195,7 +1203,10 @@ export class Agent {
       await this.runUserTurnInner(req);
     } finally {
       this.turnAudiences.end(req.key, turnId);
-      if (req.webRequestId) this.webRequestIds.delete(req.key);
+      if (req.webRequestId) {
+        const requests = this.webRequestIds.get(req.key); requests?.delete(req.webRequestId);
+        if (!requests?.size) this.webRequestIds.delete(req.key);
+      }
     }
   }
 
@@ -1562,6 +1573,8 @@ export class Agent {
 
   /** Thin delegate kept on Agent so TurnRunner's late-bound dep (and tests
    *  that stub it on the instance) dispatch through `this`. */
+  readMcpStatuses() { return this.liveSessionManager.readMcpStatuses(); }
+
   private runWithRetry(req: RunWithRetryRequest): Promise<string> {
     return this.liveSessionManager.runWithRetry(req);
   }

@@ -24,11 +24,11 @@ export interface WebSession {
 }
 export interface WebCatalog { sessions: WebSession[]; ownerId: string | null; setupRequired: boolean }
 export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown";
-export interface WebRequest { requestId: string; state: RequestState; sessionId?: string }
+export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; text?: string; timestamp?: number }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebEvent =
-  | { type: "block"; sessionId: string; requestId: string; id: string; text: string }
+  | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
   | { type: "invalidate"; sessionId?: string }
   | { type: "tool"; sessionId: string; tool: string; state: "started" | "completed" | "failed" }
@@ -46,8 +46,13 @@ export class WebError extends Error {
 }
 
 /** This is a closed RPC protocol, never a generic method/file/command proxy. */
+export interface WebMcpLiveSession { sessionId: string; connections: import("../mcp/live-status.js").McpConnection[] | null }
+
 export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
+  z.object({ method: z.literal("mcp-status") }).strict(),
+  z.object({ method: z.literal("restart"), epoch: z.uuid(), reason: z.string().trim().min(1).max(240) }).strict(),
+  z.object({ method: z.literal("context-events"), sessionId: z.string().max(128) }).strict(),
   z.object({ method: z.literal("request"), requestId: z.uuid() }).strict(),
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
 ]);

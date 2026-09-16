@@ -163,9 +163,18 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.isAlive() ?? false;
   }
 
+  isInteractiveTurn(key: string): boolean {
+    return this.liveSessions.get(key)?.isInteractiveTurn() ?? false;
+  }
+
   /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */
   takeUndeliveredReply(key: string): boolean {
     return this.liveSessions.get(key)?.takeUndeliveredReply() ?? false;
+  }
+
+  async readMcpStatuses() {
+    const sessions = [...this.liveSessions].filter(([, session]) => session.isAlive()).slice(0, 32);
+    return Promise.all(sessions.map(async ([key, session]) => ({ key, connections: await session.readMcpStatus() })));
   }
 
   mountedExternalMcpServers(key: string): ReadonlySet<string> {
@@ -542,8 +551,8 @@ export class LiveSessionManager {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
       return await this.runTurnOnSession(key, session, steer, () => (steer
-        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience)
-        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery)));
+        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, req.replyContext, req.onJoined)
+        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext)));
     } catch (err) {
       // A turn the CLI ended on an error result is NOT a session error:
       // runTurnOnSession already recorded it; let it through to TurnRunner's

@@ -98,3 +98,41 @@ it("reaps a process whose event loop hangs after it reports ready", async () => 
   expect(supervisor.status().pid).toBeTypeOf("number");
   await expect.poll(() => supervisor.status().pid, { timeout: 2000 }).toBeNull();
 });
+
+it("maps live MCP health through owner visibility and dispatches a restart only once", async () => {
+  const reasons: string[] = [];
+  supervisor = new WebSupervisor(channel, { ...options(), mcpStatus: async () => [
+    { key: "dm:owner", connections: [{ name: "example", status: "connected" }] },
+    { key: "dm:someone-else", connections: [{ name: "private", status: "failed" }] },
+  ] }, { restart: async (reason) => { reasons.push(reason); } });
+  await supervisor.start();
+  const base = `http://127.0.0.1:${supervisor.status().port}`;
+  const response = await fetch(`${base}/api/v1/bootstrap?t=${readFileSync(join(root, "web-token"), "utf8").trim()}`, { headers });
+  const boot = await response.json() as WebBootstrap;
+  const cookie = response.headers.get("set-cookie")!.split(";")[0];
+  const read = async (path: string) => (await fetch(`${base}/api/v1/${path}`, { headers: { ...headers, cookie } })).json();
+  const mcp = await read("mcp");
+  expect(mcp.live).toEqual({ available: true, sessions: [{ sessionId: boot.ownerId, connections: [{ name: "example", status: "connected" }] }] });
+  const { revision } = await read("config");
+  const restart = async (epoch: string) => fetch(`${base}/api/v1/restart`, { method: "POST", headers: { ...headers, cookie,
+    origin: base, "content-type": "application/json", "x-tomo-csrf": boot.csrfToken, "x-tomo-epoch": epoch },
+    body: JSON.stringify({ revision, confirm: true, reason: "Apply reviewed settings" }) });
+  expect((await restart(randomUUID())).status).toBe(409); expect(reasons).toEqual([]);
+  expect((await restart(boot.epoch)).status).toBe(202); expect(reasons).toEqual(["Apply reviewed settings"]);
+  expect((await restart(boot.epoch)).status).toBe(409); expect(reasons).toHaveLength(1);
+});
+
+it("independently rejects a stale mutation at the daemon IPC boundary", async () => {
+  const childPath = join(root, "stale-rpc.cjs"); const output = join(root, "rpc-result.json");
+  const stale = { method: "message", epoch: randomUUID(), input: { requestId: randomUUID(), text: "Stale child message" } };
+  writeFileSync(childPath, `const fs = require('node:fs'); process.on('message', (message) => {
+    if (message.type === 'init') {
+      process.send({type:'ready', port:9465, accessToken:'tomo_web_'+'a'.repeat(64)});
+      process.send({type:'rpc', id:17, input:${JSON.stringify(stale)}});
+    } else if (message.type === 'result' && message.id === 17) fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify(message));
+    else if (message.type === 'ping') process.send({type:'pong'});
+  });`);
+  supervisor = new WebSupervisor(channel, options(), { childPath, maxRestarts: 0 }); await supervisor.start();
+  await expect.poll(() => { try { return JSON.parse(readFileSync(output, "utf8")); } catch { return undefined; } }).toMatchObject({ error: { status: 409, code: "epoch_changed" } });
+  expect(channel.snapshot().requests).toEqual([]);
+});

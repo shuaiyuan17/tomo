@@ -33,6 +33,8 @@ default and requires the access token stored in `~/.tomo/web-token` (`0600`).
 The listener binds to `127.0.0.1`; optional Tailscale Serve access uses one exact
 HTTPS `web.externalOrigin`. Configure `web.enabled`, `web.port`, and, when
 multiple identities exist, `web.ownerIdentity` in `config.json`.
+The Study includes TODOs, cron controls, memory search, context history, MCP
+management, and a secret-safe config editor with reviewed saves and restart.
 See [web UI setup, security, and limits](docs/web-ui.md).
 
 That's it. Open Telegram and message your bot.

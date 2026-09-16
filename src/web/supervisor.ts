@@ -1,3 +1,5 @@
+import { dispatchWebRestart } from "./restart.js";
+import type { McpConnection } from "../mcp/live-status.js";
 import { fork, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -11,11 +13,12 @@ export interface WebSupervisorOptions extends WebDataOptions {
   externalOrigin?: string;
   port: number;
   assetsDir?: string;
+  mcpStatus?: () => Promise<Array<{ key: string; connections: McpConnection[] | null }>>;
   diagnostic?: (message: string) => void;
 }
 /** Internal timing/entry overrides allow real-process failure tests without
  * exposing executable paths or arbitrary process options in web config. */
-export interface SupervisorRuntime { childPath?: string; startupMs?: number; heartbeatMs?: number; maxRestarts?: number }
+export interface SupervisorRuntime { childPath?: string; startupMs?: number; heartbeatMs?: number; maxRestarts?: number; restart?: (reason: string) => Promise<void> }
 
 export class WebSupervisor implements WebLifecycle {
   private child?: ChildProcess;
@@ -25,6 +28,7 @@ export class WebSupervisor implements WebLifecycle {
   private unsubscribe?: () => void;
   private boundPort: number | null = null;
   private starting?: Promise<void>;
+  private restartPending = false;
 
   constructor(private readonly channel: WebChannel, private readonly options: WebSupervisorOptions,
     private readonly runtime: SupervisorRuntime = {}) {}
@@ -128,8 +132,18 @@ export class WebSupervisor implements WebLifecycle {
             if (Buffer.byteLength(JSON.stringify(result)) > MAX_BUFFER_BYTES - 1024) result.replay = null;
             return result;
           }
+          if (input.method === "mcp-status") return (await this.options.mcpStatus?.() ?? []).flatMap((entry) => {
+            const sessionId = this.channel.sessionId(entry.key); return sessionId ? [{ sessionId, connections: entry.connections }] : [];
+          });
+          if (input.method === "context-events") return this.channel.contextEvents(input.sessionId);
           if (input.method === "request") return this.channel.request(input.requestId);
           if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+          if (input.method === "restart") {
+            if (this.restartPending) throw new WebError(409, "restart_pending");
+            this.restartPending = true;
+            try { await (this.runtime.restart ?? dispatchWebRestart)(input.reason); return { restarting: true }; }
+            catch { this.restartPending = false; throw new WebError(503, "restart_failed"); }
+          }
           return this.channel.receive(input.input);
         };
         void run().then((result) => send({ type: "result", id, value: result }), (err: unknown) => {
@@ -149,8 +163,8 @@ export class WebSupervisor implements WebLifecycle {
         this.timer = setTimeout(() => { void this.launch().catch(() => this.report("Web UI restart failed.")); }, 500 * 2 ** (this.restarts - 1));
         this.timer.unref();
       });
-      const { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin,
+      const { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin, workspaceDir, runningConfig } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin, workspaceDir, runningConfig,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

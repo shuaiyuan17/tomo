@@ -1,3 +1,4 @@
+import { mcpServerName, mcpServerSchema } from "../config/schema.js";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 
 type Env = Record<string, string | undefined>;
@@ -18,7 +19,6 @@ export interface ExternalMcpServerConfig {
   oauth?: McpOAuthConfig;
 }
 
-const SERVER_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const ENV_VAR_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
 
 export function expandEnvVars(value: string, env: Env = process.env): string {
@@ -35,9 +35,10 @@ export function parseExternalMcpServers(
 
   const servers: Record<string, ExternalMcpServerConfig> = {};
   for (const [name, value] of Object.entries(raw)) {
-    if (!SERVER_NAME_RE.test(name) || !isRecord(value)) continue;
+    if (!mcpServerName.safeParse(name).success || !isRecord(value)) continue;
     if (value.enabled === false || value.disabled === true) continue;
 
+    if (!mcpServerSchema.safeParse(value).success) continue;
     const server = parseServer(value, env);
     if (server) {
       const oauth = parseOAuthConfig(value.oauth, name, env);

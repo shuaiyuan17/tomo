@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { loadConfig, saveConfig, modelLabel } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig, modelLabel } from "./shared.js";
 import { promptForModel } from "./model-picker.js";
 import { DEFAULT_MODEL } from "../../models.js";
 
@@ -12,6 +12,6 @@ export async function configModel(): Promise<void> {
   if (!choice) return;
 
   cfg.model = choice;
-  saveConfig(cfg);
+  await saveConfig(cfg);
   p.log.success(`Default model set to ${modelLabel(choice)}`);
 }

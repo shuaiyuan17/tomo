@@ -1,7 +1,7 @@
+import { Text } from "./content.js";
+import { Study, type StudyPage } from "./study.js";
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
@@ -18,19 +18,10 @@ function storedTheme(): Theme {
 function Mark() {
   return <svg className="mark" viewBox="0 0 40 40" aria-hidden="true"><path d="M 32 14 C 36 20, 32 32, 20 32 C 8 32, 5 22, 10 14 C 14 7, 26 6, 30 12" /></svg>;
 }
-function Text({ children }: { children: string }) {
-  return <Markdown remarkPlugins={[remarkGfm]} skipHtml components={{
-    // Remote images would disclose local reading activity. Links require a
-    // deliberate click and cannot take control of the local window.
-    img: ({ alt }) => <span className="attachment">[Image: {alt || "not loaded"}]</span>,
-    a: ({ href, children }) => href && /^https?:\/\//.test(href)
-      ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> : <span>{children}</span>,
-    input: ({ checked }) => <input type="checkbox" checked={checked ?? false} disabled aria-label={checked ? "Completed task" : "Incomplete task"} />,
-  }}>{children}</Markdown>;
-}
 
 export function App() {
   const web = useWeb();
+  const [view, setView] = useState<"conversation" | StudyPage>("conversation");
   const [selected, setSelected] = useState("");
   const selectedId = selected || web.bootstrap?.ownerId || web.bootstrap?.sessions[0]?.id || "";
   const session = web.bootstrap?.sessions.find((s) => s.id === selectedId);
@@ -78,10 +69,10 @@ export function App() {
     if (!element) return;
     if (restoreScroll.current !== null) { element.scrollTop = element.scrollHeight - restoreScroll.current; restoreScroll.current = null; }
     else if (atBottom.current) element.scrollTop = element.scrollHeight;
-  }, [history, web.blocks]);
+  }, [history, web.blocks, web.requests, view]);
 
   useEffect(() => {
-    web.discardRecordedBlocks(new Set(history.messages.filter((m) => m.role === "assistant" && m.requestId).map((m) => m.requestId!)));
+    web.discardRecordedBlocks(new Set(history.messages.filter((m) => m.role === "assistant").flatMap((m) => [m.requestId, m.turnId]).filter((id): id is string => !!id)));
   }, [history, web.discardRecordedBlocks]);
 
   const remember = (id: string | null) => {
@@ -96,6 +87,7 @@ export function App() {
     setSending(true); setFeedback("Sending…"); remember(requestId);
     try {
       const request = await sendMessage({ requestId, targetId: session.id, text }, web.bootstrap, web.refreshBootstrap);
+      web.acceptRequest({ ...request, text, timestamp: Date.now() });
       setDraft((old) => old.trim() === text ? "" : old);
       setFeedback(labels[request.state]); remember(null); setReload((r) => r + 1); atBottom.current = true;
     } catch (err) {
@@ -135,22 +127,29 @@ export function App() {
       } else setHistoryStatus("error");
     }
   };
-  const durable = new Set(history.messages.filter((m) => m.role === "assistant").map((m) => m.requestId).filter(Boolean));
-  const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.requestId));
+  const durable = new Set(history.messages.filter((m) => m.role === "assistant").flatMap((m) => [m.requestId, m.turnId]).filter((id): id is string => !!id));
+  const recordedUsers = new Set(history.messages.filter((m) => m.role === "user").map((m) => m.requestId));
+  const pendingUsers = web.requests.filter((request) => request.sessionId === selectedId && request.text && !recordedUsers.has(request.requestId) && request.state !== "refused");
+  const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.turnId ?? b.requestId));
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   return <div className="shell">
-    <a className="skip" href="#conversation">Skip to conversation</a>
+    <a className="skip" href={view === "conversation" ? "#conversation" : "#study"}>Skip to content</a>
     <header className="topbar"><a className="brand" href="/" aria-label="Tomo home"><Mark /><span>tomo<span className="brand-dot">.</span></span></a>
-      <span className="section-name">Conversation</span>
+      <span className="section-name">{view === "conversation" ? "Conversation" : "The Study"}</span>
       <div className="header-actions"><span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
         <label className="theme-label"><span className="sr-only">Color theme</span><select aria-label="Color theme" value={theme} onChange={(e) => setTheme(e.target.value as Theme)}><option value="system">System theme</option><option value="light">Light theme</option><option value="dark">Dark theme</option></select></label>
       </div>
     </header>
     <div className="workspace">
       <aside className="sidebar" aria-label="Conversation details">
-        <p className="eyebrow">Your conversations</p>
+        <nav className="workspace-nav" aria-label="Workspace">
+          <button aria-current={view === "conversation" ? "page" : undefined} onClick={() => setView("conversation")}>Conversation</button>
+          <p className="eyebrow">The Study</p>
+          {(["todos", "cron", "memory", "context", "mcp", "config"] as StudyPage[]).map((page) => <button key={page} aria-current={view === page ? "page" : undefined} onClick={() => setView(page)}>{({ todos: "TODOs", cron: "Cron", memory: "Memory", context: "Context", mcp: "MCP servers", config: "Config" })[page]}</button>)}
+        </nav>
+        <p className="eyebrow session-title">Your conversations</p>
         <label htmlFor="session">Session</label>
         <select id="session" value={selectedId} disabled={!web.bootstrap?.sessions.length} onChange={(e) => { setSelected(e.target.value); setFeedback(""); }}>
           {!web.bootstrap?.sessions.length && <option value="">No session available</option>}
@@ -164,7 +163,7 @@ export function App() {
         </section>
         <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
-      <main id="conversation" className="conversation" tabIndex={-1}>
+      <main id="conversation" className="conversation" tabIndex={-1} hidden={view !== "conversation"}>
         <div className="conversation-heading"><div><p className="eyebrow">{session?.kind === "group" ? "Group history" : "A conversation with Tomo"}</p><h1>{session?.kind === "group" ? session.title : "Room to think."}</h1></div><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         {web.bootstrap?.setupRequired && <div className="notice" role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className="notice" role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
@@ -172,8 +171,9 @@ export function App() {
           {history.nextCursor && <button className="older" onClick={() => void older()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</button>}
           {historyStatus === "error" && <div className="notice" role="alert">History is unavailable. <button onClick={() => setReload((r) => r + 1)}>Try again</button></div>}
           {historyStatus === "loading" && selectedId && <p className="empty-note" role="status">Opening your conversation…</p>}
-          {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && <div className="empty"><Mark /><h2>Start wherever you are.</h2><p>{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
+          {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="empty"><Mark /><h2>Start wherever you are.</h2><p>{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
           {history.messages.map((message) => <article className={`message ${message.role}`} key={message.id}><div className="message-meta"><span>{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span></div><div className="markdown"><Text>{message.content}</Text></div></article>)}
+          {pendingUsers.map((request) => <article className="message user pending" data-request-id={request.requestId} key={request.requestId}><div className="message-meta"><span>You</span><span>Web</span><span>{request.joined ? "Joined the active turn" : labels[request.state]}</span></div><div className="markdown"><Text>{request.text!}</Text></div></article>)}
           {blocks.map((block) => <article className="message assistant" key={block.id}><div className="message-meta"><span>Tomo</span><span>Reply in progress</span></div><div className="markdown"><Text>{block.text}</Text></div></article>)}
         </div>
         <div className="composer-area"><div className="activity" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
@@ -184,6 +184,7 @@ export function App() {
           {uncertain && !sending && <div className="recovery"><button onClick={() => void checkOutcome()}>Check message status</button><button onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</button></div>}
         </div>
       </main>
+      {view !== "conversation" && <Study page={view} selectedId={selectedId} session={session} web={web} />}
     </div>
   </div>;
 }

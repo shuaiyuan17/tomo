@@ -215,9 +215,12 @@ async function startForeground(): Promise<void> {
     try {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
+      const { runningConfigSnapshot } = await import("../web/management.js");
       const web = new WebChannel(config.identities, config.web.ownerIdentity);
       web.attach(new WebSupervisor(web, {
-        ...config.web, identities: config.identities,
+        ...config.web, identities: config.identities, workspaceDir: config.workspaceDir,
+        runningConfig: runningConfigSnapshot(config as unknown as Record<string, unknown>, config.fileRevision ?? "", process.env),
+        mcpStatus: () => agent.readMcpStatuses(),
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
         diagnostic: (message) => log.info(message),
       }));

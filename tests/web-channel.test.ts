@@ -147,3 +147,22 @@ it("replays bounded events and reports gaps or another epoch", () => {
   expect(events.after("previous-epoch:1")).toBeNull();
   expect(events.after(events.cursor())).toEqual([]);
 });
+
+it("shares a serialized snapshot budget between queued text and completed blocks", async () => {
+  const { channel } = setup(); const text = "\u0001".repeat(16_000); const ids: string[] = [];
+  for (let i = 0; i < 21; i++) { const requestId = randomUUID(); ids.push(requestId); await channel.receive({ requestId, text }); }
+  await expect(channel.receive({ requestId: randomUUID(), text })).rejects.toMatchObject({ status: 429 });
+  await expect(channel.send({ chatId: ids[0], text: "x".repeat(200_000) })).rejects.toThrow("Web mailbox full");
+  expect(Buffer.byteLength(JSON.stringify(channel.snapshot()))).toBeLessThan(MAX_BUFFER_BYTES);
+  channel.settleMessage(ids[0], "refused");
+  expect(channel.request(ids[0]).text).toBeUndefined();
+  await expect(channel.receive({ requestId: randomUUID(), text })).resolves.toMatchObject({ state: "queued" });
+});
+it("releases accepted text after failed handoff and terminal settlement", async () => {
+  const { channel, handler, bus } = setup(); handler.mockResolvedValue(false);
+  const refused = randomUUID(); await expect(channel.receive({ requestId: refused, text: "Private draft" })).rejects.toThrow();
+  expect(channel.request(refused).text).toBeUndefined();
+  handler.mockResolvedValue(true); const completed = randomUUID(); await channel.receive({ requestId: completed, text: "Accepted draft" });
+  bus.publish({ type: "turn.end", sessionKey: "dm:owner", requestId: completed, source: "user", ok: true, durationMs: 1 });
+  expect(channel.request(completed).text).toBeUndefined();
+});

@@ -28,6 +28,7 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  private pendingTextBytes = 0;
 
   constructor(identities: IdentityConfig[], ownerIdentity?: string, private readonly bus: WatchBus = watchBus) {
     this.owner = selectWebOwner(identities, ownerIdentity);
@@ -41,6 +42,7 @@ export class WebChannel implements Channel {
     if (!receipt || receipt.settled) return;
     this.state(messageId, outcome);
     receipt.settled = true;
+    this.clearRequestText(receipt);
   }
   onCommand(_handler: CommandHandler): void { /* No command endpoint; chat remains ordinary Agent input. */ }
 
@@ -57,6 +59,8 @@ export class WebChannel implements Channel {
       if (previous.digest !== digest) throw new WebError(409, "request_id_conflict");
       return { ...previous.request };
     }
+    const textBytes = Buffer.byteLength(JSON.stringify(input.text));
+    if (this.pendingTextBytes + this.blockBytes + textBytes > MAX_BUFFER_BYTES - 64 * 1024) throw new WebError(429, "request_limit");
     if ([...this.receipts.values()].filter((r) => !r.settled).length >= 32) {
       throw new WebError(429, "request_limit");
     }
@@ -65,8 +69,9 @@ export class WebChannel implements Channel {
       if (!oldest) throw new WebError(429, "request_limit");
       this.receipts.delete(oldest[0]);
     }
-    const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId };
+    const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId, text: input.text, timestamp: Date.now(), responseTurnId: input.requestId };
     this.receipts.set(input.requestId, { digest, request, settled: false });
+    this.pendingTextBytes += textBytes;
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
       text: input.text, timestamp: Date.now(), isGroup: false };
     const handoff = Promise.resolve().then(() => this.handler!(message));
@@ -79,6 +84,7 @@ export class WebChannel implements Channel {
     } catch (err) {
       if (request.state !== "refused") this.state(input.requestId, "unknown");
       this.receipts.get(input.requestId)!.settled = true;
+      this.clearRequestText(this.receipts.get(input.requestId)!);
       throw err instanceof WebError ? err : new WebError(503, "handoff_failed");
     } finally { this.handoffs.delete(handoff); }
   }
@@ -86,7 +92,7 @@ export class WebChannel implements Channel {
   request(id: string): WebRequest { return { ...(this.receipts.get(id)?.request ?? { requestId: id, state: "unknown" }) }; }
   snapshot() {
     return { epoch: this.events.epoch, cursor: this.events.cursor(),
-      requests: [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request })), blocks: [...this.blocks] };
+      requests: [...this.receipts.values()].filter((r) => !r.settled || r.request.timestamp! > Date.now() - 15 * 60_000).slice(-128).map((r) => ({ ...r.request })), blocks: [...this.blocks] };
   }
 
   async send(message: OutgoingMessage): Promise<void> {
@@ -99,13 +105,13 @@ export class WebChannel implements Channel {
       this.state(requestId, "failed");
       throw markDefiniteFailure(new Error("Web attachments are not supported"));
     }
-    const bytes = Buffer.byteLength(message.text);
-    if (this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024) {
+    const block: Extract<WebEvent, { type: "block" }> = { type: "block", sessionId: this.ownerId,
+      requestId, turnId: receipt.request.responseTurnId, id: `${requestId}:${this.blocks.length}`, text: message.text };
+    const bytes = Buffer.byteLength(JSON.stringify(block));
+    if (this.blockBytes + bytes + this.pendingTextBytes > MAX_BUFFER_BYTES - 64 * 1024) {
       this.state(requestId, "failed");
       throw markDefiniteFailure(new Error("Web mailbox full"));
     }
-    const block: Extract<WebEvent, { type: "block" }> = { type: "block", sessionId: this.ownerId,
-      requestId, id: `${requestId}:${this.blocks.length}`, text: message.text };
     try { this.events.publish(block); } catch (err) {
       this.state(requestId, "failed");
       throw markDefiniteFailure(err);
@@ -128,30 +134,44 @@ export class WebChannel implements Channel {
   }
   async stop(): Promise<void> { this.closeIngestion(); await this.quiesce(); await this.teardown(); }
 
+  private clearRequestText(receipt: Receipt): void {
+    if (receipt.request.text !== undefined) this.pendingTextBytes -= Buffer.byteLength(JSON.stringify(receipt.request.text));
+    delete receipt.request.text;
+  }
+
   private state(requestId: string, state: WebRequest["state"]): void {
     const receipt = this.receipts.get(requestId);
     if (!receipt) return;
     receipt.request.state = state;
     this.events.publish({ type: "request", request: { ...receipt.request } });
   }
-  private sessionId(key: string): string | undefined {
+  sessionId(key: string): string | undefined {
     if (isGroupSessionKey(key)) return webSessionId(key);
     if (!this.owner || !this.ownerId) return;
     if (key === `dm:${this.owner.name.toLowerCase()}` || Object.entries(this.owner.channels).some(([ch, id]) =>
       legacySessionKeysForBinding([key], ch, id).length > 0)) return this.ownerId;
   }
+  contextEvents(sessionId: string) {
+    return this.bus.recent().filter((e) => e.type === "compact" && e.sessionKey && this.sessionId(e.sessionKey) === sessionId)
+      .map((e) => { const event = e as Extract<WatchEvent, { type: "compact" }>; return { timestamp: event.ts, preTokens: event.preTokens, postTokens: event.postTokens }; }).slice(-50);
+  }
   private observe(event: WatchEvent): void {
+    if (event.type === "cron.fired" || event.type === "cron.done") { this.events.publish({ type: "invalidate" }); return; }
+    if (event.type === "compact") { this.events.publish({ type: "invalidate", sessionId: event.sessionKey ? this.sessionId(event.sessionKey) : undefined }); return; }
     if (!("sessionKey" in event) || !event.sessionKey) return;
     const sessionId = this.sessionId(event.sessionKey);
     if (!sessionId) return;
-    if (event.type === "turn.start" && event.requestId && this.receipts.has(event.requestId)) {
+    if (event.type === "turn.join") {
+      const receipt = this.receipts.get(event.requestId);
+      if (receipt) { receipt.request.responseTurnId = event.turnId; receipt.request.joined = true; this.state(event.requestId, "running"); }
+    } else if (event.type === "turn.start" && event.requestId && this.receipts.has(event.requestId)) {
       this.state(event.requestId, "running");
     } else if (event.type === "turn.end" && event.requestId) {
       if (this.request(event.requestId).state !== "failed") this.state(event.requestId, event.ok ? "completed" : "failed");
       const receipt = this.receipts.get(event.requestId);
-      if (receipt) receipt.settled = true;
+      if (receipt) { receipt.settled = true; this.clearRequestText(receipt); }
       this.blocks = this.blocks.filter((block) => block.requestId !== event.requestId);
-      this.blockBytes = this.blocks.reduce((sum, block) => sum + Buffer.byteLength(block.text), 0);
+      this.blockBytes = this.blocks.reduce((sum, block) => sum + Buffer.byteLength(JSON.stringify(block)), 0);
       this.events.publish({ type: "invalidate", sessionId });
     } else if (event.type === "transcript" || event.type === "turn.stats") {
       this.events.publish({ type: "invalidate", sessionId });

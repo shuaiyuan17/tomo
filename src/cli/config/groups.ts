@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { loadConfig, saveConfig } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig } from "./shared.js";
 
 export async function configGroups(): Promise<void> {
   const cfg = loadConfig();
@@ -13,7 +13,7 @@ export async function configGroups(): Promise<void> {
     const { randomBytes } = await import("node:crypto");
     const newSecret = `tomo-${randomBytes(4).toString("hex")}`;
     cfg.groupSecret = newSecret;
-    saveConfig(cfg);
+    await saveConfig(cfg);
     p.log.success("Group chat enabled!");
     p.log.message([
       "Send this secret in any group chat to activate Tomo there:",
@@ -45,7 +45,7 @@ export async function configGroups(): Promise<void> {
     const { randomBytes } = await import("node:crypto");
     const newSecret = `tomo-${randomBytes(4).toString("hex")}`;
     cfg.groupSecret = newSecret;
-    saveConfig(cfg);
+    await saveConfig(cfg);
     p.log.success(`New secret: ${newSecret}`);
     p.log.warn("Existing groups stay active. New groups need the new secret.");
   }
@@ -54,7 +54,7 @@ export async function configGroups(): Promise<void> {
     const confirm = await p.confirm({ message: "Disable group chat? Existing activated groups will stop working." });
     if (p.isCancel(confirm) || !confirm) return;
     delete cfg.groupSecret;
-    saveConfig(cfg);
+    await saveConfig(cfg);
     p.log.success("Group chat disabled");
   }
 }

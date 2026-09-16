@@ -1,7 +1,9 @@
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
+import * as p from "@clack/prompts";
+import { isDeepStrictEqual } from "node:util";
+import { FileLockTimeoutError } from "../../file-lock.js";
+import { ConfigStore, ConfigConflictError } from "../../config/store.js";
 import { defaultRuntimePaths } from "../../runtime-paths.js";
 
 const paths = defaultRuntimePaths;
@@ -14,101 +16,73 @@ export const LOG_PATH = join(paths.logsDir, "tomo.log");
 
 export const MODELS = MODEL_ALIASES;
 
-/**
- * The config file exists but could not be turned into an object. Carries the
- * underlying error as `cause` so callers can show the syntax error (or the
- * errno) that a user has to fix by hand.
- */
-export class ConfigReadError extends Error {
-  readonly path: string;
-  constructor(path: string, cause: unknown) {
-    super(`config file could not be read: ${path}`, { cause });
-    this.name = "ConfigReadError";
-    this.path = path;
-  }
-}
-
-/**
- * Read the config, or return undefined when there is no file at all.
- *
- * Absent is a normal state (a fresh install has no config); anything else —
- * EACCES, EIO, a trailing comma left by a hand-edit — is a failure, not
- * emptiness. Reading a failure as `{}` is what made every `configXxx()` a
- * read-modify-write that persisted a config containing only the key just
- * edited, silently destroying the bot token, allowlists, identities,
- * groupSecret, mcpServers, plugins and auth — while printing success.
- */
-function readConfigFile(path: string): Record<string, unknown> | undefined {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw new ConfigReadError(path, err);
-  }
-  let data: unknown;
-  try {
-    data = JSON.parse(raw);
-  } catch (err) {
-    throw new ConfigReadError(path, err);
-  }
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
-    throw new ConfigReadError(path, new Error("config root is not a JSON object"));
-  }
-  return data as Record<string, unknown>;
-}
-
-/** Throws {@link ConfigReadError} when the file exists but is unreadable. */
+// No path argument: callers/tests must isolate runtime paths BEFORE import.
+// A previous test passed an ignored path argument and overwrote a real config.
+const store = new ConfigStore(CONFIG_PATH, CONFIG_BACKUP_PATH, 1_000);
+const revisions = new WeakMap<Record<string, unknown>, string>();
+const originals = new WeakMap<Record<string, unknown>, Record<string, unknown>>();
 export function loadConfig(): Record<string, unknown> {
-  return readConfigFile(CONFIG_PATH) ?? {};
+  const { value, revision } = store.read(); revisions.set(value, revision); originals.set(value, structuredClone(value)); return value;
 }
-
-/**
- * Neither this nor {@link loadConfig} takes a path override, deliberately.
- * An earlier revision let tests pass a temp path, which meant the test
- * isolated only on a build that had the parameter — run against one without
- * it, the same test wrote the developer's real ~/.tomo/config.json. That
- * happened. Tests isolate by $HOME instead (see
- * tests/cli-config-write-guard.test.ts), which holds on every revision;
- * removing the parameter makes the old mistake a compile error.
- */
 export function saveConfig(cfg: Record<string, unknown>): void {
-  // Re-check the file at write time, not just at load time. Two reasons, and
-  // both are data loss:
-  //  - the backup is a copy of THIS file, so rotating it from a file we
-  //    cannot parse would replace a good `.bak` with a broken one — the
-  //    second save is what makes the damage unrecoverable;
-  //  - the caller assembled `cfg` from whatever load returned, so writing it
-  //    over content we never understood publishes a config with the missing
-  //    keys gone.
-  // The file can also have been hand-edited between load and save (the config
-  // UI is a long-lived interactive session), so the load-time check alone is
-  // not enough.
-  readConfigFile(CONFIG_PATH);
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
-  writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+  const result = store.update(() => cfg, revisions.get(cfg)); revisions.set(cfg, result.revision); originals.set(cfg, structuredClone(cfg));
 }
-
-/**
- * Rotate `path` into `backupPath` only if it currently parses.
- *
- * `backupFileIfExistsSync` is content-blind, so calling it directly on a
- * config that has gone bad replaces the one good backup with the broken file
- * — which is what made the damage in this issue unrecoverable after a second
- * write. Callers that intend to overwrite regardless (`tomo init --force`)
- * want to skip the rotation, not abort, so this reports rather than throws.
- *
- * Returns true when a backup was taken.
- */
-export function backupConfigIfParseableSync(path: string, backupPath: string): boolean {
-  try {
-    if (readConfigFile(path) === undefined) return false; // nothing there yet
-  } catch {
-    return false; // unparseable: keep whatever backup already exists
-  }
-  backupFileIfExistsSync(path, backupPath, { mode: 0o600 });
-  return true;
-}
-
+export { ConfigReadError, backupConfigIfParseableSync } from "../../config/store.js";
 export { modelLabel };
+
+export class ConfigSaveCancelled extends Error {}
+function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
+/** Reapply only this editor's delta. Arrays are atomic; unrelated latest fields survive. */
+function rebase(base: unknown, draft: unknown, latest: unknown, path: string[], conflicts: string[]): unknown {
+  if (isDeepStrictEqual(base, draft)) return latest;
+  if (record(base) && record(draft) && record(latest)) {
+    return Object.fromEntries([...new Set([...Object.keys(latest), ...Object.keys(base), ...Object.keys(draft)])]
+      .map((key) => [key, rebase(Object.hasOwn(base, key) ? base[key] : undefined,
+        Object.hasOwn(draft, key) ? draft[key] : undefined, Object.hasOwn(latest, key) ? latest[key] : undefined, [...path, key], conflicts)])
+      .filter(([, value]) => value !== undefined));
+  }
+  if (!isDeepStrictEqual(base, latest) && !isDeepStrictEqual(draft, latest)) conflicts.push(path.join("."));
+  return draft;
+}
+/** Preserve references held by a submenu (e.g. Sessions' overrides object). */
+function syncDraft(target: Record<string, unknown>, saved: Record<string, unknown>): void {
+  for (const key of Object.keys(target)) if (!Object.hasOwn(saved, key)) delete target[key];
+  for (const [key, value] of Object.entries(saved)) {
+    if (Object.hasOwn(target, key) && record(target[key]) && record(value)) syncDraft(target[key], value);
+    else if (Array.isArray(target[key]) && Array.isArray(value)) target[key].splice(0, target[key].length, ...structuredClone(value));
+    else Object.defineProperty(target, key, { value: structuredClone(value), writable: true, enumerable: true, configurable: true });
+  }
+}
+/** Keep the draft and submenu alive while the user resolves a write collision. */
+export async function saveConfigInteractive(cfg: Record<string, unknown>): Promise<void> {
+  let candidate = cfg;
+  let revision = revisions.get(cfg);
+  const original = originals.get(cfg);
+  for (;;) {
+    try {
+      const result = store.update(() => candidate, revision);
+      syncDraft(cfg, result.value);
+      revisions.set(cfg, result.revision); originals.set(cfg, structuredClone(cfg));
+      return;
+    } catch (error) {
+      if (error instanceof FileLockTimeoutError) {
+        p.log.warn("Config is busy in another process. Your unsaved edits are still held here.");
+        const retry = await p.confirm({ message: "Retry saving your edits? (No discards this action.)", initialValue: true });
+        if (p.isCancel(retry) || !retry) throw new ConfigSaveCancelled();
+        continue;
+      }
+      if (!(error instanceof ConfigConflictError)) throw error;
+      const latest = store.read(); const conflicts: string[] = [];
+      // Production submenus always load first; never replace an untracked file.
+      if (!original) throw error;
+      candidate = rebase(original, cfg, latest.value, [], conflicts) as Record<string, unknown>;
+      p.log.warn("Config changed in another process. Your unsaved edits are still held here.");
+      if (conflicts.length) p.log.warn(`Both editors changed: ${conflicts.join(", ")}. Values are hidden.`);
+      const apply = await p.confirm({ message: conflicts.length
+        ? "Apply your edits to the latest config, replacing those conflicting fields? (No discards this action.)"
+        : "Apply your edits while keeping the other process's changes? (No discards this action.)", initialValue: false });
+      if (p.isCancel(apply) || !apply) throw new ConfigSaveCancelled();
+      revision = latest.revision;
+    }
+  }
+}

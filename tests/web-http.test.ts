@@ -21,7 +21,7 @@ let handoff: ReturnType<typeof vi.fn>;
 let cookie: string;
 let bootstrap: WebBootstrap;
 const baseHeaders = { "x-tomo-request": "1", "sec-fetch-site": "same-origin" };
-const accessToken = "a".repeat(64);
+const accessToken = "tomo_web_" + "a".repeat(64);
 const externalOrigin = "https://test-node.test-tailnet.ts.net";
 let now: number;
 

@@ -102,6 +102,7 @@ export class WebSupervisor implements WebLifecycle {
           this.boundPort = value.port;
           this.report(`Web UI: http://127.0.0.1:${value.port}/?t=${value.accessToken}`);
           if (this.options.externalOrigin) this.report(`Web UI via Tailscale Serve: ${this.options.externalOrigin}/?t=${value.accessToken}`);
+          this.report("Open the private access link in the runtime home's web-access.log (0600).");
           settle();
           return;
         }

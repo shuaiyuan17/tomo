@@ -102,7 +102,7 @@ export function App() {
       if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
         remember(null);
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
-          : err.status === 401 ? "Open the access link from tomo start to reconnect. Your draft is kept."
+          : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
           : err.code === "owner_dm_only" ? "Group conversations are read-only." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
       } else setFeedback(labels.unknown);
     } finally { setSending(false); }
@@ -167,7 +167,7 @@ export function App() {
       <main id="conversation" className="conversation" tabIndex={-1}>
         <div className="conversation-heading"><div><p className="eyebrow">{session?.kind === "group" ? "Group history" : "A conversation with Tomo"}</p><h1>{session?.kind === "group" ? session.title : "Room to think."}</h1></div><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         {web.bootstrap?.setupRequired && <div className="notice" role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
-        {web.connection === "locked" && <div className="notice" role="alert">Open the access link shown by <code>tomo start</code> to connect. The link includes your private access token.</div>}
+        {web.connection === "locked" && <div className="notice" role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
         <div className="transcript" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={() => { const e = scroll.current!; atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 80; }}>
           {history.nextCursor && <button className="older" onClick={() => void older()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</button>}
           {historyStatus === "error" && <div className="notice" role="alert">History is unavailable. <button onClick={() => setReload((r) => r + 1)}>Try again</button></div>}

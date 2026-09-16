@@ -14,6 +14,8 @@ cpSync(source, temporary, { recursive: true, filter: (path) => !excluded.has(bas
 symlinkSync(join(source, "node_modules"), join(temporary, "node_modules"), "dir");
 
 const cases = [
+  ["access-log-permissions","src/web/token-store.ts","const fd = openSync(temporary, \"wx\", 0o600);","const fd = openSync(temporary, \"wx\", 0o644);","tests/web-access.test.ts"],
+  ["web-token-redaction","src/redact.ts","  [/\\btomo_web_[a-f0-9]{64}\\b/g, \"***\"],","","tests/web-access.test.ts"],
   ["unicode-body-limit","src/web/protocol.ts","MAX_BODY_BYTES = 128 * 1024","MAX_BODY_BYTES = 32 * 1024","tests/web-http.test.ts"],
   ["csrf-recovery","web/src/api.ts","const fresh = await refresh();","throw error; const fresh = await refresh();","tests/web-http.test.ts"],
   ["private-api-auth","src/web/http.ts","access.require(req, origin)) : undefined","\"unauthenticated\") : undefined","tests/web-http.test.ts"],

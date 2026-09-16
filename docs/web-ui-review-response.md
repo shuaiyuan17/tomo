@@ -13,6 +13,8 @@ The 2026-09-16 review decisions include token authentication and private Tailsca
 | 6. Receipt capacity | At 4,096 retained receipts, evict the oldest settled receipt. The 32-active limit counts unsettled failed deliveries too. A 4,101-submission test proves continued admission and preservation of a live outlet. Lookup of an evicted ID returns unknown without scanning history. Deduplication is bounded by retained receipts, as documented; the browser never automatically resubmits unknown work. |
 | 7. History errors | Typed history errors map malformed cursors to 400, revision changes to 409, and resource limits to 413. Browser E2E introduces rotation during the cursor request and verifies first-page recovery without an error prompt. |
 
+Full access links use a separate `0600` access log. This deliberately avoids the suggested unredacted ordinary log: the repository explicitly notes that ordinary logs may be world-readable and shared in bug reports. Tokens have a recognizable format so both URL diagnostics and bare token-file contents are scrubbed by the existing logger.
+
 ## Other comments
 
 - SSE sends the authoritative snapshot first, replays only transient tool/typing activity, then sends buffered events newer than its watermark. Old block replay cannot resurrect completed work.
@@ -25,4 +27,4 @@ The 2026-09-16 review decisions include token authentication and private Tailsca
 
 ## Validation
 
-Lint and strict TypeScript build pass. All 2,611 tests in 142 files pass; all 8 Chromium E2E scenarios pass. Each of 45 targeted implementation reversions fails a behavioral assertion, and the restored suites pass. See [validation evidence](web-ui-validation.md) for the matrix and packaging check. Remote results are recorded in the PR checks.
+Lint and strict TypeScript build pass. All 2,612 tests in 142 files pass; all 8 Chromium E2E scenarios pass. Each of 47 targeted implementation reversions fails a behavioral assertion, and the restored suites pass. See [validation evidence](web-ui-validation.md) for the matrix and packaging check. Remote results are recorded in the PR checks.

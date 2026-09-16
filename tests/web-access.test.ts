@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { WebAccess } from "../src/web/access.js";
-import { loadWebToken } from "../src/web/token-store.js";
+import { loadWebToken, writeWebAccessLinks } from "../src/web/token-store.js";
+import { scrubSecretValues } from "../src/redact.js";
 import { parseWebConfig } from "../src/web/config.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const request = (cookie = "") => ({ headers: { cookie } }) as IncomingMessage;
-const token = "a".repeat(64);
+const token = "tomo_web_" + "a".repeat(64);
 const origin = "http://127.0.0.1:9465";
 function login(access: WebAccess, target = origin) {
   let cookie = "";
@@ -29,7 +30,7 @@ describe("web access authentication", () => {
     expect(signed.cookie).toContain("HttpOnly; SameSite=Strict; Path=/api/v1");
     expect(signed.cookie).not.toContain(token);
     expect(new WebAccess(token).bootstrap(signed.req, {} as ServerResponse, new URL(origin), origin)).toBe(signed.session);
-    expect(() => new WebAccess("b".repeat(64)).require(signed.req, origin)).toThrow();
+    expect(() => new WebAccess("tomo_web_" + "b".repeat(64)).require(signed.req, origin)).toThrow();
     expect(() => new WebAccess("")).toThrow();
   });
   it("binds cookies to the exact origin, denies forgery/duplicates and expires authentication", () => {
@@ -49,7 +50,7 @@ describe("persistent token", () => {
   it("creates a private token and reuses it across restarts", () => {
     const root = setup(); const diagnostic = vi.fn();
     const first = loadWebToken(root, diagnostic);
-    expect(first).toMatch(/^[a-f0-9]{64}$/);
+    expect(first).toMatch(/^tomo_web_[a-f0-9]{64}$/);
     expect(statSync(join(root, "web-token")).mode & 0o777).toBe(0o600);
     expect(loadWebToken(root, diagnostic)).toBe(first);
     expect(diagnostic).toHaveBeenCalledOnce();
@@ -60,7 +61,7 @@ describe("persistent token", () => {
     writeFileSync(path, token, { mode: 0o644 }); chmodSync(path, 0o644);
     expect(loadWebToken(root, () => {})).not.toBe(token);
     writeFileSync(path, "bad");
-    expect(loadWebToken(root, () => {})).toMatch(/^[a-f0-9]{64}$/);
+    expect(loadWebToken(root, () => {})).toMatch(/^tomo_web_[a-f0-9]{64}$/);
     rmSync(path); const target = join(root, "unrelated"); writeFileSync(target, "unchanged"); symlinkSync(target, path);
     loadWebToken(root, () => {});
     expect(readFileSync(target, "utf8")).toBe("unchanged");
@@ -69,6 +70,16 @@ describe("persistent token", () => {
   it("refuses a directory writable by other OS users", () => {
     const root = setup(); chmodSync(root, 0o777);
     expect(() => loadWebToken(root, () => {})).toThrow("Unsafe");
+  });
+  it("keeps full access links private and redacts both URLs and bare tokens from ordinary logs", () => {
+    const root = setup(); const path = join(root, "web-access.log");
+    const link = `${origin}/?t=${token}`;
+    writeFileSync(path, "old", { mode: 0o644 }); chmodSync(path, 0o644);
+    writeWebAccessLinks(root, [link]);
+    expect(readFileSync(path, "utf8")).toBe(link + "\n");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(scrubSecretValues(`Web UI: ${link}`)).toBe(`Web UI: ${origin}/?t=***`);
+    expect(scrubSecretValues(token)).toBe("***");
   });
 });
 

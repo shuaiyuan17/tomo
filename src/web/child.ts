@@ -1,7 +1,7 @@
 import { WebData, type WebDataOptions } from "./data.js";
 import { startWebHttp } from "./http.js";
 import { WebError, type EventEnvelope, type Rpc } from "./protocol.js";
-import { loadWebToken } from "./token-store.js";
+import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
 
 interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string } }
 type Message = Init | { type: "ping" } | { type: "event"; value: EventEnvelope }
@@ -56,7 +56,12 @@ process.on("message", (value: Message) => {
       });
     },
     });
-  }).then((result) => { service = result; send({ type: "ready", port: result.port, accessToken }); })
+  }).then((result) => {
+    service = result;
+    const origins = [`http://127.0.0.1:${result.port}`, ...(value.options.externalOrigin ? [value.options.externalOrigin] : [])];
+    writeWebAccessLinks(value.options.tomoHome, origins.map((origin) => `${origin}/?t=${accessToken}`));
+    send({ type: "ready", port: result.port, accessToken });
+  })
     .catch((err: unknown) => {
       // Only an enumerated error crosses the process boundary, never a path,
       // request body, transcript, config value, or arbitrary exception text.

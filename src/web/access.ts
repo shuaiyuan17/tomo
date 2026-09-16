@@ -2,7 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { WebError } from "./protocol.js";
 
-export const validAccessToken = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+export const validAccessToken = (value: unknown): value is string => typeof value === "string" && /^tomo_web_[a-f0-9]{64}$/.test(value);
 const equal = (left: string, right: string) => Buffer.byteLength(left) === Buffer.byteLength(right)
   && timingSafeEqual(Buffer.from(left), Buffer.from(right));
 const SESSION_MS = 30 * 24 * 60 * 60_000;

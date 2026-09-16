@@ -92,7 +92,7 @@ it("times out a hung child, limits restart attempts, and shuts down promptly", a
 
 it("reaps a process whose event loop hangs after it reports ready", async () => {
   const childPath = join(root, "blocked.cjs");
-  writeFileSync(childPath, "process.on('message', (m) => { if (m.type === 'init') { process.send({type:'ready', port:9465, accessToken:'a'.repeat(64)}); setTimeout(() => { for (;;) {} }, 10); } });");
+  writeFileSync(childPath, "process.on('message', (m) => { if (m.type === 'init') { process.send({type:'ready', port:9465, accessToken:'tomo_web_'+'a'.repeat(64)}); setTimeout(() => { for (;;) {} }, 10); } });");
   supervisor = new WebSupervisor(channel, options(), { childPath, startupMs: 1000, heartbeatMs: 50, maxRestarts: 0 });
   await supervisor.start();
   expect(supervisor.status().pid).toBeTypeOf("number");

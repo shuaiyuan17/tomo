@@ -1,6 +1,6 @@
 # Local web chat
 
-`tomo start` starts the optional web UI on **127.0.0.1:9465**. Open the private access link shown in the startup log (`tomo logs`); it includes `?t=<token>`. The page removes this parameter from the address bar and uses an HttpOnly cookie thereafter. At least one existing messaging channel must still be configured.
+`tomo start` starts the optional web UI on **127.0.0.1:9465**. Read the private access link with `cat ~/.tomo/web-access.log`; it includes `?t=<token>`. The page removes this parameter from the address bar and uses an HttpOnly cookie thereafter. At least one existing messaging channel must still be configured.
 
 ```json
 {
@@ -36,7 +36,7 @@ History reads are limited to 100 records per page, 1,024 files / 64 MiB scanned 
 
 ## Security and operations
 
-The web child generates a random 32-byte token in the runtime home's `web-token` file (normally `~/.tomo/web-token`), with mode `0600`. A valid existing token survives restarts/upgrades. Missing, malformed, symlinked, or incorrectly permissioned files are atomically replaced under the existing file lock; the startup log announces replacement. If the token cannot be safely persisted, the UI fails closed while messaging remains available. Keep the access link and logs private. To rotate access, stop Tomo, remove `web-token`, and restart; existing signed cookies then become invalid.
+The web child generates a random 32-byte token in the runtime home's `web-token` file (normally `~/.tomo/web-token`), with mode `0600`. A valid existing token survives restarts/upgrades. Missing, malformed, symlinked, or incorrectly permissioned files are atomically replaced under the existing file lock; the startup log announces replacement. If the token cannot be safely persisted, the UI fails closed while messaging remains available. Usable access URLs are written to `web-access.log` under the runtime home, atomically replaced at mode `0600`. Ordinary logs redact the recognizable Web token format, including when a tool prints the token file. Keep the private access link file out of bug reports. To rotate access, stop Tomo, remove `web-token`, and restart; existing signed cookies then become invalid.
 
 Bootstrap requires the token or an existing signed cookie. Every other API, including history and SSE, also requires authentication. Cookies are bound to the exact origin, last 30 days, and survive web/daemon restarts when the token is unchanged. HTTPS cookies are Secure. CSRF tokens expire after 12 hours; a definite `invalid_csrf` rejection refreshes bootstrap and retries once with the same request ID and daemon epoch. Network failures and epoch changes never trigger automatic resubmission.
 
@@ -58,7 +58,7 @@ Copy the exact HTTPS origin reported by Serve into `web.externalOrigin` and rest
 { "web": { "externalOrigin": "https://test-node.test-tailnet.ts.net" } }
 ```
 
-Use the Tailscale access link from the startup log on a device in that tailnet. Preserve the original Host and Origin through the proxy. The allowlist consists of the exact local origin and this single configured HTTPS `.ts.net` origin; no wildcard, suffix-based request matching, LAN listener, or forwarded-header trust is used. Authentication remains mandatory for both origins, and cookies cannot cross between them. Tailnet access rules should also restrict who can reach the service.
+Use the Tailscale access link from `web-access.log` on a device in that tailnet. Preserve the original Host and Origin through the proxy. The allowlist consists of the exact local origin and this single configured HTTPS `.ts.net` origin; no wildcard, suffix-based request matching, LAN listener, or forwarded-header trust is used. Authentication remains mandatory for both origins, and cookies cannot cross between them. Tailnet access rules should also restrict who can reach the service.
 
 **Never use Tailscale Funnel.** Funnel exposes a service to the public internet; public deployment is unsupported. Tomo does not configure Tailscale or infer whether an operator enabled Funnel. Use Serve restricted to the tailnet and check its configuration. The implementation is tested with equivalent proxy Host/Origin requests; a live tailnet smoke test remains an operator check.
 

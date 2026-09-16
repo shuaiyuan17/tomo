@@ -6,9 +6,9 @@ Validated on 2026-09-16 with macOS 26.6.2 (arm64), Node 24.11.1, and Chromium 15
 
 - `npm run lint` — passed.
 - `npm run build` — strict backend and frontend TypeScript, plus packaged Vite assets, passed.
-- `npm run test:coverage -- --maxWorkers=4` — 2,611 tests in 142 files passed.
+- `npm run test:coverage -- --maxWorkers=4` — 2,612 tests in 142 files passed.
 - `npm run test:e2e` — 8 Chromium scenarios passed: normal chat/history/group read-only behavior, token admission, 16,000-unit CJK round-trip, CSRF recovery, oversized-message feedback, stale-cursor recovery, uncertain-response recovery without resubmission, and provider operation after web-process failure.
-- `npm run test:web:mutations` — 45 targeted implementation reversions produced behavioral test failures; restored backend and browser suites passed. Compilation/import failures do not count.
+- `npm run test:web:mutations` — 47 targeted implementation reversions produced behavioral test failures; restored backend and browser suites passed. Compilation/import failures do not count.
 - `npm pack` followed by installation into a disposable directory — installed web process returned HTTP 200 for its page, JavaScript, and CSS without source-checkout dependencies; unauthenticated bootstrap returned 401, token bootstrap returned 200, and react-dom/react-markdown/remark-gfm were absent from the production installation.
 - `git diff --check` — passed.
 
@@ -26,6 +26,8 @@ The runner copies the working tree into a temporary directory, keeps tests uncha
 
 | Reverted behavior | Unchanged test | Evidence |
 | --- | --- | --- |
+| `access-log-permissions` | `tests/web-access.test.ts` | Failed on behavior; passed after restore |
+| `web-token-redaction` | `tests/web-access.test.ts` | Failed on behavior; passed after restore |
 | `unicode-body-limit` | `tests/web-http.test.ts` | Failed on behavior; passed after restore |
 | `csrf-recovery` | `tests/web-http.test.ts` | Failed on behavior; passed after restore |
 | `private-api-auth` | `tests/web-http.test.ts` | Failed on behavior; passed after restore |
@@ -79,3 +81,5 @@ The full-suite run also exposed an existing LCM fixture that encoded local calen
 The initial stale-cursor browser test could pass because a scheduled snapshot refresh masked the missing recovery handler. It now waits for that initial refresh and introduces rotation only after the cursor request is captured, explicitly asserting a 409 response. Reverting recovery now fails. The CSRF and receipt-capacity checks explicitly assert promise success so runtime rejection counts as behavioral assertion evidence.
 
 Tailscale coverage exercises an exact HTTPS Host/Origin pair through the real loopback HTTP service, including secure cookie issuance, authenticated mutation, and hostile alternate authorities. No live Tailscale account or network was configured; the operator should verify Serve on their own tailnet.
+
+Full-suite validation selected the installed Command Line Tools using `DEVELOPER_DIR=/Library/Developer/CommandLineTools`; the host-selected Xcode app required license confirmation and could not run the existing git/python sandbox tests. No system selection or license acceptance was changed. Private access-log permissions and ordinary-log token redaction are covered by two additional behavioral reversions.

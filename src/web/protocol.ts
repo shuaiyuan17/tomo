@@ -2,7 +2,9 @@ import { z } from "zod";
 import type { SessionMessage, SessionStats } from "../sessions/types.js";
 
 export const WEB_CHAT_ID = "owner";
-export const MAX_BODY_BYTES = 32 * 1024;
+// JSON can escape one UTF-16 code unit as six bytes (e.g. a lone surrogate).
+// Leave room for 16,000 such units plus the validated request envelope.
+export const MAX_BODY_BYTES = 128 * 1024;
 export const MAX_EVENT_BYTES = 256 * 1024;
 export const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 export const WEB_REQUEST_HEADER = "x-tomo-request";

@@ -218,7 +218,7 @@ async function startForeground(): Promise<void> {
       const web = new WebChannel(config.identities, config.web.ownerIdentity);
       web.attach(new WebSupervisor(web, {
         ...config.web, identities: config.identities,
-        sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir,
+        sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
         diagnostic: (message) => log.info(message),
       }));
       agent.addChannel(web);

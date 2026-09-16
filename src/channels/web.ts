@@ -57,8 +57,13 @@ export class WebChannel implements Channel {
       if (previous.digest !== digest) throw new WebError(409, "request_id_conflict");
       return { ...previous.request };
     }
-    if (this.receipts.size >= 4096 || [...this.receipts.values()].filter((r) => ["queued", "running"].includes(r.request.state)).length >= 32) {
+    if ([...this.receipts.values()].filter((r) => !r.settled).length >= 32) {
       throw new WebError(429, "request_limit");
+    }
+    if (this.receipts.size >= 4096) {
+      const oldest = [...this.receipts].find(([, receipt]) => receipt.settled);
+      if (!oldest) throw new WebError(429, "request_limit");
+      this.receipts.delete(oldest[0]);
     }
     const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId };
     this.receipts.set(input.requestId, { digest, request, settled: false });
@@ -73,6 +78,7 @@ export class WebChannel implements Channel {
       return { ...request };
     } catch (err) {
       if (request.state !== "refused") this.state(input.requestId, "unknown");
+      this.receipts.get(input.requestId)!.settled = true;
       throw err instanceof WebError ? err : new WebError(503, "handoff_failed");
     } finally { this.handoffs.delete(handoff); }
   }

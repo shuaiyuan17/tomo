@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { chromium, expect as browserExpect, type Browser, type Page } from "@playwright/test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 vi.mock("../../src/config.js", async () => (await import("../helpers/agent-mocks.js")).configModuleMock());
@@ -13,6 +13,7 @@ import { WebChannel } from "../../src/channels/web.js";
 import { WebSupervisor } from "../../src/web/supervisor.js";
 import { webSessionId } from "../../src/web/owner.js";
 import { watchBus } from "../../src/watch/bus.js";
+import { transcriptFileStem } from "../../src/sessions/store.js";
 
 installAgentTestHooks();
 let agent: Agent;
@@ -35,10 +36,85 @@ beforeEach(async () => {
   expect(supervisor.status().port).toBeTypeOf("number");
   url = `http://127.0.0.1:${supervisor.status().port}`;
   browser = await chromium.launch(); page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  await page.goto(url);
-  await browserExpect(page.getByText("Local connection", { exact: true })).toBeVisible();
+  await page.goto(`${url}/?t=${readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim()}`);
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  expect(new URL(page.url()).searchParams.has("t")).toBe(false);
 });
 afterEach(async () => { await browser?.close(); await agent.stop(); });
+
+it("keeps private history locked without the access link", async () => {
+  const anonymous = await browser.newPage();
+  await anonymous.goto(url);
+  await browserExpect(anonymous.getByText("Access link required", { exact: true })).toBeVisible();
+  await browserExpect(anonymous.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await browserExpect(anonymous.getByRole("alert")).toContainText("Open the access link");
+  await anonymous.close();
+});
+
+it("round-trips 16,000 CJK characters through the chat and transcript", async () => {
+  const text = "中".repeat(16_000);
+  mockSdk.responseFn = () => text;
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill(text);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator(".message.assistant .markdown")).toHaveText(text);
+  await page.reload();
+  await browserExpect(page.locator(".message.user .markdown")).toHaveText(text);
+  await browserExpect(page.locator(".message.assistant .markdown")).toHaveText(text);
+  expect(mockSdk.promptsBySession).toHaveLength(1);
+});
+
+it("refreshes bootstrap after a definite CSRF rejection and retries the same request only once", async () => {
+  const ids: string[] = []; let refreshes = 0;
+  page.on("request", (request) => { if (new URL(request.url()).pathname === "/api/v1/bootstrap") refreshes++; });
+  await page.route("**/api/v1/messages", async (route) => {
+    ids.push(route.request().postDataJSON().requestId);
+    if (ids.length > 1) { await route.continue(); return; }
+    const response = await route.fetch({ headers: { ...await route.request().allHeaders(), "sec-fetch-site": "same-origin", origin: url, "x-tomo-csrf": "expired" } });
+    expect(response.status()).toBe(403);
+    await route.fulfill({ response });
+  });
+  mockSdk.responseFn = () => "Recovered once.";
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("After a long break");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.getByText("Recovered once.", { exact: true })).toBeVisible();
+  expect(ids).toHaveLength(2); expect(ids[0]).toBe(ids[1]); expect(refreshes).toBe(1);
+  expect(mockSdk.promptsBySession).toHaveLength(1);
+});
+
+it("explains oversized requests and preserves the draft", async () => {
+  await page.route("**/api/v1/messages", (route) => route.fulfill({ status: 413, contentType: "application/json", body: '{"error":"body_too_large"}' }));
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Keep this draft");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator(".feedback")).toContainText("Shorten it and send again");
+  await browserExpect(page.getByRole("textbox", { name: "Message Tomo" })).toHaveValue("Keep this draft");
+  expect(mockSdk.promptsBySession).toHaveLength(0);
+});
+
+it("silently reloads the first history page after rotation invalidates a cursor", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const timestamp = Date.now();
+  for (let i = 0; i < 110; i++) store.append("dm:owner", { role: "user", channel: "web", content: `Earlier message ${i}`, timestamp: timestamp + i });
+  let firstPages = 0;
+  page.on("response", (response) => {
+    const value = new URL(response.url());
+    if (value.pathname.endsWith("/messages") && !value.search) firstPages++;
+  });
+  await page.reload();
+  // Wait for the initial snapshot's debounced refresh before introducing a
+  // rotation. Otherwise that unrelated refresh can hide a broken 409 handler.
+  await browserExpect.poll(() => firstPages).toBeGreaterThanOrEqual(2);
+  await browserExpect(page.getByRole("button", { name: "Load earlier messages" })).toBeVisible();
+  let staleStatus = 0;
+  await page.route("**/messages?cursor=*", async (route) => {
+    writeFileSync(resolve(mockConfig.sessionsDir, `${transcriptFileStem("dm:owner")}.legacy-20260916-000000.jsonl`), JSON.stringify({ role: "user", channel: "web", content: "History changed safely", timestamp: timestamp + 200 }) + "\n");
+    const response = await route.fetch({ headers: { ...await route.request().allHeaders(), "sec-fetch-site": "same-origin" } });
+    staleStatus = response.status(); await route.fulfill({ response });
+  });
+  await page.getByRole("button", { name: "Load earlier messages" }).click();
+  await browserExpect(page.getByText("History changed safely", { exact: true })).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Try again" })).toHaveCount(0);
+  expect(staleStatus).toBe(409);
+});
 
 it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibility and group read-only state", async () => {
   const errors: string[] = []; const requests: string[] = [];
@@ -54,7 +130,7 @@ it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibili
   await browserExpect(page.getByText("5,000", { exact: false })).toBeVisible();
   expect(provider.delivered).toHaveLength(0);
   expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner"]);
-  expect(requests.some((request) => request.startsWith("https://example.invalid"))).toBe(false);
+  expect(requests.some((request) => new URL(request).hostname === "example.invalid")).toBe(false);
   expect(await page.evaluate(() => "pwned" in window)).toBe(false);
   await browserExpect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
   await page.reload();

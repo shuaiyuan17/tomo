@@ -27,9 +27,11 @@ tomo init       # Set up config, pick a name and personality
 tomo start      # Runs in background
 ```
 
-Open [the local web chat](http://127.0.0.1:9465) after starting. It shares the
-owner's DM session; existing groups are read-only. The UI is enabled by default
-and binds only to `127.0.0.1`. Configure `web.enabled`, `web.port`, and, when
+Open the private web access link in the startup log (`tomo logs`). It shares
+the owner's DM session; existing groups are read-only. The UI is enabled by
+default and requires the access token stored in `~/.tomo/web-token` (`0600`).
+The listener binds to `127.0.0.1`; optional Tailscale Serve access uses one exact
+HTTPS `web.externalOrigin`. Configure `web.enabled`, `web.port`, and, when
 multiple identities exist, `web.ownerIdentity` in `config.json`.
 See [web UI setup, security, and limits](docs/web-ui.md).
 

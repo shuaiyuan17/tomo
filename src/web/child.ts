@@ -1,8 +1,9 @@
 import { WebData, type WebDataOptions } from "./data.js";
 import { startWebHttp } from "./http.js";
 import { WebError, type EventEnvelope, type Rpc } from "./protocol.js";
+import { loadWebToken } from "./token-store.js";
 
-interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string } }
+interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string } }
 type Message = Init | { type: "ping" } | { type: "event"; value: EventEnvelope }
   | { type: "result"; id: number; value?: unknown; error?: { status: number; code: string } };
 const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
@@ -35,7 +36,12 @@ process.on("message", (value: Message) => {
   }
   if (value.type !== "init" || initialized) return;
   initialized = true;
-  void startWebHttp(value.options.port, {
+  let accessToken: string;
+  void Promise.resolve().then(() => {
+    accessToken = loadWebToken(value.options.tomoHome, () => send({ type: "token_created" }));
+    return startWebHttp(value.options.port, {
+    accessToken,
+    externalOrigin: value.options.externalOrigin,
     data: new WebData(value.options),
     assetsDir: value.options.assetsDir,
     subscribe(fn) { subscribers.add(fn); return () => { subscribers.delete(fn); }; },
@@ -49,7 +55,8 @@ process.on("message", (value: Message) => {
         catch (err) { clearTimeout(timer); pending.delete(id); reject(err); }
       });
     },
-  }).then((result) => { service = result; send({ type: "ready", port: result.port }); })
+    });
+  }).then((result) => { service = result; send({ type: "ready", port: result.port, accessToken }); })
     .catch((err: unknown) => {
       // Only an enumerated error crosses the process boundary, never a path,
       // request body, transcript, config value, or arbitrary exception text.

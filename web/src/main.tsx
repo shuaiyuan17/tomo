@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "re
 import { createRoot } from "react-dom/client";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, ApiError } from "./api.js";
+import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
@@ -95,15 +95,15 @@ export function App() {
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
     try {
-      const request = await api<WebRequest>("/messages", { method: "POST", headers: { "content-type": "application/json",
-        "x-tomo-csrf": web.bootstrap.csrfToken, "x-tomo-epoch": web.bootstrap.epoch },
-      body: JSON.stringify({ requestId, targetId: session.id, text }) });
+      const request = await sendMessage({ requestId, targetId: session.id, text }, web.bootstrap, web.refreshBootstrap);
       setDraft((old) => old.trim() === text ? "" : old);
       setFeedback(labels[request.state]); remember(null); setReload((r) => r + 1); atBottom.current = true;
     } catch (err) {
-      if (err instanceof ApiError && [400, 403, 409, 413, 415, 429].includes(err.status)) {
+      if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
         remember(null);
-        setFeedback(err.code === "owner_dm_only" ? "Group conversations are read-only." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
+        setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
+          : err.status === 401 ? "Open the access link from tomo start to reconnect. Your draft is kept."
+          : err.code === "owner_dm_only" ? "Group conversations are read-only." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
       } else setFeedback(labels.unknown);
     } finally { setSending(false); }
   };
@@ -127,7 +127,13 @@ export function App() {
       if (element) restoreScroll.current = element.scrollHeight - element.scrollTop;
       setHistory((old) => ({ revision: value.revision, messages: [...value.messages.filter((m) => !old.messages.some((item) => item.id === m.id)), ...old.messages], nextCursor: value.nextCursor }));
       setHistoryStatus("ready");
-    } catch { if (historySession.current === target) setHistoryStatus("error"); }
+    } catch (error) {
+      if (historySession.current !== target) return;
+      if (error instanceof ApiError && error.status === 409 && error.code === "history_changed") {
+        setHistory({ messages: [], nextCursor: null }); setHistoryStatus("loading");
+        restoreScroll.current = null; atBottom.current = true; setReload((value) => value + 1);
+      } else setHistoryStatus("error");
+    }
   };
   const durable = new Set(history.messages.filter((m) => m.role === "assistant").map((m) => m.requestId).filter(Boolean));
   const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.requestId));
@@ -138,7 +144,7 @@ export function App() {
     <a className="skip" href="#conversation">Skip to conversation</a>
     <header className="topbar"><a className="brand" href="/" aria-label="Tomo home"><Mark /><span>tomo<span className="brand-dot">.</span></span></a>
       <span className="section-name">Conversation</span>
-      <div className="header-actions"><span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Local connection" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
+      <div className="header-actions"><span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
         <label className="theme-label"><span className="sr-only">Color theme</span><select aria-label="Color theme" value={theme} onChange={(e) => setTheme(e.target.value as Theme)}><option value="system">System theme</option><option value="light">Light theme</option><option value="dark">Dark theme</option></select></label>
       </div>
     </header>
@@ -156,11 +162,12 @@ export function App() {
           {hasContext && <progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" />}
           <p className="session-note">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
-        <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>On this device</span></div>
+        <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
       <main id="conversation" className="conversation" tabIndex={-1}>
         <div className="conversation-heading"><div><p className="eyebrow">{session?.kind === "group" ? "Group history" : "A conversation with Tomo"}</p><h1>{session?.kind === "group" ? session.title : "Room to think."}</h1></div><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         {web.bootstrap?.setupRequired && <div className="notice" role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
+        {web.connection === "locked" && <div className="notice" role="alert">Open the access link shown by <code>tomo start</code> to connect. The link includes your private access token.</div>}
         <div className="transcript" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={() => { const e = scroll.current!; atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 80; }}>
           {history.nextCursor && <button className="older" onClick={() => void older()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</button>}
           {historyStatus === "error" && <div className="notice" role="alert">History is unavailable. <button onClick={() => setReload((r) => r + 1)}>Try again</button></div>}

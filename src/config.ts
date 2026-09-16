@@ -840,7 +840,7 @@ function buildConfig(): TomoConfig {
 
   return {
     auth: parseAnthropicAuthConfig(file.auth),
-    web: parseWebConfig(file.web, (message) => console.error(message)),
+    web: parseWebConfig(file.web, (message) => log.warn(message)),
     telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",
     model,
     workspaceDir: paths.workspaceDir,

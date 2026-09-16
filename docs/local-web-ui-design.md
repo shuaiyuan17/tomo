@@ -1,6 +1,6 @@
 # Proposal: local web UI
 
-**Status:** approved with the decisions below. PR 2 implements the web channel, local service, and minimal chat.
+**Status:** approved, including the 2026-09-16 review update: persistent token authentication and opt-in Tailscale Serve access supersede the original no-login/local-access-only requirement. PR 2 implements the web channel, service, and minimal chat.
 
 Reviewed against `255cb7f1ee7bb32f24a86550a4b73ae39e8b3058` (2026-09-14), using the supplied HTML mockup as the visual reference.
 
@@ -20,7 +20,7 @@ flowchart LR
   W -->|module APIs off daemon thread| S[Sessions, cron, workspace, LCM, config]
 ```
 
-Proposed config: `web.enabled: true`, `web.port: 9465`, optional `web.ownerIdentity`. Bind address is permanently `127.0.0.1`. Start with `tomo start`; print the URL without opening a browser. Preserve the existing configured-messaging-channel requirement initially. Invalid web-specific settings disable the UI with a diagnostic rather than stopping the daemon; existing core config validation remains intact.
+Proposed config: `web.enabled: true`, `web.port: 9465`, optional `web.ownerIdentity` and exact HTTPS `web.externalOrigin`. The listener remains on `127.0.0.1`; Tailscale Serve may proxy the configured external origin. Start with `tomo start`; log the private token-bearing access URL without opening a browser. Preserve the existing configured-messaging-channel requirement initially. Invalid web-specific settings disable the UI with a diagnostic rather than stopping the daemon; existing core config validation remains intact.
 
 Add `src/channels/web.ts`, supervisor/API code under `src/web/`, and a separate browser package under `web/`. Use strict TypeScript, the existing React major, stable compatible Vite tooling, accessible primitives, and mockup-derived CSS tokens. Verify current stable releases and Node 22.12 compatibility at implementation time. Bundle assets into the npm distribution; no runtime CDN or development server.
 
@@ -50,9 +50,9 @@ Partition batching/steering when delivery destinations or privacy audiences are 
 
 The existing transcript writer remains authoritative. Add optional request/turn/block correlation metadata there; the web channel must not append duplicate assistant entries. Keep clipped watch text for TUI compatibility and add references for full browser history. Use sidecar-safe opaque pagination cursors rather than assuming `seq` is globally unique.
 
-POST acknowledgment means daemon custody, not completion. A request ID deduplicates retries within a daemon epoch, including child restarts; conflicting reuse returns `409`. Every mutation carries the observed daemon epoch; an old epoch returns `409`. After a daemon crash, request lookup can identify a recent recorded input, but reports its outcome as unknown unless a live receipt proves it. The browser preserves an uncertain draft and never automatically resubmits. Do not promise exactly-once execution across crashes. PR 2 bounds admission to 32 active and 4,096 total receipts per daemon lifetime; after the latter limit, restart to renew capacity.
+POST acknowledgment means daemon custody, not completion. A request ID deduplicates retries while its receipt is retained within a daemon epoch, including child restarts; conflicting reuse returns `409`. Every mutation carries the observed daemon epoch; an old epoch returns `409`. After a daemon crash or settled-receipt eviction, request lookup reports unknown without scanning transcripts, which cannot establish a delivery outcome. The browser preserves an uncertain draft and never automatically resubmits. Do not promise exactly-once execution across crashes. PR 2 bounds admission to 32 active and 4,096 retained receipts. At capacity it evicts the oldest settled receipt; failed deliveries that still have active turns cannot be evicted. Clients must never automatically resubmit an unknown request, and deduplication is not indefinite after eviction.
 
-SSE uses epoch-scoped event IDs, bounded replay, and snapshot watermarks: subscribe/buffer before snapshot, then deliver newer events. A gap triggers canonical history refresh. Forward tool names, status, and attributed sessions; omit raw arguments/results and unattributed activity.
+SSE uses epoch-scoped event IDs, bounded replay, and snapshot watermarks: subscribe/buffer before snapshot, then replay transient tool/typing activity and deliver newer events. Durable blocks and request states come from the snapshot, so old replay cannot resurrect settled work. A gap triggers canonical history refresh. Forward tool names, status, and attributed sessions; omit raw arguments/results and unattributed activity.
 
 ## API surface
 
@@ -77,10 +77,13 @@ Use `403` for security/admission rejection, `409` for stale state, `422` for val
 
 ## Security and failure isolation
 
-The trust boundary is the local machine/account; loopback alone cannot authenticate an OS user. No new login.
+The revised trust boundary requires a private access token in addition to browser-origin checks. Other OS accounts or sandboxes without access to the token file cannot obtain web access. Processes with the owner's file access remain trusted.
 
-- Accept only exact `Host: 127.0.0.1:<port>`. Reject missing/duplicate Host, alternate host spellings, absolute-form targets, and any present Origin other than the exact advertised origin, including `null`. Ignore forwarding headers. API reads, bootstrap, and SSE require a custom request header plus same-origin fetch metadata; a normal GET may omit Origin only with those guards. Cross-origin preflights receive no CORS permission.
-- Mutations require exact Origin, JSON, and a random CSRF token in a header. Bind it to an HttpOnly, SameSite=Strict cookie and the web-process lifetime (also invalidated by a daemon restart); deliver it only through guarded bootstrap. No token in URLs, logs, or persistent browser storage. Static navigation never mutates state.
+- Accept only the exact local Host/Origin pair, plus an optional exact HTTPS Tailscale Serve origin from `web.externalOrigin`. Requests use exact equality, never suffix or wildcard matching. Reject missing/duplicate Host, alternate host spellings, absolute-form targets, and any present Origin other than the exact advertised origin, including `null`. Ignore forwarding headers. API reads, bootstrap, and SSE require a custom request header plus same-origin fetch metadata; a normal GET may omit Origin only with those guards. Cross-origin preflights receive no CORS permission.
+- Generate/reuse a private 32-byte `web-token` file (`0600`) under the runtime home using the existing lock and atomic replacement. Perform disk work only in the supervised child. Failure to persist safely disables the UI without blocking the daemon. Bootstrap requires the access token or a valid signed origin-bound cookie; all other APIs, including reads and SSE, require that cookie. Static assets remain public.
+- Log a private access URL with `?t=<token>` at readiness; remove the query parameter from browser history before bootstrap. Do not persist it in JavaScript storage. Signed HttpOnly, SameSite=Strict cookies last 30 days and survive restarts with the same token; HTTPS adds Secure. Rotate the file to revoke access.
+- Mutations also require exact Origin, JSON, and a random cookie-bound CSRF header. CSRF expires independently after 12 hours. On a definite `invalid_csrf` rejection, refresh bootstrap and retry once using the same request ID and epoch; never retry network uncertainty or cross epochs.
+- Tailscale Serve runs on the same host and forwards to loopback, preserving Host/Origin. Do not use Funnel or public deployment. Tailnet identity headers are not an authentication substitute; access tokens are mandatory.
 - Self-host assets and enforce CSP: self scripts/styles/fonts/connections, no eval/inline scripts, no framing, no objects/base overrides. Add no-referrer, nosniff, and no-store for private responses. Render markdown without raw HTML, executable links, or automatic remote images.
 - Workspace APIs reject traversal, absolute paths, special files, and escaping symlinks; verify opened-file identity against symlink swaps. Bound depth, bytes, search duration, and concurrency. The owner memory view can include private files but never injects them into a selected group prompt.
 - Secrets appear only as set/unset, with replacement-only inputs and no suffix hints. Apply schema classification and existing redaction rules, treating unknown extension values and arbitrary MCP env/header values, arguments, and credential-bearing URLs as opaque. Never serialize expanded secrets, raw config errors, or submitted replacements into responses/diffs/events/logs.
@@ -126,3 +129,7 @@ For every added behavior, keep tests unchanged and revert its implementation hun
 2. Completed-block streaming through the existing delivery pipeline is approved. No token deltas.
 3. Use a unique owner or require `web.ownerIdentity` when ambiguous. Port `9465`, enabled by default, with the existing messaging-channel startup requirement.
 4. Architecture and PR sequence are approved. PR 2 may proceed; subsequent PRs remain separately reviewable. Never merge automatically.
+
+### Review follow-up
+
+The 2026-09-16 approval includes all seven review findings. JSON body capacity covers the full UTF-16 input limit including escapes; invalid optional web config uses the existing warning logger; browser-only packages are build dependencies; stale history cursors return 409 and reload the first page. The existing messaging startup requirement, owner-only writes, group read-only access, and completed-block delivery are unchanged.

@@ -70,6 +70,8 @@ Runtime data lives at `~/.tomo/` (config, sessions, cron jobs, logs, workspace, 
 
 The browser frontend lives in `web/` at the repository root, uses strict React/TypeScript and mockup-derived CSS tokens, and builds into `dist/web-assets`. See `docs/web-ui.md` for limits and development commands. The web child never owns another Agent or writes transcripts. Owner input goes through `Agent.addChannel`; reply outlets are bound to request IDs, and web/provider turns cannot steer into each other's delivery destination. Preserve the existing persistent notification target and transcript policy.
 
+All private web APIs, including reads and SSE, require a signed origin-bound session cookie. Bootstrap grants one only with the persistent private `web-token`; CSRF expires independently and can be renewed without logging in again. Token file I/O and locking happen in the supervised child. The HTTP listener remains loopback-only; `web.externalOrigin` permits one exact HTTPS Tailscale Serve origin, never a wildcard. Do not use Funnel or infer authentication from forwarded identity headers. Evict only settled receipts; a failed delivery can still have an active turn and must retain its outlet until settlement.
+
 ## Key Design Patterns
 
 ### Session Keys

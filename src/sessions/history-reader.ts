@@ -9,6 +9,9 @@ import type { SessionMessage } from "./types.js";
 
 const cursorSchema = z.object({ time: z.number().finite(), order: z.number().int().nonnegative(), revision: z.string().max(64) }).strict();
 const MAX_SCAN_BYTES = 64 * 1024 * 1024;
+export class HistoryReadError extends Error {
+  constructor(readonly code: "invalid_cursor" | "history_changed" | "history_too_large") { super(code); }
+}
 export interface HistoryRecord extends SessionMessage { id: string }
 type PositionedRecord = HistoryRecord & { order: number };
 const position = (m: PositionedRecord) => ({ time: m.timestamp, order: m.order });
@@ -22,13 +25,15 @@ export async function readHistoryPage(
 ): Promise<{ messages: HistoryRecord[]; nextCursor: string | null; revision: string }> {
   let before: z.infer<typeof cursorSchema> | undefined;
   if (cursor) {
-    if (cursor.length > 512) throw new Error("Invalid history cursor");
-    before = cursorSchema.parse(JSON.parse(Buffer.from(cursor, "base64url").toString()));
+    try {
+      if (cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
+      before = cursorSchema.parse(JSON.parse(Buffer.from(cursor, "base64url").toString()));
+    } catch { throw new HistoryReadError("invalid_cursor"); }
   }
   const files = SessionStore.readHistoryFiles(dirs.sessionsDir, dirs.sdkSessionsDir, key).reverse();
-  if (files.length > 1024) throw new Error("History scan limit");
+  if (files.length > 1024) throw new HistoryReadError("history_too_large");
   const revision = createHash("sha256").update(files.map((file) => basename(file)).join("\n")).digest("base64url");
-  if (before && before.revision !== revision) throw new Error("History changed; refresh before paging");
+  if (before && before.revision !== revision) throw new HistoryReadError("history_changed");
   let scanned = 0;
   let order = 0;
   const tail: PositionedRecord[] = [];
@@ -42,7 +47,7 @@ export async function readHistoryPage(
       const stat = await fd.stat();
       if (!stat.isFile()) throw new Error("Invalid history file");
       scanned += stat.size;
-      if (scanned > MAX_SCAN_BYTES) throw new Error("History scan limit");
+      if (scanned > MAX_SCAN_BYTES) throw new HistoryReadError("history_too_large");
       // Snapshot this file's byte length so an active writer cannot make an
       // otherwise bounded read run forever. Ignore its incomplete last line.
       if (!stat.size) continue;
@@ -63,8 +68,13 @@ export async function readHistoryPage(
           const record: PositionedRecord = { id, order, role: m.role, content: m.content, timestamp: m.timestamp,
             channel: m.channel, ...(m.requestId ? { requestId: m.requestId } : {}) };
           if (before && compare(position(record), before) >= 0) continue;
-          tail.push(record);
-          tail.sort((a, b) => compare(position(b), position(a)));
+          let low = 0; let high = tail.length;
+          while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (compare(position(tail[middle]), position(record)) > 0) low = middle + 1;
+            else high = middle;
+          }
+          tail.splice(low, 0, record);
           if (tail.length > 101) tail.pop();
         }
       } finally { lines.close(); stream.destroy(); }
@@ -73,7 +83,7 @@ export async function readHistoryPage(
   const hasMore = tail.length > 100;
   const selected = tail.slice(0, 100).reverse();
   const messages = selected.map(({ order, ...message }) => { void order; return message; });
-  if (Buffer.byteLength(JSON.stringify(messages)) > 2 * 1024 * 1024) throw new Error("History response limit");
+  if (Buffer.byteLength(JSON.stringify(messages)) > 2 * 1024 * 1024) throw new HistoryReadError("history_too_large");
   return { messages, revision, nextCursor: hasMore
     ? Buffer.from(JSON.stringify({ ...position(selected[0]), revision })).toString("base64url") : null };
 }

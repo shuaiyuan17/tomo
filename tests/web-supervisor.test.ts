@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -18,7 +18,27 @@ beforeEach(() => {
   channel = new WebChannel(identities); channel.onMessage(async () => true);
 });
 afterEach(async () => { await supervisor?.stop(); await channel.stop(); rmSync(root, { recursive: true, force: true }); });
-function options() { return { identities, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), port: 0 }; }
+function options() { return { tomoHome: root, identities, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), port: 0 }; }
+
+it("fails closed without blocking its channel when the token cannot be persisted", async () => {
+  mkdirSync(join(root, "web-token"));
+  supervisor = new WebSupervisor(channel, options(), { maxRestarts: 0 });
+  channel.attach(supervisor);
+  await expect(channel.start()).resolves.toBeUndefined();
+  expect(supervisor.status().port).toBeNull();
+});
+
+it("starts again after a completed stop and reuses its access token", async () => {
+  supervisor = new WebSupervisor(channel, options());
+  await supervisor.start();
+  const pid = supervisor.status().pid;
+  const token = readFileSync(join(root, "web-token"), "utf8");
+  await supervisor.stop(); await supervisor.start();
+  expect(supervisor.status().pid).toBeTypeOf("number");
+  expect(supervisor.status().pid).not.toBe(pid);
+  expect(supervisor.status().port).toBeTypeOf("number");
+  expect(readFileSync(join(root, "web-token"), "utf8")).toBe(token);
+});
 
 it("keeps receipts and replay across a real web process crash/restart", async () => {
   supervisor = new WebSupervisor(channel, options());
@@ -30,7 +50,7 @@ it("keeps receipts and replay across a real web process crash/restart", async ()
   process.kill(previous, "SIGKILL");
   await expect.poll(() => supervisor.status().pid, { timeout: 6_000 }).not.toBe(previous);
   await expect.poll(() => supervisor.status().port, { timeout: 6_000 }).toBeTypeOf("number");
-  const response = await fetch(`http://127.0.0.1:${supervisor.status().port}/api/v1/bootstrap`, { headers });
+  const response = await fetch(`http://127.0.0.1:${supervisor.status().port}/api/v1/bootstrap?t=${readFileSync(join(root, "web-token"), "utf8").trim()}`, { headers });
   expect(response.status).toBe(200);
   const bootstrap = await response.json() as WebBootstrap;
   expect(bootstrap.epoch).toBe(channel.events.epoch);
@@ -72,7 +92,7 @@ it("times out a hung child, limits restart attempts, and shuts down promptly", a
 
 it("reaps a process whose event loop hangs after it reports ready", async () => {
   const childPath = join(root, "blocked.cjs");
-  writeFileSync(childPath, "process.on('message', (m) => { if (m.type === 'init') { process.send({type:'ready', port:9465}); setTimeout(() => { for (;;) {} }, 10); } });");
+  writeFileSync(childPath, "process.on('message', (m) => { if (m.type === 'init') { process.send({type:'ready', port:9465, accessToken:'a'.repeat(64)}); setTimeout(() => { for (;;) {} }, 10); } });");
   supervisor = new WebSupervisor(channel, options(), { childPath, startupMs: 1000, heartbeatMs: 50, maxRestarts: 0 });
   await supervisor.start();
   expect(supervisor.status().pid).toBeTypeOf("number");

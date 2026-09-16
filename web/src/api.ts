@@ -1,4 +1,4 @@
-import type { EventEnvelope, WebBootstrap, WebEvent, WebSnapshot } from "../../src/web/protocol.js";
+import type { EventEnvelope, MessageInput, WebBootstrap, WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
@@ -11,6 +11,34 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(response.status, value.error ?? "unavailable");
   }
   return response.json() as Promise<T>;
+}
+
+let entryToken: string | null | undefined;
+export async function readBootstrap(signal?: AbortSignal): Promise<WebBootstrap> {
+  if (entryToken === undefined) {
+    const url = new URL(window.location.href);
+    entryToken = url.searchParams.get("t");
+    url.searchParams.delete("t");
+    window.history.replaceState(window.history.state, "", url);
+  }
+  const value = await api<WebBootstrap>(`/bootstrap${entryToken ? `?t=${encodeURIComponent(entryToken)}` : ""}`, { signal });
+  entryToken = null; // Only the HttpOnly cookie persists the login.
+  return value;
+}
+
+/** Only a definite, pre-admission CSRF rejection may be retried. Preserve the
+ * request id and epoch; an uncertain transport failure must never resubmit. */
+export async function sendMessage(input: MessageInput, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
+  const send = (csrfToken: string) => api<WebRequest>("/messages", { method: "POST", headers: {
+    "content-type": "application/json", "x-tomo-csrf": csrfToken, "x-tomo-epoch": bootstrap.epoch,
+  }, body: JSON.stringify(input) });
+  try { return await send(bootstrap.csrfToken); }
+  catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 403 || error.code !== "invalid_csrf") throw error;
+    const fresh = await refresh();
+    if (fresh.epoch !== bootstrap.epoch) throw new ApiError(409, "epoch_changed");
+    return send(fresh.csrfToken);
+  }
 }
 
 export interface StreamHandlers {

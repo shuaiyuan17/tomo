@@ -41,6 +41,31 @@ describe("web configuration and owner", () => {
 });
 
 describe("WebChannel", () => {
+  it("evicts settled receipts after capacity while keeping ingress and active outlets alive", async () => {
+    const { channel, bus, handler } = setup();
+    const active = randomUUID(); await channel.receive({ requestId: active, text: "still running" });
+    let evicted = "";
+    for (let i = 0; i < 4100; i++) {
+      const requestId = randomUUID(); if (i === 0) evicted = requestId;
+      await expect(channel.receive({ requestId, text: "settled" })).resolves.toMatchObject({ state: "queued" });
+      bus.publish({ type: "turn.end", sessionKey: "dm:owner", requestId, source: "user", ok: true, durationMs: 1 });
+    }
+    expect(channel.request(evicted).state).toBe("unknown");
+    expect(channel.request(active).state).toBe("queued");
+    await expect(channel.send({ chatId: active, text: "still deliverable" })).resolves.toBeUndefined();
+    expect(handler).toHaveBeenCalledTimes(4101);
+  });
+  it("counts unsettled failed delivery against the active cap until the turn ends", async () => {
+    const { channel, bus } = setup(); let first = "";
+    for (let i = 0; i < 32; i++) {
+      const requestId = randomUUID(); if (!first) first = requestId;
+      await channel.receive({ requestId, text: "running" });
+      await expect(channel.send({ chatId: requestId, text: "x".repeat(MAX_BUFFER_BYTES) })).rejects.toThrow();
+    }
+    await expect(channel.receive({ requestId: randomUUID(), text: "over cap" })).rejects.toMatchObject({ status: 429 });
+    bus.publish({ type: "turn.end", sessionKey: "dm:owner", requestId: first, source: "user", ok: false, durationMs: 1 });
+    await expect(channel.receive({ requestId: randomUUID(), text: "next" })).resolves.toMatchObject({ state: "queued" });
+  });
   it("hands ordinary owner DM input to Agent and deduplicates both pending and completed receipts", async () => {
     const { channel, handler, bus } = setup();
     const input = { requestId: randomUUID(), text: "Hello" };

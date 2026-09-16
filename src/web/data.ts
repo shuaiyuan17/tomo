@@ -1,6 +1,6 @@
 import type { IdentityConfig } from "../config.js";
 import { SessionStore } from "../sessions/store.js";
-import { readHistoryPage } from "../sessions/history-reader.js";
+import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { selectWebOwner, webSessionId } from "./owner.js";
 import { WebError, type WebCatalog } from "./protocol.js";
@@ -52,16 +52,11 @@ export class WebData {
   async history(id: string, cursor?: string) {
     const key = this.catalog().keys.get(id);
     if (!key) throw new WebError(404, "session_not_found");
-    return readHistoryPage(this.options, key, cursor);
-  }
-
-  async recordedRequest(requestId: string) {
-    const { ownerId, keys } = this.catalog();
-    if (!ownerId) return { requestId, state: "unknown" as const };
-    const page = await readHistoryPage(this.options, keys.get(ownerId)!);
-    const matched = page.messages.filter((m) => m.requestId === requestId);
-    // Without a live receipt or a persisted explicit outcome, text alone
-    // cannot establish whether all work completed before the crash.
-    return { requestId, state: "unknown" as const, ...(matched.length ? { sessionId: ownerId } : {}) };
+    try { return await readHistoryPage(this.options, key, cursor); }
+    catch (error) {
+      if (error instanceof HistoryReadError) throw new WebError(
+        error.code === "invalid_cursor" ? 400 : error.code === "history_changed" ? 409 : 413, error.code);
+      throw error;
+    }
   }
 }

@@ -4,8 +4,11 @@ import { fileURLToPath } from "node:url";
 import type { WebChannel, WebLifecycle } from "../channels/web.js";
 import type { WebDataOptions } from "./data.js";
 import { MAX_BUFFER_BYTES, rpcSchema, WebError } from "./protocol.js";
+import { validAccessToken } from "./access.js";
 
 export interface WebSupervisorOptions extends WebDataOptions {
+  tomoHome: string;
+  externalOrigin?: string;
   port: number;
   assetsDir?: string;
   diagnostic?: (message: string) => void;
@@ -29,8 +32,11 @@ export class WebSupervisor implements WebLifecycle {
   status() { return { port: this.boundPort, pid: this.child?.pid ?? null, restarts: this.restarts }; }
   start(): Promise<void> {
     if (this.starting) return this.starting;
+    if (this.child && !this.stopping) return Promise.resolve();
     this.stopping = false;
-    this.starting = this.launch().catch(() => { this.report("Web UI unavailable; messaging channels remain active."); });
+    this.restarts = 0;
+    this.starting = this.launch().catch(() => { this.report("Web UI unavailable; messaging channels remain active."); })
+      .finally(() => { this.starting = undefined; });
     return this.starting;
   }
   async stop(): Promise<void> {
@@ -91,9 +97,11 @@ export class WebSupervisor implements WebLifecycle {
         if (!raw || typeof raw !== "object" || this.child !== child) return;
         const value = raw as Record<string, unknown>;
         if (value.type === "pong") { lastPong = Date.now(); return; }
-        if (value.type === "ready" && typeof value.port === "number") {
+        if (value.type === "token_created") { this.report("Web access token created or replaced; use the new access link."); return; }
+        if (value.type === "ready" && typeof value.port === "number" && validAccessToken(value.accessToken)) {
           this.boundPort = value.port;
-          this.report(`Web UI: http://127.0.0.1:${value.port}`);
+          this.report(`Web UI: http://127.0.0.1:${value.port}/?t=${value.accessToken}`);
+          if (this.options.externalOrigin) this.report(`Web UI via Tailscale Serve: ${this.options.externalOrigin}/?t=${value.accessToken}`);
           settle();
           return;
         }
@@ -140,8 +148,8 @@ export class WebSupervisor implements WebLifecycle {
         this.timer = setTimeout(() => { void this.launch().catch(() => this.report("Web UI restart failed.")); }, 500 * 2 ** (this.restarts - 1));
         this.timer.unref();
       });
-      const { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port,
+      const { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

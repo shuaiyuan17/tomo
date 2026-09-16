@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, stream, type WebBootstrap } from "./api.js";
+import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
 import type { WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
 
 export function useWeb() {
   const [bootstrap, setBootstrap] = useState<WebBootstrap>();
-  const [connection, setConnection] = useState<"connecting" | "live" | "reconnecting">("connecting");
+  const [connection, setConnection] = useState<"connecting" | "live" | "reconnecting" | "locked">("connecting");
   const [blocks, setBlocks] = useState<WebSnapshot["blocks"]>([]);
   const [requests, setRequests] = useState<WebRequest[]>([]);
   const [activity, setActivity] = useState<Record<string, string>>({});
   const [revision, setRevision] = useState(0);
+  const refreshBootstrap = useCallback(async () => {
+    try { const value = await readBootstrap(); setBootstrap(value); return value; }
+    catch (error) { if (error instanceof ApiError && error.status === 401) setConnection("locked"); throw error; }
+  }, []);
   const discardRecordedBlocks = useCallback((requestIds: Set<string>) => {
     setBlocks((old) => old.some((block) => requestIds.has(block.requestId))
       ? old.filter((block) => !requestIds.has(block.requestId)) : old);
@@ -45,15 +49,16 @@ export function useWeb() {
     let delay = 1_000;
     const connect = async () => {
       try {
-        const value = await api<WebBootstrap>("/bootstrap", { signal: controller.signal });
+        const value = await readBootstrap(controller.signal);
         if (controller.signal.aborted) return;
         if (epoch !== value.epoch) { cursor = value.cursor; epoch = value.epoch; }
         setBootstrap(value);
         snapshot(value);
         delay = 1_000;
         await stream(cursor || value.cursor, controller.signal, { snapshot, update, cursor: (value) => { cursor = value; } });
-      } catch {
+      } catch (error) {
         if (controller.signal.aborted) return;
+        if (error instanceof ApiError && error.status === 401) { setConnection("locked"); return; }
         setConnection("reconnecting");
         retryTimer = setTimeout(() => { void connect(); }, delay);
         delay = Math.min(delay * 2, 10_000);
@@ -62,5 +67,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, revision, discardRecordedBlocks };
+  return { bootstrap, connection, blocks, requests, activity, revision, discardRecordedBlocks, refreshBootstrap };
 }

@@ -4,10 +4,15 @@ import { open, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import type { WebData } from "./data.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
+import { WebAccess } from "./access.js";
+import { webConfigSchema } from "./config.js";
 import { MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
   type EventEnvelope, type Rpc, type WebRequest, type WebSync } from "./protocol.js";
 
 export interface HttpDependencies {
+  accessToken: string;
+  externalOrigin?: string;
+  now?: () => number;
   data: WebData;
   assetsDir: string;
   rpc(value: Rpc): Promise<unknown>;
@@ -15,7 +20,9 @@ export interface HttpDependencies {
 }
 
 export async function startWebHttp(port: number, deps: HttpDependencies) {
-  const csrf = new CsrfTokens();
+  const csrf = new CsrfTokens(deps.now);
+  const access = new WebAccess(deps.accessToken, deps.now);
+  const externalOrigin = webConfigSchema.shape.externalOrigin.parse(deps.externalOrigin);
   const streams = new Set<ServerResponse>();
   let active = 0;
   let boundPort = port;
@@ -37,10 +44,12 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const api = req.url?.startsWith("/api/") ?? false;
-    checkRequest(req, boundPort, api);
-    const url = new URL(req.url!, `http://127.0.0.1:${boundPort}`);
+    const origin = checkRequest(req, boundPort, api, externalOrigin);
+    const url = new URL(req.url!, origin);
+    const bootstrap = url.pathname === "/api/v1/bootstrap" && req.method === "GET";
+    const session = api ? (bootstrap ? access.bootstrap(req, res, url, origin) : access.require(req, origin)) : undefined;
     if (url.pathname === "/api/v1/events" && req.method === "GET") {
-      await events(url, req, res);
+      await events(url, req, res, origin);
       return;
     }
     if (active >= 8) throw new WebError(429, "request_limit");
@@ -53,7 +62,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       }
       if (req.method === "GET") {
         if (url.pathname === "/api/v1/bootstrap") {
-          const csrfToken = csrf.bootstrap(req, res);
+          const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
           const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
           json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken });
@@ -72,11 +81,11 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const request = /^\/api\/v1\/messages\/([a-f0-9-]{36})$/.exec(url.pathname);
         if (request) {
           const value = await deps.rpc({ method: "request", requestId: request[1] }) as WebRequest;
-          json(res, 200, value.state === "unknown" ? await deps.data.recordedRequest(request[1]) : value);
+          json(res, 200, value);
           return;
         }
       } else if (req.method === "POST" && url.pathname === "/api/v1/messages") {
-        csrf.verify(req);
+        csrf.verify(req, session!);
         const parsed = messageInputSchema.safeParse(await body(req));
         if (!parsed.success) throw new WebError(400, "invalid_message");
         const { ownerId } = deps.data.catalog();
@@ -91,7 +100,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     } finally { active--; }
   }
 
-  async function events(url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function events(url: URL, req: IncomingMessage, res: ServerResponse, origin: string): Promise<void> {
     if (streams.size >= 16) throw new WebError(429, "stream_limit");
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor && cursor.length > 128) throw new WebError(400, "invalid_cursor");
@@ -123,8 +132,12 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       req.socket.setTimeout(0);
       res.writeHead(200, { "content-type": "text/event-stream", "x-accel-buffering": "no" });
       res.flushHeaders();
-      for (const item of sync.replay ?? []) write("update", item.event, item.id);
       write("snapshot", { ...sync.snapshot, resync: sync.replay === null }, sync.snapshot.cursor);
+      // Durable blocks/receipts come from the snapshot. Replaying old blocks
+      // would resurrect settled work; only transient activity needs replay.
+      for (const item of sync.replay ?? []) {
+        if (item.event.type === "tool" || item.event.type === "typing") write("update", item.event);
+      }
       const watermark = Number(sync.snapshot.cursor.split(":")[1]);
       for (const item of pending) {
         const [epoch, sequence] = item.id.split(":");
@@ -132,6 +145,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       }
       pending = undefined;
       heartbeat = setInterval(() => {
+        try { access.require(req, origin); } catch { res.destroy(); return; }
         if (res.writableLength > 0) res.destroy();
         else res.write(": heartbeat\n\n");
       }, 15_000);

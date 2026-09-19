@@ -56,6 +56,8 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
   const lines = [
     `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
+    "⚠️ Before you run this: a rollup reloads the session and will interrupt any subagent that is currently working — its transcript is saved and it can be resumed, but its in-progress turn is cut. If a subagent is running right now, DEFER this rollup until it finishes; the next heartbeat re-nudges, so nothing is lost by waiting.",
+    "",
     ...(p.replacesExistingBlock ? [
       `IMPORTANT: \`${p.level} ${p.period}\` already has a rollup block. The command below REPLACES that block; it does not append to it.`,
       "Write a fresh summary covering the WHOLE period. Preserve the existing block's important content and integrate the newly eligible source material.",

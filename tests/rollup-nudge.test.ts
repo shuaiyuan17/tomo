@@ -42,4 +42,12 @@ describe("rollup nudge text", () => {
     const text = nudgeText(promo("daily"), "sess-1", "dm:someone");
     expect(text).not.toContain("REPLACES that block");
   });
+
+  it("warns that running a rollup interrupts a working subagent, and to defer if one is running", () => {
+    const text = nudgeText(promo("daily"), "sess-1", "dm:someone");
+    expect(text).toContain("interrupt any subagent");
+    expect(text).toContain("DEFER this rollup until it finishes");
+    // The caveat must precede the command so it is read before the rollup is run.
+    expect(text.indexOf("interrupt any subagent")).toBeLessThan(text.indexOf("tomo lcm daily"));
+  });
 });

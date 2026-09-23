@@ -11,7 +11,7 @@ import { log } from "../logger.js";
 import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
-import type { SessionMessage } from "../sessions/types.js";
+import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
@@ -79,6 +79,11 @@ export interface LiveSessionManagerDeps {
   setSdkSessionId(key: string, sessionId: string): void;
   clearSdkSessionId(key: string): void;
   retireSdkSessionId(key: string): void;
+  /**
+   * The persisted SDK usage baseline for the session `key` links to — what a
+   * resumed session's cumulative cost/token totals are differenced against.
+   */
+  getUsageBaseline(key: string): UsageBaseline | undefined;
   updateStats(key: string, result: QueryResult): void;
   /** Transcript messages for pre-resume repair. */
   getSessionMessages(key: string): SessionMessage[];
@@ -314,6 +319,7 @@ export class LiveSessionManager {
       onToolResult: (toolName, content, isError) => {
         this.deps.handleToolResult?.(key, toolName, content, isError);
       },
+      ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: this.deps.getUsageBaseline(key) } } : {}),
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
     // yields — it can spend real time on OAuth — and stop() may have run its

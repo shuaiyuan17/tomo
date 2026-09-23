@@ -202,6 +202,64 @@ describe("SessionStore", () => {
     expect(entry?.stats.totalInputTokens).toBe(20);
   });
 
+  describe("usage baseline", () => {
+    const turn = {
+      costUsd: 0.1, inputTokens: 10, outputTokens: 5,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      contextUsed: 10, contextMax: 100,
+    };
+    const baseline = (sdkSessionId: string, totalCostUsd: number) => ({
+      sdkSessionId, totalCostUsd, tokens: { input: 1, output: 2, cacheRead: 3, cacheCreated: 4 },
+    });
+
+    it("persists the baseline next to the SDK session id and reads it back from disk", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setSdkSessionId("telegram:1", "session-1");
+      store.updateStats("telegram:1", { ...turn, usageBaseline: baseline("session-1", 275.47) });
+
+      const fresh = new SessionStore(TEST_DIR, 20);
+      expect(fresh.getUsageBaseline("telegram:1")).toEqual(baseline("session-1", 275.47));
+      // No usageBaseline in the update: left untouched.
+      fresh.updateStats("telegram:1", turn);
+      expect(fresh.getUsageBaseline("telegram:1")?.totalCostUsd).toBe(275.47);
+      // null: the totals reset, so the baseline is dropped.
+      fresh.updateStats("telegram:1", { ...turn, usageBaseline: null });
+      expect(fresh.getUsageBaseline("telegram:1")).toBeUndefined();
+    });
+
+    it("never stores a baseline measured on a different SDK session", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setSdkSessionId("telegram:1", "session-1");
+      store.updateStats("telegram:1", { ...turn, usageBaseline: baseline("session-other", 5) });
+      expect(store.getUsageBaseline("telegram:1")).toBeUndefined();
+    });
+
+    it("drops the baseline when the SDK session is cleared (/new) or rotated", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setSdkSessionId("telegram:1", "session-1");
+      store.updateStats("telegram:1", { ...turn, usageBaseline: baseline("session-1", 275.47) });
+
+      store.clearSdkSessionId("telegram:1");
+      expect(store.getUsageBaseline("telegram:1")).toBeUndefined();
+      expect(store.listAllSessions().some((e) => e.usageBaseline)).toBe(false);
+
+      store.setSdkSessionId("telegram:1", "session-2");
+      expect(store.getUsageBaseline("telegram:1")).toBeUndefined();
+    });
+
+    it("drops the baseline when the SDK session is retired", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      store.setSdkSessionId("telegram:1", "session-1");
+      store.updateStats("telegram:1", { ...turn, usageBaseline: baseline("session-1", 275.47) });
+
+      store.retireSdkSessionId("telegram:1");
+      expect(store.getUsageBaseline("telegram:1")).toBeUndefined();
+      expect(store.listAllSessions().some((e) => e.usageBaseline)).toBe(false);
+      store.setSdkSessionId("telegram:1", "session-2");
+      expect(store.getUsageBaseline("telegram:1")).toBeUndefined();
+    });
+  });
+
   it("retires a poisoned SDK session while preserving active metadata", () => {
     const store = new SessionStore(TEST_DIR, 20);
     store.setChatTitle("telegram:-987", "Ski Trip");

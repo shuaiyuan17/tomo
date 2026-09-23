@@ -298,6 +298,7 @@ export class Agent {
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
       retireSdkSessionId: (key) => { this.sessions.retireSdkSessionId(key); },
+      getUsageBaseline: (key) => this.sessions.getUsageBaseline(key),
       updateStats: (key, result) => {
         this.sessions.updateStats(key, result);
         watchBus.publish({

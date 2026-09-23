@@ -118,6 +118,7 @@ function makeManagerDeps(buildExternalMcpServers?: Deps["buildExternalMcpServers
     setSdkSessionId: vi.fn(),
     clearSdkSessionId: vi.fn(),
     retireSdkSessionId: vi.fn(),
+    getUsageBaseline: vi.fn(() => undefined),
     updateStats: vi.fn(),
     getSessionMessages: () => [],
     getModelOverride: () => undefined,

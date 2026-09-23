@@ -104,6 +104,14 @@ function makeSession(settings?: {
   onMcpAuthError?: (serverName: string) => Promise<string> | string;
   now?: () => number;
   onToolResult?: (toolName: string, content: unknown, isError: boolean) => void;
+  resumeFrom?: {
+    sdkSessionId: string;
+    baseline?: {
+      sdkSessionId: string;
+      totalCostUsd: number;
+      tokens: { input: number; output: number; cacheRead: number; cacheCreated: number };
+    };
+  };
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
@@ -1073,6 +1081,142 @@ describe("LiveSession token accounting", () => {
     harness.pushEvent({ ...resultEvent(), total_cost_usd: 0.1 });
     await p2;
     expect(session.lastResult?.costUsd).toBeCloseTo(0.1);
+  });
+
+  // Totals of modelUsage(n) summed across both models.
+  const tokensAt = (n: number) => ({ input: 1010 * n, output: 505 * n, cacheRead: 100 * n, cacheCreated: n });
+
+  async function runTurn(
+    session: InstanceType<typeof LiveSession>,
+    harness: Harness,
+    n: number,
+    result: Record<string, unknown>,
+  ) {
+    const p = session.send(`turn ${n}`);
+    await waitFor(() => harness.inputs.length === n);
+    harness.pushEvent({ ...resultEvent(), ...result });
+    await p;
+    return session.lastResult!;
+  }
+
+  describe("resumed sessions (SDK totals carry the transcript's earlier turns)", () => {
+    it("differences the first result against the persisted baseline, not zero", async () => {
+      const { session, harness } = makeSession({
+        resumeFrom: {
+          sdkSessionId: "sid-1",
+          baseline: { sdkSessionId: "sid-1", totalCostUsd: 275.47, tokens: tokensAt(50) },
+        },
+      });
+
+      // The carried total is exactly what we last recorded: this turn (e.g.
+      // a crash-free restart and a turn that cost nothing new) is ~0.
+      const r1 = await runTurn(session, harness, 1, { total_cost_usd: 275.47, modelUsage: modelUsage(50) });
+      expect(r1.costUsd).toBeCloseTo(0, 10);
+      expect(r1).toMatchObject({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 });
+
+      const r2 = await runTurn(session, harness, 2, { total_cost_usd: 276.0, modelUsage: modelUsage(51) });
+      expect(r2.costUsd).toBeCloseTo(0.53, 10);
+      expect(r2).toMatchObject({ inputTokens: 1010, outputTokens: 505, cacheReadTokens: 100, cacheCreationTokens: 1 });
+      expect(r2.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 276.0, tokens: tokensAt(51) });
+    });
+
+    it("does not charge the carried total when there is no baseline yet", async () => {
+      const { session, harness } = makeSession({ resumeFrom: { sdkSessionId: "sid-1" } });
+
+      const r1 = await runTurn(session, harness, 1, {
+        total_cost_usd: 275.47,
+        modelUsage: modelUsage(50),
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 2 },
+      });
+      // Cost unknown for this one turn: 0, not the session's lifetime.
+      // Tokens from `usage`, which the SDK reports per turn.
+      expect(r1.costUsd).toBe(0);
+      expect(r1).toMatchObject({ inputTokens: 7, outputTokens: 3, cacheReadTokens: 2, cacheCreationTokens: 0 });
+      // ... and that first result becomes the baseline.
+      expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 275.47, tokens: tokensAt(50) });
+
+      const r2 = await runTurn(session, harness, 2, { total_cost_usd: 276.0, modelUsage: modelUsage(51) });
+      expect(r2.costUsd).toBeCloseTo(0.53, 10);
+      expect(r2).toMatchObject({ inputTokens: 1010, outputTokens: 505, cacheReadTokens: 100, cacheCreationTokens: 1 });
+    });
+
+    it("ignores a baseline recorded for a different SDK session", async () => {
+      const { session, harness } = makeSession({
+        resumeFrom: {
+          sdkSessionId: "sid-1",
+          baseline: { sdkSessionId: "sid-old", totalCostUsd: 1, tokens: tokensAt(1) },
+        },
+      });
+      const r1 = await runTurn(session, harness, 1, { total_cost_usd: 275.47, modelUsage: modelUsage(50) });
+      expect(r1.costUsd).toBe(0);
+    });
+
+    it("treats a first result BELOW the baseline as unknown, not as a reset charging the whole total", async () => {
+      const { session, harness } = makeSession({
+        resumeFrom: {
+          sdkSessionId: "sid-1",
+          baseline: { sdkSessionId: "sid-1", totalCostUsd: 275.47, tokens: tokensAt(50) },
+        },
+      });
+      const r1 = await runTurn(session, harness, 1, { total_cost_usd: 270.0, modelUsage: modelUsage(49) });
+      expect(r1.costUsd).toBe(0);
+      const r2 = await runTurn(session, harness, 2, { total_cost_usd: 270.25, modelUsage: modelUsage(50) });
+      expect(r2.costUsd).toBeCloseTo(0.25, 10);
+    });
+
+    it("still treats a total that goes backwards mid-session as a reset (/clear), and drops the baseline", async () => {
+      const { session, harness } = makeSession({
+        resumeFrom: {
+          sdkSessionId: "sid-1",
+          baseline: { sdkSessionId: "sid-1", totalCostUsd: 275.47, tokens: tokensAt(50) },
+        },
+      });
+      await runTurn(session, harness, 1, { total_cost_usd: 276.0, modelUsage: modelUsage(51) });
+
+      // A mid-session /clear restarts the SDK's running sum.
+      const r2 = await runTurn(session, harness, 2, { total_cost_usd: 0.2, modelUsage: modelUsage(1) });
+      expect(r2.costUsd).toBeCloseTo(0.2, 10);
+      expect(r2).toMatchObject({ inputTokens: 1010, outputTokens: 505 });
+      // What total the transcript now holds is unknown: persist no baseline.
+      expect(r2.usageBaseline).toBeNull();
+
+      const r3 = await runTurn(session, harness, 3, { total_cost_usd: 0.5, modelUsage: modelUsage(2) });
+      expect(r3.costUsd).toBeCloseTo(0.3, 10);
+      expect(r3.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0.5, tokens: tokensAt(2) });
+    });
+  });
+
+  it("after a reset, every cumulative counter is the turn's own — even one that came back larger", async () => {
+    const { session, harness } = makeSession();
+    await runTurn(session, harness, 1, { total_cost_usd: 1.0, modelUsage: modelUsage(1) });
+    // /clear: cost and input restart, but this first cleared turn happens to
+    // read more cache than the whole previous run did (100 → 1000).
+    const r2 = await runTurn(session, harness, 2, {
+      total_cost_usd: 0.2,
+      modelUsage: {
+        "claude-x": { inputTokens: 5, outputTokens: 2, cacheReadInputTokens: 1000, cacheCreationInputTokens: 0 },
+      },
+    });
+    expect(r2.costUsd).toBeCloseTo(0.2, 10);
+    expect(r2).toMatchObject({ inputTokens: 5, outputTokens: 2, cacheReadTokens: 1000, cacheCreationTokens: 0 });
+  });
+
+  it("keeps a zero-cost result with real tokens as a baseline (a route that reports no price)", async () => {
+    const { session, harness } = makeSession({ resumeFrom: { sdkSessionId: "sid-1" } });
+    const r1 = await runTurn(session, harness, 1, { total_cost_usd: 0, modelUsage: modelUsage(3) });
+    expect(r1.costUsd).toBe(0);
+    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0, tokens: tokensAt(3) });
+  });
+
+  it("a fresh session charges the first result in full and reports it as the baseline", async () => {
+    const { session, harness } = makeSession();
+    const r1 = await runTurn(session, harness, 1, { total_cost_usd: 0.5, modelUsage: modelUsage(1) });
+    expect(r1.costUsd).toBeCloseTo(0.5, 10);
+    expect(r1).toMatchObject({ inputTokens: 1010, outputTokens: 505, cacheReadTokens: 100, cacheCreationTokens: 1 });
+    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0.5, tokens: tokensAt(1) });
+
+    const r2 = await runTurn(session, harness, 2, { total_cost_usd: 0.75, modelUsage: modelUsage(2) });
+    expect(r2.costUsd).toBeCloseTo(0.25, 10);
   });
 
   it("falls back to usage when a result carries no modelUsage", async () => {

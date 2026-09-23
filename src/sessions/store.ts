@@ -1,7 +1,7 @@
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, readSync, fstatSync, linkSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
-import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget } from "./types.js";
+import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget, UsageBaseline } from "./types.js";
 import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
 import {
@@ -1391,6 +1391,20 @@ export class SessionStore {
     return entry?.sdkSessionId || undefined;
   }
 
+  /**
+   * The usage baseline recorded for the SDK session `key` currently links to,
+   * or undefined when there is none (never recorded, reset, or recorded for a
+   * different SDK session id).
+   */
+  getUsageBaseline(key: string): UsageBaseline | undefined {
+    this.loadRegistry();
+    this.noteStaleRead("getUsageBaseline");
+    const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+    const baseline = entry?.usageBaseline;
+    if (!entry?.sdkSessionId || !baseline || baseline.sdkSessionId !== entry.sdkSessionId) return undefined;
+    return baseline;
+  }
+
   /** Get the active registry entry for a channel key */
   getEntry(key: string): SessionEntry | undefined {
     this.loadRegistry();
@@ -1409,6 +1423,8 @@ export class SessionStore {
       const stub = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && !e.sdkSessionId);
       if (stub) {
         stub.sdkSessionId = sessionId;
+        // A new SDK session starts its cumulative totals from zero.
+        delete stub.usageBaseline;
         stub.lastActiveAt = Date.now();
         this.saveRegistry();
         return;
@@ -1453,6 +1469,12 @@ export class SessionStore {
     contextMax: number;
     contextEstimated?: boolean;
     contextBreakdown?: { name: string; tokens: number }[];
+    /**
+     * The SDK's cumulative counters after this turn, to resume from next time.
+     * `null` drops the stored baseline (the totals just reset, so it is not
+     * known what the SDK transcript saved); absent leaves it untouched.
+     */
+    usageBaseline?: UsageBaseline | null;
   }): void {
     // Bookkeeping: this runs after the model has already answered. Skipping it
     // costs a stale stat line; throwing would fail a turn that succeeded.
@@ -1484,6 +1506,17 @@ export class SessionStore {
       entry.stats.contextEstimated = update.contextEstimated ?? false;
       if (update.contextBreakdown) {
         entry.stats.contextBreakdown = update.contextBreakdown;
+      }
+      // Persisted in the SAME write as the stats it was measured with: if this
+      // bookkeeping write is skipped, the turn's cost was not recorded either,
+      // and the older baseline correctly charges it on the next resume. Only
+      // stored against the SDK session it was measured on.
+      if (update.usageBaseline !== undefined) {
+        if (update.usageBaseline && update.usageBaseline.sdkSessionId === entry.sdkSessionId) {
+          entry.usageBaseline = update.usageBaseline;
+        } else {
+          delete entry.usageBaseline;
+        }
       }
       entry.lastActiveAt = Date.now();
       this.saveRegistryBestEffort("updateStats");
@@ -1562,6 +1595,7 @@ export class SessionStore {
           if (deferredStub && !entry.sdkSessionId) continue;
           entry.unlinkedAt = now;
           entry.expiresAt = now + UNLINKED_TTL_MS;
+          delete entry.usageBaseline;
           log.info(
             { key, sessionId: entry.sdkSessionId, expiresAt: new Date(entry.expiresAt).toISOString() },
             "Session unlinked, will be deleted in 30 days",
@@ -1587,6 +1621,7 @@ export class SessionStore {
       const retiredSessionId = entry.sdkSessionId;
       entry.unlinkedAt = now;
       entry.expiresAt = now + UNLINKED_TTL_MS;
+      delete entry.usageBaseline;
 
       this.registry.push({
         sdkSessionId: "",

@@ -21,6 +21,7 @@ import {
   type FabricatedMarker,
 } from "./inbound-markers.js";
 import { silentTurnSteerNote } from "../continuity-defaults.js";
+import type { UsageBaseline } from "../sessions/types.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
@@ -143,6 +144,33 @@ interface TokenTotals {
   cacheCreated: number;
 }
 
+/** Cumulative `modelUsage` summed across models; null when the result has none. */
+function cumulativeModelTokens(result: SdkResultLike): TokenTotals | null {
+  const models = result.modelUsage ? Object.values(result.modelUsage) : [];
+  if (models.length === 0) return null;
+  return models.reduce<TokenTotals>((acc, m) => ({
+    input: acc.input + (m.inputTokens ?? 0),
+    output: acc.output + (m.outputTokens ?? 0),
+    cacheRead: acc.cacheRead + (m.cacheReadInputTokens ?? 0),
+    cacheCreated: acc.cacheCreated + (m.cacheCreationInputTokens ?? 0),
+  }), { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 });
+}
+
+/** `usage`: main agent loop only, but already per-turn. */
+function tokenSum(t: TokenTotals): number {
+  return t.input + t.output + t.cacheRead + t.cacheCreated;
+}
+
+function mainLoopUsage(result: SdkResultLike): TokenTotals {
+  const u = result.usage as Record<string, number> | undefined;
+  return {
+    input: u?.input_tokens ?? 0,
+    output: u?.output_tokens ?? 0,
+    cacheRead: u?.cache_read_input_tokens ?? 0,
+    cacheCreated: u?.cache_creation_input_tokens ?? 0,
+  };
+}
+
 /**
  * A turn the CLI ended on a non-success result. Thrown (rejected) from
  * send()/steer() so the failure travels the same path as any other turn
@@ -242,6 +270,13 @@ export interface LiveSessionSettings {
   /** Clock for the MCP auth-refresh rate window. Injected by tests. */
   now?: () => number;
   onToolResult?: (toolName: string, content: unknown, isError: boolean) => void;
+  /**
+   * Set when this session RESUMES an existing SDK session: its id and the
+   * usage baseline persisted for it, if any. The SDK's first result on a
+   * resume already carries the totals the transcript saved, so per-turn
+   * deltas start from `baseline` instead of 0. See `turnUsage`.
+   */
+  resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
 }
 
 /** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
@@ -483,6 +518,14 @@ export interface QueryResult {
    * that acts on the ratio — the context-nudge ladder — must skip instead.
    */
   contextEstimated?: boolean;
+  /**
+   * The SDK's cumulative counters after this turn — what the next resume of
+   * this SDK session must difference against. `null` when they cannot be
+   * trusted as that baseline (the totals just reset, or the result carried no
+   * `modelUsage`/session id), which makes the next resume take the
+   * conservative no-baseline path rather than charge a carried total.
+   */
+  usageBaseline?: UsageBaseline | null;
 }
 
 /**
@@ -619,6 +662,13 @@ export class LiveSession {
   private prevTotalCost = 0;
   /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
   private prevModelTokens: TokenTotals | null = null;
+  /**
+   * The next result is the first since this session resumed an SDK session.
+   * `"baseline"`: prev* were seeded from the persisted baseline. `"unknown"`:
+   * there was none, so the carried totals are unknown. Null otherwise
+   * (including for every fresh session). Consumed by the first result.
+   */
+  private resumeState: "baseline" | "unknown" | null = null;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
   private turnBudget: TurnBudget | undefined;
@@ -688,6 +738,17 @@ export class LiveSession {
     this.onMcpAuthError = settings.onMcpAuthError;
     this.now = settings.now ?? Date.now;
     this.onToolResult = settings.onToolResult;
+    const resumeFrom = settings.resumeFrom;
+    if (resumeFrom) {
+      const baseline = resumeFrom.baseline;
+      if (baseline && baseline.sdkSessionId === resumeFrom.sdkSessionId) {
+        this.prevTotalCost = baseline.totalCostUsd;
+        this.prevModelTokens = { ...baseline.tokens };
+        this.resumeState = "baseline";
+      } else {
+        this.resumeState = "unknown";
+      }
+    }
     this.q = query({ prompt: this.messageGenerator(), options });
     this.eventLoopDone = this.consumeEvents();
   }
@@ -1117,20 +1178,12 @@ export class LiveSession {
         this.sessionId = result.session_id;
       }
 
-      // Token accounting. `usage` is the MAIN AGENT LOOP ONLY (per the SDK's
-      // own doc comment) — a turn that fans out to subagents undercounts by
-      // everything they consumed. `modelUsage` covers the whole query
-      // pipeline but is cumulative across turns in a streaming-input session,
-      // so it is differenced against the previous result, like the cost.
-      const { input, output, cacheRead, cacheCreated } = this.turnTokenUsage(result);
-
-      // Per-turn cost as the delta from the cumulative total. A total that
-      // went BACKWARDS is a reset, not a refund — crash results carry zeroed
-      // totals and a mid-session /clear restarts the running sum — so the
-      // cumulative value is then this turn's own; never persist a negative.
-      const totalCost = result.total_cost_usd ?? 0;
-      const turnCost = totalCost >= this.prevTotalCost ? totalCost - this.prevTotalCost : totalCost;
-      this.prevTotalCost = totalCost;
+      const {
+        costUsd: turnCost,
+        totalCost,
+        tokens: { input, output, cacheRead, cacheCreated },
+        baseline,
+      } = this.turnUsage(result);
 
       // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
       // successful one. `subtype` names why the CLI stopped early (max turns,
@@ -1157,6 +1210,7 @@ export class LiveSession {
         cacheCreationTokens: cacheCreated,
         contextUsed: 0,
         contextMax: 0,
+        usageBaseline: baseline,
       };
 
       // Await context usage before resolving so stats are complete
@@ -1371,41 +1425,96 @@ export class LiveSession {
   }
 
   /**
-   * Per-turn token counts for this result. Prefers `modelUsage` (whole query
-   * pipeline, cumulative — differenced against the previous result) and
-   * falls back to `usage` (main loop only, already per-turn) when a result
-   * carries no `modelUsage` (older CLIs, crash results with zeroed totals).
+   * Per-turn cost and tokens for this result, plus the cumulative baseline the
+   * next resume must start from.
+   *
+   * `total_cost_usd` and `modelUsage` are cumulative per query() (and
+   * `modelUsage` covers the whole pipeline, subagents included, where `usage`
+   * is the MAIN AGENT LOOP ONLY), so a turn's own figures are the delta from
+   * the previous result. A counter that went BACKWARDS is a reset, not a
+   * refund — crash results carry zeroed totals and a mid-session /clear
+   * restarts the running sum — so the cumulative value is then this turn's
+   * own; never record a negative. A result without `modelUsage` (older CLIs,
+   * zeroed crash results) falls back to `usage`, already per-turn.
+   *
+   * THE FIRST RESULT AFTER A RESUME is different: the SDK continues from the
+   * totals the transcript saved, so it already carries every earlier turn.
+   *  - With a persisted baseline, prev* were seeded from it and the delta is
+   *    this turn's own. If the carried total is BELOW the baseline, the
+   *    transcript saved an older total than tomo last recorded (e.g. a reload
+   *    after compaction); that is not a reset — charging the whole carried
+   *    total is exactly the over-count this exists to prevent — so it takes
+   *    the no-baseline path below.
+   *  - With NO baseline (sessions persisted before baselines existed, or whose
+   *    last result reset the totals), the carried total is unknown. The SDK
+   *    exposes no per-turn cost, so this turn's cost is recorded as 0 and its
+   *    tokens as `usage` (per-turn, main loop only): a one-turn UNDERcount
+   *    instead of charging the session's lifetime. The result then becomes
+   *    the baseline for every later delta.
    */
-  private turnTokenUsage(result: SdkResultLike): TokenTotals {
-    const models = result.modelUsage ? Object.values(result.modelUsage) : [];
-    if (models.length > 0) {
-      const cumulative = models.reduce<TokenTotals>((acc, m) => ({
-        input: acc.input + (m.inputTokens ?? 0),
-        output: acc.output + (m.outputTokens ?? 0),
-        cacheRead: acc.cacheRead + (m.cacheReadInputTokens ?? 0),
-        cacheCreated: acc.cacheCreated + (m.cacheCreationInputTokens ?? 0),
-      }), { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 });
-      const prev = this.prevModelTokens;
-      this.prevModelTokens = cumulative;
-      // A counter that went backwards means the CLI reset its totals (a
-      // resume, a /clear); the cumulative value is then this turn's own.
-      const delta = (now: number, before: number) => (now >= before ? now - before : now);
-      return prev
-        ? {
-          input: delta(cumulative.input, prev.input),
-          output: delta(cumulative.output, prev.output),
-          cacheRead: delta(cumulative.cacheRead, prev.cacheRead),
-          cacheCreated: delta(cumulative.cacheCreated, prev.cacheCreated),
-        }
-        : cumulative;
+  private turnUsage(result: SdkResultLike): {
+    costUsd: number;
+    totalCost: number;
+    tokens: TokenTotals;
+    baseline: UsageBaseline | null;
+  } {
+    const totalCost = result.total_cost_usd ?? 0;
+    const cumulative = cumulativeModelTokens(result);
+    const perTurnUsage = mainLoopUsage(result);
+
+    const resumeState = this.resumeState;
+    this.resumeState = null;
+    const prevCost = this.prevTotalCost;
+    const prevTokens = this.prevModelTokens;
+
+    const tokensWentBackwards = !!(cumulative && prevTokens) && (
+      cumulative.input < prevTokens.input
+      || cumulative.output < prevTokens.output
+      || cumulative.cacheRead < prevTokens.cacheRead
+      || cumulative.cacheCreated < prevTokens.cacheCreated
+    );
+    const costWentBackwards = totalCost < prevCost;
+
+    this.prevTotalCost = totalCost;
+    if (cumulative) this.prevModelTokens = cumulative;
+
+    const baselineFor = (trusted: boolean): UsageBaseline | null =>
+      trusted && cumulative && this.sessionId
+        ? { sdkSessionId: this.sessionId, totalCostUsd: totalCost, tokens: { ...cumulative } }
+        : null;
+
+    if (resumeState === "unknown" || (resumeState === "baseline" && (costWentBackwards || tokensWentBackwards))) {
+      log.info(
+        { session: this.sessionKey, carriedTotalUsd: totalCost, baselineUsd: resumeState === "baseline" ? prevCost : undefined },
+        "First result after resume without a usable usage baseline; recording 0 cost for this turn",
+      );
+      // A zeroed crash result is no baseline at all — keep none. Judge
+      // "zeroed" by cost AND tokens: a zero-cost route (e.g. a gateway that
+      // reports no price) with real cumulative tokens is a valid baseline.
+      const zeroed = totalCost <= 0 && !(cumulative && tokenSum(cumulative) > 0);
+      return { costUsd: 0, totalCost, tokens: perTurnUsage, baseline: baselineFor(!zeroed) };
     }
-    const u = result.usage as Record<string, number> | undefined;
-    return {
-      input: u?.input_tokens ?? 0,
-      output: u?.output_tokens ?? 0,
-      cacheRead: u?.cache_read_input_tokens ?? 0,
-      cacheCreated: u?.cache_creation_input_tokens ?? 0,
-    };
+
+    // A reset is decided ONCE for the whole result: after one (crash or
+    // /clear) every cumulative figure is this turn's own. Deciding per field
+    // would subtract the old total from any counter that happened to come
+    // back larger than before, undercounting that turn.
+    const reset = costWentBackwards || tokensWentBackwards;
+    const costUsd = reset ? totalCost : totalCost - prevCost;
+    const tokens = cumulative
+      ? prevTokens && !reset
+        ? {
+          input: cumulative.input - prevTokens.input,
+          output: cumulative.output - prevTokens.output,
+          cacheRead: cumulative.cacheRead - prevTokens.cacheRead,
+          cacheCreated: cumulative.cacheCreated - prevTokens.cacheCreated,
+        }
+        : cumulative
+      : perTurnUsage;
+    // After a reset it is unknown what total the SDK transcript saved (a
+    // crash leaves the old one, a /clear the new one): drop the baseline so
+    // the next resume takes the conservative path instead of guessing.
+    return { costUsd, totalCost, tokens, baseline: baselineFor(!reset) };
   }
 
   private async logContextUsage(

@@ -132,6 +132,7 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
     setSdkSessionId: vi.fn(),
     clearSdkSessionId: vi.fn(),
     retireSdkSessionId: vi.fn(),
+    getUsageBaseline: vi.fn(() => undefined),
     updateStats: vi.fn(),
     getSessionMessages: () => [],
     getModelOverride: () => undefined,
@@ -163,6 +164,23 @@ beforeEach(() => {
 });
 
 describe("LiveSessionManager session lifecycle", () => {
+  it("hands a resumed session its persisted usage baseline, and a fresh one nothing", async () => {
+    const baseline = {
+      sdkSessionId: "sdk-resumed", totalCostUsd: 275.47,
+      tokens: { input: 1, output: 2, cacheRead: 3, cacheCreated: 4 },
+    };
+    const manager = new LiveSessionManager(makeDeps({
+      getSdkSessionId: vi.fn((key: string) => (key === "telegram:resumed" ? "sdk-resumed" : undefined)),
+      getUsageBaseline: vi.fn((key: string) => (key === "telegram:resumed" ? baseline : undefined)),
+    }));
+
+    await manager.getOrCreateLiveSession("telegram:resumed");
+    await manager.getOrCreateLiveSession("telegram:fresh");
+    const [resumed, fresh] = mockState.instances as unknown as Array<{ settings: Record<string, unknown> }>;
+    expect(resumed.settings.resumeFrom).toEqual({ sdkSessionId: "sdk-resumed", baseline });
+    expect(fresh.settings.resumeFrom).toBeUndefined();
+  });
+
   it("reuses an alive session and dedupes concurrent creation", async () => {
     let releaseBuild!: () => void;
     const buildGate = new Promise<void>((r) => { releaseBuild = r; });

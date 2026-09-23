@@ -1186,6 +1186,28 @@ describe("LiveSession token accounting", () => {
     });
   });
 
+  it("after a reset, every cumulative counter is the turn's own — even one that came back larger", async () => {
+    const { session, harness } = makeSession();
+    await runTurn(session, harness, 1, { total_cost_usd: 1.0, modelUsage: modelUsage(1) });
+    // /clear: cost and input restart, but this first cleared turn happens to
+    // read more cache than the whole previous run did (100 → 1000).
+    const r2 = await runTurn(session, harness, 2, {
+      total_cost_usd: 0.2,
+      modelUsage: {
+        "claude-x": { inputTokens: 5, outputTokens: 2, cacheReadInputTokens: 1000, cacheCreationInputTokens: 0 },
+      },
+    });
+    expect(r2.costUsd).toBeCloseTo(0.2, 10);
+    expect(r2).toMatchObject({ inputTokens: 5, outputTokens: 2, cacheReadTokens: 1000, cacheCreationTokens: 0 });
+  });
+
+  it("keeps a zero-cost result with real tokens as a baseline (a route that reports no price)", async () => {
+    const { session, harness } = makeSession({ resumeFrom: { sdkSessionId: "sid-1" } });
+    const r1 = await runTurn(session, harness, 1, { total_cost_usd: 0, modelUsage: modelUsage(3) });
+    expect(r1.costUsd).toBe(0);
+    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0, tokens: tokensAt(3) });
+  });
+
   it("a fresh session charges the first result in full and reports it as the baseline", async () => {
     const { session, harness } = makeSession();
     const r1 = await runTurn(session, harness, 1, { total_cost_usd: 0.5, modelUsage: modelUsage(1) });

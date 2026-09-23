@@ -157,6 +157,10 @@ function cumulativeModelTokens(result: SdkResultLike): TokenTotals | null {
 }
 
 /** `usage`: main agent loop only, but already per-turn. */
+function tokenSum(t: TokenTotals): number {
+  return t.input + t.output + t.cacheRead + t.cacheCreated;
+}
+
 function mainLoopUsage(result: SdkResultLike): TokenTotals {
   const u = result.usage as Record<string, number> | undefined;
   return {
@@ -1484,26 +1488,33 @@ export class LiveSession {
         { session: this.sessionKey, carriedTotalUsd: totalCost, baselineUsd: resumeState === "baseline" ? prevCost : undefined },
         "First result after resume without a usable usage baseline; recording 0 cost for this turn",
       );
-      // A zeroed crash result is no baseline at all — keep none.
-      return { costUsd: 0, totalCost, tokens: perTurnUsage, baseline: baselineFor(totalCost > 0) };
+      // A zeroed crash result is no baseline at all — keep none. Judge
+      // "zeroed" by cost AND tokens: a zero-cost route (e.g. a gateway that
+      // reports no price) with real cumulative tokens is a valid baseline.
+      const zeroed = totalCost <= 0 && !(cumulative && tokenSum(cumulative) > 0);
+      return { costUsd: 0, totalCost, tokens: perTurnUsage, baseline: baselineFor(!zeroed) };
     }
 
-    const delta = (now: number, before: number) => (now >= before ? now - before : now);
-    const costUsd = delta(totalCost, prevCost);
+    // A reset is decided ONCE for the whole result: after one (crash or
+    // /clear) every cumulative figure is this turn's own. Deciding per field
+    // would subtract the old total from any counter that happened to come
+    // back larger than before, undercounting that turn.
+    const reset = costWentBackwards || tokensWentBackwards;
+    const costUsd = reset ? totalCost : totalCost - prevCost;
     const tokens = cumulative
-      ? prevTokens
+      ? prevTokens && !reset
         ? {
-          input: delta(cumulative.input, prevTokens.input),
-          output: delta(cumulative.output, prevTokens.output),
-          cacheRead: delta(cumulative.cacheRead, prevTokens.cacheRead),
-          cacheCreated: delta(cumulative.cacheCreated, prevTokens.cacheCreated),
+          input: cumulative.input - prevTokens.input,
+          output: cumulative.output - prevTokens.output,
+          cacheRead: cumulative.cacheRead - prevTokens.cacheRead,
+          cacheCreated: cumulative.cacheCreated - prevTokens.cacheCreated,
         }
         : cumulative
       : perTurnUsage;
     // After a reset it is unknown what total the SDK transcript saved (a
     // crash leaves the old one, a /clear the new one): drop the baseline so
     // the next resume takes the conservative path instead of guessing.
-    return { costUsd, totalCost, tokens, baseline: baselineFor(!costWentBackwards && !tokensWentBackwards) };
+    return { costUsd, totalCost, tokens, baseline: baselineFor(!reset) };
   }
 
   private async logContextUsage(

@@ -5,8 +5,7 @@ import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
-import { writeJsonAtomicSync } from "../fs-utils.js";
-import { backupConfigIfParseableSync } from "./config/shared.js";
+import { ConfigStore } from "../config/store.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { DEFAULT_MODEL } from "../models.js";
 
@@ -382,9 +381,7 @@ export const initCommand = new Command("init")
  * version rather than preserving it. Exported for tests.
  */
 export function writeInitConfig(configPath: string, backupPath: string, config: Record<string, unknown>): void {
-  mkdirSync(dirname(configPath), { recursive: true });
-  backupConfigIfParseableSync(configPath, backupPath);
-  writeJsonAtomicSync(configPath, config, { mode: 0o600 });
+  new ConfigStore(configPath, backupPath).replace(config);
 }
 
 export function deriveOwnerIdentity(

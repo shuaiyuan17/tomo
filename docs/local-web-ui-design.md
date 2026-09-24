@@ -1,6 +1,6 @@
 # Proposal: local web UI
 
-**Status:** approved, including the 2026-09-16 review update: persistent token authentication and opt-in Tailscale Serve access supersede the original no-login/local-access-only requirement. PR 2 implements the web channel, service, and minimal chat.
+**Status:** approved, including the 2026-09-16 review update: persistent token authentication and opt-in Tailscale Serve access supersede the original no-login/local-access-only requirement. The web channel foundation shipped in #380. The subsequent approval combines all remaining Study, management, polish, and #381/#382 fixes in one completion PR.
 
 Reviewed against `255cb7f1ee7bb32f24a86550a4b73ae39e8b3058` (2026-09-14), using the supplied HTML mockup as the visual reference.
 
@@ -44,7 +44,7 @@ Add `src/channels/web.ts`, supervisor/API code under `src/web/`, and a separate 
 
 **Delivery:** browser-originated owner turns reply through the web channel, with a request-bound outlet independent of the canonical DM session. Provider messages, cron, continuity, and explicit `send_message` retain their destinations. Never replace the persistent notification target with web `last-active` state.
 
-Partition batching/steering when delivery destinations or privacy audiences are incompatible. Keep one execution queue per canonical session, so a browser and provider message cannot accidentally change each other's recipients.
+Keep one execution queue per canonical session and separate request-bound delivery from transcript ownership. For #382, owner browser input may steer into an active private user turn; SDK echo confirms the merge. The original turn writes the canonical reply once and retains its destination; a joined web outlet mirrors completed blocks only when the original outlet is not already web. Group-audience and background work stay queued. Provider-to-web steering remains guarded. Failed joined turns settle their receipts without retry or duplicate transcripts.
 
 **Streaming and recovery:** deliver completed blocks through the existing pipeline into `WebChannel.send()`, preserving `NO_REPLY`, scaffold/privacy/media filtering, ordered settlement, and no retry after a send attempt. Web delivery means acceptance into a bounded daemon mailbox, not a browser read receipt; overflow or service failure enters the existing failure path. Never wait for a slow browser.
 
@@ -111,13 +111,14 @@ Preserve the mockup's Enso mark, warm paper, ink text, serif headings, sans-seri
 
 Keep Conversation and The Study, adding a session picker and accurate connection/delivery labels. Study contains TODOs, Cron, Memory, Context, MCP, and Config. Replace demo content/controls with real capabilities; omit fake statistics, unsupported persona/creativity controls, and unimplemented voice/upload buttons. Light/dark/system themes, labeled controls, visible focus, keyboard dialogs/navigation, 44px touch targets, IME-safe Enter, restrained live announcements, and preserved history scroll position are required. Verify tablet (768px) and desktop layouts and all loading/empty/error/reconnecting states.
 
-## PR sequence and test evidence
+## Delivery sequence and test evidence
 
-1. **Design only:** review this proposal before implementation.
-2. **Web channel backend:** isolation/security, routing/delivery separation, history, streaming, minimal real chat; unit, DM/group integration, and browser chat E2E tests.
-3. **Inspection views:** TODO/cron/memory/context; store-backed confirmed cron mutations, confinement and CLI-parity tests.
-4. **MCP/config:** shared schema/transaction extraction (split if needed), secret-safe diff/save, live status and restart; stale-write/redaction/status/restart tests.
-5. **Polish:** responsive/accessibility/theme/recovery, packaging and docs. Essential accessibility/security begin in the first implementation PR.
+1. Design and web channel foundation: already reviewed and delivered in #380.
+2. **One completion PR, explicitly requested after collaborator access:** TODO/cron/memory/context, shared config transactions and schema, MCP status/management, restart, responsive/accessibility polish, documentation, and issues #381/#382. No additional design gate or phased PRs; never merge automatically.
+
+### Visual extension assessment
+
+Mode: **Extension**. The existing warm paper/ink UI, Enso brand, serif headings, mono metadata, 4px spacing and light/dark tokens already fit the mockup. Preserve them and add functional Study navigation, readable file/table views and native keyboard-accessible confirmation dialogs. Calibration: restrained variance 3/10, motion 2/10, information density 7/10, asset emphasis 2/10, reference fidelity 9/10. No new visual assets or libraries are needed. Verify real desktop, tablet and mobile renders and focus/error/empty/restart states before handoff.
 
 Reuse Vitest's existing Agent harness with temporary runtime roots and a deterministic SDK double. E2E drives real HTTP/CSRF/IPC/SSE without external credentials. Cover interleaved provider/web input, fixed/last-active delivery, group privacy and summons, shutdown custody, duplicate requests, multi-block/late-NO_REPLY/failure ordering, long history, reconnect, hostile headers/markdown/paths, config races, and UI child failure while another channel completes a turn.
 
@@ -128,7 +129,7 @@ For every added behavior, keep tests unchanged and revert its implementation hun
 1. Group sessions are read-only in the browser: history and context inspection only. Owner DM is the sole writable target.
 2. Completed-block streaming through the existing delivery pipeline is approved. No token deltas.
 3. Use a unique owner or require `web.ownerIdentity` when ambiguous. Port `9465`, enabled by default, with the existing messaging-channel startup requirement.
-4. Architecture and PR sequence are approved. PR 2 may proceed; subsequent PRs remain separately reviewable. Never merge automatically.
+4. Architecture is approved. The latest delivery decision supersedes the original staged sequence: complete all remaining scope and both reported issues in one next PR. Never merge automatically.
 
 ### Review follow-up
 

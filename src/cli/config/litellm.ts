@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { loadConfig, saveConfig } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig } from "./shared.js";
 import { resolveModelName } from "../../models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
@@ -53,7 +53,7 @@ export async function configLiteLlm(): Promise<void> {
 
   if (action === "disable") {
     delete cfg.litellm;
-    saveConfig(cfg);
+    await saveConfig(cfg);
     p.log.success("LiteLLM gateway disabled");
     return;
   }
@@ -119,7 +119,7 @@ export async function configLiteLlm(): Promise<void> {
     baseUrl: String(baseUrl).trim(),
     apiKey: nextKey,
   };
-  saveConfig(cfg);
+  await saveConfig(cfg);
   p.log.success(
     mode === CHATGPT_SUBSCRIPTION_MODE && chatGptModel
       ? `ChatGPT subscription gateway saved with ${chatGptModel}. Restart tomo for the daemon to use it.`

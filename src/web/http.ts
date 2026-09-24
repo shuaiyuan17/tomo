@@ -1,3 +1,6 @@
+import { z } from "zod";
+import { MemoryReadError } from "../workspace/memory-reader.js";
+import { restartSchema, WebValidationError } from "./management.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
@@ -25,13 +28,16 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   const externalOrigin = webConfigSchema.shape.externalOrigin.parse(deps.externalOrigin);
   const streams = new Set<ServerResponse>();
   let active = 0;
+  let inspecting = false;
   let boundPort = port;
   const server = createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 10_000 }, (req, res) => {
     for (const [key, value] of Object.entries(securityHeaders)) res.setHeader(key, value);
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) { res.destroy(); return; }
-      const err = error instanceof WebError ? error : new WebError(503, "service_unavailable");
-      json(res, err.status, { error: err.code });
+      const err = error instanceof WebError ? error : error instanceof MemoryReadError
+        ? new WebError(error.code === "invalid_path" ? 400 : error.code === "not_found" ? 404 : error.code === "limit" ? 413 : 503, "memory_" + error.code)
+        : new WebError(503, "service_unavailable");
+      json(res, err.status, { error: err.code, ...(error instanceof WebValidationError ? { fields: error.fields.slice(0, 50) } : {}) });
       req.resume();
     });
   });
@@ -53,6 +59,12 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       return;
     }
     if (active >= 8) throw new WebError(429, "request_limit");
+    // A single bounded workspace/context inspection at a time across clients.
+    // Chat, SSE and management remain available while disk inspection awaits.
+    const inspection = req.method === "GET" && (url.pathname === "/api/v1/todos"
+      || url.pathname.startsWith("/api/v1/memory/") || /^\/api\/v1\/sessions\/[^/]+\/context$/.test(url.pathname));
+    if (inspection && inspecting) throw new WebError(429, "inspection_busy");
+    if (inspection) inspecting = true;
     active++;
     try {
       if (!api) {
@@ -60,7 +72,35 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         await asset(url.pathname, res);
         return;
       }
+      if (req.method !== "GET") {
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        // Messages are checked at the authoritative daemon boundary; local
+        // mutations need only its epoch, never a multi-megabyte snapshot.
+        if (!(req.method === "POST" && url.pathname === "/api/v1/messages")) {
+          if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        }
+      }
       if (req.method === "GET") {
+        if (url.pathname === "/api/v1/restart") { json(res, 200, await deps.rpc({ method: "restart-status" })); return; }
+        if (url.pathname === "/api/v1/todos") { json(res, 200, await required(deps.data.memory).todos()); return; }
+        if (url.pathname === "/api/v1/memory/tree") { json(res, 200, await required(deps.data.memory).tree()); return; }
+        if (url.pathname === "/api/v1/memory/file") { json(res, 200, await required(deps.data.memory).file(url.searchParams.get("path") ?? "")); return; }
+        if (url.pathname === "/api/v1/memory/search") { json(res, 200, await required(deps.data.memory).search(url.searchParams.get("q") ?? "")); return; }
+        if (url.pathname === "/api/v1/cron") { json(res, 200, required(deps.data.cron).list()); return; }
+        if (url.pathname === "/api/v1/config/schema") { json(res, 200, required(deps.data.management).schema()); return; }
+        if (url.pathname === "/api/v1/config") { json(res, 200, required(deps.data.management).config()); return; }
+        if (url.pathname === "/api/v1/mcp") {
+          const saved = required(deps.data.management).mcp();
+          const live = await deps.rpc({ method: "mcp-status" }).then((sessions) => ({ sessions, available: true }), () => ({ sessions: [], available: false }));
+          json(res, 200, { ...saved, live }); return;
+        }
+        const context = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/context$/.exec(url.pathname);
+        if (context) {
+          const value = await deps.data.context(context[1]);
+          const recentCompactions = await deps.rpc({ method: "context-events", sessionId: context[1] }).catch(() => []);
+          json(res, 200, { ...value, recentCompactions }); return;
+        }
         if (url.pathname === "/api/v1/bootstrap") {
           const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
@@ -84,8 +124,22 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           json(res, 200, value);
           return;
         }
+      } else if (req.method === "POST" && url.pathname === "/api/v1/config/preview") {
+        json(res, 200, required(deps.data.management).previewConfig(await body(req), session!)); return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/mcp/preview") {
+        json(res, 200, required(deps.data.management).previewMcp(await body(req), session!)); return;
+      } else if (req.method === "POST" && ["/api/v1/config/apply", "/api/v1/mcp/apply"].includes(url.pathname)) {
+        json(res, 200, required(deps.data.management).apply(await body(req), session!)); return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/restart") {
+        const parsed = restartSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_restart");
+        required(deps.data.management).checkRevision(parsed.data.revision);
+        json(res, 202, await deps.rpc({ method: "restart", epoch: req.headers["x-tomo-epoch"] as string, reason: parsed.data.reason })); return;
+      } else if (["PATCH", "DELETE"].includes(req.method ?? "") && /^\/api\/v1\/cron\/[A-Za-z0-9-]{1,64}$/.test(url.pathname)) {
+        const parsed = z.object({ revision: z.string().length(64), confirm: z.literal(true), enabled: z.boolean().optional() }).strict().safeParse(await body(req));
+        if (!parsed.success || (req.method === "PATCH" && parsed.data.enabled === undefined)) throw new WebError(400, "invalid_cron_change");
+        json(res, 200, required(deps.data.cron).change(url.pathname.split("/").at(-1)!, parsed.data.revision, req.method === "DELETE" ? undefined : parsed.data.enabled)); return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/messages") {
-        csrf.verify(req, session!);
         const parsed = messageInputSchema.safeParse(await body(req));
         if (!parsed.success) throw new WebError(400, "invalid_message");
         const { ownerId } = deps.data.catalog();
@@ -97,7 +151,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         return;
       }
       throw new WebError(404, "not_found");
-    } finally { active--; }
+    } finally { active--; if (inspection) inspecting = false; }
   }
 
   async function events(url: URL, req: IncomingMessage, res: ServerResponse, origin: string): Promise<void> {
@@ -205,3 +259,5 @@ async function body(req: IncomingMessage): Promise<unknown> {
   try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
   catch { throw new WebError(400, "invalid_json"); }
 }
+
+function required<T>(value: T | undefined): T { if (!value) throw new WebError(503, "service_unavailable"); return value; }

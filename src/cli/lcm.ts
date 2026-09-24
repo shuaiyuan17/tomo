@@ -1,3 +1,4 @@
+import { readSummaryBlocks } from "../lcm/summary-reader.js";
 import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { compactSession } from "../lcm/compact.js";
@@ -169,34 +170,13 @@ lcmCommand
   .option("--full", "Show full summary content instead of a preview")
   .option("--preview <chars>", "Preview length in chars (default 160)", (v) => parseInt(v, 10), 160)
   .action(async (opts) => {
-    const { readFileSync } = await import("node:fs");
     const paths = await getRuntimeDirs();
     const sessionPath = getSdkSessionPath(opts.sessionId, paths.sdkSessionsDir);
     if (!existsSync(sessionPath)) {
       console.error(`Session file not found: ${sessionPath}`);
       process.exit(1);
     }
-    interface Block { tag: string; level: string; timestamp: string; eventsSummarized: number; content: string; }
-    const blocks: Block[] = [];
-    for (const line of readFileSync(sessionPath, "utf-8").split("\n")) {
-      if (!line) continue;
-      let e: Record<string, unknown>;
-      try { e = JSON.parse(line); } catch { continue; }
-      if (!e.isCompactSummary) continue;
-      const msg = e.message as { content?: unknown } | undefined;
-      const content = typeof msg?.content === "string" ? msg.content : "";
-      const tag = typeof e.blockTag === "string" ? e.blockTag : "legacy";
-      const level = tag === "legacy" ? "legacy" : tag.split(" ")[0];
-      const m = content.match(/^\[(?:[^\]]+? — )?(\d+) events? summarized\]/);
-      const eventsSummarized = m ? parseInt(m[1], 10) : 0;
-      blocks.push({
-        tag,
-        level,
-        timestamp: typeof e.timestamp === "string" ? e.timestamp : "",
-        eventsSummarized,
-        content,
-      });
-    }
+    const blocks = readSummaryBlocks(opts.sessionId, paths.sdkSessionsDir);
     const filtered = opts.level ? blocks.filter((b) => b.level === opts.level) : blocks;
     if (filtered.length === 0) {
       console.log(`No summary blocks found${opts.level ? ` for level=${opts.level}` : ""}.`);

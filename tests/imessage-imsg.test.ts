@@ -1559,7 +1559,7 @@ describe("imsg inbound message mapping", () => {
           const giveUp = () => warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("could not be delivered; giving up"));
           for (let t = 0; t < 180_000; t += 5_000) await tick(5_000);
           expect(giveUp()).toHaveLength(1);
-          expect(giveUp()[0][0]).toMatchObject({ messageId: "hang-timeout-1", count: 1, undelivered: 1, neverArrived: 0 });
+          expect(giveUp()[0][0]).toMatchObject({ messageId: "hang-timeout-1", count: 1, handOffPending: 1, undelivered: 0, neverArrived: 0 });
           expect(channel.pendingDeferredAttachmentWatches).toBe(0);
           expect(followUps(handler)).toHaveLength(1); // the hung call is never repeated
 
@@ -1568,6 +1568,102 @@ describe("imsg inbound message mapping", () => {
           for (let t = 0; t < 30_000 && !stopped; t += 1_000) await tick(1_000);
           expect(stopped).toBe(true);
         });
+      });
+    });
+
+    it("never hands over a follow-up still queued on the FIFO when the watch gives up", async () => {
+      useFakeClock();
+      await withDir("tomo-imsg-queued-giveup-", async (dir) => {
+        const latePath = join(dir, "late.png");
+        const warnSpy = vi.spyOn(log, "warn");
+        const { channel, children, handler } = await setup({ imageStoreBaseDir: dir, deferredAttachmentTimeoutMs: 12_000 });
+        let releaseSlow: () => void = () => {};
+        handler.mockImplementation(async (m) => {
+          if (m.text === "slow") await new Promise<void>((r) => { releaseSlow = r; });
+          return true;
+        });
+
+        children[0].notifyMessage(inboundMessage({
+          id: 400, guid: "queued-giveup-1",
+          attachments: [{ mime_type: "image/png", original_path: latePath, missing: true }],
+        }));
+        await ioUntil(() => handler.mock.calls.length >= 1);
+        writeFileSync(latePath, pngBytes);
+        await tick(5_000); // first sight
+        children[0].notifyMessage(inboundMessage({ id: 401, guid: "slow-row", text: "slow" })); // blocks the FIFO
+        await ioUntil(() => handler.mock.calls.some(([m]) => m.text === "slow"));
+        await tick(5_000); // t=10s: landed, follow-up queued behind the slow row
+        await tick(2_000); // t=12s: give-up fires while it waits
+
+        const giveUp = () => warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("giving up"));
+        expect(giveUp()).toHaveLength(1);
+        expect(giveUp()[0][0]).toMatchObject({ messageId: "queued-giveup-1", undelivered: 1 });
+
+        releaseSlow();
+        await flushIo();
+        await tick(30_000);
+        expect(followUps(handler)).toHaveLength(0);
+        expect(giveUp()).toHaveLength(1);
+        await channel.stop();
+      });
+    });
+
+    it("does not warn at the deadline when a slow hand-off was accepted after all", async () => {
+      useFakeClock();
+      await withDir("tomo-imsg-late-accept-", async (dir) => {
+        const latePath = join(dir, "late.png");
+        const warnSpy = vi.spyOn(log, "warn");
+        const { channel, children, handler } = await setup({
+          imageStoreBaseDir: dir,
+          deferredAttachmentTimeoutMs: 15_000,
+          deferredFollowUpDispatchTimeoutMs: 3_000,
+        });
+        handler.mockImplementation(async (m) => {
+          if (m.text.includes("finished downloading")) await new Promise<void>((r) => setTimeout(r, 4_000));
+          return true;
+        });
+        children[0].notifyMessage(inboundMessage({
+          guid: "late-accept-1",
+          attachments: [{ mime_type: "image/png", original_path: latePath, missing: true }],
+        }));
+        await ioUntil(() => handler.mock.calls.length >= 1);
+        writeFileSync(latePath, pngBytes);
+        await tick(5_000);
+        await vi.advanceTimersByTimeAsync(5_000); // t=10s: hand-off starts, answers at t=14s
+        await ioUntil(() => followUps(handler).length >= 1);
+        for (let i = 0; i < 6; i++) await tick(1_000); // past the 3s bound, the late accept, and the t=15s deadline
+
+        expect(warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("giving up"))).toHaveLength(0);
+        expect(channel.pendingDeferredAttachmentWatches).toBe(0);
+        await tick(20_000);
+        expect(followUps(handler)).toHaveLength(1); // accepted late — never re-sent
+        await channel.stop();
+      });
+    });
+
+    it("bounds the shutdown wait for a hung re-check once, not once per phase", async () => {
+      useFakeClock();
+      await withDir("tomo-imsg-stop-once-", async (dir) => {
+        const warnSpy = vi.spyOn(log, "warn");
+        const { channel, children, handler } = await setup({ imageStoreBaseDir: dir });
+        children[0].notifyMessage(inboundMessage({
+          guid: "stop-once-1",
+          attachments: [{ mime_type: "image/png", original_path: join(dir, "late.png"), missing: true }],
+        }));
+        await ioUntil(() => handler.mock.calls.length >= 1);
+
+        const internals = channel as unknown as { resolveOnDiskAttachment: (att: Record<string, unknown>) => Promise<unknown> };
+        const probe = vi.spyOn(internals, "resolveOnDiskAttachment").mockImplementation(() => new Promise(() => {}));
+        await vi.advanceTimersByTimeAsync(5_000);
+        await ioUntil(() => probe.mock.calls.length >= 1); // the check is now hung
+
+        let stopped = false;
+        void channel.stop().then(() => { stopped = true; });
+        await tick(9_000);
+        expect(stopped).toBe(false);
+        await tick(1_500); // just past the 10s bound
+        expect(stopped).toBe(true);
+        expect(warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("still running at shutdown"))).toHaveLength(1);
       });
     });
 

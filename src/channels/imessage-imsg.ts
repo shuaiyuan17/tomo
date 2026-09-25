@@ -427,6 +427,8 @@ export class ImsgChannel implements Channel {
   private deferredWatchesDone = new Set<string>();
   /** Deferred-attachment checks currently running (awaited on shutdown). */
   private deferredChecksInFlight = new Set<Promise<void>>();
+  /** The one bounded shutdown wait for in-flight checks (shared by quiesce and teardown). */
+  private deferredSettle: Promise<void> | null = null;
   private readonly probeHeicAlphaFn: (srcPath: string, timeoutMs?: number) => Promise<boolean | null>;
   // Settles a request's parked-on-'drain' write link, keyed by request id, so a
   // request timeout/cancel can release its own stuck write (else future writes
@@ -1834,8 +1836,17 @@ export class ImsgChannel implements Channel {
     }
   }
 
-  /** Wait (bounded) for deferred-attachment checks already running (shutdown). */
-  private async settleDeferredChecks(): Promise<void> {
+  /**
+   * Wait (bounded) for deferred-attachment checks already running. Shutdown
+   * calls this from both quiesce() and teardown(); the wait (and its warning)
+   * happens once per stop, not once per phase.
+   */
+  private settleDeferredChecks(): Promise<void> {
+    this.deferredSettle ??= this.settleDeferredChecksOnce();
+    return this.deferredSettle;
+  }
+
+  private async settleDeferredChecksOnce(): Promise<void> {
     if (this.deferredChecksInFlight.size === 0) return;
     const settled = await this.withDeadline(
       (async () => {
@@ -1992,14 +2003,26 @@ export class ImsgChannel implements Channel {
   private giveUpDeferredWatch(watch: DeferredAttachmentWatch): void {
     watch.deadlineTimer = null;
     if (this.deferredWatches.get(watch.key) !== watch) return;
-    const undelivered = watch.undelivered.reduce((n, f) => n + f.atts.length, 0);
+    // A follow-up every handler accepted has been delivered (the check just
+    // hasn't finished the watch yet) — nothing is lost, so no warning. Of the
+    // rest, one still inside a handler can't be recalled any more; it is
+    // reported apart from the ones never handed over.
+    const unaccepted = watch.undelivered.filter((f) => !this.handlers.every((h) => f.acceptedBy.has(h)));
+    const handOffPending = unaccepted.filter((f) => f.inFlight.size > 0).reduce((n, f) => n + f.atts.length, 0);
+    const undelivered = unaccepted.filter((f) => f.inFlight.size === 0).reduce((n, f) => n + f.atts.length, 0);
+    if (watch.remaining.length === 0 && unaccepted.length === 0) {
+      log.info({ messageId: watch.messageId }, "Deferred imsg attachment watch reached its deadline after delivery completed");
+      this.finishDeferredWatch(watch);
+      return;
+    }
     log.warn(
       {
         messageId: watch.messageId,
         chatGuid: watch.chatGuid,
-        count: watch.remaining.length + undelivered,
+        count: watch.remaining.length + undelivered + handOffPending,
         neverArrived: watch.remaining.length,
         undelivered,
+        handOffPending,
         timeoutMs: this.deferredAttachmentTimeoutMs,
       },
       "imsg attachment(s) never finished downloading or could not be delivered; giving up — the agent was told they were still downloading and will not receive them",
@@ -2077,7 +2100,10 @@ export class ImsgChannel implements Channel {
   }
 
   private async runFollowUpHandlers(watch: DeferredAttachmentWatch, followUp: DeferredFollowUp): Promise<void> {
-    if (this.stopping) return;
+    // The link may have waited on the FIFO past the give-up (or a stop):
+    // the agent-facing warning already said these would not arrive, so they
+    // must not arrive now.
+    if (!this.isLiveWatch(watch)) return;
     const calls = this.handlers.filter((h) => !followUp.acceptedBy.has(h)).map((handler) => {
       let call = followUp.inFlight.get(handler);
       if (!call) {

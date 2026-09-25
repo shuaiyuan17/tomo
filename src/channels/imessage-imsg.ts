@@ -22,6 +22,7 @@ import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import {
   ChatDbAttachmentLookup,
+  expandChatDbPath,
   TRANSFER_STATE_COMPLETE,
   TRANSFER_STATE_FAILED,
   type AttachmentLookup,
@@ -51,6 +52,14 @@ export const MESSAGE_CONVERSION_BUDGET_MS = 60_000;
  */
 export const DEFERRED_ATTACHMENT_POLL_INTERVAL_MS = 5_000;
 export const DEFERRED_ATTACHMENT_TIMEOUT_MS = 180_000;
+/**
+ * Longest a follow-up hand-off may take (waiting for its FIFO turn plus each
+ * handler's answer). Past it the handler counts as not-accepted for this poll
+ * and is retried at the next one — but a call still running is never repeated.
+ */
+export const DEFERRED_FOLLOWUP_DISPATCH_TIMEOUT_MS = 30_000;
+/** Longest shutdown waits for a deferred-attachment re-check already running. */
+export const DEFERRED_CHECK_STOP_WAIT_MS = 10_000;
 /** Bound on remembered finished deferred-attachment watches (replay dedupe). */
 const DEFERRED_ATTACHMENT_DONE_MEMORY = 256;
 /**
@@ -290,6 +299,10 @@ export interface ImsgChannelConfig {
   deferredAttachmentPollIntervalMs?: number;
   /** Override {@link DEFERRED_ATTACHMENT_TIMEOUT_MS}. Tests only. */
   deferredAttachmentTimeoutMs?: number;
+  /** Override {@link DEFERRED_FOLLOWUP_DISPATCH_TIMEOUT_MS}. Tests only. */
+  deferredFollowUpDispatchTimeoutMs?: number;
+  /** Override {@link DEFERRED_CHECK_STOP_WAIT_MS}. Tests only. */
+  deferredCheckStopWaitMs?: number;
   /** Override {@link MAX_DEFERRED_ATTACHMENT_WATCHES}. Tests only. */
   maxDeferredAttachmentWatches?: number;
   /**
@@ -312,27 +325,45 @@ export interface ImsgChannelConfig {
  */
 interface DeferredAttachment {
   att: Record<string, unknown>;
-  /** Position in the message's attachment list (chat.db path re-query fallback). */
+  /** Position in the message's attachment list. */
   index: number;
   /** Size seen at the previous poll (size-stability fallback). */
   lastSize: number | null;
+}
+
+/**
+ * Loaded attachments waiting to be accepted as one follow-up message.
+ * Delivery is tracked PER HANDLER: a handler that accepted is never handed
+ * the same follow-up again, and one whose call is still pending (it outlived
+ * the dispatch deadline) is not called a second time while it runs.
+ */
+interface DeferredFollowUp {
+  atts: Array<Record<string, unknown>>;
+  message: IncomingMessage;
+  acceptedBy: Set<MessageHandler>;
+  inFlight: Map<MessageHandler, Promise<boolean>>;
+  /** The queued FIFO link delivering it, while one is outstanding. */
+  queued: Promise<void> | null;
 }
 
 interface DeferredAttachmentWatch {
   key: string;
   messageId: string;
   chatGuid: string;
+  /** Every attachment on the original message, in imsg's order. */
+  entries: DeferredAttachment[];
+  /** The subset of `entries` still waiting for its file. */
   remaining: DeferredAttachment[];
-  /** Number of attachments on the original message (for the path re-query). */
-  attachmentCount: number;
-  /** Loaded but not yet accepted by the agent (a failed dispatch is retried). */
-  undelivered: { atts: Array<Record<string, unknown>>; images: ImageAttachment[]; documents: DocumentAttachment[] } | null;
+  /** Loaded, not yet accepted by every handler; delivered in order. */
+  undelivered: DeferredFollowUp[];
   /** Routing fields copied from the original message (sender, chat, group/mention state). */
   origin: Pick<IncomingMessage, "id" | "chatId" | "senderName" | "senderId" | "isGroup" | "isMentioned" | "chatTitle">;
   /** Short quote of the original text so the agent can tie the follow-up back to it. */
   excerpt: string;
-  deadline: number;
+  /** Next re-check. */
   timer: ReturnType<typeof setTimeout> | null;
+  /** Overall give-up, independent of any re-check that may be stuck awaiting. */
+  deadlineTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface PendingRequest {
@@ -387,6 +418,8 @@ export class ImsgChannel implements Channel {
   private readonly deferredAttachmentPollIntervalMs: number;
   private readonly deferredAttachmentTimeoutMs: number;
   private readonly maxDeferredAttachmentWatches: number;
+  private readonly deferredFollowUpDispatchTimeoutMs: number;
+  private readonly deferredCheckStopWaitMs: number;
   private readonly attachmentLookup: AttachmentLookup;
   /** Active deferred-attachment watches, keyed by message GUID (or rowid). */
   private deferredWatches = new Map<string, DeferredAttachmentWatch>();
@@ -475,6 +508,8 @@ export class ImsgChannel implements Channel {
     this.deferredAttachmentPollIntervalMs = config.deferredAttachmentPollIntervalMs ?? DEFERRED_ATTACHMENT_POLL_INTERVAL_MS;
     this.deferredAttachmentTimeoutMs = config.deferredAttachmentTimeoutMs ?? DEFERRED_ATTACHMENT_TIMEOUT_MS;
     this.maxDeferredAttachmentWatches = config.maxDeferredAttachmentWatches ?? MAX_DEFERRED_ATTACHMENT_WATCHES;
+    this.deferredFollowUpDispatchTimeoutMs = config.deferredFollowUpDispatchTimeoutMs ?? DEFERRED_FOLLOWUP_DISPATCH_TIMEOUT_MS;
+    this.deferredCheckStopWaitMs = config.deferredCheckStopWaitMs ?? DEFERRED_CHECK_STOP_WAIT_MS;
     this.attachmentLookup = config.attachmentLookup ?? new ChatDbAttachmentLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
     this.probeHeicAlphaFn = config.probeHeicAlpha ?? heicHasAlpha;
     this.loadCursor();
@@ -1718,13 +1753,14 @@ export class ImsgChannel implements Channel {
     // Only shutdown can have changed since the dispatch await.
     if (this.stopping) return;
     const trimmed = originalText.trim().replace(/\s+/g, " ");
+    const entries: DeferredAttachment[] = rawAttachments.map((att, index) => ({ att, index, lastSize: null }));
     const watch: DeferredAttachmentWatch = {
       key,
       messageId: original.id,
       chatGuid: original.chatId,
-      remaining: deferred.map((att) => ({ att, index: rawAttachments.indexOf(att), lastSize: null })),
-      attachmentCount: rawAttachments.length,
-      undelivered: null,
+      entries,
+      remaining: entries.filter((e) => deferred.includes(e.att)),
+      undelivered: [],
       origin: {
         id: original.id,
         chatId: original.chatId,
@@ -1735,8 +1771,8 @@ export class ImsgChannel implements Channel {
         chatTitle: original.chatTitle,
       },
       excerpt: trimmed.length > 80 ? `${trimmed.slice(0, 79)}…` : trimmed,
-      deadline: Date.now() + this.deferredAttachmentTimeoutMs,
       timer: null,
+      deadlineTimer: null,
     };
     this.deferredWatches.set(key, watch);
     log.info(
@@ -1756,7 +1792,15 @@ export class ImsgChannel implements Channel {
         "Deferred imsg attachment has no local path; re-querying chat.db for it on every re-check",
       );
     }
+    // The give-up runs on its own timer, so a re-check stuck in an await
+    // (a hung handler, a slow conversion) cannot postpone it.
+    watch.deadlineTimer = setTimeout(() => this.giveUpDeferredWatch(watch), this.deferredAttachmentTimeoutMs);
+    watch.deadlineTimer.unref?.();
     this.scheduleDeferredCheck(watch);
+  }
+
+  private isLiveWatch(watch: DeferredAttachmentWatch): boolean {
+    return !this.stopping && this.deferredWatches.get(watch.key) === watch;
   }
 
   private scheduleDeferredCheck(watch: DeferredAttachmentWatch): void {
@@ -1764,8 +1808,8 @@ export class ImsgChannel implements Channel {
       watch.timer = null;
       // Off the inbound FIFO: stat, read and HEIC conversion of landed files
       // run here, concurrently with new rows. Only the follow-up dispatch is
-      // queued on the FIFO (see deliverDeferredAttachments). Tracked so
-      // quiesce()/teardown() wait for it rather than close things under it.
+      // queued on the FIFO (see deliverFollowUp). Tracked so quiesce() and
+      // teardown() wait for it (bounded) rather than close things under it.
       const check = this.checkDeferredAttachments(watch).catch((err) => {
         log.error({ err, messageId: watch.messageId }, "Error re-checking deferred imsg attachments");
         this.finishDeferredWatch(watch);
@@ -1776,52 +1820,125 @@ export class ImsgChannel implements Channel {
     watch.timer.unref?.();
   }
 
-  /** Wait for deferred-attachment checks already running (shutdown). */
+  /** Resolve true when `p` settles within `ms`, false when the deadline wins. */
+  private async withDeadline(p: Promise<unknown>, ms: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([p.then(() => true, () => true), deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Wait (bounded) for deferred-attachment checks already running (shutdown). */
   private async settleDeferredChecks(): Promise<void> {
-    while (this.deferredChecksInFlight.size > 0) {
-      await Promise.allSettled([...this.deferredChecksInFlight]);
+    if (this.deferredChecksInFlight.size === 0) return;
+    const settled = await this.withDeadline(
+      (async () => {
+        while (this.deferredChecksInFlight.size > 0) await Promise.allSettled([...this.deferredChecksInFlight]);
+      })(),
+      this.deferredCheckStopWaitMs,
+    );
+    if (!settled) {
+      log.warn(
+        { inFlight: this.deferredChecksInFlight.size, waitedMs: this.deferredCheckStopWaitMs },
+        "Deferred imsg attachment re-check still running at shutdown; not waiting for it any longer",
+      );
     }
   }
 
   /**
-   * This attachment's chat.db row, re-read on every poll (its path and
-   * transfer_state change as the download progresses). Matches by path, then
-   * transfer name, then position when the message's attachment count agrees.
-   * Fills in `original_path` when the row arrived without one.
+   * Bind each attachment of the message to its chat.db row, one-to-one.
+   *
+   * imsg's attachment objects carry no attachment GUID or rowid (verified on
+   * imsg 0.15.8: filename, is_sticker, mime_type, missing, original_path,
+   * total_bytes, transfer_name, uti), so there is no stable id to join on.
+   * Instead:
+   * 1. An attachment with a path binds to the row with that path. The path
+   *    is chat.db's own `attachment.filename` (imsg's `filename` is that
+   *    column verbatim), unique per attachment.
+   * 2. Path-less attachments bind by transfer name AND ordinal: the k-th
+   *    path-less attachment named N takes the k-th still-unbound row named N,
+   *    rows in ROWID order. imsg lists a message's attachments in ROWID order
+   *    (checked against multi-attachment messages in a live chat.db).
+   * 3. Name-less ones bind by position, only when the row count matches.
+   * Every row is consumed at most once, so two attachments with the same
+   * name can never both read the same row.
    */
-  private deferredAttachmentRow(watch: DeferredAttachmentWatch, pending: DeferredAttachment): AttachmentRow | undefined {
-    const rows = this.attachmentLookup.attachmentsForMessage(watch.messageId);
-    if (rows.length === 0) return undefined;
-    const path = this.attachmentPath(pending.att);
-    const transferName = typeof pending.att.transfer_name === "string" ? pending.att.transfer_name : "";
-    const row = (path && rows.find((r) => r.path === path))
-      || (transferName && rows.find((r) => r.transferName === transferName))
-      || (rows.length === watch.attachmentCount && pending.index >= 0 ? rows[pending.index] : undefined)
-      || (rows.length === 1 && watch.attachmentCount === 1 ? rows[0] : undefined)
-      || undefined;
-    if (row?.path && !this.hasAttachmentPath(pending.att)) {
-      log.info({ messageId: watch.messageId, path: row.path }, "Deferred imsg attachment path resolved from chat.db");
-      pending.att = { ...pending.att, original_path: row.path };
+  private bindAttachmentRows(watch: DeferredAttachmentWatch, rows: AttachmentRow[]): Map<DeferredAttachment, AttachmentRow> {
+    const bound = new Map<DeferredAttachment, AttachmentRow>();
+    const used = new Set<AttachmentRow>();
+    for (const entry of watch.entries) {
+      const paths = this.chatDbPathsOf(entry.att);
+      if (paths.length === 0) continue;
+      const row = rows.find((r) => !used.has(r) && r.path !== "" && paths.includes(r.path));
+      if (row) {
+        bound.set(entry, row);
+        used.add(row);
+      }
     }
-    return row;
+    for (const entry of watch.entries) {
+      if (bound.has(entry) || this.attachmentPath(entry.att)) continue;
+      const name = typeof entry.att.transfer_name === "string" ? entry.att.transfer_name : "";
+      if (!name) continue;
+      const row = rows.find((r) => !used.has(r) && r.transferName === name);
+      if (row) {
+        bound.set(entry, row);
+        used.add(row);
+      }
+    }
+    if (rows.length === watch.entries.length) {
+      for (const entry of watch.entries) {
+        if (bound.has(entry) || this.attachmentPath(entry.att)) continue;
+        const row = rows[entry.index];
+        if (row && !used.has(row)) {
+          bound.set(entry, row);
+          used.add(row);
+        }
+      }
+    }
+    return bound;
+  }
+
+  /**
+   * The paths an attachment may appear under in chat.db's
+   * `attachment.filename`: imsg's `filename` (that column verbatim, `~/`
+   * form) and the original path. Not the converted path — that is imsg's
+   * cache, not chat.db's.
+   */
+  private chatDbPathsOf(att: Record<string, unknown>): string[] {
+    const out: string[] = [];
+    if (typeof att.filename === "string" && att.filename.includes("/")) out.push(expandChatDbPath(att.filename));
+    if (typeof att.original_path === "string" && att.original_path) out.push(att.original_path);
+    if (typeof att.path === "string" && att.path) out.push(att.path);
+    return out;
   }
 
   private async checkDeferredAttachments(watch: DeferredAttachmentWatch): Promise<void> {
-    if (this.stopping || this.deferredWatches.get(watch.key) !== watch) return;
+    if (!this.isLiveWatch(watch)) return;
 
     // When is a file done? Primary signal: chat.db `transfer_state` says the
     // transfer completed AND the file is on disk and non-empty. Fallback, only
-    // when chat.db has no usable row (unreadable, or the row can't be
-    // matched): the size is non-zero and identical on two consecutive polls.
-    // The fallback is weaker — a preallocated or paused write also holds its
+    // when chat.db has no usable row (unreadable, or the row can't be bound):
+    // the size is non-zero and identical on two consecutive polls. The
+    // fallback is weaker — a preallocated or paused write also holds its
     // size — which is why it is not the first choice.
+    const rows = this.attachmentLookup.attachmentsForMessage(watch.messageId);
+    const bound = this.bindAttachmentRows(watch, rows);
     const ready: DeferredAttachment[] = [];
     const transferFailed: DeferredAttachment[] = [];
     for (const pending of watch.remaining) {
-      // Checked before each chat.db read: a stop mid-check must not query
-      // (or reopen) the database the channel is tearing down.
+      // A stop mid-check must not keep probing the disk or chat.db.
       if (this.stopping) return;
-      const row = this.deferredAttachmentRow(watch, pending);
+      const row = bound.get(pending);
+      if (row?.path && !this.hasAttachmentPath(pending.att)) {
+        log.info({ messageId: watch.messageId, path: row.path }, "Deferred imsg attachment path resolved from chat.db");
+        pending.att = { ...pending.att, original_path: row.path };
+      }
       const onDisk = await this.resolveOnDiskAttachment(pending.att);
       const size = onDisk && !onDisk.empty ? onDisk.size : null;
       const state = row?.transferState ?? null;
@@ -1833,7 +1950,7 @@ export class ImsgChannel implements Channel {
       }
       pending.lastSize = size;
     }
-    if (this.stopping) return;
+    if (!this.isLiveWatch(watch)) return;
 
     if (transferFailed.length > 0) {
       watch.remaining = watch.remaining.filter((p) => !transferFailed.includes(p));
@@ -1846,105 +1963,155 @@ export class ImsgChannel implements Channel {
     if (ready.length > 0) {
       const readyAtts = ready.map((p) => p.att);
       const { images, documents, deferred, failed } = await this.loadAttachments(readyAtts, watch.chatGuid, { recheck: true });
+      if (!this.isLiveWatch(watch)) return;
       // Anything that vanished again or failed to read stays pending (and is
       // retried at the next poll) until the deadline — never counted as done.
       const retry = new Set([...deferred, ...failed]);
       const arrived = readyAtts.filter((att) => !retry.has(att));
       watch.remaining = watch.remaining.filter((p) => !arrived.includes(p.att));
-      if (arrived.length > 0) {
-        // Loaded but not yet delivered: merged with anything an earlier
-        // failed dispatch left behind, delivered together below.
-        const u = watch.undelivered ?? { atts: [], images: [], documents: [] };
-        watch.undelivered = {
-          atts: [...u.atts, ...arrived],
-          images: [...u.images, ...images],
-          documents: [...u.documents, ...documents],
-        };
-      }
+      if (arrived.length > 0) watch.undelivered.push(this.buildFollowUp(watch, arrived, images, documents));
     }
 
-    // A dispatch that fails keeps its payload: the next poll retries it
-    // until the deadline. The watch is only finished once it went through.
-    if (watch.undelivered) {
-      if (this.stopping) return;
-      if (await this.deliverDeferredAttachments(watch, watch.undelivered)) watch.undelivered = null;
+    // Deliver in order. One not fully accepted stays queued (and blocks the
+    // ones after it, preserving order) for the next poll.
+    while (watch.undelivered.length > 0) {
+      if (!this.isLiveWatch(watch)) return;
+      if (!await this.deliverFollowUp(watch, watch.undelivered[0])) break;
+      watch.undelivered.shift();
     }
+    if (!this.isLiveWatch(watch)) return;
 
-    if (watch.remaining.length === 0 && !watch.undelivered) {
+    if (watch.remaining.length === 0 && watch.undelivered.length === 0) {
       log.info({ messageId: watch.messageId, chatGuid: watch.chatGuid }, "Deferred imsg attachment watch finished");
       this.finishDeferredWatch(watch);
       return;
     }
-    if (Date.now() >= watch.deadline) {
-      log.warn(
-        {
-          messageId: watch.messageId,
-          chatGuid: watch.chatGuid,
-          count: watch.remaining.length + (watch.undelivered?.atts.length ?? 0),
-          neverArrived: watch.remaining.length,
-          undelivered: watch.undelivered?.atts.length ?? 0,
-          timeoutMs: this.deferredAttachmentTimeoutMs,
-        },
-        "imsg attachment(s) never finished downloading or could not be delivered; giving up — the agent was told they were still downloading and will not receive them",
-      );
-      this.finishDeferredWatch(watch);
-      return;
-    }
-    if (!this.stopping && this.deferredWatches.get(watch.key) === watch) this.scheduleDeferredCheck(watch);
+    this.scheduleDeferredCheck(watch);
+  }
+
+  private giveUpDeferredWatch(watch: DeferredAttachmentWatch): void {
+    watch.deadlineTimer = null;
+    if (this.deferredWatches.get(watch.key) !== watch) return;
+    const undelivered = watch.undelivered.reduce((n, f) => n + f.atts.length, 0);
+    log.warn(
+      {
+        messageId: watch.messageId,
+        chatGuid: watch.chatGuid,
+        count: watch.remaining.length + undelivered,
+        neverArrived: watch.remaining.length,
+        undelivered,
+        timeoutMs: this.deferredAttachmentTimeoutMs,
+      },
+      "imsg attachment(s) never finished downloading or could not be delivered; giving up — the agent was told they were still downloading and will not receive them",
+    );
+    this.finishDeferredWatch(watch);
   }
 
   /**
-   * Deliver attachments that finished downloading as a follow-up inbound
-   * message. It is routed exactly like the original: same chat, same sender,
-   * same group/mention state, and the ORIGINAL message id — so a threaded
-   * reply or a tapback lands on the message the photos actually belong to.
-   * The dispatch itself is queued on the inbound FIFO so it is ordered with
-   * live rows and `quiesce()` waits for it. Resolves true only when the agent
-   * took the message.
+   * Build the follow-up for attachments that finished downloading. It is
+   * routed exactly like the original: same chat, same sender, same
+   * group/mention state, and the ORIGINAL message id — so a threaded reply or
+   * a tapback lands on the message the photos actually belong to.
    */
-  private async deliverDeferredAttachments(
+  private buildFollowUp(
     watch: DeferredAttachmentWatch,
-    payload: { atts: Array<Record<string, unknown>>; images: ImageAttachment[]; documents: DocumentAttachment[] },
-  ): Promise<boolean> {
-    const { atts, images, documents } = payload;
+    atts: Array<Record<string, unknown>>,
+    images: ImageAttachment[],
+    documents: DocumentAttachment[],
+  ): DeferredFollowUp {
     const { stickerMarker, imageMarker, docMarker } = this.attachmentMarkers(atts, images, documents, []);
     const quote = watch.excerpt ? ` ("${watch.excerpt}")` : "";
     const header = `[Attachments from an earlier message${quote} finished downloading]`;
     const text = [header, stickerMarker, imageMarker, docMarker].filter(Boolean).join(" ");
-    const message: IncomingMessage = {
-      ...watch.origin,
-      text,
-      images: images.length > 0 ? images : undefined,
-      documents: documents.length > 0 ? documents : undefined,
-      timestamp: Date.now(),
+    return {
+      atts,
+      message: {
+        ...watch.origin,
+        text,
+        images: images.length > 0 ? images : undefined,
+        documents: documents.length > 0 ? documents : undefined,
+        timestamp: Date.now(),
+      },
+      acceptedBy: new Set(),
+      inFlight: new Map(),
+      queued: null,
     };
-    const delivery = this.watchChain.then(async (): Promise<boolean> => {
-      if (this.stopping) return false;
-      const accepted = await this.dispatch(message);
-      if (!accepted) {
-        log.warn(
-          { messageId: watch.messageId, count: atts.length },
-          "Deferred imsg attachment follow-up refused by the agent; will retry until the watch times out",
-        );
-        return false;
-      }
+  }
+
+  /**
+   * Hand a follow-up to every handler that has not accepted it yet. Queued on
+   * the inbound FIFO (ordered with live rows; `quiesce()` waits for it) and
+   * bounded by {@link DEFERRED_FOLLOWUP_DISPATCH_TIMEOUT_MS} at every step,
+   * so a hung handler costs one poll, not the watch. Resolves true once every
+   * handler has accepted.
+   *
+   * Unlike a watch row, a follow-up is retried per handler: re-running the
+   * whole dispatch after one handler accepted and another failed would hand
+   * the first a duplicate. A handler that THREW is retried (the same
+   * at-least-once contract a failed row gets on replay); one that accepted
+   * never is; one whose call is still running is not called again.
+   */
+  private async deliverFollowUp(watch: DeferredAttachmentWatch, followUp: DeferredFollowUp): Promise<boolean> {
+    if (!followUp.queued) {
+      const link: Promise<void> = this.watchChain
+        .then(() => this.runFollowUpHandlers(watch, followUp))
+        .catch((err) => { log.error({ err, messageId: watch.messageId }, "Failed to deliver deferred imsg attachments"); })
+        .finally(() => { if (followUp.queued === link) followUp.queued = null; });
+      followUp.queued = link;
+      this.watchChain = link;
+    }
+    await this.withDeadline(followUp.queued, this.deferredFollowUpDispatchTimeoutMs);
+    const done = this.handlers.every((h) => followUp.acceptedBy.has(h));
+    if (done) {
       log.info(
-        { messageId: watch.messageId, chatGuid: watch.chatGuid, count: atts.length, stillPending: watch.remaining.length },
+        { messageId: watch.messageId, chatGuid: watch.chatGuid, count: followUp.atts.length, stillPending: watch.remaining.length },
         "Delivered deferred imsg attachment(s) as a follow-up message",
       );
-      return true;
-    }).catch((err) => {
-      log.error({ err, messageId: watch.messageId }, "Failed to deliver deferred imsg attachments; will retry until the watch times out");
-      return false;
+    } else {
+      log.warn(
+        { messageId: watch.messageId, count: followUp.atts.length, accepted: followUp.acceptedBy.size, handlers: this.handlers.length },
+        "Deferred imsg attachment follow-up not accepted by every handler; will retry until the watch times out",
+      );
+    }
+    return done;
+  }
+
+  private async runFollowUpHandlers(watch: DeferredAttachmentWatch, followUp: DeferredFollowUp): Promise<void> {
+    if (this.stopping) return;
+    const calls = this.handlers.filter((h) => !followUp.acceptedBy.has(h)).map((handler) => {
+      let call = followUp.inFlight.get(handler);
+      if (!call) {
+        const started: Promise<boolean> = Promise.resolve()
+          .then(() => handler(followUp.message))
+          .then(
+            (accepted) => {
+              // Recorded even when it lands after the deadline, so the retry
+              // never re-sends to a handler that did take it.
+              if (accepted) followUp.acceptedBy.add(handler);
+              return accepted;
+            },
+            (err) => {
+              log.error({ err, messageId: watch.messageId }, "Deferred imsg attachment follow-up handler threw");
+              return false;
+            },
+          )
+          .finally(() => { if (followUp.inFlight.get(handler) === started) followUp.inFlight.delete(handler); });
+        followUp.inFlight.set(handler, started);
+        call = started;
+      }
+      return this.withDeadline(call, this.deferredFollowUpDispatchTimeoutMs);
     });
-    this.watchChain = delivery.then(() => {});
-    return delivery;
+    await Promise.all(calls);
   }
 
   private finishDeferredWatch(watch: DeferredAttachmentWatch): void {
     if (watch.timer) {
       clearTimeout(watch.timer);
       watch.timer = null;
+    }
+    if (watch.deadlineTimer) {
+      clearTimeout(watch.deadlineTimer);
+      watch.deadlineTimer = null;
     }
     if (this.deferredWatches.get(watch.key) === watch) this.deferredWatches.delete(watch.key);
     this.deferredWatchesDone.add(watch.key);
@@ -1963,8 +2130,13 @@ export class ImsgChannel implements Channel {
     if (this.deferredWatches.size === 0) return;
     const abandoned = [...this.deferredWatches.values()].map((watch) => {
       if (watch.timer) clearTimeout(watch.timer);
+      if (watch.deadlineTimer) clearTimeout(watch.deadlineTimer);
       watch.timer = null;
-      return { messageId: watch.messageId, count: watch.remaining.length };
+      watch.deadlineTimer = null;
+      return {
+        messageId: watch.messageId,
+        count: watch.remaining.length + watch.undelivered.reduce((n, f) => n + f.atts.length, 0),
+      };
     });
     log.warn(
       { watches: abandoned },

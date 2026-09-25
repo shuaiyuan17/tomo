@@ -884,13 +884,35 @@ describe("imsg inbound message mapping", () => {
     const flushIo = async (rounds = 200) => {
       for (let i = 0; i < rounds; i++) await new Promise<void>((r) => setImmediate(r));
     };
-    // Spin real IO turns until `cond` holds (bounded), for positive waits.
-    const ioUntil = async (cond: () => boolean) => {
-      for (let i = 0; i < 20_000 && !cond(); i++) await new Promise<void>((r) => setImmediate(r));
+    // Spin real IO turns until `cond` holds. Bounded by REAL time
+    // (performance.now is not faked), not by a turn count: how many loop turns
+    // a stat/readFile/write takes depends on the machine and on coverage
+    // instrumentation, which is exactly what made fixed counts flaky on CI.
+    const ioUntil = async (cond: () => boolean, maxMs = 10_000) => {
+      const start = performance.now();
+      while (!cond() && performance.now() - start < maxMs) await new Promise<void>((r) => setImmediate(r));
     };
+    // The channel under test (set by setup) — used to wait for its re-checks.
+    let current: ImsgChannel | null = null;
+    const checksIdle = () =>
+      !current || (current as unknown as { deferredChecksInFlight: Set<unknown> }).deferredChecksInFlight.size === 0;
+    // Advance fake time, then wait for every re-check it started to finish
+    // its real IO. Use only when no re-check is expected to stay blocked.
     const tick = async (ms: number) => {
       await vi.advanceTimersByTimeAsync(ms);
-      await flushIo();
+      await ioUntil(checksIdle);
+      await flushIo(20);
+    };
+    // Advance fake time where a re-check is deliberately blocked (a hung
+    // handler or probe) — waiting for idle would only burn the bound.
+    const tickBlocked = async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+      await flushIo(50);
+    };
+    // Wait until the watch for `key` has a loaded follow-up queued.
+    const followUpQueued = (key: string) => () => {
+      const watches = (current as unknown as { deferredWatches: Map<string, { undelivered: unknown[] }> }).deferredWatches;
+      return (watches.get(key)?.undelivered.length ?? 0) > 0;
     };
     const pngBytes = Buffer.from("89504e470d0a1a0a", "hex");
     const FOLLOW = "will follow in a separate message once received";
@@ -906,6 +928,7 @@ describe("imsg inbound message mapping", () => {
     };
     const setup = async (config: Partial<ImsgChannelConfig> = {}) => {
       const made = makeChannel({ config });
+      current = made.channel;
       await made.channel.start();
       const handler: Handler = vi.fn(async () => true);
       made.channel.onMessage(handler);
@@ -1224,12 +1247,14 @@ describe("imsg inbound message mapping", () => {
         await tick(5_000);
         await vi.advanceTimersByTimeAsync(5_000); // landed → dispatch throws
         await ioUntil(() => followUps(handler).length >= 1);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(channel.pendingDeferredAttachmentWatches).toBe(1);
 
         await vi.advanceTimersByTimeAsync(5_000); // retried → accepted
         await ioUntil(() => followUps(handler).length >= 2);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         const attempts = followUps(handler);
         expect(attempts).toHaveLength(2);
         // Same payload retried — not re-read and re-saved.
@@ -1408,7 +1433,7 @@ describe("imsg inbound message mapping", () => {
 
           let stopped = false;
           const stopping = channel.stop().then(() => { stopped = true; });
-          await flushIo();
+          await flushIo(); // the check is blocked in conversion — don't wait for idle
           expect(stopped).toBe(false); // waits for the in-flight check
           expect(events).not.toContain("close");
 
@@ -1455,7 +1480,8 @@ describe("imsg inbound message mapping", () => {
 
         await vi.advanceTimersByTimeAsync(5_000);
         await ioUntil(() => followUps(handler).length >= 1);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(followUps(handler)).toHaveLength(1);
         expect(Buffer.from(followUps(handler)[0].images![0].data, "base64").equals(bytes2)).toBe(true);
         expect(channel.pendingDeferredAttachmentWatches).toBe(1); // the first is still waiting
@@ -1464,7 +1490,8 @@ describe("imsg inbound message mapping", () => {
         writeFileSync(p1, bytes1);
         await vi.advanceTimersByTimeAsync(5_000);
         await ioUntil(() => followUps(handler).length >= 2);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(followUps(handler)).toHaveLength(2);
         expect(Buffer.from(followUps(handler)[1].images![0].data, "base64").equals(bytes1)).toBe(true);
         expect(channel.pendingDeferredAttachmentWatches).toBe(0);
@@ -1496,12 +1523,14 @@ describe("imsg inbound message mapping", () => {
         await tick(5_000);
         await vi.advanceTimersByTimeAsync(5_000); // A accepts, B throws
         await ioUntil(() => followUps(b).length >= 1);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(channel.pendingDeferredAttachmentWatches).toBe(1);
 
         await vi.advanceTimersByTimeAsync(5_000); // retried to B only
         await ioUntil(() => followUps(b).length >= 2);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(followUps(a)).toHaveLength(1);
         expect(followUps(b)).toHaveLength(2);
         expect(channel.pendingDeferredAttachmentWatches).toBe(0);
@@ -1536,7 +1565,8 @@ describe("imsg inbound message mapping", () => {
 
           let stopped = false;
           void channel.stop().then(() => { stopped = true; });
-          for (let t = 0; t < 30_000 && !stopped; t += 1_000) await tick(1_000);
+          for (let t = 0; t < 30_000 && !stopped; t += 1_000) await tickBlocked(1_000);
+          await ioUntil(() => stopped, 2_000);
           expect(stopped).toBe(true);
           expect(followUps(handler)).toHaveLength(1);
         });
@@ -1557,7 +1587,10 @@ describe("imsg inbound message mapping", () => {
           writeFileSync(latePath, pngBytes);
 
           const giveUp = () => warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("could not be delivered; giving up"));
-          for (let t = 0; t < 180_000; t += 5_000) await tick(5_000);
+          await tick(5_000); // t=5s: first sight
+          await vi.advanceTimersByTimeAsync(5_000); // t=10s: hand-off starts and hangs
+          await ioUntil(() => followUps(handler).length >= 1);
+          for (let t = 10_000; t < 180_000; t += 5_000) await tickBlocked(5_000);
           expect(giveUp()).toHaveLength(1);
           expect(giveUp()[0][0]).toMatchObject({ messageId: "hang-timeout-1", count: 1, handOffPending: 1, undelivered: 0, neverArrived: 0 });
           expect(channel.pendingDeferredAttachmentWatches).toBe(0);
@@ -1565,7 +1598,8 @@ describe("imsg inbound message mapping", () => {
 
           let stopped = false;
           void channel.stop().then(() => { stopped = true; });
-          for (let t = 0; t < 30_000 && !stopped; t += 1_000) await tick(1_000);
+          for (let t = 0; t < 30_000 && !stopped; t += 1_000) await tickBlocked(1_000);
+          await ioUntil(() => stopped, 2_000);
           expect(stopped).toBe(true);
         });
       });
@@ -1592,15 +1626,17 @@ describe("imsg inbound message mapping", () => {
         await tick(5_000); // first sight
         children[0].notifyMessage(inboundMessage({ id: 401, guid: "slow-row", text: "slow" })); // blocks the FIFO
         await ioUntil(() => handler.mock.calls.some(([m]) => m.text === "slow"));
-        await tick(5_000); // t=10s: landed, follow-up queued behind the slow row
-        await tick(2_000); // t=12s: give-up fires while it waits
+        await vi.advanceTimersByTimeAsync(5_000); // t=10s: landed, follow-up queued behind the slow row
+        await ioUntil(followUpQueued("queued-giveup-1"));
+        await tickBlocked(2_000); // t=12s: give-up fires while it waits
 
         const giveUp = () => warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("giving up"));
         expect(giveUp()).toHaveLength(1);
         expect(giveUp()[0][0]).toMatchObject({ messageId: "queued-giveup-1", undelivered: 1 });
 
         releaseSlow();
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         await tick(30_000);
         expect(followUps(handler)).toHaveLength(0);
         expect(giveUp()).toHaveLength(1);
@@ -1631,7 +1667,8 @@ describe("imsg inbound message mapping", () => {
         await tick(5_000);
         await vi.advanceTimersByTimeAsync(5_000); // t=10s: hand-off starts, answers at t=14s
         await ioUntil(() => followUps(handler).length >= 1);
-        for (let i = 0; i < 6; i++) await tick(1_000); // past the 3s bound, the late accept, and the t=15s deadline
+        for (let i = 0; i < 6; i++) await tickBlocked(1_000); // past the 3s bound, the late accept, and the t=15s deadline
+        await ioUntil(checksIdle);
 
         expect(warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("giving up"))).toHaveLength(0);
         expect(channel.pendingDeferredAttachmentWatches).toBe(0);
@@ -1659,9 +1696,10 @@ describe("imsg inbound message mapping", () => {
 
         let stopped = false;
         void channel.stop().then(() => { stopped = true; });
-        await tick(9_000);
+        await tickBlocked(9_000);
         expect(stopped).toBe(false);
-        await tick(1_500); // just past the 10s bound
+        await tickBlocked(1_500); // just past the 10s bound
+        await ioUntil(() => stopped, 2_000);
         expect(stopped).toBe(true);
         expect(warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("still running at shutdown"))).toHaveLength(1);
       });
@@ -1672,7 +1710,8 @@ describe("imsg inbound message mapping", () => {
       await withDir("tomo-imsg-never-", async (dir) => {
         const warnSpy = vi.spyOn(log, "warn");
         const { channel, children, handler } = await setup({ imageStoreBaseDir: dir });
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         const baselineTimers = vi.getTimerCount();
 
         children[0].notifyMessage(inboundMessage({
@@ -1681,7 +1720,8 @@ describe("imsg inbound message mapping", () => {
           attachments: [{ mime_type: "image/png", original_path: join(dir, "never.png"), missing: true }],
         }));
         await ioUntil(() => handler.mock.calls.length >= 1);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(vi.getTimerCount()).toBe(baselineTimers + 2); // next re-check + overall deadline
 
         const giveUp = () => warnSpy.mock.calls.filter(([, msg]) => typeof msg === "string" && msg.includes("never finished downloading"));
@@ -1783,7 +1823,8 @@ describe("imsg inbound message mapping", () => {
         await tick(5_000);
         await vi.advanceTimersByTimeAsync(5_000);
         await ioUntil(() => followUps(handler).length >= 1);
-        await flushIo();
+        await ioUntil(checksIdle);
+        await flushIo(20);
         expect(followUps(handler)).toHaveLength(1);
         expect(channel.pendingDeferredAttachmentWatches).toBe(0);
 

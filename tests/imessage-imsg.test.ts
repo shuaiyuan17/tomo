@@ -1201,6 +1201,230 @@ describe("imsg inbound message mapping", () => {
       });
     });
 
+    it("retries a follow-up whose dispatch failed and delivers it exactly once", async () => {
+      useFakeClock();
+      await withDir("tomo-imsg-retry-", async (dir) => {
+        const latePath = join(dir, "late.png");
+        const { channel, children, handler } = await setup({ imageStoreBaseDir: dir });
+        let failures = 0;
+        handler.mockImplementation(async (m) => {
+          if (m.text.includes("finished downloading") && failures === 0) {
+            failures++;
+            throw new Error("agent hiccup");
+          }
+          return true;
+        });
+
+        children[0].notifyMessage(inboundMessage({
+          guid: "retry-img-1",
+          attachments: [{ mime_type: "image/png", original_path: latePath, missing: true }],
+        }));
+        await ioUntil(() => handler.mock.calls.length >= 1);
+        writeFileSync(latePath, pngBytes);
+        await tick(5_000);
+        await vi.advanceTimersByTimeAsync(5_000); // landed → dispatch throws
+        await ioUntil(() => followUps(handler).length >= 1);
+        await flushIo();
+        expect(channel.pendingDeferredAttachmentWatches).toBe(1);
+
+        await vi.advanceTimersByTimeAsync(5_000); // retried → accepted
+        await ioUntil(() => followUps(handler).length >= 2);
+        await flushIo();
+        const attempts = followUps(handler);
+        expect(attempts).toHaveLength(2);
+        // Same payload retried — not re-read and re-saved.
+        expect(attempts[1].images![0].savedPath).toBe(attempts[0].images![0].savedPath);
+        expect(channel.pendingDeferredAttachmentWatches).toBe(0);
+
+        await tick(30_000);
+        expect(followUps(handler)).toHaveLength(2); // one failed attempt + one delivery, nothing more
+        await channel.stop();
+      });
+    });
+
+    describe("chat.db transfer_state", () => {
+      type Row = { path: string; transferName: string; mimeType: string; transferState: number | null };
+      const lookupWith = (rows: () => Row[]) => ({ attachmentsForMessage: vi.fn(rows), close: () => {} });
+
+      it("takes a file as soon as chat.db says the transfer is complete", async () => {
+        useFakeClock();
+        await withDir("tomo-imsg-ts-done-", async (dir) => {
+          const latePath = join(dir, "late.png");
+          let state = 0;
+          const { channel, children, handler } = await setup({
+            imageStoreBaseDir: dir,
+            attachmentLookup: lookupWith(() => [{ path: latePath, transferName: "late.png", mimeType: "image/png", transferState: state }]),
+          });
+          children[0].notifyMessage(inboundMessage({
+            guid: "ts-done-1",
+            attachments: [{ mime_type: "image/png", original_path: latePath, missing: true }],
+          }));
+          await ioUntil(() => handler.mock.calls.length >= 1);
+
+          writeFileSync(latePath, pngBytes);
+          state = 5;
+          await vi.advanceTimersByTimeAsync(5_000); // first poll: complete → no stability wait
+          await ioUntil(() => followUps(handler).length >= 1);
+          expect(followUps(handler)).toHaveLength(1);
+          expect(followUps(handler)[0].images).toHaveLength(1);
+          await channel.stop();
+        });
+      });
+
+      it("keeps waiting while the transfer is in progress, even if the size holds", async () => {
+        useFakeClock();
+        await withDir("tomo-imsg-ts-busy-", async (dir) => {
+          const latePath = join(dir, "late.png");
+          let state = 3;
+          const { channel, children, handler } = await setup({
+            imageStoreBaseDir: dir,
+            attachmentLookup: lookupWith(() => [{ path: latePath, transferName: "late.png", mimeType: "image/png", transferState: state }]),
+          });
+          children[0].notifyMessage(inboundMessage({
+            guid: "ts-busy-1",
+            attachments: [{ mime_type: "image/png", original_path: latePath, missing: true }],
+          }));
+          await ioUntil(() => handler.mock.calls.length >= 1);
+
+          writeFileSync(latePath, pngBytes); // present, size stable across every poll below
+          for (let i = 0; i < 4; i++) await tick(5_000);
+          expect(followUps(handler)).toHaveLength(0);
+          expect(channel.pendingDeferredAttachmentWatches).toBe(1);
+
+          state = 5;
+          await vi.advanceTimersByTimeAsync(5_000);
+          await ioUntil(() => followUps(handler).length >= 1);
+          expect(followUps(handler)).toHaveLength(1);
+          await channel.stop();
+        });
+      });
+
+      it("stops watching and warns when chat.db says the transfer failed", async () => {
+        useFakeClock();
+        await withDir("tomo-imsg-ts-fail-", async (dir) => {
+          const latePath = join(dir, "late.png");
+          const warnSpy = vi.spyOn(log, "warn");
+          const { channel, children, handler } = await setup({
+            imageStoreBaseDir: dir,
+            attachmentLookup: lookupWith(() => [{ path: latePath, transferName: "late.png", mimeType: "image/png", transferState: 6 }]),
+          });
+          children[0].notifyMessage(inboundMessage({
+            guid: "ts-fail-1",
+            attachments: [{ mime_type: "image/png", original_path: latePath, missing: true }],
+          }));
+          await ioUntil(() => handler.mock.calls.length >= 1);
+
+          await tick(5_000);
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ messageId: "ts-fail-1", count: 1 }),
+            expect.stringContaining("transfer failed"),
+          );
+          expect(channel.pendingDeferredAttachmentWatches).toBe(0);
+          writeFileSync(latePath, pngBytes);
+          await tick(30_000);
+          expect(followUps(handler)).toHaveLength(0);
+          await channel.stop();
+        });
+      });
+
+      it("stops querying chat.db as soon as a stop begins mid-check", async () => {
+        useFakeClock();
+        await withDir("tomo-imsg-ts-midloop-", async (dir) => {
+          const queries = vi.fn(() => [
+            { path: "", transferName: "A.heic", mimeType: "image/heic", transferState: 0 },
+            { path: "", transferName: "B.heic", mimeType: "image/heic", transferState: 0 },
+          ]);
+          const { channel, children, handler } = await setup({
+            imageStoreBaseDir: dir,
+            attachmentLookup: { attachmentsForMessage: queries, close: () => {} },
+          });
+          children[0].notifyMessage(inboundMessage({
+            guid: "ts-midloop-1",
+            attachments: [
+              { mime_type: "image/heic", transfer_name: "A.heic", missing: true },
+              { mime_type: "image/heic", transfer_name: "B.heic", missing: true },
+            ],
+          }));
+          await ioUntil(() => handler.mock.calls.length >= 1);
+
+          // Hold the check on its first attachment's disk probe.
+          let release: () => void = () => {};
+          const internals = channel as unknown as { resolveOnDiskAttachment: (att: Record<string, unknown>) => Promise<unknown> };
+          vi.spyOn(internals, "resolveOnDiskAttachment").mockImplementationOnce(
+            () => new Promise((r) => { release = () => r(null); }),
+          );
+          queries.mockClear();
+          await vi.advanceTimersByTimeAsync(5_000);
+          await ioUntil(() => queries.mock.calls.length >= 1);
+
+          const stopping = channel.stop();
+          release();
+          await stopping;
+          expect(queries).toHaveBeenCalledTimes(1); // attachment B never queried
+        });
+      });
+
+      it("waits for an in-flight check on stop and never touches chat.db after closing it", async () => {
+        useFakeClock();
+        await withDir("tomo-imsg-ts-stop-", async (dir) => {
+          const heicPath = join(dir, "IMG_1.heic");
+          writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+          const events: string[] = [];
+          const all = vi.fn(() => {
+            events.push("query");
+            return [
+              { filename: heicPath, transfer_name: "IMG_1.heic", mime_type: "image/heic", transfer_state: 5 },
+              { filename: null, transfer_name: "IMG_2.heic", mime_type: "image/heic", transfer_state: 0 },
+            ];
+          });
+          const DatabaseSync = vi.fn(function () {
+            events.push("open");
+            return { prepare: () => ({ all }), close: () => events.push("close") };
+          });
+          const { ChatDbAttachmentLookup } = await import("../src/channels/imsg-attachment-lookup.js");
+          const attachmentLookup = new ChatDbAttachmentLookup("/db/chat.db", () => ({ DatabaseSync }) as never);
+          let release: () => void = () => {};
+          const convertHeic = vi.fn(async (_src: string, format: string) => {
+            events.push("convert-start");
+            await new Promise<void>((r) => { release = r; });
+            events.push("convert-end");
+            const out = join(dir, `converted.${format === "png" ? "png" : "jpg"}`);
+            writeFileSync(out, Buffer.from("ffd8ffe000104a464946", "hex"));
+            return out;
+          });
+          const { channel, children, handler } = await setup({ imageStoreBaseDir: dir, attachmentLookup, convertHeic, probeHeicAlpha: async () => false });
+
+          children[0].notifyMessage(inboundMessage({
+            guid: "ts-stop-1",
+            attachments: [
+              { mime_type: "image/heic", transfer_name: "IMG_1.heic", missing: true },
+              { mime_type: "image/heic", transfer_name: "IMG_2.heic", missing: true },
+            ],
+          }));
+          await ioUntil(() => handler.mock.calls.length >= 1);
+          await vi.advanceTimersByTimeAsync(5_000);
+          await ioUntil(() => convertHeic.mock.calls.length >= 1); // check is mid-flight
+
+          let stopped = false;
+          const stopping = channel.stop().then(() => { stopped = true; });
+          await flushIo();
+          expect(stopped).toBe(false); // waits for the in-flight check
+          expect(events).not.toContain("close");
+
+          release();
+          await stopping;
+          expect(events.filter((e) => e === "open")).toHaveLength(1);
+          expect(events.filter((e) => e === "close")).toHaveLength(1);
+          expect(events.lastIndexOf("query")).toBeLessThan(events.indexOf("convert-end"));
+          expect(events.indexOf("close")).toBeGreaterThan(events.indexOf("convert-end"));
+          expect(followUps(handler)).toHaveLength(0); // stopping: not delivered (and warned)
+
+          await tick(30_000);
+          expect(events.filter((e) => e === "open" || e === "query")).toHaveLength(3);
+        });
+      });
+    });
+
     it("gives up after the timeout with one warning and no follow-up", async () => {
       useFakeClock();
       await withDir("tomo-imsg-never-", async (dir) => {

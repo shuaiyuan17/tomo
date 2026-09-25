@@ -320,3 +320,21 @@ describe("unconverted-attachment note on the inline markers", () => {
     );
   });
 });
+
+describe("still-downloading clause on the inline markers", () => {
+  const FOLLOW = "will follow in a separate message once received";
+
+  it("is absent when nothing is pending", () => {
+    expect(formatImageMarker(2, ["/abs/a.jpg", "/abs/b.jpg"], 0, 0)).toBe("[Sent 2 images, saved to: /abs/a.jpg, /abs/b.jpg]");
+  });
+
+  it("says the whole send is still downloading when nothing loaded", () => {
+    expect(formatImageMarker(7, [], 0, 7)).toBe(`[Sent 7 images, still downloading — ${FOLLOW}]`);
+    expect(formatStickerMarker(1, [], 0, 1)).toBe(`[Sent a sticker, still downloading — ${FOLLOW}]`);
+  });
+
+  it("counts the pending part after the saved paths, clamped to the intended count", () => {
+    expect(formatImageMarker(3, ["/abs/a.jpg"], 0, 2)).toBe(`[Sent 3 images, saved to: /abs/a.jpg; 2 still downloading — ${FOLLOW}]`);
+    expect(formatImageMarker(1, [], 0, 5)).toBe(`[Sent an image, still downloading — ${FOLLOW}]`);
+  });
+});

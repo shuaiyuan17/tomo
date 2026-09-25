@@ -30,6 +30,22 @@ import { convertHeicImage, heicHasAlpha, looksLikeHeic, SIPS_TIMEOUT_MS, type He
  * the budget are delivered in their original format and marked unconverted.
  */
 export const MESSAGE_CONVERSION_BUDGET_MS = 60_000;
+
+/**
+ * Deferred attachments. Messages can surface a message row in chat.db before
+ * the attachment file behind it has been written to disk (imsg reports it as
+ * `missing: true`); observed landing minutes later on a multi-photo send.
+ * Blocking the in-order inbound FIFO for that long is not an option, so the
+ * message is delivered at once with a "still downloading" marker and the
+ * missing files are re-checked in the background every
+ * {@link DEFERRED_ATTACHMENT_POLL_INTERVAL_MS}, giving up (loudly) after
+ * {@link DEFERRED_ATTACHMENT_TIMEOUT_MS}. Whatever lands is delivered as a
+ * follow-up inbound message from the same sender and chat.
+ */
+export const DEFERRED_ATTACHMENT_POLL_INTERVAL_MS = 5_000;
+export const DEFERRED_ATTACHMENT_TIMEOUT_MS = 180_000;
+/** Bound on remembered finished deferred-attachment watches (replay dedupe). */
+const DEFERRED_ATTACHMENT_DONE_MEMORY = 256;
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
@@ -257,11 +273,33 @@ export interface ImsgChannelConfig {
   convertHeic?: (srcPath: string, format: HeicTargetFormat, timeoutMs?: number) => Promise<string | null>;
   /** Override {@link MESSAGE_CONVERSION_BUDGET_MS}. Tests only. */
   conversionBudgetMs?: number;
+  /** Override {@link DEFERRED_ATTACHMENT_POLL_INTERVAL_MS}. Tests only. */
+  deferredAttachmentPollIntervalMs?: number;
+  /** Override {@link DEFERRED_ATTACHMENT_TIMEOUT_MS}. Tests only. */
+  deferredAttachmentTimeoutMs?: number;
   /**
    * Test seam: alpha-channel probe for a source image file. `true`/`false` on
    * a clean probe, `null` when unknown. Defaults to `sips -g hasAlpha`.
    */
   probeHeicAlpha?: (srcPath: string, timeoutMs?: number) => Promise<boolean | null>;
+}
+
+/**
+ * One inbound message whose image/document attachments were not on disk yet
+ * when it was delivered. `remaining` shrinks as files land; the watch ends
+ * when it is empty or the deadline passes.
+ */
+interface DeferredAttachmentWatch {
+  key: string;
+  messageId: string;
+  chatGuid: string;
+  remaining: Array<Record<string, unknown>>;
+  /** Routing fields copied from the original message (sender, chat, group/mention state). */
+  origin: Pick<IncomingMessage, "id" | "chatId" | "senderName" | "senderId" | "isGroup" | "isMentioned" | "chatTitle">;
+  /** Short quote of the original text so the agent can tie the follow-up back to it. */
+  excerpt: string;
+  deadline: number;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 interface PendingRequest {
@@ -313,6 +351,12 @@ export class ImsgChannel implements Channel {
   private readonly serviceLookup: ServiceLookup;
   private readonly convertHeicFn: (srcPath: string, format: HeicTargetFormat, timeoutMs?: number) => Promise<string | null>;
   private readonly conversionBudgetMs: number;
+  private readonly deferredAttachmentPollIntervalMs: number;
+  private readonly deferredAttachmentTimeoutMs: number;
+  /** Active deferred-attachment watches, keyed by message GUID (or rowid). */
+  private deferredWatches = new Map<string, DeferredAttachmentWatch>();
+  /** Keys of finished watches (bounded), so a re-seen message never re-arms one. */
+  private deferredWatchesDone = new Set<string>();
   private readonly probeHeicAlphaFn: (srcPath: string, timeoutMs?: number) => Promise<boolean | null>;
   // Settles a request's parked-on-'drain' write link, keyed by request id, so a
   // request timeout/cancel can release its own stuck write (else future writes
@@ -391,6 +435,8 @@ export class ImsgChannel implements Channel {
     this.serviceLookup = config.serviceLookup ?? new ChatDbServiceLookup(config.dbPath ?? DEFAULT_CHAT_DB_PATH);
     this.convertHeicFn = config.convertHeic ?? convertHeicImage;
     this.conversionBudgetMs = config.conversionBudgetMs ?? MESSAGE_CONVERSION_BUDGET_MS;
+    this.deferredAttachmentPollIntervalMs = config.deferredAttachmentPollIntervalMs ?? DEFERRED_ATTACHMENT_POLL_INTERVAL_MS;
+    this.deferredAttachmentTimeoutMs = config.deferredAttachmentTimeoutMs ?? DEFERRED_ATTACHMENT_TIMEOUT_MS;
     this.probeHeicAlphaFn = config.probeHeicAlpha ?? heicHasAlpha;
     this.loadCursor();
   }
@@ -472,6 +518,7 @@ export class ImsgChannel implements Channel {
       clearTimeout(this.capabilityRetryTimer);
       this.capabilityRetryTimer = null;
     }
+    this.cancelDeferredAttachmentWatches();
   }
 
   /**
@@ -504,6 +551,7 @@ export class ImsgChannel implements Channel {
         // Best-effort; the child is about to be killed anyway.
       }
     }
+    this.cancelDeferredAttachmentWatches();
     this.killChild();
     this.serviceLookup.close();
   }
@@ -1400,11 +1448,10 @@ export class ImsgChannel implements Channel {
     // as just "an image" buries the expressive act (and, worse, hides that
     // the source lives in StickerCache with its alpha channel intact).
     const rawAttachments = Array.isArray(data.attachments) ? data.attachments as Array<Record<string, unknown>> : [];
-    const isImageAtt = (a: Record<string, unknown>) => this.attachmentMime(a).startsWith("image/");
-    const intendedStickerCount = rawAttachments.filter((a) => isImageAtt(a) && a.is_sticker === true).length;
-    const intendedImageCount = rawAttachments.filter((a) => isImageAtt(a) && a.is_sticker !== true).length;
-    const intendedDocumentCount = rawAttachments.filter((a) => isSupportedDocumentMime(this.attachmentMime(a))).length;
-    const { images, documents, files } = await this.loadAttachments(rawAttachments, chatGuid);
+    // `deferred` = image/document attachments whose file is not on disk yet
+    // (still downloading). They are counted in the markers as pending and
+    // re-checked in the background once this row has been dispatched.
+    const { images, documents, files, deferred } = await this.loadAttachments(rawAttachments, chatGuid);
 
     // Attachment loading may have blocked long enough for a restart + replay to
     // supersede this row. Bail before any side effect (read, dispatch, cursor).
@@ -1419,21 +1466,7 @@ export class ImsgChannel implements Channel {
       this.maybeReprobeCapabilities();
     }
 
-    const imageSavedPaths = images.filter((i) => !i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
-    const stickerSavedPaths = images.filter((i) => i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
-    const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
-    // Counted over the same partition as intendedImageCount/intendedStickerCount
-    // above — `image.isSticker` is set from the identical `att.is_sticker ===
-    // true` predicate — so the note can never claim more unconverted
-    // attachments than the marker says were sent. `images` is a subset of the
-    // intended set (an attachment that failed to READ never makes it here), so
-    // the counts are consistent by construction; formatImageMarker clamps
-    // anyway rather than emit "[Sent an image; 2 attachments could not …]".
-    const unconvertedImages = images.filter((i) => !i.isSticker && i.conversionFailed).length;
-    const unconvertedStickers = images.filter((i) => i.isSticker && i.conversionFailed).length;
-    const stickerMarker = formatStickerMarker(intendedStickerCount, stickerSavedPaths, unconvertedStickers);
-    const imageMarker = formatImageMarker(intendedImageCount, imageSavedPaths, unconvertedImages);
-    const docMarker = formatDocumentMarker(intendedDocumentCount, docSavedPaths);
+    const { stickerMarker, imageMarker, docMarker } = this.attachmentMarkers(rawAttachments, images, documents, deferred);
     // Path-only marker: unlike the image/document markers this is the ONLY
     // representation of the file the agent gets — no bytes are attached.
     const fileMarker = formatFileMarker(files);
@@ -1542,6 +1575,216 @@ export class ImsgChannel implements Channel {
     // Success under the current generation: record the GUID and advance.
     if (guid) this.messageGuidDedupe.record(guid);
     this.advanceCursor(rowId);
+
+    // Only now — once the row is committed — start watching for attachments
+    // that were still downloading. Arming it any earlier would let a refused
+    // or superseded row leave a watch behind for a message the replay is
+    // about to deliver (and arm) again.
+    if (deferred.length > 0) {
+      this.startDeferredAttachmentWatch(guid || `row:${rowId}`, deferred, message, text);
+    }
+  }
+
+  /**
+   * The `[Sent …]` markers for one message's images, stickers and documents.
+   * `rawAttachments` is everything the row carried; `images`/`documents` are
+   * what loaded; `deferred` is what was still downloading.
+   */
+  private attachmentMarkers(
+    rawAttachments: Array<Record<string, unknown>>,
+    images: ImageAttachment[],
+    documents: DocumentAttachment[],
+    deferred: Array<Record<string, unknown>>,
+  ): { stickerMarker: string; imageMarker: string; docMarker: string } {
+    // Stickers are counted apart from plain images: chat.db marks them
+    // (attachment.is_sticker, surfaced by imsg 0.13+) and a sticker described
+    // as just "an image" buries the expressive act.
+    const isImageAtt = (a: Record<string, unknown>) => this.attachmentMime(a).startsWith("image/");
+    const isStickerAtt = (a: Record<string, unknown>) => isImageAtt(a) && a.is_sticker === true;
+    const isPlainImageAtt = (a: Record<string, unknown>) => isImageAtt(a) && a.is_sticker !== true;
+    const isDocAtt = (a: Record<string, unknown>) => isSupportedDocumentMime(this.attachmentMime(a));
+    const intendedStickerCount = rawAttachments.filter(isStickerAtt).length;
+    const intendedImageCount = rawAttachments.filter(isPlainImageAtt).length;
+    const intendedDocumentCount = rawAttachments.filter(isDocAtt).length;
+
+    const imageSavedPaths = images.filter((i) => !i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
+    const stickerSavedPaths = images.filter((i) => i.isSticker).map((i) => i.savedPath).filter((p): p is string => Boolean(p));
+    const docSavedPaths = documents.map((d) => d.savedPath).filter((p): p is string => Boolean(p));
+    // Counted over the same partition as intendedImageCount/intendedStickerCount
+    // above — `image.isSticker` is set from the identical `att.is_sticker ===
+    // true` predicate — so the note can never claim more unconverted
+    // attachments than the marker says were sent. `images` is a subset of the
+    // intended set (an attachment that failed to READ never makes it here), so
+    // the counts are consistent by construction; formatImageMarker clamps
+    // anyway rather than emit "[Sent an image; 2 attachments could not …]".
+    const unconvertedImages = images.filter((i) => !i.isSticker && i.conversionFailed).length;
+    const unconvertedStickers = images.filter((i) => i.isSticker && i.conversionFailed).length;
+    return {
+      stickerMarker: formatStickerMarker(intendedStickerCount, stickerSavedPaths, unconvertedStickers, deferred.filter(isStickerAtt).length),
+      imageMarker: formatImageMarker(intendedImageCount, imageSavedPaths, unconvertedImages, deferred.filter(isPlainImageAtt).length),
+      docMarker: formatDocumentMarker(intendedDocumentCount, docSavedPaths, deferred.filter(isDocAtt).length),
+    };
+  }
+
+  // --- Deferred (still-downloading) attachments ---
+
+  private startDeferredAttachmentWatch(
+    key: string,
+    deferred: Array<Record<string, unknown>>,
+    original: IncomingMessage,
+    originalText: string,
+  ): void {
+    // Dedupe: a message re-seen (replay after a restart, a superseded
+    // generation) must not arm a second watch and deliver the same files twice.
+    if (this.stopping || this.deferredWatches.has(key) || this.deferredWatchesDone.has(key)) return;
+    const trimmed = originalText.trim().replace(/\s+/g, " ");
+    const watch: DeferredAttachmentWatch = {
+      key,
+      messageId: original.id,
+      chatGuid: original.chatId,
+      remaining: deferred,
+      origin: {
+        id: original.id,
+        chatId: original.chatId,
+        senderName: original.senderName,
+        senderId: original.senderId,
+        isGroup: original.isGroup,
+        isMentioned: original.isMentioned,
+        chatTitle: original.chatTitle,
+      },
+      excerpt: trimmed.length > 80 ? `${trimmed.slice(0, 79)}…` : trimmed,
+      deadline: Date.now() + this.deferredAttachmentTimeoutMs,
+      timer: null,
+    };
+    this.deferredWatches.set(key, watch);
+    log.info(
+      {
+        messageId: original.id,
+        chatGuid: original.chatId,
+        count: deferred.length,
+        pollMs: this.deferredAttachmentPollIntervalMs,
+        timeoutMs: this.deferredAttachmentTimeoutMs,
+      },
+      "imsg attachment(s) not on disk yet (still downloading); delivered the message now, will re-check in the background",
+    );
+    this.scheduleDeferredCheck(watch);
+  }
+
+  private scheduleDeferredCheck(watch: DeferredAttachmentWatch): void {
+    watch.timer = setTimeout(() => {
+      watch.timer = null;
+      // Through the watch FIFO: the follow-up is ordered after any row
+      // already being processed, and quiesce() waits for it at shutdown.
+      this.watchChain = this.watchChain.then(() => this.checkDeferredAttachments(watch).catch((err) => {
+        log.error({ err, messageId: watch.messageId }, "Error re-checking deferred imsg attachments");
+        this.finishDeferredWatch(watch);
+      }));
+    }, this.deferredAttachmentPollIntervalMs);
+    watch.timer.unref?.();
+  }
+
+  private async checkDeferredAttachments(watch: DeferredAttachmentWatch): Promise<void> {
+    if (this.stopping || this.deferredWatches.get(watch.key) !== watch) return;
+
+    const landed = watch.remaining;
+    const { images, documents, deferred } = await this.loadAttachments(landed, watch.chatGuid);
+    const arrived = landed.filter((att) => !deferred.includes(att));
+    watch.remaining = deferred;
+
+    if (arrived.length > 0) {
+      // Channel may have closed while the files were being read/converted.
+      if (this.stopping) return;
+      await this.deliverDeferredAttachments(watch, arrived, images, documents);
+    }
+
+    if (watch.remaining.length === 0) {
+      log.info({ messageId: watch.messageId, chatGuid: watch.chatGuid }, "All deferred imsg attachments arrived");
+      this.finishDeferredWatch(watch);
+      return;
+    }
+    if (Date.now() >= watch.deadline) {
+      log.warn(
+        {
+          messageId: watch.messageId,
+          chatGuid: watch.chatGuid,
+          count: watch.remaining.length,
+          timeoutMs: this.deferredAttachmentTimeoutMs,
+        },
+        "imsg attachment(s) never finished downloading; giving up — the agent was told they were still downloading and will not receive them",
+      );
+      this.finishDeferredWatch(watch);
+      return;
+    }
+    if (!this.stopping) this.scheduleDeferredCheck(watch);
+  }
+
+  /**
+   * Deliver attachments that finished downloading as a follow-up inbound
+   * message. It is routed exactly like the original: same chat, same sender,
+   * same group/mention state, and the ORIGINAL message id — so a threaded
+   * reply or a tapback lands on the message the photos actually belong to.
+   */
+  private async deliverDeferredAttachments(
+    watch: DeferredAttachmentWatch,
+    arrived: Array<Record<string, unknown>>,
+    images: ImageAttachment[],
+    documents: DocumentAttachment[],
+  ): Promise<void> {
+    const { stickerMarker, imageMarker, docMarker } = this.attachmentMarkers(arrived, images, documents, []);
+    const quote = watch.excerpt ? ` ("${watch.excerpt}")` : "";
+    const header = `[Attachments from an earlier message${quote} finished downloading]`;
+    const text = [header, stickerMarker, imageMarker, docMarker].filter(Boolean).join(" ");
+    const message: IncomingMessage = {
+      ...watch.origin,
+      text,
+      images: images.length > 0 ? images : undefined,
+      documents: documents.length > 0 ? documents : undefined,
+      timestamp: Date.now(),
+    };
+    const accepted = await this.dispatch(message);
+    if (!accepted) {
+      log.warn(
+        { messageId: watch.messageId, count: arrived.length },
+        "Deferred imsg attachments refused by the agent (shutting down); not delivered",
+      );
+      return;
+    }
+    log.info(
+      { messageId: watch.messageId, chatGuid: watch.chatGuid, count: arrived.length, stillPending: watch.remaining.length },
+      "Delivered deferred imsg attachment(s) as a follow-up message",
+    );
+  }
+
+  private finishDeferredWatch(watch: DeferredAttachmentWatch): void {
+    if (watch.timer) {
+      clearTimeout(watch.timer);
+      watch.timer = null;
+    }
+    if (this.deferredWatches.get(watch.key) === watch) this.deferredWatches.delete(watch.key);
+    this.deferredWatchesDone.add(watch.key);
+    if (this.deferredWatchesDone.size > DEFERRED_ATTACHMENT_DONE_MEMORY) {
+      const oldest = this.deferredWatchesDone.values().next().value;
+      if (oldest !== undefined) this.deferredWatchesDone.delete(oldest);
+    }
+  }
+
+  /** Stop every deferred-attachment watch (channel shutdown). */
+  private cancelDeferredAttachmentWatches(): void {
+    if (this.deferredWatches.size === 0) return;
+    for (const watch of this.deferredWatches.values()) {
+      if (watch.timer) clearTimeout(watch.timer);
+      watch.timer = null;
+      log.info(
+        { messageId: watch.messageId, count: watch.remaining.length },
+        "imsg channel stopping; abandoning deferred attachment watch",
+      );
+    }
+    this.deferredWatches.clear();
+  }
+
+  /** Number of active deferred-attachment watches. Test/diagnostic seam. */
+  get pendingDeferredAttachmentWatches(): number {
+    return this.deferredWatches.size;
   }
 
   /** True (with a log) when a row's generation has been superseded by a replay. */
@@ -1702,10 +1945,17 @@ export class ImsgChannel implements Channel {
   private async loadAttachments(
     attachments: Array<Record<string, unknown>>,
     chatGuid: string,
-  ): Promise<{ images: ImageAttachment[]; documents: DocumentAttachment[]; files: SavedFileNotice[] }> {
+  ): Promise<{
+    images: ImageAttachment[];
+    documents: DocumentAttachment[];
+    files: SavedFileNotice[];
+    /** Image/document attachments whose file is not on disk yet (still downloading). */
+    deferred: Array<Record<string, unknown>>;
+  }> {
     const images: ImageAttachment[] = [];
     const documents: DocumentAttachment[] = [];
     const files: SavedFileNotice[] = [];
+    const deferred: Array<Record<string, unknown>> = [];
 
     // Per-`sips` deadlines bound one conversion; this bounds the MESSAGE. The
     // loop below is sequential, so ten hostile HEICs in one iMessage would
@@ -1739,11 +1989,19 @@ export class ImsgChannel implements Channel {
       }
 
       // Images and documents are load-or-nothing: with no bytes there is
-      // nothing to put in the context, and the intended-count markers already
-      // tell the agent how many did not make it.
-      if (att.missing === true) continue;
-      const filePath = this.attachmentPath(att);
-      if (!filePath) continue;
+      // nothing to put in the context. But "no bytes YET" is not "no bytes":
+      // Messages can hand us the message row before the attachment file has
+      // been written (imsg reports `missing: true`). Skipping it here used to
+      // lose the photo for good — the marker said "[Sent 7 images]" with
+      // nothing behind it and nothing ever looked again. Defer it instead;
+      // the caller re-checks in the background and delivers a follow-up.
+      const onDisk = await this.resolveOnDiskAttachment(att);
+      if (!onDisk) {
+        deferred.push(att);
+        continue;
+      }
+      const filePath = onDisk.path;
+      const loadMime = this.attachmentMime(onDisk.att) || mimeType;
 
       try {
         if (isDocument) {
@@ -1779,21 +2037,58 @@ export class ImsgChannel implements Channel {
           // transparency into a solid background), to JPEG otherwise.
           // Failure keeps the original bytes — never drop the attachment.
           const isSticker = att.is_sticker === true;
-          const { buffer: imageBuffer, mimeType: imageMime, conversionFailed } = await this.normalizeHeicImage(buffer, mimeType, filePath, isSticker, conversionDeadline);
+          const { buffer: imageBuffer, mimeType: imageMime, conversionFailed } = await this.normalizeHeicImage(buffer, loadMime, filePath, isSticker, conversionDeadline);
           const image = await buildImageAttachment(imageBuffer, imageMime, meta, this.imageStoreBaseDir);
           if (isSticker) image.isSticker = true;
           if (conversionFailed) image.conversionFailed = true;
           images.push(image);
         } else {
           const filename = (typeof att.transfer_name === "string" && att.transfer_name) || basename(filePath);
-          documents.push(await buildDocumentAttachment(buffer, mimeType, { ...meta, filename }, this.imageStoreBaseDir));
+          documents.push(await buildDocumentAttachment(buffer, loadMime, { ...meta, filename }, this.imageStoreBaseDir));
         }
       } catch (err) {
         log.error({ err, path: filePath }, "Failed to read imsg attachment");
       }
     }
 
-    return { images, documents, files };
+    return { images, documents, files, deferred };
+  }
+
+  /**
+   * Locate an attachment's file on disk, or `null` when it is not there yet.
+   *
+   * Prefers imsg's converted copy; when only the original exists, returns the
+   * attachment with the `converted_*` fields stripped so the MIME matches the
+   * bytes actually read. `missing: true` is imsg's own "not on disk" verdict,
+   * but it was taken when the row was read — the file may have landed since,
+   * so the disk is always the authority. (The declared `total_bytes` is NOT
+   * compared against the on-disk size: it describes the sender's original and
+   * need not match the stored copy, so gating on it could defer forever.)
+   */
+  private async resolveOnDiskAttachment(
+    att: Record<string, unknown>,
+  ): Promise<{ att: Record<string, unknown>; path: string } | null> {
+    const converted = typeof att.converted_path === "string" ? att.converted_path : "";
+    if (converted && await this.fileSize(converted) !== null) return { att, path: converted };
+
+    const original = (typeof att.original_path === "string" && att.original_path)
+      || (typeof att.path === "string" && att.path)
+      || "";
+    if (!original) return null;
+    if (await this.fileSize(original) === null) return null;
+    if (!converted) return { att, path: original };
+    const rest = { ...att };
+    delete rest.converted_path;
+    delete rest.converted_mime_type;
+    return { att: rest, path: original };
+  }
+
+  private async fileSize(path: string): Promise<number | null> {
+    try {
+      return (await stat(path)).size;
+    } catch {
+      return null;
+    }
   }
 
   /**

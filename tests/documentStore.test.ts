@@ -59,6 +59,13 @@ describe("isSupportedDocumentMime", () => {
 });
 
 describe("formatDocumentMarker", () => {
+  it("notes documents that are still downloading", () => {
+    expect(formatDocumentMarker(1, [], 1)).toBe("[Sent a document, still downloading — will follow in a separate message once received]");
+    expect(formatDocumentMarker(2, ["/abs/a.pdf"], 1)).toBe(
+      "[Sent 2 documents, saved to: /abs/a.pdf; 1 still downloading — will follow in a separate message once received]",
+    );
+  });
+
   it("returns empty string for zero docs", () => {
     expect(formatDocumentMarker(0, [])).toBe("");
   });

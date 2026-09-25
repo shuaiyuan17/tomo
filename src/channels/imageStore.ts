@@ -90,13 +90,31 @@ export function buildImagePath(
  * `savedPaths` lists absolute disk paths for images that were also persisted
  * locally. Returns `""` when `intendedCount === 0`.
  */
-export function formatImageMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0): string {
+export function formatImageMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0, pendingCount = 0): string {
   if (intendedCount <= 0) return "";
   const noun = intendedCount === 1 ? "an image" : `${intendedCount} images`;
-  const head = savedPaths.length === 0
-    ? `[Sent ${noun}`
-    : `[Sent ${noun}, saved to: ${savedPaths.join(", ")}`;
-  return `${head}${formatUnconvertedNote(unconvertedCount, intendedCount)}]`;
+  return `[Sent ${noun}${formatSavedAndPending(savedPaths, pendingCount, intendedCount)}${formatUnconvertedNote(unconvertedCount, intendedCount)}]`;
+}
+
+/**
+ * The `, saved to: …` / `still downloading` middle of a `[Sent …]` marker.
+ *
+ * `pendingCount` is the number of the intended attachments whose file was not
+ * on disk yet when the message was processed (the sender's device has sent
+ * the message row but the attachment is still downloading). The channel
+ * delivers those in a separate follow-up message once they land, so the agent
+ * is told to expect it rather than seeing a count with nothing behind it.
+ */
+export function formatSavedAndPending(savedPaths: string[], pendingCount: number, intendedCount: number): string {
+  // Never claim more pending attachments than the marker says were sent.
+  pendingCount = Math.min(Math.max(pendingCount, 0), intendedCount);
+  const saved = savedPaths.length === 0 ? "" : `, saved to: ${savedPaths.join(", ")}`;
+  if (pendingCount <= 0) return saved;
+  const pending = pendingCount === intendedCount
+    ? "still downloading"
+    : `${pendingCount} still downloading`;
+  const sep = saved ? "; " : ", ";
+  return `${saved}${sep}${pending} — will follow in a separate message once received`;
 }
 
 /**
@@ -131,12 +149,13 @@ function formatUnconvertedNote(unconvertedCount: number, intendedCount: number):
  * (`STICKER:<path>` accepts a local image path on the iMessage channel).
  * The hint is only offered when a copy was actually persisted.
  */
-export function formatStickerMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0): string {
+export function formatStickerMarker(intendedCount: number, savedPaths: string[], unconvertedCount = 0, pendingCount = 0): string {
   if (intendedCount <= 0) return "";
   const noun = intendedCount === 1 ? "a sticker" : `${intendedCount} stickers`;
   const note = formatUnconvertedNote(unconvertedCount, intendedCount);
-  if (savedPaths.length === 0) return `[Sent ${noun}${note}]`;
-  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}${note}; resend with STICKER:<saved path>]`;
+  const middle = formatSavedAndPending(savedPaths, pendingCount, intendedCount);
+  if (savedPaths.length === 0) return `[Sent ${noun}${middle}${note}]`;
+  return `[Sent ${noun}${middle}${note}; resend with STICKER:<saved path>]`;
 }
 
 /**

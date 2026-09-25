@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { log } from "../logger.js";
 import { writeWithoutOverwrite } from "./attachment-write.js";
+import { formatSavedAndPending } from "./imageStore.js";
 
 export interface DocumentSaveMeta {
   /** Logical session or chat identifier (e.g. "dm_shuai", "tg_12345"). */
@@ -131,11 +132,10 @@ export function buildDocumentPath(
  * `savedPaths` lists absolute disk paths for documents that were also persisted
  * locally. Returns `""` when `intendedCount === 0`.
  */
-export function formatDocumentMarker(intendedCount: number, savedPaths: string[]): string {
+export function formatDocumentMarker(intendedCount: number, savedPaths: string[], pendingCount = 0): string {
   if (intendedCount <= 0) return "";
   const noun = intendedCount === 1 ? "a document" : `${intendedCount} documents`;
-  if (savedPaths.length === 0) return `[Sent ${noun}]`;
-  return `[Sent ${noun}, saved to: ${savedPaths.join(", ")}]`;
+  return `[Sent ${noun}${formatSavedAndPending(savedPaths, pendingCount, intendedCount)}]`;
 }
 
 /**

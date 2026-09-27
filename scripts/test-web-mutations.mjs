@@ -4,16 +4,20 @@ import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writ
 import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { controlPanelCases } from "./control-panel-mutations.mjs";
+import { review383Cases } from "./review-383-mutations.mjs";
 
 const source = resolve(import.meta.dirname, "..");
 const temporary = mkdtempSync(join(tmpdir(), "tomo-web-mutations-"));
-const evidence = join(source, "test-results", "mutations");
+const evidence = join(source, "test-results", process.env.MUTATIONS ? "mutations-filtered" : "mutations");
 mkdirSync(evidence, { recursive: true });
 const excluded = new Set(["node_modules", ".git", "dist", "coverage", "test-results", ".claude"]);
 cpSync(source, temporary, { recursive: true, filter: (path) => !excluded.has(basename(path)) });
 symlinkSync(join(source, "node_modules"), join(temporary, "node_modules"), "dir");
 
-const cases = [
+const allCases = [
+  ...controlPanelCases,
+  ...review383Cases,
   ["access-log-permissions","src/web/token-store.ts","const fd = openSync(temporary, \"wx\", 0o600);","const fd = openSync(temporary, \"wx\", 0o644);","tests/web-access.test.ts"],
   ["web-token-redaction","src/redact.ts","  [/\\btomo_web_[a-f0-9]{64}\\b/g, \"***\"],","","tests/web-access.test.ts"],
   ["unicode-body-limit","src/web/protocol.ts","MAX_BODY_BYTES = 128 * 1024","MAX_BODY_BYTES = 32 * 1024","tests/web-http.test.ts"],
@@ -41,7 +45,7 @@ const cases = [
   ["provider-web-steering", "src/agent/inbound-batcher.ts", "&& this.host.canSteerIntoSession?.(sessionKey) !== false", "", "tests/web-routing.test.ts"],
   ["request-deduplication", "src/channels/web.ts", "if (previous) {", "if (previous && false) {", "tests/web-channel.test.ts"],
   ["completed-block-stream", "src/channels/web.ts", "try { this.events.publish(block); }", "try { void block; }", "tests/web-routing.test.ts"],
-  ["mailbox-limit", "src/channels/web.ts", "this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024", "false", "tests/web-channel.test.ts"],
+  ["mailbox-limit", "src/channels/web.ts", "this.blockBytes + bytes + this.pendingTextBytes > MAX_BUFFER_BYTES - 64 * 1024", "false", "tests/web-channel.test.ts"],
   ["ingress-close", "src/channels/web.ts", "closeIngestion(): void { this.closed = true; }", "closeIngestion(): void {}", "tests/web-channel.test.ts"],
   ["safe-tool-activity", "src/channels/web.ts", "tool: event.tool.slice(0, 128)", 'tool: "omitted"', "tests/web-channel.test.ts"],
   ["event-replay", "src/web/events.ts", "this.ring.slice(index + 1).map(({ envelope }) => envelope)", "[]", "tests/web-channel.test.ts"],
@@ -62,8 +66,11 @@ const cases = [
   ["theme-choice", "web/src/main.tsx", "document.documentElement.dataset.theme = theme", 'document.documentElement.dataset.theme = "light"', "e2e"],
   ["uncertain-draft", "web/src/main.tsx", "else setFeedback(labels.unknown);", 'else { setDraft(""); setFeedback(labels.unknown); }', "e2e"],
 ];
+const cases = process.env.MUTATIONS ? allCases.filter(([name]) => new RegExp(process.env.MUTATIONS).test(name)) : allCases;
+if (!cases.length) throw new Error("No matching mutations");
+for (const [name, file, from] of cases) if (!readFileSync(join(temporary, file), "utf8").includes(from)) throw new Error(`Mutation no longer matches: ${name}`);
 const results = [];
-function run(args, timeout = 45_000) {
+function run(args, timeout = 120_000) {
   return spawnSync(process.execPath, args, { cwd: temporary, encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024,
     env: { ...process.env, TOMO_LOG_FILE: "", TOMO_LOG_INLINE: "1" } });
 }
@@ -77,19 +84,20 @@ try {
   const baseline = run(["node_modules/vitest/vitest.mjs", "run", ...new Set(cases.map((c) => c[4]).filter((s) => s !== "e2e"))]);
   writeFileSync(join(evidence, "baseline.log"), baseline.stdout + baseline.stderr);
   if (baseline.status !== 0) throw new Error("Baseline must pass before applying mutations");
-  for (const [name, file, from, to, test] of cases) {
+  for (const [name, file, from, to, test, filter] of cases) {
     const path = join(temporary, file); const original = readFileSync(path, "utf8");
     if (!original.includes(from)) throw new Error(`Mutation no longer matches: ${name}`);
     writeFileSync(path, original.replace(from, to));
     try {
       if (test === "e2e") build();
-      const result = run(["node_modules/vitest/vitest.mjs", "run", ...(test === "e2e" ? ["--config", "vitest.e2e.config.ts"] : [test])]);
+      const result = run(["node_modules/vitest/vitest.mjs", "run", ...(test === "e2e" ? ["--config", "vitest.e2e.config.ts"] : [test]), ...(filter ? ["-t", filter] : [])]);
       const output = result.stdout + result.stderr;
       const killed = result.status !== null && result.status !== 0 && /AssertionError|expect\(locator\)/.test(output)
         && !/Transform failed|Failed to resolve|Cannot find module/.test(output);
       writeFileSync(join(evidence, `${name}.log`), output);
       results.push({ behavior: name, test, result: killed ? "behavioral failure observed" : "INVALID: investigate", exitCode: result.status });
       console.log(`${killed ? "PASS" : "FAIL"} ${name}`);
+      writeFileSync(join(evidence, "results.json"), JSON.stringify(results, null, 2) + "\n");
       if (!killed) process.exitCode = 1;
     } finally { writeFileSync(path, original); }
   }

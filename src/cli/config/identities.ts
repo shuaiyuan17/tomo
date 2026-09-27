@@ -3,7 +3,7 @@ import { SessionStore } from "../../sessions/store.js";
 import { CronStore, CronStoreReadError } from "../../cron/store.js";
 import { cronStoreErrorMessage } from "../cron-errors.js";
 import { legacySessionKeysForBinding, rawSessionKeyForBinding } from "../../sessions/keys.js";
-import { loadConfig, saveConfig, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 
 export async function configIdentities(): Promise<void> {
   const cfg = loadConfig();
@@ -74,7 +74,7 @@ export async function configIdentities(): Promise<void> {
 
       identities.push(identity);
       cfg.identities = identities;
-      saveConfig(cfg);
+      await saveConfig(cfg);
       p.log.success(`Identity "${identity.name}" created`);
 
       const moved = migrateCronJobsToIdentity(identity);
@@ -111,7 +111,7 @@ export async function configIdentities(): Promise<void> {
           }
         }
         cfg.identities = identities;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success("Bindings updated");
 
         const moved = migrateCronJobsToIdentity(id);
@@ -137,7 +137,7 @@ export async function configIdentities(): Promise<void> {
         if (p.isCancel(policy)) continue;
         id.replyPolicy = policy as string;
         cfg.identities = identities;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success(`Reply policy set to "${policy}"`);
       }
 
@@ -150,7 +150,7 @@ export async function configIdentities(): Promise<void> {
         // first would move every job off an identity that then stayed.
         identities.splice(idx, 1);
         cfg.identities = identities;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success(`Identity "${id.name}" removed`);
         // The identity is gone from the config already. Rewriting its cron
         // jobs' session keys touches the session registry and the cron store,

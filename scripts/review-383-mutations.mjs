@@ -1,0 +1,21 @@
+/** Regressions reported in the PR #383 review. Each changes implementation only. */
+export const review383Cases = [
+  ["review-cli-wait", "src/cli/config/shared.ts", "new ConfigStore(CONFIG_PATH, CONFIG_BACKUP_PATH, 1_000)", "new ConfigStore(CONFIG_PATH, CONFIG_BACKUP_PATH, 0)", "tests/cli-config-concurrency.test.ts"],
+  ["review-cli-retain-latest", "src/cli/config/shared.ts", "if (isDeepStrictEqual(base, draft)) return latest;", "if (isDeepStrictEqual(base, draft)) return base;", "tests/cli-config-concurrency.test.ts"],
+  ["review-cli-confirm-conflict", "src/cli/config/shared.ts", "if (p.isCancel(apply) || !apply) throw new ConfigSaveCancelled();", "void apply;", "tests/cli-config-concurrency.test.ts"],
+  ["review-cli-reference", "src/cli/config/shared.ts", "syncDraft(cfg, result.value);", "Object.assign(cfg, result.value);", "tests/cli-config-concurrency.test.ts"],
+  ["review-mcp-tolerance", "src/mcp/external-config.ts", "const server = parseServer(value, env);", 'const server = value.timeout === 0 || (Array.isArray(value.tools) && value.tools.includes(null)) ? null : parseServer(value, env);', "tests/external-mcp-config.test.ts"],
+  ["review-mcp-repair", "src/config/file-schema.ts", "return !(mcp && prior", "return !(false && prior", "tests/web-management.test.ts"],
+  ["review-mcp-repair-secrets", "src/web/management.ts", "|| !definition || !safeValue(definition, valueAt(previous, [key]))", "", "tests/web-management.test.ts"],
+  ["review-restart-worker", "src/web/restart.ts", 'child.once("exit", (code, signal) => onExit(code !== 0 || signal !== null));', 'void onExit;', "tests/web-restart.test.ts"],
+  ["review-restart-release", "src/web/supervisor.ts", "this.restartPending = false;\n                if (failed)", "this.restartPending = true;\n                if (failed)", "tests/web-supervisor.test.ts"],
+  ["review-restart-ui", "web/src/study-settings.tsx", "status.epoch === startingEpoch && !status.pending", "false", "e2e", "explicit restart retry"],
+  ["review-cron-intent", "src/web/inspection.ts", "JSON.stringify({ id, name, schedule, message, sessionKey, enabled, deleteAfterRun })", "JSON.stringify(job)", "tests/web-inspection.test.ts"],
+  ["review-steer-current-turn", "src/agent/live-session.ts", "!this.isInteractiveTurn() || canJoin?.() !== true", "canJoin?.() !== true", "tests/web-routing.test.ts"],
+  ["review-steer-current-audience", "src/agent/live-session.ts", "!this.isInteractiveTurn() || canJoin?.() !== true", "!this.isInteractiveTurn()", "tests/web-routing.test.ts"],
+  ["review-small-epoch", "src/web/http.ts", 'epoch !== await deps.rpc({ method: "epoch" })', 'epoch !== (await deps.rpc({ method: "snapshot" }) as WebSync).snapshot.epoch', "tests/web-control-http.test.ts"],
+  ["review-inspection-concurrency", "src/web/http.ts", "if (inspection && inspecting) throw", "if (false) throw", "tests/web-control-http.test.ts"],
+  ["review-context-line-limit", "src/web/inspection.ts", "end - start > 256 * 1024", "end - start > 512 * 1024", "tests/web-inspection.test.ts"],
+  ["review-context-event-limit", "src/web/inspection.ts", "++count > 20_000", "++count > 40_000", "tests/web-inspection.test.ts"],
+  ["review-context-preview-limit", "src/web/inspection.ts", "if (summaries.length > 100) summaries.pop();", "void summaries;", "tests/web-inspection.test.ts"],
+];

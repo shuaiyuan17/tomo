@@ -214,48 +214,50 @@ export class CronStore {
   setEnabled(id: string, enabled: boolean): CronJob | undefined | "unschedulable";
   setEnabled(id: string, enabled: boolean, guard: (job: CronJob) => boolean): CronJob | undefined | "refused" | "unschedulable";
   setEnabled(id: string, enabled: boolean, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" | "unschedulable" {
-    this.load();
-    const job = this.get(id);
-    if (!job) return undefined;
-    if (guard && !guard(job)) return "refused";
-    if (job.enabled === enabled) return job;
-    if (enabled) {
-      const next = computeNextRun(job.schedule, Date.now());
-      if (next === null && job.schedule.kind !== "at") return "unschedulable";
-    }
-    job.enabled = enabled;
-    if (enabled) {
-      const now = Date.now();
-      const next = computeNextRun(job.schedule, now);
-      job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
-      if (job.schedule.kind === "at") delete job.retryCount;
-      // Re-enabling adjudicates an interrupted run that recovery has ALREADY
-      // settled: whoever re-enabled it has decided the job should run again,
-      // so clear the state that would otherwise make the next daemon start
-      // settle (and for a one-shot, immediately re-disable) it a second time.
-      //
-      // "Settled" is BOTH halves: the status says interrupted AND the run
-      // token is acknowledged. The status alone is not enough — recovery
-      // stamps it on a *resumed recurring* job too, and that job then gets
-      // dispatched again with the status still set, so a disable→enable
-      // during the resumed run would acknowledge the LIVE token and the next
-      // restart would re-fire it with no [resumed] marker. Checking
-      // isInterrupted means a live run is never mistaken for a settled one.
-      // (For a genuinely settled job the ack is a no-op — recovery already
-      // acknowledged the token — and stays only to repair a hand-edited file.)
-      if (job.lastStatus === "interrupted" && !isInterrupted(job)) {
-        job.lastStatus = null;
-        job.lastCompletedRunId = job.lastRunId ?? null;
-        if (job.interruptedAt != null) job.interruptedAt = null;
-        delete job.resumeAttempts;
+    return withFileLockSync(this.lockPath, () => {
+      this.load();
+      const job = this.get(id);
+      if (!job) return undefined;
+      if (guard && !guard(job)) return "refused";
+      if (job.enabled === enabled) return job;
+      if (enabled) {
+        const next = computeNextRun(job.schedule, Date.now());
+        if (next === null && job.schedule.kind !== "at") return "unschedulable";
       }
-    } else {
-      // Clear rather than leave a stale timestamp that list/detail views
-      // would show as a "next run" that will never fire.
-      job.nextRunAt = null;
-    }
-    this.save();
-    return job;
+      job.enabled = enabled;
+      if (enabled) {
+        const now = Date.now();
+        const next = computeNextRun(job.schedule, now);
+        job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
+        if (job.schedule.kind === "at") delete job.retryCount;
+        // Re-enabling adjudicates an interrupted run that recovery has ALREADY
+        // settled: whoever re-enabled it has decided the job should run again,
+        // so clear the state that would otherwise make the next daemon start
+        // settle (and for a one-shot, immediately re-disable) it a second time.
+        //
+        // "Settled" is BOTH halves: the status says interrupted AND the run
+        // token is acknowledged. The status alone is not enough — recovery
+        // stamps it on a *resumed recurring* job too, and that job then gets
+        // dispatched again with the status still set, so a disable→enable
+        // during the resumed run would acknowledge the LIVE token and the next
+        // restart would re-fire it with no [resumed] marker. Checking
+        // isInterrupted means a live run is never mistaken for a settled one.
+        // (For a genuinely settled job the ack is a no-op — recovery already
+        // acknowledged the token — and stays only to repair a hand-edited file.)
+        if (job.lastStatus === "interrupted" && !isInterrupted(job)) {
+          job.lastStatus = null;
+          job.lastCompletedRunId = job.lastRunId ?? null;
+          if (job.interruptedAt != null) job.interruptedAt = null;
+          delete job.resumeAttempts;
+        }
+      } else {
+        // Clear rather than leave a stale timestamp that list/detail views
+        // would show as a "next run" that will never fire.
+        job.nextRunAt = null;
+      }
+      this.save();
+      return job;
+    });
   }
 
   /**
@@ -275,13 +277,15 @@ export class CronStore {
   remove(id: string): boolean;
   remove(id: string, guard: (job: CronJob) => boolean): boolean | "refused";
   remove(id: string, guard?: (job: CronJob) => boolean): boolean | "refused" {
-    this.load();
-    const existing = this.jobs.find((j) => j.id === id);
-    if (!existing) return false;
-    if (guard && !guard(existing)) return "refused";
-    this.jobs = this.jobs.filter((j) => j.id !== id);
-    this.save();
-    return true;
+    return withFileLockSync(this.lockPath, () => {
+      this.load();
+      const existing = this.jobs.find((j) => j.id === id);
+      if (!existing) return false;
+      if (guard && !guard(existing)) return "refused";
+      this.jobs = this.jobs.filter((j) => j.id !== id);
+      this.save();
+      return true;
+    });
   }
 
   /**

@@ -58,6 +58,7 @@ export const mockSdk = {
    *  the steered message is already pending before the turn unblocks; a
    *  timed-out race here would otherwise swallow a later message. */
   steerEcho: false,
+  steerEchoCount: 1,
   /** Context usage reported by the mock SDK's getContextUsage() after each turn. */
   contextUsage: { totalTokens: 5000, maxTokens: 200000 },
   /** When true, getContextUsage() rejects — the transient-failure path that
@@ -89,6 +90,7 @@ export function resetMockSdk(): void {
   mockSdk.emitStreamDeltas = true;
   mockSdk.userContents = [];
   mockSdk.steerEcho = false;
+  mockSdk.steerEchoCount = 1;
   mockSdk.contextUsage = { totalTokens: 5000, maxTokens: 200000 };
   mockSdk.contextUsageFails = false;
   mockSdk.failNextQuery = null;
@@ -236,7 +238,7 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
         const responseValue = await mockSdk.responseFn(text);
         let blocks = responseBlocks(responseValue);
 
-        if (mockSdk.steerEcho) {
+        for (let echo = 0; mockSdk.steerEcho && echo < mockSdk.steerEchoCount; echo++) {
           const extra = await Promise.race([
             prompt.next() as Promise<IteratorResult<unknown>>,
             new Promise<null>((r) => setTimeout(() => r(null), 25)),

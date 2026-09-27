@@ -23,14 +23,19 @@ let supervisor: WebSupervisor;
 let browser: Browser;
 let page: Page;
 let url: string;
+let restartHandler: ((reason: string, onExit: (failed: boolean) => void) => Promise<void>) | undefined;
 beforeEach(async () => {
+  restartHandler = undefined;
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
   agent = new Agent(); channel = new WebChannel(mockConfig.identities); provider = new MockChannel("telegram");
-  supervisor = new WebSupervisor(channel, { ...mockConfig, port: 0 });
+  supervisor = new WebSupervisor(channel, { ...mockConfig, port: 0 }, { restart: async (reason, onExit) => {
+    if (!restartHandler) throw new Error("Test restart handler is not installed");
+    await restartHandler(reason, onExit);
+  } });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
   expect(supervisor.status().port).toBeTypeOf("number");
@@ -192,4 +197,167 @@ it("keeps messaging operational when the optional web process dies", async () =>
   expect(provider.delivered.map((message) => message.text)).toEqual(["Provider remains available."]);
   // All fixture files and browser captures stay under disposable test roots.
   expect(resolve(mockConfig.sessionsDir)).not.toContain("/.tomo/");
+});
+
+it("shows an accepted queued message immediately and reconciles it without duplicate bubbles (#381)", async () => {
+  mockConfig.steering = false;
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  mockSdk.responseFn = async (text) => { if (text.includes("Long first turn")) await gate; return "Handled: " + (text.includes("Correction while waiting") ? "correction" : "first"); };
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Long first turn"); await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator(".message.user .markdown")).toHaveText("Long first turn");
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Correction while waiting"); await page.getByRole("button", { name: "Send", exact: true }).click();
+  const pending = page.locator(".message.pending").filter({ hasText: "Correction while waiting" });
+  await browserExpect(pending).toBeVisible(); await browserExpect(pending).toContainText("Queued");
+  await page.reload(); await browserExpect(page.getByLabel("Conversation history").getByText("Correction while waiting", { exact: true })).toBeVisible();
+  release(); await browserExpect(page.getByText("Handled: correction", { exact: true })).toBeVisible();
+  await browserExpect(page.getByLabel("Conversation history").getByText("Correction while waiting", { exact: true })).toHaveCount(1); await browserExpect(page.locator(".message.pending")).toHaveCount(0);
+});
+
+it("injects a correction into the active web turn and displays the shared response once (#382)", async () => {
+  mockSdk.steerEcho = true;
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started = false;
+  mockSdk.responseFn = async (text) => { if (text.includes("Start working")) { started = true; await gate; return "Started with your correction."; } return "Correction received."; };
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Start working"); await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.getByLabel("Conversation history").getByText("Start working", { exact: true })).toBeVisible();
+  await expect.poll(() => started).toBe(true);
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Use the updated direction"); await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.getByLabel("Conversation history").getByText("Use the updated direction", { exact: true })).toBeVisible();
+  const pending = () => (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { pendingSteers: unknown[] }> } }).liveSessionManager.liveSessions.get("dm:owner")!.pendingSteers.length;
+  await expect.poll(pending).toBe(1); // Assert before releasing the original turn.
+  release(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
+  await browserExpect(page.locator(".message.assistant .markdown")).toContainText("Correction received.");
+  await page.reload(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
+  await browserExpect(page.getByLabel("Conversation history").getByText("Use the updated direction", { exact: true })).toHaveCount(1);
+});
+
+it("browses TODOs and memory, searches notes, and shows genuine context data", async () => {
+  const memory = resolve(mockConfig.workspaceDir, "memory"); mkdirSync(resolve(memory, "topics"), { recursive: true });
+  writeFileSync(resolve(memory, "MEMORY.md"), "# Workspace index\nA test index.");
+  writeFileSync(resolve(memory, "TODO-work.md"), "# Work\n- [x] Completed example\n- [ ] Pending example");
+  writeFileSync(resolve(memory, "topics", "notes.md"), "# Notes\nA searchable cucumber note.\n<script>window.leaked = true</script>");
+  await page.getByRole("button", { name: "TODOs", exact: true }).click();
+  await browserExpect(page.getByRole("checkbox", { name: "Completed task" })).toBeChecked();
+  await browserExpect(page.getByRole("checkbox", { name: "Incomplete task" })).not.toBeChecked();
+  await browserExpect(page.getByRole("checkbox", { name: "Completed task" })).toBeDisabled();
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+  await browserExpect(page.getByRole("heading", { name: "Workspace index" })).toBeVisible();
+  await page.getByRole("searchbox", { name: "Search memory" }).fill("cucumber"); await page.getByRole("button", { name: "Search", exact: true }).click();
+  await page.getByRole("button", { name: /topics\/notes.md:2/ }).click(); await browserExpect(page.getByRole("heading", { name: "Notes", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { leaked?: boolean }).leaked)).toBeUndefined();
+  await page.getByRole("button", { name: "Context", exact: true }).click();
+  await browserExpect(page.getByText("Window usage is unavailable until the SDK reports it.")).toBeVisible();
+  await browserExpect(page.getByRole("heading", { name: "Rollup summaries" })).toBeVisible(); await browserExpect(page.getByText("No SDK transcript is available for analysis yet.")).toBeVisible();
+  await page.selectOption("#session", webSessionId("telegram:-1")); await browserExpect(page.locator("#study .page-toolbar")).toContainText("Test group");
+  await page.setViewportSize({ width: 768, height: 1024 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: "test-results/study-context-tablet.png", fullPage: true });
+});
+
+it("confirms cron changes, saves a redacted config diff, and manages MCP servers", async () => {
+  const { CronStore } = await import("../../src/cron/store.js"); const { ConfigStore } = await import("../../src/config/store.js");
+  const cron = new CronStore(resolve(mockConfig.tomoHome, "data", "cron", "jobs.json"));
+  cron.add({ name: "Example reminder", schedule: { kind: "every", everyMs: 60000 }, message: "Check the example note.", sessionKey: "dm:owner" });
+  const cfg = new ConfigStore(resolve(mockConfig.tomoHome, "config.json"));
+  cfg.replace({ model: "saved-model", auth: { apiKey: "synthetic-stored-secret" } });
+  await page.getByRole("button", { name: "Cron", exact: true }).click();
+  await page.getByRole("button", { name: "Disable", exact: true }).click(); await browserExpect(page.getByRole("dialog")).toContainText("Example reminder");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click(); expect(cron.list()[0].enabled).toBe(true);
+  await page.getByRole("button", { name: "Disable", exact: true }).click(); await page.getByRole("button", { name: "Confirm disable", exact: true }).click();
+  await browserExpect(page.getByRole("button", { name: "Enable", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Config", exact: true }).click();
+  expect(await page.locator("body").textContent()).not.toContain("synthetic-stored-secret");
+  await page.locator("summary").filter({ hasText: /^model/ }).click(); await page.getByLabel("model", { exact: true }).fill("replacement-model");
+  await page.getByRole("button", { name: "Preview config changes" }).click();
+  await browserExpect(page.getByRole("dialog")).toContainText("saved-model"); await browserExpect(page.getByRole("dialog")).toContainText("replacement-model");
+  await page.screenshot({ path: "test-results/study-config-review-desktop.png" });
+  expect(cfg.read().value.model).toBe("saved-model"); await page.getByRole("button", { name: "Save reviewed changes" }).click();
+  await browserExpect(page.getByRole("alert")).toContainText("Configuration saved"); expect(cfg.read().value.model).toBe("replacement-model");
+  expect(cfg.read().value.auth).toEqual({ apiKey: "synthetic-stored-secret" });
+  await page.getByRole("button", { name: "MCP servers", exact: true }).click(); await page.getByRole("button", { name: "Add server" }).click();
+  await page.getByLabel("Server name", { exact: true }).fill("example-tool"); await page.getByLabel("command", { exact: true }).fill("synthetic-command");
+  await page.getByRole("button", { name: "Preview server changes" }).click();
+  await browserExpect(page.getByRole("dialog")).not.toContainText("synthetic-command");
+  await page.getByRole("button", { name: "Save reviewed changes" }).click(); await browserExpect(page.getByRole("heading", { name: "example-tool", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Disable", exact: true }).click(); await page.getByRole("button", { name: "Save reviewed changes" }).click();
+  await browserExpect(page.getByText("Disabled in config", { exact: true })).toBeVisible();
+  await page.screenshot({ path: "test-results/study-mcp-desktop.png" });
+  await page.getByRole("button", { name: "Remove", exact: true }).click(); await page.getByRole("button", { name: "Save reviewed changes" }).click();
+  await browserExpect(page.getByText("No external MCP servers configured.")).toBeVisible();
+  await page.getByRole("button", { name: "Restart Tomo", exact: true }).click();
+  await browserExpect(page.getByRole("dialog")).toContainText("127.0.0.1:9465");
+  await page.keyboard.press("Escape"); await browserExpect(page.getByRole("dialog")).toHaveCount(0);
+  await browserExpect(page.getByRole("button", { name: "Restart Tomo", exact: true })).toBeFocused();
+});
+
+it("keeps Study navigation and management controls reachable on mobile and in dark mode", async () => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.selectOption('select[aria-label="Color theme"]', "dark");
+  await page.getByRole("button", { name: "Config", exact: true }).click();
+  await browserExpect(page.getByRole("button", { name: "Reload settings" })).toBeVisible();
+  await page.locator("summary").filter({ hasText: /^web/ }).click();
+  await browserExpect(page.getByLabel("web.port", { exact: true })).toBeVisible();
+  await page.getByLabel("web.port", { exact: true }).fill("9466");
+  await browserExpect(page.getByLabel("web.port", { exact: true })).toHaveValue("9466");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: "test-results/study-config-mobile-dark.png", fullPage: true });
+});
+
+it("confirms restart once and waits for a new daemon epoch before reporting success", async () => {
+  const previousEpoch = channel.events.epoch;
+  const calls: string[] = []; let replacement: Promise<void> | undefined;
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  restartHandler = async (reason) => {
+    calls.push(reason);
+    // Substitute only the restart executor: the browser, HTTP, child and IPC
+    // remain real. Never restart a developer's actual Tomo daemon in tests.
+    replacement = gate.then(async () => {
+      const port = supervisor.status().port!; await channel.stop();
+      channel = new WebChannel(mockConfig.identities);
+      supervisor = new WebSupervisor(channel, { ...mockConfig, port });
+      channel.attach(supervisor); agent.addChannel(channel); await channel.start();
+    });
+  };
+  await page.getByRole("button", { name: "Config", exact: true }).click();
+  await page.getByRole("button", { name: "Restart Tomo", exact: true }).click();
+  await page.getByLabel("Reason", { exact: true }).fill("Apply example settings");
+  await page.getByRole("button", { name: "Confirm restart", exact: true }).click();
+  try {
+    await browserExpect(page.getByText("Restart requested. Waiting for Tomo to reconnect…")).toBeVisible();
+    await browserExpect(page.getByText("Restart complete. Connected to the new daemon.")).toHaveCount(0);
+    await browserExpect(page.getByRole("button", { name: "Restart Tomo", exact: true })).toBeDisabled();
+  } finally { release(); }
+  await browserExpect(page.getByText("Restart complete. Connected to the new daemon.")).toBeVisible();
+  await replacement; expect(channel.events.epoch).not.toBe(previousEpoch); expect(calls).toEqual(["Apply example settings"]);
+});
+
+it("reconciles a provider turn mirrored to its web correction by canonical turn ID", async () => {
+  mockSdk.steerEcho = true;
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  mockSdk.responseFn = async (text) => { if (text.includes("Provider starts")) { await gate; return "Provider original reply."; } return "Shared corrected reply."; };
+  await provider.simulateMessage(makeMsg({ chatId: "test-owner", text: "Provider starts" }));
+  await browserExpect(page.getByText("Provider starts", { exact: true })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Browser correction");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.getByLabel("Conversation history").getByText("Browser correction", { exact: true })).toBeVisible();
+  release(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
+  await browserExpect(page.locator(".message.assistant .markdown")).toContainText("Shared corrected reply.");
+  await page.reload(); await browserExpect(page.locator(".message.assistant .markdown")).toHaveCount(1);
+  expect(provider.delivered.filter((message) => message.text.includes("Shared corrected reply."))).toHaveLength(1);
+});
+
+it("allows an explicit restart retry after the dispatched worker fails without changing daemon epoch", async () => {
+  let exit!: (failed: boolean) => void; let calls = 0;
+  restartHandler = async (_reason, onExit) => { calls++; exit = onExit; };
+  await page.getByRole("button", { name: "Config", exact: true }).click();
+  await page.getByRole("button", { name: "Restart Tomo", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm restart", exact: true }).click();
+  await browserExpect(page.getByText("Restart requested. Waiting for Tomo to reconnect…")).toBeVisible();
+  exit(true);
+  await browserExpect(page.getByText("Restart did not replace this daemon. Check Tomo’s logs, then retry when ready.")).toBeVisible();
+  expect(calls).toBe(1);
+  await page.getByRole("button", { name: "Restart Tomo", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm restart", exact: true }).click();
+  await expect.poll(() => calls).toBe(2);
+  await browserExpect(page.getByText("Restart complete. Connected to the new daemon.")).toHaveCount(0);
 });

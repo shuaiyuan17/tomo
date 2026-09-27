@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { loadConfig, saveConfig } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig } from "./shared.js";
 
 export async function configChannels(): Promise<void> {
   const cfg = loadConfig();
@@ -64,7 +64,7 @@ export async function configChannels(): Promise<void> {
         if (!channels.telegram) channels.telegram = {};
         channels.telegram.token = entered;
         cfg.channels = channels;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success("Telegram token saved");
       }
 
@@ -96,7 +96,7 @@ export async function configChannels(): Promise<void> {
         if (imEnabled) delete channels.imessage.provider;
         else channels.imessage.provider = "imsg";
         cfg.channels = channels;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success(imEnabled
           ? "iMessage disabled"
           : "iMessage enabled (imsg CLI — Tomo needs Full Disk Access)");
@@ -114,7 +114,7 @@ export async function configChannels(): Promise<void> {
         if (trimmed) channels.imessage.cliPath = trimmed;
         else delete channels.imessage.cliPath;
         cfg.channels = channels;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success("imsg CLI settings saved");
       }
 
@@ -170,7 +170,7 @@ async function manageAllowlist(
         allowlist.push(val);
         ch.allowlist = allowlist;
         cfg.channels = channels;
-        saveConfig(cfg);
+        await saveConfig(cfg);
         p.log.success(`Added ${val}`);
       }
     }
@@ -180,7 +180,7 @@ async function manageAllowlist(
       const removed = allowlist.splice(idx, 1)[0];
       ch.allowlist = allowlist;
       cfg.channels = channels;
-      saveConfig(cfg);
+      await saveConfig(cfg);
       p.log.success(`Removed ${removed}`);
     }
   }

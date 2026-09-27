@@ -1,6 +1,8 @@
+import { configRevision } from "./config/store.js";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { z } from "zod";
+import { positiveInt, nonNegativeInt, positiveNumber, boolLike, channelEntrySchema, imessageProviderSchema, identitySchema, DEFAULT_LCM, lcmSchema, continuityScriptEntrySchema, litellmEntrySchema, pluginEntrySchema, agentProfileSchema } from "./config/schema.js";
 import { type ExternalMcpServerConfig, parseExternalMcpServers } from "./mcp/external-config.js";
 import type { PluginSpec } from "./agent/plugins.js";
 import { inferLiteLlmMode, type LiteLlmMode } from "./litellm.js";
@@ -159,6 +161,7 @@ export interface LiteLlmConfig {
 }
 
 export interface TomoConfig {
+  fileRevision?: string;
   web: WebConfig;
   /** Anthropic authentication used for direct Claude model sessions. */
   auth: AnthropicAuthConfig;
@@ -384,97 +387,7 @@ export function envVar(name: string): string | undefined {
 // Coercing schemas: config.json values arrive typed, env overrides arrive as
 // strings — z.coerce keeps the Number()-compatible semantics of the old
 // hand-rolled parsers.
-const positiveInt = z.coerce.number().positive("expected a positive number").transform(Math.floor);
-const nonNegativeInt = z.coerce.number().min(0, "expected a non-negative number").transform(Math.floor);
-const positiveNumber = z.coerce.number().positive("expected a positive number");
-const boolLike = z.unknown().transform((value, ctx) => {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    if (["true", "1", "yes", "on"].includes(normalized)) return true;
-    if (["false", "0", "no", "off"].includes(normalized)) return false;
-  }
-  ctx.addIssue({ code: "custom", message: "expected a boolean (true/false, or yes/no/on/off/1/0)" });
-  return z.NEVER;
-});
-/** Chat ids may be written as JSON numbers (Telegram); normalize to strings. */
-const chatId = z.union([z.string(), z.number()]).transform(String);
-
-const channelEntrySchema = z.looseObject({
-  token: z.string().optional(),
-  // Deliberately a bare string, not an enum: an unrecognized provider must not
-  // fail the WHOLE channel entry (which would fall the allowlist back to {} as
-  // well). The value is checked on its own at the `imessageProvider` build
-  // site, so a stale `"bluebubbles"` yields one targeted issue, not a wiped
-  // iMessage config.
-  provider: z.string().optional(),
-  cliPath: z.string().optional(),
-  dbPath: z.string().optional(),
-  inboundSettleMs: nonNegativeInt.optional(),
-  inboundMaxSettleMs: nonNegativeInt.optional(),
-  typingStartDelayMs: nonNegativeInt.optional(),
-  passiveTypingStartDelayMs: nonNegativeInt.optional(),
-  allowlist: z.array(chatId).optional(),
-  passiveGroups: z.array(chatId).optional(),
-});
 type ChannelEntry = z.output<typeof channelEntrySchema>;
-
-/**
- * `channels.imessage.provider`. Only `"imsg"` remains — the BlueBubbles
- * backend was removed on 2026-08-27.
- *
- * An absent key means iMessage is off (see `validated()`: undefined/null takes
- * the fallback without an issue), so installs that never opted in keep working
- * and never spawn an `imsg` child they didn't ask for. A config still pinned to
- * `"bluebubbles"` deliberately raises a startup issue instead of being quietly
- * switched to a backend the owner never chose, or quietly losing its iMessage
- * channel.
- */
-const imessageProviderSchema = z.unknown().transform((value, ctx): "imsg" | null => {
-  if (value === "imsg") return "imsg";
-  if (value === "bluebubbles") {
-    ctx.addIssue({
-      code: "custom",
-      message: 'the BlueBubbles backend has been removed — set "imsg" to use the local imsg CLI, or delete the key to turn iMessage off',
-    });
-    return z.NEVER;
-  }
-  ctx.addIssue({ code: "custom", message: 'expected "imsg"' });
-  return z.NEVER;
-});
-
-const identitySchema = z.object({
-  name: z.string().min(1, "expected a non-empty name"),
-  channels: z.record(z.string(), chatId),
-  replyPolicy: z.string().default("last-active"),
-});
-
-const DEFAULT_LCM: LcmConfig = {
-  nudgeAtPct: 70,
-  nudgeResetPct: 60,
-  groupCompactStyle: "lcm",
-  dailyFreshTail: 32,
-  globalFreshTail: false,
-};
-
-const lcmSchema = z.object({
-  nudgeAtPct: z.coerce.number().positive().max(100, "expected a percentage in (0, 100]").default(DEFAULT_LCM.nudgeAtPct),
-  nudgeResetPct: z.coerce.number().min(0).optional(),
-  groupCompactStyle: z.enum(["sdk", "lcm"]).default(DEFAULT_LCM.groupCompactStyle),
-  dailyFreshTail: z.coerce.number().int().min(0, "expected a non-negative integer").default(DEFAULT_LCM.dailyFreshTail),
-  globalFreshTail: boolLike.default(DEFAULT_LCM.globalFreshTail),
-}).transform((lcm, ctx) => {
-  // An omitted reset derives from the (possibly custom) nudge threshold: the
-  // stock 60 when that sits below it, else 10 points under the threshold.
-  // Only an EXPLICIT reset can conflict, and that is a real error.
-  const nudgeResetPct = lcm.nudgeResetPct
-    ?? (DEFAULT_LCM.nudgeResetPct < lcm.nudgeAtPct ? DEFAULT_LCM.nudgeResetPct : Math.max(0, lcm.nudgeAtPct - 10));
-  if (nudgeResetPct >= lcm.nudgeAtPct) {
-    ctx.addIssue({ code: "custom", path: ["nudgeResetPct"], message: "nudgeResetPct must be below nudgeAtPct" });
-    return z.NEVER;
-  }
-  return { ...lcm, nudgeResetPct };
-});
 
 const DEFAULT_METRICS: MetricsConfig = {
   enabled: false,
@@ -518,17 +431,6 @@ function parseMetricsConfig(raw: unknown): MetricsConfig {
     ),
   };
 }
-
-const continuityScriptEntrySchema = z.union([
-  z.string().transform((path) => ({ path }) as { path?: string; timeoutMs?: unknown; maxOutputChars?: unknown }),
-  z.looseObject({ path: z.string().optional(), timeoutMs: z.unknown().optional(), maxOutputChars: z.unknown().optional() }),
-]);
-
-const litellmEntrySchema = z.looseObject({
-  mode: z.unknown().optional(),
-  baseUrl: z.string().optional(),
-  apiKey: z.string().optional(),
-});
 
 function parseLiteLlmConfig(raw: unknown, defaultModel: string): LiteLlmConfig | null {
   const entry = validated("litellm", litellmEntrySchema, raw, {});
@@ -625,19 +527,6 @@ function parseIdentities(raw: unknown): IdentityConfig[] {
   return identities;
 }
 
-const pluginEntrySchema = z.union([
-  z.string().min(1, "expected a non-empty plugin path or name"),
-  z
-    .object({
-      path: z.string().min(1).optional(),
-      name: z.string().min(1).optional(),
-      skipMcpDiscovery: z.boolean().optional(),
-    })
-    .refine((o) => Boolean(o.path) !== Boolean(o.name), {
-      message: "expected exactly one of `path` or `name`",
-    }),
-]);
-
 /** Parse the `plugins` config array into normalized PluginSpec entries.
  *  Invalid entries are dropped with a configIssues record (same policy as
  *  identities): one bad plugin must not take the daemon down. */
@@ -666,14 +555,6 @@ function parsePlugins(raw: unknown): PluginSpec[] {
   }
   return specs;
 }
-
-const agentProfileSchema = z.object({
-  writeRoots: z.array(z.string()).default([]),
-  denyPaths: z.array(z.string()).default([]),
-  denyReadPaths: z.array(z.string()).default([]),
-  // Narrowest default: see AgentProfile.bash.
-  bash: z.enum(["none", "readonly", "worktree", "full"]).default("none"),
-});
 
 /**
  * Expand one profile's path list, dropping anything that does not come out
@@ -839,6 +720,7 @@ function buildConfig(): TomoConfig {
   );
 
   return {
+    fileRevision: configRevision(file),
     auth: parseAnthropicAuthConfig(file.auth),
     web: parseWebConfig(file.web, (message) => log.warn(message)),
     telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",

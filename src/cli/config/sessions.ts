@@ -1,6 +1,6 @@
 import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
-import { loadConfig, saveConfig, modelLabel, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig, modelLabel, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 import { promptForModel } from "./model-picker.js";
 
 export async function configSessions(): Promise<void> {
@@ -58,14 +58,14 @@ export async function configSessions(): Promise<void> {
       if (!model) continue;
       overrides[key] = model;
       cfg.sessionModelOverrides = overrides;
-      saveConfig(cfg);
+      await saveConfig(cfg);
       p.log.success(`Model for ${key} set to ${modelLabel(model)}`);
     }
 
     if (action === "clear-model") {
       delete overrides[key];
       cfg.sessionModelOverrides = overrides;
-      saveConfig(cfg);
+      await saveConfig(cfg);
       p.log.success(`Model override cleared for ${key}`);
     }
 
@@ -77,7 +77,7 @@ export async function configSessions(): Promise<void> {
       // the conversation and then abort, leaving the override behind.
       delete overrides[key];
       cfg.sessionModelOverrides = overrides;
-      saveConfig(cfg);
+      await saveConfig(cfg);
       // The config is already saved, so that is the truthful state to report
       // whatever happens next. clearSdkSessionId can refuse when the session
       // registry itself is unreadable; that must not take the menu down with

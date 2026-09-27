@@ -1,6 +1,6 @@
 import * as p from "@clack/prompts";
 import { anthropicAuthLabel, parseAnthropicAuthConfig } from "../../auth.js";
-import { loadConfig, saveConfig } from "./shared.js";
+import { loadConfig, saveConfigInteractive as saveConfig } from "./shared.js";
 
 interface RawAuthConfig {
   method?: string;
@@ -40,7 +40,7 @@ export async function configAnthropicAuth(): Promise<void> {
 
   if (action === "subscription") {
     cfg.auth = { method: "subscription" };
-    saveConfig(cfg);
+    await saveConfig(cfg);
     p.log.success("Claude subscription authentication saved");
     if (process.env.ANTHROPIC_API_KEY?.trim()) {
       p.log.warn("ANTHROPIC_API_KEY is set and overrides config.json until it is unset.");
@@ -63,6 +63,6 @@ export async function configAnthropicAuth(): Promise<void> {
     method: "api-key",
     apiKey: String(apiKey).trim() || configuredApiKey,
   };
-  saveConfig(cfg);
+  await saveConfig(cfg);
   p.log.success("Anthropic API key authentication saved. Restart Tomo to use it.");
 }

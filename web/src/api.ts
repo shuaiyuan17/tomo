@@ -1,14 +1,14 @@
 import type { EventEnvelope, MessageInput, WebBootstrap, WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
-  constructor(readonly status: number, readonly code: string) { super(code); }
+  constructor(readonly status: number, readonly code: string, readonly fields?: string[]) { super(code); }
 }
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/v1${path}`, { ...init, credentials: "same-origin",
     headers: { "x-tomo-request": "1", ...init?.headers } });
   if (!response.ok) {
     const value = await response.json().catch(() => ({}));
-    throw new ApiError(response.status, value.error ?? "unavailable");
+    throw new ApiError(response.status, value.error ?? "unavailable", value.fields);
   }
   return response.json() as Promise<T>;
 }
@@ -75,3 +75,14 @@ export async function stream(cursor: string, signal: AbortSignal, handlers: Stre
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 export type { WebBootstrap };
+
+export async function mutate<T>(path: string, input: unknown, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>, method = "POST"): Promise<T> {
+  const run = (csrfToken: string) => api<T>(path, { method, headers: { "content-type": "application/json", "x-tomo-csrf": csrfToken, "x-tomo-epoch": bootstrap.epoch }, body: JSON.stringify(input) });
+  try { return await run(bootstrap.csrfToken); }
+  catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 403 || error.code !== "invalid_csrf") throw error;
+    const fresh = await refresh();
+    if (fresh.epoch !== bootstrap.epoch) throw new ApiError(409, "epoch_changed");
+    return run(fresh.csrfToken);
+  }
+}

@@ -6,7 +6,7 @@ import { isAutostartEnabled, isMacOS } from "../service.js";
 import { getDaemonStatus } from "../status-info.js";
 import { formatDuration } from "../../cron/format.js";
 import { configIssues } from "../../config.js";
-import { CONFIG_BACKUP_PATH, CONFIG_PATH, ConfigReadError, loadConfig } from "./shared.js";
+import { CONFIG_BACKUP_PATH, CONFIG_PATH, ConfigReadError, ConfigSaveCancelled, loadConfig } from "./shared.js";
 import { configModel } from "./model.js";
 import { configAutostart } from "./autostart.js";
 import { configChannels } from "./channels.js";
@@ -162,6 +162,7 @@ async function runConfig(): Promise<void> {
         if (choice === "costs") await configCostAnalysis();
         if (choice === "autostart") await configAutostart();
       } catch (err) {
+        if (err instanceof ConfigSaveCancelled) { p.log.info("Unsaved changes from this action discarded. Earlier saves are intact."); continue; }
         if (!(err instanceof ConfigReadError)) throw err;
         // The config went bad underneath a running session. Report, remember
         // it so the next pass offers only the submenus that do not read the

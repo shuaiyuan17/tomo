@@ -14,8 +14,11 @@ export function useWeb() {
     catch (error) { if (error instanceof ApiError && error.status === 401) setConnection("locked"); throw error; }
   }, []);
   const discardRecordedBlocks = useCallback((requestIds: Set<string>) => {
-    setBlocks((old) => old.some((block) => requestIds.has(block.requestId))
-      ? old.filter((block) => !requestIds.has(block.requestId)) : old);
+    setBlocks((old) => old.some((block) => requestIds.has(block.turnId ?? block.requestId))
+      ? old.filter((block) => !requestIds.has(block.turnId ?? block.requestId)) : old);
+  }, []);
+  const acceptRequest = useCallback((request: WebRequest) => {
+    setRequests((old) => [...old.filter((r) => r.requestId !== request.requestId), { ...request, ...old.find((r) => r.requestId === request.requestId), text: request.text }].slice(-128));
   }, []);
   useEffect(() => {
     const controller = new AbortController();
@@ -67,5 +70,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, revision, discardRecordedBlocks, refreshBootstrap };
+  return { bootstrap, connection, blocks, requests, activity, revision, discardRecordedBlocks, refreshBootstrap, acceptRequest };
 }

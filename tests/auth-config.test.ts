@@ -23,7 +23,7 @@ vi.mock("@clack/prompts", () => ({
 
 vi.mock("../src/cli/config/shared.js", () => ({
   loadConfig: () => mocks.cfg,
-  saveConfig: mocks.saveConfig,
+  saveConfigInteractive: mocks.saveConfig,
 }));
 
 const { configAnthropicAuth } = await import("../src/cli/config/auth.js");

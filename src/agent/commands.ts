@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
+import { ConfigStore, readConfigFile } from "../config/store.js";
 import type { IdentityRouter } from "../router.js";
 import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
@@ -24,12 +24,6 @@ import type { ExternalMcpServerStatus, McpLoginStart } from "../mcp/oauth.js";
 import { ClaudeLoginManager } from "./claude-login.js";
 import { buildUsageReport } from "./usage.js";
 import { litellmRoutesModel } from "../litellm.js";
-
-/** Back up ~/.tomo/config.json before a programmatic rewrite. */
-export function backupConfigFile(): void {
-  mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
-  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
-}
 
 export interface ChatCommandDeps {
   router: IdentityRouter;
@@ -440,16 +434,13 @@ export class ChatCommandHandler {
    *  leaving in-memory state untouched) if the file can't be read or written. */
   private persistModelOverride(key: string, model: string): boolean {
     try {
-      const cfg = existsSync(CONFIG_PATH)
-        ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
-        : {};
-      const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-      overrides[key] = model;
-      cfg.sessionModelOverrides = overrides;
+      new ConfigStore(CONFIG_PATH, CONFIG_BACKUP_PATH).update((cfg) => {
+        const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
+        overrides[key] = model;
+        cfg.sessionModelOverrides = overrides;
 
-      mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-      backupConfigFile();
-      writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+        return cfg;
+      });
       config.sessionModelOverrides[key] = model;
       return true;
     } catch (err) {
@@ -625,9 +616,9 @@ export class ChatCommandHandler {
     }
 
     try {
-      mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-      copyFileSync(CONFIG_BACKUP_PATH, CONFIG_PATH);
-      chmodSync(CONFIG_PATH, 0o600);
+      const restored = readConfigFile(CONFIG_BACKUP_PATH);
+      if (!restored) throw new Error("Backup is unavailable");
+      new ConfigStore(CONFIG_PATH, CONFIG_BACKUP_PATH).replace(restored, false);
 
       const reason = "Restored ~/.tomo/config.json from ~/.tomo/config.json.bak";
       // Attribute the session that issued /restore so the post-restart notice

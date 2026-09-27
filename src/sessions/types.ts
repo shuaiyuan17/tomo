@@ -1,6 +1,8 @@
 export interface SessionMessage {
   /** Web ingress correlation; absent in older/provider transcript records. */
   requestId?: string;
+  /** Canonical reply shared by web messages that joined the same SDK turn. */
+  turnId?: string;
   role: "user" | "assistant" | "tool_summary";
   content: string;
   channel: string;

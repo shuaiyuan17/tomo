@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { ReplyContext, TurnRequest } from "./live-session.js";
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
@@ -11,6 +13,8 @@ import { formatInboundStamp } from "./inbound-markers.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
+  replyContext?: ReplyContext;
+  onJoined?: TurnRequest["onJoined"];
   key: string;
   prompt: string;
   images?: Array<{ data: string; mediaType: string }>;
@@ -154,6 +158,8 @@ export interface TurnErrorPolicy {
 }
 
 export interface TurnSpec {
+  replyContext?: ReplyContext;
+  joined?: boolean;
   requestId?: string;
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
@@ -198,7 +204,7 @@ export interface TurnRunnerDeps {
   drainPendingNotes(sessionKey: string): string;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
-  appendAssistantTranscript(sessionKey: string, content: string, channelName: string): void;
+  appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
   /** Typing indicator with per-channel start delay (Agent.startTurnTyping). */
   startTurnTyping(channel: Channel, chatId: string, passiveListen?: boolean): StopTyping;
@@ -305,6 +311,13 @@ export class TurnRunner {
    * same way. What is left for after the turn is only what genuinely needs the
    * whole response: the transcript, the log line, silence and error policy.
    */
+  private appendTranscript(spec: TurnSpec, content: string, channel: string): void {
+    if (spec.joined) return; // The original turn writes the shared reply once.
+    if (spec.requestId || spec.replyContext?.webJoined) this.deps.appendAssistantTranscript(spec.key, content, channel,
+      { requestId: spec.requestId, turnId: spec.replyContext!.turnId });
+    else this.deps.appendAssistantTranscript(spec.key, content, channel);
+  }
+
   private async runDelivery(
     spec: TurnSpec,
     prompt: string,
@@ -313,6 +326,9 @@ export class TurnRunner {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
 
+    const channel = delivery.kind === "deferred-send" ? "" : delivery.channel.name;
+    spec.replyContext = { turnId: spec.requestId ?? randomUUID(), channel, requestId: spec.requestId,
+      interactive: spec.source === "user" && delivery.kind === "reply" };
     const sink = this.makeBlockSink(spec);
     let rawResponse: string;
     try {
@@ -323,7 +339,13 @@ export class TurnRunner {
         silentDelivery: isSuppressed(delivery),
         onBlock: sink.onBlock,
         onBlockAbandoned: sink.onBlockAbandoned,
-        hasShipped: sink.hasShipped,
+        hasShipped: () => spec.joined === true || sink.hasShipped(),
+        replyContext: spec.replyContext,
+        ...(spec.requestId && reply?.steer ? { onJoined: (parent: ReplyContext | undefined) => {
+          spec.joined = true;
+          watchBus.publish({ type: "turn.join", sessionKey: spec.key, requestId: spec.requestId!, turnId: parent?.turnId ?? spec.replyContext!.turnId });
+          return parent?.channel !== "web";
+        } } : {}),
         flushOnShutdown: sink.flushBlockTranscript,
         ...(reply
           ? {
@@ -394,7 +416,7 @@ export class TurnRunner {
     // spoke. Nothing else can flush and then arrive here (the turn-died path
     // rethrows), so this guard only ever bites on shutdown.
     if (spec.transcript === "always" && reply && !sink.recordedAny()) {
-      this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
+      this.appendTranscript(spec, response, reply.channel.name);
     }
 
     // SHUTDOWN REFUSED THIS TURN — the prompt never reached the model.
@@ -469,12 +491,12 @@ export class TurnRunner {
             },
           );
           if (spec.transcript === "on-delivery") {
-            this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+            this.appendTranscript(spec, deliverText, target.channel.name);
           }
         } catch (err) {
           if (spec.transcript === "on-delivery") {
-            this.deps.appendAssistantTranscript(
-              spec.key,
+            this.appendTranscript(
+              spec,
               `${DELIVERY_FAILED_MARKER}${deliverText}`,
               target.channel.name,
             );
@@ -555,7 +577,7 @@ export class TurnRunner {
     const transcript = createOrderedBlockTranscript(
       (entry) => {
         if (!channelName) return;
-        this.deps.appendAssistantTranscript(spec.key, entry, channelName);
+        this.appendTranscript(spec, entry, channelName);
         recordedAny = true;
       },
       { defer: spec.transcript !== "on-delivery" },
@@ -677,7 +699,7 @@ export class TurnRunner {
         // is also the entry that follows the turn's already-shipped blocks on a
         // turn that died mid-delivery, so recall reads back what the owner
         // actually saw: the blocks, then the failure.
-        this.deps.appendAssistantTranscript(spec.key, visibleError, target.channel.name);
+        this.appendTranscript(spec, visibleError, target.channel.name);
       }
     } finally {
       await stopTyping({ clear: true });

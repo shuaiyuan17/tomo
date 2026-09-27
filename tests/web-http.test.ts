@@ -1,3 +1,4 @@
+import { WebError } from "../src/web/protocol.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { request } from "node:http";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
@@ -53,9 +54,13 @@ beforeEach(async () => {
   channel = new WebChannel(identities); handoff = vi.fn(async () => true); channel.onMessage(handoff);
   service = await startWebHttp(0, { accessToken, externalOrigin, now: () => now, assetsDir, data: new WebData({ sessionsDir, sdkSessionsDir, identities }),
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
-      if (input.method === "message") return channel.receive(input.input);
+      if (input.method === "epoch") return channel.events.epoch;
+      if (input.method === "message") {
+        if (input.epoch !== channel.events.epoch) throw new WebError(409, "epoch_changed");
+        return channel.receive(input.input);
+      }
       if (input.method === "request") return channel.request(input.requestId);
-      return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
+      return { snapshot: channel.snapshot(), replay: input.method === "snapshot" && input.cursor ? channel.events.after(input.cursor) : null };
     } });
   const response = await call(`/api/v1/bootstrap?t=${accessToken}`);
   expect(response.status).toBe(200);

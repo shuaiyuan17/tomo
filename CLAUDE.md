@@ -42,6 +42,7 @@ src/
   router.ts           # IdentityRouter — session key resolution, allowlists, summons
   people.ts           # People registry — person records, alias/handle resolution, auto-binding
   config.ts           # Config from ~/.tomo/config.json + env vars (zod-validated)
+  config/             # Shared validators, web field metadata and locked config transactions
   tomo-event.ts       # <tomo-event> envelope for harness-composed messages
   auth.ts             # Anthropic auth resolution (env key > config; subscription or API key)
   channels/           # Channel implementations (Telegram, iMessage via imsg, local web)
@@ -68,7 +69,9 @@ src/
 
 Runtime data lives at `~/.tomo/` (config, sessions, cron jobs, logs, workspace, memory).
 
-The browser frontend lives in `web/` at the repository root, uses strict React/TypeScript and mockup-derived CSS tokens, and builds into `dist/web-assets`. See `docs/web-ui.md` for limits and development commands. The web child never owns another Agent or writes transcripts. Owner input goes through `Agent.addChannel`; reply outlets are bound to request IDs, and web/provider turns cannot steer into each other's delivery destination. Preserve the existing persistent notification target and transcript policy.
+The browser frontend lives in `web/` at the repository root, uses strict React/TypeScript and mockup-derived CSS tokens, and builds into `dist/web-assets`. See `docs/web-ui.md` for limits and development commands. The web child never owns another Agent or writes transcripts. Owner input goes through `Agent.addChannel`; reply outlets are bound to request IDs. Web input may steer into an active private user turn: SDK echo confirms joining, the original turn retains transcript ownership and delivery, and at most one joined web sink mirrors each completed block. Group-audience/background work remains queued. Preserve the existing persistent notification target and transcript policy.
+
+The Study reads TODO/memory through the confined workspace reader, cron through `CronStore`, and context through the shared LCM parsers plus persisted status readings. Config/MCP saves use `ConfigStore`: lock, fresh revision check, guarded backup, atomic `0600` write. All programmatic config writers share this lock; daemon writers fail promptly on contention. The web child validates candidates with the shared Zod schemas and returns only safe values/set-unset metadata. Preview proposals bind browser, revision and candidate; never echo secret replacements. MCP health comes from active queries' bounded `mcpServerStatus()` calls, not saved configuration. Restart dispatches the installed CLI with a reason; the UI waits for a new daemon epoch before reporting completion.
 
 All private web APIs, including reads and SSE, require a signed origin-bound session cookie. Bootstrap grants one only with the persistent private `web-token`; CSRF expires independently and can be renewed without logging in again. Token file I/O and locking happen in the supervised child. The HTTP listener remains loopback-only; `web.externalOrigin` permits one exact HTTPS Tailscale Serve origin, never a wildcard. Do not use Funnel or infer authentication from forwarded identity headers. Evict only settled receipts; a failed delivery can still have an active turn and must retain its outlet until settlement.
 

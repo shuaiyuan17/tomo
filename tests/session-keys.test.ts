@@ -60,6 +60,10 @@ describe("identity binding matchers", () => {
     expect(matchesChannelBinding("imessage", "iMessage;-;+15551234567", "any;-;+15551234567")).toBe(true);
     expect(matchesChannelBinding("imessage", "user@example.com", "iMessage;-;user@example.com")).toBe(true);
     expect(matchesChannelBinding("imessage", "+15559999999", "any;-;+15551234567")).toBe(false);
+    // Group GUID bindings are never reduced: no cross-prefix or bare-id match.
+    expect(matchesChannelBinding("imessage", "any;+;chat123", "iMessage;+;chat123")).toBe(false);
+    expect(matchesChannelBinding("imessage", "chat123", "iMessage;+;chat123")).toBe(false);
+    expect(matchesChannelBinding("imessage", "iMessage;+;chat123", "iMessage;+;chat123")).toBe(true);
     // Only iMessage canonicalises GUIDs.
     expect(matchesChannelBinding("telegram", "+15551234567", "any;-;+15551234567")).toBe(false);
   });

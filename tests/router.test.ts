@@ -352,6 +352,18 @@ describe("IdentityRouter", () => {
       expect(router.identityForSender("telegram", "111")?.name).toBe("Alice");
       expect(router.identityForSender("telegram", "222")).toBeUndefined();
     });
+
+    it("identityForSender resolves an iMessage identity bound to a DM chat GUID (#393)", () => {
+      const router = new IdentityRouter(
+        [{ name: "Gina", channels: { imessage: "any;-;+15551234567" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      // Routing sees the chat GUID; owner checks see the bare sender handle.
+      expect(router.resolve("imessage", "any;-;+15551234567", false).sessionKey).toBe("dm:gina");
+      expect(router.identityForSender("imessage", "+15551234567")?.name).toBe("Gina");
+      expect(router.identityForSender("imessage", "+15559999999")).toBeUndefined();
+    });
   });
 
   describe("session migration", () => {

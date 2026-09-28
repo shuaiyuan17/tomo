@@ -54,6 +54,16 @@ describe("identity binding matchers", () => {
     expect(matchesChannelBinding("imessage", "any;-;+15551234567", undefined)).toBe(false);
   });
 
+  it("matches an iMessage binding given as a chat GUID against the bare sender handle (#393)", () => {
+    // Owner checks (identityForSender) pass the provider's bare sender handle.
+    expect(matchesChannelBinding("imessage", "+15551234567", "any;-;+15551234567")).toBe(true);
+    expect(matchesChannelBinding("imessage", "iMessage;-;+15551234567", "any;-;+15551234567")).toBe(true);
+    expect(matchesChannelBinding("imessage", "user@example.com", "iMessage;-;user@example.com")).toBe(true);
+    expect(matchesChannelBinding("imessage", "+15559999999", "any;-;+15551234567")).toBe(false);
+    // Only iMessage canonicalises GUIDs.
+    expect(matchesChannelBinding("telegram", "+15551234567", "any;-;+15551234567")).toBe(false);
+  });
+
   it("finds the legacy per-channel keys an identity binding would have routed to, excluding groups", () => {
     const keys = [
       "telegram:111",

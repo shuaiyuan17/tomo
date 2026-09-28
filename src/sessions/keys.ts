@@ -69,18 +69,26 @@ export function privateReplyTargetFromSessionKey(key: string): ReplyTarget | und
 
 /**
  * Does a raw chatId belong to an identity's binding for that channel?
- * Exact match, plus iMessage chat GUIDs matched by their identifier: config
- * binds the handle ("+15551234567") while the provider keys sessions by chat
- * GUID ("any;-;+15551234567"). Every place that compares a configured binding
- * against a live chatId (inbound routing, send_message targets, session
- * migration) must use this — a bare `===` silently misses iMessage.
+ * Exact match, plus iMessage handles and chat GUIDs matched by their
+ * identifier on both sides: config usually binds the handle ("+15551234567")
+ * while the provider keys sessions by chat GUID ("any;-;+15551234567"), but a
+ * binding may also be the GUID itself, and owner checks pass the bare sender
+ * handle rather than the chat GUID. Every place that compares a configured
+ * binding against a live chatId or sender id (inbound routing, owner checks,
+ * send_message targets, session migration) must use this — a bare `===`
+ * silently misses iMessage.
  */
 export function matchesChannelBinding(channelName: string, chatId: string, bound: string | undefined): boolean {
   if (bound === undefined) return false;
   if (bound === chatId) return true;
   if (channelName === "imessage") {
-    const identifier = extractImessageIdentifier(chatId);
-    if (identifier !== null && identifier === bound) return true;
+    // Only a DM GUID ("<svc>;-;<handle>") reduces to its handle, on either
+    // side. Group GUIDs (";+;") stay exact so a group chat never matches a DM
+    // binding, nor the same group under another service prefix.
+    const toHandle = (id: string) => (id.includes(";-;") ? (extractImessageIdentifier(id) ?? id) : id);
+    const want = toHandle(bound);
+    const have = toHandle(chatId);
+    if (want === have) return true;
   }
   return false;
 }

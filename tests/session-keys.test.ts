@@ -64,6 +64,9 @@ describe("identity binding matchers", () => {
     expect(matchesChannelBinding("imessage", "any;+;chat123", "iMessage;+;chat123")).toBe(false);
     expect(matchesChannelBinding("imessage", "chat123", "iMessage;+;chat123")).toBe(false);
     expect(matchesChannelBinding("imessage", "iMessage;+;chat123", "iMessage;+;chat123")).toBe(true);
+    // A group chat GUID never matches a DM binding, whether GUID or bare handle.
+    expect(matchesChannelBinding("imessage", "any;+;+15551234567", "any;-;+15551234567")).toBe(false);
+    expect(matchesChannelBinding("imessage", "any;+;+15551234567", "+15551234567")).toBe(false);
     // Only iMessage canonicalises GUIDs.
     expect(matchesChannelBinding("telegram", "+15551234567", "any;-;+15551234567")).toBe(false);
   });

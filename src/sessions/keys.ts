@@ -82,11 +82,12 @@ export function matchesChannelBinding(channelName: string, chatId: string, bound
   if (bound === undefined) return false;
   if (bound === chatId) return true;
   if (channelName === "imessage") {
-    // Only a DM GUID ("<svc>;-;<handle>") reduces to its handle. Group GUIDs
-    // (";+;") stay exact so a group binding never matches the same group
-    // under another service prefix, nor a bare handle.
-    const want = bound.includes(";-;") ? (extractImessageIdentifier(bound) ?? bound) : bound;
-    const have = extractImessageIdentifier(chatId) ?? chatId;
+    // Only a DM GUID ("<svc>;-;<handle>") reduces to its handle, on either
+    // side. Group GUIDs (";+;") stay exact so a group chat never matches a DM
+    // binding, nor the same group under another service prefix.
+    const toHandle = (id: string) => (id.includes(";-;") ? (extractImessageIdentifier(id) ?? id) : id);
+    const want = toHandle(bound);
+    const have = toHandle(chatId);
     if (want === have) return true;
   }
   return false;

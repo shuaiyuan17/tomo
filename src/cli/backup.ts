@@ -108,6 +108,23 @@ function externalSessionsDir(): string | null {
   return isInsideDir(sessionsDir, join(TOMO_HOME, "data")) ? null : resolve(sessionsDir);
 }
 
+/**
+ * Filter for the workspace leg. Skips `.claude/` (its skills are copied
+ * separately) and the workspace's top-level `tmp/`, which the harness reserves
+ * for downloads and generated scratch files. Agents park build output and
+ * worktrees there; one night it doubled a backup from 3.9 GB to 7.5 GB and
+ * nearly filled the disk. Only the top-level `tmp` is skipped — a `tmp`
+ * folder deeper in the tree is ordinary content.
+ */
+export function workspaceBackupFilter(workspaceSrc: string): (src: string) => boolean {
+  const scratch = join(workspaceSrc, "tmp");
+  return (src) =>
+    !src.includes(`${sep}.claude${sep}`) &&
+    !src.endsWith(`${sep}.claude`) &&
+    src !== scratch &&
+    !src.startsWith(scratch + sep);
+}
+
 function copyIfExists(src: string, dest: string, opts?: { filter?: (src: string, dest: string) => boolean }): boolean {
   if (!existsSync(src)) return false;
   mkdirSync(dest, { recursive: true });
@@ -332,9 +349,7 @@ backupCommand
     // 2. workspace/ (excluding .claude/)
     const workspaceSrc = config.workspaceDir;
     const workspaceDest = join(tmpDest, "workspace");
-    if (copyIfExists(workspaceSrc, workspaceDest, {
-      filter: (src) => !src.includes(`${sep}.claude${sep}`) && !src.endsWith(`${sep}.claude`),
-    })) {
+    if (copyIfExists(workspaceSrc, workspaceDest, { filter: workspaceBackupFilter(workspaceSrc) })) {
       console.log("  [ok] workspace/");
     } else {
       console.log("  [--] workspace/ (not found)");

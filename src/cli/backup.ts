@@ -117,12 +117,14 @@ function externalSessionsDir(): string | null {
  * folder deeper in the tree is ordinary content.
  */
 export function workspaceBackupFilter(workspaceSrc: string): (src: string) => boolean {
-  const scratch = join(workspaceSrc, "tmp");
-  return (src) =>
-    !src.includes(`${sep}.claude${sep}`) &&
-    !src.endsWith(`${sep}.claude`) &&
-    src !== scratch &&
-    !src.startsWith(scratch + sep);
+  return (src) => {
+    if (src.includes(`${sep}.claude${sep}`) || src.endsWith(`${sep}.claude`)) return false;
+    // Compared case-insensitively: on the default case-insensitive APFS an
+    // existing `TMP/` *is* the scratch directory, and cpSync reports its
+    // on-disk spelling.
+    const top = relative(workspaceSrc, src).split(sep)[0];
+    return top.toLowerCase() !== "tmp";
+  };
 }
 
 function copyIfExists(src: string, dest: string, opts?: { filter?: (src: string, dest: string) => boolean }): boolean {

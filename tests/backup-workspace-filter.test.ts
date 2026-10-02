@@ -35,4 +35,17 @@ describe("workspaceBackupFilter", () => {
     expect(existsSync(join(dest, "tmp"))).toBe(false);
     expect(existsSync(join(dest, ".claude"))).toBe(false);
   });
+
+  it("skips a top-level scratch directory whatever its case", () => {
+    root = mkdtempSync(join(tmpdir(), "backup-filter-"));
+    const ws = join(root, "workspace");
+    file(join(ws, "TMP", "huge.bin"));
+    file(join(ws, "memory", "a.md"));
+    const keep = workspaceBackupFilter(ws);
+    expect(keep(join(ws, "TMP"))).toBe(false);
+    expect(keep(join(ws, "TMP", "huge.bin"))).toBe(false);
+    expect(keep(join(ws, "Tmp"))).toBe(false);
+    expect(keep(ws)).toBe(true);
+    expect(keep(join(ws, "memory", "a.md"))).toBe(true);
+  });
 });

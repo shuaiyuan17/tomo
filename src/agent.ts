@@ -36,6 +36,7 @@ import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
+import { prepareSessionRewind } from "./agent/session-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
@@ -276,6 +277,17 @@ export class Agent {
       modelOverrides: this.modelOverrides,
       closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
       isSessionLive: (key) => this.liveSessionManager.isAlive(key),
+      rewindSession: (key, count) => this.enqueueForSession(key, async () => {
+        if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
+        if (this.liveSessionManager.isBusy(key)) throw new Error("A turn is still running. Try /rewind after it finishes.");
+        const sid = this.sessions.getSdkSessionId(key);
+        if (!sid) throw new Error("No active conversation to rewind.");
+        this.liveSessionManager.closeLiveSession(key);
+        const rewind = await prepareSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir);
+        if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
+        rewind.assertUnchanged();
+        this.sessions.replaceSdkSessionId(key, sid, rewind.sessionId);
+      }),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
       getExternalMcpStatuses: (key) => this.mcpOAuthManager.getServerStatuses(
         config.mcpServers ?? {},

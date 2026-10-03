@@ -151,7 +151,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]) {
+    for (const cmd of ["new", "rewind", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]) {
       this.bot.command(cmd, (ctx) => this.ingest(String(ctx.chat.id), String(ctx.msg?.message_id ?? ""), async () => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
@@ -812,6 +812,7 @@ export class TelegramChannel implements Channel {
     // Register commands with Telegram so they show in the menu
     await this.bot.api.setMyCommands([
       { command: "new", description: "Start a new conversation" },
+      { command: "rewind", description: "Rewind context by N user messages (default 1, owner DM only)" },
       { command: "model", description: "Switch model (Claude aliases or LiteLLM provider/model)" },
       { command: "restore", description: "Restore config from backup and restart" },
       { command: "login", description: "Refresh Claude login (owner DM only)" },

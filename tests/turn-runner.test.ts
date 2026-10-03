@@ -196,6 +196,35 @@ describe("SDK error results through the turn pipeline", () => {
   });
 });
 
+describe("safeguard failures", () => {
+  it.each([false, true])("does not feed the raw refusal into the next prompt (thrown=%s)", async (thrown) => {
+    const error = "API Error: Example Model's safeguards flagged this message. Request ID: req_example";
+    const h = makeHarness(async (req) => {
+      await req.onBlock?.(error);
+      if (thrown) throw new SdkResultError(error, "success");
+      return error;
+    });
+    expect(await h.runner.runTurn(replySpec(h))).toBe(false);
+    expect(h.channel.sent).toHaveLength(1);
+    expect(h.channel.sent[0].text).toContain("req_example");
+    expect(h.channel.sent[0].text).toContain("/rewind");
+    expect(h.errorNotes).toEqual([]);
+  });
+
+  it("keeps a safeguard failure silent under a note-only policy", async () => {
+    const error = "API Error: Example Model's safeguards flagged this message.";
+    const h = makeHarness(async (req) => {
+      await req.onBlock?.(error);
+      throw new SdkResultError(error, "success");
+    });
+    const spec = replySpec(h);
+    spec.errors.thrown = "note-only";
+    expect(await h.runner.runTurn(spec)).toBe(false);
+    expect(h.channel.sent).toEqual([]);
+    expect(h.errorNotes).toEqual([]);
+  });
+});
+
 describe("originForSource", () => {
   it("stamps channel-relayed user turns as human and harness turns as unclassified", () => {
     // The SDK fails closed at its strict isHuman() gates when origin is

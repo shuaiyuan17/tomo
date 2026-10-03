@@ -40,6 +40,7 @@ export interface ChatCommandDeps {
   modelOverrides: Map<string, string>;
   closeLiveSession(key: string): void;
   isSessionLive(key: string): boolean;
+  rewindSession(key: string, count: number): Promise<void>;
   queuePendingNote(sessionKey: string, note: string): void;
   getExternalMcpStatuses(sessionKey: string): ExternalMcpServerStatus[];
   startExternalMcpLogin(serverName: string): Promise<McpLoginStart>;
@@ -47,7 +48,7 @@ export interface ChatCommandDeps {
 
 /**
  * Handles slash commands typed in chat (/new, /model, /status, /pet,
- * /cost, /restore, /login, /mcp, /pause, /resume).
+ * /cost, /restore, /login, /mcp, /pause, /resume, /rewind).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -89,6 +90,28 @@ export class ChatCommandHandler {
 
     if (command === "mcp") {
       await this.handleExternalMcpCommand(channel, chatId, senderId, args);
+      return;
+    }
+
+    if (command === "rewind") {
+      const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+      if (isGroupSessionKey(`${channel.name}:${chatId}`) || !identity) {
+        await channel.send({ chatId, text: "⚠️ /rewind is only available in a configured owner's private DM." });
+        return;
+      }
+      const arg = args?.trim() || "1";
+      if (!/^[1-9]\d*$/.test(arg) || !Number.isSafeInteger(Number(arg))) {
+        await channel.send({ chatId, text: "Usage: /rewind or /rewind <positive integer>" });
+        return;
+      }
+      try {
+        await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
+      } catch (err) {
+        log.warn({ err }, "Session rewind failed");
+        await channel.send({ chatId, text: `⚠️ Could not rewind: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+      await channel.send({ chatId, text: `↩️ Context rewound to before the last ${arg} user message(s). Send an edited request to continue. Chat history is kept; completed actions and file changes are not undone.` });
       return;
     }
 

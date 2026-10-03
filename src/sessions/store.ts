@@ -1458,6 +1458,36 @@ export class SessionStore {
     });
   }
 
+  /** Atomically publish a rewind, retaining routing metadata and the old SDK file. */
+  replaceSdkSessionId(key: string, expectedId: string, replacementId?: string): void {
+    this.mutateRegistry("replaceSdkSessionId", "link", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (!entry || entry.sdkSessionId !== expectedId) throw new Error("Session changed during rewind. Try again.");
+      const now = Date.now();
+      const replacement: SessionEntry = {
+        ...structuredClone(entry),
+        sdkSessionId: replacementId ?? "",
+        createdAt: now,
+        lastActiveAt: now,
+        stats: {
+          totalQueries: 0, totalCostUsd: 0, totalInputTokens: 0, totalOutputTokens: 0,
+          totalCacheReadTokens: 0, totalCacheCreationTokens: 0, contextUsed: 0, contextMax: 0,
+        },
+      };
+      delete replacement.usageBaseline;
+      const retired = { ...entry, unlinkedAt: now, expiresAt: now + UNLINKED_TTL_MS };
+      delete retired.usageBaseline;
+      const previous = this.registry;
+      this.registry = [...previous.map((e) => e === entry ? retired : e), replacement];
+      try {
+        this.saveRegistry();
+      } catch (err) {
+        this.registry = previous;
+        throw err;
+      }
+    });
+  }
+
   /** Update session stats after a query */
   updateStats(key: string, update: {
     costUsd: number;

@@ -74,6 +74,7 @@ tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a new conversation (resets session) |
+| `/rewind [N]` | Return to before the last N recorded user messages (default 1; configured owner's private DM only) |
 | `/model` | Switch model (Claude aliases, direct model IDs, or LiteLLM `provider/model` names) |
 | `/restore` | Restore `config.json` from `config.json.bak` and restart |
 | `/login` | Refresh Claude login from a configured owner's private DM (`/login cancel` aborts a pending login) |
@@ -84,6 +85,8 @@ tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 | `/pet` | Check Tomo's pet's mood, growth stage, and stats |
 | `/summon` | (groups) Pull your main DM session into this group temporarily |
 | `/dismiss` | (groups) Hand the group back to its own Tomo session |
+
+**Rewind** — In an owner's Telegram or iMessage DM, `/rewind` branches the conversation before the most recent recorded human message; `/rewind 3` goes back before the last three. All later context is omitted from the new branch. Send your edited request afterward. No model call or automatic retry is needed, so the command also works after an API refusal. It waits for queued turns to finish and does not undo tools, file changes, messages already sent, or persistent memory. Tomo's chat transcript stays intact; the original SDK session follows the normal 30-day unlinked-session retention. Only human messages with recorded provenance in the current context can be selected; compacted or older messages without provenance cannot. Use `/new` to start fresh when that history is unavailable. Rewinding does not guarantee that a subsequent request will be accepted.
 
 **Summon** — `/summon` in a group routes that group's messages into your main `dm:` session, so Tomo answers with your full personal context. Group-facing replies go through an explicit `send_message` direct call; plain output stays in your private DM. `/dismiss` hands back, and the summon auto-expires after `summonExpiryMinutes` (default 60) of group inactivity.
 

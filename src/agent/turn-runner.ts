@@ -8,6 +8,7 @@ import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { formatInboundStamp } from "./inbound-markers.js";
+import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -412,8 +413,8 @@ export class TurnRunner {
     }
 
     if (isAgentErrorResponse(response)) {
-      const visibleError = `${spec.errors.visiblePrefix}${response}`;
-      this.deps.queuePendingErrorNote(spec.key, visibleError);
+      const visibleError = `${spec.errors.visiblePrefix}${withRecoveryHint(response)}`;
+      if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(spec.key, visibleError);
       if (spec.errors.response === "note-only") {
         if (spec.errors.responseSuppressedLog) {
           log.warn({ sessionKey: spec.key }, spec.errors.responseSuppressedLog);
@@ -658,8 +659,8 @@ export class TurnRunner {
     }
 
     const detail = err instanceof Error ? err.message : String(err);
-    const visibleError = `${spec.errors.visiblePrefix}${detail}`;
-    this.deps.queuePendingErrorNote(spec.key, visibleError);
+    const visibleError = `${spec.errors.visiblePrefix}${withRecoveryHint(detail)}`;
+    if (!isSafeguardError(detail)) this.deps.queuePendingErrorNote(spec.key, visibleError);
 
     if (spec.errors.thrown === "note-only") {
       if (spec.errors.thrownSuppressedLog) {

@@ -10,6 +10,7 @@ import {
 } from "../channels/types.js";
 import { deliverText } from "../channels/delivery.js";
 import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
+import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
 import { isPrivateAttachmentPath } from "./permissions.js";
 import {
   endsWithTrailingNoReply,
@@ -181,6 +182,7 @@ export interface BlockSender {
 export function isAgentErrorResponse(response: string): boolean {
   const text = response.trim();
   return /^API Error: \d+/i.test(text)
+    || isSafeguardError(text)
     || /^Failed to authenticate\.\s+API Error: \d+/i.test(text)
     || /^\{"type":"error"/.test(text)
     || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
@@ -226,8 +228,8 @@ export class DeliveryPipeline {
     options: DeliverOptions = {},
   ): Promise<void> {
     if (isAgentErrorResponse(response)) {
-      const visibleError = `[error] ${response}`;
-      this.deps.queuePendingErrorNote(sessionKey, visibleError);
+      const visibleError = `[error] ${withRecoveryHint(response)}`;
+      if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(sessionKey, visibleError);
       await replyChannel.send({ chatId: replyChatId, text: visibleError });
       return;
     }

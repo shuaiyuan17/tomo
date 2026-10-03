@@ -291,6 +291,36 @@ afterEach(() => {
 
 // ---------------------------------------------------------------------------
 
+describe("CLI API error delivery", () => {
+  it.each([
+    "API Error: means the remote service could not complete a request.",
+    "API Error: as requested, this reply starts with that phrase.",
+    "API Error: here is how to interpret the message.\nIt may say safeguards flagged this message.",
+  ])("delivers ordinary prose starting with API Error verbatim: %s", async (reply) => {
+    const r = rig();
+    expect(await r.run([assistant([textBlock(reply)]), result()])).toBe(true);
+    expect(r.channel.sent.map((message) => message.text)).toEqual([reply]);
+    expect(r.transcript).toEqual([reply]);
+  });
+
+  it.each([false, true])("delivers a safeguard error once, preserving earlier output (%s)", async (withEarlierOutput) => {
+    const r = rig();
+    const error = "API Error: Example Model's safeguards flagged this message.\nDetails: [example_category]\nRequest ID: req_example";
+    const ok = await r.run([
+      ...(withEarlierOutput ? [assistant([textBlock("Earlier output")])] : []),
+      assistant([textBlock(error)]),
+      { ...result(), is_error: true, result: error },
+    ]);
+    expect(ok).toBe(false);
+    const errors = r.channel.sent.filter((m) => m.text?.includes("API Error:"));
+    expect(errors).toHaveLength(1);
+    expect(errors[0].text).toContain("req_example");
+    expect(errors[0].text).toContain("/rewind");
+    expect(r.transcript.filter((text) => text.includes("API Error:"))).toHaveLength(1);
+    if (withEarlierOutput) expect(r.channel.sent[0].text).toBe("Earlier output");
+  });
+});
+
 describe("a completed text block reaches the channel while the turn is still running", () => {
   /**
    * THE regression test for #292. The owner's complaint, stated as something

@@ -197,6 +197,18 @@ describe("SDK error results through the turn pipeline", () => {
 });
 
 describe("safeguard failures", () => {
+  it("does not queue ordinary API Error prose as a pending error note", async () => {
+    const reply = "API Error: is a label for a failed API request.";
+    const h = makeHarness(async (req) => {
+      await req.onBlock?.(reply);
+      return reply;
+    });
+    expect(await h.runner.runTurn(replySpec(h))).toBe(true);
+    expect(h.channel.sent).toHaveLength(1);
+    expect(h.channel.sent[0].text).toBe(reply);
+    expect(h.errorNotes).toEqual([]);
+  });
+
   it.each([false, true])("does not feed the raw refusal into the next prompt (thrown=%s)", async (thrown) => {
     const error = "API Error: Example Model's safeguards flagged this message. Request ID: req_example";
     const h = makeHarness(async (req) => {

@@ -1,6 +1,8 @@
-import { readFileSync } from "node:fs";
-import { forkSession, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
+import { statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { deleteSession, forkSession, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { getSdkSessionPath } from "../sessions/index.js";
+import { log } from "../logger.js";
 
 interface Entry {
   type?: string;
@@ -20,11 +22,22 @@ export async function prepareSessionRewind(
   count: number,
   workspaceDir: string,
   sdkSessionsDir: string,
-): Promise<{ sessionId?: string; assertUnchanged(): void }> {
+): Promise<{ sessionId?: string; assertUnchanged(): void; discard(): Promise<void> }> {
   if (!Number.isSafeInteger(count) || count < 1) throw new Error("Use /rewind or /rewind <positive integer>.");
   if (!/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(sessionId)) throw new Error("Invalid SDK session ID.");
   const path = getSdkSessionPath(sessionId, sdkSessionsDir);
-  const snapshot = readFileSync(path, "utf8");
+  const fileVersion = () => {
+    const { dev, ino, size, mtimeNs, ctimeNs } = statSync(path, { bigint: true });
+    return [dev, ino, size, mtimeNs, ctimeNs].join(":");
+  };
+  const version = fileVersion();
+  // The final publish guard must not yield between validation and the link
+  // swap. Keep only the small metadata check synchronous, not whole-file I/O.
+  const assertUnchanged = () => {
+    if (fileVersion() !== version) throw new Error("Session history changed during rewind. Try again.");
+  };
+  const snapshot = await readFile(path, "utf8");
+  assertUnchanged();
   // Refuse incomplete/corrupt snapshots instead of silently dropping history.
   if (!snapshot.endsWith("\n")) throw new Error("Session history is still being written. Try /rewind again shortly.");
   const entries = snapshot.split("\n").filter((line) => line.trim()).map((line): Entry => {
@@ -79,15 +92,33 @@ export async function prepareSessionRewind(
     }
   }
   if (pendingTools.size) throw new Error("That message arrived during a tool call. Increase the /rewind count to include the preceding user message.");
-  const assertUnchanged = () => {
-    if (readFileSync(path, "utf8") !== snapshot) throw new Error("Session history changed during rewind. Try again.");
+  const assertSnapshotUnchanged = async () => {
+    if (await readFile(path, "utf8") !== snapshot) throw new Error("Session history changed during rewind. Try again.");
+    assertUnchanged();
   };
-  assertUnchanged();
+  await assertSnapshotUnchanged();
   const fork = parent ? await forkSession(sessionId, {
     dir: workspaceDir,
     upToMessageId: parent,
     title: "Rewound conversation",
   }) : undefined;
-  assertUnchanged();
-  return { sessionId: fork?.sessionId, assertUnchanged };
+  let discarded = false;
+  const discard = async () => {
+    if (!fork || discarded) return;
+    try {
+      await deleteSession(fork.sessionId, { dir: workspaceDir });
+      discarded = true;
+    } catch (err) {
+      // Preserve the original rewind failure while making cleanup failures
+      // visible. The source session must never be deleted here.
+      log.warn({ err, sessionId: fork.sessionId }, "Could not remove unpublished rewind fork");
+    }
+  };
+  try {
+    await assertSnapshotUnchanged();
+  } catch (err) {
+    await discard();
+    throw err;
+  }
+  return { sessionId: fork?.sessionId, assertUnchanged, discard };
 }

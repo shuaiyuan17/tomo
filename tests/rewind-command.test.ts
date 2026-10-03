@@ -4,12 +4,14 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 const prepare = vi.hoisted(() => vi.fn());
+const discard = vi.hoisted(() => vi.fn());
 vi.mock("../src/agent/session-rewind.js", () => ({ prepareSessionRewind: prepare }));
 import { Agent, MockChannel, SessionStore, installAgentTestHooks, resetConfig, mockSdk, drainQueue, makeMsg } from "./helpers/agent-harness.js";
 
 installAgentTestHooks();
 beforeEach(() => {
-  prepare.mockReset().mockResolvedValue({ sessionId: "fork-example", assertUnchanged: () => {} });
+  discard.mockReset().mockResolvedValue(undefined);
+  prepare.mockReset().mockResolvedValue({ sessionId: "fork-example", assertUnchanged: () => {}, discard });
   resetConfig({ identities: [{ name: "example", channels: { telegram: "owner-example" }, replyPolicy: "last-active" }] });
 });
 function setup() {
@@ -31,6 +33,7 @@ describe("/rewind", () => {
       expect(prepare.mock.calls[0].slice(0, 2)).toEqual(["source-example", 2]);
       expect(mockSdk.promptsBySession).toHaveLength(0);
       expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
+      expect(discard).not.toHaveBeenCalled();
       expect(channel.sent[0].text).toContain("completed actions and file changes are not undone");
       await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Edited request" }));
       await drainQueue(agent);
@@ -73,12 +76,36 @@ describe("/rewind", () => {
       expect(channel.sent.at(-1)?.text).toContain("Could not rewind");
       prepare.mockImplementationOnce(async () => {
         store.setSdkSessionId("dm:example", "concurrent-example");
-        return { sessionId: "fork-example", assertUnchanged: () => {} };
+        return { sessionId: "fork-example", assertUnchanged: () => {}, discard };
       });
       await command(channel);
       expect(store.getSdkSessionId("dm:example")).toBe("concurrent-example");
       expect(channel.sent.at(-1)?.text).toContain("Session changed");
+      expect(discard).toHaveBeenCalledOnce();
     } finally { await agent.stop(); }
+  });
+
+  it.each(["snapshot", "registry", "shutdown"])("discards the unpublished fork after a %s failure", async (failure) => {
+    const { agent, channel, store } = setup();
+    try {
+      prepare.mockImplementationOnce(async () => {
+        if (failure === "shutdown") (agent as unknown as { stopping: boolean }).stopping = true;
+        return {
+          sessionId: "fork-example", discard,
+          assertUnchanged: () => { if (failure === "snapshot") throw new Error("History changed"); },
+        };
+      });
+      const publish = vi.spyOn(store, "replaceSdkSessionId");
+      if (failure === "registry") publish.mockImplementationOnce(() => { throw new Error("Registry unavailable"); });
+      await command(channel);
+      expect(discard).toHaveBeenCalledOnce();
+      expect(store.getSdkSessionId("dm:example")).toBe("source-example");
+      expect(channel.sent.at(-1)?.text).toContain("Could not rewind");
+      if (failure !== "registry") expect(publish).not.toHaveBeenCalled();
+    } finally {
+      (agent as unknown as { stopping: boolean }).stopping = false;
+      await agent.stop();
+    }
   });
 
   it("waits behind an active turn before closing and forking the session", async () => {

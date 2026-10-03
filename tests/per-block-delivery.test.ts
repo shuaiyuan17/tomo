@@ -292,6 +292,17 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("CLI API error delivery", () => {
+  it.each([
+    "API Error: means the remote service could not complete a request.",
+    "API Error: as requested, this reply starts with that phrase.",
+    "API Error: here is how to interpret the message.\nIt may say safeguards flagged this message.",
+  ])("delivers ordinary prose starting with API Error verbatim: %s", async (reply) => {
+    const r = rig();
+    expect(await r.run([assistant([textBlock(reply)]), result()])).toBe(true);
+    expect(r.channel.sent.map((message) => message.text)).toEqual([reply]);
+    expect(r.transcript).toEqual([reply]);
+  });
+
   it.each([false, true])("delivers a safeguard error once, preserving earlier output (%s)", async (withEarlierOutput) => {
     const r = rig();
     const error = "API Error: Example Model's safeguards flagged this message.\nDetails: [example_category]\nRequest ID: req_example";

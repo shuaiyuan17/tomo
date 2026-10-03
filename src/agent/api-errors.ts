@@ -1,6 +1,6 @@
 /** CLI error frames do not always include an HTTP status code. */
 export function isSafeguardError(text: string): boolean {
-  return /^API Error:/i.test(text.trim()) && /safeguards flagged this message/i.test(text);
+  return /^API Error: [^\r\n]+['’]s safeguards flagged this message\b/i.test(text.trim());
 }
 
 export function withRecoveryHint(text: string): string {

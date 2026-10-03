@@ -1,13 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
+import * as sdk from "@anthropic-ai/claude-agent-sdk";
 import { prepareSessionRewind } from "../src/agent/session-rewind.js";
 import { SessionStore } from "../src/sessions/store.js";
 import * as fsUtils from "../src/fs-utils.js";
 
+// Keep the native implementations while allowing failure injection around a fork.
+vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>(),
+}));
 vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 let root: string;
@@ -46,6 +51,46 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 
 describe("conversation rewind with the installed SDK (no model requests)", () => {
+  it("discards only an unpublished fork and tolerates repeated cleanup", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const original = readFileSync(path, "utf8");
+    const prepared = await rewind();
+    const forkPath = join(sdkDir, `${prepared.sessionId}.jsonl`);
+    expect(existsSync(forkPath)).toBe(true);
+    await prepared.discard();
+    await prepared.discard();
+    expect(existsSync(forkPath)).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe(original);
+  });
+
+  it("removes the fork when source validation fails after the SDK created it", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const fork = sdk.forkSession;
+    let forkId: string | undefined;
+    vi.spyOn(sdk, "forkSession").mockImplementationOnce(async (...args) => {
+      const result = await fork(...args);
+      forkId = result.sessionId;
+      appendFileSync(path, JSON.stringify({ type: "custom-title", customTitle: "Changed" }) + "\n");
+      return result;
+    });
+    await expect(rewind()).rejects.toThrow("changed during rewind");
+    expect(forkId).toBeTruthy();
+    expect(existsSync(join(sdkDir, `${forkId}.jsonl`))).toBe(false);
+    expect(readFileSync(path, "utf8")).toContain("Changed");
+  });
+
+  it("rejects changes during the asynchronous initial read before creating a fork", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const fork = vi.spyOn(sdk, "forkSession");
+    const pending = rewind();
+    appendFileSync(path, JSON.stringify({ type: "custom-title", customTitle: "Changed" }) + "\n");
+    await expect(pending).rejects.toThrow("changed during rewind");
+    expect(fork).not.toHaveBeenCalled();
+  });
+
   it("forks before the selected human message and preserves the source byte for byte", async () => {
     human("Initial request"); assistant("Initial answer");
     human("Request to edit"); assistant("API Error: Example Model's safeguards flagged this message");

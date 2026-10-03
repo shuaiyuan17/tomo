@@ -181,8 +181,9 @@ export interface BlockSender {
 
 export function isAgentErrorResponse(response: string): boolean {
   const text = response.trim();
-  return /^API Error:/i.test(text)
-    || /^Failed to authenticate\.\s+API Error:/i.test(text)
+  return /^API Error: \d+/i.test(text)
+    || isSafeguardError(text)
+    || /^Failed to authenticate\.\s+API Error: \d+/i.test(text)
     || /^\{"type":"error"/.test(text)
     || /^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(text);
 }

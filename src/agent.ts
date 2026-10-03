@@ -284,9 +284,14 @@ export class Agent {
         if (!sid) throw new Error("No active conversation to rewind.");
         this.liveSessionManager.closeLiveSession(key);
         const rewind = await prepareSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir);
-        if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-        rewind.assertUnchanged();
-        this.sessions.replaceSdkSessionId(key, sid, rewind.sessionId);
+        try {
+          if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
+          rewind.assertUnchanged();
+          this.sessions.replaceSdkSessionId(key, sid, rewind.sessionId);
+        } catch (err) {
+          await rewind.discard();
+          throw err;
+        }
       }),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
       getExternalMcpStatuses: (key) => this.mcpOAuthManager.getServerStatuses(

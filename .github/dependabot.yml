@@ -13,12 +13,12 @@ updates:
       # Remove this once typescript-eslint supports TS 7, then upgrade deliberately.
       - dependency-name: "typescript"
         versions: ["7.x"]
+      # zod 4.5 changed the .default() marker the Agent SDK's bundled zod reads (#359).
+      - dependency-name: "zod"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       dev-dependencies:
         dependency-type: development
-    ignore:
-      - dependency-name: "zod"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

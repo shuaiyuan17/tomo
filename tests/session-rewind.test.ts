@@ -133,14 +133,69 @@ describe("conversation rewind with the installed SDK (no model requests)", () =>
     await expect(rewind(2)).rejects.toThrow("Only 1 recorded human");
   });
 
-  it("refuses to split a tool call from its result at a steered message", async () => {
+  it("moves the cut back past a steered message that split a tool call from its later result", async () => {
     human("Start work");
     add("assistant", [{ type: "tool_use", id: "tool-example", name: "Read", input: {} }]);
     human("Steered request");
     add("user", [{ type: "tool_result", tool_use_id: "tool-example", content: "Done" }]);
     assistant("Finished"); save();
-    await expect(rewind()).rejects.toThrow("during a tool call");
-    expect((await rewind(2)).sessionId).toBeUndefined();
+    const first = await rewind();
+    expect(first).toMatchObject({ sessionId: undefined, count: 2, preview: "Start work" });
+    expect(await rewind(2)).toMatchObject({ sessionId: undefined, count: 2 });
+  });
+
+  it("lands at the end of the previous complete turn, keeping that turn's tool result", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Start work");
+    add("assistant", [{ type: "tool_use", id: "tool-done", name: "Read", input: {} }]);
+    add("user", [{ type: "tool_result", tool_use_id: "tool-done", content: "Done" }]);
+    add("assistant", [{ type: "tool_use", id: "tool-split", name: "Read", input: {} }]);
+    human("Steered request");
+    add("user", [{ type: "tool_result", tool_use_id: "tool-split", content: "Done" }]);
+    assistant("Finished"); human("Next request"); assistant("Unavailable"); save();
+    expect(await rewind()).toMatchObject({ count: 1, preview: "Next request" });
+    const moved = await rewind(2);
+    expect(moved).toMatchObject({ count: 3, preview: "Start work" });
+    const fork = JSON.stringify(await getSessionMessages(moved.sessionId!, { dir: workspace }));
+    expect(fork).toContain("Initial answer");
+    expect(fork).not.toContain("Start work");
+    expect(fork).not.toContain("tool-split");
+  });
+
+  it("refuses when even the earliest human message split a tool call from its result", async () => {
+    add("user", "Background maintenance", { origin: { kind: "unclassified" } });
+    add("assistant", [{ type: "tool_use", id: "tool-example", name: "Read", input: {} }]);
+    human("Steered request");
+    add("user", [{ type: "tool_result", tool_use_id: "tool-example", content: "Done" }]);
+    assistant("Finished"); save();
+    const fork = vi.spyOn(sdk, "forkSession");
+    await expect(rewind()).rejects.toThrow("no completed turn to return to");
+    expect(fork).not.toHaveBeenCalled();
+  });
+
+  it("ignores historical tool calls whose result never arrived", async () => {
+    human("Earlier request");
+    add("assistant", [{ type: "tool_use", id: "tool-orphan", name: "Read", input: {} }]);
+    human("Request after an interrupted turn"); assistant("Answer");
+    add("assistant", [{ type: "tool_use", id: "tool-blocked", name: "Bash", input: {} }]);
+    human("Request to edit"); assistant("Unavailable"); save();
+    const result = await rewind();
+    expect(result).toMatchObject({ count: 1, preview: "Request to edit" });
+    const fork = JSON.stringify(await getSessionMessages(result.sessionId!, { dir: workspace }));
+    expect(fork).toContain("tool-orphan");
+    expect(fork).toContain("tool-blocked");
+    expect(fork).not.toContain("Request to edit");
+    expect(await rewind(2)).toMatchObject({ count: 2, preview: "Request after an interrupted turn" });
+  });
+
+  it("quotes the opening words of the rewound message, trimmed", async () => {
+    human("Initial request"); assistant("Answer");
+    add("user", [{ type: "text", text: `[imessage · Mon 10/05 16:54 PDT]   ${"word ".repeat(40)}` }], { origin: { kind: "human" } });
+    assistant("Unavailable"); save();
+    const { preview } = await rewind();
+    expect(preview.startsWith("[imessage · Mon 10/05 16:54 PDT] word word")).toBe(true);
+    expect(preview.endsWith("…")).toBe(true);
+    expect([...preview].length).toBeLessThanOrEqual(81);
   });
 
   it("rewinding the first human message prepares a fresh context without deleting the source", async () => {

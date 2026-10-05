@@ -40,7 +40,8 @@ export interface ChatCommandDeps {
   modelOverrides: Map<string, string>;
   closeLiveSession(key: string): void;
   isSessionLive(key: string): boolean;
-  rewindSession(key: string, count: number): Promise<void>;
+  /** Resolves to the number of human messages actually rewound and the earliest one's opening words. */
+  rewindSession(key: string, count: number): Promise<{ count: number; preview: string }>;
   queuePendingNote(sessionKey: string, note: string): void;
   getExternalMcpStatuses(sessionKey: string): ExternalMcpServerStatus[];
   startExternalMcpLogin(serverName: string): Promise<McpLoginStart>;
@@ -104,14 +105,19 @@ export class ChatCommandHandler {
         await channel.send({ chatId, text: "Usage: /rewind or /rewind <positive integer>" });
         return;
       }
+      let rewound: { count: number; preview: string };
       try {
-        await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
+        rewound = await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
       } catch (err) {
         log.warn({ err }, "Session rewind failed");
         await channel.send({ chatId, text: `⚠️ Could not rewind: ${err instanceof Error ? err.message : String(err)}` });
         return;
       }
-      await channel.send({ chatId, text: `↩️ Context rewound to before the last ${arg} user message(s). Send an edited request to continue. Chat history is kept; completed actions and file changes are not undone.` });
+      const target = rewound.preview ? ` ("${rewound.preview}")` : "";
+      const moved = rewound.count > Number(arg)
+        ? ` That is further back than the ${arg} you asked for: the later message arrived during a tool call, so it went back to the end of the previous complete turn.`
+        : "";
+      await channel.send({ chatId, text: `↩️ Context rewound to before the last ${rewound.count} user message(s)${target}.${moved} Send an edited request to continue. Chat history is kept; completed actions and file changes are not undone.` });
       return;
     }
 

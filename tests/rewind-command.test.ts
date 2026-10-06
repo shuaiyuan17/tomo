@@ -11,7 +11,8 @@ import { Agent, MockChannel, SessionStore, installAgentTestHooks, resetConfig, m
 installAgentTestHooks();
 beforeEach(() => {
   discard.mockReset().mockResolvedValue(undefined);
-  prepare.mockReset().mockResolvedValue({ sessionId: "fork-example", assertUnchanged: () => {}, discard });
+  prepare.mockReset().mockImplementation(async (_sid: string, count: number) =>
+    ({ sessionId: "fork-example", count, preview: "Request to edit", assertUnchanged: () => {}, discard }));
   resetConfig({ identities: [{ name: "example", channels: { telegram: "owner-example" }, replyPolicy: "last-active" }] });
 });
 function setup() {
@@ -35,9 +36,21 @@ describe("/rewind", () => {
       expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
       expect(discard).not.toHaveBeenCalled();
       expect(channel.sent[0].text).toContain("completed actions and file changes are not undone");
+      expect(channel.sent[0].text).toContain('before the last 2 user message(s) ("Request to edit").');
+      expect(channel.sent[0].text).not.toContain("further back");
       await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Edited request" }));
       await drainQueue(agent);
       expect(mockSdk.optionsBySession.at(-1)?.options.resume).toBe("fork-example");
+    } finally { await agent.stop(); }
+  });
+
+  it("says so when the rewind went further back than asked", async () => {
+    const { agent, channel, store } = setup();
+    try {
+      prepare.mockResolvedValueOnce({ sessionId: "fork-example", count: 3, preview: "Start work", assertUnchanged: () => {}, discard });
+      await command(channel);
+      expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
+      expect(channel.sent.at(-1)?.text).toContain('before the last 3 user message(s) ("Start work"). That is further back than the 1 you asked for');
     } finally { await agent.stop(); }
   });
 

@@ -292,6 +292,7 @@ export class Agent {
           await rewind.discard();
           throw err;
         }
+        return { count: rewind.count, preview: rewind.preview };
       }),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
       getExternalMcpStatuses: (key) => this.mcpOAuthManager.getServerStatuses(

@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- `/rewind`: tool calls from interrupted or blocked turns (a result that never arrived) no longer block every rewind with "That message arrived during a tool call". Only a cut that would split a tool call from a result that does appear later counts as mid-turn, and instead of refusing, the rewind moves back to the end of the previous complete turn. The reply quotes the message it rewound to and says when that is further back than N.
+
 ## 0.10.0 (2026-10-05)
 
 ### Features

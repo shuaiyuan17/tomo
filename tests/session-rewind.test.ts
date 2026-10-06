@@ -208,6 +208,33 @@ describe("conversation rewind with the installed SDK (no model requests)", () =>
     expect(new Set(readdirSync(sdkDir))).toEqual(before);
   });
 
+  it("jumps straight past an early split tool call instead of forking once per message", async () => {
+    const start = human("Start work");
+    const offChain = add("assistant", [{ type: "tool_use", id: "tool-team", name: "Read", input: {} }], { teamName: "example-team" });
+    add("assistant", [{ type: "text", text: "Working" }], { parentUuid: start });
+    for (let i = 0; i < 12; i++) { human(`Message ${i}`); assistant(`Answer ${i}`); }
+    const last = entries.at(-1)!.uuid as string;
+    add("user", [{ type: "tool_result", tool_use_id: "tool-team", content: "Done" }], { parentUuid: offChain, teamName: "example-team" });
+    human("Request to edit"); entries.at(-1)!.parentUuid = last;
+    assistant("Unavailable"); save();
+    const fork = vi.spyOn(sdk, "forkSession");
+    expect(await rewind()).toMatchObject({ sessionId: undefined, count: 14, preview: "Start work" });
+    expect(fork.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it("stops instead of stepping back when a rejected fork cannot be removed", async () => {
+    const start = human("Start work");
+    const offChain = add("assistant", [{ type: "tool_use", id: "tool-team", name: "Read", input: {} }], { teamName: "example-team" });
+    add("assistant", [{ type: "text", text: "Working" }], { parentUuid: start });
+    human("Steered request");
+    add("user", [{ type: "tool_result", tool_use_id: "tool-team", content: "Done" }], { parentUuid: offChain, teamName: "example-team" });
+    assistant("Finished"); entries.at(-1)!.parentUuid = entries.at(-3)!.uuid; save();
+    const fork = vi.spyOn(sdk, "forkSession");
+    vi.spyOn(sdk, "deleteSession").mockRejectedValueOnce(new Error("Disk busy"));
+    await expect(rewind()).rejects.toThrow("Could not remove a rejected rewind branch");
+    expect(fork).toHaveBeenCalledOnce();
+  });
+
   it("ignores historical tool calls whose result never arrived", async () => {
     human("Earlier request");
     add("assistant", [{ type: "tool_use", id: "tool-orphan", name: "Read", input: {} }]);

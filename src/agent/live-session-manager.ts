@@ -186,6 +186,13 @@ export class LiveSessionManager {
    * end with TurnInterruptedError at its next step instead of running later.
    */
   private dispatches = new Map<string, Set<{ interrupted: boolean }>>();
+  /**
+   * Per-key generation, bumped by suspendForRewind. A session build captures
+   * it (and the SDK id it resumes) at start and refuses to publish if either
+   * changed — so a build that outlived a rewind's wait budget cannot publish a
+   * session resuming the pre-rewind conversation after the rewind finished.
+   */
+  private generations = new Map<string, number>();
   /** Release for each hold in `sessionHolds` — stop() releases them all. */
   private holdReleases = new Map<string, () => void>();
 
@@ -238,7 +245,12 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.lastResult ?? null;
   }
 
-  async getOrCreateLiveSession(key: string): Promise<LiveSession> {
+  /**
+   * `abandon`: asked when a build was discarded (rewind/stale id); true makes
+   * this return the dead session instead of building again — for a turn that
+   * was itself stopped by the rewind.
+   */
+  async getOrCreateLiveSession(key: string, abandon?: () => boolean): Promise<LiveSession> {
     for (;;) {
       // A rewind holds this key: wait, then use the rewound conversation.
       for (let hold = this.sessionHolds.get(key); hold; hold = this.sessionHolds.get(key)) await hold;
@@ -253,8 +265,10 @@ export class LiveSessionManager {
 
       const created = await (this.liveSessionCreates.get(key) ?? this.startCreate(key));
       // Built for the pre-rewind conversation and discarded by createLiveSession
-      // because a rewind began meanwhile: build again once it is done.
-      if (!created.isAlive() && !this.stopping && this.sessionHolds.has(key)) continue;
+      // (a rewind began or finished meanwhile): build again on the current
+      // conversation — after the rewind, if it is still holding the key.
+      // createLiveSession returns a dead session only when it discarded it.
+      if (!created.isAlive() && !this.stopping && !abandon?.()) continue;
       return created;
     }
   }
@@ -302,6 +316,7 @@ export class LiveSessionManager {
       // Every turn already dispatched for this key is stopped, whether or not
       // its session exists or has claimed it yet. Turns dispatched from here
       // on are untouched: they wait for the hold and run afterwards.
+      this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
       const deadline = Date.now() + timeoutMs;
       const dispatched = [...(this.dispatches.get(key) ?? [])];
       for (const token of dispatched) token.interrupted = true;
@@ -392,6 +407,7 @@ export class LiveSessionManager {
     let session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
 
+    const generation = this.generations.get(key) ?? 0;
     const resumeId = this.deps.getSdkSessionId(key);
     if (resumeId) {
       const repair = repairSdkSessionForResume(
@@ -449,6 +465,15 @@ export class LiveSessionManager {
     if (this.sessionHolds.has(key)) {
       session.close();
       log.info({ key }, "Discarding a live session that finished building after a rewind began");
+      return session;
+    }
+    // ...or that began AND finished while this build was parked (it outlived
+    // the rewind's wait budget), or anything else relinked the key (/new, a
+    // timeout retirement): this session resumes a conversation the key no
+    // longer points at.
+    if ((this.generations.get(key) ?? 0) !== generation || (this.deps.getSdkSessionId(key) ?? null) !== (resumeId ?? null)) {
+      session.close();
+      log.info({ key }, "Discarding a live session built for a conversation the key no longer points at");
       return session;
     }
     this.liveSessions.set(key, session);
@@ -667,7 +692,7 @@ export class LiveSessionManager {
 
     let session: LiveSession | undefined;
     try {
-      session = await this.getOrCreateLiveSession(key);
+      session = await this.getOrCreateLiveSession(key, () => token.interrupted);
       // Stopped by /rewind while it was still getting its session.
       if (token.interrupted) throw new TurnInterruptedError();
       // The session was built while we were parked in buildExternalMcpServers

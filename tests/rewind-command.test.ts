@@ -219,6 +219,43 @@ describe("/rewind", () => {
     } finally { finishBuild(); manager.deps.buildExternalMcpServers = build; await agent.stop(); }
   });
 
+  it("a session build that outlives the rewind's wait budget is discarded; the next request resumes the fork", async () => {
+    const { agent, channel, store } = setup();
+    const manager = (agent as unknown as { liveSessionManager: {
+      deps: { buildExternalMcpServers: (key: string) => Promise<Record<string, unknown>> };
+      liveSessionCreates: Map<string, unknown>;
+      liveSessions: Map<string, { isAlive(): boolean }>;
+      suspendForRewind(key: string, timeoutMs?: number): Promise<unknown>;
+    } }).liveSessionManager;
+    const suspend = manager.suspendForRewind.bind(manager);
+    manager.suspendForRewind = (key) => suspend(key, 30); // a budget the build outlives
+    let finishBuild!: () => void;
+    const slowSetup = new Promise<void>((resolve) => { finishBuild = resolve; });
+    const build = manager.deps.buildExternalMcpServers;
+    let stalled = true;
+    manager.deps.buildExternalMcpServers = async (key) => { if (stalled) { stalled = false; await slowSetup; } return build(key); };
+    try {
+      await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Work" }));
+      await vi.waitFor(() => expect(manager.liveSessionCreates.size).toBe(1));
+      await command(channel);
+      expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
+      expect(channel.sent.at(-1)?.text).toContain("Context rewound");
+
+      finishBuild();
+      await drainQueue(agent);
+      await vi.waitFor(() => expect(manager.liveSessionCreates.size).toBe(0));
+      // The late build (resuming the pre-rewind id) was not published.
+      expect(manager.liveSessions.get("dm:example")?.isAlive() ?? false).toBe(false);
+      expect(mockSdk.promptsBySession).toHaveLength(0);
+
+      await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Next" }));
+      await drainQueue(agent);
+      expect(mockSdk.promptsBySession.map((p) => p.text).join(" ")).toContain("Next");
+      expect(mockSdk.promptsBySession.some((p) => p.text.includes("Work"))).toBe(false);
+      expect(mockSdk.optionsBySession.at(-1)?.options.resume).toBe("fork-example");
+    } finally { finishBuild(); manager.deps.buildExternalMcpServers = build; await agent.stop(); }
+  });
+
   it("shutdown during a stalled prepare waits for it, discards the fork, publishes nothing, and releases the hold", async () => {
     const { agent, channel, store } = setup();
     let unstall!: () => void;

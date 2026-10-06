@@ -178,6 +178,14 @@ export class LiveSessionManager {
    * here and then run on the rewound conversation.
    */
   private sessionHolds = new Map<string, Promise<void>>();
+  /**
+   * Turns inside dispatchTurn, per key. A turn is "running" from the moment it
+   * is dispatched — still building its session (slow external-MCP setup), or
+   * built but not yet claimed — not only once LiveSession.isBusy() says so.
+   * suspendForRewind marks every one present as interrupted, which makes it
+   * end with TurnInterruptedError at its next step instead of running later.
+   */
+  private dispatches = new Map<string, Set<{ interrupted: boolean }>>();
   /** Release for each hold in `sessionHolds` — stop() releases them all. */
   private holdReleases = new Map<string, () => void>();
 
@@ -291,24 +299,37 @@ export class LiveSessionManager {
     };
     this.holdReleases.set(key, release);
     try {
-      // A session still being built is not waited for: createLiveSession
-      // re-checks the hold before publishing and discards it.
+      // Every turn already dispatched for this key is stopped, whether or not
+      // its session exists or has claimed it yet. Turns dispatched from here
+      // on are untouched: they wait for the hold and run afterwards.
+      const deadline = Date.now() + timeoutMs;
+      const dispatched = [...(this.dispatches.get(key) ?? [])];
+      for (const token of dispatched) token.interrupted = true;
+      // A session still being built finishes first (bounded): createLiveSession
+      // re-checks the hold before publishing and closes it, so its CLI child
+      // has started exiting before the caller waits for the transcript to go
+      // quiet — rather than spawning in the middle of the snapshot.
+      const creating = this.liveSessionCreates.get(key);
+      if (creating && !await withTimeout(creating, timeoutMs)) {
+        log.warn({ key, timeoutMs }, "Rewind: a session still being built did not finish in time; continuing");
+      }
       const session = this.liveSessions.get(key);
-      let stoppedTurn = false;
+      let stoppedTurn = dispatched.length > 0;
       let droppedMessages = 0;
       if (session) {
-        stoppedTurn = session.isAlive() && session.isBusy();
-        droppedMessages = stoppedTurn ? session.steeredRequestCount() : 0;
+        const busy = session.isAlive() && session.isBusy();
+        stoppedTurn ||= busy;
+        droppedMessages = busy ? session.steeredRequestCount() : 0;
         this.promptStale.delete(session);
         this.liveSessions.delete(key);
         this.externalMcpServersBySession.delete(key);
         this.mcpServerConfigsBySession.delete(key);
         session.interrupt(new TurnInterruptedError());
-        if (!await withTimeout(session.whenEventLoopDone(), timeoutMs)) {
+        if (!await withTimeout(session.whenEventLoopDone(), Math.max(0, deadline - Date.now()))) {
           log.warn({ key, timeoutMs }, "Rewind: the stopped session's event loop did not end in time; continuing");
         }
-        if (stoppedTurn) log.info({ key, droppedMessages }, "Rewind stopped the running turn");
       }
+      if (stoppedTurn) log.info({ key, droppedMessages }, "Rewind stopped the running turn");
       return { stoppedTurn, droppedMessages, release };
     } catch (err) {
       release();
@@ -629,11 +650,26 @@ export class LiveSessionManager {
   }
 
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
+    const token = { interrupted: false };
+    let tokens = this.dispatches.get(req.key);
+    if (!tokens) this.dispatches.set(req.key, tokens = new Set());
+    tokens.add(token);
+    try {
+      return await this.dispatchTurnOnce(req, token);
+    } finally {
+      tokens.delete(token);
+      if (tokens.size === 0 && this.dispatches.get(req.key) === tokens) this.dispatches.delete(req.key);
+    }
+  }
+
+  private async dispatchTurnOnce(req: RunWithRetryRequest, token: { interrupted: boolean }): Promise<string> {
     const { key, prompt, images, documents, steer = false, steerAudience, onBlock, onBlockAbandoned, hasShipped, origin, silentDelivery } = req;
 
     let session: LiveSession | undefined;
     try {
       session = await this.getOrCreateLiveSession(key);
+      // Stopped by /rewind while it was still getting its session.
+      if (token.interrupted) throw new TurnInterruptedError();
       // The session was built while we were parked in buildExternalMcpServers
       // and shutdown began in the meantime, so createLiveSession closed it
       // rather than publishing it (see there). Refuse rather than call send()
@@ -651,10 +687,13 @@ export class LiveSessionManager {
       // runTurnOnSession already recorded it; let it through to TurnRunner's
       // error policy untouched. Never retried — the conversation is intact,
       // and a re-run would re-send any blocks that already shipped.
-      if (err instanceof SdkResultError) throw err;
       // Stopped on purpose by /rewind. Never retried: the turn may already
       // have run tools, and re-running it from the top would repeat them.
+      // Whatever it failed with (a "Session is closed" from a send that had
+      // not yet claimed the session included), it ends as interrupted.
       if (err instanceof TurnInterruptedError) throw err;
+      if (token.interrupted) throw new TurnInterruptedError();
+      if (err instanceof SdkResultError) throw err;
 
       const errMsg = err instanceof Error ? err.message : "";
 

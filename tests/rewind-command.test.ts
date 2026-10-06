@@ -188,6 +188,37 @@ describe("/rewind", () => {
     } finally { release(); await agent.stop(); }
   });
 
+  it("stops a first turn that is still building its session (not yet busy), so it never runs", async () => {
+    const { agent, channel, store } = setup();
+    store.clearSdkSessionId("dm:example");
+    const manager = (agent as unknown as { liveSessionManager: {
+      deps: { buildExternalMcpServers: (key: string) => Promise<Record<string, unknown>> };
+      liveSessionCreates: Map<string, unknown>;
+      isBusy(key: string): boolean;
+    } }).liveSessionManager;
+    let finishBuild!: () => void;
+    const slowSetup = new Promise<void>((resolve) => { finishBuild = resolve; });
+    const build = manager.deps.buildExternalMcpServers;
+    manager.deps.buildExternalMcpServers = async (key) => { await slowSetup; return build(key); };
+    try {
+      await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Work" }));
+      await vi.waitFor(() => expect(manager.liveSessionCreates.size).toBe(1));
+      expect(manager.isBusy("dm:example")).toBe(false);
+      const pending = command(channel);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finishBuild();
+      await pending;
+      expect(prepare).not.toHaveBeenCalled();
+      expect(channel.sent).toHaveLength(1);
+      expect(channel.sent[0].text).toContain("Stopped the turn that was still running");
+      await drainQueue(agent);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // The first turn never reached the model, and nothing else was sent.
+      expect(mockSdk.promptsBySession).toHaveLength(0);
+      expect(channel.sent).toHaveLength(1);
+    } finally { finishBuild(); manager.deps.buildExternalMcpServers = build; await agent.stop(); }
+  });
+
   it("shutdown during a stalled prepare waits for it, discards the fork, publishes nothing, and releases the hold", async () => {
     const { agent, channel, store } = setup();
     let unstall!: () => void;

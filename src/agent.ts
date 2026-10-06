@@ -567,8 +567,9 @@ export class Agent {
     // A brand-new conversation has no stored SDK id until its first turn
     // returns a result — so a FIRST turn that is stuck has none either. There
     // is nothing to fork, but the owner still needs the turn stopped.
+    // Always suspended, even then: the first turn may still be building its
+    // session (not yet busy), and only the hold plus the interrupt stop it.
     const stopOnly = !this.sessions.getSdkSessionId(key);
-    if (stopOnly && !this.liveSessionManager.isBusy(key)) throw new Error("No active conversation to rewind.");
     const suspension = await this.liveSessionManager.suspendForRewind(key);
     try {
       if (this.stopping) throw stopping();

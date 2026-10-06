@@ -113,49 +113,83 @@ export async function prepareSessionRewind(
     }
     return ids;
   };
-  // A steered user message can sit between a tool call and its result, which
-  // then arrives later in the chain. Cutting there would resume a half-finished
-  // turn, so step back to the previous human message until no kept tool call
-  // has its result after the cut. Tool calls whose result never appears
-  // (interrupted or blocked turns) are history the SDK already resumes past.
-  const position = new Map(chain.map((message, index) => [message.uuid, index]));
-  let index = human.length - count;
-  let target: Entry;
-  let parent: string | null;
-  for (;;) {
-    target = byId.get(human[index].uuid)!;
-    parent = resolveParent(target);
-    const kept = keptToolUses(parent);
-    const splitsTurn = chain.slice(position.get(target.uuid!)!).some((message) => {
-      const entry = byId.get(message.uuid);
-      return entry?.type === "user" && Array.isArray(entry.message?.content)
-        && entry.message.content.some((block) => block?.type === "tool_result" && kept.has(block.tool_use_id));
-    });
-    if (!splitsTurn) break;
-    if (index === 0) throw new Error("Every recorded message in the current context arrived during a tool call, so there is no completed turn to return to. /new starts fresh.");
-    index--;
-  }
   const assertSnapshotUnchanged = async () => {
     if (await readFile(path, "utf8") !== snapshot) throw new Error("Session history changed during rewind. Try again.");
     assertUnchanged();
   };
-  await assertSnapshotUnchanged();
-  const fork = parent ? await forkSession(sessionId, {
-    dir: workspaceDir,
-    upToMessageId: parent,
-    title: "Rewound conversation",
-  }) : undefined;
-  let discarded = false;
-  const discard = async () => {
-    if (!fork || discarded) return;
+  const remove = async (forkId: string): Promise<boolean> => {
     try {
-      await deleteSession(fork.sessionId, { dir: workspaceDir });
-      discarded = true;
+      await deleteSession(forkId, { dir: workspaceDir });
+      return true;
     } catch (err) {
       // Preserve the original rewind failure while making cleanup failures
       // visible. The source session must never be deleted here.
-      log.warn({ err, sessionId: fork.sessionId }, "Could not remove unpublished rewind fork");
+      log.warn({ err, sessionId: forkId }, "Could not remove unpublished rewind fork");
+      return false;
     }
+  };
+  const toolIds = (records: Entry[]) => {
+    const uses = new Set<string>();
+    const results = new Set<string>();
+    for (const entry of records) {
+      if (!Array.isArray(entry.message?.content)) continue;
+      for (const block of entry.message.content) {
+        if (entry.type === "assistant" && block?.type === "tool_use" && typeof block.id === "string") uses.add(block.id);
+        if (entry.type === "user" && block?.type === "tool_result" && typeof block.tool_use_id === "string") results.add(block.tool_use_id);
+      }
+    }
+    return { uses, results };
+  };
+  const sourceResults = toolIds(entries).results;
+  // The guard: a tool call the fork contains whose result exists in the source
+  // but was not copied. Checks the written fork, not a model of what the SDK
+  // copies (it also keeps compaction-preserved and off-chain records).
+  const forkSplitsTurn = async (forkId: string): Promise<boolean> => {
+    const text = await readFile(getSdkSessionPath(forkId, sdkSessionsDir), "utf8");
+    const { uses, results } = toolIds(text.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line) as Entry));
+    return [...uses].some((id) => sourceResults.has(id) && !results.has(id));
+  };
+  // A steered user message can sit between a tool call and its result, which
+  // then arrives later. Cutting there would resume a half-finished turn, so
+  // step back to the previous human message until the cut splits no turn.
+  // Tool calls whose result never appears (interrupted or blocked turns) are
+  // history the SDK already resumes past and do not count.
+  const position = new Map(chain.map((message, index) => [message.uuid, index]));
+  let index = human.length - count;
+  let target: Entry;
+  let fork: { sessionId: string } | undefined;
+  for (;;) {
+    target = byId.get(human[index].uuid)!;
+    const parent = resolveParent(target);
+    // Cheap pre-check on the main chain, before creating any fork.
+    const kept = keptToolUses(parent);
+    let splitsTurn = chain.slice(position.get(target.uuid!)!).some((message) => {
+      const entry = byId.get(message.uuid);
+      return entry?.type === "user" && Array.isArray(entry.message?.content)
+        && entry.message.content.some((block) => block?.type === "tool_result" && kept.has(block.tool_use_id));
+    });
+    if (!splitsTurn && parent) {
+      await assertSnapshotUnchanged();
+      fork = await forkSession(sessionId, { dir: workspaceDir, upToMessageId: parent, title: "Rewound conversation" });
+      try {
+        splitsTurn = await forkSplitsTurn(fork.sessionId);
+      } catch (err) {
+        await remove(fork.sessionId);
+        throw err;
+      }
+      if (splitsTurn) {
+        await remove(fork.sessionId);
+        fork = undefined;
+      }
+    }
+    if (!splitsTurn) break;
+    if (index === 0) throw new Error("Every recorded message in the current context arrived during a tool call, so there is no completed turn to return to. /new starts fresh.");
+    index--;
+  }
+  let discarded = false;
+  const discard = async () => {
+    if (!fork || discarded) return;
+    discarded = await remove(fork.sessionId);
   };
   try {
     await assertSnapshotUnchanged();

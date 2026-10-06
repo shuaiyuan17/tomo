@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
@@ -171,6 +171,41 @@ describe("conversation rewind with the installed SDK (no model requests)", () =>
     const fork = vi.spyOn(sdk, "forkSession");
     await expect(rewind()).rejects.toThrow("no completed turn to return to");
     expect(fork).not.toHaveBeenCalled();
+  });
+
+  it("steps back when the fork would keep a compaction-preserved tool call whose result comes later", async () => {
+    human("Before compaction");
+    const preserved = add("assistant", [{ type: "tool_use", id: "tool-preserved", name: "Read", input: {} }]);
+    const boundary = add("system", undefined, {
+      subtype: "compact_boundary", parentUuid: null, logicalParentUuid: preserved,
+      compactMetadata: { trigger: "auto", preTokens: 1, preservedMessages: { anchorUuid: "", uuids: [preserved] } },
+    });
+    (entries.at(-1)!.compactMetadata as { preservedMessages: { anchorUuid: string } }).preservedMessages.anchorUuid = boundary;
+    delete entries.at(-1)!.message;
+    human("Steered request");
+    add("user", [{ type: "tool_result", tool_use_id: "tool-preserved", content: "Done" }]);
+    assistant("Finished"); save();
+    const before = new Set(readdirSync(sdkDir));
+    const fork = vi.spyOn(sdk, "forkSession");
+    await expect(rewind()).rejects.toThrow("no completed turn to return to");
+    expect(fork).toHaveBeenCalledOnce();
+    expect(new Set(readdirSync(sdkDir))).toEqual(before);
+  });
+
+  it("steps back when the fork would keep an off-chain tool call whose result comes later", async () => {
+    const start = human("Start work");
+    const offChain = add("assistant", [{ type: "tool_use", id: "tool-team", name: "Read", input: {} }], { teamName: "example-team" });
+    const answer = add("assistant", [{ type: "text", text: "Working" }], { parentUuid: start });
+    human("Steered request");
+    add("user", [{ type: "tool_result", tool_use_id: "tool-team", content: "Done" }], { parentUuid: offChain, teamName: "example-team" });
+    assistant("Finished");
+    entries.at(-1)!.parentUuid = entries.at(-3)!.uuid; save();
+    expect(answer).toBeTruthy();
+    const before = new Set(readdirSync(sdkDir));
+    const fork = vi.spyOn(sdk, "forkSession");
+    expect(await rewind()).toMatchObject({ sessionId: undefined, count: 2, preview: "Start work" });
+    expect(fork).toHaveBeenCalledOnce();
+    expect(new Set(readdirSync(sdkDir))).toEqual(before);
   });
 
   it("ignores historical tool calls whose result never arrived", async () => {

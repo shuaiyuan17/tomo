@@ -13,7 +13,7 @@ import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -39,6 +39,22 @@ function sameServerConfig(a: McpServerConfig | undefined, b: McpServerConfig): b
     return JSON.stringify(a) === JSON.stringify(b);
   } catch {
     return false;
+  }
+}
+
+/** Upper bound on how long /rewind waits for a stopped session to wind down. */
+export const REWIND_SUSPEND_TIMEOUT_MS = 10_000;
+
+/** Resolves true if `promise` settled within `ms`, false on timeout. Never rejects. */
+async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -155,6 +171,30 @@ export class LiveSessionManager {
    * transcript being flushed.
    */
   private inFlightTurns = new Set<Promise<string>>();
+  /**
+   * Keys a /rewind is working on (see suspendForRewind). While a key is held,
+   * no live session is created or handed out for it: turns that arrive in the
+   * meantime — queued user messages, steered drains, crons, heartbeats — wait
+   * here and then run on the rewound conversation.
+   */
+  private sessionHolds = new Map<string, Promise<void>>();
+  /**
+   * Turns inside dispatchTurn, per key. A turn is "running" from the moment it
+   * is dispatched — still building its session (slow external-MCP setup), or
+   * built but not yet claimed — not only once LiveSession.isBusy() says so.
+   * suspendForRewind marks every one present as interrupted, which makes it
+   * end with TurnInterruptedError at its next step instead of running later.
+   */
+  private dispatches = new Map<string, Set<{ interrupted: boolean }>>();
+  /**
+   * Per-key generation, bumped by suspendForRewind. A session build captures
+   * it (and the SDK id it resumes) at start and refuses to publish if either
+   * changed — so a build that outlived a rewind's wait budget cannot publish a
+   * session resuming the pre-rewind conversation after the rewind finished.
+   */
+  private generations = new Map<string, number>();
+  /** Release for each hold in `sessionHolds` — stop() releases them all. */
+  private holdReleases = new Map<string, () => void>();
 
   constructor(private readonly deps: LiveSessionManagerDeps) {}
 
@@ -205,18 +245,35 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.lastResult ?? null;
   }
 
-  async getOrCreateLiveSession(key: string): Promise<LiveSession> {
-    // Checked on every message (not just on creation): a lone session that is
-    // only ever reused would otherwise never notice a workspace change and
-    // serve a stale prompt indefinitely.
-    this.sweepPromptChanges();
+  /**
+   * `abandon`: asked when a build was discarded (rewind/stale id); true makes
+   * this return the dead session instead of building again — for a turn that
+   * was itself stopped by the rewind.
+   */
+  async getOrCreateLiveSession(key: string, abandon?: () => boolean): Promise<LiveSession> {
+    for (;;) {
+      // A rewind holds this key: wait, then use the rewound conversation.
+      for (let hold = this.sessionHolds.get(key); hold; hold = this.sessionHolds.get(key)) await hold;
 
-    const session = this.liveSessions.get(key);
-    if (session?.isAlive()) return session;
+      // Checked on every message (not just on creation): a lone session that is
+      // only ever reused would otherwise never notice a workspace change and
+      // serve a stale prompt indefinitely.
+      this.sweepPromptChanges();
 
-    const creating = this.liveSessionCreates.get(key);
-    if (creating) return creating;
+      const session = this.liveSessions.get(key);
+      if (session?.isAlive()) return session;
 
+      const created = await (this.liveSessionCreates.get(key) ?? this.startCreate(key));
+      // Built for the pre-rewind conversation and discarded by createLiveSession
+      // (a rewind began or finished meanwhile): build again on the current
+      // conversation — after the rewind, if it is still holding the key.
+      // createLiveSession returns a dead session only when it discarded it.
+      if (!created.isAlive() && !this.stopping && !abandon?.()) continue;
+      return created;
+    }
+  }
+
+  private async startCreate(key: string): Promise<LiveSession> {
     const create = this.createLiveSession(key);
     this.liveSessionCreates.set(key, create);
     try {
@@ -225,6 +282,73 @@ export class LiveSessionManager {
       if (this.liveSessionCreates.get(key) === create) {
         this.liveSessionCreates.delete(key);
       }
+    }
+  }
+
+  /**
+   * Take a key away from every turn so /rewind can fork its transcript.
+   *
+   * Holds the key first (no live session is created or handed out for it),
+   * then interrupts whatever is running: its
+   * requests reject with TurnInterruptedError, which is never retried. Waits,
+   * bounded, for the session's SDK event loop to end so nothing more is
+   * handled or delivered from it. The CLI child can still be appending its
+   * exit-time records after that — the caller waits for the transcript itself
+   * to go quiet.
+   *
+   * `release()` MUST be called (finally) — held turns are waiting on it.
+   */
+  async suspendForRewind(key: string, timeoutMs = REWIND_SUSPEND_TIMEOUT_MS): Promise<{ stoppedTurn: boolean; droppedMessages: number; release: () => void }> {
+    if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
+    if (this.sessionHolds.has(key)) throw new Error("A rewind is already in progress.");
+    let releaseHold!: () => void;
+    const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+    this.sessionHolds.set(key, hold);
+    const release = () => {
+      if (this.sessionHolds.get(key) === hold) {
+        this.sessionHolds.delete(key);
+        this.holdReleases.delete(key);
+      }
+      releaseHold();
+    };
+    this.holdReleases.set(key, release);
+    try {
+      // Every turn already dispatched for this key is stopped, whether or not
+      // its session exists or has claimed it yet. Turns dispatched from here
+      // on are untouched: they wait for the hold and run afterwards.
+      this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
+      const deadline = Date.now() + timeoutMs;
+      const dispatched = [...(this.dispatches.get(key) ?? [])];
+      for (const token of dispatched) token.interrupted = true;
+      // A session still being built finishes first (bounded): createLiveSession
+      // re-checks the hold before publishing and closes it, so its CLI child
+      // has started exiting before the caller waits for the transcript to go
+      // quiet — rather than spawning in the middle of the snapshot.
+      const creating = this.liveSessionCreates.get(key);
+      if (creating && !await withTimeout(creating, timeoutMs)) {
+        log.warn({ key, timeoutMs }, "Rewind: a session still being built did not finish in time; continuing");
+      }
+      const session = this.liveSessions.get(key);
+      let stoppedTurn = dispatched.length > 0;
+      let droppedMessages = 0;
+      if (session) {
+        const busy = session.isAlive() && session.isBusy();
+        stoppedTurn ||= busy;
+        droppedMessages = busy ? session.steeredRequestCount() : 0;
+        this.promptStale.delete(session);
+        this.liveSessions.delete(key);
+        this.externalMcpServersBySession.delete(key);
+        this.mcpServerConfigsBySession.delete(key);
+        session.interrupt(new TurnInterruptedError());
+        if (!await withTimeout(session.whenEventLoopDone(), Math.max(0, deadline - Date.now()))) {
+          log.warn({ key, timeoutMs }, "Rewind: the stopped session's event loop did not end in time; continuing");
+        }
+      }
+      if (stoppedTurn) log.info({ key, droppedMessages }, "Rewind stopped the running turn");
+      return { stoppedTurn, droppedMessages, release };
+    } catch (err) {
+      release();
+      throw err;
     }
   }
 
@@ -283,6 +407,7 @@ export class LiveSessionManager {
     let session = this.liveSessions.get(key);
     if (session?.isAlive()) return session;
 
+    const generation = this.generations.get(key) ?? 0;
     const resumeId = this.deps.getSdkSessionId(key);
     if (resumeId) {
       const repair = repairSdkSessionForResume(
@@ -332,6 +457,23 @@ export class LiveSessionManager {
     if (this.stopping) {
       session.close();
       log.info({ key }, "Discarding a live session that finished building after shutdown began");
+      return session;
+    }
+    // Same for a /rewind that began while we were building: this session
+    // resumes the conversation being rewound. getOrCreateLiveSession builds
+    // again once the rewind is done.
+    if (this.sessionHolds.has(key)) {
+      session.close();
+      log.info({ key }, "Discarding a live session that finished building after a rewind began");
+      return session;
+    }
+    // ...or that began AND finished while this build was parked (it outlived
+    // the rewind's wait budget), or anything else relinked the key (/new, a
+    // timeout retirement): this session resumes a conversation the key no
+    // longer points at.
+    if ((this.generations.get(key) ?? 0) !== generation || (this.deps.getSdkSessionId(key) ?? null) !== (resumeId ?? null)) {
+      session.close();
+      log.info({ key }, "Discarding a live session built for a conversation the key no longer points at");
       return session;
     }
     this.liveSessions.set(key, session);
@@ -533,11 +675,26 @@ export class LiveSessionManager {
   }
 
   private async dispatchTurn(req: RunWithRetryRequest): Promise<string> {
+    const token = { interrupted: false };
+    let tokens = this.dispatches.get(req.key);
+    if (!tokens) this.dispatches.set(req.key, tokens = new Set());
+    tokens.add(token);
+    try {
+      return await this.dispatchTurnOnce(req, token);
+    } finally {
+      tokens.delete(token);
+      if (tokens.size === 0 && this.dispatches.get(req.key) === tokens) this.dispatches.delete(req.key);
+    }
+  }
+
+  private async dispatchTurnOnce(req: RunWithRetryRequest, token: { interrupted: boolean }): Promise<string> {
     const { key, prompt, images, documents, steer = false, steerAudience, onBlock, onBlockAbandoned, hasShipped, origin, silentDelivery } = req;
 
     let session: LiveSession | undefined;
     try {
-      session = await this.getOrCreateLiveSession(key);
+      session = await this.getOrCreateLiveSession(key, () => token.interrupted);
+      // Stopped by /rewind while it was still getting its session.
+      if (token.interrupted) throw new TurnInterruptedError();
       // The session was built while we were parked in buildExternalMcpServers
       // and shutdown began in the meantime, so createLiveSession closed it
       // rather than publishing it (see there). Refuse rather than call send()
@@ -555,6 +712,12 @@ export class LiveSessionManager {
       // runTurnOnSession already recorded it; let it through to TurnRunner's
       // error policy untouched. Never retried — the conversation is intact,
       // and a re-run would re-send any blocks that already shipped.
+      // Stopped on purpose by /rewind. Never retried: the turn may already
+      // have run tools, and re-running it from the top would repeat them.
+      // Whatever it failed with (a "Session is closed" from a send that had
+      // not yet claimed the session included), it ends as interrupted.
+      if (err instanceof TurnInterruptedError) throw err;
+      if (token.interrupted) throw new TurnInterruptedError();
       if (err instanceof SdkResultError) throw err;
 
       const errMsg = err instanceof Error ? err.message : "";
@@ -764,6 +927,13 @@ export class LiveSessionManager {
     // even though the hot-mount drain below yields before the sessions are
     // closed.
     this.stopping = true;
+
+    // NO HOLD OUTLIVES SHUTDOWN. The Agent awaits (bounded) and aborts any
+    // rewind before calling this; a rewind still stalled past that budget must
+    // not leave turns parked on its hold. Released turns find `stopping` set
+    // and are refused (createLiveSession), and the rewind itself can no longer
+    // publish (its publish step checks the Agent's stopping flag).
+    for (const release of [...this.holdReleases.values()]) release();
 
     // BEFORE the sessions are closed. `stopping` is already the admission
     // gate, so nothing new joins the queue and anything queued-but-unstarted

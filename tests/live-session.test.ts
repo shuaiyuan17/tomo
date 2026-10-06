@@ -118,6 +118,41 @@ function makeSession(settings?: {
   return { session, harness };
 }
 
+describe("LiveSession.interrupt (/rewind)", () => {
+  it("rejects the turn with TurnInterruptedError and ships nothing the SDK hands over afterwards", async () => {
+    const { TurnInterruptedError } = await import("../src/agent/live-session.js");
+    const unownedBlocks: string[] = [];
+    const factory = vi.fn(() => ({
+      resolve: () => {},
+      reject: () => {},
+      onBlock: (block: string) => { unownedBlocks.push(block); },
+    }));
+    const session = new LiveSession({} as never, "dm:owner", undefined, factory);
+    const harness = harnessRef.current!;
+    const shipped: string[] = [];
+    let unblock!: () => void;
+    const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+    const turn = session.send("Work", undefined, undefined, async (block) => {
+      shipped.push(block);
+      if (shipped.length === 1) await blocked; // a slow channel send, mid-turn
+    });
+    const outcome = turn.then(() => null, (err: Error) => err);
+
+    harness.pushEvent(assistantEvent("First block"));
+    await waitFor(() => shipped.length === 1);
+    // Already buffered when /rewind arrives.
+    harness.pushEvent(assistantEvent("Second block"));
+    session.interrupt(new TurnInterruptedError());
+    expect(await outcome).toBeInstanceOf(TurnInterruptedError);
+
+    unblock();
+    await session.whenEventLoopDone();
+    expect(shipped).toEqual(["First block"]);
+    expect(factory).not.toHaveBeenCalled();
+    expect(unownedBlocks).toEqual([]);
+  });
+});
+
 describe("LiveSession tool-result observation", () => {
   it("notifies after the SDK emits a named tool result", async () => {
     const onToolResult = vi.fn();

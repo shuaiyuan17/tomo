@@ -188,6 +188,20 @@ export class SdkResultError extends Error {
 }
 
 /**
+ * The owner stopped this turn on purpose (/rewind). Not a session failure:
+ * LiveSessionManager never retries it (a retry would repeat whatever the turn
+ * already did), and TurnRunner delivers nothing for it — the command's own
+ * reply says the turn was stopped. The message must not match the manager's
+ * "session closed" patterns.
+ */
+export class TurnInterruptedError extends Error {
+  constructor(message = "Turn stopped by /rewind.") {
+    super(message);
+    this.name = "TurnInterruptedError";
+  }
+}
+
+/**
  * Classify a turn-ending result. `null` for a clean success; otherwise the
  * typed error the turn should reject with.
  *
@@ -1079,6 +1093,13 @@ export class LiveSession {
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
+    // A RETIRED SESSION HANDLES NOTHING. close() rejected every request, but
+    // the SDK can still hand over events it had already buffered — and the
+    // event loop may have been parked in `await onBlock` when close() ran.
+    // With no current request, the next assistant event would be claimed as
+    // an unowned turn and shipped to the default target: text from a turn
+    // the owner just stopped with /rewind, arriving after the rewind reply.
+    if (!this.alive) return;
     this.refreshActivityTimeout();
 
     // Events originating inside a subagent (Agent tool) carry
@@ -1774,6 +1795,31 @@ export class LiveSession {
 
   getSessionId(): string | null {
     return this.sessionId;
+  }
+
+  /**
+   * Stop the in-flight turn and retire the session: every request it holds
+   * (owner, merged and pending steers) rejects with `err` rather than the
+   * generic "Session is closed", so the manager can tell a deliberate stop
+   * from a crash and never retries it. Same order as timeoutTurn.
+   */
+  /** Steered messages riding on the in-flight turn (merged or still pending). */
+  steeredRequestCount(): number {
+    return this.mergedRequests.length + this.pendingSteers.length;
+  }
+
+  interrupt(err: Error): void {
+    this.failTurn(err);
+    this.close();
+  }
+
+  /**
+   * Resolves once the SDK event loop has ended — after close(), no further
+   * event will be handled. Note the CLI child may still be exiting (and
+   * appending its exit-time metadata to the transcript) after this resolves.
+   */
+  whenEventLoopDone(): Promise<void> {
+    return this.eventLoopDone;
   }
 
   isAlive(): boolean {

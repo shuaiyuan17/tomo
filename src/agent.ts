@@ -36,7 +36,7 @@ import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
-import { prepareSessionRewind } from "./agent/session-rewind.js";
+import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
@@ -154,6 +154,22 @@ const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
  */
 const MCP_SWEEP_SHUTDOWN_TIMEOUT_MS = 3_000;
 const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
+/**
+ * How long shutdown waits for an aborted /rewind to wind down. Abort is
+ * honoured between steps, so this only covers one step already in flight
+ * (a fork or transcript read); a stall past it is abandoned, never published.
+ */
+const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
+
+/** What a /rewind did — see ChatCommandDeps.rewindSession. */
+type RewindOutcome = {
+  count: number;
+  preview: string;
+  stoppedTurn: boolean;
+  droppedMessages: number;
+  /** A stuck first turn was stopped; there was no earlier history to fork. */
+  nothingToRewind?: boolean;
+};
 
 /**
  * How long after start the full legacy-transcript migration status is logged
@@ -182,6 +198,12 @@ export class Agent {
   private sessions: SessionStore;
   private router: IdentityRouter;
   private sessionQueue = new SessionQueue();
+  /** Per-key chain serializing /rewind (see rewindSession). */
+  private rewinds = new Map<string, Promise<void>>();
+  /** Rewinds in progress, awaited (bounded) by stop() after it aborts them. */
+  private activeRewinds = new Set<Promise<unknown>>();
+  /** Fired by stop(): rewinds stop between waits/attempts and discard their fork. */
+  private readonly rewindAbort = new AbortController();
   /**
    * Inbound work that has been accepted by a channel but has not started its
    * per-session task yet. Unlike the generic SessionQueue tail, this retains
@@ -277,23 +299,7 @@ export class Agent {
       modelOverrides: this.modelOverrides,
       closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
       isSessionLive: (key) => this.liveSessionManager.isAlive(key),
-      rewindSession: (key, count) => this.enqueueForSession(key, async () => {
-        if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-        if (this.liveSessionManager.isBusy(key)) throw new Error("A turn is still running. Try /rewind after it finishes.");
-        const sid = this.sessions.getSdkSessionId(key);
-        if (!sid) throw new Error("No active conversation to rewind.");
-        this.liveSessionManager.closeLiveSession(key);
-        const rewind = await prepareSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir);
-        try {
-          if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-          rewind.assertUnchanged();
-          this.sessions.replaceSdkSessionId(key, sid, rewind.sessionId);
-        } catch (err) {
-          await rewind.discard();
-          throw err;
-        }
-        return { count: rewind.count, preview: rewind.preview };
-      }),
+      rewindSession: (key, count) => this.rewindSession(key, count),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
       getExternalMcpStatuses: (key) => this.mcpOAuthManager.getServerStatuses(
         config.mcpServers ?? {},
@@ -530,6 +536,58 @@ export class Agent {
    */
   private enqueueForSession<T>(sessionKey: string, task: () => Promise<T>): Promise<T> {
     return this.sessionQueue.enqueue(sessionKey, task);
+  }
+
+  /**
+   * /rewind. Deliberately NOT on the session queue: the owner reaches for it
+   * when a turn is stuck, and behind the queue it would wait for that very
+   * turn. Instead it interrupts the running turn (never retried, nothing more
+   * delivered from it) and holds the key in the LiveSessionManager while it
+   * forks, so every other turn for this key — queued user messages, steered
+   * drains, crons, heartbeats — waits and then runs on the rewound
+   * conversation. Nothing queued is dropped or re-run. Rewinds of one key
+   * run one at a time.
+   */
+  private rewindSession(key: string, count: number): Promise<RewindOutcome> {
+    const previous = this.rewinds.get(key) ?? Promise.resolve();
+    const run = previous.then(() => this.rewindSessionNow(key, count));
+    const settled = run.then(() => {}, () => {});
+    this.rewinds.set(key, settled);
+    this.activeRewinds.add(settled);
+    void settled.then(() => {
+      this.activeRewinds.delete(settled);
+      if (this.rewinds.get(key) === settled) this.rewinds.delete(key);
+    });
+    return run;
+  }
+
+  private async rewindSessionNow(key: string, count: number): Promise<RewindOutcome> {
+    const stopping = () => new Error("Tomo is stopping. Try again after restart.");
+    if (this.stopping) throw stopping();
+    // A brand-new conversation has no stored SDK id until its first turn
+    // returns a result — so a FIRST turn that is stuck has none either. There
+    // is nothing to fork, but the owner still needs the turn stopped.
+    // Always suspended, even then: the first turn may still be building its
+    // session (not yet busy), and only the hold plus the interrupt stop it.
+    const stopOnly = !this.sessions.getSdkSessionId(key);
+    const suspension = await this.liveSessionManager.suspendForRewind(key);
+    try {
+      if (this.stopping) throw stopping();
+      const sid = this.sessions.getSdkSessionId(key);
+      if (stopOnly && !sid) {
+        if (!suspension.stoppedTurn) throw new Error("No active conversation to rewind.");
+        return { count: 0, preview: "", stoppedTurn: suspension.stoppedTurn, droppedMessages: suspension.droppedMessages, nothingToRewind: true };
+      }
+      if (!sid) throw new Error("No active conversation to rewind.");
+      const rewind = await prepareSettledSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir, (prepared) => {
+        if (this.stopping) throw stopping();
+        prepared.assertUnchanged();
+        this.sessions.replaceSdkSessionId(key, sid, prepared.sessionId);
+      }, { signal: this.rewindAbort.signal });
+      return { count: rewind.count, preview: rewind.preview, stoppedTurn: suspension.stoppedTurn, droppedMessages: suspension.droppedMessages };
+    } finally {
+      suspension.release();
+    }
   }
 
   /**
@@ -2438,6 +2496,17 @@ export class Agent {
         // transcript record is what keeps that a visible non-answer instead of
         // a silent drop.
         this.recordUnprocessedInbound();
+
+        // A rewind still working would otherwise hold its key past shutdown
+        // (turns parked behind it) or publish a fork mid-teardown. Abort it —
+        // it stops between waits and attempts and discards any fork — and
+        // give it a bounded moment to finish. LiveSessionManager.stop()
+        // releases any hold a stalled one still has.
+        this.rewindAbort.abort();
+        if (this.activeRewinds.size > 0) {
+          const rewinds = [...this.activeRewinds];
+          await this.boundedShutdownStep("rewind", REWIND_SHUTDOWN_TIMEOUT_MS, () => Promise.allSettled(rewinds));
+        }
 
         // Closing the live sessions rejects their in-flight turns, and those
         // turns still have to flush the blocks they delivered into the

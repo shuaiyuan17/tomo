@@ -3,7 +3,7 @@ import { log } from "../logger.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
-import { STEER_MERGED } from "./live-session.js";
+import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
@@ -651,6 +651,14 @@ export class TurnRunner {
   }
 
   private async handleThrownError(spec: TurnSpec, err: unknown, stopTyping: StopTyping): Promise<boolean> {
+    // Stopped on purpose by /rewind, whose own reply tells the owner. No error
+    // message, and no pending error note: the next turn runs on the rewound
+    // conversation, which must not hear about the turn it no longer contains.
+    if (err instanceof TurnInterruptedError) {
+      log.info({ sessionKey: spec.key, source: spec.source }, "Turn stopped by /rewind; nothing further delivered for it");
+      await stopTyping({ clear: true });
+      return false;
+    }
     log.error({ err }, spec.errors.thrownLogMessage);
 
     if (spec.errors.thrown === "ignore") {

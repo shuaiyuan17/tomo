@@ -16,6 +16,18 @@ interface Entry {
   message?: { content?: unknown };
 }
 
+/**
+ * The source transcript was written to while a rewind was reading it — or was
+ * caught mid-write. Usually the CLI child of the session the rewind just
+ * closed, appending its exit-time records; retrying once it is quiet works.
+ */
+export class SessionHistoryChangedError extends Error {
+  constructor(message = "Session history changed during rewind. Try again.") {
+    super(message);
+    this.name = "SessionHistoryChangedError";
+  }
+}
+
 export interface PreparedRewind {
   /** Fork to publish; undefined means a fresh context (rewound the first message). */
   sessionId?: string;
@@ -55,12 +67,12 @@ export async function prepareSessionRewind(
   // The final publish guard must not yield between validation and the link
   // swap. Keep only the small metadata check synchronous, not whole-file I/O.
   const assertUnchanged = () => {
-    if (fileVersion() !== version) throw new Error("Session history changed during rewind. Try again.");
+    if (fileVersion() !== version) throw new SessionHistoryChangedError();
   };
   const snapshot = await readFile(path, "utf8");
   assertUnchanged();
   // Refuse incomplete/corrupt snapshots instead of silently dropping history.
-  if (!snapshot.endsWith("\n")) throw new Error("Session history is still being written. Try /rewind again shortly.");
+  if (!snapshot.endsWith("\n")) throw new SessionHistoryChangedError("Session history is still being written. Try /rewind again shortly.");
   const entries = snapshot.split("\n").filter((line) => line.trim()).map((line): Entry => {
     const entry: unknown = JSON.parse(line);
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Unreadable session history.");
@@ -114,7 +126,7 @@ export async function prepareSessionRewind(
     return ids;
   };
   const assertSnapshotUnchanged = async () => {
-    if (await readFile(path, "utf8") !== snapshot) throw new Error("Session history changed during rewind. Try again.");
+    if (await readFile(path, "utf8") !== snapshot) throw new SessionHistoryChangedError();
     assertUnchanged();
   };
   const remove = async (forkId: string): Promise<boolean> => {

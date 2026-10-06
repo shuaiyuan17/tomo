@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import * as sdk from "@anthropic-ai/claude-agent-sdk";
 import { prepareSessionRewind } from "../src/agent/session-rewind.js";
+import { HISTORY_KEPT_CHANGING, prepareSettledSessionRewind } from "../src/agent/settled-rewind.js";
 import { SessionStore } from "../src/sessions/store.js";
 import * as fsUtils from "../src/fs-utils.js";
 
@@ -275,6 +276,76 @@ describe("conversation rewind with the installed SDK (no model requests)", () =>
     await expect(rewind()).rejects.toThrow();
     writeFileSync(path, "{unfinished");
     await expect(rewind()).rejects.toThrow("still being written");
+  });
+});
+
+// What the CLI child appends to the transcript as it exits — after its event
+// stream has already ended (seen live on 2026-10-06 at 16:07 PDT).
+const exitRecord = () => JSON.stringify({ type: "cost-state", sessionId: sid, totalCostUSD: 1 }) + "\n";
+const forkFiles = () => readdirSync(sdkDir).filter((name) => name.endsWith(".jsonl") && name !== `${sid}.jsonl`);
+
+describe("rewinding a session that was just closed", () => {
+  it("waits out the closed CLI's trailing writes, then rewinds on the first try", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const writes: number[] = [];
+    const timers = [80, 200].map((ms) => setTimeout(() => { appendFileSync(path, exitRecord()); writes.push(Date.now()); }, ms));
+    const read = vi.spyOn(sdk, "getSessionMessages");
+    const publish = vi.fn((prepared: { assertUnchanged(): void }) => prepared.assertUnchanged());
+    try {
+      const prepared = await prepareSettledSessionRewind(sid, 1, workspace, sdkDir, publish, { quietMs: 250, pollMs: 10 });
+      expect(writes).toHaveLength(2);
+      expect(read).toHaveBeenCalledOnce();
+      expect(publish).toHaveBeenCalledOnce();
+      expect(existsSync(join(sdkDir, `${prepared.sessionId}.jsonl`))).toBe(true);
+      expect(readFileSync(path, "utf8").trimEnd().split("\n").at(-1)).toContain("cost-state");
+    } finally { timers.forEach(clearTimeout); }
+  });
+
+  it("retries when a trailing write still lands mid-prepare", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const original = sdk.getSessionMessages;
+    const read = vi.spyOn(sdk, "getSessionMessages").mockImplementationOnce(async (...args) => {
+      appendFileSync(path, exitRecord());
+      return original(...args);
+    });
+    const publish = vi.fn((prepared: { assertUnchanged(): void }) => prepared.assertUnchanged());
+    const prepared = await prepareSettledSessionRewind(sid, 1, workspace, sdkDir, publish, { quietMs: 50, pollMs: 10 });
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(forkFiles()).toEqual([`${prepared.sessionId}.jsonl`]);
+  });
+
+  it("fails cleanly after two retries when the transcript never stops changing, discarding every fork", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const original = readFileSync(path, "utf8");
+    const fork = sdk.forkSession;
+    const forked: string[] = [];
+    vi.spyOn(sdk, "forkSession").mockImplementation(async (...args) => {
+      const result = await fork(...args);
+      forked.push(result.sessionId);
+      appendFileSync(path, exitRecord());
+      return result;
+    });
+    const publish = vi.fn();
+    await expect(prepareSettledSessionRewind(sid, 1, workspace, sdkDir, publish, { quietMs: 30, pollMs: 5 }))
+      .rejects.toThrow(HISTORY_KEPT_CHANGING);
+    expect(forked).toHaveLength(3);
+    expect(publish).not.toHaveBeenCalled();
+    expect(forkFiles()).toEqual([]);
+    expect(readFileSync(path, "utf8").startsWith(original)).toBe(true);
+  });
+
+  it("discards the fork and does not retry when publishing fails for another reason", async () => {
+    human("Initial request"); assistant("Initial answer");
+    human("Request to edit"); assistant("Unavailable"); save();
+    const fork = vi.spyOn(sdk, "forkSession");
+    await expect(prepareSettledSessionRewind(sid, 1, workspace, sdkDir, () => { throw new Error("Session changed"); }, { quietMs: 0 }))
+      .rejects.toThrow("Session changed");
+    expect(fork).toHaveBeenCalledOnce();
+    expect(forkFiles()).toEqual([]);
   });
 });
 

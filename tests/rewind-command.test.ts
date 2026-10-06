@@ -159,6 +159,74 @@ describe("/rewind", () => {
     } finally { release(); await agent.stop(); }
   });
 
+  it("stops a stuck FIRST turn even though no session id is stored yet, and forks nothing", async () => {
+    const { agent, channel, store } = setup();
+    store.clearSdkSessionId("dm:example");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    mockSdk.responseFn = async (text) => {
+      if (text.includes("Work")) { await gate; return "Late reply from the stopped turn"; }
+      return "Fresh answer";
+    };
+    try {
+      await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Work" }));
+      await vi.waitFor(() => expect(mockSdk.promptsBySession).toHaveLength(1));
+      expect(store.getSdkSessionId("dm:example")).toBeFalsy();
+      await command(channel);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(store.getSdkSessionId("dm:example")).toBeFalsy();
+      expect(channel.sent).toHaveLength(1);
+      expect(channel.sent[0].text).toContain("Stopped the turn that was still running");
+      expect(channel.sent[0].text).toContain("no earlier history to rewind to");
+      release();
+      await drainQueue(agent);
+      expect(mockSdk.promptsBySession).toHaveLength(1);
+      expect(channel.sent).toHaveLength(1);
+      // Still refuses when nothing is running and nothing is stored.
+      await command(channel);
+      expect(channel.sent.at(-1)?.text).toContain("No active conversation to rewind.");
+    } finally { release(); await agent.stop(); }
+  });
+
+  it("shutdown during a stalled prepare waits for it, discards the fork, publishes nothing, and releases the hold", async () => {
+    const { agent, channel, store } = setup();
+    let unstall!: () => void;
+    const stalled = new Promise<void>((resolve) => { unstall = resolve; });
+    prepare.mockImplementationOnce(async (_sid: string, count: number) => {
+      await stalled;
+      return { sessionId: "fork-example", count, preview: "Request to edit", assertUnchanged: () => {}, discard };
+    });
+    const publish = vi.spyOn(store, "replaceSdkSessionId");
+    const holds = () => (agent as unknown as { liveSessionManager: { sessionHolds: Map<string, unknown> } }).liveSessionManager.sessionHolds;
+    const pending = command(channel);
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(holds().size).toBe(1);
+    let stopped = false;
+    const stopping = agent.stop().then(() => { stopped = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(stopped).toBe(false);
+    unstall();
+    await stopping;
+    await pending;
+    expect(discard).toHaveBeenCalledOnce();
+    expect(publish).not.toHaveBeenCalled();
+    expect(store.getSdkSessionId("dm:example")).toBe("source-example");
+    expect(holds().size).toBe(0);
+    expect(channel.sent.at(-1)?.text).toContain("Could not rewind: Tomo is stopping");
+  });
+
+  it("shutdown does not hang on a prepare that never returns, and still releases the hold", async () => {
+    const { agent, channel, store } = setup();
+    prepare.mockImplementationOnce(() => new Promise(() => {}));
+    const holds = () => (agent as unknown as { liveSessionManager: { sessionHolds: Map<string, unknown> } }).liveSessionManager.sessionHolds;
+    void command(channel);
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(holds().size).toBe(1);
+    await agent.stop();
+    expect(holds().size).toBe(0);
+    expect(store.getSdkSessionId("dm:example")).toBe("source-example");
+  }, 10_000);
+
   it("does not mention a stopped turn when nothing was running", async () => {
     const { agent, channel } = setup();
     try {

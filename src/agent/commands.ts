@@ -42,7 +42,7 @@ export interface ChatCommandDeps {
   isSessionLive(key: string): boolean;
   /** Resolves to the number of human messages actually rewound, the earliest
    *  one's opening words, and whether a running turn had to be stopped first. */
-  rewindSession(key: string, count: number): Promise<{ count: number; preview: string; stoppedTurn?: boolean; droppedMessages?: number }>;
+  rewindSession(key: string, count: number): Promise<{ count: number; preview: string; stoppedTurn?: boolean; droppedMessages?: number; nothingToRewind?: boolean }>;
   queuePendingNote(sessionKey: string, note: string): void;
   getExternalMcpStatuses(sessionKey: string): ExternalMcpServerStatus[];
   startExternalMcpLogin(serverName: string): Promise<McpLoginStart>;
@@ -106,7 +106,7 @@ export class ChatCommandHandler {
         await channel.send({ chatId, text: "Usage: /rewind or /rewind <positive integer>" });
         return;
       }
-      let rewound: { count: number; preview: string; stoppedTurn?: boolean; droppedMessages?: number };
+      let rewound: { count: number; preview: string; stoppedTurn?: boolean; droppedMessages?: number; nothingToRewind?: boolean };
       try {
         rewound = await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
       } catch (err) {
@@ -114,12 +114,16 @@ export class ChatCommandHandler {
         await channel.send({ chatId, text: `⚠️ Could not rewind: ${err instanceof Error ? err.message : String(err)}` });
         return;
       }
+      const dropped = rewound.droppedMessages
+        ? ` ${rewound.droppedMessages} message(s) you sent while it ran went with it; resend them if still needed.`
+        : "";
+      if (rewound.nothingToRewind) {
+        await channel.send({ chatId, text: `⏹️ Stopped the turn that was still running; it will send nothing more.${dropped} This conversation had no earlier history to rewind to, so nothing was rewound. Send your request again to continue.` });
+        return;
+      }
       const target = rewound.preview ? ` ("${rewound.preview}")` : "";
       const moved = rewound.count > Number(arg)
         ? ` That is further back than the ${arg} you asked for: the later message arrived during a tool call, so it went back to the end of the previous complete turn.`
-        : "";
-      const dropped = rewound.droppedMessages
-        ? ` ${rewound.droppedMessages} message(s) you sent while it ran went with it; resend them if still needed.`
         : "";
       const stopped = rewound.stoppedTurn
         ? ` The turn that was still running was stopped first and will send nothing more.${dropped}`

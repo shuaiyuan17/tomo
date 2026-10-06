@@ -178,6 +178,8 @@ export class LiveSessionManager {
    * here and then run on the rewound conversation.
    */
   private sessionHolds = new Map<string, Promise<void>>();
+  /** Release for each hold in `sessionHolds` — stop() releases them all. */
+  private holdReleases = new Map<string, () => void>();
 
   constructor(private readonly deps: LiveSessionManagerDeps) {}
 
@@ -275,14 +277,19 @@ export class LiveSessionManager {
    * `release()` MUST be called (finally) — held turns are waiting on it.
    */
   async suspendForRewind(key: string, timeoutMs = REWIND_SUSPEND_TIMEOUT_MS): Promise<{ stoppedTurn: boolean; droppedMessages: number; release: () => void }> {
+    if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
     if (this.sessionHolds.has(key)) throw new Error("A rewind is already in progress.");
     let releaseHold!: () => void;
     const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
     this.sessionHolds.set(key, hold);
     const release = () => {
-      if (this.sessionHolds.get(key) === hold) this.sessionHolds.delete(key);
+      if (this.sessionHolds.get(key) === hold) {
+        this.sessionHolds.delete(key);
+        this.holdReleases.delete(key);
+      }
       releaseHold();
     };
+    this.holdReleases.set(key, release);
     try {
       // A session still being built is not waited for: createLiveSession
       // re-checks the hold before publishing and discards it.
@@ -856,6 +863,13 @@ export class LiveSessionManager {
     // even though the hot-mount drain below yields before the sessions are
     // closed.
     this.stopping = true;
+
+    // NO HOLD OUTLIVES SHUTDOWN. The Agent awaits (bounded) and aborts any
+    // rewind before calling this; a rewind still stalled past that budget must
+    // not leave turns parked on its hold. Released turns find `stopping` set
+    // and are refused (createLiveSession), and the rewind itself can no longer
+    // publish (its publish step checks the Agent's stopping flag).
+    for (const release of [...this.holdReleases.values()]) release();
 
     // BEFORE the sessions are closed. `stopping` is already the admission
     // gate, so nothing new joins the queue and anything queued-but-unstarted

@@ -11,9 +11,14 @@ export interface SettleOptions {
   pollMs?: number;
   /** Total prepare attempts when the snapshot guard trips (1 + retries). */
   attempts?: number;
+  /** Shutdown. Checked between every wait and attempt; a fork prepared after
+   *  it fired is discarded, never published. */
+  signal?: AbortSignal;
 }
 
-const DEFAULTS: Required<SettleOptions> = { quietMs: 500, maxWaitMs: 5_000, pollMs: 50, attempts: 3 };
+export const REWIND_ABORTED = "Tomo is stopping. Try again after restart.";
+
+const DEFAULTS: Required<Omit<SettleOptions, "signal">> = { quietMs: 500, maxWaitMs: 5_000, pollMs: 50, attempts: 3 };
 
 export const HISTORY_KEPT_CHANGING = "Session history kept changing during rewind. Try again in a moment.";
 
@@ -32,13 +37,13 @@ function fileVersion(path: string): { version: string; mtimeMs: number } {
  * modification — so a transcript that went quiet long ago costs no wait.
  * Resolves false if it was still changing at `maxWaitMs`.
  */
-export async function waitForQuietFile(path: string, quietMs: number, maxWaitMs: number, pollMs: number): Promise<boolean> {
+export async function waitForQuietFile(path: string, quietMs: number, maxWaitMs: number, pollMs: number, signal?: AbortSignal): Promise<boolean> {
   const deadline = Date.now() + maxWaitMs;
   const initial = fileVersion(path);
   let version = initial.version;
   let quietSince = Math.min(Date.now(), initial.mtimeMs);
   while (Date.now() - quietSince < quietMs) {
-    if (Date.now() >= deadline) return false;
+    if (Date.now() >= deadline || signal?.aborted) return false;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
     const next = fileVersion(path).version;
     if (next !== version) {
@@ -70,14 +75,19 @@ export async function prepareSettledSessionRewind(
   options: SettleOptions = {},
 ): Promise<PreparedRewind> {
   const { quietMs, maxWaitMs, pollMs, attempts } = { ...DEFAULTS, ...options };
+  const { signal } = options;
+  const aborted = () => new Error(REWIND_ABORTED);
   const path = getSdkSessionPath(sessionId, sdkSessionsDir);
   for (let attempt = 1; ; attempt++) {
-    if (!await waitForQuietFile(path, quietMs, maxWaitMs, pollMs)) {
+    if (signal?.aborted) throw aborted();
+    if (!await waitForQuietFile(path, quietMs, maxWaitMs, pollMs, signal)) {
+      if (signal?.aborted) throw aborted();
       log.warn({ sessionId, attempt, maxWaitMs }, "Rewind: transcript still changing; trying anyway");
     }
     try {
       const prepared = await prepareSessionRewind(sessionId, count, workspaceDir, sdkSessionsDir);
       try {
+        if (signal?.aborted) throw aborted();
         publish(prepared);
       } catch (err) {
         await prepared.discard();

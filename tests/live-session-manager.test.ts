@@ -42,6 +42,7 @@ const { mockState } = vi.hoisted(() => ({
       errors: Record<string, string>;
     } | null>),
     compactTriggered: false,
+    onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
   },
 }));
 
@@ -65,6 +66,10 @@ vi.mock("../src/agent/live-session.js", () => {
     isAlive() { return !this.closed; }
     isBusy() { return this.busy; }
     close() { this.closed = true; }
+    interruptedWith: Error | null = null;
+    interrupt(err: Error) { this.interruptedWith = err; this.closed = true; mockState.onInterrupt?.(err, this); }
+    whenEventLoopDone() { return Promise.resolve(); }
+    steeredRequestCount() { return 0; }
     waitForIdle() { return new Promise<void>((r) => this.idleResolvers.push(r)); }
     getSessionId() { return this.sessionId; }
     async setMcpServers(servers: Record<string, unknown>) {
@@ -90,6 +95,12 @@ vi.mock("../src/agent/live-session.js", () => {
     STEER_MERGED: "",
     DELIVERY_TIMEOUT_MS: 60_000,
     MAX_TURNS_RESPONSE: "I ran out of steps trying to complete that. Can you try a simpler request?",
+    TurnInterruptedError: class TurnInterruptedError extends Error {
+      constructor(message = "Turn stopped by /rewind.") {
+        super(message);
+        this.name = "TurnInterruptedError";
+      }
+    },
     SdkResultError: class SdkResultError extends Error {
       constructor(message: string, readonly subtype: string, readonly errors: string[] = []) {
         super(message);
@@ -161,6 +172,7 @@ beforeEach(() => {
   mockState.mcpSetCalls = [];
   mockState.mcpSetImpl = null;
   mockState.compactTriggered = false;
+  mockState.onInterrupt = null;
 });
 
 describe("LiveSessionManager session lifecycle", () => {
@@ -855,6 +867,40 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(response).toBe("A");
     expect(attempts).toBe(2);
     expect(received).toEqual(["A"]);
+  });
+
+  it("a /rewind interrupt stops the running turn without retrying it, and holds new turns until released", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    const prompts: string[] = [];
+    mockState.sendImpl = (prompt, session) => {
+      prompts.push(prompt);
+      if (prompt !== "stuck") return Promise.resolve("next answer");
+      session.busy = true;
+      return new Promise<string>((_resolve, reject) => {
+        mockState.onInterrupt = (err) => { session.busy = false; reject(err); };
+      });
+    };
+
+    const stuck = manager.runWithRetry({ key: "dm:owner", prompt: "stuck", hasShipped: () => false });
+    await vi.waitFor(() => expect(manager.isBusy("dm:owner")).toBe(true));
+    const suspension = await manager.suspendForRewind("dm:owner");
+    expect(suspension.stoppedTurn).toBe(true);
+    await expect(stuck).rejects.toMatchObject({ name: "TurnInterruptedError" });
+    // Not retried: one prompt, one session, and nothing reset.
+    expect(prompts).toEqual(["stuck"]);
+    expect(mockState.instances).toHaveLength(1);
+    expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
+
+    // A turn arriving during the rewind waits, then runs on a fresh session.
+    const next = manager.runWithRetry({ key: "dm:owner", prompt: "after" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(prompts).toEqual(["stuck"]);
+    expect(mockState.instances).toHaveLength(1);
+    suspension.release();
+    await expect(next).resolves.toBe("next answer");
+    expect(prompts).toEqual(["stuck", "after"]);
+    expect(mockState.instances).toHaveLength(2);
   });
 
   it("keeps the SDK session id on 'Session is closed' errors and retries once", async () => {

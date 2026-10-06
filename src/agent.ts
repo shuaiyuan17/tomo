@@ -36,7 +36,7 @@ import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
-import { prepareSessionRewind } from "./agent/session-rewind.js";
+import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
@@ -182,6 +182,8 @@ export class Agent {
   private sessions: SessionStore;
   private router: IdentityRouter;
   private sessionQueue = new SessionQueue();
+  /** Per-key chain serializing /rewind (see rewindSession). */
+  private rewinds = new Map<string, Promise<void>>();
   /**
    * Inbound work that has been accepted by a channel but has not started its
    * per-session task yet. Unlike the generic SessionQueue tail, this retains
@@ -277,23 +279,7 @@ export class Agent {
       modelOverrides: this.modelOverrides,
       closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
       isSessionLive: (key) => this.liveSessionManager.isAlive(key),
-      rewindSession: (key, count) => this.enqueueForSession(key, async () => {
-        if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-        if (this.liveSessionManager.isBusy(key)) throw new Error("A turn is still running. Try /rewind after it finishes.");
-        const sid = this.sessions.getSdkSessionId(key);
-        if (!sid) throw new Error("No active conversation to rewind.");
-        this.liveSessionManager.closeLiveSession(key);
-        const rewind = await prepareSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir);
-        try {
-          if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-          rewind.assertUnchanged();
-          this.sessions.replaceSdkSessionId(key, sid, rewind.sessionId);
-        } catch (err) {
-          await rewind.discard();
-          throw err;
-        }
-        return { count: rewind.count, preview: rewind.preview };
-      }),
+      rewindSession: (key, count) => this.rewindSession(key, count),
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
       getExternalMcpStatuses: (key) => this.mcpOAuthManager.getServerStatuses(
         config.mcpServers ?? {},
@@ -530,6 +516,45 @@ export class Agent {
    */
   private enqueueForSession<T>(sessionKey: string, task: () => Promise<T>): Promise<T> {
     return this.sessionQueue.enqueue(sessionKey, task);
+  }
+
+  /**
+   * /rewind. Deliberately NOT on the session queue: the owner reaches for it
+   * when a turn is stuck, and behind the queue it would wait for that very
+   * turn. Instead it interrupts the running turn (never retried, nothing more
+   * delivered from it) and holds the key in the LiveSessionManager while it
+   * forks, so every other turn for this key — queued user messages, steered
+   * drains, crons, heartbeats — waits and then runs on the rewound
+   * conversation. Nothing queued is dropped or re-run. Rewinds of one key
+   * run one at a time.
+   */
+  private rewindSession(key: string, count: number): Promise<{ count: number; preview: string; stoppedTurn: boolean; droppedMessages: number }> {
+    const previous = this.rewinds.get(key) ?? Promise.resolve();
+    const run = previous.then(() => this.rewindSessionNow(key, count));
+    const settled = run.then(() => {}, () => {});
+    this.rewinds.set(key, settled);
+    void settled.then(() => { if (this.rewinds.get(key) === settled) this.rewinds.delete(key); });
+    return run;
+  }
+
+  private async rewindSessionNow(key: string, count: number): Promise<{ count: number; preview: string; stoppedTurn: boolean; droppedMessages: number }> {
+    const stopping = () => new Error("Tomo is stopping. Try again after restart.");
+    if (this.stopping) throw stopping();
+    if (!this.sessions.getSdkSessionId(key)) throw new Error("No active conversation to rewind.");
+    const suspension = await this.liveSessionManager.suspendForRewind(key);
+    try {
+      if (this.stopping) throw stopping();
+      const sid = this.sessions.getSdkSessionId(key);
+      if (!sid) throw new Error("No active conversation to rewind.");
+      const rewind = await prepareSettledSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir, (prepared) => {
+        if (this.stopping) throw stopping();
+        prepared.assertUnchanged();
+        this.sessions.replaceSdkSessionId(key, sid, prepared.sessionId);
+      });
+      return { count: rewind.count, preview: rewind.preview, stoppedTurn: suspension.stoppedTurn, droppedMessages: suspension.droppedMessages };
+    } finally {
+      suspension.release();
+    }
   }
 
   /**

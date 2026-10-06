@@ -5,7 +5,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/a
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 const prepare = vi.hoisted(() => vi.fn());
 const discard = vi.hoisted(() => vi.fn());
-vi.mock("../src/agent/session-rewind.js", () => ({ prepareSessionRewind: prepare }));
+vi.mock("../src/agent/session-rewind.js", async (importOriginal) => ({ ...await importOriginal<typeof import("../src/agent/session-rewind.js")>(), prepareSessionRewind: prepare }));
 import { Agent, MockChannel, SessionStore, installAgentTestHooks, resetConfig, mockSdk, drainQueue, makeMsg } from "./helpers/agent-harness.js";
 
 installAgentTestHooks();
@@ -121,22 +121,50 @@ describe("/rewind", () => {
     }
   });
 
-  it("waits behind an active turn before closing and forking the session", async () => {
-    const { agent, channel } = setup();
+  it("stops a stuck turn instead of waiting behind it; the turn is not retried and sends nothing more", async () => {
+    const { agent, channel, store } = setup();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    mockSdk.responseFn = async () => { await gate; return "Finished"; };
+    mockSdk.responseFn = async (text) => {
+      if (text.includes("Work")) { await gate; return "Late reply from the stopped turn"; }
+      return "Fresh answer";
+    };
     try {
       await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Work" }));
       await vi.waitFor(() => expect(mockSdk.promptsBySession).toHaveLength(1));
-      const pending = command(channel);
-      await Promise.resolve();
-      expect(prepare).not.toHaveBeenCalled();
-      release();
-      await pending;
+      // Sent while the turn is stuck: steered into it, so it goes with it.
+      await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Still there?" }));
+      const live = () => (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { steeredRequestCount(): number }> } })
+        .liveSessionManager.liveSessions.get("dm:example");
+      await vi.waitFor(() => expect(live()?.steeredRequestCount()).toBe(1));
+      // A cron queued behind the stuck turn: runs after the rewind, on the fork.
+      const cron = agent.handleCronMessage("Scheduled check", "dm:example");
+
+      await command(channel);
       expect(prepare).toHaveBeenCalledOnce();
-      expect(channel.sent[0].text).toBe("Finished");
-      expect(channel.sent.at(-1)?.text).toContain("Context rewound");
+      expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
+      expect(channel.sent).toHaveLength(1);
+      expect(channel.sent[0].text).toContain("Context rewound");
+      expect(channel.sent[0].text).toContain("The turn that was still running was stopped first and will send nothing more. 1 message(s) you sent while it ran went with it");
+
+      release();
+      await cron;
+      await drainQueue(agent);
+      // Neither the stopped turn nor the steered message was re-run.
+      expect(mockSdk.promptsBySession.filter((p) => p.text.includes("Work") || p.text.includes("Still there?"))).toHaveLength(1);
+      expect(mockSdk.promptsBySession.at(-1)?.text).toContain("Scheduled check");
+      expect(mockSdk.optionsBySession.at(-1)?.options.resume).toBe("fork-example");
+      // Nothing from the stopped turn (no late block, no error) after the rewind reply.
+      expect(channel.sent.map((m) => m.text).join("\n")).not.toMatch(/Late reply|\[error\]/);
     } finally { release(); await agent.stop(); }
+  });
+
+  it("does not mention a stopped turn when nothing was running", async () => {
+    const { agent, channel } = setup();
+    try {
+      await command(channel);
+      expect(channel.sent.at(-1)?.text).toContain("Context rewound");
+      expect(channel.sent.at(-1)?.text).not.toContain("stopped");
+    } finally { await agent.stop(); }
   });
 });

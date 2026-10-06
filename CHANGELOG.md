@@ -2,6 +2,7 @@
 
 ## Unreleased
 - `/rewind`: tool calls from interrupted or blocked turns (a result that never arrived) no longer block every rewind with "That message arrived during a tool call". Only a cut that would split a tool call from a result that does appear later counts as mid-turn, and instead of refusing, the rewind moves back to the end of the previous complete turn. The reply quotes the message it rewound to and says when that is further back than N.
+- `/rewind` works while the assistant is stuck: it stops the running turn instead of waiting behind it or refusing (the stopped turn is not retried and sends nothing more; the reply says so), waits for the closed session's last transcript writes before forking, and retries up to twice if the transcript still changes. Previously it failed with "Session history changed during rewind" right after a stopped turn. Work queued for the session runs after the rewind, on the rewound context.
 
 ## 0.10.0 (2026-10-05)
 

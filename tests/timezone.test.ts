@@ -128,10 +128,25 @@ describe("warn-once memo under a flood of bad values", () => {
     expect(warnCount() - beforeSecondPass).toBe(0);
   });
 
-  it("says once that further warnings are suppressed", () => {
-    const notices = vi.mocked(log.warn).mock.calls.filter(
+  it("says once that further warnings are suppressed", async () => {
+    // Self-contained: a fresh copy of the module (empty memo, notice not yet
+    // announced) and of the mocked logger, so this neither depends on the test
+    // above having filled the memo nor on mock calls surviving between tests
+    // (vitest clears mocks before each test).
+    vi.resetModules();
+    const fresh = await import("../src/timezone.js");
+    const { log: freshLog } = await import("../src/logger.js");
+    const notices = () => vi.mocked(freshLog.warn).mock.calls.filter(
       ([, message]) => typeof message === "string" && message.includes("further invalid timezone warnings are suppressed"),
     );
-    expect(notices).toHaveLength(1);
+
+    const values = Array.from({ length: 260 }, (_, i) => `Not/AFreshZone${i}`);
+    for (const v of values) fresh.validTimeZone(v);
+    expect(notices()).toHaveLength(1);
+
+    // Further passes past the ceiling must not repeat the notice.
+    for (const v of values) fresh.validTimeZone(v);
+    for (const v of values) fresh.validTimeZone(`${v}-again`);
+    expect(notices()).toHaveLength(1);
   });
 });

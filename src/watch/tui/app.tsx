@@ -1,3 +1,4 @@
+import type { WriteStream } from "node:tty";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import { WatchClient } from "../client.js";
@@ -24,11 +25,25 @@ export interface AppProps {
   logPath: string;
 }
 
+const DEFAULT_COLUMNS = 100;
+const DEFAULT_ROWS = 30;
+
+/**
+ * Ink 8 types `useStdout().stdout` as a generic writable stream; only a TTY
+ * carries `columns`/`rows`. Narrow on `isTTY` rather than casting, so a piped
+ * or test stream just gets the defaults.
+ */
+function isTtyStream(stream: NodeJS.WritableStream): stream is WriteStream {
+  return "isTTY" in stream && stream.isTTY === true;
+}
+
 function useTerminalSize(): { columns: number; rows: number } {
   const { stdout } = useStdout();
   // `|| fallback` (not ??): some ptys report 0×0, which must not collapse
   // the layout to nothing.
-  const read = () => ({ columns: stdout.columns || 100, rows: stdout.rows || 30 });
+  const read = () => isTtyStream(stdout)
+    ? { columns: stdout.columns || DEFAULT_COLUMNS, rows: stdout.rows || DEFAULT_ROWS }
+    : { columns: DEFAULT_COLUMNS, rows: DEFAULT_ROWS };
   const [size, setSize] = useState(read);
   useEffect(() => {
     const onResize = () => setSize(read());

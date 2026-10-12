@@ -1,8 +1,25 @@
 # Changelog
 
-## Unreleased
-- `/rewind`: tool calls from interrupted or blocked turns (a result that never arrived) no longer block every rewind with "That message arrived during a tool call". Only a cut that would split a tool call from a result that does appear later counts as mid-turn, and instead of refusing, the rewind moves back to the end of the previous complete turn. The reply quotes the message it rewound to and says when that is further back than N.
-- `/rewind` works while the assistant is stuck: it stops the running turn instead of waiting behind it or refusing (the stopped turn is not retried and sends nothing more; the reply says so), waits for the closed session's last transcript writes before forking, and retries up to twice if the transcript still changes. Previously it failed with "Session history changed during rewind" right after a stopped turn. Work queued for the session runs after the rewind, on the rewound context.
+## 0.10.1 (2026-10-12)
+
+### Bug fixes
+
+- `/rewind` no longer refuses every count because of an old interrupted tool call. If the cut would split a tool call from its result, it moves back to the previous complete turn and tells you which message it rewound to (#407).
+- `/rewind` works while a turn is stuck: it stops the running turn instead of waiting or failing with "Session history changed during rewind". Queued messages and scheduled jobs run afterwards on the rewound conversation (#408).
+- `/rewind` can stop a stuck first turn in a new conversation, and shutdown no longer hangs on a rewind in progress (#408).
+- Context rollups refuse an empty summary instead of replacing a period with a blank block, e.g. when `--summary "$(cat file)"` points at a missing file (#413).
+- iMessage: editing a sent message works on macOS 26 and later (#414).
+
+### Other
+
+- Dependabot config: the `@types/node` and TypeScript 7 ignore rules were silently dropped by a duplicate YAML key; they are back (#405).
+- Test isolation fix for vitest 5 (#415).
+
+### Dependencies
+
+- `@anthropic-ai/claude-agent-sdk` 0.3.289 → 0.3.296 (#409, #412); additive changes only.
+- `ink` 7 → 8, `vitest` 4 → 5 (#415); unused `dotenv` removed.
+- Minor bumps: `@playwright/test`, `typescript-eslint`, `vite` 8.3.3 (#415); transitive refresh. `npm audit`: 0 vulnerabilities.
 
 ## 0.10.0 (2026-10-05)
 

@@ -238,6 +238,130 @@ describe("buildUsageReport", () => {
     expect(report).toContain("Re-login to Claude Code");
   });
 
+  describe("stale access token with a refresh token", () => {
+    const USAGE_BODY = {
+      five_hour: { utilization: 2, resets_at: "2026-07-28T02:59:59+00:00" },
+      seven_day: { utilization: 36, resets_at: "2026-08-02T14:59:59+00:00" },
+    };
+    const STALE = { claudeAiOauth: { accessToken: "stale", refreshToken: "rt", expiresAt: NOW - 1000, subscriptionType: "max" } };
+    const FRESH = { claudeAiOauth: { accessToken: "fresh", refreshToken: "rt2", expiresAt: NOW + 3_600_000, subscriptionType: "max" } };
+
+    /** Credential store that returns `first`, then `afterRefresh` once refreshCredentials ran. */
+    function store(first: unknown, afterRefresh: unknown) {
+      const state = { refreshes: 0, loads: 0 };
+      return {
+        state,
+        loadCredentials: async () => { state.loads++; return (state.refreshes > 0 ? afterRefresh : first) as typeof CREDS; },
+        refreshCredentials: async () => { state.refreshes++; },
+      };
+    }
+
+    it("delegates the refresh to Claude Code, re-reads, and reports usage with the fresh token", async () => {
+      const s = store(STALE, FRESH);
+      const seenAuth: string[] = [];
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async (_url: string, init?: RequestInit) => {
+          seenAuth.push(new Headers(init?.headers).get("Authorization") ?? "");
+          return okResponse(USAGE_BODY);
+        }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(seenAuth).toEqual(["Bearer fresh"]);
+      expect(report).toContain("Session (5h):  2%");
+      expect(report).not.toContain("expired");
+    });
+
+    it("does not tell the owner to re-login when the refresh didn't land yet", async () => {
+      const s = store(STALE, STALE);
+      let fetched = false;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { fetched = true; return okResponse(USAGE_BODY); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(fetched).toBe(false);
+      expect(report).toContain("refreshes automatically on the next agent turn");
+      expect(report).not.toContain("Re-login to Claude Code (");
+    });
+
+    it("degrades to the stale-token message when the refresh or re-read throws", async () => {
+      let loads = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => { if (loads++ > 0) throw new Error("secret detail"); return STALE; },
+        refreshCredentials: async () => { throw new Error("spawn failed"); },
+      });
+      expect(report).toContain("refreshes automatically on the next agent turn");
+      expect(report).not.toContain("secret detail");
+    });
+
+    it("still asks to re-login when the token is expired and there is no refresh token", async () => {
+      let refreshes = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => ({ claudeAiOauth: { accessToken: "t", expiresAt: NOW - 1000 } }),
+        refreshCredentials: async () => { refreshes++; },
+      });
+      expect(refreshes).toBe(0);
+      expect(report).toContain("access token expired");
+      expect(report).toContain("Re-login to Claude Code");
+    });
+
+    it("on a 401 with a valid-looking expiry, refreshes and retries once with the new token", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      const s = store(valid, FRESH);
+      const seenAuth: string[] = [];
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async (_url: string, init?: RequestInit) => {
+          const auth = new Headers(init?.headers).get("Authorization") ?? "";
+          seenAuth.push(auth);
+          return auth === "Bearer fresh" ? okResponse(USAGE_BODY) : new Response("", { status: 401 });
+        }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(seenAuth).toEqual(["Bearer stale", "Bearer fresh"]);
+      expect(report).toContain("Weekly (7d):   36%");
+    });
+
+    it("on a 401 whose token didn't change, doesn't retry and doesn't say re-login", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      const s = store(valid, valid);
+      let calls = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { calls++; return new Response("", { status: 401 }); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(calls).toBe(1);
+      expect(report).toContain("refreshes automatically on the next agent turn");
+      expect(report).not.toContain("Re-login to Claude Code (");
+    });
+
+    it("refreshes at most once per /usage (expired, then 401 on the fresh token)", async () => {
+      const s = store(STALE, FRESH);
+      let calls = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { calls++; return new Response("", { status: 401 }); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(calls).toBe(1);
+      expect(report).toContain("refreshes automatically on the next agent turn");
+    });
+  });
+
   it("returns a FIXED network-error message that never echoes the raw error", async () => {
     // The thrown message must not leak into the surfaced text (a future fetch
     // wrapper could put the bearer token in an error). Assert exact string.

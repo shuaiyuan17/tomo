@@ -1797,3 +1797,256 @@ describe("McpOAuthManager — rejected refreshes", () => {
     expect(exchanges).toBe(1);
   });
 });
+
+describe("McpOAuthManager — issuer-rejected client", () => {
+  const servers = (): Record<string, ExternalMcpServerConfig> => ({
+    "cloudflare-api": {
+      server: { type: "http", url: "https://api.cf.example/mcp" },
+      // No configured clientId: the client was dynamically registered.
+      oauth: { authorizationServer: "https://auth.example", scopes: [], tokenStoreKey: "cloudflare" },
+    },
+  });
+
+  function seed(oauthPath: string, now: number) {
+    mkdirSync(join(TEST_DIR, "secrets"), { recursive: true });
+    writeFileSync(oauthPath, JSON.stringify({
+      mcpOAuth: {
+        cloudflare: {
+          accessToken: "old-access",
+          refreshToken: "old-refresh",
+          tokenType: "Bearer",
+          expiresAt: now + 1_000,
+          clientId: "old-client",
+          authorizationServer: "https://auth.example",
+          tokenEndpoint: "https://auth.example/token",
+          registrationEndpoint: "https://auth.example/register",
+          resource: "https://api.cf.example/mcp",
+          updatedAt: now - 1_000,
+        },
+      },
+    }));
+  }
+
+  function issuer(tokenResponse: () => Response, registrations: string[]) {
+    return async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "https://auth.example/token") return tokenResponse();
+      if (url === "https://auth.example/.well-known/oauth-authorization-server") {
+        return new Response(JSON.stringify({
+          authorization_endpoint: "https://auth.example/authorize",
+          token_endpoint: "https://auth.example/token",
+          registration_endpoint: "https://auth.example/register",
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url === "https://auth.example/register") {
+        registrations.push(String(init?.body ?? ""));
+        return new Response(JSON.stringify({ client_id: "new-client" }), {
+          status: 201, headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+  }
+
+  /** Run the browser flow just far enough to see which client_id the authorize link carries. */
+  async function authorizeClientId(manager: McpOAuthManager): Promise<string | null> {
+    let seen: string | null = null;
+    await expect(manager.withOAuthHeader("cloudflare-api", servers()["cloudflare-api"], async (_name, url) => {
+      seen = new URL(url).searchParams.get("client_id");
+      throw new Error("stop at authorize link");
+    }, true)).rejects.toThrow("stop at authorize link");
+    return seen;
+  }
+
+  it("flags the client on invalid_client and registers a new one at the next login", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const registrations: string[] = [];
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: issuer(
+          () => new Response(JSON.stringify({ error: "invalid_client" }), { status: 401 }),
+          registrations,
+        ),
+      });
+
+      await expect(manager.refreshServerToken("cloudflare-api", servers())).resolves.toBe("failed");
+      const stored = JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.cloudflare;
+      expect(stored.clientRejectedAt).toBe(clock);
+      expect(stored.clientId).toBe("old-client");
+
+      expect(await authorizeClientId(manager)).toBe("new-client");
+      expect(registrations).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("treats a bare 401 from the token endpoint as a client rejection", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: issuer(() => new Response("unauthorized", { status: 401 }), []),
+      });
+      await manager.refreshServerToken("cloudflare-api", servers());
+      expect(JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.cloudflare.clientRejectedAt).toBe(clock);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps the client when only the grant died (invalid_grant)", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const registrations: string[] = [];
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: issuer(
+          () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }),
+          registrations,
+        ),
+      });
+
+      await expect(manager.refreshServerToken("cloudflare-api", servers())).resolves.toBe("failed");
+      expect(JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.cloudflare.clientRejectedAt).toBeUndefined();
+      expect(await authorizeClientId(manager)).toBe("old-client");
+      expect(registrations).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("flags invalid_client sent as a 400 too", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: issuer(() => new Response(JSON.stringify({ error: "invalid_client" }), { status: 400 }), []),
+      });
+      await manager.refreshServerToken("cloudflare-api", servers());
+      expect(JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.cloudflare.clientRejectedAt).toBe(clock);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not flag a 401 that names a different error", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: issuer(() => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 401 }), []),
+      });
+      await manager.refreshServerToken("cloudflare-api", servers());
+      expect(JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.cloudflare.clientRejectedAt).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("registers a new client when the configured client_id is the one that was rejected", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const store = JSON.parse(readFileSync(oauthPath, "utf-8"));
+    store.mcpOAuth.cloudflare.clientRejectedAt = clock;
+    writeFileSync(oauthPath, JSON.stringify(store));
+    const registrations: string[] = [];
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      now: () => clock,
+      fetchImpl: issuer(() => new Response("unused", { status: 500 }), registrations),
+    });
+    const entry = { ...servers()["cloudflare-api"], oauth: { ...servers()["cloudflare-api"].oauth!, clientId: "old-client" } };
+    let seen: string | null = null;
+    await expect(manager.withOAuthHeader("cloudflare-api", entry, async (_name, url) => {
+      seen = new URL(url).searchParams.get("client_id");
+      throw new Error("stop at authorize link");
+    }, true)).rejects.toThrow("stop at authorize link");
+    expect(seen).toBe("new-client");
+    expect(registrations).toHaveLength(1);
+  });
+
+  it("stops the sweep from refreshing with a rejected client", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    const store = JSON.parse(readFileSync(oauthPath, "utf-8"));
+    store.mcpOAuth.cloudflare.clientRejectedAt = clock - 5_000;
+    writeFileSync(oauthPath, JSON.stringify(store));
+    let exchanges = 0;
+    // A fresh manager: no in-memory backoff, as after a restart.
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      now: () => clock,
+      fetchImpl: issuer(() => { exchanges++; return new Response("x", { status: 401 }); }, []),
+    });
+    await manager.refreshExpiringTokens(servers());
+    expect(exchanges).toBe(0);
+  });
+
+  it("does not flag a record that a login replaced while the refresh was in flight", async () => {
+    resetDir();
+    const oauthPath = join(TEST_DIR, "secrets", "mcp-oauth.json");
+    const clock = 1_000_000;
+    seed(oauthPath, clock);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const atToken = new Promise<void>((resolve) => { reached = resolve; });
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      const manager = new McpOAuthManager({
+        workspaceDir: TEST_DIR,
+        now: () => clock,
+        fetchImpl: async (input) => {
+          if (String(input) !== "https://auth.example/token") throw new Error(`unexpected fetch ${String(input)}`);
+          reached();
+          await gate;
+          return new Response("unauthorized", { status: 401 });
+        },
+      });
+      const refresh = manager.refreshServerToken("cloudflare-api", servers());
+      await atToken;
+      // A login lands first: same client id, new grant, next revision.
+      const store = JSON.parse(readFileSync(oauthPath, "utf-8"));
+      store.mcpOAuth.cloudflare = { ...store.mcpOAuth.cloudflare, accessToken: "login-access", revision: 1 };
+      writeFileSync(oauthPath, JSON.stringify(store));
+      release();
+      await expect(refresh).resolves.toBe("failed");
+      const stored = JSON.parse(readFileSync(oauthPath, "utf-8")).mcpOAuth.cloudflare;
+      expect(stored.accessToken).toBe("login-access");
+      expect(stored.clientRejectedAt).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

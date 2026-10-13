@@ -71,7 +71,37 @@ export interface OAuthTokenRecord {
   tokenEndpoint?: string;
   registrationEndpoint?: string;
   resource?: string;
+  /**
+   * Set when the token endpoint rejected `clientId` itself (RFC 6749
+   * `invalid_client`, or a 401). A dynamically registered client can be
+   * dropped by the issuer at any time; once it is, every refresh fails and
+   * every authorize link built from it dead-ends on the issuer's
+   * "Invalid client_id" page. The next browser flow registers a new client
+   * instead of reusing this one, and its grant overwrites the whole record.
+   */
+  clientRejectedAt?: number;
   updatedAt: number;
+}
+
+/** A non-2xx answer from a token endpoint, with the RFC 6749 error code when the body carried one. */
+class OAuthTokenExchangeError extends Error {
+  constructor(readonly status: number, readonly code?: string) {
+    super(`OAuth token exchange failed: ${status}${code ? ` (${code})` : ""}`);
+  }
+}
+
+/**
+ * Did the issuer reject the CLIENT, as opposed to the grant? RFC 6749 §5.2
+ * reserves 401 for `invalid_client`; every other token error is a 400
+ * (`invalid_grant` for a dead refresh token). A bare 401 with no error code
+ * counts too — a false positive costs one extra dynamic registration at the
+ * next login, a false negative a login link that can never work — but a 401
+ * that names some OTHER error is taken at its word.
+ */
+function isClientRejection(error: unknown): boolean {
+  if (!(error instanceof OAuthTokenExchangeError)) return false;
+  if (error.code !== undefined) return error.code === "invalid_client";
+  return error.status === 401;
 }
 
 interface TokenStoreFile {
@@ -517,6 +547,10 @@ export class McpOAuthManager {
       // live server and a hand-run `/mcp login` are things someone is waiting
       // on, and they pass onlyIfExpiring false.
       if (options.onlyIfExpiring && this.isBackingOff(storeKey)) return "skipped";
+      // A client the issuer rejected cannot refresh anything; the sweep waits
+      // for the login that replaces it. (The backoff above lives in memory and
+      // is gone after a restart — this flag is on disk.)
+      if (options.onlyIfExpiring && existing.clientRejectedAt) return "skipped";
       result = await this.refreshStoredToken(storeKey, existing, oauth);
     }
 
@@ -589,6 +623,9 @@ export class McpOAuthManager {
         }
         return { outcome: "refreshed", token: refreshed };
       } catch (error) {
+        if (isClientRejection(error) && existing.clientId) {
+          this.markClientRejected(storeKey, existing.clientId, revisionOf(existing));
+        }
         return { outcome: "failed", error };
       } finally {
         this.tokenRefreshes.delete(storeKey);
@@ -876,9 +913,14 @@ export class McpOAuthManager {
     redirectUri: string,
     existing?: OAuthTokenRecord,
   ): Promise<{ clientId: string; clientSecret?: string }> {
-    if (existing?.clientId) return { clientId: existing.clientId, clientSecret: existing.clientSecret };
-    if (oauth.clientId) return { clientId: oauth.clientId };
+    // A client the issuer has rejected is reused only when there is nothing to
+    // replace it with: no DIFFERENT configured id, no registration endpoint.
+    const rejected = existing?.clientRejectedAt ? existing.clientId : undefined;
+    if (existing?.clientId && !rejected) return { clientId: existing.clientId, clientSecret: existing.clientSecret };
+    if (oauth.clientId && oauth.clientId !== rejected) return { clientId: oauth.clientId };
     if (!discovery.auth.registration_endpoint) {
+      if (existing?.clientId) return { clientId: existing.clientId, clientSecret: existing.clientSecret };
+      if (oauth.clientId) return { clientId: oauth.clientId };
       throw new Error("OAuth client_id is required because dynamic client registration is unavailable");
     }
 
@@ -907,7 +949,16 @@ export class McpOAuthManager {
       headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
       body,
     });
-    if (!response.ok) throw new Error(`OAuth token exchange failed: ${response.status}`);
+    if (!response.ok) {
+      let code: string | undefined;
+      try {
+        const body = await response.json() as { error?: unknown };
+        if (typeof body.error === "string") code = body.error;
+      } catch {
+        // Not JSON: the status alone has to do.
+      }
+      throw new OAuthTokenExchangeError(response.status, code);
+    }
     return await response.json() as Record<string, unknown>;
   }
 
@@ -934,6 +985,23 @@ export class McpOAuthManager {
     if (revisionOf(current) !== expectedRevision) return false;
     this.writeToken(key, token);
     return true;
+  }
+
+  /**
+   * Flag the stored client as rejected. Deliberately NOT `writeToken`: that
+   * clears the sweep's backoff, and a rejection is exactly when the sweep
+   * should keep resting. Compare-and-set like the success path: a login that
+   * stored a new record while this exchange was in flight may well have
+   * reused the same client id, and its fresh grant is not ours to condemn.
+   */
+  private markClientRejected(key: string, clientId: string, expectedRevision: number): void {
+    const store = this.readStore();
+    const current = store.mcpOAuth?.[key];
+    if (!current || revisionOf(current) !== expectedRevision) return;
+    if (current.clientId !== clientId || current.clientRejectedAt) return;
+    store.mcpOAuth![key] = { ...current, clientRejectedAt: this.now(), revision: revisionOf(current) + 1 };
+    writeFileAtomicSync(this.tokenStorePath, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
+    log.warn({ storeKey: key, clientId }, "MCP OAuth client rejected by issuer; next login registers a new client");
   }
 
   private writeToken(key: string, token: OAuthTokenRecord): void {

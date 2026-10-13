@@ -239,9 +239,10 @@ export interface TomoConfig {
    *  Outbound text is never pattern-matched to guess what is "thinking" — a
    *  `text` block is always the model's chosen words and always ships. */
   showThinking: boolean;
-  /** DM the owner when an error is kept out of a group chat (passive group
-   *  turns, group cron/background turns), rate-limited to one notice per
-   *  session and error class per 30 minutes. Default true. */
+  /** Tell the owner when an error is kept out of a chat (passive group
+   *  turns, group cron/background turns, silent housekeeping and heartbeat
+   *  turns on the owner's DM), rate-limited to one notice per session and
+   *  error class per 30 minutes. Default true. */
   notifyOwnerOnSuppressedErrors: boolean;
   /** Inactivity timeout for one LiveSession send()/steer() turn. Default 10 minutes. */
   liveSessionTimeoutMs: number;

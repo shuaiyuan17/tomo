@@ -154,10 +154,10 @@ export interface TurnErrorPolicy {
   thrownLogMessage: string;
   /**
    * Who to tell when an error is kept out of the chat by this policy
-   * (`response: "note-only"`, `thrown: "note-only" | "ignore"`). Present only
-   * when the Agent judged the failure worth an owner DM — never for the
-   * owner's own DM session, whose errors are delivered there. Interrupted
-   * turns are never reported. See agent/owner-error-notice.ts.
+   * (`response: "note-only"`, `thrown: "note-only" | "ignore"`) — on any
+   * session, the owner's DM included. Errors a policy delivers visibly are
+   * never reported, and interrupted turns are not errors. See
+   * agent/owner-error-notice.ts.
    */
   ownerNotice?: OwnerNoticeTarget;
 }
@@ -168,6 +168,9 @@ export interface OwnerNoticeTarget {
   label: string;
   turnKind: string;
   rewindable?: boolean;
+  /** dm: session whose own chat receives the notice; absent → the owner's
+   *  default notification target. */
+  deliverTo?: string;
 }
 
 export interface TurnSpec {

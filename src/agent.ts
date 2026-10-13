@@ -248,7 +248,7 @@ export class Agent {
   private stopping = false;
   /** Owner DMs for errors kept out of a group chat (rate-limited). */
   private readonly ownerErrorNotifier = new OwnerErrorNotifier({
-    send: (text) => this.sendNotification(text),
+    send: (text, report) => this.sendOwnerNotice(text, report.deliverTo),
     enabled: () => config.notifyOwnerOnSuppressedErrors !== false,
   });
   private proactive: ProactiveSendService;
@@ -1073,10 +1073,10 @@ export class Agent {
         if (settled) return;
         settled = true;
         log.error({ err, key }, "Background task turn failed");
-        // Nothing is delivered for a failed background turn; on a group that
-        // means nobody hears of it unless the owner is told.
+        // Nothing is delivered for a failed background turn, on any session,
+        // so nobody hears of it unless the owner is told.
         if (!(err instanceof TurnInterruptedError)) {
-          const target = this.groupNoticeTarget(key, "A background task turn");
+          const target = this.ownerNoticeTarget(key, "A background task turn");
           if (target) this.reportSuppressedError(key, target, err instanceof Error ? err.message : String(err));
         }
         await stop();
@@ -1488,7 +1488,7 @@ export class Agent {
       documents: message.documents,
       audiences,
       suppressErrors: isPassiveGroup,
-      ...(isPassiveGroup ? { ownerNotice: this.groupNoticeTarget(`${channel.name}:${message.chatId}`, "A message turn", isDmSessionKey(key)) } : {}),
+      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
       errorLogMessage: "Error handling message",
       steer,
       steerAudience: audience,
@@ -1640,7 +1640,7 @@ export class Agent {
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       audiences,
       suppressErrors: isPassiveGroup,
-      ...(isPassiveGroup ? { ownerNotice: this.groupNoticeTarget(`${lastChannel.name}:${lastMessage.chatId}`, "A message turn", isDmSessionKey(key)) } : {}),
+      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
       steer,
       // PER ITEM, not per batch, IN `numbered`'s ORDER. `summonTargets` (the
@@ -1888,11 +1888,12 @@ export class Agent {
           thrown: suppressErrorDelivery ? "note-only" : "deliver",
           thrownSuppressedLog: "Thrown cron error suppressed from chat delivery",
           thrownLogMessage: "Cron message handling failed",
-          // Only a GROUP's suppressed failure is news to the owner: on a dm:
-          // session errors are delivered, or suppressed on request for silent
-          // housekeeping the owner's next turn will hit anyway.
+          // Any error held back from the chat is news to the owner — on the
+          // owner's own DM too: a silent housekeeping turn failing on an
+          // expired login is otherwise only a pending note for a next turn
+          // that fails the same way.
           ...(suppressErrorDelivery
-            ? { ownerNotice: this.groupNoticeTarget(key, options.jobName ? `Cron job "${options.jobName}"` : "A background turn") }
+            ? { ownerNotice: this.ownerNoticeTarget(key, options.jobName ? `Cron job "${options.jobName}"` : "A background turn") }
             : {}),
         },
       });
@@ -1917,7 +1918,7 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
-    return this.enqueueForSession(key, () => this.processContinuity(prompt, key))
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn"))
       .catch((err) => {
         log.error({ err, sessionKey: key }, "Continuity failed in queue");
       });
@@ -1954,25 +1955,25 @@ export class Agent {
     // group is summoned, is the group's turn wherever it runs — same rule as
     // the cron handoff in processCronMessage.
     const audiences = summonedKey ? [sessionKey] : undefined;
-    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences))
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn"))
       .catch((err) => {
         log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
   }
 
-  private async processContinuity(prompt: string, key: string, audiences?: string[]): Promise<void> {
+  private async processContinuity(prompt: string, key: string, audiences: string[] | undefined, turnKind: string): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
     try {
       // A summoned group's restart notice runs on the owner's dm: session;
       // its failure still belongs to (and is reported as) the group's.
       const groupKey = audiences?.find((a) => isGroupSessionKey(a));
-      await this.runContinuityTurn(prompt, key, groupKey);
+      await this.runContinuityTurn(prompt, key, turnKind, groupKey);
     } finally {
       if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
-  private async runContinuityTurn(prompt: string, key: string, noticeGroupKey: string = key): Promise<void> {
+  private async runContinuityTurn(prompt: string, key: string, turnKind: string, noticeGroupKey?: string): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
@@ -2022,9 +2023,10 @@ export class Agent {
         responseSuppressedLog: "Continuity returned an agent error response",
         thrown: "ignore",
         thrownLogMessage: "Continuity heartbeat failed",
-        // Heartbeats run on the owner's DM (no notice); a restart notice can
-        // run on a group session, whose failure would otherwise vanish.
-        ownerNotice: this.groupNoticeTarget(noticeGroupKey, "A restart notice turn", isDmSessionKey(key)),
+        // Nothing from a continuity turn is ever delivered, error included —
+        // an expired login fails every heartbeat silently unless the owner
+        // is told (rate-limited, so an hourly heartbeat cannot spam).
+        ownerNotice: this.ownerNoticeTarget(key, turnKind, noticeGroupKey),
       },
     });
   }
@@ -2352,19 +2354,49 @@ export class Agent {
   }
 
   /**
-   * Owner-notice target for a failure kept out of a GROUP chat, or undefined
-   * when the key is not a group — the owner's DM gets its errors delivered,
-   * so it is never reported (see agent/owner-error-notice.ts).
+   * Owner-notice target for a failure kept out of a chat (see
+   * agent/owner-error-notice.ts). `groupKey` names the group a summoned turn
+   * belongs to when it runs on the owner's dm: session.
+   *
+   * - a group: reported to the owner's DM (sendNotification), never the group;
+   * - the owner's dm: session: reported IN that DM — the error was held back
+   *   there, so this is the only visible trace of it;
+   * - a raw private chat (not an identity): reported to the owner, not to
+   *   whoever that chat belongs to.
+   *
+   * Callers attach a target only where the turn's policy suppresses errors;
+   * an error delivered visibly is never reported again.
    */
-  private groupNoticeTarget(groupKey: string, turnKind: string, rewindable = false): OwnerNoticeTarget | undefined {
-    if (!isGroupSessionKey(groupKey)) return undefined;
-    const title = this.sessions.getEntry(groupKey)?.chatTitle;
-    return {
-      noticeKey: groupKey,
-      label: title ? `group "${title}" (${groupKey})` : `group ${groupKey}`,
-      turnKind,
-      ...(rewindable ? { rewindable: true } : {}),
-    };
+  private ownerNoticeTarget(sessionKey: string, turnKind: string, groupKey?: string): OwnerNoticeTarget {
+    const noticeKey = groupKey !== undefined && isGroupSessionKey(groupKey) ? groupKey : sessionKey;
+    const rewindable = isDmSessionKey(sessionKey);
+    if (isGroupSessionKey(noticeKey)) {
+      const title = this.sessions.getEntry(noticeKey)?.chatTitle;
+      return {
+        noticeKey,
+        label: title ? `group "${title}" (${noticeKey})` : `group ${noticeKey}`,
+        turnKind,
+        ...(rewindable ? { rewindable: true } : {}),
+      };
+    }
+    if (isDmSessionKey(noticeKey)) {
+      return { noticeKey, label: `this DM session (${noticeKey})`, turnKind, rewindable: true, deliverTo: noticeKey };
+    }
+    return { noticeKey, label: `private chat ${noticeKey}`, turnKind };
+  }
+
+  /** Owner notice into a specific dm: session's own chat. Falls back to the
+   *  generic owner notification target when that chat is unreachable. */
+  private async sendOwnerNotice(text: string, deliverTo: string | undefined): Promise<boolean> {
+    if (deliverTo !== undefined) {
+      const target = this.resolvePrivateReplyTarget(deliverTo);
+      const channel = target ? this.getChannel(target.channelName) : undefined;
+      if (target && channel) {
+        await channel.send({ chatId: target.chatId, text });
+        return true;
+      }
+    }
+    return this.sendNotification(text);
   }
 
   /** Fire-and-forget owner DM for a suppressed error; never throws. */

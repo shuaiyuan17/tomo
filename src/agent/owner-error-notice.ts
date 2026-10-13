@@ -4,12 +4,13 @@ import { classifyTurnError, type TurnErrorClass } from "./api-errors.js";
 /**
  * OWNER NOTICES FOR ERRORS KEPT OUT OF A CHAT.
  *
- * Some turns fail where the failure must not be shown: a passive group (the
- * group never asked for Tomo, and an `[error] …` line there is noise or a
- * leak), and scheduled/background turns on a group. Those policies drop the
- * error from the chat — correctly — but before this module nothing reached
- * the owner either, so a group refused by the safety classifier on every turn,
- * or every group cron failing on an expired login, went unnoticed until the
+ * Some turns fail where the failure is not shown: a passive group (the group
+ * never asked for Tomo, and an `[error] …` line there is noise or a leak),
+ * scheduled/background turns on a group, silent housekeeping turns and
+ * heartbeats on the owner's own DM. Those policies keep the error out of the
+ * chat (at most a pending note for the session's next turn), so a group
+ * refused by the safety classifier on every turn, or every heartbeat and
+ * housekeeping turn failing on an expired login, went unnoticed until the
  * owner happened to look at the logs.
  *
  * This sends the owner a short DM instead: which session, what kind of
@@ -17,8 +18,10 @@ import { classifyTurnError, type TurnErrorClass } from "./api-errors.js";
  * (session, error class) so a session that fails on every turn produces one
  * notice per window, and the next notice says how many were folded into it.
  *
- * Callers decide eligibility (see Agent): the owner's own DM session is never
- * reported, because its errors are delivered there already.
+ * Callers decide eligibility (see Agent.ownerNoticeTarget): only errors the
+ * turn's policy held back are reported — an error delivered visibly to a chat
+ * is never reported a second time. A group's notice goes to the owner, never
+ * to the group.
  */
 
 export const OWNER_NOTICE_WINDOW_MS = 30 * 60 * 1000;
@@ -36,15 +39,17 @@ export interface SuppressedErrorReport {
   detail: string;
   /** SDK session id of the session the turn ran on, for the compact hint. */
   sdkSessionId?: string;
-  /** The turn ran on the owner's dm: session (a summoned group), where
-   *  /rewind is available. */
+  /** The turn ran on the owner's dm: session, where /rewind is available. */
   rewindable?: boolean;
+  /** dm: session whose own chat receives the notice (the failure happened
+   *  there); absent → the owner's default notification target. */
+  deliverTo?: string;
 }
 
 export interface OwnerErrorNotifierDeps {
   /** Deliver a DM to the owner (Agent.sendNotification). Resolving false
    *  means there was no owner target; it counts as a failed send. */
-  send(text: string): Promise<boolean | void>;
+  send(text: string, report: SuppressedErrorReport): Promise<boolean | void>;
   /** Config gate, read per report so a config reload applies. */
   enabled(): boolean;
   now?: () => number;
@@ -79,7 +84,9 @@ function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport): strin
         : `Recovery: ${compact}. Until then, every turn in that session is likely to be refused.`;
     }
     case "auth":
-      return "Recovery: send /login in this DM to refresh the Claude login.";
+      // /login is a harness command (ChatCommandHandler), not a model turn,
+      // so it works while every model turn is failing on auth.
+      return "Recovery: send /login in this DM to refresh the Claude login (handled by Tomo directly, no model turn needed). If that fails, run `claude auth login` on the host.";
     case "usage-limit":
       return "Recovery: wait for the usage window to reset (/usage shows when).";
     default:
@@ -130,7 +137,7 @@ export class OwnerErrorNotifier {
     // cannot both notify.
     this.windows.set(windowKey, { lastSentAt: now, dropped: 0 });
     try {
-      const delivered = await this.deps.send(formatOwnerNotice(report, cls, dropped));
+      const delivered = await this.deps.send(formatOwnerNotice(report, cls, dropped), report);
       if (delivered === false) throw new Error("no owner DM target");
       log.info({ noticeKey: report.noticeKey, errorClass: cls }, "Owner notified of a suppressed error");
       return true;

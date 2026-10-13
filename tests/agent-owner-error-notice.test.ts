@@ -22,6 +22,7 @@ installAgentTestHooks();
 
 const OWNER_CHAT = "12345";
 const GROUP_CHAT = "iMessage;+;group123";
+const AUTH = "Failed to authenticate: OAuth session expired and could not be refreshed";
 const SAFEGUARD = "API Error: Example Model's safeguards flagged this message (https://example.invalid/aup). This sometimes happens with safe, normal conversations.";
 
 /** Owner DM on telegram (identity-bound), passive iMessage group. */
@@ -131,22 +132,61 @@ describe("owner notice for errors kept out of a chat", () => {
     await agent.stop();
   });
 
-  it("never sends an extra notice for the owner's own DM session", async () => {
+  it("does not add a notice when the owner's DM already shows the error", async () => {
     const { agent, tg, im } = await setup();
 
     // A DM turn: the error is delivered in the DM itself — exactly once.
     failNextTurnWith(SAFEGUARD);
     await tg.simulateMessage(makeMsg({ chatId: OWNER_CHAT, text: "question" }));
     await drainQueue(agent);
-    // Silent housekeeping cron on the DM: suppressed on request, no notice.
-    failNextTurnWith("API Error: 500 internal");
-    await agent.handleCronMessage("housekeeping", "dm:owner", { suppressDelivery: true, showTyping: false });
 
     await expectNoChangeFor(() => {
       expect(tg.delivered).toHaveLength(1);
       expect(tg.delivered[0].text).toMatch(/^\[error\] API Error: Example Model's safeguards/);
     });
     expect(im.delivered).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("DM housekeeping cron whose error is held back (note-only): one visible notice in that DM", async () => {
+    const { agent, tg, im } = await setup();
+
+    failNextTurnWith(AUTH);
+    const ok = await agent.handleCronMessage("housekeeping", "dm:owner", { suppressDelivery: true, showTyping: false });
+    expect(ok).toBe(false);
+
+    await waitFor(() => expect(tg.delivered).toHaveLength(1));
+    expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
+    expect(tg.delivered[0].text).toContain("A background turn in this DM session (dm:owner) failed");
+    expect(tg.delivered[0].text).toContain("Kind: authentication failure");
+    expect(tg.delivered[0].text).toContain("send /login in this DM");
+    expect(im.delivered).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("repeated heartbeat auth failures on the DM are rate-limited, sharing the window with crons", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+    const { agent, tg } = await setup();
+
+    failNextTurnWith(AUTH);
+    await agent.handleContinuity("System: Free time.");
+    await waitFor(() => expect(tg.delivered).toHaveLength(1));
+    expect(tg.delivered[0].text).toContain("A heartbeat turn in this DM session (dm:owner) failed");
+    expect(tg.delivered[0].text).toContain("Kind: authentication failure");
+
+    failNextTurnWith(AUTH);
+    await agent.handleContinuity("System: Free time.");
+    failNextTurnWith(AUTH);
+    await agent.handleCronMessage("housekeeping", "dm:owner", { suppressDelivery: true, showTyping: false });
+    await expectNoChangeFor(() => expect(tg.delivered).toHaveLength(1));
+
+    vi.setSystemTime(Date.now() + OWNER_NOTICE_WINDOW_MS + 1000);
+    failNextTurnWith(AUTH);
+    await agent.handleContinuity("System: Free time.");
+    await waitFor(() => expect(tg.delivered).toHaveLength(2));
+    expect(tg.delivered[1].text).toContain("happened 2 more times there since the last notice");
 
     await agent.stop();
   });

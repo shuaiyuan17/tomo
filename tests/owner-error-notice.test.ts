@@ -8,7 +8,7 @@ import {
   OWNER_NOTICE_WINDOW_MS,
   OwnerErrorNotifier,
   errorExcerpt,
-  localIsoSeconds,
+  localIsoTime,
   type SuppressedErrorReport,
 } from "../src/agent/owner-error-notice.js";
 import { TurnRunner, type OwnerNoticeTarget, type TurnErrorPolicy, type TurnSpec } from "../src/agent/turn-runner.js";
@@ -116,11 +116,11 @@ describe("OwnerErrorNotifier", () => {
 
   it("fills the compact range from the last good turn to the failure, and warns the next turn may be refused", async () => {
     const h = make();
-    const lastGood = new Date(2026, 9, 13, 9, 15, 0).getTime();
+    const lastGood = new Date(2026, 9, 13, 9, 15, 0, 850).getTime();
     await h.notifier.report(report({ lastGoodTurnAt: lastGood }));
-    expect(h.sent[0]).toContain(`--from-time ${localIsoSeconds(lastGood)} --to-time ${localIsoSeconds(1_000_000)}`);
-    expect(localIsoSeconds(lastGood)).toMatch(/^2026-10-13T09:15:00[+-]\d{2}:\d{2}$/);
-    expect(new Date(localIsoSeconds(lastGood)).getTime()).toBe(lastGood);
+    expect(h.sent[0]).toContain(`--from-time ${localIsoTime(lastGood)} --to-time ${localIsoTime(1_000_000)}`);
+    expect(localIsoTime(lastGood)).toMatch(/^2026-10-13T09:15:00\.850[+-]\d{2}:\d{2}$/);
+    expect(new Date(localIsoTime(lastGood)).getTime()).toBe(lastGood);
     expect(h.sent[0]).toContain("the next turn there may still be refused");
     await h.notifier.report(report({ noticeKey: "other" }));
     expect(h.sent[1]).toContain("--from-time <time of the last turn that worked>");

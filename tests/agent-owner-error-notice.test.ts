@@ -74,7 +74,7 @@ describe("owner notice for errors kept out of a chat", () => {
     expect(notice.text).toContain("Error: API Error: Example Model's safeguards flagged this message");
     expect(notice.text).toContain("tomo lcm compact --session-id ");
     // The group's earlier (silent, successful) turn bounds the range.
-    expect(notice.text).toMatch(/--from-time \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} --to-time \d{4}-/);
+    expect(notice.text).toMatch(/--from-time \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2} --to-time \d{4}-/);
     expect(notice.text).not.toContain("more time");
     expect(im.delivered).toEqual([]);
 
@@ -358,6 +358,44 @@ describe("owner notice for errors kept out of a chat", () => {
     await waitFor(() => expect(tg.delivered).toHaveLength(1));
     expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
     expect(tg.delivered[0].text).toContain("A background task turn in group \"Team\"");
+    await agent.stop();
+  });
+
+  it("does not follow a persisted reply target the owner identity is no longer bound to", async () => {
+    // The owner chatted from 12345, which persisted dm:owner's reply target…
+    const first = await setup();
+    await first.agent.stop();
+
+    // …then the identity was rebound to another chat and Tomo restarted.
+    resetConfig({
+      identities: [{ name: "owner", channels: { telegram: "54321" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+
+    await groupMessageThatFails(agent, im);
+
+    await waitFor(() => expect(tg.delivered).toHaveLength(1));
+    expect(tg.delivered[0].chatId).toBe("54321");
+    await agent.stop();
+  });
+
+  it("never sends a notice to a group id configured as an identity binding", async () => {
+    resetConfig({
+      identities: [{ name: "owner", channels: { telegram: "-100999" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+
+    await groupMessageThatFails(agent, im);
+
+    await expectNoChangeFor(() => expect(tg.delivered).toEqual([]));
     await agent.stop();
   });
 });

@@ -72,14 +72,16 @@ const CLASS_LABEL: Record<TurnErrorClass, string> = {
   other: "error",
 };
 
-/** Local wall-clock ISO 8601 with offset, to the second — what
- *  `tomo lcm compact --from-time/--to-time` parses. */
-export function localIsoSeconds(ms: number): string {
+/** Local wall-clock ISO 8601 with offset, to the millisecond — what
+ *  `tomo lcm compact --from-time/--to-time` parses, as an exact instant (so
+ *  no precision is dropped: a truncated --to-time would cut off events from
+ *  the failure's own second). */
+export function localIsoTime(ms: number): string {
   const d = new Date(ms);
   const pad = (n: number) => String(Math.trunc(Math.abs(n))).padStart(2, "0");
   const off = -d.getTimezoneOffset();
   const sign = off >= 0 ? "+" : "-";
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, "0")}`
     + `${sign}${pad(off / 60)}:${pad(off % 60)}`;
 }
 
@@ -95,9 +97,9 @@ function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport, failed
       // The failing turn's own prompt is in the range; the last good turn is
       // not (its events all precede the moment it ended).
       const from = report.lastGoodTurnAt !== undefined
-        ? localIsoSeconds(report.lastGoodTurnAt)
+        ? localIsoTime(report.lastGoodTurnAt)
         : "<time of the last turn that worked>";
-      const compact = `compact the range since the last good turn: tomo lcm compact --session-id ${sid} --from-time ${from} --to-time ${localIsoSeconds(failedAt)} --summary "<summary>"`;
+      const compact = `compact the range since the last good turn: tomo lcm compact --session-id ${sid} --from-time ${from} --to-time ${localIsoTime(failedAt)} --summary "<summary>"`;
       const rewind = report.rewindable ? " — or send /rewind in this DM" : "";
       return `Recovery: ${compact}${rewind}. Until that is done and the session reloads, the next turn there may still be refused.`;
     }

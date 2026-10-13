@@ -9,6 +9,7 @@ import {
   isDmSessionKey,
   dmIdentityFromSessionKey,
   dmSessionKeyForIdentity,
+  matchesChannelBinding,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -2420,8 +2421,15 @@ export class Agent {
     if (identityName === undefined) return undefined;
     const identity = config.identities.find((id) => id.name.toLowerCase() === identityName.toLowerCase());
     if (!identity) return undefined;
-    const target = this.router.getReplyTarget(dmSessionKeyForIdentity(identity.name))
-      ?? this.router.deriveReplyTargetFromConfig(identity.name);
+    // The persisted last-active target is used only while it is still one of
+    // the identity's CURRENT private bindings — a rebinding, or a binding to
+    // a group id, must not carry a notice somewhere else.
+    const isPrivateBinding = (t: ReplyTarget | undefined): t is ReplyTarget => t !== undefined
+      && !isGroupSessionKey(`${t.channelName}:${t.chatId}`)
+      && matchesChannelBinding(t.channelName, t.chatId, identity.channels[t.channelName]);
+    const persisted = this.router.getReplyTarget(dmSessionKeyForIdentity(identity.name));
+    const configured = this.router.deriveReplyTargetFromConfig(identity.name);
+    const target = isPrivateBinding(persisted) ? persisted : isPrivateBinding(configured) ? configured : undefined;
     if (!target) return undefined;
     const channel = this.getChannel(target.channelName);
     return channel ? { channel, chatId: target.chatId } : undefined;

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ExecFileException } from "node:child_process";
+import type { ExecFileException, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -318,15 +319,40 @@ describe("buildUsageReport", () => {
       expect(report).not.toMatch(/re-login/i);
     });
 
-    it("degrades to the stale-token message when the refresh or re-read throws", async () => {
-      let loads = 0;
+    it("treats a throwing refresh as not attempted (next-turn wording)", async () => {
       const report = await buildUsageReport({
         now: () => NOW,
-        loadCredentials: async () => { if (loads++ > 0) throw new Error("secret detail"); return STALE; },
+        loadCredentials: async () => STALE,
         refreshCredentials: async () => { throw new Error("spawn failed"); },
       });
       expect(report).toContain(PENDING);
+      expect(report).not.toContain("spawn failed");
+    });
+
+    it("gives a neutral try-again message (not 'refresh failed') when the post-refresh re-read fails", async () => {
+      let loads = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => { if (loads++ > 0) throw new Error("secret detail: keychain locked"); return STALE; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => "completed",
+      });
+      expect(report).toContain("couldn't read the Claude Code credentials after refreshing them");
+      expect(report).not.toContain("refresh failed");
+      expect(report).not.toMatch(/re-login/i);
       expect(report).not.toContain("secret detail");
+    });
+
+    it("gives the same neutral message when the re-read after a 401 fails", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      let loads = 0;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: async () => { if (loads++ > 0) return null as unknown as typeof CREDS; return valid; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => "completed",
+        fetchImpl: (async () => new Response("", { status: 401 })) as unknown as typeof fetch,
+      });
+      expect(report).toContain("couldn't read the Claude Code credentials after refreshing them");
+      expect(report).not.toMatch(/re-login/i);
     });
 
     it("still asks to re-login when the token is expired and there is no refresh token", async () => {
@@ -414,9 +440,6 @@ describe("buildUsageReport", () => {
       chmodSync(bin, 0o755);
       return { dir, bin };
     }
-    function alive(pid: number): boolean {
-      try { process.kill(pid, 0); return true; } catch { return false; }
-    }
 
     it("runs the binary with the refresh argv and no stdin, and reports completed on exit", async () => {
       const { dir, bin } = stub(`
@@ -442,28 +465,49 @@ describe("buildUsageReport", () => {
     });
 
     it("resolves at the deadline even if the child ignores SIGTERM, then SIGKILLs it", async () => {
-      const { dir, bin } = stub(`
-        require("node:fs").writeFileSync(process.argv[1] + ".pid", String(process.pid));
-        process.on("SIGTERM", () => {});
-        setInterval(() => {}, 1000);
-      `);
-      try {
-        const started = Date.now();
-        const outcome = await runClaudeRefresh(bin, { cwd: dir, timeoutMs: 500, killGraceMs: 300 });
-        const elapsed = Date.now() - started;
-        expect(outcome).toBe("timed_out");
-        expect(elapsed).toBeLessThan(2_000);
-        const pid = Number(readFileSync(`${bin}.pid`, "utf-8"));
-        // Still alive right after the deadline (SIGTERM ignored)...
-        expect(alive(pid)).toBe(true);
-        // ...but SIGKILLed after the grace period.
-        const until = Date.now() + 3_000;
-        while (alive(pid) && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
-        expect(alive(pid)).toBe(false);
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    }, 10_000);
+      // A fake child makes this deterministic: no process start-up race with
+      // the deadline. It ignores SIGTERM and only exits on SIGKILL.
+      const signals: string[] = [];
+      let spawnedWith: unknown[] = [];
+      const fakeSpawn = ((...args: unknown[]) => {
+        spawnedWith = args;
+        const child = new EventEmitter() as EventEmitter & { kill: (sig: string) => boolean };
+        child.kill = (sig: string) => {
+          signals.push(sig);
+          if (sig === "SIGKILL") setImmediate(() => child.emit("exit", null, "SIGKILL"));
+          return true;
+        };
+        return child;
+      }) as unknown as typeof spawn;
+
+      const outcome = await runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn });
+      expect(outcome).toBe("timed_out");
+      // Resolved at the deadline: SIGTERM sent, SIGKILL not yet (still in grace).
+      expect(signals).toEqual(["SIGTERM"]);
+      expect(spawnedWith[0]).toBe("/fake/claude");
+      expect(spawnedWith[1]).toEqual([...CLAUDE_REFRESH_ARGS]);
+
+      const until = Date.now() + 2_000;
+      while (!signals.includes("SIGKILL") && Date.now() < until) await new Promise((r) => setTimeout(r, 5));
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    });
+
+    it("does not escalate to SIGKILL when the child exits after SIGTERM", async () => {
+      const signals: string[] = [];
+      const fakeSpawn = (() => {
+        const child = new EventEmitter() as EventEmitter & { kill: (sig: string) => boolean };
+        child.kill = (sig: string) => {
+          signals.push(sig);
+          setImmediate(() => child.emit("exit", null, sig));
+          return true;
+        };
+        return child;
+      }) as unknown as typeof spawn;
+
+      expect(await runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn })).toBe("timed_out");
+      await new Promise((r) => setTimeout(r, 80));
+      expect(signals).toEqual(["SIGTERM"]);
+    });
   });
 
   it("returns a FIXED network-error message that never echoes the raw error", async () => {

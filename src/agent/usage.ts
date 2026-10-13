@@ -127,6 +127,12 @@ const REFRESH_PENDING_MESSAGE =
 const REFRESH_FAILED_MESSAGE =
   "Claude usage unavailable: the access token is expired and Claude Code's token refresh failed. " +
   `Try again after the next agent turn; if this persists, ${RELOGIN_HINT.charAt(0).toLowerCase()}${RELOGIN_HINT.slice(1)}`;
+/**
+ * The refresh ran, but re-reading the credentials afterwards failed (e.g. the
+ * Keychain was momentarily locked). Says nothing about the token's health.
+ */
+const REREAD_FAILED_MESSAGE =
+  "Claude usage unavailable: couldn't read the Claude Code credentials after refreshing them. Try /usage again.";
 /** Claude Code ran its refresh, but the usage endpoint still rejects the token. */
 const REJECTED_AFTER_REFRESH_MESSAGE =
   "Claude usage unavailable: the usage endpoint rejected the stored access token (401) and Claude Code's refresh didn't replace it. " +
@@ -186,7 +192,8 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
       return `Claude usage unavailable: access token expired. ${RELOGIN_HINT}`;
     }
     refreshAttempted = true;
-    const { outcome, oauth: fresh } = await refreshAndReload(deps, loadCredentials);
+    const { outcome, oauth: fresh, readFailed } = await refreshAndReload(deps, loadCredentials);
+    if (readFailed) return REREAD_FAILED_MESSAGE;
     if (!fresh?.accessToken || isExpired(fresh.expiresAt, now())) {
       return outcome === "completed" ? REFRESH_FAILED_MESSAGE : REFRESH_PENDING_MESSAGE;
     }
@@ -202,7 +209,8 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   // was rotated by another Claude Code process after we read it). Give Claude
   // Code one chance to refresh, and retry once only if the token changed.
   if (res.status === 401 && oauth?.refreshToken && !refreshAttempted) {
-    const { outcome, oauth: fresh } = await refreshAndReload(deps, loadCredentials);
+    const { outcome, oauth: fresh, readFailed } = await refreshAndReload(deps, loadCredentials);
+    if (readFailed) return REREAD_FAILED_MESSAGE;
     lastOutcome = outcome;
     if (fresh?.accessToken && fresh.accessToken !== token && !isExpired(fresh.expiresAt, now())) {
       oauth = fresh;
@@ -275,13 +283,14 @@ async function requestUsage(fetchImpl: typeof fetch, token: string): Promise<Res
 
 /**
  * Have Claude Code refresh its token, then re-read the stored credentials.
- * `oauth` is the fresh OAuth block, or null when the re-read failed. Never
- * throws.
+ * `readFailed` means the re-read itself failed (so the token's state is
+ * unknown); otherwise `oauth` is whatever is stored now (null if absent).
+ * Never throws.
  */
 async function refreshAndReload(
   deps: UsageDeps,
   loadCredentials: () => Promise<ClaudeCredentials>,
-): Promise<{ outcome: RefreshOutcome; oauth: NonNullable<ClaudeCredentials["claudeAiOauth"]> | null }> {
+): Promise<{ outcome: RefreshOutcome; oauth: NonNullable<ClaudeCredentials["claudeAiOauth"]> | null; readFailed: boolean }> {
   let outcome: RefreshOutcome;
   try {
     outcome = await (deps.refreshCredentials ?? (() => runClaudeRefresh(resolveClaudeBinary())))();
@@ -290,10 +299,10 @@ async function refreshAndReload(
   }
   try {
     const creds = await loadCredentials();
-    if (!creds || typeof creds !== "object") return { outcome, oauth: null };
-    return { outcome, oauth: creds.claudeAiOauth ?? null };
+    if (!creds || typeof creds !== "object") return { outcome, oauth: null, readFailed: true };
+    return { outcome, oauth: creds.claudeAiOauth ?? null, readFailed: false };
   } catch {
-    return { outcome, oauth: null };
+    return { outcome, oauth: null, readFailed: true };
   }
 }
 
@@ -313,7 +322,13 @@ export const CLAUDE_REFRESH_ARGS = ["-p", "/usage", "--safe-mode", "--no-session
  */
 export function runClaudeRefresh(
   binary: string,
-  opts: { timeoutMs?: number; killGraceMs?: number; cwd?: string } = {},
+  opts: {
+    timeoutMs?: number;
+    killGraceMs?: number;
+    cwd?: string;
+    /** Injectable for tests (a fake child gives deterministic signal handling). */
+    spawnImpl?: typeof spawn;
+  } = {},
 ): Promise<RefreshOutcome> {
   const timeoutMs = opts.timeoutMs ?? REFRESH_TIMEOUT_MS;
   const killGraceMs = opts.killGraceMs ?? REFRESH_KILL_GRACE_MS;
@@ -327,7 +342,7 @@ export function runClaudeRefresh(
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(binary, [...CLAUDE_REFRESH_ARGS], {
+      child = (opts.spawnImpl ?? spawn)(binary, [...CLAUDE_REFRESH_ARGS], {
         cwd: opts.cwd ?? tmpdir(),
         // stdin ignored: `-p` would otherwise wait on an open stdin pipe.
         stdio: ["ignore", "ignore", "ignore"],
@@ -374,10 +389,14 @@ function resolveClaudeBinary(): string {
   try {
     const sdkRequire = createRequire(createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk"));
     const exe = process.platform === "win32" ? ".exe" : "";
-    const base = `@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`;
-    const candidates = process.platform !== "linux"
-      ? [base]
-      : isMuslLinux() ? [`${base}-musl`, base] : [base, `${base}-musl`];
+    const sdk = "@anthropic-ai/claude-agent-sdk";
+    const linux = `${sdk}-linux-${process.arch}`;
+    // Same package names and order as the SDK's own lookup.
+    const candidates = process.platform === "android"
+      ? [`${linux}-android`]
+      : process.platform === "linux"
+        ? (isMuslLinux() ? [`${linux}-musl`, linux] : [linux, `${linux}-musl`])
+        : [`${sdk}-${process.platform}-${process.arch}`];
     for (const pkg of candidates) {
       try {
         return sdkRequire.resolve(`${pkg}/claude${exe}`);

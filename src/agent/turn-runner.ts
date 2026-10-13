@@ -247,6 +247,8 @@ export interface TurnRunnerDeps {
    * (spec.errors.ownerNotice). Fire-and-forget; must not throw.
    */
   reportSuppressedError?(sessionKey: string, target: OwnerNoticeTarget, detail: string): void;
+  /** Every turn's outcome, after it ends (ok as returned by runTurn). */
+  recordTurnOutcome?(sessionKey: string, ok: boolean): void;
 }
 
 /**
@@ -311,6 +313,7 @@ export class TurnRunner {
       ok = await this.handleThrownError(spec, err, stopTyping);
       return ok;
     } finally {
+      this.deps.recordTurnOutcome?.(spec.key, ok);
       watchBus.publish({
         type: "turn.end",
         ...(spec.requestId ? { requestId: spec.requestId } : {}),

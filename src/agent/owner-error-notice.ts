@@ -39,6 +39,9 @@ export interface SuppressedErrorReport {
   detail: string;
   /** SDK session id of the session the turn ran on, for the compact hint. */
   sdkSessionId?: string;
+  /** End time (epoch ms) of the session's last successful turn, when this
+   *  process has seen one — the start of the range to compact. */
+  lastGoodTurnAt?: number;
   /** The turn ran on the owner's dm: session, where /rewind is available. */
   rewindable?: boolean;
   /** dm: session whose own chat receives the notice (the failure happened
@@ -69,19 +72,34 @@ const CLASS_LABEL: Record<TurnErrorClass, string> = {
   other: "error",
 };
 
+/** Local wall-clock ISO 8601 with offset, to the second — what
+ *  `tomo lcm compact --from-time/--to-time` parses. */
+export function localIsoSeconds(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(Math.trunc(Math.abs(n))).padStart(2, "0");
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    + `${sign}${pad(off / 60)}:${pad(off % 60)}`;
+}
+
 export function errorExcerpt(detail: string): string {
   const line = detail.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "(no error text)";
   return line.length > EXCERPT_MAX_CHARS ? `${line.slice(0, EXCERPT_MAX_CHARS - 1)}…` : line;
 }
 
-function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport): string {
+function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport, failedAt: number): string {
   switch (cls) {
     case "safeguard": {
       const sid = report.sdkSessionId ?? "<session-id>";
-      const compact = `compact the range since the last good turn: tomo lcm compact --session-id ${sid} --from-time <last good turn> --to-time <now> --summary "<summary>"`;
-      return report.rewindable
-        ? `Recovery: ${compact} — or send /rewind in this DM.`
-        : `Recovery: ${compact}. Until then, every turn in that session is likely to be refused.`;
+      // The failing turn's own prompt is in the range; the last good turn is
+      // not (its events all precede the moment it ended).
+      const from = report.lastGoodTurnAt !== undefined
+        ? localIsoSeconds(report.lastGoodTurnAt)
+        : "<time of the last turn that worked>";
+      const compact = `compact the range since the last good turn: tomo lcm compact --session-id ${sid} --from-time ${from} --to-time ${localIsoSeconds(failedAt)} --summary "<summary>"`;
+      const rewind = report.rewindable ? " — or send /rewind in this DM" : "";
+      return `Recovery: ${compact}${rewind}. Until that is done and the session reloads, the next turn there may still be refused.`;
     }
     case "auth":
       // /login is a harness command (ChatCommandHandler), not a model turn,
@@ -94,7 +112,7 @@ function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport): strin
   }
 }
 
-export function formatOwnerNotice(report: SuppressedErrorReport, cls: TurnErrorClass, dropped: number): string {
+export function formatOwnerNotice(report: SuppressedErrorReport, cls: TurnErrorClass, dropped: number, failedAt: number = Date.now()): string {
   const lines = [
     `⚠️ ${report.turnKind} in ${report.label} failed; the error was kept out of that chat.`,
     `Kind: ${CLASS_LABEL[cls]}`,
@@ -103,7 +121,7 @@ export function formatOwnerNotice(report: SuppressedErrorReport, cls: TurnErrorC
   if (dropped > 0) {
     lines.push(`This kind of failure happened ${dropped} more time${dropped === 1 ? "" : "s"} there since the last notice.`);
   }
-  lines.push(recoveryHint(cls, report));
+  lines.push(recoveryHint(cls, report, failedAt));
   return lines.join("\n");
 }
 
@@ -137,7 +155,7 @@ export class OwnerErrorNotifier {
     // cannot both notify.
     this.windows.set(windowKey, { lastSentAt: now, dropped: 0 });
     try {
-      const delivered = await this.deps.send(formatOwnerNotice(report, cls, dropped), report);
+      const delivered = await this.deps.send(formatOwnerNotice(report, cls, dropped, now), report);
       if (delivered === false) throw new Error("no owner DM target");
       log.info({ noticeKey: report.noticeKey, errorClass: cls }, "Owner notified of a suppressed error");
       return true;

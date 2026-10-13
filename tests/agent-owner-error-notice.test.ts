@@ -17,6 +17,8 @@ import {
   waitFor,
 } from "./helpers/agent-harness.js";
 import { OWNER_NOTICE_WINDOW_MS } from "../src/agent/owner-error-notice.js";
+import { TurnInterruptedError } from "../src/agent/live-session.js";
+import type { TurnRequest } from "../src/agent/live-session.js";
 
 installAgentTestHooks();
 
@@ -71,6 +73,8 @@ describe("owner notice for errors kept out of a chat", () => {
     expect(notice.text).toContain("Kind: safety classifier refusal");
     expect(notice.text).toContain("Error: API Error: Example Model's safeguards flagged this message");
     expect(notice.text).toContain("tomo lcm compact --session-id ");
+    // The group's earlier (silent, successful) turn bounds the range.
+    expect(notice.text).toMatch(/--from-time \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} --to-time \d{4}-/);
     expect(notice.text).not.toContain("more time");
     expect(im.delivered).toEqual([]);
 
@@ -203,6 +207,157 @@ describe("owner notice for errors kept out of a chat", () => {
     await expectNoChangeFor(() => expect(tg.delivered).toEqual([]));
     expect(im.delivered).toEqual([]);
 
+    await agent.stop();
+  });
+
+  it("never sends a notice to a stranger's private chat when the owner has no DM session yet", async () => {
+    resetConfig({
+      identities: [{ name: "owner", channels: { telegram: OWNER_CHAT }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+
+    // Someone else has chatted privately; the owner has not.
+    mockSdk.responseFn = () => "hello friend";
+    await tg.simulateMessage(makeMsg({ chatId: "999", text: "hi tomo" }));
+    mockSdk.responseFn = () => "NO_REPLY";
+    await im.simulateMessage(makeMsg({ chatId: GROUP_CHAT, text: "chatter", isGroup: true, chatTitle: "Book Club" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await groupMessageThatFails(agent, im);
+
+    // Resolved through the configured owner identity, not "the first private
+    // chat that has a session".
+    await waitFor(() => expect(tg.delivered).toHaveLength(1));
+    expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
+    await expectNoChangeFor(() => expect(tg.delivered.filter((d) => d.chatId === "999")).toEqual([]));
+
+    await agent.stop();
+  });
+
+  it("drops the notice (no raw-chat fallback) when no owner identity is configured", async () => {
+    resetConfig({ identities: [] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    const im = new MockChannel("imessage");
+    agent.addChannel(tg);
+    agent.addChannel(im);
+    mockSdk.responseFn = () => "hello";
+    await tg.simulateMessage(makeMsg({ chatId: "999", text: "hi tomo" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await groupMessageThatFails(agent, im);
+
+    await expectNoChangeFor(() => expect(tg.delivered).toEqual([]));
+    expect(im.delivered).toEqual([]);
+
+    await agent.stop();
+  });
+
+  describe("with several identities", () => {
+    const SECOND_CHAT = "777";
+    async function setupTwo() {
+      resetConfig({
+        identities: [
+          { name: "owner", channels: { telegram: OWNER_CHAT }, replyPolicy: "last-active" },
+          { name: "second", channels: { telegram: SECOND_CHAT }, replyPolicy: "last-active" },
+        ],
+      });
+      const agent = new Agent();
+      const tg = new MockChannel("telegram");
+      const im = new MockChannel("imessage");
+      agent.addChannel(tg);
+      agent.addChannel(im);
+      // The SECOND identity's DM session exists first.
+      mockSdk.responseFn = () => "hi";
+      await tg.simulateMessage(makeMsg({ chatId: SECOND_CHAT, text: "hello" }));
+      await tg.simulateMessage(makeMsg({ chatId: OWNER_CHAT, text: "hello" }));
+      mockSdk.responseFn = () => "NO_REPLY";
+      await im.simulateMessage(makeMsg({ chatId: GROUP_CHAT, text: "chatter", isGroup: true, chatTitle: "Book Club" }));
+      await drainQueue(agent);
+      tg.clearDelivered();
+      im.clearDelivered();
+      return { agent, tg, im };
+    }
+
+    it("a group failure goes to the configured owner (first identity), not the first dm session", async () => {
+      const { agent, tg, im } = await setupTwo();
+      await groupMessageThatFails(agent, im);
+      await waitFor(() => expect(tg.delivered).toHaveLength(1));
+      expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
+      await agent.stop();
+    });
+
+    it("a held-back failure on an identity's dm session is reported in THAT identity's DM", async () => {
+      const { agent, tg } = await setupTwo();
+      failNextTurnWith(AUTH);
+      await agent.handleCronMessage("housekeeping", "dm:second", { suppressDelivery: true, showTyping: false });
+      await waitFor(() => expect(tg.delivered).toHaveLength(1));
+      expect(tg.delivered[0].chatId).toBe(SECOND_CHAT);
+      expect(tg.delivered[0].text).toContain("this DM session (dm:second)");
+      await agent.stop();
+    });
+
+    it("a summoned group's failure is labelled as the group's and delivered to the DM it ran on, with /rewind", async () => {
+      const { agent, tg, im } = await setupTwo();
+      (agent as unknown as { router: { summonGroup(c: string, id: string, who: string): void } })
+        .router.summonGroup("imessage", GROUP_CHAT, "second");
+
+      await groupMessageThatFails(agent, im);
+
+      await waitFor(() => expect(tg.delivered).toHaveLength(1));
+      expect(tg.delivered[0].chatId).toBe(SECOND_CHAT);
+      expect(tg.delivered[0].text).toContain(`group "Book Club" (imessage:${GROUP_CHAT})`);
+      expect(tg.delivered[0].text).toContain("/rewind in this DM");
+      expect(im.delivered).toEqual([]);
+      await agent.stop();
+    });
+  });
+
+  it("reports an agent-error RESPONSE a group cron keeps out of the chat (response: note-only)", async () => {
+    const { agent, tg } = await setup();
+    await tg.simulateMessage(makeMsg({ chatId: "-100group", text: "@tomo hi", isGroup: true, isMentioned: true, chatTitle: "Team" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    mockSdk.responseFn = () => "API Error: 529 overloaded";
+    expect(await agent.handleCronMessage("digest", "telegram:-100group", { jobName: "digest" })).toBe(false);
+
+    await waitFor(() => expect(tg.delivered).toHaveLength(1));
+    expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
+    expect(tg.delivered[0].text).toContain("Error: API Error: 529 overloaded");
+    expect(tg.delivered.filter((d) => d.chatId === "-100group")).toEqual([]);
+    await agent.stop();
+  });
+
+  it("sends nothing for a failure that happens while Tomo is stopping", async () => {
+    const { agent, tg, im } = await setup();
+    (agent as unknown as { stopping: boolean }).stopping = true;
+    await groupMessageThatFails(agent, im);
+    await expectNoChangeFor(() => expect(tg.delivered).toEqual([]));
+    (agent as unknown as { stopping: boolean }).stopping = false;
+    await agent.stop();
+  });
+
+  it("a background turn stopped by /rewind is not reported; a failed one is", async () => {
+    const { agent, tg } = await setup();
+    await tg.simulateMessage(makeMsg({ chatId: "-100group", text: "@tomo hi", isGroup: true, isMentioned: true, chatTitle: "Team" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+    const internals = agent as unknown as { createUnownedTurnRequest(key: string): TurnRequest | undefined };
+
+    await internals.createUnownedTurnRequest("telegram:-100group")!.reject(new TurnInterruptedError());
+    await expectNoChangeFor(() => expect(tg.delivered).toEqual([]));
+
+    await internals.createUnownedTurnRequest("telegram:-100group")!.reject(new Error("background boom"));
+    await waitFor(() => expect(tg.delivered).toHaveLength(1));
+    expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
+    expect(tg.delivered[0].text).toContain("A background task turn in group \"Team\"");
     await agent.stop();
   });
 });

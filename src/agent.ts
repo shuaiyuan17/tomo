@@ -8,6 +8,7 @@ import {
   isGroupSessionKey,
   isDmSessionKey,
   dmIdentityFromSessionKey,
+  dmSessionKeyForIdentity,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -246,7 +247,10 @@ export class Agent {
    * it failed. Shutdown wins; the request is dropped, with a line saying so.
    */
   private stopping = false;
-  /** Owner DMs for errors kept out of a group chat (rate-limited). */
+  /** End time of each session's last successful turn this process saw — the
+   *  start of the range an owner notice suggests compacting. */
+  private readonly lastGoodTurnAt = new Map<string, number>();
+  /** Owner DMs for errors kept out of a chat (rate-limited). */
   private readonly ownerErrorNotifier = new OwnerErrorNotifier({
     send: (text, report) => this.sendOwnerNotice(text, report.deliverTo),
     enabled: () => config.notifyOwnerOnSuppressedErrors !== false,
@@ -295,6 +299,7 @@ export class Agent {
       undeliveredReplyAtTurnEnd: (sessionKey) => this.liveSessionManager.takeUndeliveredReply(sessionKey),
       requestRestate: (sessionKey, target) => this.restateUndeliveredReply(sessionKey, target),
       reportSuppressedError: (sessionKey, target, detail) => this.reportSuppressedError(sessionKey, target, detail),
+      recordTurnOutcome: (sessionKey, ok) => { if (ok) this.lastGoodTurnAt.set(sessionKey, Date.now()); },
     });
     const summons = new SummonStore(
       join(config.tomoHome, "data", "summons.json"),
@@ -2377,34 +2382,59 @@ export class Agent {
    */
   private ownerNoticeTarget(sessionKey: string, turnKind: string, groupKey?: string): OwnerNoticeTarget {
     const noticeKey = groupKey !== undefined && isGroupSessionKey(groupKey) ? groupKey : sessionKey;
-    const rewindable = isDmSessionKey(sessionKey);
+    // The turn ran on an identity's dm: session (its own turn, or a summoned
+    // group's): the notice goes to THAT identity's DM, where /rewind works.
+    const ranOnDm = isDmSessionKey(sessionKey);
+    const deliver = ranOnDm ? { rewindable: true, deliverTo: sessionKey } : {};
     if (isGroupSessionKey(noticeKey)) {
       const title = this.sessions.getEntry(noticeKey)?.chatTitle;
       return {
         noticeKey,
         label: title ? `group "${title}" (${noticeKey})` : `group ${noticeKey}`,
         turnKind,
-        ...(rewindable ? { rewindable: true } : {}),
+        ...deliver,
       };
     }
-    if (isDmSessionKey(noticeKey)) {
-      return { noticeKey, label: `this DM session (${noticeKey})`, turnKind, rewindable: true, deliverTo: noticeKey };
-    }
+    if (ranOnDm) return { noticeKey, label: `this DM session (${noticeKey})`, turnKind, ...deliver };
     return { noticeKey, label: `private chat ${noticeKey}`, turnKind };
   }
 
-  /** Owner notice into a specific dm: session's own chat. Falls back to the
-   *  generic owner notification target when that chat is unreachable. */
+  /**
+   * Where an owner notice goes — resolved STRICTLY through a configured
+   * identity, never through a raw session key. A notice carries a group's
+   * title, key, error text and session id; `sendNotification`'s fallback to
+   * "the first private chat with a session" could hand that to whoever else
+   * has messaged Tomo privately.
+   *
+   * - `deliverTo` (a dm: session the turn ran on): that identity's own DM.
+   * - otherwise: the owner identity — `web.ownerIdentity` when set (the same
+   *   selection the local web UI uses), else the first configured identity.
+   *
+   * Undefined when no identity resolves to a loaded channel.
+   */
+  private resolveOwnerNoticeTarget(deliverTo: string | undefined): { channel: Channel; chatId: string } | undefined {
+    const identityName = deliverTo !== undefined
+      ? dmIdentityFromSessionKey(deliverTo)
+      : (this.router.webOwner() ?? config.identities[0])?.name;
+    if (identityName === undefined) return undefined;
+    const identity = config.identities.find((id) => id.name.toLowerCase() === identityName.toLowerCase());
+    if (!identity) return undefined;
+    const target = this.router.getReplyTarget(dmSessionKeyForIdentity(identity.name))
+      ?? this.router.deriveReplyTargetFromConfig(identity.name);
+    if (!target) return undefined;
+    const channel = this.getChannel(target.channelName);
+    return channel ? { channel, chatId: target.chatId } : undefined;
+  }
+
+  /** Deliver an owner notice; false (nothing sent) when no owner target. */
   private async sendOwnerNotice(text: string, deliverTo: string | undefined): Promise<boolean> {
-    if (deliverTo !== undefined) {
-      const target = this.resolvePrivateReplyTarget(deliverTo);
-      const channel = target ? this.getChannel(target.channelName) : undefined;
-      if (target && channel) {
-        await channel.send({ chatId: target.chatId, text });
-        return true;
-      }
+    const target = this.resolveOwnerNoticeTarget(deliverTo);
+    if (!target) {
+      log.warn({ deliverTo }, "Owner error notice dropped: no configured owner identity with a reachable DM");
+      return false;
     }
-    return this.sendNotification(text);
+    await target.channel.send({ chatId: target.chatId, text });
+    return true;
   }
 
   /** Fire-and-forget owner DM for a suppressed error; never throws. */
@@ -2412,16 +2442,17 @@ export class Agent {
     // A turn torn down by shutdown is not a failure worth a DM.
     if (this.stopping) return;
     const sdkSessionId = this.sessions.getSdkSessionId(sessionKey);
+    const lastGoodTurnAt = this.lastGoodTurnAt.get(sessionKey);
     void this.ownerErrorNotifier.report({
       ...target,
       detail,
       ...(sdkSessionId ? { sdkSessionId } : {}),
+      ...(lastGoodTurnAt !== undefined ? { lastGoodTurnAt } : {}),
     });
   }
 
-  /** Send a direct notification to the user's DM channel (no agent query).
-   *  Resolves false when there was nowhere to send it. */
-  async sendNotification(text: string): Promise<boolean> {
+  /** Send a direct notification to the user's DM channel (no agent query) */
+  async sendNotification(text: string): Promise<void> {
     const dmKey = this.router.findFirstDmSession();
     let target: ReplyTarget | undefined;
 
@@ -2440,16 +2471,12 @@ export class Agent {
       }
     }
 
-    // No DM session yet: fall back to a configured identity's private chat.
-    target ??= this.findPrivateReplyTarget();
-
-    if (!target) { log.debug("Notification: no active DM session"); return false; }
+    if (!target) { log.debug("Notification: no active DM session"); return; }
 
     const channel = this.getChannel(target.channelName);
-    if (!channel) return false;
+    if (!channel) return;
 
     await channel.send({ chatId: target.chatId, text });
-    return true;
   }
 
   async start(): Promise<void> {

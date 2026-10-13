@@ -187,7 +187,7 @@ export class CronScheduler {
         // real agent failures land in lastStatus instead of reading as "ok".
         // waitForHandoff makes a run that is handed to a summoned session
         // resolve when that turn actually completes, not when it is queued.
-        ok = await this.agent.handleCronMessage(cronMessage, sessionKey, { waitForHandoff: true });
+        ok = await this.agent.handleCronMessage(cronMessage, sessionKey, { waitForHandoff: true, jobName: name });
       } catch (err) {
         // Unreachable by contract; a broken contract must not read as success.
         log.error({ err, jobId, runId }, "Cron turn rejected");

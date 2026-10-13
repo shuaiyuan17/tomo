@@ -325,6 +325,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
   },
   "groupSecret": "tomo-xxxxxxxx",
   "summonExpiryMinutes": 60,
+  "notifyOwnerOnSuppressedErrors": true,
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,
@@ -362,6 +363,7 @@ Environment variables override config file values:
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
 | `TOMO_SAVE_INBOUND_FILES` | Override storage of inbound attachments that are neither images nor supported documents. Defaults to whatever `saveInboundImages` is. |
+| `TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS` | DM the owner when a failure is kept out of a group chat (passive-group turns, group cron/background turns): which group, the kind of error, a one-line excerpt and a recovery hint. At most one notice per group and error kind per 30 minutes; the next one says how many failures were folded in. Defaults to `true` (config key `notifyOwnerOnSuppressedErrors`); set `false` to keep these failures in the log only. |
 | `TOMO_SHOW_THINKING` | Deliver the model's thinking blocks to the chat, prefixed with `💭`. Defaults to `false`; with it off, a thinking block that still has text in it is delivered unprefixed, as a `text` block would be. |
 | `TOMO_CONTINUITY_INTERVAL_MINUTES` | Override scheduled continuity heartbeat interval (default: `55`, minimum: `1`) |
 | `TOMO_CONTINUITY_SCRIPT` | Override the optional continuity script path |

@@ -187,6 +187,16 @@ describe("config file validation", () => {
     expect(off.config.saveInboundFiles).toBe(false);
   });
 
+  it("notifies the owner of suppressed errors by default, and can be turned off", async () => {
+    const on = await loadWithConfigFile(JSON.stringify({}));
+    expect(on.config.notifyOwnerOnSuppressedErrors).toBe(true);
+    expect(on.configIssues).toEqual([]);
+
+    const off = await loadWithConfigFile(JSON.stringify({ notifyOwnerOnSuppressedErrors: false }));
+    expect(off.config.notifyOwnerOnSuppressedErrors).toBe(false);
+    expect(off.configIssues).toEqual([]);
+  });
+
   it("lets saveInboundFiles be set independently of saveInboundImages", async () => {
     const { config } = await loadWithConfigFile(JSON.stringify({
       saveInboundImages: false,

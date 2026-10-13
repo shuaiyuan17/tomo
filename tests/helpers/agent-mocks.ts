@@ -344,6 +344,7 @@ export const mockConfig = {
   groupSecret: null as string | null,
   groupShellAllowlist: [] as string[],
   steering: true,
+  notifyOwnerOnSuppressedErrors: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
   /** External MCP servers (src/mcp/external-config.ts shape); undefined = none configured. */

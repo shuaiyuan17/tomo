@@ -239,6 +239,10 @@ export interface TomoConfig {
    *  Outbound text is never pattern-matched to guess what is "thinking" — a
    *  `text` block is always the model's chosen words and always ships. */
   showThinking: boolean;
+  /** DM the owner when an error is kept out of a group chat (passive group
+   *  turns, group cron/background turns), rate-limited to one notice per
+   *  session and error class per 30 minutes. Default true. */
+  notifyOwnerOnSuppressedErrors: boolean;
   /** Inactivity timeout for one LiveSession send()/steer() turn. Default 10 minutes. */
   liveSessionTimeoutMs: number;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
@@ -923,6 +927,12 @@ function buildConfig(): TomoConfig {
     maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
     showThinking: validated("showThinking (TOMO_SHOW_THINKING)", boolLike, envVar("TOMO_SHOW_THINKING") ?? file.showThinking, false),
+    notifyOwnerOnSuppressedErrors: validated(
+      "notifyOwnerOnSuppressedErrors (TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS)",
+      boolLike,
+      envVar("TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS") ?? file.notifyOwnerOnSuppressedErrors,
+      true,
+    ),
     liveSessionTimeoutMs: validated(
       "liveSessionTimeoutMs (TOMO_LIVE_SESSION_TIMEOUT_MS)",
       positiveInt,

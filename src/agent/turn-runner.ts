@@ -152,6 +152,22 @@ export interface TurnErrorPolicy {
   thrownSuppressedLog?: string;
   /** log.error message for thrown errors. */
   thrownLogMessage: string;
+  /**
+   * Who to tell when an error is kept out of the chat by this policy
+   * (`response: "note-only"`, `thrown: "note-only" | "ignore"`). Present only
+   * when the Agent judged the failure worth an owner DM — never for the
+   * owner's own DM session, whose errors are delivered there. Interrupted
+   * turns are never reported. See agent/owner-error-notice.ts.
+   */
+  ownerNotice?: OwnerNoticeTarget;
+}
+
+/** The parts of an owner notice the spec builder knows (see SuppressedErrorReport). */
+export interface OwnerNoticeTarget {
+  noticeKey: string;
+  label: string;
+  turnKind: string;
+  rewindable?: boolean;
 }
 
 export interface TurnSpec {
@@ -223,6 +239,11 @@ export interface TurnRunnerDeps {
    * undefined when it had none). Fire-and-forget; the runner does not wait.
    */
   requestRestate?(sessionKey: string, target: { channel: Channel; chatId: string } | undefined): void;
+  /**
+   * An error this turn's policy kept out of the chat, for an owner DM notice
+   * (spec.errors.ownerNotice). Fire-and-forget; must not throw.
+   */
+  reportSuppressedError?(sessionKey: string, target: OwnerNoticeTarget, detail: string): void;
 }
 
 /**
@@ -419,6 +440,7 @@ export class TurnRunner {
         if (spec.errors.responseSuppressedLog) {
           log.warn({ sessionKey: spec.key }, spec.errors.responseSuppressedLog);
         }
+        this.reportSuppressed(spec, response);
         await stopTyping({ clear: true });
         return false;
       }
@@ -661,12 +683,13 @@ export class TurnRunner {
     }
     log.error({ err }, spec.errors.thrownLogMessage);
 
+    const detail = err instanceof Error ? err.message : String(err);
     if (spec.errors.thrown === "ignore") {
+      this.reportSuppressed(spec, detail);
       await stopTyping({ clear: true });
       return false;
     }
 
-    const detail = err instanceof Error ? err.message : String(err);
     const visibleError = `${spec.errors.visiblePrefix}${withRecoveryHint(detail)}`;
     if (!isSafeguardError(detail)) this.deps.queuePendingErrorNote(spec.key, visibleError);
 
@@ -674,6 +697,7 @@ export class TurnRunner {
       if (spec.errors.thrownSuppressedLog) {
         log.warn({ sessionKey: spec.key }, spec.errors.thrownSuppressedLog);
       }
+      this.reportSuppressed(spec, detail);
       await stopTyping({ clear: true });
       return false;
     }
@@ -692,6 +716,17 @@ export class TurnRunner {
       await stopTyping({ clear: true });
     }
     return false;
+  }
+
+  /** Hand an error the policy kept out of the chat to the owner notifier. */
+  private reportSuppressed(spec: TurnSpec, detail: string): void {
+    const target = spec.errors.ownerNotice;
+    if (!target || !this.deps.reportSuppressedError) return;
+    try {
+      this.deps.reportSuppressedError(spec.key, target, detail);
+    } catch (err) {
+      log.warn({ err, sessionKey: spec.key }, "Owner error notice failed");
+    }
   }
 
   /**

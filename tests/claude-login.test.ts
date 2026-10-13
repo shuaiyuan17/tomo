@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
-import { resolveClaudeExecutable, ClaudeLoginManager } from "../src/agent/claude-login.js";
+import { bundledPackageNames, resolveClaudeExecutable, ClaudeLoginManager } from "../src/agent/claude-login.js";
 
 const LOGIN_URL = "https://claude.com/cai/oauth/authorize?code=true&state=test-state";
 
@@ -137,5 +137,24 @@ describe("resolveClaudeExecutable", () => {
   it("finds a real binary in this checkout", () => {
     const path = resolveClaudeExecutable({});
     expect(path).not.toBe("claude");
+  });
+
+  it("tries the musl build first on musl Linux, glibc first elsewhere", () => {
+    expect(bundledPackageNames("linux", "x64", () => true))
+      .toEqual(["claude-agent-sdk-linux-x64-musl", "claude-agent-sdk-linux-x64"]);
+    expect(bundledPackageNames("linux", "arm64", () => false))
+      .toEqual(["claude-agent-sdk-linux-arm64", "claude-agent-sdk-linux-arm64-musl"]);
+    expect(bundledPackageNames("darwin", "arm64", () => true)).toEqual(["claude-agent-sdk-darwin-arm64"]);
+  });
+
+  it("on musl, skips a missing musl package and uses the next candidate", () => {
+    const seen: string[] = [];
+    const path = resolveClaudeExecutable({}, (id) => {
+      seen.push(id);
+      if (id.includes("-musl")) throw new Error("MODULE_NOT_FOUND");
+      return "/nm/glibc/package.json";
+    }, () => true, "linux", "x64", () => true);
+    expect(seen[0]).toContain("linux-x64-musl");
+    expect(path).toBe("/nm/glibc/claude");
   });
 });

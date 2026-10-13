@@ -238,15 +238,36 @@ export function resolveClaudeExecutable(
   env: NodeJS.ProcessEnv = process.env,
   resolvePackage: (id: string) => string = (id) => createRequire(import.meta.url).resolve(id),
   exists: (path: string) => boolean = existsSync,
+  platform: string = process.platform,
+  arch: string = process.arch,
+  isMusl: () => boolean = detectMusl,
 ): string {
   const explicit = env.TOMO_CLAUDE_PATH?.trim();
   if (explicit) return explicit;
-  try {
-    const pkg = resolvePackage(`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/package.json`);
-    const binary = join(dirname(pkg), process.platform === "win32" ? "claude.exe" : "claude");
-    if (exists(binary)) return binary;
-  } catch {
-    // Package not installed for this platform: fall through.
+  for (const name of bundledPackageNames(platform, arch, isMusl)) {
+    try {
+      const pkg = resolvePackage(`@anthropic-ai/${name}/package.json`);
+      const binary = join(dirname(pkg), platform === "win32" ? "claude.exe" : "claude");
+      if (exists(binary)) return binary;
+    } catch {
+      // Package not installed for this platform: try the next candidate.
+    }
   }
   return "claude";
+}
+
+/**
+ * The SDK's platform packages in the order the SDK itself tries them: on
+ * Linux npm installs both the glibc and the musl build, and the glibc binary
+ * will not even start on a musl system, so musl goes first there.
+ */
+export function bundledPackageNames(platform: string, arch: string, isMusl: () => boolean): string[] {
+  const base = `claude-agent-sdk-${platform}-${arch}`;
+  if (platform !== "linux") return [base];
+  return isMusl() ? [`${base}-musl`, base] : [base, `${base}-musl`];
+}
+
+function detectMusl(): boolean {
+  const report = process.report?.getReport?.() as { header?: { glibcVersionRuntime?: string } } | undefined;
+  return !report?.header?.glibcVersionRuntime;
 }

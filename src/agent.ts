@@ -2371,9 +2371,10 @@ export class Agent {
    * agent/owner-error-notice.ts). `groupKey` names the group a summoned turn
    * belongs to when it runs on the owner's dm: session.
    *
-   * - a group: reported to the owner's DM (sendNotification), never the group;
-   * - the owner's dm: session: reported IN that DM — the error was held back
-   *   there, so this is the only visible trace of it;
+   * - a group: reported to the owner's DM (resolveOwnerNoticeTarget), never
+   *   the group — or, for a summoned group, to the dm: session it ran on;
+   * - an identity's dm: session: reported IN that DM — the error was held
+   *   back there, so this is the only visible trace of it;
    * - a raw private chat (not an identity): reported to the owner, not to
    *   whoever that chat belongs to.
    *

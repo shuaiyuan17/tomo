@@ -257,11 +257,13 @@ export function resolveClaudeExecutable(
 }
 
 /**
- * The SDK's platform packages in the order the SDK itself tries them: on
+ * The SDK's platform packages in the order the SDK itself tries them
+ * (mirrors its resolver, Android included): on
  * Linux npm installs both the glibc and the musl build, and the glibc binary
  * will not even start on a musl system, so musl goes first there.
  */
 export function bundledPackageNames(platform: string, arch: string, isMusl: () => boolean): string[] {
+  if (platform === "android") return [`claude-agent-sdk-linux-${arch}-android`];
   const base = `claude-agent-sdk-${platform}-${arch}`;
   if (platform !== "linux") return [base];
   return isMusl() ? [`${base}-musl`, base] : [base, `${base}-musl`];

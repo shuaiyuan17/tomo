@@ -145,6 +145,7 @@ describe("resolveClaudeExecutable", () => {
     expect(bundledPackageNames("linux", "arm64", () => false))
       .toEqual(["claude-agent-sdk-linux-arm64", "claude-agent-sdk-linux-arm64-musl"]);
     expect(bundledPackageNames("darwin", "arm64", () => true)).toEqual(["claude-agent-sdk-darwin-arm64"]);
+    expect(bundledPackageNames("android", "arm64", () => false)).toEqual(["claude-agent-sdk-linux-arm64-android"]);
   });
 
   it("on musl, skips a missing musl package and uses the next candidate", () => {

@@ -1,6 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type { ExecFileException } from "node:child_process";
-import { buildUsageReport, formatCountdown, formatReset, formatUsageReport, keychainErrorMessage } from "../src/agent/usage.js";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  buildUsageReport,
+  CLAUDE_REFRESH_ARGS,
+  formatCountdown,
+  formatReset,
+  formatUsageReport,
+  keychainErrorMessage,
+  runClaudeRefresh,
+  type RefreshOutcome,
+} from "../src/agent/usage.js";
 
 // A fixed "now" so countdowns and clock times are deterministic.
 // 2026-07-27T15:36:00-07:00 == 2026-07-27T22:36:00Z
@@ -247,14 +259,15 @@ describe("buildUsageReport", () => {
     const FRESH = { claudeAiOauth: { accessToken: "fresh", refreshToken: "rt2", expiresAt: NOW + 3_600_000, subscriptionType: "max" } };
 
     /** Credential store that returns `first`, then `afterRefresh` once refreshCredentials ran. */
-    function store(first: unknown, afterRefresh: unknown) {
+    function store(first: unknown, afterRefresh: unknown, outcome: RefreshOutcome = "completed") {
       const state = { refreshes: 0, loads: 0 };
       return {
         state,
         loadCredentials: async () => { state.loads++; return (state.refreshes > 0 ? afterRefresh : first) as typeof CREDS; },
-        refreshCredentials: async () => { state.refreshes++; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => { state.refreshes++; return outcome; },
       };
     }
+    const PENDING = "refreshes automatically on the next agent turn";
 
     it("delegates the refresh to Claude Code, re-reads, and reports usage with the fresh token", async () => {
       const s = store(STALE, FRESH);
@@ -274,8 +287,8 @@ describe("buildUsageReport", () => {
       expect(report).not.toContain("expired");
     });
 
-    it("does not tell the owner to re-login when the refresh didn't land yet", async () => {
-      const s = store(STALE, STALE);
+    it("says the refresh failed (re-login if it persists) when Claude Code ran but the token is still expired", async () => {
+      const s = store(STALE, STALE, "completed");
       let fetched = false;
       const report = await buildUsageReport({
         now: () => NOW,
@@ -285,8 +298,24 @@ describe("buildUsageReport", () => {
       });
       expect(s.state.refreshes).toBe(1);
       expect(fetched).toBe(false);
-      expect(report).toContain("refreshes automatically on the next agent turn");
-      expect(report).not.toContain("Re-login to Claude Code (");
+      expect(report).toContain("token refresh failed");
+      expect(report).toContain("if this persists, re-login");
+      expect(report).not.toContain(PENDING);
+    });
+
+    it("does not tell the owner to re-login when the refresh timed out", async () => {
+      const s = store(STALE, STALE, "timed_out");
+      let fetched = false;
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => { fetched = true; return okResponse(USAGE_BODY); }) as unknown as typeof fetch,
+      });
+      expect(s.state.refreshes).toBe(1);
+      expect(fetched).toBe(false);
+      expect(report).toContain(PENDING);
+      expect(report).not.toMatch(/re-login/i);
     });
 
     it("degrades to the stale-token message when the refresh or re-read throws", async () => {
@@ -296,7 +325,7 @@ describe("buildUsageReport", () => {
         loadCredentials: async () => { if (loads++ > 0) throw new Error("secret detail"); return STALE; },
         refreshCredentials: async () => { throw new Error("spawn failed"); },
       });
-      expect(report).toContain("refreshes automatically on the next agent turn");
+      expect(report).toContain(PENDING);
       expect(report).not.toContain("secret detail");
     });
 
@@ -305,7 +334,7 @@ describe("buildUsageReport", () => {
       const report = await buildUsageReport({
         now: () => NOW,
         loadCredentials: async () => ({ claudeAiOauth: { accessToken: "t", expiresAt: NOW - 1000 } }),
-        refreshCredentials: async () => { refreshes++; },
+        refreshCredentials: async (): Promise<RefreshOutcome> => { refreshes++; return "completed"; },
       });
       expect(refreshes).toBe(0);
       expect(report).toContain("access token expired");
@@ -331,9 +360,9 @@ describe("buildUsageReport", () => {
       expect(report).toContain("Weekly (7d):   36%");
     });
 
-    it("on a 401 whose token didn't change, doesn't retry and doesn't say re-login", async () => {
+    it("on a 401 whose token didn't change after a timed-out refresh, doesn't retry and says next turn", async () => {
       const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
-      const s = store(valid, valid);
+      const s = store(valid, valid, "timed_out");
       let calls = 0;
       const report = await buildUsageReport({
         now: () => NOW,
@@ -343,8 +372,22 @@ describe("buildUsageReport", () => {
       });
       expect(s.state.refreshes).toBe(1);
       expect(calls).toBe(1);
-      expect(report).toContain("refreshes automatically on the next agent turn");
-      expect(report).not.toContain("Re-login to Claude Code (");
+      expect(report).toContain(PENDING);
+      expect(report).not.toMatch(/re-login/i);
+    });
+
+    it("on a 401 that survives a completed refresh, says so and suggests re-login if it persists", async () => {
+      const valid = { claudeAiOauth: { ...STALE.claudeAiOauth, expiresAt: NOW + 3_600_000 } };
+      const s = store(valid, valid, "completed");
+      const report = await buildUsageReport({
+        now: () => NOW,
+        loadCredentials: s.loadCredentials,
+        refreshCredentials: s.refreshCredentials,
+        fetchImpl: (async () => new Response("", { status: 401 })) as unknown as typeof fetch,
+      });
+      expect(report).toContain("rejected the stored access token (401)");
+      expect(report).toContain("If this persists, re-login");
+      expect(report).not.toContain(PENDING);
     });
 
     it("refreshes at most once per /usage (expired, then 401 on the fresh token)", async () => {
@@ -358,8 +401,69 @@ describe("buildUsageReport", () => {
       });
       expect(s.state.refreshes).toBe(1);
       expect(calls).toBe(1);
-      expect(report).toContain("refreshes automatically on the next agent turn");
+      expect(report).toContain("rejected the stored access token (401)");
     });
+  });
+
+  describe("runClaudeRefresh (real launcher, stub executable)", () => {
+    /** Write an executable node script into a fresh temp dir. */
+    function stub(body: string): { dir: string; bin: string } {
+      const dir = mkdtempSync(join(tmpdir(), "tomo-usage-stub-"));
+      const bin = join(dir, "claude");
+      writeFileSync(bin, `#!${process.execPath}\n${body}\n`);
+      chmodSync(bin, 0o755);
+      return { dir, bin };
+    }
+    function alive(pid: number): boolean {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    }
+
+    it("runs the binary with the refresh argv and no stdin, and reports completed on exit", async () => {
+      const { dir, bin } = stub(`
+        const fs = require("node:fs");
+        fs.writeFileSync(process.argv[1] + ".args",
+          JSON.stringify({ args: process.argv.slice(2), stdinIsPipe: fs.fstatSync(0).isFIFO() }));
+      `);
+      try {
+        const outcome = await runClaudeRefresh(bin, { cwd: dir, timeoutMs: 10_000 });
+        expect(outcome).toBe("completed");
+        const seen = JSON.parse(readFileSync(`${bin}.args`, "utf-8"));
+        expect(seen.args).toEqual([...CLAUDE_REFRESH_ARGS]);
+        expect(seen.args).toEqual(["-p", "/usage", "--safe-mode", "--no-session-persistence"]);
+        // stdin must not be an open pipe, or `claude -p` would wait on it.
+        expect(seen.stdinIsPipe).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reports failed_to_start for a missing binary", async () => {
+      expect(await runClaudeRefresh(join(tmpdir(), "definitely-not-a-claude-binary-xyz"))).toBe("failed_to_start");
+    });
+
+    it("resolves at the deadline even if the child ignores SIGTERM, then SIGKILLs it", async () => {
+      const { dir, bin } = stub(`
+        require("node:fs").writeFileSync(process.argv[1] + ".pid", String(process.pid));
+        process.on("SIGTERM", () => {});
+        setInterval(() => {}, 1000);
+      `);
+      try {
+        const started = Date.now();
+        const outcome = await runClaudeRefresh(bin, { cwd: dir, timeoutMs: 500, killGraceMs: 300 });
+        const elapsed = Date.now() - started;
+        expect(outcome).toBe("timed_out");
+        expect(elapsed).toBeLessThan(2_000);
+        const pid = Number(readFileSync(`${bin}.pid`, "utf-8"));
+        // Still alive right after the deadline (SIGTERM ignored)...
+        expect(alive(pid)).toBe(true);
+        // ...but SIGKILLed after the grace period.
+        const until = Date.now() + 3_000;
+        while (alive(pid) && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
+        expect(alive(pid)).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 10_000);
   });
 
   it("returns a FIXED network-error message that never echoes the raw error", async () => {

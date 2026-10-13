@@ -9,8 +9,10 @@ const OAUTH_BETA = "oauth-2025-04-20";
 const REQUEST_TIMEOUT_MS = 10_000;
 const TIMEOUT_MESSAGE = "Claude usage unavailable: usage request timed out.";
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
-/** Upper bound on the delegated `claude -p /usage` token refresh (normally ~1s). */
+/** Deadline for the delegated `claude -p /usage` token refresh (normally ~1s). */
 const REFRESH_TIMEOUT_MS = 30_000;
+/** After the deadline's SIGTERM, how long a child gets before SIGKILL. */
+const REFRESH_KILL_GRACE_MS = 2_000;
 /** Fallback credentials file used on Linux / non-macOS installs. */
 const CREDENTIALS_FILE = join(homedir(), ".claude", ".credentials.json");
 
@@ -73,6 +75,13 @@ interface ClaudeCredentials {
   };
 }
 
+/**
+ * What happened to the delegated refresh. "completed" means Claude Code ran to
+ * exit — it had its chance to refresh, so a still-stale token afterwards is a
+ * real failure. "timed_out" / "failed_to_start" mean it never got that chance.
+ */
+export type RefreshOutcome = "completed" | "timed_out" | "failed_to_start";
+
 interface UsageDeps {
   fetchImpl?: typeof fetch;
   now?: () => number;
@@ -85,7 +94,7 @@ interface UsageDeps {
    * credentials to find out. Tomo never refreshes or writes the credentials
    * itself. Defaults to running the SDK's bundled `claude` binary.
    */
-  refreshCredentials?: () => Promise<void>;
+  refreshCredentials?: () => Promise<RefreshOutcome>;
   /**
    * Anthropic auth mode for direct Claude sessions (`config.auth.method`).
    * "api-key" means there is no subscription session/weekly cap at all — usage
@@ -107,14 +116,21 @@ const API_KEY_MESSAGE =
   "📊 API-key auth — no subscription limits. Usage is billed per-token; see console.anthropic.com/settings/usage";
 const RELOGIN_HINT = "Re-login to Claude Code (`claude` → /login).";
 /**
- * The stored access token is stale but a refresh token exists, and the
- * delegated refresh didn't produce a usable token. Claude Code refreshes it on
- * the agent's next API call, so this is not a reason to re-login.
+ * The stored access token is stale but Claude Code never got to refresh it
+ * here (the refresh timed out or couldn't start). It refreshes on the agent's
+ * next API call, so this is not yet a reason to re-login.
  */
-const STALE_TOKEN_MESSAGE =
+const REFRESH_PENDING_MESSAGE =
   "Claude usage unavailable: the stored Claude Code access token is stale and couldn't be refreshed just now. " +
-  "It refreshes automatically on the next agent turn — send a message, then try /usage again. " +
-  "(Only re-login if the agent itself stops answering.)";
+  "It refreshes automatically on the next agent turn — send a message, then try /usage again.";
+/** Claude Code ran its refresh and the token is still expired. */
+const REFRESH_FAILED_MESSAGE =
+  "Claude usage unavailable: the access token is expired and Claude Code's token refresh failed. " +
+  `Try again after the next agent turn; if this persists, ${RELOGIN_HINT.charAt(0).toLowerCase()}${RELOGIN_HINT.slice(1)}`;
+/** Claude Code ran its refresh, but the usage endpoint still rejects the token. */
+const REJECTED_AFTER_REFRESH_MESSAGE =
+  "Claude usage unavailable: the usage endpoint rejected the stored access token (401) and Claude Code's refresh didn't replace it. " +
+  `If this persists, ${RELOGIN_HINT.charAt(0).toLowerCase()}${RELOGIN_HINT.slice(1)}`;
 const GATEWAY_CAVEAT =
   "(gateway mode active — these are your Claude subscription limits, not necessarily what this session bills to)";
 
@@ -164,15 +180,17 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   // here: a rotated refresh token that isn't written back exactly as Claude
   // Code expects would break the agent itself.
   let refreshAttempted = false;
+  let lastOutcome: RefreshOutcome | undefined;
   if (isExpired(oauth?.expiresAt, now())) {
     if (!oauth?.refreshToken) {
       return `Claude usage unavailable: access token expired. ${RELOGIN_HINT}`;
     }
     refreshAttempted = true;
-    const fresh = await refreshAndReload(deps, loadCredentials);
+    const { outcome, oauth: fresh } = await refreshAndReload(deps, loadCredentials);
     if (!fresh?.accessToken || isExpired(fresh.expiresAt, now())) {
-      return STALE_TOKEN_MESSAGE;
+      return outcome === "completed" ? REFRESH_FAILED_MESSAGE : REFRESH_PENDING_MESSAGE;
     }
+    lastOutcome = outcome;
     oauth = fresh;
     token = fresh.accessToken;
   }
@@ -184,7 +202,8 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   // was rotated by another Claude Code process after we read it). Give Claude
   // Code one chance to refresh, and retry once only if the token changed.
   if (res.status === 401 && oauth?.refreshToken && !refreshAttempted) {
-    const fresh = await refreshAndReload(deps, loadCredentials);
+    const { outcome, oauth: fresh } = await refreshAndReload(deps, loadCredentials);
+    lastOutcome = outcome;
     if (fresh?.accessToken && fresh.accessToken !== token && !isExpired(fresh.expiresAt, now())) {
       oauth = fresh;
       token = fresh.accessToken;
@@ -194,10 +213,9 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   }
 
   if (res.status === 401 && oauth?.refreshToken) {
-    // Don't tell the owner to re-login while the agent is very likely still
-    // working: the refresh token is the authority, and Claude Code uses it on
-    // the next turn. If that fails too, the agent itself will report it.
-    return STALE_TOKEN_MESSAGE;
+    // Only claim "it'll refresh next turn" when Claude Code never got to try;
+    // once it ran and the token is still rejected, say so honestly.
+    return lastOutcome === "completed" ? REJECTED_AFTER_REFRESH_MESSAGE : REFRESH_PENDING_MESSAGE;
   }
   if (res.status === 401 || res.status === 403) {
     return `Claude usage unavailable: token expired or unauthorized. ${RELOGIN_HINT}`;
@@ -257,64 +275,109 @@ async function requestUsage(fetchImpl: typeof fetch, token: string): Promise<Res
 
 /**
  * Have Claude Code refresh its token, then re-read the stored credentials.
- * Returns the fresh OAuth block, or null when the refresh or re-read failed.
- * Never throws.
+ * `oauth` is the fresh OAuth block, or null when the re-read failed. Never
+ * throws.
  */
 async function refreshAndReload(
   deps: UsageDeps,
   loadCredentials: () => Promise<ClaudeCredentials>,
-): Promise<NonNullable<ClaudeCredentials["claudeAiOauth"]> | null> {
+): Promise<{ outcome: RefreshOutcome; oauth: NonNullable<ClaudeCredentials["claudeAiOauth"]> | null }> {
+  let outcome: RefreshOutcome;
   try {
-    await (deps.refreshCredentials ?? refreshViaClaudeCode)();
-    const creds = await loadCredentials();
-    if (!creds || typeof creds !== "object") return null;
-    return creds.claudeAiOauth ?? null;
+    outcome = await (deps.refreshCredentials ?? (() => runClaudeRefresh(resolveClaudeBinary())))();
   } catch {
-    return null;
+    outcome = "failed_to_start";
+  }
+  try {
+    const creds = await loadCredentials();
+    if (!creds || typeof creds !== "object") return { outcome, oauth: null };
+    return { outcome, oauth: creds.claudeAiOauth ?? null };
+  } catch {
+    return { outcome, oauth: null };
   }
 }
+
+/** Arguments for the delegated refresh; exported for tests. */
+export const CLAUDE_REFRESH_ARGS = ["-p", "/usage", "--safe-mode", "--no-session-persistence"] as const;
 
 /**
  * Delegate the OAuth refresh to Claude Code: `claude -p /usage` refreshes an
  * expiring access token at startup — under Claude Code's own refresh lock,
  * writing the rotated tokens back in its own storage format — and `/usage` is
  * a local command, so no model call is made. `--safe-mode` keeps the user's
- * hooks, plugins and MCP servers from running. Uses the same binary the Agent
- * SDK runs, so it shares the agent's credential storage. Resolves on exit,
- * error, or timeout; the outcome is observed by re-reading the credentials.
+ * hooks, plugins and MCP servers from running.
+ *
+ * Resolves by `timeoutMs` at the latest, whatever the child does: at the
+ * deadline it is sent SIGTERM and, if still alive `killGraceMs` later, SIGKILL.
+ * Never throws; child output is discarded (it never reaches the chat).
  */
-function refreshViaClaudeCode(): Promise<void> {
+export function runClaudeRefresh(
+  binary: string,
+  opts: { timeoutMs?: number; killGraceMs?: number; cwd?: string } = {},
+): Promise<RefreshOutcome> {
+  const timeoutMs = opts.timeoutMs ?? REFRESH_TIMEOUT_MS;
+  const killGraceMs = opts.killGraceMs ?? REFRESH_KILL_GRACE_MS;
   return new Promise((resolve) => {
+    let settled = false;
+    const settle = (outcome: RefreshOutcome) => {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    };
+
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(
-        resolveClaudeBinary(),
-        ["-p", "/usage", "--safe-mode", "--no-session-persistence"],
+      child = spawn(binary, [...CLAUDE_REFRESH_ARGS], {
+        cwd: opts.cwd ?? tmpdir(),
         // stdin ignored: `-p` would otherwise wait on an open stdin pipe.
-        { cwd: tmpdir(), stdio: ["ignore", "ignore", "ignore"] },
-      );
+        stdio: ["ignore", "ignore", "ignore"],
+      });
     } catch {
-      resolve();
+      settle("failed_to_start");
       return;
     }
-    const timer = setTimeout(() => child.kill("SIGTERM"), REFRESH_TIMEOUT_MS);
-    const done = () => { clearTimeout(timer); resolve(); };
-    child.once("error", done);
-    child.once("close", done);
+
+    let exited = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = setTimeout(() => {
+      // Resolve now, independent of the child; then make sure it dies.
+      settle("timed_out");
+      if (exited) return;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!exited) child.kill("SIGKILL");
+      }, killGraceMs);
+    }, timeoutMs);
+
+    child.once("error", () => {
+      exited = true;
+      clearTimeout(deadline);
+      clearTimeout(killTimer);
+      settle("failed_to_start");
+    });
+    child.once("exit", () => {
+      exited = true;
+      clearTimeout(deadline);
+      clearTimeout(killTimer);
+      settle("completed");
+    });
   });
 }
 
 /**
  * Path of the native `claude` binary the Agent SDK spawns (its per-platform
- * optional dependency), resolved the same way the SDK does; falls back to
- * `claude` on PATH.
+ * optional dependency), resolved the same way the SDK does — including its
+ * musl-first ordering on musl Linux, where both variants can be installed but
+ * only the musl one runs. Falls back to `claude` on PATH.
  */
 function resolveClaudeBinary(): string {
   try {
     const sdkRequire = createRequire(createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk"));
     const exe = process.platform === "win32" ? ".exe" : "";
     const base = `@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`;
-    const candidates = process.platform === "linux" ? [base, `${base}-musl`] : [base];
+    const candidates = process.platform !== "linux"
+      ? [base]
+      : isMuslLinux() ? [`${base}-musl`, base] : [base, `${base}-musl`];
     for (const pkg of candidates) {
       try {
         return sdkRequire.resolve(`${pkg}/claude${exe}`);
@@ -326,6 +389,14 @@ function resolveClaudeBinary(): string {
     // SDK not resolvable from here — fall through to PATH
   }
   return "claude";
+}
+
+/** Same check the SDK uses: a glibc runtime reports glibcVersionRuntime. */
+function isMuslLinux(): boolean {
+  const report = typeof process.report?.getReport === "function"
+    ? process.report.getReport() as { header?: { glibcVersionRuntime?: string } }
+    : null;
+  return report != null && report.header?.glibcVersionRuntime === undefined;
 }
 
 /** Turn a parsed usage payload into the plain-text chat report. */

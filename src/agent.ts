@@ -1893,7 +1893,15 @@ export class Agent {
           // expired login is otherwise only a pending note for a next turn
           // that fails the same way.
           ...(suppressErrorDelivery
-            ? { ownerNotice: this.ownerNoticeTarget(key, options.jobName ? `Cron job "${options.jobName}"` : "A background turn") }
+            ? {
+              ownerNotice: this.ownerNoticeTarget(
+                key,
+                options.jobName ? `Cron job "${options.jobName}"` : "A background turn",
+                // A group's turn handed to the summoned dm: session (or a
+                // group's delegate) is still the group's failure.
+                options.audiences?.find((a) => isGroupSessionKey(a)),
+              ),
+            }
             : {}),
         },
       });

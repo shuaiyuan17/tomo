@@ -100,6 +100,19 @@ describe("OwnerErrorNotifier", () => {
     expect(h.sent[0]).toContain("happened 1 more time there since the last notice");
   });
 
+  it("treats 'no owner target' (send resolves false) as a failed send", async () => {
+    let reachable = false;
+    const sent: string[] = [];
+    const notifier = new OwnerErrorNotifier({
+      send: async (text) => { if (!reachable) return false; sent.push(text); return true; },
+      enabled: () => true,
+    });
+    expect(await notifier.report(report())).toBe(false);
+    reachable = true;
+    expect(await notifier.report(report())).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
   it("gives an auth hint pointing at /login, and /rewind only for a dm-hosted turn", async () => {
     const h = make();
     await h.notifier.report(report({ detail: "Failed to authenticate. API Error: 401 x" }));

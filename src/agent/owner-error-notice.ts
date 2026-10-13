@@ -42,8 +42,9 @@ export interface SuppressedErrorReport {
 }
 
 export interface OwnerErrorNotifierDeps {
-  /** Deliver a DM to the owner (Agent.sendNotification). */
-  send(text: string): Promise<void>;
+  /** Deliver a DM to the owner (Agent.sendNotification). Resolving false
+   *  means there was no owner target; it counts as a failed send. */
+  send(text: string): Promise<boolean | void>;
   /** Config gate, read per report so a config reload applies. */
   enabled(): boolean;
   now?: () => number;
@@ -129,7 +130,8 @@ export class OwnerErrorNotifier {
     // cannot both notify.
     this.windows.set(windowKey, { lastSentAt: now, dropped: 0 });
     try {
-      await this.deps.send(formatOwnerNotice(report, cls, dropped));
+      const delivered = await this.deps.send(formatOwnerNotice(report, cls, dropped));
+      if (delivered === false) throw new Error("no owner DM target");
       log.info({ noticeKey: report.noticeKey, errorClass: cls }, "Owner notified of a suppressed error");
       return true;
     } catch (err) {

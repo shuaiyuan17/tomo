@@ -1963,13 +1963,16 @@ export class Agent {
   private async processContinuity(prompt: string, key: string, audiences?: string[]): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
     try {
-      await this.runContinuityTurn(prompt, key);
+      // A summoned group's restart notice runs on the owner's dm: session;
+      // its failure still belongs to (and is reported as) the group's.
+      const groupKey = audiences?.find((a) => isGroupSessionKey(a));
+      await this.runContinuityTurn(prompt, key, groupKey);
     } finally {
       if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
-  private async runContinuityTurn(prompt: string, key: string): Promise<void> {
+  private async runContinuityTurn(prompt: string, key: string, noticeGroupKey: string = key): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
@@ -2021,7 +2024,7 @@ export class Agent {
         thrownLogMessage: "Continuity heartbeat failed",
         // Heartbeats run on the owner's DM (no notice); a restart notice can
         // run on a group session, whose failure would otherwise vanish.
-        ownerNotice: this.groupNoticeTarget(key, "A restart notice turn"),
+        ownerNotice: this.groupNoticeTarget(noticeGroupKey, "A restart notice turn", isDmSessionKey(key)),
       },
     });
   }
@@ -2376,8 +2379,9 @@ export class Agent {
     });
   }
 
-  /** Send a direct notification to the user's DM channel (no agent query) */
-  async sendNotification(text: string): Promise<void> {
+  /** Send a direct notification to the user's DM channel (no agent query).
+   *  Resolves false when there was nowhere to send it. */
+  async sendNotification(text: string): Promise<boolean> {
     const dmKey = this.router.findFirstDmSession();
     let target: ReplyTarget | undefined;
 
@@ -2396,12 +2400,16 @@ export class Agent {
       }
     }
 
-    if (!target) { log.debug("Notification: no active DM session"); return; }
+    // No DM session yet: fall back to a configured identity's private chat.
+    target ??= this.findPrivateReplyTarget();
+
+    if (!target) { log.debug("Notification: no active DM session"); return false; }
 
     const channel = this.getChannel(target.channelName);
-    if (!channel) return;
+    if (!channel) return false;
 
     await channel.send({ chatId: target.chatId, text });
+    return true;
   }
 
   async start(): Promise<void> {

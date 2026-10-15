@@ -519,8 +519,9 @@ export class McpOAuthManager {
         body: JSON.stringify(MCP_INITIALIZE_PROBE),
       });
       const header = res.headers.get("www-authenticate") ?? "";
-      if (res.status !== 401 || !/^\s*bearer\b/i.test(header)) return;
-      this.discoveredOAuth.set(serverName, parseChallengeScopes(header));
+      const bearer = res.status === 401 ? bearerChallenge(header) : null;
+      if (bearer === null) return;
+      this.discoveredOAuth.set(serverName, parseChallengeScopes(bearer));
     } catch (err) {
       log.warn({ serverName, err }, "MCP OAuth discovery probe failed");
     }
@@ -1203,6 +1204,17 @@ function withBearer(
     ...server,
     headers: { ...(server.headers ?? {}), Authorization: `Bearer ${accessToken}` },
   };
+}
+
+/**
+ * The Bearer challenge out of a WWW-Authenticate value, or null. A header may
+ * carry several challenges (`Basic realm="x", Bearer scope="..."`), so Bearer
+ * counts at any challenge boundary, not only first; the returned slice starts
+ * at Bearer so its own params are read, not a preceding scheme's.
+ */
+function bearerChallenge(header: string): string | null {
+  const match = /(?:^|,)\s*bearer(?=\s|,|$)/i.exec(header);
+  return match ? header.slice(match.index).replace(/^,?\s*/, "") : null;
 }
 
 function parseChallengeScopes(header: string): string[] {

@@ -17,7 +17,7 @@ const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
 /** A spec-style MCP server: 401 + Bearer challenge, RFC 9728 + RFC 8414 metadata, DCR. */
-function specServerFetch(calls: string[], opts: { challenge?: boolean } = {}) {
+function specServerFetch(calls: string[], opts: { challenge?: boolean; header?: string } = {}) {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input);
     calls.push(`${init?.method ?? "GET"} ${url}`);
@@ -26,7 +26,7 @@ function specServerFetch(calls: string[], opts: { challenge?: boolean } = {}) {
       return new Response(null, {
         status: 401,
         headers: {
-          "WWW-Authenticate":
+          "WWW-Authenticate": opts.header ??
             'Bearer realm="OAuth", resource_metadata="https://grub.example/.well-known/oauth-protected-resource/mcp", scope="spots:read spots:write"',
         },
       });
@@ -87,6 +87,29 @@ describe("MCP OAuth discovery for servers without an oauth block", () => {
     const built = await restarted.buildServersWithAuth(grub(), async () => {});
     expect(built.grub).toMatchObject({ headers: { Authorization: "Bearer tok-abc" } });
     expect(restarted.getServerStatuses(grub())[0]).toMatchObject({ name: "grub", oauth: true, authRequired: false });
+  });
+
+  it("finds a Bearer challenge that is not the first one and reads its own scope", async () => {
+    resetDir();
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      tokenStorePath: TOKEN_STORE,
+      fetchImpl: specServerFetch([], {
+        header: 'Basic realm="legacy", scope="basic-only", Bearer resource_metadata="https://grub.example/.well-known/oauth-protected-resource/mcp", scope="spots:read"',
+      }),
+    });
+    const login = await manager.startLogin("grub", grub());
+    expect(new URL(login.url).searchParams.get("scope")).toBe("spots:read");
+  });
+
+  it("does not mistake a scheme that merely starts with 'bearer' or a param value for a Bearer challenge", async () => {
+    resetDir();
+    const manager = new McpOAuthManager({
+      workspaceDir: TEST_DIR,
+      tokenStorePath: TOKEN_STORE,
+      fetchImpl: specServerFetch([], { header: 'BearerX realm="a", Basic realm="Bearer"' }),
+    });
+    await expect(manager.startLogin("grub", grub())).rejects.toThrow("does not use OAuth");
   });
 
   it("still reports 'does not use OAuth' when the server sends no Bearer challenge", async () => {

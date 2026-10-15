@@ -30,6 +30,7 @@ import { SummonStore } from "./sessions/summon-store.js";
 import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js";
+import { mayUseDiscoveredOAuth } from "./mcp/external-config.js";
 import { log } from "./logger.js";
 import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
@@ -2573,7 +2574,9 @@ export class Agent {
    */
   private startMcpTokenRefreshSweep(): void {
     const servers = config.mcpServers ?? {};
-    if (!Object.values(servers).some((entry) => entry.oauth)) return;
+    // http/sse servers without an `oauth` block may still turn out to be
+    // OAuth by discovery (`/mcp login` probe), so they keep the sweep alive.
+    if (!Object.values(servers).some((entry) => entry.oauth || mayUseDiscoveredOAuth(entry))) return;
     const sweep = () => {
       // Held (not cleared on completion) so stop() can wait for an exchange
       // that is still in flight: abandoning one mid-write leaves the token

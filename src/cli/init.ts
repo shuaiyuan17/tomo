@@ -10,7 +10,29 @@ import { backupConfigIfParseableSync, SDK_SESSIONS_DIR } from "./config/shared.j
 import { SessionStore } from "../sessions/store.js";
 import { dmSessionKeyForIdentity } from "../sessions/keys.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { DEFAULT_MODEL } from "../models.js";
+import { DEFAULT_MODEL, PICKER_MODELS } from "../models.js";
+import {
+  buildInitConfig,
+  checkClaudeRuntime,
+  ownerSummary,
+  probeImsgCli,
+  runChannelSetup,
+  runInteractiveClaudeLogin,
+  type InitChannel,
+  type InitPromptPort,
+} from "./init-setup.js";
+
+/** @clack/prompts behind the port the channel step is tested through. */
+const initPrompts: InitPromptPort = {
+  text: (opts) => p.text(opts) as Promise<string | symbol>,
+  password: (opts) => p.password(opts) as Promise<string | symbol>,
+  confirm: (opts) => p.confirm(opts),
+  select: (opts) => p.select(opts) as Promise<string | symbol>,
+  multiselect: (opts) => p.multiselect(opts) as Promise<string[] | symbol>,
+  isCancel: (value: unknown): value is symbol => p.isCancel(value),
+  note: (message, title) => p.note(message, title),
+  log: { info: (m) => p.log.info(m), warn: (m) => p.log.warn(m), success: (m) => p.log.success(m) },
+};
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
@@ -54,34 +76,34 @@ export const initCommand = new Command("init")
     const configPath = CONFIG_PATH;
     const isReinit = existsSync(configPath) && !opts.force;
 
-    // 1. Prerequisites check (before anything else)
+    // 1. Prerequisites check (before anything else). Tomo runs Claude Code
+    // from the Agent SDK's bundled binary (sessions and /login alike), so no
+    // separately installed `claude` on PATH is required — only a login, or an
+    // API key.
     const s0 = p.spinner();
-    s0.start("Checking prerequisites");
-    const { execSync } = await import("node:child_process");
-    try {
-      const version = execSync("claude --version 2>/dev/null", { encoding: "utf-8" }).trim();
-      s0.stop(`Claude Code found (${version})`);
-
-      const s1 = p.spinner();
-      s1.start("Verifying Claude Code authentication");
-      try {
-        execSync('claude -p "say ok" --max-turns 1 2>/dev/null', {
-          encoding: "utf-8",
-          timeout: 30_000,
-        });
-        s1.stop("Claude Code authenticated");
-      } catch {
-        s1.stop("Claude Code not responding");
-        p.log.error("This could mean you're not logged in, or your usage limit has been reached.");
-        p.log.error("Run `claude` in your terminal to check, then try `tomo init` again.");
-        p.outro("Setup incomplete");
-        process.exit(1);
-      }
-    } catch {
-      s0.stop("Claude Code not found");
-      p.log.error("Claude Code is required. Install it: npm install -g @anthropic-ai/claude-code");
+    s0.start("Checking the Claude Code runtime");
+    const runtime = await checkClaudeRuntime();
+    if (runtime.kind === "missing") {
+      s0.stop("Claude Code runtime not found");
+      p.log.error("Tomo's bundled Claude Code binary did not run. Reinstall with `npm install -g tomo-ai`, or point TOMO_CLAUDE_PATH at a Claude Code binary.");
       p.outro("Setup incomplete");
       process.exit(1);
+    }
+    if (runtime.kind === "ok") {
+      s0.stop(`Claude Code ready (${runtime.version}; ${runtime.auth === "api-key" ? "using ANTHROPIC_API_KEY" : "logged in"})`);
+    } else {
+      s0.stop(`Claude Code found (${runtime.version}) but not logged in`);
+      const login = await p.confirm({ message: "Log in to Claude now? (opens a browser)", initialValue: true });
+      if (!p.isCancel(login) && login && runInteractiveClaudeLogin()) {
+        p.log.success("Logged in to Claude");
+      } else {
+        p.log.warn([
+          "Continuing without a Claude login. Tomo will not answer until you either:",
+          "  • send /login from your owner DM once Tomo is running,",
+          "  • set an API key with `tomo config` → Anthropic authentication, or",
+          "  • run `tomo init` again.",
+        ].join("\n"));
+      }
     }
 
     if (isReinit) {
@@ -100,8 +122,8 @@ export const initCommand = new Command("init")
           "    bad input — double-check anything consequential.",
           "  • Prompt injection is real. Messages, emails, or web content Tomo",
           "    reads may contain hidden instructions that try to hijack the agent.",
-          "  • Keep the allowlist tight. Only let people you trust message Tomo —",
-          "    every allowed user can steer the agent.",
+          "  • Only you (the owner) get answered in DMs. Anyone in a group you",
+          "    activate can still steer the agent — activate groups with care.",
           "  • Run Tomo on a machine without sensitive data or credentials you",
           "    can't afford to expose. Treat it like a semi-trusted process.",
           "",
@@ -200,68 +222,20 @@ export const initCommand = new Command("init")
     }
 
     // 4. Configuration
+    let channelsPicked: InitChannel[] = [];
     if (!isReinit) {
-      p.log.step("Telegram setup");
-      p.log.message([
-        "To connect Tomo to Telegram, you need a bot token:",
-        "",
-        "  1. Open Telegram and message @BotFather",
-        "  2. Send /newbot",
-        "  3. Choose a name (e.g., \"My Tomo\")",
-        "  4. Choose a username (must end in \"bot\", e.g., \"my_tomo_bot\")",
-        "  5. BotFather will reply with a token like: 123456:ABC-DEF...",
-        "  6. Also send /setprivacy → select your bot → Disable",
-        "     (so Tomo can read group messages)",
-        "",
-        "  Open BotFather: https://t.me/BotFather",
-      ].join("\n"));
-
-      const token = await p.text({
-        message: "Paste your bot token",
-        placeholder: "123456:ABC-DEF1234ghIkl-zyx57W2v...",
-        validate: (val) => {
-          if (!val?.trim()) return "Token is required.";
-          if (!/^\d+:.+$/.test(val.trim())) return "That doesn't look like a bot token. It should be like: 123456:ABC-DEF...";
-        },
-      });
-
-      if (p.isCancel(token)) {
+      p.log.step("Channels");
+      const setup = await runChannelSetup(initPrompts, { isMac: isMacOS(), probeImsg: () => probeImsgCli() });
+      if (!setup) {
         p.cancel("Setup cancelled.");
         process.exit(0);
       }
-
-      p.log.message([
-        "Your Telegram user ID is needed so only you can message the bot.",
-        "",
-        "  To find it: message @userinfobot on Telegram — it replies with your ID.",
-        "  It looks like: 123456789",
-        "",
-        "  You can add more allowed users later with `tomo config`.",
-      ].join("\n"));
-
-      const telegramUserId = await p.text({
-        message: "Your Telegram user ID",
-        placeholder: "e.g. 123456789",
-        validate: (val) => {
-          if (!val?.trim()) return "User ID is required for security.";
-          if (!/^\d+$/.test(val.trim())) return "User ID should be a number.";
-        },
-      });
-
-      if (p.isCancel(telegramUserId)) {
-        p.cancel("Setup cancelled.");
-        process.exit(0);
-      }
+      channelsPicked = setup.channels;
 
       const model = await p.select({
         message: "Default model",
-        options: [
-          { value: DEFAULT_MODEL, label: "Claude Sonnet 5 1M", hint: "fast, recommended, long context" },
-          { value: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "fast" },
-          { value: "claude-opus-5[1m]", label: "Claude Opus 5 1M", hint: "most capable, long context" },
-          { value: "claude-opus-5", label: "Claude Opus 5", hint: "most capable" },
-          { value: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "cheapest" },
-        ],
+        options: PICKER_MODELS.map((m) => ({ value: m.id, label: m.label, hint: m.hint })),
+        initialValue: DEFAULT_MODEL,
       });
 
       if (p.isCancel(model)) {
@@ -279,9 +253,9 @@ export const initCommand = new Command("init")
         process.exit(0);
       }
 
-      // Group chat setup
+      // Group chats are off until a group is activated with this secret.
       const enableGroups = await p.confirm({
-        message: "Enable group chat support?",
+        message: "Enable group chats? (each group is activated by sending a secret in it)",
         initialValue: false,
       });
 
@@ -301,39 +275,25 @@ export const initCommand = new Command("init")
           `  ${groupSecret}`,
           "",
           "  Tomo will recognize it and start listening in that group.",
-          "  You can view this secret later with `tomo config`.",
+          "  Other groups stay off. You can view this secret later with `tomo config`.",
         ].join("\n"));
       }
 
-      const userId = (telegramUserId as string).trim();
-      const ownerIdentity = deriveOwnerIdentity(personality?.userName ?? "", userId);
-      const config: Record<string, unknown> = {
-        channels: {
-          // No allowlist: it only lists activated groups now; the owner's DMs
-          // are admitted through `owner`.
-          telegram: { token: token as string },
-        },
-        owner: {
-          name: ownerIdentity.name,
-          ...(personality?.userName?.trim() ? { displayName: personality.userName.trim() } : {}),
-          telegram: [userId],
-          imessage: [],
-        },
-        model,
-      };
-      if ((city as string)?.trim()) {
-        config.city = (city as string).trim();
-      }
-      if (groupSecret) {
-        config.groupSecret = groupSecret;
-      }
+      const { config, owner } = buildInitConfig({
+        userName: personality?.userName ?? "",
+        channels: setup.channels,
+        telegramToken: setup.telegramToken,
+        telegramUserId: setup.telegramUserId,
+        imessageHandles: setup.imessageHandles,
+        model: model as string,
+        city: (city as string) ?? "",
+        groupSecret,
+      });
 
       writeInitConfig(configPath, CONFIG_BACKUP_PATH, config);
       p.log.success("Config saved");
-      precreateOwnerSession(ownerIdentity.name);
-      p.log.info(
-        `Owner "${ownerIdentity.name}" created (session dm:${ownerIdentity.name}) — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Add your iMessage handle later with \`tomo config\` → Owner.`,
-      );
+      precreateOwnerSession(owner.name);
+      p.note(ownerSummary(owner), "Owner");
     }
 
     // 4b. Autostart (first-time only, macOS only)
@@ -370,18 +330,14 @@ export const initCommand = new Command("init")
       "Your files",
     );
 
+    const where = channelsPicked.length === 0 ? "" : ` on ${channelsPicked.map((c) => (c === "telegram" ? "Telegram" : "iMessage")).join(" or ")}`;
     if (isAutostartEnabled()) {
-      p.outro(`${agentLabel} is running — say hi on Telegram!`);
+      p.outro(`${agentLabel} is running — say hi${where}!`);
     } else {
       p.outro(`Run \`tomo start\` to meet ${agentLabel}!`);
     }
   });
 
-/** Owner identity seeded at init. Binding the owner's Telegram user ID makes
- *  owner-gated commands (/login, /model, /summon) work from day one and gives
- *  the owner's DM a unified dm:<name> session key. The name feeds that session
- *  key (lowercased by the router), so use only the first word of the display
- *  name and fall back to "owner" when none was given. */
 /**
  * Write the config `tomo init` assembled, rotating the previous file into
  * `backupPath` only if it parses.
@@ -409,18 +365,6 @@ export function precreateOwnerSession(ownerName: string, sessionsDir = SESSIONS_
   } catch {
     // The daemon's first start creates it.
   }
-}
-
-export function deriveOwnerIdentity(
-  userName: string,
-  telegramUserId: string,
-): { name: string; channels: Record<string, string>; replyPolicy: string } {
-  const first = userName.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
-  return {
-    name: first || "owner",
-    channels: { telegram: telegramUserId },
-    replyPolicy: "last-active",
-  };
 }
 
 async function askPersonality(): Promise<Personality | null> {

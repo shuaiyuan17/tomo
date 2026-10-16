@@ -3081,7 +3081,7 @@ export class SessionStore {
    * AN INCOMPLETE ATTEMPT MUST NOT BE RECORDED AS A CHECK. The first version of
    * this marked the key before doing the work, so the one failure mode that
    * actually happens in the field — the transcript lock held by a second
-   * process, `tomo config identities` running against a live daemon — marked
+   * process, a CLI command running against a live daemon — marked
    * the key, returned, and let the triggering message `append()` under the NEW
    * stem. From then on both files existed, and the legacy one was never looked
    * at again: `loadTranscript`, `searchTranscript`, `transcriptCreatedAt` and
@@ -3641,8 +3641,7 @@ export class SessionStore {
    *
    * `existsSync(to)` then `renameSync(from, to)` is a check-then-act with a
    * window in it, and the window is reachable: `append()` in another process
-   * (`tomo config identities` → `pickChatId` → `store.get()`, `tomo lcm search
-   * --channel-key`) creates `to` between the two calls, and `rename` then
+   * (`tomo lcm search --channel-key`, or any CLI that builds its own store) creates `to` between the two calls, and `rename` then
    * replaces that brand-new live transcript with the legacy file, silently. A
    * `link` cannot do that — it fails with EEXIST if the name is taken — so the
    * move is `link` then `unlink`, and the destination's existence is decided by
@@ -4001,9 +4000,8 @@ export class SessionStore {
     if (this.rotateSkipMonth.get(key) === currentMonth) return;
 
     // SERIALIZE ROTATORS ACROSS PROCESSES. `get()` triggers rotation, and
-    // `get()` is called from a second process — `tomo config identities`
-    // builds its own SessionStore while the daemon is up
-    // (cli/config/identities.ts). Two rotators interleaving is not a thought
+    // `get()` is called from a second process — a CLI command such as
+    // `tomo lcm search` builds its own SessionStore while the daemon is up. Two rotators interleaving is not a thought
     // experiment: both read the same file, both write a temp, and both rename
     // it over the original, so the later rename either loses the earlier
     // rotator's work or, with the old FIXED temp name, fails with ENOENT

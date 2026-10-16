@@ -26,6 +26,12 @@
 - **Adoption is one-time and complete.** A legacy per-channel owner session is adopted only while the owner's `dm:` key has never existed, so `/new`, a timeout reset or a restart can no longer pull an old raw session back in. The adoption moves that session's cron jobs and `sessionModelOverrides` entry with it.
 - **`tomo config` → Owner replaces Identities**: session id read-only, display name, Telegram IDs, iMessage handles, and Convert legacy identities. All setup flows (Owner, Channels → iMessage → Enable, `tomo init`) write the `owner` block, never `identities`. The Identities menu, including its Remove path that rewrote the owner's cron jobs, is gone. Channels → Allowlist is now **Groups** (group ids only; DM entries shown as ignored).
 
+### Setup and models
+
+- **`tomo init`** asks which channels you use — Telegram, iMessage, or both (the web UI is always on) — and for iMessage your phone number or Apple ID email, validated (country code confirmation, pasted chat IDs reduced to the handle, group IDs rejected). It writes an `owner` block (never `identities`), no DM allowlist, and creates your `dm:<name>` session right away.
+- `tomo init` no longer requires a separately installed `claude` on PATH: it checks the Claude Code binary bundled with the Agent SDK (the one sessions and `/login` use since #421), offers to log in through it, and continues with instructions if you'd rather log in later or use an API key.
+- **Models: the 5.5 family.** Default `claude-sonnet-5-5` (1M context). Aliases: `sonnet`/`sonnet-1m` → `claude-sonnet-5-5`, `opus`/`opus-1m` → `claude-opus-5-5[1m]`, `opus-std` → `claude-opus-5-5`, `haiku` → `claude-haiku-5-5`, `fable` → `claude-fable-5-1`. All four are 1M-context natively; only Opus 5.5 declares the `[1m]` suffix. Older ids are no longer offered in the pickers but are still accepted, so existing configs keep working.
+
 **Upgrade notes — check these before restarting:**
 
 - **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Owner, add your Telegram user ID / iMessage handle (the daemon warns at startup for every channel the owner has no handle on).

@@ -203,7 +203,7 @@ export class ClaudeLoginManager {
   }
 }
 
-function verifyClaudeLogin(): Promise<void> {
+export function verifyClaudeLogin(): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile(
       resolveClaudeExecutable(),

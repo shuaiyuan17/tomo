@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
-import { MODEL_ALIASES, resolveModelName } from "../src/models.js";
+import { DEFAULT_MODEL, MODEL_ALIASES, PICKER_MODELS, resolveModelName } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
   inferLiteLlmMode,
@@ -218,15 +218,31 @@ describe("summarizeToolInput", () => {
 
 describe("model resolution", () => {
   it("maps short names to full model IDs", () => {
-    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5");
-    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5[1m]");
-    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5");
-    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5[1m]");
-    expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-4-5");
+    // 5.5 family, 1M wherever available: Sonnet/Haiku/Fable are natively 1M
+    // (plain ids); Opus 5.5 is the one model that declares the [1m] suffix.
+    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5-5");
+    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5-5");
+    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5-5[1m]");
+    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5-5[1m]");
+    expect(MODEL_ALIASES["opus-std"]).toBe("claude-opus-5-5");
+    expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-5-5");
+    expect(MODEL_ALIASES["fable"]).toBe("claude-fable-5-1");
+    expect(DEFAULT_MODEL).toBe("claude-sonnet-5-5");
   });
 
   it("does not have unknown model keys", () => {
-    expect(Object.keys(MODEL_ALIASES)).toEqual(["sonnet", "sonnet-1m", "opus", "opus-1m", "haiku"]);
+    expect(Object.keys(MODEL_ALIASES)).toEqual(["sonnet", "sonnet-1m", "opus", "opus-1m", "opus-std", "haiku", "fable"]);
+  });
+
+  it("pickers offer only the 5.5 family plus Fable 5.1, default first", () => {
+    expect(PICKER_MODELS.map((m) => m.id)).toEqual(["claude-sonnet-5-5", "claude-opus-5-5[1m]", "claude-haiku-5-5", "claude-fable-5-1"]);
+    expect(PICKER_MODELS.some((m) => /-4-|claude-(opus|sonnet)-5(\[|$)/.test(m.id))).toBe(false);
+  });
+
+  it("still accepts older explicit ids, so existing configs keep working", () => {
+    for (const id of ["claude-sonnet-5[1m]", "claude-opus-5[1m]", "claude-opus-4-8[1m]", "claude-haiku-4-5", "claude-opus-5-5[1m]"]) {
+      expect(resolveModelName(id)).toBe(id);
+    }
   });
 
   it("accepts LiteLLM provider/model names", () => {

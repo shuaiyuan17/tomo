@@ -35,14 +35,14 @@ export async function promptForModel(message: string, current?: string): Promise
           {
             value: CUSTOM_MODEL,
             label: "Custom model ID",
-            hint: `e.g. claude-sonnet-5 or ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`,
+            hint: `e.g. claude-sonnet-5-5 or ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`,
           },
         ]
       : [
           {
             value: CUSTOM_MODEL,
             label: "Custom model ID",
-            hint: "e.g. claude-sonnet-5",
+            hint: "e.g. claude-sonnet-5-5",
           },
         ]),
   ];
@@ -54,7 +54,7 @@ export async function promptForModel(message: string, current?: string): Promise
 
   const custom = await p.text({
     message: "Model ID",
-    placeholder: gatewayConfigured ? CHATGPT_SUBSCRIPTION_DEFAULT_MODEL : "claude-sonnet-5",
+    placeholder: gatewayConfigured ? CHATGPT_SUBSCRIPTION_DEFAULT_MODEL : "claude-sonnet-5-5",
     validate: (value) => {
       const resolved = resolveModelName(String(value ?? ""));
       if (!resolved) {

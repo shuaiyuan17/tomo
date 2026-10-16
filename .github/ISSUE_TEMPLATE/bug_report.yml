@@ -109,7 +109,7 @@ body:
     attributes:
       label: Model and auth mode
       description: The model in use and how Tomo authenticates. Do not paste keys or tokens.
-      placeholder: "claude-sonnet-5 via Claude subscription / API key / LiteLLM gateway"
+      placeholder: "claude-sonnet-5-5 via Claude subscription / API key / LiteLLM gateway"
   - type: textarea
     id: logs
     attributes:

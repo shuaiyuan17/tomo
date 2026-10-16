@@ -448,4 +448,37 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     const stale = registry().find((e) => e.channelKey === STALE_RAW && e.unlinkedAt === null);
     expect(stale?.sdkSessionId).toBe("sdk-stale-raw");
   });
+
+  it("a cron job dispatched on the raw owner key runs on the owner session once a DM completed the adoption", async () => {
+    seedPreIdentityInstall();
+    const agent = new Agent();
+    agent.addChannel(new MockChannel("telegram"));
+    // Startup adoption deferred (registry briefly unreadable, say): the
+    // scheduler still dispatches the job under the raw key...
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    // ...and an owner DM completes the adoption before the job executes.
+    store.migrateSessionKey(RAW, "dm:owner");
+    mockSdk.responseFn = () => "NO_REPLY";
+    const ok = await agent.handleCronMessage("morning", RAW, { waitForHandoff: true, jobName: "morning" });
+    await drainQueue(agent);
+    await agent.stop();
+
+    expect(ok).toBe(true);
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner"]);
+    expect(mockSdk.optionsBySession[0].options.resume).toBe(SDK_ID);
+    const after = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    expect(after.getEntry(RAW)).toBeUndefined();   // no raw session recreated
+  });
+
+  it("while an adoption is still pending, a raw-key cron job keeps running on the raw (legacy) session", async () => {
+    seedPreIdentityInstall();
+    const agent = new Agent();   // prepareOwner not run: nothing adopted yet
+    agent.addChannel(new MockChannel("telegram"));
+    mockSdk.responseFn = () => "NO_REPLY";
+    await agent.handleCronMessage("morning", RAW, { waitForHandoff: true });
+    await drainQueue(agent);
+    await agent.stop();
+    expect(mockSdk.optionsBySession.map((o) => [o.sessionKey, o.options.resume])).toEqual([[RAW, SDK_ID]]);
+  });
 });
+

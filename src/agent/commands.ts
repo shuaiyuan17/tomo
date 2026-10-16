@@ -7,6 +7,7 @@ import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { OwnerRouter } from "../router.js";
 import { ownerDisplayName, type OwnerConfig } from "../owner.js";
 import { redactChatIdForLog } from "./blocked-inbound-log.js";
+import { withConfigLockSync } from "../config-file.js";
 import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
@@ -488,16 +489,18 @@ export class ChatCommandHandler {
    *  leaving in-memory state untouched) if the file can't be read or written. */
   private persistModelOverride(key: string, model: string): boolean {
     try {
-      const cfg = existsSync(CONFIG_PATH)
-        ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
-        : {};
-      const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-      overrides[key] = model;
-      cfg.sessionModelOverrides = overrides;
-
       mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-      backupConfigFile();
-      writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+      // Shared config lock, re-read inside it (see saveConfig).
+      withConfigLockSync(CONFIG_PATH, () => {
+        const cfg = existsSync(CONFIG_PATH)
+          ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
+          : {};
+        const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
+        overrides[key] = model;
+        cfg.sessionModelOverrides = overrides;
+        backupConfigFile();
+        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+      });
       config.sessionModelOverrides[key] = model;
       return true;
     } catch (err) {

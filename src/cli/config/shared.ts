@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
 import { defaultRuntimePaths } from "../../runtime-paths.js";
+import { threeWayMerge, withConfigLockSync } from "../../config-file.js";
 
 const paths = defaultRuntimePaths;
 export const TOMO_HOME = paths.tomoHome;
@@ -58,9 +59,15 @@ function readConfigFile(path: string): Record<string, unknown> | undefined {
   return data as Record<string, unknown>;
 }
 
+/** What each object `loadConfig` returned looked like on disk, so a later
+ *  `saveConfig` can merge only the fields the editor actually changed. */
+const loadedSnapshots = new WeakMap<object, string>();
+
 /** Throws {@link ConfigReadError} when the file exists but is unreadable. */
 export function loadConfig(): Record<string, unknown> {
-  return readConfigFile(CONFIG_PATH) ?? {};
+  const cfg = readConfigFile(CONFIG_PATH) ?? {};
+  loadedSnapshots.set(cfg, JSON.stringify(cfg));
+  return cfg;
 }
 
 /**
@@ -84,10 +91,26 @@ export function saveConfig(cfg: Record<string, unknown>): void {
   // The file can also have been hand-edited between load and save (the config
   // UI is a long-lived interactive session), so the load-time check alone is
   // not enough.
-  readConfigFile(CONFIG_PATH);
+  //
+  // LOST UPDATES. `tomo config` is long-lived and the daemon writes the same
+  // file (group activation, /model, owner-session adoption moving a model
+  // override). Writing `cfg` whole would revert whatever the daemon wrote
+  // since this menu loaded. So: take the shared config lock, re-read, and
+  // write a field-level three-way merge of (what we loaded, what we want,
+  // what is there now). `cfg` is then updated in place to what was written,
+  // so the menu's next save merges against the right base.
   mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
-  writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+  withConfigLockSync(CONFIG_PATH, () => {
+    const theirs = readConfigFile(CONFIG_PATH) ?? {};
+    const snapshot = loadedSnapshots.get(cfg);
+    const base = snapshot === undefined ? {} : JSON.parse(snapshot) as Record<string, unknown>;
+    const merged = threeWayMerge(base, cfg, theirs) as Record<string, unknown>;
+    backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
+    writeJsonAtomicSync(CONFIG_PATH, merged, { mode: 0o600 });
+    for (const key of Object.keys(cfg)) if (!(key in merged)) delete cfg[key];
+    Object.assign(cfg, JSON.parse(JSON.stringify(merged)) as Record<string, unknown>);
+    loadedSnapshots.set(cfg, JSON.stringify(merged));
+  });
 }
 
 /**

@@ -66,6 +66,7 @@ import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { CronStore } from "./cron/store.js";
+import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
 import { spawn } from "node:child_process";
@@ -502,17 +503,19 @@ export class Agent {
       // closed), so the secret CREATES the list here. That no longer touches
       // DMs: the owner's DM is admitted through its identity binding, not
       // through the allowlist.
-      const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-      const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
-      if (!channels[channel.name]) channels[channel.name] = {};
-      const allowlist = ((channels[channel.name].allowlist ?? []) as string[]);
-      if (!allowlist.includes(chatId)) {
-        allowlist.push(chatId);
-        channels[channel.name].allowlist = allowlist;
-        cfg.channels = channels;
-        backupConfigFile();
-        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
-      }
+      withConfigLockSync(CONFIG_PATH, () => {
+        const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+        const channels = (cfg.channels ?? {}) as Record<string, Record<string, unknown>>;
+        if (!channels[channel.name]) channels[channel.name] = {};
+        const allowlist = ((channels[channel.name].allowlist ?? []) as string[]);
+        if (!allowlist.includes(chatId)) {
+          allowlist.push(chatId);
+          channels[channel.name].allowlist = allowlist;
+          cfg.channels = channels;
+          backupConfigFile();
+          writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+        }
+      });
       // Update the router's in-memory allowlist (also when the file already
       // listed it, e.g. hand-edited since startup).
       this.router.addToAllowlist(channel.name, chatId);
@@ -581,17 +584,19 @@ export class Agent {
   }
 
   private moveModelOverride(from: string, to: string): void {
-    if (existsSync(CONFIG_PATH)) {
+    // Under the shared config lock, re-reading inside it: `tomo config` may be
+    // saving at the same moment (see saveConfig's field-level merge).
+    withConfigLockSync(CONFIG_PATH, () => {
+      if (!existsSync(CONFIG_PATH)) return;
       const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>;
       const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-      if (overrides[from] !== undefined) {
-        if (overrides[to] === undefined) overrides[to] = overrides[from];
-        delete overrides[from];
-        cfg.sessionModelOverrides = overrides;
-        backupConfigFile();
-        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
-      }
-    }
+      if (overrides[from] === undefined) return;
+      if (overrides[to] === undefined) overrides[to] = overrides[from];
+      delete overrides[from];
+      cfg.sessionModelOverrides = overrides;
+      backupConfigFile();
+      writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
+    });
     const live = config.sessionModelOverrides;
     if (live[from] !== undefined) {
       if (live[to] === undefined) live[to] = live[from];
@@ -1923,7 +1928,39 @@ export class Agent {
       });
   }
 
+  /**
+   * The owner's `dm:` key for a raw `<channel>:<owner handle>` key, once the
+   * owner session exists (registry has, or had, an entry for it). Undefined
+   * otherwise — including while an adoption is still pending, when the raw
+   * key IS the owner's conversation and must keep running there.
+   */
+  private ownerKeyForRawOwnerSession(sessionKey: string): string | undefined {
+    const parsed = parseRawSessionKey(sessionKey);
+    const owner = config.owner;
+    const ownerKey = this.router.ownerSessionKey();
+    if (!parsed || !owner || !ownerKey) return undefined;
+    if (!isOwnerHandle(owner, parsed.channelName, parsed.chatId)) return undefined;
+    return this.sessions.hasEverHadEntry(ownerKey) ? ownerKey : undefined;
+  }
+
   private async processCronMessage(message: string, sessionKey: string, options: CronTurnOptions): Promise<boolean> {
+    // Resolved at EXECUTION time, not dispatch: a job dispatched on the raw
+    // owner key while an adoption was pending may run after a DM completed
+    // that adoption. Running it on the raw key then would recreate a raw
+    // session beside the owner's (a fork). Hand it to the owner's queue.
+    const adoptedKey = this.ownerKeyForRawOwnerSession(sessionKey);
+    if (adoptedKey) {
+      log.info({ from: sessionKey, to: adoptedKey }, "Background turn on a raw owner key handed to the owner session");
+      const handoff = this.enqueueForSession(adoptedKey, () => this.processCronMessage(message, adoptedKey, options));
+      if (options.waitForHandoff) {
+        return handoff.catch((err) => {
+          log.error({ err, sessionKey: adoptedKey }, "Owner background turn failed in queue");
+          return false;
+        });
+      }
+      handoff.catch((err) => { log.error({ err, sessionKey: adoptedKey }, "Owner background turn failed in queue"); });
+      return true;
+    }
     const summonedKey = this.summonedDmKeyForGroupSession(sessionKey);
     if (summonedKey) {
       const parsed = parseRawSessionKey(sessionKey)!;

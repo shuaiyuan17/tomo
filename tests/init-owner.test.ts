@@ -203,6 +203,29 @@ describe("tomo init --force merges onto the existing config", () => {
     expect(kept.sort()).toEqual(["auth", "groupSecret", "litellm", "plugins", "sessionModelOverrides", "web"]);
   });
 
+  it("a legacy owner (from identities) keeps its Telegram id when --force picks iMessage only", () => {
+    const existing = {
+      channels: { telegram: { token: "old-token" } },
+      identities: [{ name: "alex", channels: { telegram: "123456789" }, replyPolicy: "last-active" }],
+    };
+    const { config: fresh } = buildInitConfig({
+      ownerName: "alex", userName: "Alex", channels: ["imessage"], imessageHandles: ["+15555550123"], model: "m",
+    });
+    const { config } = mergeInitConfig(structuredClone(existing), fresh, ["imessage"]);
+    expect(config.owner).toEqual({ name: "alex", displayName: "Alex", telegram: ["123456789"], imessage: ["+15555550123"] });
+    expect(config.identities).toEqual(existing.identities);
+    expect(resolveOwner({ owner: config.owner, identities: [] }).owner?.telegram).toEqual(["123456789"]);
+  });
+
+  it("an owner adopted from the allowlist (pre-identity install) keeps its Telegram id too", () => {
+    const existing = { channels: { telegram: { token: "t", allowlist: ["123456789"] } } };
+    const { config: fresh } = buildInitConfig({
+      ownerName: "owner", userName: "", channels: ["imessage"], imessageHandles: ["+15555550123"], model: "m",
+    });
+    expect(mergeInitConfig(structuredClone(existing), fresh, ["imessage"]).config.owner)
+      .toEqual({ name: "owner", telegram: ["123456789"], imessage: ["+15555550123"] });
+  });
+
   it("a fresh install is written as built", () => {
     const { config: fresh } = buildInitConfig({ userName: "Alex", channels: ["telegram"], telegramToken: TOKEN, telegramUserId: "1", model: "m" });
     expect(mergeInitConfig(undefined, fresh, ["telegram"]).config).toEqual(fresh);

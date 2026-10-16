@@ -4,6 +4,7 @@ import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from
 import { SessionStore } from "../sessions/store.js";
 import { legacySessionKeysForBinding } from "../sessions/keys.js";
 import {
+  currentOwner,
   deriveOwnerName,
   promptImessageOwnerHandles,
   promptTelegramUserId,
@@ -263,7 +264,17 @@ export function mergeInitConfig(
   const replaced = new Set<string>();
 
   const freshOwner = fresh.owner as { name: string; displayName?: string; telegram: string[]; imessage: string[] };
-  const oldOwner = (typeof existing.owner === "object" && existing.owner !== null ? existing.owner : {}) as Record<string, unknown>;
+  // The owner the daemon resolves today — an explicit `owner` block, or one
+  // derived from legacy `identities` / adopted from the allowlist. Basing the
+  // merge on the block alone dropped the handles of a legacy owner for every
+  // channel not picked now (e.g. Telegram DMs stopped being admitted).
+  const explicit = (typeof existing.owner === "object" && existing.owner !== null ? existing.owner : {}) as Record<string, unknown>;
+  const resolved = currentOwner(existing).owner;
+  const oldOwner: Record<string, unknown> = {
+    ...clone(explicit),
+    ...(resolved ? { telegram: resolved.telegram, imessage: resolved.imessage } : {}),
+    ...(resolved?.displayName && explicit.displayName === undefined ? { displayName: resolved.displayName } : {}),
+  };
   out.owner = {
     ...clone(oldOwner),
     name: freshOwner.name,

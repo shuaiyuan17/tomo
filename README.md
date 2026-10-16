@@ -139,7 +139,6 @@ Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonica
 Tomo works for one person, the **owner**. Every owner DM — Telegram, iMessage and the web UI — lands in one session, `dm:<owner.name>`, and Tomo replies on whichever channel you last used.
 
 - The owner's session is created up front (by `tomo init`, or on first start), so a channel connected later joins it instead of starting a new one
-- `tomo config` → **Owner** shows your session id (read-only), display name, Telegram IDs and iMessage handles, and converts a legacy `identities` block. Enabling iMessage in `tomo config` → Channels asks for your handle; going without one needs an explicit confirmation
 - **Admission fails closed.** Only DMs from the owner's handles are answered. Anyone else gets no reply and no session; Tomo logs one line per sender per hour. A channel with no allowlist is not open
 - Group chats always get their own isolated session, and are off until activated: send the secret passphrase (`tomo config` → Group chats) in the group, which adds it to the channel's `allowlist`. The allowlist only lists groups; DM entries in it are ignored
 - iMessage handles are compared in a normal form, so `+1 (555) 555-0123` and `iMessage;-;+15555550123` match

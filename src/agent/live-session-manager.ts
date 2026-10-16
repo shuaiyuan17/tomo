@@ -58,11 +58,6 @@ async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boole
   }
 }
 
-/** A failed resume, as current SDKs report it: an error result, not a throw. */
-function isResumeMissingResult(err: SdkResultError): boolean {
-  return err.errors.some((e) => e.includes("No conversation found"));
-}
-
 function isRecoverableSessionError(errMsg: string): boolean {
   return errMsg.includes("No conversation found")
     || /session (?:is )?closed/i.test(errMsg)
@@ -724,14 +719,13 @@ export class LiveSessionManager {
       if (err instanceof TurnInterruptedError) throw err;
       if (token.interrupted) throw new TurnInterruptedError();
       // One exception: a resume that can't find its conversation. Current SDKs
-      // report it as an error result (error_during_execution, turns 0, the
-      // reason only in `errors`) instead of throwing, so nothing ran and the
-      // reset-and-retry below must still fire. Matched on that phrase alone.
-      if (err instanceof SdkResultError && !isResumeMissingResult(err)) throw err;
+      // report it as a zero-turn error result instead of throwing, so nothing
+      // ran and the reset-and-retry below must still fire (see isResumeMissing).
+      if (err instanceof SdkResultError && !err.isResumeMissing) throw err;
 
-      // For a missing-conversation error result the reason is in `errors`; the
-      // message is our generic execution-error text.
-      const errMsg = err instanceof SdkResultError ? err.errors.join("; ") : err instanceof Error ? err.message : "";
+      // A missing-conversation result reaches here only with every error saying
+      // so (isResumeMissing); give it the phrase the retry path matches on.
+      const errMsg = err instanceof SdkResultError ? "No conversation found" : err instanceof Error ? err.message : "";
 
       if (this.stopping && errMsg.includes("closed")) {
         // FLUSH BEFORE CONVERTING, NOT AFTER — there is no after. Resolving
@@ -854,7 +848,9 @@ export class LiveSessionManager {
     try {
       response = await attempt();
     } catch (err) {
-      if (err instanceof SdkResultError) this.recordTurnCompletion(key, session);
+      // A failed resume ran nothing and is about to be retried: recording it
+      // would count one turn twice and persist nothing useful.
+      if (err instanceof SdkResultError && !err.isResumeMissing) this.recordTurnCompletion(key, session);
       throw err;
     }
     if (steer && response === STEER_MERGED) return response;

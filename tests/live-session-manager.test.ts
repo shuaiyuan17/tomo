@@ -102,9 +102,13 @@ vi.mock("../src/agent/live-session.js", () => {
       }
     },
     SdkResultError: class SdkResultError extends Error {
-      constructor(message: string, readonly subtype: string, readonly errors: string[] = []) {
+      constructor(message: string, readonly subtype: string, readonly errors: string[] = [], readonly numTurns?: number) {
         super(message);
         this.name = "SdkResultError";
+      }
+      get isResumeMissing(): boolean {
+        return this.subtype === "error_during_execution" && this.numTurns === 0
+          && this.errors.length > 0 && this.errors.every((e) => e.includes("No conversation found"));
       }
     },
   };
@@ -805,7 +809,7 @@ describe("LiveSessionManager.runWithRetry", () => {
       if (calls === 1) {
         throw new SdkResultError("Something went wrong", "error_during_execution", [
           "No conversation found with session ID: 5a54ee9f-67d2-4ea7-963d-22f68076c89b",
-        ]);
+        ], 0);
       }
       return "recovered";
     };
@@ -816,13 +820,44 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances[0].closed).toBe(true);
   });
 
+  it("does not retry a missing-conversation result from a turn that ran", async () => {
+    // Only a zero-turn result proves nothing ran; anything else may have run
+    // tools, and re-running it would repeat them.
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => {
+      throw new SdkResultError("Something went wrong", "error_during_execution", ["No conversation found with session ID: x"], 3);
+    };
+
+    await expect(manager.runWithRetry({ key: "imessage:group", prompt: "hi" })).rejects.toThrow();
+    expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
+    expect(mockState.instances).toHaveLength(1);
+  });
+
+  it("counts a retried failed resume as one turn", async () => {
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    let calls = 0;
+    mockState.sendImpl = async () => {
+      calls++;
+      if (calls === 1) throw new SdkResultError("x", "error_during_execution", ["No conversation found with session ID: y"], 0);
+      return "recovered";
+    };
+    const statsBefore = (deps.updateStats as { mock: { calls: unknown[] } }).mock.calls.length;
+
+    await manager.runWithRetry({ key: "imessage:group", prompt: "hi" });
+
+    expect(deps.maybeNudgeCompact).toHaveBeenCalledTimes(1);
+    expect((deps.updateStats as { mock: { calls: unknown[] } }).mock.calls.length - statsBefore).toBeLessThanOrEqual(1);
+  });
+
   it("does not retry other SDK error results, even ones that mention a closed session", async () => {
     // An error result usually means the turn ran; re-running it would repeat
     // its side effects. Only the missing-conversation reason is retried.
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);
     mockState.sendImpl = async () => {
-      throw new SdkResultError("Something went wrong", "error_during_execution", ["Session is closed"]);
+      throw new SdkResultError("Something went wrong", "error_during_execution", ["Session is closed"], 0);
     };
 
     await expect(manager.runWithRetry({ key: "imessage:group", prompt: "hi" })).rejects.toThrow();

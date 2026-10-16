@@ -181,9 +181,29 @@ function mainLoopUsage(result: SdkResultLike): TokenTotals {
  * pipeline's `isAgentErrorResponse` already classifies).
  */
 export class SdkResultError extends Error {
-  constructor(message: string, readonly subtype: string, readonly errors: string[] = []) {
+  constructor(
+    message: string,
+    readonly subtype: string,
+    readonly errors: string[] = [],
+    /** `num_turns` from the result, when the SDK reported it. 0 = nothing ran. */
+    readonly numTurns?: number,
+  ) {
     super(message);
     this.name = "SdkResultError";
+  }
+
+  /**
+   * A resume that couldn't find its conversation, as current SDKs report it:
+   * an execution-error result with zero turns and the reason in `errors`,
+   * rather than a throw. Nothing ran, so the turn is safe to re-run on a
+   * fresh session. Every condition is required; a result that ran any turn,
+   * or failed for any other reason too, is not this.
+   */
+  get isResumeMissing(): boolean {
+    return this.subtype === "error_during_execution"
+      && this.numTurns === 0
+      && this.errors.length > 0
+      && this.errors.every((e) => e.includes("No conversation found"));
   }
 }
 
@@ -222,7 +242,7 @@ export function describeResultFailure(result: SdkResultLike): SdkResultError | n
       return new SdkResultError(MAX_BUDGET_RESPONSE, result.subtype, errors);
     default:
       return result.subtype.startsWith("error") || result.is_error
-        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors)
+        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors, result.num_turns)
         : null;
   }
 }

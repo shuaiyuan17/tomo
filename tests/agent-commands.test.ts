@@ -806,13 +806,13 @@ describe("chat commands", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m", "12345");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5-5");
+    expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5-5[1m]");
 
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-sonnet-5-5");
-    expect(mockConfig.sessionModelOverrides["dm:owner"]).toBe("claude-sonnet-5-5");
+    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-sonnet-5-5[1m]");
+    expect(mockConfig.sessionModelOverrides["dm:owner"]).toBe("claude-sonnet-5-5[1m]");
 
     const backup = JSON.parse(readFileSync(agentEnv.configBackupPath, "utf-8")) as { model?: string };
     expect(backup.model).toBe("claude-haiku-4-5");

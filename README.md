@@ -312,7 +312,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     },
     "imessage": { "provider": "imsg", "allowlist": ["any;+;<group-chat-guid>"] }
   },
-  "model": "claude-sonnet-5-5",
+  "model": "claude-opus-5-5[1m]",
   "litellm": {
     "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",

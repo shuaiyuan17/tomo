@@ -218,24 +218,27 @@ describe("summarizeToolInput", () => {
 
 describe("model resolution", () => {
   it("maps short names to full model IDs", () => {
-    // 5.5 family, 1M wherever available: Sonnet/Haiku/Fable are natively 1M
-    // (plain ids); Opus 5.5 is the one model that declares the [1m] suffix.
-    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5-5");
-    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5-5");
+    // 5.5 family, 1M by default: [1m] ids where the SDK takes the suffix
+    // (it strips it from any id, and aliases sonnet/opus/fable[1m]); Haiku
+    // 5.5 is natively 1M and has no [1m] alias in the SDK.
     expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5-5[1m]");
     expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5-5[1m]");
     expect(MODEL_ALIASES["opus-std"]).toBe("claude-opus-5-5");
+    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5-5[1m]");
+    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5-5[1m]");
+    expect(MODEL_ALIASES["sonnet-std"]).toBe("claude-sonnet-5-5");
     expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-5-5");
-    expect(MODEL_ALIASES["fable"]).toBe("claude-fable-5-1");
-    expect(DEFAULT_MODEL).toBe("claude-sonnet-5-5");
+    expect(MODEL_ALIASES["fable"]).toBe("claude-fable-5-1[1m]");
+    expect(MODEL_ALIASES["fable-std"]).toBe("claude-fable-5-1");
+    expect(DEFAULT_MODEL).toBe("claude-opus-5-5[1m]");
   });
 
   it("does not have unknown model keys", () => {
-    expect(Object.keys(MODEL_ALIASES)).toEqual(["sonnet", "sonnet-1m", "opus", "opus-1m", "opus-std", "haiku", "fable"]);
+    expect(Object.keys(MODEL_ALIASES)).toEqual(["opus", "opus-1m", "opus-std", "sonnet", "sonnet-1m", "sonnet-std", "haiku", "fable", "fable-std"]);
   });
 
-  it("pickers offer only the 5.5 family plus Fable 5.1, default first", () => {
-    expect(PICKER_MODELS.map((m) => m.id)).toEqual(["claude-sonnet-5-5", "claude-opus-5-5[1m]", "claude-haiku-5-5", "claude-fable-5-1"]);
+  it("pickers offer only the 5.5 family plus Fable 5.1, 1M by default, default first", () => {
+    expect(PICKER_MODELS.map((m) => m.id)).toEqual(["claude-opus-5-5[1m]", "claude-sonnet-5-5[1m]", "claude-haiku-5-5", "claude-fable-5-1[1m]"]);
     expect(PICKER_MODELS.some((m) => /-4-|claude-(opus|sonnet)-5(\[|$)/.test(m.id))).toBe(false);
   });
 

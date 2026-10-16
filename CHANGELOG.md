@@ -30,7 +30,7 @@
 
 - **`tomo init`** asks which channels you use — Telegram, iMessage, or both (the web UI is always on) — and for iMessage your phone number or Apple ID email, validated (country code confirmation, pasted chat IDs reduced to the handle, group IDs rejected). It writes an `owner` block (never `identities`), no DM allowlist, and creates your `dm:<name>` session right away.
 - `tomo init` no longer requires a separately installed `claude` on PATH: it checks the Claude Code binary bundled with the Agent SDK (the one sessions and `/login` use since #421), offers to log in through it, and continues with instructions if you'd rather log in later or use an API key.
-- **Models: the 5.5 family.** Default `claude-sonnet-5-5` (1M context). Aliases: `sonnet`/`sonnet-1m` → `claude-sonnet-5-5`, `opus`/`opus-1m` → `claude-opus-5-5[1m]`, `opus-std` → `claude-opus-5-5`, `haiku` → `claude-haiku-5-5`, `fable` → `claude-fable-5-1`. All four are 1M-context natively; only Opus 5.5 declares the `[1m]` suffix. Older ids are no longer offered in the pickers but are still accepted, so existing configs keep working.
+- **Models: the 5.5 family, 1M context by default.** Default `claude-opus-5-5[1m]`. Aliases: `opus`/`opus-1m` → `claude-opus-5-5[1m]`, `sonnet`/`sonnet-1m` → `claude-sonnet-5-5[1m]`, `fable` → `claude-fable-5-1[1m]`, `haiku` → `claude-haiku-5-5` (natively 1M); `opus-std`, `sonnet-std`, `fable-std` give the ids without `[1m]`. Older ids are no longer offered in the pickers but are still accepted, so existing configs keep working.
 
 **Upgrade notes — check these before restarting:**
 

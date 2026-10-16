@@ -16,6 +16,7 @@ import {
   makeMsg,
   mockSdk,
   resetConfig,
+  useRealAdmission,
 } from "./helpers/agent-harness.js";
 
 installAgentTestHooks();
@@ -231,13 +232,19 @@ describe("allowlist enforcement", () => {
     await agent.stop();
   });
 
-  it("admits every chat on a channel with no allowlist", async () => {
-    resetConfig({ channelAllowlists: {} });
+  it("fails closed on a channel with no allowlist: only owner DMs are admitted", async () => {
+    useRealAdmission();
+    resetConfig({
+      channelAllowlists: {},
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    expect(tg.admissionPredicate?.("anything")).toBe(true);
+    expect(tg.admissionPredicate?.("12345")).toBe(true);
+    expect(tg.admissionPredicate?.("99999")).toBe(false);
+    expect(tg.admissionPredicate?.("-100555")).toBe(false);
 
     await agent.stop();
   });
@@ -353,10 +360,11 @@ describe("group chat handling", () => {
     await agent.stop();
   });
 
-  it("does not create an allowlist when the secret arrives on an open channel", async () => {
-    // The channel has no allowlist — everything (including this group) is
-    // already allowed. Activation must not flip the channel to enforced,
-    // which would lock out every other chat until restart.
+  it("creates the group allowlist when the secret arrives on a channel with none, and the owner DM still gets through", async () => {
+    // Groups on a channel with no allowlist are closed, so the secret is the
+    // way in: it must persist the group. That no longer locks anyone out —
+    // the owner's DM is admitted by its identity binding, not the allowlist.
+    useRealAdmission();
     const configPath = join(agentEnv.tmpDir, "config.json");
     writeFileSync(configPath, JSON.stringify({
       channels: { telegram: { token: "test" } },
@@ -365,10 +373,17 @@ describe("group chat handling", () => {
     resetConfig({
       channelAllowlists: {},
       groupSecret: "tomo-secret-123",
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
+
+    // Before activation the group is refused.
+    mockSdk.responseFn = () => "group reply";
+    await tg.simulateMessage(makeMsg({ chatId: "-100group", text: "@tomo hi", isGroup: true, isMentioned: true, senderName: "Alice" }));
+    await drainQueue(agent);
+    expect(tg.sent).toHaveLength(0);
 
     await tg.simulateMessage(makeMsg({
       chatId: "-100group",
@@ -379,16 +394,18 @@ describe("group chat handling", () => {
     }));
     await drainQueue(agent);
 
-    // Acknowledged, but the config gained no allowlist.
-    expect(tg.sent.find(m => m.text?.includes("already active"))).toBeDefined();
+    expect(tg.sent.find(m => m.text?.includes("activated"))?.chatId).toBe("-100group");
     const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
-    expect(cfg.channels.telegram.allowlist).toBeUndefined();
+    expect(cfg.channels.telegram.allowlist).toEqual(["-100group"]);
+    expect(tg.admissionPredicate?.("-100group")).toBe(true);
 
-    // Other chats (e.g. the owner's DM) still get through.
+    // The owner's DM still gets through; a stranger still does not.
     mockSdk.responseFn = () => "Hi there!";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "Hello" }));
+    await tg.simulateMessage(makeMsg({ chatId: "99999", senderId: "99999", text: "Hello" }));
     await drainQueue(agent);
     expect(tg.delivered.some(m => m.chatId === "12345")).toBe(true);
+    expect(tg.delivered.some(m => m.chatId === "99999")).toBe(false);
 
     await agent.stop();
   });

@@ -138,8 +138,9 @@ Talk to Tomo from multiple channels using the same session. Configure identities
 
 - DM sessions are unified across channels per identity
 - Group chats always get their own isolated session
-- Per-channel allowlists control who can message Tomo
-- Group chats require a secret passphrase to activate (configured in `tomo config`)
+- **Admission fails closed.** A DM is answered only when it comes from a handle bound to your identity (or a chat listed explicitly in that channel's allowlist). Anyone else gets no reply and no session; Tomo logs one line per sender per hour. A channel with no allowlist is not open.
+- Group chats are off until activated: send the secret passphrase (configured in `tomo config` → Groups) in the group, which adds it to the channel's allowlist
+- Enabling iMessage in `tomo config` asks for the phone number or Apple ID email you text from. Handles are compared in a normal form, so `+1 (555) 555-0123` and `iMessage;-;+15555550123` match
 
 ### Tools
 
@@ -339,10 +340,15 @@ To enable iMessage (the Tomo process needs Full Disk Access; advanced features a
 ```json
 {
   "channels": {
-    "imessage": { "provider": "imsg", "cliPath": "/opt/homebrew/bin/imsg", "allowlist": ["+15551234567"] }
-  }
+    "imessage": { "provider": "imsg", "cliPath": "/opt/homebrew/bin/imsg" }
+  },
+  "identities": [
+    { "name": "yourname", "channels": { "imessage": "+15551234567" }, "replyPolicy": "last-active" }
+  ]
 }
 ```
+
+Only the bound handle's DMs are answered; iMessage groups need the group secret (or an explicit `allowlist` entry with the group's chat GUID).
 
 Environment variables override config file values:
 

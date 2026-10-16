@@ -5512,3 +5512,86 @@ describe("imsg bare-handle targets", () => {
     await channel.stop();
   });
 });
+
+describe("imsg admission before spending anything on a chat", () => {
+  it("does not load attachments or send a read receipt for a chat the agent will refuse, but still dispatches", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-adm-"));
+    const imgPath = join(dir, "photo.png");
+    writeFileSync(imgPath, Buffer.from("89504e470d0a1a0a", "hex"));
+    try {
+      const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+      const asked: string[] = [];
+      channel.onAdmission((chatId) => { asked.push(chatId); return false; });
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "stranger-1",
+        text: "hi, look at this",
+        attachments: [{ filename: "photo.png", mime_type: "image/png", original_path: imgPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+
+      const msg = handler.mock.calls[0][0] as { images?: unknown[]; text: string };
+      expect(asked).toEqual([DM_GUID]);
+      expect(msg.images).toBeUndefined();
+      expect(msg.text).toBe("hi, look at this");
+      expect(requests().map((r) => r.method)).not.toContain("read");
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads attachments and marks read for an admitted chat", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-adm-"));
+    const imgPath = join(dir, "photo.png");
+    writeFileSync(imgPath, Buffer.from("89504e470d0a1a0a", "hex"));
+    try {
+      const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+      channel.onAdmission(() => true);
+
+      children[0].notifyMessage(inboundMessage({
+        guid: "owner-1",
+        text: "",
+        attachments: [{ filename: "photo.png", mime_type: "image/png", original_path: imgPath, missing: false }],
+      }));
+      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      const msg = handler.mock.calls[0][0] as { images?: unknown[] };
+      expect(msg.images).toHaveLength(1);
+      expect(requests().find((r) => r.method === "read")?.params).toEqual({ chat_guid: DM_GUID });
+      await channel.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the admission predicate throws", async () => {
+    const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    const handler = vi.fn(async () => true);
+    channel.onMessage(handler);
+    channel.onAdmission(() => { throw new Error("boom"); });
+
+    children[0].notifyMessage(inboundMessage({ guid: "x-1" }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect(requests().map((r) => r.method)).not.toContain("read");
+    await channel.stop();
+  });
+
+  it("normalizes the sender id with the shared handle normalizer", async () => {
+    const { channel, children } = makeChannel({ caps: CAPS_FULL });
+    await channel.start();
+    const handler = vi.fn(async () => true);
+    channel.onMessage(handler);
+
+    children[0].notifyMessage(inboundMessage({ guid: "fmt-1", sender: "+1 (555) 123-4567" }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    expect((handler.mock.calls[0][0] as { senderId?: string }).senderId).toBe("+15551234567");
+    await channel.stop();
+  });
+});

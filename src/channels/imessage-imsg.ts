@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { Channel, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
+import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
 import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure } from "./types.js";
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
@@ -70,6 +70,7 @@ const DEFERRED_ATTACHMENT_DONE_MEMORY = 256;
 export const MAX_DEFERRED_ATTACHMENT_WATCHES = 32;
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
+import { normalizeImessageHandle } from "../sessions/keys.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const RECENT_MESSAGES_PER_CHAT = 50;
@@ -519,6 +520,25 @@ export class ImsgChannel implements Channel {
 
   onMessage(handler: MessageHandler): void {
     this.handlers.push(handler);
+  }
+
+  /** Set by the Agent (onAdmission). Absent = every chat is admitted. */
+  private admissionPredicate: AdmissionPredicate | undefined;
+
+  onAdmission(predicate: AdmissionPredicate): void {
+    this.admissionPredicate = predicate;
+  }
+
+  /** Fails CLOSED: a predicate that throws leaves admission unknown, and an
+   *  unknown chat gets nothing spent on it (the agent still decides). */
+  private isAdmitted(chatGuid: string): boolean {
+    if (!this.admissionPredicate) return true;
+    try {
+      return this.admissionPredicate(chatGuid);
+    } catch (err) {
+      log.warn({ err }, "imsg admission check failed; skipping attachments and read receipt");
+      return false;
+    }
   }
 
   onCommand(handler: CommandHandler): void {
@@ -1536,7 +1556,14 @@ export class ImsgChannel implements Channel {
     // (attachment.is_sticker, surfaced by imsg 0.13+) and a sticker described
     // as just "an image" buries the expressive act (and, worse, hides that
     // the source lives in StickerCache with its alpha channel intact).
-    const rawAttachments = Array.isArray(data.attachments) ? data.attachments as Array<Record<string, unknown>> : [];
+    // Admission (advisory, see AdmissionPredicate): a chat the agent is about
+    // to refuse — a stranger's DM, a group nobody activated — gets nothing
+    // spent on it and no presence signal. Its attachments are not copied to
+    // disk and it is not marked read. The row is still dispatched so the
+    // agent makes (and logs) the real custody decision, and the cursor
+    // advances as usual.
+    const admitted = this.isAdmitted(chatGuid);
+    const rawAttachments = admitted && Array.isArray(data.attachments) ? data.attachments as Array<Record<string, unknown>> : [];
     // `deferred` = image/document attachments whose file is not on disk yet
     // (still downloading). They are counted in the markers as pending and
     // re-checked in the background once this row has been dispatched.
@@ -1547,7 +1574,9 @@ export class ImsgChannel implements Channel {
     if (this.isStaleGeneration(generation, rowId)) return;
 
     // Mark chat as read (best-effort; needs the bridge's read-receipt path).
-    if (this.capabilities.readReceipts) {
+    if (!admitted) {
+      // No read receipt for a chat that will not be answered.
+    } else if (this.capabilities.readReceipts) {
       this.request("read", { chat_guid: chatGuid }, 5_000).catch(() => {});
     } else {
       // Skipped as before — but a degraded snapshot may be stale (#258), so
@@ -3165,8 +3194,9 @@ export class ImsgChannel implements Channel {
   }
 
   /** Normalize phone number: strip non-digits except leading + */
+  /** The shared handle normal form (see normalizeImessageHandle), so sender
+   *  ids compare equal to configured owner handles however either is spelled. */
   private normalizeAddress(addr: string): string {
-    if (addr.includes("@")) return addr.toLowerCase();
-    return addr.replace(/[^\d+]/g, "");
+    return normalizeImessageHandle(addr);
   }
 }

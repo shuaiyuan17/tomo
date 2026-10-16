@@ -22,9 +22,63 @@ describe("IdentityRouter", () => {
   });
 
   describe("isAllowed", () => {
-    it("allows any chatId when no allowlist is configured", () => {
+    it("refuses any DM when no allowlist and no identity is configured (fails closed)", () => {
       const router = new IdentityRouter([], sessions, {});
-      expect(router.isAllowed("telegram", "999")).toBe(true);
+      expect(router.isAllowed("telegram", "999")).toBe(false);
+      expect(router.isAllowed("imessage", "any;-;+15555550123")).toBe(false);
+    });
+
+    it("refuses groups on a channel with no allowlist until one is activated", () => {
+      const router = new IdentityRouter(
+        [{ name: "alice", channels: { telegram: "111", imessage: "+15555550123" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      expect(router.isAllowed("telegram", "-100123")).toBe(false);
+      expect(router.isAllowed("imessage", "any;+;chat0123456789")).toBe(false);
+      router.addToAllowlist("imessage", "any;+;chat0123456789");
+      expect(router.isAllowed("imessage", "any;+;chat0123456789")).toBe(true);
+    });
+
+    it("iMessage with no allowlist: only the bound owner handle is admitted, in any GUID form", () => {
+      // The fresh-setup hole: `tomo config` → Enable iMessage wrote no
+      // allowlist, and an open channel let ANY sender in with owner-grade tools.
+      const router = new IdentityRouter(
+        [{ name: "alice", channels: { telegram: "111", imessage: "+15555550123" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      expect(router.isAllowed("imessage", "any;-;+15559999999")).toBe(false);
+      expect(router.isAllowed("imessage", "iMessage;-;+15555550123")).toBe(true);
+      expect(router.isAllowed("imessage", "SMS;-;+15555550123")).toBe(true);
+      expect(router.isAllowed("imessage", "any;-;+15555550123")).toBe(true);
+    });
+
+    it("iMessage identity bound to Telegram only: an unknown iMessage DM is refused", () => {
+      const router = new IdentityRouter(
+        [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      expect(router.isAllowed("imessage", "any;-;+15559999999")).toBe(false);
+      expect(router.isAllowed("telegram", "111")).toBe(true);
+      expect(router.isAllowed("telegram", "222")).toBe(false);
+    });
+
+    it("matches a bound handle despite formatting drift", () => {
+      const router = new IdentityRouter(
+        [{ name: "alice", channels: { imessage: "+1 (555) 555-0123" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      expect(router.isAllowed("imessage", "iMessage;-;+15555550123")).toBe(true);
+      const byEmail = new IdentityRouter(
+        [{ name: "alice", channels: { imessage: "Alice@Example.COM" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      expect(byEmail.isAllowed("imessage", "any;-;alice@example.com")).toBe(true);
+      expect(byEmail.isAllowed("imessage", "any;-;bob@example.com")).toBe(false);
     });
 
     it("allows chatIds in the explicit allowlist", () => {
@@ -54,9 +108,9 @@ describe("IdentityRouter", () => {
       expect(router.isAllowed("imessage", "iMessage;-;+15559999999")).toBe(false);
     });
 
-    it("allows unknown channels (no allowlist = open)", () => {
+    it("refuses DMs on a channel it knows nothing about (no allowlist is not open)", () => {
       const router = new IdentityRouter([], sessions, { telegram: ["123"] });
-      expect(router.isAllowed("discord", "anyone")).toBe(true);
+      expect(router.isAllowed("discord", "anyone")).toBe(false);
     });
   });
 
@@ -76,15 +130,14 @@ describe("IdentityRouter", () => {
       expect(router.isAllowed("discord", "xyz")).toBe(false);
     });
 
-    it("seeds a newly created allowlist with identity-bound chatIds", () => {
+    it("creating a channel's first allowlist (group activation) never locks out the identity's DM", () => {
       const router = new IdentityRouter(
         [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
       );
-      // Channel starts open; the first add flips it to enforced but must not
-      // lock out the identity's own DM.
-      expect(router.isAllowed("telegram", "999")).toBe(true);
+      expect(router.isAllowed("telegram", "999")).toBe(false);
+      expect(router.isAllowed("telegram", "111")).toBe(true);
       router.addToAllowlist("telegram", "-100group");
       expect(router.isAllowed("telegram", "-100group")).toBe(true);
       expect(router.isAllowed("telegram", "111")).toBe(true);

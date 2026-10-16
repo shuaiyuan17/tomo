@@ -1,7 +1,7 @@
 import type { IdentityConfig } from "./config.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
-import { extractImessageIdentifier, isDmSessionKey, legacySessionKeysForBinding, matchesChannelBinding } from "./sessions/keys.js";
+import { extractImessageIdentifier, isDmSessionKey, isGroupSessionKey, legacySessionKeysForBinding, matchesChannelBinding } from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
 import { selectWebOwner } from "./web/owner.js";
@@ -32,56 +32,72 @@ export class IdentityRouter {
     private summons: SummonStore = new SummonStore(null),
     private webOwnerName?: string,
   ) {
-    // Build fast lookup sets: explicit allowlist + all identity-bound chatIds per channel
+    // Explicit per-channel allowlists only. Identity bindings are NOT merged
+    // in: they admit DMs on their own (see isAllowed), so the presence or
+    // absence of a channel's allowlist no longer decides who may DM.
     this.allowlists = {};
     for (const [ch, list] of Object.entries(channelAllowlists)) {
       this.allowlists[ch] = new Set(list);
     }
-    // Add identity-bound chatIds to existing allowlists (don't create new ones —
-    // an identity alone should not enable allowlist enforcement for a channel)
-    for (const id of identities) {
-      for (const [ch, chatId] of Object.entries(id.channels)) {
-        if (this.allowlists[ch]) {
-          this.allowlists[ch].add(chatId);
-        }
-      }
-    }
   }
 
-  /** True when this channel enforces an allowlist (absent = open channel). */
+  /** True when this channel has an explicit allowlist in config. */
   hasAllowlist(channelName: string): boolean {
     return this.allowlists[channelName] !== undefined;
   }
 
-  /** Check if a chatId is allowed on a channel. Returns true if no allowlist is configured (open). */
+  /**
+   * Admission for an inbound (channel, chatId). FAILS CLOSED:
+   *
+   * - **DM** (not a group key): admitted only when the chat belongs to a
+   *   configured identity's binding on this channel, or is listed explicitly
+   *   in the channel's allowlist. A channel with no allowlist is NOT open to
+   *   DMs any more — before, any phone number that texted the Mac got its own
+   *   owner-grade session. Unknown senders get no session and no reply.
+   * - **Group**: admitted only when listed in the channel's allowlist (the
+   *   group-secret activation path adds it). A channel with no allowlist has
+   *   no active groups, so being added to a group by a stranger does nothing.
+   * - **web**: only the authenticated owner pseudo-chat.
+   *
+   * iMessage entries are compared by handle (`matchesChannelBinding`), so a
+   * configured `+1 (555) 555-0123` still matches `iMessage;-;+15555550123`.
+   */
   isAllowed(channelName: string, chatId: string): boolean {
     if (channelName === "web") return chatId === "owner" && this.webOwner() !== undefined;
     const allowlist = this.allowlists[channelName];
-    if (!allowlist) return true; // No allowlist → open
+    if (isGroupSessionKey(`${channelName}:${chatId}`)) {
+      if (!allowlist) return false;
+      if (allowlist.has(chatId)) return true;
+      // iMessage: a bare group identifier ("chat123…") matches the group under
+      // any service prefix, as before.
+      if (channelName === "imessage") {
+        const identifier = extractImessageIdentifier(chatId);
+        if (identifier && allowlist.has(identifier)) return true;
+      }
+      return false;
+    }
+    if (this.findIdentity(channelName, chatId)) return true;
+    if (!allowlist) return false;
     if (allowlist.has(chatId)) return true;
-    // iMessage: match by identifier suffix (e.g. "+15551234567" matches "any;-;+15551234567")
-    if (channelName === "imessage") {
-      const identifier = extractImessageIdentifier(chatId);
-      if (identifier && allowlist.has(identifier)) return true;
+    for (const entry of allowlist) {
+      if (!isGroupSessionKey(`${channelName}:${entry}`) && matchesChannelBinding(channelName, chatId, entry)) return true;
     }
     return false;
   }
 
-  /** Add a chatId to a channel's in-memory allowlist (after persisting to config) */
+  /** Add a chatId to a channel's in-memory allowlist (after persisting to config). */
   addToAllowlist(channelName: string, chatId: string): void {
     let allowlist = this.allowlists[channelName];
     if (!allowlist) {
-      // Creating a channel's first allowlist flips it from open to enforced.
-      // Seed it with identity-bound chatIds — the same merge the constructor
-      // does — so the owner's own DM isn't locked out by the new list.
       allowlist = new Set();
-      for (const id of this.identities) {
-        const bound = id.channels[channelName];
-        if (bound) allowlist.add(bound);
-      }
       this.allowlists[channelName] = allowlist;
     }
     allowlist.add(chatId);
+  }
+
+  /** True when some configured identity binds a DM on this channel. */
+  hasBoundIdentity(channelName: string): boolean {
+    return this.identities.some((id) => typeof id.channels[channelName] === "string" && id.channels[channelName] !== "");
   }
 
   /** Mark a group as summoned: its messages route to the identity's dm: session until dismissed. */

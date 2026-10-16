@@ -155,7 +155,9 @@ export class ChatCommandHandler {
     if (command === "model") {
       if (!this.isIdentityOwner(channel, senderId)) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/model refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: "⚠️ Only a configured owner can change the model." });
+        await channel.send({ chatId, text: config.identities.length === 0
+          ? "⚠️ No owner identity is configured, so /model is locked. On the machine running Tomo, run `tomo config` → Identities and bind your user ID, then try again."
+          : "⚠️ Only a configured owner can change the model." });
         return;
       }
       const arg = args?.trim();
@@ -218,7 +220,9 @@ export class ChatCommandHandler {
     if (command === "restore") {
       if (!this.isIdentityOwner(channel, senderId)) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/restore refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: "⚠️ Only a configured owner can restore config." });
+        await channel.send({ chatId, text: config.identities.length === 0
+          ? "⚠️ No owner identity is configured, so /restore is locked. On the machine running Tomo, run `tomo config` → Identities and bind your user ID, then try again."
+          : "⚠️ Only a configured owner can restore config." });
         return;
       }
       await this.restoreConfigAndRestart(channel, chatId, key);
@@ -468,10 +472,9 @@ export class ChatCommandHandler {
 
   /** Gate for config-mutating commands (/model, /restore): the sender must own
    *  a configured identity on this channel — the same identityForSender check
-   *  /login uses. With no identities configured there are no owners to
-   *  restrict to, so these commands stay available to allowed chats. */
+   *  /login uses. FAILS CLOSED: with no identity configured there is no owner,
+   *  so nobody may change the model or restore config from chat. */
   private isIdentityOwner(channel: Channel, senderId?: string): boolean {
-    if (config.identities.length === 0) return true;
     if (!senderId) return false;
     return this.deps.router.identityForSender(channel.name, senderId) !== undefined;
   }

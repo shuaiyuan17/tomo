@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AdmissionPredicate, Channel, IncomingMessage, MessageReaction, OutgoingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
 import { agentEnv, mockConfig, mockWorkspace, queryState, resetMockSdk } from "./agent-mocks.js";
+import { IdentityRouter } from "../../src/router.js";
 
 // ---------------------------------------------------------------------------
 // Shared Agent test harness: MockChannel, message/config helpers, and the
@@ -240,10 +241,47 @@ export async function expectNoChangeFor(assertion: () => void, durationMs = 20):
 // Setup / Teardown
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Admission seam
+// ---------------------------------------------------------------------------
+
+/**
+ * Admission fails closed in production: a DM must come from a configured
+ * owner binding, a group must be activated. Most Agent tests are about
+ * routing, batching, delivery or tooling, and send from arbitrary chat ids
+ * ("12345", "-100…", iMessage GUIDs) on channels with no allowlist. Rather than
+ * thread an owner binding through every one of them, the harness keeps those
+ * tests on the old open-channel rule BY DEFAULT: a channel with no explicit
+ * allowlist admits every chat; a channel with one uses the real router logic.
+ *
+ * Any test that is about admission must call `useRealAdmission()` (see
+ * tests/agent-admission.test.ts and the allowlist suite in
+ * agent-routing.test.ts). That runs the production `isAllowed` unchanged.
+ */
+const admissionState: { real: boolean; restore: (() => void) | null } = { real: false, restore: null };
+
+export function useRealAdmission(): void {
+  admissionState.real = true;
+}
+
+function installAdmissionSeam(): void {
+  const original = IdentityRouter.prototype.isAllowed;
+  const spy = vi.spyOn(IdentityRouter.prototype, "isAllowed");
+  admissionState.restore = () => spy.mockRestore();
+  spy.mockImplementation(function (this: IdentityRouter, channelName: string, chatId: string) {
+    if (admissionState.real || channelName === "web" || this.hasAllowlist(channelName)) {
+      return original.call(this, channelName, chatId);
+    }
+    return true;
+  });
+}
+
 /** Register the per-test tmp dir + mock-state reset hooks. Call once at the
  *  top level of each Agent test file. */
 export function installAgentTestHooks(): void {
   beforeEach(() => {
+    admissionState.real = false;
+    installAdmissionSeam();
     agentEnv.tmpDir = join(tmpdir(), `tomo-int-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
     mkdirSync(agentEnv.tmpDir, { recursive: true });
     resetConfig();
@@ -253,6 +291,8 @@ export function installAgentTestHooks(): void {
   });
 
   afterEach(() => {
+    admissionState.restore?.();
+    admissionState.restore = null;
     vi.useRealTimers();
     rmSync(agentEnv.tmpDir, { recursive: true, force: true });
   });

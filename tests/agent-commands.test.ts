@@ -689,6 +689,7 @@ describe("chat commands", () => {
 
   it("routes back through the ChatGPT gateway after switching from a Claude model", async () => {
     resetConfig({
+      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
       model: "chatgpt/gpt-5.5",
       litellm: {
         mode: "chatgpt-subscription",
@@ -703,7 +704,7 @@ describe("chat commands", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "ChatGPT turn" }));
     await drainQueue(agent);
 
-    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
+    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m", "12345");
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Claude turn" }));
     await drainQueue(agent);
 
@@ -714,7 +715,7 @@ describe("chat commands", () => {
     expect(lastCall.options?.model).toBe("claude-opus-5[1m]");
     expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
 
-    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5", "12345");
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Back to ChatGPT" }));
     await drainQueue(agent);
 
@@ -795,12 +796,13 @@ describe("chat commands", () => {
   });
 
   it("/model persists a session override to config", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
+    await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5[1m]");
@@ -808,8 +810,8 @@ describe("chat commands", () => {
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-5[1m]");
-    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBe("claude-sonnet-5[1m]");
+    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-sonnet-5[1m]");
+    expect(mockConfig.sessionModelOverrides["dm:owner"]).toBe("claude-sonnet-5[1m]");
 
     const backup = JSON.parse(readFileSync(agentEnv.configBackupPath, "utf-8")) as { model?: string };
     expect(backup.model).toBe("claude-haiku-4-5");
@@ -818,6 +820,7 @@ describe("chat commands", () => {
   });
 
   it("/model keeps the active SDK session so provider switches preserve continuity", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -825,23 +828,24 @@ describe("chat commands", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
     await drainQueue(agent);
     const store = (agent as unknown as { sessions: { getSdkSessionId(key: string): string | undefined } }).sessions;
-    expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
+    expect(store.getSdkSessionId("dm:owner")).toBe("mock-sdk-session-123");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m");
+    await tg.simulateCommand("model", "12345", "TestUser", "opus-1m", "12345");
 
     expect(tg.sent.at(-1)?.text).toBe("🔄 Switched to claude-opus-5[1m]");
-    expect(store.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
+    expect(store.getSdkSessionId("dm:owner")).toBe("mock-sdk-session-123");
 
     await agent.stop();
   });
 
   it("/model accepts known full model IDs", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8[1m]");
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8[1m]", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toBe("🔄 Switched to claude-opus-4-8[1m]");
@@ -849,18 +853,19 @@ describe("chat commands", () => {
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-opus-4-8[1m]");
+    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-opus-4-8[1m]");
 
     await agent.stop();
   });
 
   it("/model accepts future direct model IDs", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-5-1");
+    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-5-1", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5-1");
@@ -868,13 +873,14 @@ describe("chat commands", () => {
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("claude-sonnet-5-1");
+    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-sonnet-5-1");
 
     await agent.stop();
   });
 
   it("/model accepts LiteLLM provider/model names when a gateway is configured", async () => {
     resetConfig({
+      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
       litellm: {
         mode: "chatgpt-subscription",
         baseUrl: "http://localhost:4000",
@@ -886,7 +892,7 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toBe("🔄 Switched to chatgpt/gpt-5.5");
@@ -894,13 +900,14 @@ describe("chat commands", () => {
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
       sessionModelOverrides?: Record<string, string>;
     };
-    expect(cfg.sessionModelOverrides?.["telegram:12345"]).toBe("chatgpt/gpt-5.5");
+    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("chatgpt/gpt-5.5");
 
     await agent.stop();
   });
 
   it("/model rejects non-chatgpt provider models in ChatGPT subscription mode", async () => {
     resetConfig({
+      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
       litellm: {
         mode: "chatgpt-subscription",
         baseUrl: "http://localhost:4000",
@@ -912,7 +919,7 @@ describe("chat commands", () => {
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "openrouter/openai/gpt-4o-mini");
+    await tg.simulateCommand("model", "12345", "TestUser", "openrouter/openai/gpt-4o-mini", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("only routes chatgpt/* models");
@@ -926,12 +933,13 @@ describe("chat commands", () => {
   });
 
   it("/model rejects LiteLLM provider/model names without a gateway and does not write config", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5");
+    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("needs a LiteLLM gateway");
@@ -945,12 +953,13 @@ describe("chat commands", () => {
   });
 
   it("/model rejects invalid model names without writing config", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "not a model");
+    await tg.simulateCommand("model", "12345", "TestUser", "not a model", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("Unknown model");
@@ -964,6 +973,7 @@ describe("chat commands", () => {
   });
 
   it("/restore restores config.json from config.json.bak", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -971,7 +981,7 @@ describe("chat commands", () => {
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
     writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
 
-    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("Restored config.json");
@@ -984,6 +994,7 @@ describe("chat commands", () => {
   });
 
   it("/restore locks out follow-up commands during restart", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -991,8 +1002,8 @@ describe("chat commands", () => {
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
     writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
 
-    await tg.simulateCommand("restore", "12345", "TestUser");
-    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
     await tg.simulateCommand("new", "12345", "TestUser");
 
     expect(tg.sent).toHaveLength(3);
@@ -1004,6 +1015,7 @@ describe("chat commands", () => {
   });
 
   it("drops normal messages during restore restart", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1011,7 +1023,7 @@ describe("chat commands", () => {
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
     writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
 
-    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "hello?" }));
     await drainQueue(agent);
 
@@ -1132,30 +1144,32 @@ describe("chat commands", () => {
   });
 
   it("/model reports an error instead of crashing when config.json is malformed", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
     writeFileSync(agentEnv.configFilePath, "{ this is not json\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m");
+    await tg.simulateCommand("model", "12345", "TestUser", "sonnet-1m", "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("[error]");
     expect(tg.sent[0].text).toContain("model unchanged");
     // Neither the in-memory override nor the broken file was touched.
-    expect(mockConfig.sessionModelOverrides["telegram:12345"]).toBeUndefined();
+    expect(mockConfig.sessionModelOverrides["dm:owner"]).toBeUndefined();
     expect(readFileSync(agentEnv.configFilePath, "utf-8")).toBe("{ this is not json\n");
 
     await agent.stop();
   });
 
   it("/restore reports when no config backup exists", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    await tg.simulateCommand("restore", "12345", "TestUser");
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("No config backup found");

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **DM admission fails closed.** A channel without an `allowlist` used to be open: on a fresh iMessage setup any phone number or email that texted the Mac got its own session with the owner's tools. Now a DM is answered only when it comes from a handle bound to an identity (or a chat listed explicitly in the channel's allowlist). Unknown senders get no reply, no session and no registry entry; Tomo logs one info line per sender per hour with the handle redacted. iMessage no longer loads a refused chat's attachments or marks it read.
+- **Groups on a channel without an allowlist are closed** (iMessage and Telegram alike). Send the group secret in a group to activate it; that now creates the channel's allowlist.
+- `/model` and `/restore` no longer fall open when no identity is configured.
+- `tomo config` → Channels → iMessage → Enable asks for the handle you text from and binds it to your identity; finishing without one needs an explicit confirmation.
+- iMessage handles are compared in one normal form, so formatting drift (`+1 (555) …`, case, `iMessage;-;` / `SMS;-;` / `any;-;` prefixes) no longer breaks the owner match.
+
+**Upgrade note:** if Tomo answered you on a channel only because that channel had no allowlist, bind your handle with `tomo config` (the daemon logs a warning at startup for any channel no identity is bound to). Groups that were active only because their channel had no allowlist need the group secret once.
+
 ## 0.10.1 (2026-10-12)
 
 ### Bug fixes

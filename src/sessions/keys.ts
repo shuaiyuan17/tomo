@@ -79,18 +79,67 @@ export function privateReplyTargetFromSessionKey(key: string): ReplyTarget | und
  * silently misses iMessage.
  */
 export function matchesChannelBinding(channelName: string, chatId: string, bound: string | undefined): boolean {
-  if (bound === undefined) return false;
+  if (bound === undefined || bound === "") return false;
   if (bound === chatId) return true;
   if (channelName === "imessage") {
     // Only a DM GUID ("<svc>;-;<handle>") reduces to its handle, on either
     // side. Group GUIDs (";+;") stay exact so a group chat never matches a DM
     // binding, nor the same group under another service prefix.
-    const toHandle = (id: string) => (id.includes(";-;") ? (extractImessageIdentifier(id) ?? id) : id);
-    const want = toHandle(bound);
-    const have = toHandle(chatId);
-    if (want === have) return true;
+    if (isImessageGroupGuid(bound) || isImessageGroupGuid(chatId)) return false;
+    return imessageHandlesMatch(bound, chatId);
   }
   return false;
+}
+
+function isImessageGroupGuid(id: string): boolean {
+  return id.includes(";+;");
+}
+
+/**
+ * The one normal form for an iMessage DM handle, shared by config parsing,
+ * setup prompts, the imsg channel's sender ids and every owner/allowlist
+ * comparison. Formatting drift between what a person typed into config and
+ * what chat.db reports must never break the owner match:
+ *
+ * - a DM chat GUID (`iMessage;-;…`, `SMS;-;…`, `any;-;…`, any service) is
+ *   reduced to its handle;
+ * - an email is lowercased;
+ * - a phone number keeps its digits and a leading `+` (`+1 (555) 555-0123`
+ *   → `+15555550123`).
+ *
+ * Group GUIDs (`;+;`) are not handles and come back trimmed but otherwise
+ * untouched. A value with no digits and no `@` is returned trimmed.
+ */
+export function normalizeImessageHandle(raw: string): string {
+  let value = raw.trim();
+  if (isImessageGroupGuid(value)) return value;
+  if (value.includes(";-;")) value = (extractImessageIdentifier(value) ?? value).trim();
+  if (value.includes("@")) return value.toLowerCase();
+  // Only phone-shaped values are reduced to digits; anything else (a chat
+  // identifier, a business-chat URN) stays as it is, so two unrelated ids
+  // that happen to share digits can never be folded together.
+  if (!PHONE_SHAPED_RE.test(value)) return value;
+  const digits = value.replace(/\D/g, "");
+  if (!digits) return value;
+  return value.startsWith("+") ? `+${digits}` : digits;
+}
+
+const PHONE_SHAPED_RE = /^\+?[\d\s().-]+$/;
+
+/**
+ * Do two iMessage DM handles (or DM GUIDs) name the same person? Compares the
+ * normal forms, and treats a phone number with and without its leading `+` as
+ * the same number (`+15555550123` = `15555550123`): chat.db stores E.164, while
+ * a config value may have been typed without the plus. A 10-digit number with
+ * no country code is NOT widened to `+1…` here — setup asks about that.
+ */
+export function imessageHandlesMatch(a: string, b: string): boolean {
+  const na = normalizeImessageHandle(a);
+  const nb = normalizeImessageHandle(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const phone = /^\+?\d+$/;
+  return phone.test(na) && phone.test(nb) && na.replace("+", "") === nb.replace("+", "");
 }
 
 /**

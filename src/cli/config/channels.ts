@@ -1,5 +1,20 @@
 import * as p from "@clack/prompts";
 import { loadConfig, saveConfig } from "./shared.js";
+import { enableImessageWithOwner, type PromptPort } from "./imessage-owner.js";
+
+/** @clack/prompts behind the small port the iMessage owner flow is tested through. */
+export const clackPrompts: PromptPort = {
+  text: (opts) => p.text(opts) as Promise<string | symbol>,
+  confirm: (opts) => p.confirm(opts),
+  select: (opts) => p.select(opts) as Promise<string | symbol>,
+  isCancel: (value: unknown): value is symbol => p.isCancel(value),
+  log: { info: (m) => p.log.info(m), warn: (m) => p.log.warn(m), success: (m) => p.log.success(m) },
+};
+
+function imessageOwnerHandle(cfg: Record<string, unknown>): string | undefined {
+  const identities = (Array.isArray(cfg.identities) ? cfg.identities : []) as Array<{ channels?: Record<string, string> }>;
+  return identities.map((id) => id.channels?.imessage).find((h): h is string => typeof h === "string" && h !== "");
+}
 
 export async function configChannels(): Promise<void> {
   const cfg = loadConfig();
@@ -74,6 +89,7 @@ export async function configChannels(): Promise<void> {
     }
 
     if (choice === "imessage") {
+      const ownerHandle = imessageOwnerHandle(cfg);
       const action = await p.select({
         message: "iMessage",
         options: [
@@ -82,6 +98,9 @@ export async function configChannels(): Promise<void> {
             label: imEnabled ? "Disable iMessage" : "Enable iMessage",
             hint: imEnabled ? "provider: imsg" : "imsg CLI — needs Full Disk Access",
           },
+          ...(imEnabled && !ownerHandle
+            ? [{ value: "owner", label: "Set owner handle", hint: "none — every iMessage DM is ignored" }]
+            : []),
           { value: "imsg", label: "imsg CLI settings", hint: (channels.imessage?.cliPath as string) ?? "imsg (PATH)" },
           { value: "allowlist", label: "Allowlist", hint: `${imAllow.length} user(s)` },
           { value: "back", label: "Back" },
@@ -91,15 +110,21 @@ export async function configChannels(): Promise<void> {
 
       // One backend, so this is a toggle rather than a picker: writing the
       // provider key enables the channel, removing it turns iMessage off.
-      if (action === "toggle") {
-        if (!channels.imessage) channels.imessage = {};
-        if (imEnabled) delete channels.imessage.provider;
-        else channels.imessage.provider = "imsg";
+      if (action === "toggle" && imEnabled) {
+        delete channels.imessage.provider;
         cfg.channels = channels;
         saveConfig(cfg);
-        p.log.success(imEnabled
-          ? "iMessage disabled"
-          : "iMessage enabled (imsg CLI — Tomo needs Full Disk Access)");
+        p.log.success("iMessage disabled");
+      }
+
+      // Enabling asks for the owner's handle: DM admission fails closed, so
+      // without one every iMessage DM is ignored — allowed only as an
+      // explicit choice.
+      if ((action === "toggle" && !imEnabled) || action === "owner") {
+        if (await enableImessageWithOwner(cfg, clackPrompts)) {
+          saveConfig(cfg);
+          if (action === "toggle") p.log.info("imsg CLI — Tomo needs Full Disk Access.");
+        }
       }
 
       if (action === "imsg") {
@@ -138,7 +163,7 @@ async function manageAllowlist(
     const options: Array<{ value: string; label: string; hint?: string }> = [];
 
     if (allowlist.length === 0) {
-      p.log.warn("Allowlist is empty — no one can DM this channel (except identity-bound users).");
+      p.log.info("Allowlist is empty — no group is active on this channel. Your owner identity's DMs are answered regardless.");
     } else {
       for (let i = 0; i < allowlist.length; i++) {
         options.push({ value: `remove:${i}`, label: allowlist[i], hint: "select to remove" });

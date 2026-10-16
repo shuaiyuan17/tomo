@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  imessageHandlesMatch,
   isGroupSessionKey,
+  normalizeImessageHandle,
   legacySessionKeysForBinding,
   matchesChannelBinding,
   rawSessionKeyForBinding,
@@ -43,7 +45,43 @@ describe("session key helpers", () => {
   });
 });
 
+describe("normalizeImessageHandle", () => {
+  it.each([
+    ["+1 (555) 555-0123", "+15555550123"],
+    ["+1.555.555.0123", "+15555550123"],
+    ["  +15555550123  ", "+15555550123"],
+    ["15555550123", "15555550123"],
+    ["Alex@Example.COM", "alex@example.com"],
+    ["iMessage;-;+15555550123", "+15555550123"],
+    ["SMS;-;+1 555 555 0123", "+15555550123"],
+    ["any;-;Alex@Example.com", "alex@example.com"],
+    ["RCS;-;+15555550123", "+15555550123"],
+    // Group GUIDs are not handles: untouched.
+    ["any;+;chat0123456789", "any;+;chat0123456789"],
+    // Not phone-shaped and not an email: left alone, never folded to digits.
+    ["chat0123456789", "chat0123456789"],
+  ])("%s → %s", (input, expected) => {
+    expect(normalizeImessageHandle(input)).toBe(expected);
+  });
+
+  it("treats a phone number with and without its leading + as the same handle", () => {
+    expect(imessageHandlesMatch("+15555550123", "15555550123")).toBe(true);
+    expect(imessageHandlesMatch("+1 (555) 555-0123", "SMS;-;+15555550123")).toBe(true);
+    // A 10-digit number is not silently widened to +1 (setup asks instead).
+    expect(imessageHandlesMatch("5555550123", "+15555550123")).toBe(false);
+    expect(imessageHandlesMatch("", "")).toBe(false);
+  });
+});
+
 describe("identity binding matchers", () => {
+  it("matches a bound iMessage handle despite formatting drift", () => {
+    expect(matchesChannelBinding("imessage", "iMessage;-;+15555550123", "+1 (555) 555-0123")).toBe(true);
+    expect(matchesChannelBinding("imessage", "any;-;alex@example.com", "Alex@Example.com")).toBe(true);
+    expect(matchesChannelBinding("imessage", "+15555550123", "SMS;-;+15555550123")).toBe(true);
+    expect(matchesChannelBinding("imessage", "any;-;+15555550124", "+1 (555) 555-0123")).toBe(false);
+    expect(matchesChannelBinding("imessage", "any;-;+15555550123", "")).toBe(false);
+  });
+
   it("matches exact chatIds on any channel and iMessage GUIDs by identifier", () => {
     expect(matchesChannelBinding("telegram", "111", "111")).toBe(true);
     expect(matchesChannelBinding("telegram", "222", "111")).toBe(false);

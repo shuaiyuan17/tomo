@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
-import type { IdentityRouter } from "../router.js";
+import type { OwnerRouter } from "../router.js";
+import { ownerDisplayName, type OwnerConfig } from "../owner.js";
 import { redactChatIdForLog } from "./blocked-inbound-log.js";
 import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
@@ -33,7 +34,7 @@ export function backupConfigFile(): void {
 }
 
 export interface ChatCommandDeps {
-  router: IdentityRouter;
+  router: OwnerRouter;
   sessions: SessionStore;
   /** Shared with the Agent — paused groups are dropped at message receipt. */
   pauses: PauseStore;
@@ -97,9 +98,9 @@ export class ChatCommandHandler {
     }
 
     if (command === "rewind") {
-      const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+      const identity = this.ownerFor(channel, senderId);
       if (isGroupSessionKey(`${channel.name}:${chatId}`) || !identity) {
-        await channel.send({ chatId, text: "⚠️ /rewind is only available in a configured owner's private DM." });
+        await channel.send({ chatId, text: "⚠️ /rewind is only available in a owner's private DM." });
         return;
       }
       const arg = args?.trim() || "1";
@@ -154,11 +155,11 @@ export class ChatCommandHandler {
     }
 
     if (command === "model") {
-      if (!this.isIdentityOwner(channel, senderId)) {
-        log.info({ channel: channel.name, chatId, sender: senderName }, "/model refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: config.identities.length === 0
-          ? "⚠️ No owner identity is configured, so /model is locked. On the machine running Tomo, run `tomo config` → Identities and bind your user ID, then try again."
-          : "⚠️ Only a configured owner can change the model." });
+      if (!this.isOwner(channel, senderId)) {
+        log.info({ channel: channel.name, chatId, sender: senderName }, "/model refused (sender is not the owner)");
+        await channel.send({ chatId, text: !config.owner
+          ? "⚠️ No owner is configured, so /model is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try again."
+          : "⚠️ Only the owner can change the model." });
         return;
       }
       const arg = args?.trim();
@@ -219,11 +220,11 @@ export class ChatCommandHandler {
     }
 
     if (command === "restore") {
-      if (!this.isIdentityOwner(channel, senderId)) {
-        log.info({ channel: channel.name, chatId, sender: senderName }, "/restore refused (sender is not a configured identity)");
-        await channel.send({ chatId, text: config.identities.length === 0
-          ? "⚠️ No owner identity is configured, so /restore is locked. On the machine running Tomo, run `tomo config` → Identities and bind your user ID, then try again."
-          : "⚠️ Only a configured owner can restore config." });
+      if (!this.isOwner(channel, senderId)) {
+        log.info({ channel: channel.name, chatId, sender: senderName }, "/restore refused (sender is not the owner)");
+        await channel.send({ chatId, text: !config.owner
+          ? "⚠️ No owner is configured, so /restore is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try again."
+          : "⚠️ Only the owner can restore config." });
         return;
       }
       await this.restoreConfigAndRestart(channel, chatId, key);
@@ -276,15 +277,15 @@ export class ChatCommandHandler {
       // default to open, so a bare DM must not read the owner's subscription
       // state). A group is shared, so any member is refused regardless.
       if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
-        await channel.send({ chatId, text: "⚠️ /usage is only available in a configured owner's private DM." });
+        await channel.send({ chatId, text: "⚠️ /usage is only available in a owner's private DM." });
         return;
       }
-      const usageIdentity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+      const usageIdentity = this.ownerFor(channel, senderId);
       if (!usageIdentity) {
-        log.info({ channel: channel.name, chatId, sender: senderName }, "/usage refused (sender is not a configured identity)");
-        const text = config.identities.length === 0
-          ? "⚠️ No owner identity is configured, so /usage is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /usage again."
-          : "⚠️ Only a configured owner can view usage.";
+        log.info({ channel: channel.name, chatId, sender: senderName }, "/usage refused (sender is not the owner)");
+        const text = !config.owner
+          ? "⚠️ No owner is configured, so /usage is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try /usage again."
+          : "⚠️ Only the owner can view usage.";
         await channel.send({ chatId, text });
         return;
       }
@@ -395,10 +396,10 @@ export class ChatCommandHandler {
       return;
     }
 
-    const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+    const identity = this.ownerFor(channel, senderId);
     if (!identity) {
-      log.info({ channel: channel.name, chatId, sender: senderName }, "/summon refused (sender is not a configured identity)");
-      await channel.send({ chatId, text: "⚠️ Only the owner of a configured identity can summon their main session." });
+      log.info({ channel: channel.name, chatId, sender: senderName }, "/summon refused (sender is not the owner)");
+      await channel.send({ chatId, text: "⚠️ Only the owner can summon the main session." });
       return;
     }
 
@@ -408,22 +409,22 @@ export class ChatCommandHandler {
       return;
     }
 
-    this.deps.router.summonGroup(channel.name, chatId, identity.name);
+    this.deps.router.summonGroup(channel.name, chatId);
     const expiryNote = config.summonExpiryMinutes > 0
       ? ` or after ${config.summonExpiryMinutes} minutes of group inactivity`
       : "";
     this.deps.queuePendingNote(
-      `dm:${identity.name.toLowerCase()}`,
+      dmSessionKeyForIdentity(identity.name),
       formatTomoEvent(
         "summon",
-        `${identity.name} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed${expiryNote}, messages from that group arrive in this session tagged [group ...] with the sender's name. To reply in the group, call send_message with mode "direct" and target "${rawKey}" — compose the reply yourself, with your context. Plain text you output goes to ${identity.name}'s private DM, not the group. Everyone in the group can read what you send it — keep private memory and DM context out of group-facing messages.`,
+        `${ownerDisplayName(identity)} summoned you into the group chat "${groupLabel}" (${rawKey}). Until dismissed${expiryNote}, messages from that group arrive in this session tagged [group ...] with the sender's name. To reply in the group, call send_message with mode "direct" and target "${rawKey}" — compose the reply yourself, with your context. Plain text you output goes to ${ownerDisplayName(identity)}'s private DM, not the group. Everyone in the group can read what you send it — keep private memory and DM context out of group-facing messages.`,
         { name: rawKey },
       ),
     );
     log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
     await channel.send({
       chatId,
-      text: `📞 ${identity.name}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
+      text: `📞 ${ownerDisplayName(identity)}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
     });
   }
 
@@ -471,13 +472,16 @@ export class ChatCommandHandler {
     });
   }
 
-  /** Gate for config-mutating commands (/model, /restore): the sender must own
-   *  a configured identity on this channel — the same identityForSender check
-   *  /login uses. FAILS CLOSED: with no identity configured there is no owner,
-   *  so nobody may change the model or restore config from chat. */
-  private isIdentityOwner(channel: Channel, senderId?: string): boolean {
-    if (!senderId) return false;
-    return this.deps.router.identityForSender(channel.name, senderId) !== undefined;
+  /** Gate for config-mutating commands (/model, /restore): the sender must be
+   *  the owner on this channel — the same check /login uses. FAILS CLOSED:
+   *  with no owner configured nobody may change the model or restore config. */
+  private isOwner(channel: Channel, senderId?: string): boolean {
+    return this.deps.router.isOwnerSender(channel.name, senderId);
+  }
+
+  /** The owner, when this sender is the owner on this channel (fails closed). */
+  private ownerFor(channel: Channel, senderId?: string): OwnerConfig | undefined {
+    return this.deps.router.isOwnerSender(channel.name, senderId) ? this.deps.router.owner() : undefined;
   }
 
   /** Persist a /model override into config.json. Returns false (after logging,
@@ -510,19 +514,19 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ /login is only available in a configured owner's private DM." });
+      await channel.send({ chatId, text: "⚠️ /login is only available in a owner's private DM." });
       return;
     }
 
-    const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+    const identity = this.ownerFor(channel, senderId);
     if (!identity) {
-      log.warn({ channel: channel.name, chatId }, "/login refused (sender is not a configured identity)");
+      log.warn({ channel: channel.name, chatId }, "/login refused (sender is not the owner)");
       // /login mutates Claude credentials, so unlike /model and /restore it
       // never falls open when no identities exist — instead point the user at
       // the setup path.
-      const text = config.identities.length === 0
-        ? "⚠️ No owner identity is configured, so /login is locked. On the machine running Tomo, run `tomo config` → Identities and bind your Telegram user ID, then try /login again."
-        : "⚠️ Only a configured owner can refresh Claude login.";
+      const text = !config.owner
+        ? "⚠️ No owner is configured, so /login is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try /login again."
+        : "⚠️ Only the owner can refresh Claude login.";
       await channel.send({ chatId, text });
       return;
     }
@@ -591,16 +595,16 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ /mcp is only available in a configured owner's private DM." });
+      await channel.send({ chatId, text: "⚠️ /mcp is only available in a owner's private DM." });
       return;
     }
 
-    const identity = senderId ? this.deps.router.identityForSender(channel.name, senderId) : undefined;
+    const identity = this.ownerFor(channel, senderId);
     if (!identity) {
-      log.warn({ channel: channel.name, chatId }, "/mcp refused (sender is not a configured identity)");
-      const text = config.identities.length === 0
-        ? "⚠️ No owner identity is configured, so /mcp is locked. On the machine running Tomo, run `tomo config` → Identities and bind your user ID, then try /mcp again."
-        : "⚠️ Only a configured owner can inspect or re-authenticate external MCP servers.";
+      log.warn({ channel: channel.name, chatId }, "/mcp refused (sender is not the owner)");
+      const text = !config.owner
+        ? "⚠️ No owner is configured, so /mcp is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try /mcp again."
+        : "⚠️ Only the owner can inspect or re-authenticate external MCP servers.";
       await channel.send({ chatId, text });
       return;
     }

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { IdentityRouter } from "../src/router.js";
+import { OwnerRouter } from "../src/router.js";
+import { resolveOwner, type LegacyIdentity } from "../src/owner.js";
 import { rawSessionKeyForBinding } from "../src/sessions/keys.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { SummonStore } from "../src/sessions/summon-store.js";
@@ -9,7 +10,19 @@ import { tmpdir } from "node:os";
 
 const TEST_DIR = join(tmpdir(), "tomo-test-router");
 
-describe("IdentityRouter", () => {
+/** Build the router the way the daemon does for a legacy `identities` config:
+ *  through the production owner resolver. */
+function routerOf(
+  identities: LegacyIdentity[],
+  store: SessionStore,
+  allowlists: Record<string, string[]>,
+  summons?: SummonStore,
+  webOwnerIdentity?: string,
+): OwnerRouter {
+  return new OwnerRouter(resolveOwner({ owner: undefined, identities, webOwnerIdentity }).owner, store, allowlists, summons);
+}
+
+describe("OwnerRouter", () => {
   let sessions: SessionStore;
 
   beforeEach(() => {
@@ -23,13 +36,13 @@ describe("IdentityRouter", () => {
 
   describe("isAllowed", () => {
     it("refuses any DM when no allowlist and no identity is configured (fails closed)", () => {
-      const router = new IdentityRouter([], sessions, {});
+      const router = routerOf([], sessions, {});
       expect(router.isAllowed("telegram", "999")).toBe(false);
       expect(router.isAllowed("imessage", "any;-;+15555550123")).toBe(false);
     });
 
     it("refuses groups on a channel with no allowlist until one is activated", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { telegram: "111", imessage: "+15555550123" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -43,7 +56,7 @@ describe("IdentityRouter", () => {
     it("iMessage with no allowlist: only the bound owner handle is admitted, in any GUID form", () => {
       // The fresh-setup hole: `tomo config` → Enable iMessage wrote no
       // allowlist, and an open channel let ANY sender in with owner-grade tools.
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { telegram: "111", imessage: "+15555550123" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -55,7 +68,7 @@ describe("IdentityRouter", () => {
     });
 
     it("iMessage identity bound to Telegram only: an unknown iMessage DM is refused", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -66,13 +79,13 @@ describe("IdentityRouter", () => {
     });
 
     it("matches a bound handle despite formatting drift", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { imessage: "+1 (555) 555-0123" }, replyPolicy: "last-active" }],
         sessions,
         {},
       );
       expect(router.isAllowed("imessage", "iMessage;-;+15555550123")).toBe(true);
-      const byEmail = new IdentityRouter(
+      const byEmail = routerOf(
         [{ name: "alice", channels: { imessage: "Alice@Example.COM" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -81,17 +94,17 @@ describe("IdentityRouter", () => {
       expect(byEmail.isAllowed("imessage", "any;-;bob@example.com")).toBe(false);
     });
 
-    it("allows chatIds in the explicit allowlist", () => {
-      const router = new IdentityRouter([], sessions, {
-        telegram: ["123", "456"],
+    it("allowlists govern groups only: DM entries in them are ignored (no guest DMs)", () => {
+      const router = routerOf([], sessions, {
+        telegram: ["123", "-100456"],
       });
-      expect(router.isAllowed("telegram", "123")).toBe(true);
-      expect(router.isAllowed("telegram", "456")).toBe(true);
-      expect(router.isAllowed("telegram", "789")).toBe(false);
+      expect(router.isAllowed("telegram", "123")).toBe(false);
+      expect(router.isAllowed("telegram", "-100456")).toBe(true);
+      expect(router.isAllowed("telegram", "-100789")).toBe(false);
     });
 
     it("allows identity-bound chatIds automatically", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         { telegram: [] },
@@ -100,38 +113,40 @@ describe("IdentityRouter", () => {
       expect(router.isAllowed("telegram", "222")).toBe(false);
     });
 
-    it("matches iMessage identifiers by suffix", () => {
-      const router = new IdentityRouter([], sessions, {
-        imessage: ["+15551234567"],
+    it("matches iMessage group identifiers under any service prefix; DM handles in the allowlist are ignored", () => {
+      const router = routerOf([], sessions, {
+        imessage: ["+15551234567", "chat0123456789"],
       });
-      expect(router.isAllowed("imessage", "iMessage;-;+15551234567")).toBe(true);
-      expect(router.isAllowed("imessage", "iMessage;-;+15559999999")).toBe(false);
+      expect(router.isAllowed("imessage", "iMessage;-;+15551234567")).toBe(false);
+      expect(router.isAllowed("imessage", "any;+;chat0123456789")).toBe(true);
+      expect(router.isAllowed("imessage", "iMessage;+;chat0123456789")).toBe(true);
+      expect(router.isAllowed("imessage", "any;+;chat9999")).toBe(false);
     });
 
     it("refuses DMs on a channel it knows nothing about (no allowlist is not open)", () => {
-      const router = new IdentityRouter([], sessions, { telegram: ["123"] });
+      const router = routerOf([], sessions, { telegram: ["123"] });
       expect(router.isAllowed("discord", "anyone")).toBe(false);
     });
   });
 
   describe("addToAllowlist", () => {
-    it("adds a chatId to an existing allowlist", () => {
-      const router = new IdentityRouter([], sessions, { telegram: ["123"] });
-      expect(router.isAllowed("telegram", "999")).toBe(false);
+    it("adds a group to an existing allowlist", () => {
+      const router = routerOf([], sessions, { telegram: ["-100123"] });
+      expect(router.isAllowed("telegram", "-100999")).toBe(false);
 
-      router.addToAllowlist("telegram", "999");
-      expect(router.isAllowed("telegram", "999")).toBe(true);
+      router.addToAllowlist("telegram", "-100999");
+      expect(router.isAllowed("telegram", "-100999")).toBe(true);
     });
 
-    it("creates a new allowlist for an unknown channel", () => {
-      const router = new IdentityRouter([], sessions, {});
-      router.addToAllowlist("discord", "abc");
-      expect(router.isAllowed("discord", "abc")).toBe(true);
-      expect(router.isAllowed("discord", "xyz")).toBe(false);
+    it("creates a new allowlist for a channel that had none", () => {
+      const router = routerOf([], sessions, {});
+      router.addToAllowlist("imessage", "any;+;chatabc");
+      expect(router.isAllowed("imessage", "any;+;chatabc")).toBe(true);
+      expect(router.isAllowed("imessage", "any;+;chatxyz")).toBe(false);
     });
 
     it("creating a channel's first allowlist (group activation) never locks out the identity's DM", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -147,7 +162,7 @@ describe("IdentityRouter", () => {
 
   describe("hasAllowlist", () => {
     it("reports whether a channel enforces an allowlist", () => {
-      const router = new IdentityRouter([], sessions, { telegram: ["123"] });
+      const router = routerOf([], sessions, { telegram: ["123"] });
       expect(router.hasAllowlist("telegram")).toBe(true);
       expect(router.hasAllowlist("imessage")).toBe(false);
     });
@@ -155,7 +170,7 @@ describe("IdentityRouter", () => {
 
   describe("resolve", () => {
     it("returns channel-scoped key for group chats", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -167,14 +182,14 @@ describe("IdentityRouter", () => {
     });
 
     it("returns channel-scoped key for unknown users (no identity)", () => {
-      const router = new IdentityRouter([], sessions, {});
+      const router = routerOf([], sessions, {});
       const result = router.resolve("telegram", "unknown-user", false);
       expect(result.sessionKey).toBe("telegram:unknown-user");
       expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "unknown-user" });
     });
 
     it("returns unified dm: key for identity-bound users", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "Alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -185,7 +200,7 @@ describe("IdentityRouter", () => {
     });
 
     it("routes reply to current channel with last-active policy", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{
           name: "Bob",
           channels: { telegram: "111", imessage: "+15551234567" },
@@ -205,8 +220,8 @@ describe("IdentityRouter", () => {
       expect(r2.replyTarget).toEqual({ channelName: "imessage", chatId: "+15551234567" });
     });
 
-    it("routes reply to fixed channel with fixed policy", () => {
-      const router = new IdentityRouter(
+    it("ignores a legacy fixed replyPolicy: replies always follow the last-active channel", () => {
+      const router = routerOf(
         [{
           name: "Carol",
           channels: { telegram: "111", imessage: "+15551234567" },
@@ -216,29 +231,13 @@ describe("IdentityRouter", () => {
         {},
       );
 
-      // Even when message comes from iMessage, reply goes to Telegram
       const result = router.resolve("imessage", "+15551234567", false);
       expect(result.sessionKey).toBe("dm:carol");
-      expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "111" });
-    });
-
-    it("falls back to current channel if fixed policy target is invalid", () => {
-      const router = new IdentityRouter(
-        [{
-          name: "Dave",
-          channels: { telegram: "111" },
-          replyPolicy: "discord", // channel not configured
-        }],
-        sessions,
-        {},
-      );
-
-      const result = router.resolve("telegram", "111", false);
-      expect(result.replyTarget).toEqual({ channelName: "telegram", chatId: "111" });
+      expect(result.replyTarget).toEqual({ channelName: "imessage", chatId: "+15551234567" });
     });
 
     it("matches iMessage chatGuid to identity by identifier extraction", () => {
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{
           name: "Eve",
           channels: { imessage: "+15551234567" },
@@ -260,7 +259,7 @@ describe("IdentityRouter", () => {
     ];
 
     it("routes a summoned group to the dm: session with the PRIVATE dm reply target", () => {
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       router.summonGroup("telegram", "-987", "Alice");
 
       const result = router.resolve("telegram", "-987", true);
@@ -275,7 +274,7 @@ describe("IdentityRouter", () => {
       sessions.setSdkSessionId("dm:alice", "session-alice");
       sessions.setReplyTarget("dm:alice", { channelName: "imessage", chatId: "+15551234567" });
 
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       router.summonGroup("telegram", "-987", "Alice");
 
       const result = router.resolve("telegram", "-987", true);
@@ -284,7 +283,7 @@ describe("IdentityRouter", () => {
 
     it("expires after the configured group inactivity and notifies via callback", () => {
       const summons = new SummonStore(null, 1000);
-      const router = new IdentityRouter(identities, sessions, {}, summons);
+      const router = routerOf(identities, sessions, {}, summons);
       const expired: string[] = [];
       router.onSummonExpired = (ch, chatId, identity, notifyGroup) =>
         expired.push(`${ch}:${chatId}:${identity}:${notifyGroup}`);
@@ -314,7 +313,7 @@ describe("IdentityRouter", () => {
       sessions.setSdkSessionId("telegram:111", "old-session");
       sessions.setReplyTarget("telegram:111", { channelName: "telegram", chatId: "111" });
 
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       router.summonGroup("telegram", "-987", "Alice");
 
       const result = router.resolve("telegram", "-987", true);
@@ -326,7 +325,7 @@ describe("IdentityRouter", () => {
 
     it("clears the dm session on a guard read but suppresses the group notice", () => {
       const summons = new SummonStore(null, 1000);
-      const router = new IdentityRouter(identities, sessions, {}, summons);
+      const router = routerOf(identities, sessions, {}, summons);
       const expired: string[] = [];
       router.onSummonExpired = (ch, chatId, identity, notifyGroup) =>
         expired.push(`${ch}:${chatId}:${identity}:${notifyGroup}`);
@@ -357,7 +356,7 @@ describe("IdentityRouter", () => {
       sessions.setSdkSessionId("dm:alice", "session-alice");
       sessions.setReplyTarget("dm:alice", { channelName: "telegram", chatId: "111" });
 
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       router.summonGroup("telegram", "-987", "Alice");
       router.resolve("telegram", "-987", true);
 
@@ -366,7 +365,7 @@ describe("IdentityRouter", () => {
     });
 
     it("does not affect other groups or DMs", () => {
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       router.summonGroup("telegram", "-987", "Alice");
 
       expect(router.resolve("telegram", "-555", true).sessionKey).toBe("telegram:-555");
@@ -374,7 +373,7 @@ describe("IdentityRouter", () => {
     });
 
     it("dismiss restores group routing", () => {
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       router.summonGroup("telegram", "-987", "Alice");
       expect(router.dismissGroup("telegram", "-987")).toBe(true);
 
@@ -383,10 +382,11 @@ describe("IdentityRouter", () => {
       expect(router.getSummonedIdentity("telegram", "-987")).toBeUndefined();
     });
 
-    it("drops a stale summon when no private reply target exists for the identity", () => {
-      const router = new IdentityRouter(identities, sessions, {});
-      // Simulates a summons.json written before the identity was renamed/removed
-      router.summonGroup("telegram", "-987", "Ghost");
+    it("drops a stale summon that names someone who is no longer the owner", () => {
+      // A summons.json written while another identity was configured.
+      const summons = new SummonStore(null);
+      summons.set("telegram:-987", "ghost");
+      const router = routerOf(identities, sessions, {}, summons);
 
       const result = router.resolve("telegram", "-987", true);
       // Must NOT route dm output to the group — the summon is dropped instead
@@ -396,26 +396,28 @@ describe("IdentityRouter", () => {
     });
 
     it("dismiss on a non-summoned group returns false", () => {
-      const router = new IdentityRouter(identities, sessions, {});
+      const router = routerOf(identities, sessions, {});
       expect(router.dismissGroup("telegram", "-987")).toBe(false);
     });
 
-    it("identityForSender matches provider-verified sender ids", () => {
-      const router = new IdentityRouter(identities, sessions, {});
-      expect(router.identityForSender("telegram", "111")?.name).toBe("Alice");
-      expect(router.identityForSender("telegram", "222")).toBeUndefined();
+    it("isOwnerSender matches provider-verified sender ids and fails closed", () => {
+      const router = routerOf(identities, sessions, {});
+      expect(router.isOwnerSender("telegram", "111")).toBe(true);
+      expect(router.isOwnerSender("telegram", "222")).toBe(false);
+      expect(router.isOwnerSender("telegram", undefined)).toBe(false);
+      expect(routerOf([], sessions, {}).isOwnerSender("telegram", "111")).toBe(false);
     });
 
-    it("identityForSender resolves an iMessage identity bound to a DM chat GUID (#393)", () => {
-      const router = new IdentityRouter(
+    it("isOwnerSender resolves an iMessage owner bound to a DM chat GUID (#393)", () => {
+      const router = routerOf(
         [{ name: "Gina", channels: { imessage: "any;-;+15551234567" }, replyPolicy: "last-active" }],
         sessions,
         {},
       );
       // Routing sees the chat GUID; owner checks see the bare sender handle.
       expect(router.resolve("imessage", "any;-;+15551234567", false).sessionKey).toBe("dm:gina");
-      expect(router.identityForSender("imessage", "+15551234567")?.name).toBe("Gina");
-      expect(router.identityForSender("imessage", "+15559999999")).toBeUndefined();
+      expect(router.isOwnerSender("imessage", "+15551234567")).toBe(true);
+      expect(router.isOwnerSender("imessage", "+15559999999")).toBe(false);
     });
   });
 
@@ -424,7 +426,7 @@ describe("IdentityRouter", () => {
       // Simulate an existing session under the old key
       sessions.setSdkSessionId("telegram:111", "session-old");
 
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "Frank", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -444,7 +446,7 @@ describe("IdentityRouter", () => {
       sessions.setSdkSessionId("imessage:any;-;+15551234567", "session-imsg");
       sessions.setSdkSessionId("imessage:any;+;groupguid", "session-group");
 
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -464,7 +466,7 @@ describe("IdentityRouter", () => {
       // restore key must be the GUID the next inbound iMessage turn will use.
       sessions.setSdkSessionId("imessage:any;-;+15551234567", "session-imsg");
       const identity = { name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
-      const router = new IdentityRouter([identity], sessions, {});
+      const router = routerOf([identity], sessions, {});
       router.resolve("imessage", "any;-;+15551234567", false);
       expect(sessions.getEntry("imessage:any;-;+15551234567")).toBeUndefined();
 
@@ -475,7 +477,7 @@ describe("IdentityRouter", () => {
     it("follows the conversation to its current GUID when it moved after migration (SMS → iMessage)", () => {
       sessions.setSdkSessionId("imessage:SMS;-;+15551234567", "session-sms");
       const identity = { name: "Ivy", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
-      const router = new IdentityRouter([identity], sessions, {});
+      const router = routerOf([identity], sessions, {});
       router.resolve("imessage", "SMS;-;+15551234567", false);
       // The contact turned on iMessage; the same handle now arrives under a
       // different chat GUID and the router keeps the reply target current.
@@ -491,7 +493,7 @@ describe("IdentityRouter", () => {
       // first message): no migratedFrom, but resolve() persisted the GUID the
       // router last replied to.
       const identity = { name: "Jo", channels: { imessage: "+15551234567" }, replyPolicy: "last-active" };
-      const router = new IdentityRouter([identity], sessions, {});
+      const router = routerOf([identity], sessions, {});
       router.resolve("imessage", "iMessage;-;+15551234567", false);
       sessions.setSdkSessionId("dm:jo", "session-jo");
 
@@ -520,7 +522,7 @@ describe("IdentityRouter", () => {
       const good = readFileSync(registry, "utf-8");
       writeFileSync(registry, good.slice(0, Math.floor(good.length / 2)));
 
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "Frank", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -540,7 +542,7 @@ describe("IdentityRouter", () => {
       sessions.setSdkSessionId("dm:grace", "session-unified");
       sessions.setSdkSessionId("telegram:111", "session-old");
 
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "Grace", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -555,7 +557,7 @@ describe("IdentityRouter", () => {
 
   describe("getReplyTarget", () => {
     it("returns undefined for unknown session", () => {
-      const router = new IdentityRouter([], sessions, {});
+      const router = routerOf([], sessions, {});
       expect(router.getReplyTarget("nonexistent")).toBeUndefined();
     });
 
@@ -563,7 +565,7 @@ describe("IdentityRouter", () => {
       // setReplyTarget only updates an existing session entry, so create one first
       sessions.setSdkSessionId("dm:hank", "session-hank");
 
-      const router = new IdentityRouter(
+      const router = routerOf(
         [{ name: "Hank", channels: { telegram: "111" }, replyPolicy: "last-active" }],
         sessions,
         {},
@@ -575,18 +577,18 @@ describe("IdentityRouter", () => {
     });
   });
 
-  describe("findFirstDmSession", () => {
-    it("returns undefined when no dm sessions exist", () => {
-      const router = new IdentityRouter([], sessions, {});
-      expect(router.findFirstDmSession()).toBeUndefined();
+  describe("ownerSessionKey", () => {
+    it("is undefined with no owner", () => {
+      sessions.setSdkSessionId("dm:alice", "session-1");
+      expect(routerOf([], sessions, {}).ownerSessionKey()).toBeUndefined();
     });
 
-    it("returns the first dm: session key", () => {
+    it("is the owner's dm: key, not the first dm: session in registry order", () => {
+      // Another former identity's session sits first in the registry.
+      sessions.setSdkSessionId("dm:sam", "session-0");
       sessions.setSdkSessionId("dm:alice", "session-1");
-      sessions.setSdkSessionId("telegram:999", "session-2");
-
-      const router = new IdentityRouter([], sessions, {});
-      expect(router.findFirstDmSession()).toBe("dm:alice");
+      const router = routerOf([{ name: "Alice", channels: { telegram: "111" }, replyPolicy: "last-active" }], sessions, {});
+      expect(router.ownerSessionKey()).toBe("dm:alice");
     });
   });
 });

@@ -45,13 +45,13 @@ beforeEach(async () => {
   const assetsDir = join(root, "assets"); mkdirSync(join(assetsDir, "assets"), { recursive: true });
   writeFileSync(join(assetsDir, "index.html"), "<!doctype html><title>Tomo</title>");
   writeFileSync(join(assetsDir, "assets", "app-test.js"), "export {};");
-  const identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" as const }];
+  const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
   const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
   store.touchSession("telegram:-1"); store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "Group history", timestamp: Date.now(), channel: "telegram" });
   store.touchSession("dm:peer");
-  channel = new WebChannel(identities); handoff = vi.fn(async () => true); channel.onMessage(handoff);
-  service = await startWebHttp(0, { accessToken, externalOrigin, now: () => now, assetsDir, data: new WebData({ sessionsDir, sdkSessionsDir, identities }),
+  channel = new WebChannel(owner); handoff = vi.fn(async () => true); channel.onMessage(handoff);
+  service = await startWebHttp(0, { accessToken, externalOrigin, now: () => now, assetsDir, data: new WebData({ sessionsDir, sdkSessionsDir, owner }),
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);

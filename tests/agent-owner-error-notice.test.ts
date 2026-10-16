@@ -14,6 +14,7 @@ import {
   makeMsg,
   mockSdk,
   resetConfig,
+  useRealAdmission,
   waitFor,
 } from "./helpers/agent-harness.js";
 import { OWNER_NOTICE_WINDOW_MS } from "../src/agent/owner-error-notice.js";
@@ -259,59 +260,73 @@ describe("owner notice for errors kept out of a chat", () => {
     await agent.stop();
   });
 
-  describe("with several identities", () => {
+  describe("with several legacy identities (single owner now)", () => {
     const SECOND_CHAT = "777";
-    async function setupTwo() {
+    async function setupTwo(webOwnerIdentity?: string) {
+      useRealAdmission();
       resetConfig({
         identities: [
           { name: "owner", channels: { telegram: OWNER_CHAT }, replyPolicy: "last-active" },
           { name: "second", channels: { telegram: SECOND_CHAT }, replyPolicy: "last-active" },
         ],
+        channelAllowlists: { imessage: [GROUP_CHAT] },
+        ...(webOwnerIdentity ? { web: { ownerIdentity: webOwnerIdentity } } : {}),
       });
       const agent = new Agent();
       const tg = new MockChannel("telegram");
       const im = new MockChannel("imessage");
       agent.addChannel(tg);
       agent.addChannel(im);
-      // The SECOND identity's DM session exists first.
       mockSdk.responseFn = () => "hi";
-      await tg.simulateMessage(makeMsg({ chatId: SECOND_CHAT, text: "hello" }));
-      await tg.simulateMessage(makeMsg({ chatId: OWNER_CHAT, text: "hello" }));
+      await tg.simulateMessage(makeMsg({ chatId: SECOND_CHAT, senderId: SECOND_CHAT, text: "hello" }));
+      await tg.simulateMessage(makeMsg({ chatId: OWNER_CHAT, senderId: OWNER_CHAT, text: "hello" }));
+      await drainQueue(agent);
       mockSdk.responseFn = () => "NO_REPLY";
       await im.simulateMessage(makeMsg({ chatId: GROUP_CHAT, text: "chatter", isGroup: true, chatTitle: "Book Club" }));
       await drainQueue(agent);
-      tg.clearDelivered();
-      im.clearDelivered();
       return { agent, tg, im };
     }
 
-    it("a group failure goes to the configured owner (first identity), not the first dm session", async () => {
+    it("the first identity is the owner; the other identity's DMs are no longer answered", async () => {
+      const { agent, tg } = await setupTwo();
+      expect(tg.delivered.map((d) => d.chatId)).toEqual([OWNER_CHAT]);
+      await agent.stop();
+    });
+
+    it("web.ownerIdentity picks the owner among several identities", async () => {
+      const { agent, tg } = await setupTwo("second");
+      expect(tg.delivered.map((d) => d.chatId)).toEqual([SECOND_CHAT]);
+      await agent.stop();
+    });
+
+    it("a group failure goes to the owner, not the first dm session", async () => {
       const { agent, tg, im } = await setupTwo();
+      tg.clearDelivered();
       await groupMessageThatFails(agent, im);
       await waitFor(() => expect(tg.delivered).toHaveLength(1));
       expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
       await agent.stop();
     });
 
-    it("a held-back failure on an identity's dm session is reported in THAT identity's DM", async () => {
+    it("a held-back failure on a former identity's dm session is not sent to that person", async () => {
       const { agent, tg } = await setupTwo();
+      tg.clearDelivered();
       failNextTurnWith(AUTH);
       await agent.handleCronMessage("housekeeping", "dm:second", { suppressDelivery: true, showTyping: false });
-      await waitFor(() => expect(tg.delivered).toHaveLength(1));
-      expect(tg.delivered[0].chatId).toBe(SECOND_CHAT);
-      expect(tg.delivered[0].text).toContain("this DM session (dm:second)");
+      await expectNoChangeFor(() => expect(tg.delivered.filter((d) => d.chatId === SECOND_CHAT)).toEqual([]));
       await agent.stop();
     });
 
-    it("a summoned group's failure is labelled as the group's and delivered to the DM it ran on, with /rewind", async () => {
+    it("a summoned group's failure is labelled as the group's and delivered to the owner's DM, with /rewind", async () => {
       const { agent, tg, im } = await setupTwo();
-      (agent as unknown as { router: { summonGroup(c: string, id: string, who: string): void } })
-        .router.summonGroup("imessage", GROUP_CHAT, "second");
+      tg.clearDelivered();
+      (agent as unknown as { router: { summonGroup(c: string, id: string): void } })
+        .router.summonGroup("imessage", GROUP_CHAT);
 
       await groupMessageThatFails(agent, im);
 
       await waitFor(() => expect(tg.delivered).toHaveLength(1));
-      expect(tg.delivered[0].chatId).toBe(SECOND_CHAT);
+      expect(tg.delivered[0].chatId).toBe(OWNER_CHAT);
       expect(tg.delivered[0].text).toContain(`group "Book Club" (imessage:${GROUP_CHAT})`);
       expect(tg.delivered[0].text).toContain("/rewind in this DM");
       expect(im.delivered).toEqual([]);

@@ -177,6 +177,9 @@ async function startForeground(): Promise<void> {
   });
 
   const agent = new Agent();
+  // Owner notices, legacy adoption and the pre-created owner session entry —
+  // before any channel can deliver a message.
+  agent.prepareOwner();
   // The messages this daemon accepted and would now never answer are recorded
   // in the transcript even on the crash path (#294).
   salvageInbound = () => agent.recordUnprocessedInboundOnCrash();
@@ -215,9 +218,9 @@ async function startForeground(): Promise<void> {
     try {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
-      const web = new WebChannel(config.identities, config.web.ownerIdentity);
+      const web = new WebChannel(config.owner);
       web.attach(new WebSupervisor(web, {
-        ...config.web, identities: config.identities,
+        ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
         diagnostic: (message) => log.info(message),
       }));

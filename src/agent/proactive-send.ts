@@ -19,6 +19,10 @@ import { formatTomoEvent } from "../tomo-event.js";
 export type SendResult = { ok: true; note?: string } | { ok: false; error: string };
 
 export interface SessionCatalog {
+  /** The one person Tomo works for; pass `name` (or "owner") to send_message. */
+  owner: { name: string; displayName?: string } | null;
+  /** Deprecated alias of `owner` (one element, or none), kept because prompts
+   *  and skills may still parse it. */
   identities: Array<{ name: string }>;
   groups: Array<{ key: string; title?: string; participants?: string[] }>;
 }
@@ -73,7 +77,7 @@ export class ProactiveSendService {
     const text = rawText;
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
-      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see the owner and valid groups.` };
     }
     const { sessionKey, replyTarget } = resolved;
 
@@ -282,7 +286,7 @@ export class ProactiveSendService {
   async delegateToSession(target: string, request: string, callerAudiences?: string[]): Promise<SendResult> {
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
-      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see valid identities and groups.` };
+      return { ok: false, error: `Unknown target "${target}". Call list_sessions to see the owner and valid groups.` };
     }
     const { sessionKey, replyTarget } = resolved;
 
@@ -526,7 +530,7 @@ export class ProactiveSendService {
   private resolveSendTarget(
     target: string,
   ): { sessionKey: string; replyTarget: ReplyTarget; rawReplyTarget?: ReplyTarget } | undefined {
-    const normalized = normalizeSendTarget(target, config.identities);
+    const normalized = normalizeSendTarget(target, config.owner);
     if (!normalized) return undefined;
     const { sessionKey, identityName, rawReplyTarget } = normalized;
 
@@ -553,7 +557,10 @@ export class ProactiveSendService {
    *  through metadata — e.g. summoned before ever running their own turn —
    *  are still listed as send targets. */
   listSessionCatalog(): SessionCatalog {
-    const identities = config.identities.map((i) => ({ name: i.name }));
+    const owner = config.owner
+      ? { name: config.owner.name, ...(config.owner.displayName ? { displayName: config.owner.displayName } : {}) }
+      : null;
+    const identities = owner ? [{ name: owner.name }] : [];
     const groups: SessionCatalog["groups"] = [];
     for (const entry of this.deps.listActiveEntries()) {
       const key = entry.channelKey;
@@ -564,7 +571,7 @@ export class ProactiveSendService {
         ...(entry.participants && entry.participants.length > 0 ? { participants: entry.participants } : {}),
       });
     }
-    return { identities, groups };
+    return { owner, identities, groups };
   }
 
   recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {

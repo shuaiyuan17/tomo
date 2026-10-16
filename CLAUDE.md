@@ -39,7 +39,8 @@ src/
     bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn
     setting-sources.ts      # which settings files the query loads (and the hook guard scans)
     #  plus: session-queue, pending-notes-queue, send-target, permissions, text-utils, claude-login
-  router.ts           # IdentityRouter — session key resolution, allowlists, summons
+  owner.ts            # The single `owner` (config shape, resolution from legacy `identities`, handle matching)
+  router.ts           # OwnerRouter — admission, session key resolution, summons
   people.ts           # People registry — person records, alias/handle resolution, auto-binding
   config.ts           # Config from ~/.tomo/config.json + env vars (zod-validated)
   tomo-event.ts       # <tomo-event> envelope for harness-composed messages
@@ -77,13 +78,15 @@ All private web APIs, including reads and SSE, require a signed origin-bound ses
 ### Session Keys
 
 Session keys determine conversation isolation:
-- **With identity**: `dm:<identityName>` — unified across all channels (Telegram + iMessage share one session)
-- **Without identity**: `<channel>:<chatId>` — e.g., `telegram:123456789`
-- **Group chats**: always `<channel>:<chatId>` — never unified
+- **The owner**: `dm:<owner.name lowercased>` — ONE session across Telegram, iMessage and the web UI. `owner.name` IS the session id (the same derivation the old per-identity key used), so it is never rewritten; the human-facing label is `owner.displayName`.
+- **Group chats**: always `<channel>:<chatId>` — never unified (unless `/summon`ed into the owner session)
+- Raw `<channel>:<chatId>` DM keys only exist as legacy history; no new one is created for anybody.
 
-The `IdentityRouter` resolves (channel, chatId, isGroup) → sessionKey + replyTarget.
+There is ONE owner (`src/owner.ts`). `config.owner` is resolved from the `owner` block or, for older files, from `identities` (read forever): one identity → it is the owner; several → `web.ownerIdentity`, else the first, with a startup warning; none → the single DM allowlist entry if exactly one exists (pre-identity installs), else no owner (every DM ignored). Other identities' sessions, transcripts and cron jobs are never touched. `replyPolicy` is ignored: replies go to the channel the owner last wrote from.
 
-**Admission fails closed** (`IdentityRouter.isAllowed`): a DM is admitted only when it matches an identity binding (or an explicit allowlist entry) on that channel; a group only when it is in the channel's allowlist (the group secret adds it). A channel with NO allowlist is not open. Refused messages still return custody (`true`) so the iMessage cursor advances, and are logged once per chat per hour (`agent/blocked-inbound-log.ts`). Compare iMessage handles only through `matchesChannelBinding` / `normalizeImessageHandle` (`src/sessions/keys.ts`) — never with `===`. Agent tests run a documented admission seam (`useRealAdmission()` in `tests/helpers/agent-harness.ts`) — admission tests must opt into the real logic.
+The `OwnerRouter` resolves (channel, chatId, isGroup) → sessionKey + replyTarget. At daemon start `Agent.prepareOwner()` logs owner notices, adopts a single legacy per-channel owner session if the owner key has no SDK session, and pre-creates the owner's registry entry (also done by `tomo init`). Adoption never runs once the owner key has a linked session, and `migrateSessionKey` folds a metadata-only stub under the destination key instead of creating a second active entry — so the owner session cannot fork.
+
+**Admission fails closed** (`OwnerRouter.isAllowed`): a DM is admitted only from one of the owner's handles on that channel (DM entries in a channel allowlist are ignored — allowlists govern groups only); a group only when it is in the channel's allowlist (the group secret adds it). A channel with NO allowlist is not open. Owner-only commands go through `isOwnerSender`, which fails closed with no owner. Refused messages still return custody (`true`) so the iMessage cursor advances, and are logged once per chat per hour (`agent/blocked-inbound-log.ts`). Compare iMessage handles only through `matchesChannelBinding` / `isOwnerHandle` / `normalizeImessageHandle` — never with `===`. Agent tests run a documented admission seam (`useRealAdmission()` in `tests/helpers/agent-harness.ts`) — admission tests must opt into the real logic; `mockConfig.owner` is derived from `mockConfig.identities` through the production resolver.
 
 **Transcript filenames** are derived from the key by `transcriptFileStem()` (`src/sessions/store.ts`) — `<stem>.jsonl` active, `_archive_<stem>_<YYYY-MM>.jsonl` rotated — and the mapping is INJECTIVE **up to case folding**, which the old `key.replace(/[^a-zA-Z0-9_-]/g, "_")` was not (`imessage:any;-;alex.smith@x` and `imessage:any;-;alex_smith@x` shared one file). A key drawn only from `[a-z0-9:-]` keeps that legacy stem; anything else — including any key carrying an uppercase letter, because APFS and NTFS are case-insensitive by default — gets `<legacy stem>.<12 hex of sha256(key)>`, and since `.` is outside the legacy safe set the two families can never meet. So the "never moves" set is **keys drawn from `[a-z0-9:-]`**, not `dm:*`/`telegram:*` as a whole: `dm:shuai` and `telegram:-100123` keep their names, but a non-canonical identity key like `dm:shuai yuan` does move (and is migrated). Never build a transcript path from a key by hand — go through the store, or through the exported `transcriptFileStem` / `legacyTranscriptFileStem`.
 
@@ -122,7 +125,7 @@ With config `steering` (default on), user messages that arrive mid-turn bypass t
 `/rewind [N]` is an owner-DM command executed inside the shared session queue without a model call. It closes the idle SDK child, uses the SDK's active-chain reader and fork API to branch before N recorded human messages, then atomically swaps the registry link with `replaceSdkSessionId` (expected-ID check). The original SDK file and Tomo transcript are preserved; the old link follows the usual 30-day retention. Tool results, harness turns, summaries, and entries without human provenance do not count. Never rewrite the source JSONL or rewind files. Refuse corrupt/changing snapshots and active autonomous turns. Whole-file reads are asynchronous; the final pre-publish check uses file identity, size, and nanosecond modification/change times without yielding before the link swap. An unpublished fork is deleted after validation, shutdown, or link-publication failure; cleanup failures are logged without masking the original error. Only numeric API errors and the known nonnumeric safeguard prefix are classified as error text. Safeguard API errors are delivered once with recovery guidance and are not queued back into model context as pending error notes.
 
 1. Channel receives message → `agent.enqueueMessage()` (serialized per session key)
-2. `handleMessage()` — allowlist check, identity resolution, timestamp injection
+2. `handleMessage()` — admission check, owner resolution, timestamp injection
 3. `runWithRetry()` → `LiveSession.send()` → SDK query; each completed assistant content block ships to the channel as the SDK closes it (no partial-token streaming — `includePartialMessages` stays off)
 4. After the `result` event the joined response drives only the transcript, logging, and silence/error policy (`src/agent/turn-runner.ts`, `src/agent/delivery-pipeline.ts`)
 
@@ -133,7 +136,7 @@ All harness-composed messages (cron, heartbeats, nudges, summons, delegate reque
 ### Sending Notifications (No Agent Query)
 
 `agent.sendNotification(text)` sends a direct channel message without invoking Claude:
-1. Tries `dm:` session via IdentityRouter
+1. Tries the owner's `dm:` session via OwnerRouter
 2. Falls back to first non-group session key from the registry
 3. Uses `privateReplyTargetFromSessionKey()` (`src/sessions/keys.ts`) which excludes groups
 

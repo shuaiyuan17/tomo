@@ -10,7 +10,7 @@ import { Agent, MockChannel, SessionStore, drainQueue, installAgentTestHooks, ma
 import { WebChannel } from "../src/channels/web.js";
 import { watchBus } from "../src/watch/bus.js";
 import { WebData } from "../src/web/data.js";
-import { IdentityRouter } from "../src/router.js";
+import { OwnerRouter } from "../src/router.js";
 import { webSessionId } from "../src/web/owner.js";
 import type { WebEvent } from "../src/web/protocol.js";
 
@@ -22,7 +22,7 @@ let events: WebEvent[];
 beforeEach(() => {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner", imessage: "test-handle" }, replyPolicy: "last-active" }];
-  agent = new Agent(); web = new WebChannel(mockConfig.identities); provider = new MockChannel("telegram");
+  agent = new Agent(); web = new WebChannel(mockConfig.owner); provider = new MockChannel("telegram");
   agent.addChannel(provider); agent.addChannel(web);
   events = []; web.events.subscribe(({ event }) => events.push(event));
 });
@@ -44,7 +44,7 @@ describe("web routing through the real Agent", () => {
     expect(messages.filter((m) => m.role === "user")).toEqual([expect.objectContaining({ content: "A web question", channel: "web", requestId })]);
     expect(messages.filter((m) => m.role === "assistant")).toEqual([expect.objectContaining({ content: "First complete block\nSecond complete block", channel: "web", requestId })]);
     expect(web.request(requestId).state).toBe("completed");
-    const catalog = new WebData(mockConfig).catalog();
+    const catalog = new WebData({ ...mockConfig, owner: mockConfig.owner }).catalog();
     expect(catalog.sessions.find((s) => s.kind === "dm")?.stats).toMatchObject({ contextUsed: 5000, contextMax: 200000, contextEstimated: false });
   });
   it("never changes the persistent notification target or provider reply policy", async () => {
@@ -60,14 +60,14 @@ describe("web routing through the real Agent", () => {
   it("rejects forged group input in the router and Agent while exposing group history read-only", async () => {
     const sessions = store(); sessions.touchSession("telegram:-1"); sessions.setChatTitle("telegram:-1", "Test group");
     sessions.append("telegram:-1", { role: "user", content: "Existing group text", timestamp: Date.now(), channel: "telegram" });
-    const router = new IdentityRouter(mockConfig.identities, sessions, {});
+    const router = new OwnerRouter(mockConfig.owner, sessions, {});
     expect(() => router.resolve("web", "owner", true)).toThrow();
     expect(() => router.resolve("web", "telegram:-1", false)).toThrow();
     const forged = new MockChannel("web"); agent.addChannel(forged);
     expect(await forged.simulateMessage(makeMsg({ chatId: "owner", isGroup: true, text: "forged", senderName: "Owner" }))).toBe(false);
     expect(await forged.simulateMessage(makeMsg({ chatId: "telegram:-1", text: "forged", senderName: "Owner" }))).toBe(false);
     await drainQueue(agent); expect(mockSdk.promptsBySession).toEqual([]);
-    const data = new WebData(mockConfig);
+    const data = new WebData({ ...mockConfig, owner: mockConfig.owner });
     expect(data.catalog().sessions.find((s) => s.kind === "group")).toMatchObject({ id: webSessionId("telegram:-1"), writable: false });
     expect((await data.history(webSessionId("telegram:-1"))).messages[0].content).toBe("Existing group text");
   });
@@ -125,7 +125,7 @@ describe("web routing through the real Agent", () => {
   it("retains SDK estimated context metadata across a fresh reader", async () => {
     mockSdk.contextUsageFails = true;
     await web.receive({ requestId: randomUUID(), text: "context" }); await drainQueue(agent);
-    expect(new WebData(mockConfig).catalog().sessions[0].stats.contextEstimated).toBe(true);
+    expect(new WebData({ ...mockConfig, owner: mockConfig.owner }).catalog().sessions[0].stats.contextEstimated).toBe(true);
   });
   it("reports a queued message refused if a restore starts before processing", async () => {
     let release!: () => void;

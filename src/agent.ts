@@ -9,13 +9,13 @@ import {
   isDmSessionKey,
   dmIdentityFromSessionKey,
   dmSessionKeyForIdentity,
-  matchesChannelBinding,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
-import { IdentityRouter, type SessionResolution } from "./router.js";
+import { OwnerRouter, type SessionResolution } from "./router.js";
+import { ignoredAllowlistDmEntries, isOwnerHandle } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
 import {
   annotateSenderName,
@@ -205,7 +205,7 @@ const PRUNE_NUDGE_MIN_FRAC = 0.10;
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
-  private router: IdentityRouter;
+  private router: OwnerRouter;
   /** Owner-facing, rate-limited trace of inbound messages the admission gate refused. */
   private readonly blockedInbound = new BlockedInboundLog();
   private sessionQueue = new SessionQueue();
@@ -309,7 +309,7 @@ export class Agent {
       join(config.tomoHome, "data", "summons.json"),
       config.summonExpiryMinutes * 60_000,
     );
-    this.router = new IdentityRouter(config.identities, this.sessions, config.channelAllowlists, summons, config.web?.ownerIdentity);
+    this.router = new OwnerRouter(config.owner, this.sessions, config.channelAllowlists, summons);
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
@@ -535,18 +535,39 @@ export class Agent {
   }
 
   /**
+   * Daemon start: log the owner notices once (multi-identity pick, legacy
+   * adoption, no owner, ignored allowlist DM entries), adopt a legacy
+   * per-channel owner session if one is due, and make sure the owner's `dm:`
+   * session entry exists — so every channel added later binds to that one
+   * session. Writes nothing for an install whose owner session is linked.
+   */
+  prepareOwner(): void {
+    for (const notice of config.ownerNotices) {
+      if (notice.level === "warn") log.warn({ ownerSource: config.ownerSource }, notice.message);
+      else log.info({ ownerSource: config.ownerSource }, notice.message);
+    }
+    const ignored = ignoredAllowlistDmEntries(config.owner, config.channelAllowlists);
+    for (const [channel, count] of Object.entries(ignored)) {
+      log.warn(
+        { channel, count },
+        "DM entries in this channel's allowlist are ignored: the allowlist only activates groups, and only the owner's DMs are answered.",
+      );
+    }
+    const key = this.router.prepareOwnerSession();
+    if (key) log.info({ sessionKey: key }, "Owner session ready");
+  }
+
+  /**
    * Admission fails closed, so a provider channel nobody is bound to answers
    * no DM at all. Say so once at startup, loudly, with the fix — otherwise a
    * fresh iMessage setup just looks broken.
    */
   private warnIfChannelHasNoOwner(channelName: string): void {
     if (channelName === "web") return;
-    if (!this.router.hasBoundIdentity(channelName)) {
+    if (!this.router.hasBoundOwner(channelName)) {
       log.warn(
         { channel: channelName },
-        this.router.hasAllowlist(channelName)
-          ? "No identity binds a handle on this channel, so only DMs listed explicitly in its allowlist are answered. Run `tomo config` and bind your handle to your owner identity."
-          : "No identity binds a handle on this channel, so its DMs are ignored. Run `tomo config` and bind your handle to your owner identity.",
+        "No owner handle is bound on this channel, so its DMs are ignored. Run `tomo config` and add your handle on this channel to the owner.",
       );
     }
     if (!this.router.hasAllowlist(channelName)) {
@@ -675,7 +696,7 @@ export class Agent {
     // redirect into their DM instead; consume callback-shaped secrets before
     // they can enter a transcript or model context. Groups and non-owners
     // never reach the OAuth manager.
-    if (!isGroup && message.senderId && this.router.identityForSender(channel.name, message.senderId)) {
+    if (!isGroup && this.router.isOwnerSender(channel.name, message.senderId)) {
       const consumed = await this.handlePastedMcpCallback(channel, message);
       if (consumed) return true;
     }
@@ -1122,34 +1143,34 @@ export class Agent {
     };
   }
 
+  /**
+   * Where something private for the session `key` goes (an MCP login link,
+   * an elicitation, an auth failure). With an owner configured that is
+   * ALWAYS the owner's DM — never another private chat, even one with a
+   * legacy raw session or a former identity's dm: session. Only an install
+   * with no owner falls back to the session's own private chat.
+   */
   private resolvePrivateReplyTarget(key: string): ReplyTarget | undefined {
-    const identityName = dmIdentityFromSessionKey(key);
-    if (identityName !== undefined) {
-      return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(identityName);
-    }
+    if (config.owner) return this.ownerPrivateReplyTarget();
+    if (!isGroupSessionKey(key)) return privateReplyTargetFromSessionKey(key);
+    return undefined;
+  }
 
-    if (!isGroupSessionKey(key)) {
-      return privateReplyTargetFromSessionKey(key);
-    }
-
-    for (const identity of config.identities) {
-      const target = this.router.deriveReplyTargetFromConfig(identity.name);
+  private findPrivateReplyTarget(): ReplyTarget | undefined {
+    if (config.owner) return this.ownerPrivateReplyTarget();
+    for (const [key] of this.sessions.listSdkSessionIds()) {
+      const target = this.resolvePrivateReplyTarget(key);
       if (target) return target;
     }
     return undefined;
   }
 
-  private findPrivateReplyTarget(): ReplyTarget | undefined {
-    for (const [key] of this.sessions.listSdkSessionIds()) {
-      const target = this.resolvePrivateReplyTarget(key);
-      if (target) return target;
-    }
-
-    for (const identity of config.identities) {
-      const target = this.router.deriveReplyTargetFromConfig(identity.name);
-      if (target) return target;
-    }
-    return undefined;
+  /** The owner's private DM target: last-active, else the first bound handle. */
+  private ownerPrivateReplyTarget(): ReplyTarget | undefined {
+    const owner = config.owner;
+    const key = this.router.ownerSessionKey();
+    if (!owner || !key) return undefined;
+    return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(owner.name);
   }
 
   /**
@@ -1954,7 +1975,7 @@ export class Agent {
   /** Handle a continuity heartbeat — runs on the first active DM session (queued) */
   async handleContinuity(prompt: string): Promise<void> {
     // Resolve target session key first so we can enqueue against it
-    const dmKey = this.router.findFirstDmSession();
+    const dmKey = this.router.ownerSessionKey();
     let key: string;
 
     if (dmKey) {
@@ -2369,7 +2390,7 @@ export class Agent {
    * so callers don't wait out a multi-minute turn for an ack.
    */
   async handleWatchChat(text: string): Promise<void> {
-    const key = this.router.findFirstDmSession();
+    const key = this.router.ownerSessionKey();
     if (!key) throw new Error("No dm session yet — message Tomo from a connected channel first");
     const delivery = this.resolveDeliveryTargetForSession(key, "Watch chat");
     if (!delivery) throw new Error("No delivery target for the dm session");
@@ -2437,33 +2458,29 @@ export class Agent {
   }
 
   /**
-   * Where an owner notice goes — resolved STRICTLY through a configured
-   * identity, never through a raw session key. A notice carries a group's
+   * Where an owner notice goes — resolved STRICTLY through the configured
+   * owner, never through a raw session key. A notice carries a group's
    * title, key, error text and session id; `sendNotification`'s fallback to
    * "the first private chat with a session" could hand that to whoever else
    * has messaged Tomo privately.
    *
-   * - `deliverTo` (a dm: session the turn ran on): that identity's own DM.
-   * - otherwise: the owner identity — `web.ownerIdentity` when set (the same
-   *   selection the local web UI uses), else the first configured identity.
+   * `deliverTo` (a dm: session the turn ran on) must be the owner's session;
+   * any other dm: key (a former identity's) gets no notice.
    *
-   * Undefined when no identity resolves to a loaded channel.
+   * Undefined when there is no owner or no owner DM on a loaded channel.
    */
   private resolveOwnerNoticeTarget(deliverTo: string | undefined): { channel: Channel; chatId: string } | undefined {
-    const identityName = deliverTo !== undefined
-      ? dmIdentityFromSessionKey(deliverTo)
-      : (this.router.webOwner() ?? config.identities[0])?.name;
-    if (identityName === undefined) return undefined;
-    const identity = config.identities.find((id) => id.name.toLowerCase() === identityName.toLowerCase());
-    if (!identity) return undefined;
+    const owner = config.owner;
+    const ownerKey = this.router.ownerSessionKey();
+    if (!owner || !ownerKey) return undefined;
+    if (deliverTo !== undefined && dmSessionKeyForIdentity(dmIdentityFromSessionKey(deliverTo) ?? "") !== ownerKey) return undefined;
     // The persisted last-active target is used only while it is still one of
-    // the identity's CURRENT private bindings — a rebinding, or a binding to
-    // a group id, must not carry a notice somewhere else.
+    // the owner's CURRENT private handles — a rebinding, or a group id, must
+    // not carry a notice somewhere else.
     const isPrivateBinding = (t: ReplyTarget | undefined): t is ReplyTarget => t !== undefined
-      && !isGroupSessionKey(`${t.channelName}:${t.chatId}`)
-      && matchesChannelBinding(t.channelName, t.chatId, identity.channels[t.channelName]);
-    const persisted = this.router.getReplyTarget(dmSessionKeyForIdentity(identity.name));
-    const configured = this.router.deriveReplyTargetFromConfig(identity.name);
+      && isOwnerHandle(owner, t.channelName, t.chatId);
+    const persisted = this.router.getReplyTarget(ownerKey);
+    const configured = this.router.deriveReplyTargetFromConfig(owner.name);
     const target = isPrivateBinding(persisted) ? persisted : isPrivateBinding(configured) ? configured : undefined;
     if (!target) return undefined;
     const channel = this.getChannel(target.channelName);
@@ -2497,7 +2514,7 @@ export class Agent {
 
   /** Send a direct notification to the user's DM channel (no agent query) */
   async sendNotification(text: string): Promise<void> {
-    const dmKey = this.router.findFirstDmSession();
+    const dmKey = this.router.ownerSessionKey();
     let target: ReplyTarget | undefined;
 
     if (dmKey) {
@@ -2507,8 +2524,9 @@ export class Agent {
         ?? privateReplyTargetFromSessionKey(dmKey);
     }
 
-    if (!target) {
-      // No identity session — find the first DM (non-group) session across all channels
+    if (!target && !config.owner) {
+      // No owner at all — find the first DM (non-group) session across all
+      // channels. With an owner, a notification never goes to anyone else.
       for (const [key] of this.sessions.listSdkSessionIds()) {
         const parsed = privateReplyTargetFromSessionKey(key);
         if (parsed) { target = parsed; break; }

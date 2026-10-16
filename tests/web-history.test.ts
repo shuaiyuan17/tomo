@@ -12,7 +12,7 @@ let dirs: { sessionsDir: string; sdkSessionsDir: string };
 let store: SessionStore;
 const key = "dm:owner";
 const timestamp = Date.UTC(2026, 8, 1);
-const identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" as const }];
+const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "tomo-web-history-"));
   dirs = { sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk") };
@@ -49,7 +49,7 @@ describe("store-owned web history reads", () => {
   it("reads full messages beyond watch clipping and fresh context metadata", async () => {
     const content = "detail ".repeat(1000);
     store.append(key, { role: "assistant", content, timestamp, channel: "web" });
-    const data = new WebData({ ...dirs, identities });
+    const data = new WebData({ ...dirs, owner });
     expect((await data.history(webSessionId(key))).messages[0].content).toBe(content);
     store.updateStats(key, { costUsd: 0, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 12, contextMax: 100, contextEstimated: true });
     expect(data.catalog().sessions[0].stats).toEqual({ contextUsed: 12, contextMax: 100, contextEstimated: true });
@@ -57,7 +57,7 @@ describe("store-owned web history reads", () => {
     expect(data.catalog().sessions[0].stats).toEqual({ contextUsed: 20, contextMax: 100, contextEstimated: false });
   });
   it("fails closed for unreadable registries, unknown sessions, invalid cursors and symlinks", async () => {
-    const data = new WebData({ ...dirs, identities });
+    const data = new WebData({ ...dirs, owner });
     await expect(data.history(webSessionId("dm:peer"))).rejects.toMatchObject({ status: 404 });
     await expect(readHistoryPage(dirs, key, "not-a-cursor")).rejects.toThrow();
     writeFileSync(join(root, "outside.jsonl"), row("outside"));
@@ -69,7 +69,7 @@ describe("store-owned web history reads", () => {
   });
   it("does not create or migrate files during a read-only catalog/history request", async () => {
     const empty = { sessionsDir: join(root, "new"), sdkSessionsDir: dirs.sdkSessionsDir };
-    expect(new WebData({ ...empty, identities }).catalog().ownerId).toBe(webSessionId(key));
+    expect(new WebData({ ...empty, owner }).catalog().ownerId).toBe(webSessionId(key));
     expect(readdirSync(root)).not.toContain("new");
     const before = state();
     SessionStore.readSnapshot(dirs.sessionsDir, dirs.sdkSessionsDir);
@@ -81,7 +81,7 @@ describe("store-owned web history reads", () => {
     const other = { sessionsDir: join(root, "legacy"), sdkSessionsDir: dirs.sdkSessionsDir };
     const legacyStore = new SessionStore(other.sessionsDir, 20, other.sdkSessionsDir);
     legacyStore.setSdkSessionId(legacy, "test-legacy-sdk-session"); legacyStore.append(legacy, { role: "user", content: "Legacy text", timestamp, channel: "telegram" });
-    const data = new WebData({ ...other, identities });
+    const data = new WebData({ ...other, owner });
     expect(data.catalog().ownerId).toBe(webSessionId(key));
     expect((await data.history(webSessionId(key))).messages[0].content).toBe("Legacy text");
     legacyStore.migrateSessionKey(legacy, key);

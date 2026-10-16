@@ -9,7 +9,16 @@ import { log } from "../src/logger.js";
 
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
+    // Legacy-shaped fixture; `owner` is what the code reads (a single
+    // identity becomes the owner, as src/owner.ts resolves it).
     identities: [] as Array<{ name: string; channels?: Record<string, string> }>,
+    get owner() {
+      const id = this.identities[0];
+      if (!id) return undefined;
+      const tg = id.channels?.telegram;
+      const im = id.channels?.imessage;
+      return { name: id.name, telegram: tg ? [tg] : [], imessage: im ? [im] : [] };
+    },
   },
 }));
 
@@ -714,7 +723,7 @@ describe("ProactiveSendService edit/unsend of own messages", () => {
 });
 
 describe("ProactiveSendService.listSessionCatalog", () => {
-  it("lists identities and group entries with metadata", () => {
+  it("lists the owner (plus the deprecated identities alias) and group entries with metadata", () => {
     mockConfig.identities = [{ name: "Alice" }];
     const entries = [
       { channelKey: "telegram:-100123", chatTitle: "Team", participants: ["Bob"] },
@@ -725,6 +734,7 @@ describe("ProactiveSendService.listSessionCatalog", () => {
 
     const catalog = h.service.listSessionCatalog();
 
+    expect(catalog.owner).toEqual({ name: "Alice" });
     expect(catalog.identities).toEqual([{ name: "Alice" }]);
     expect(catalog.groups).toEqual([
       { key: "telegram:-100123", title: "Team", participants: ["Bob"] },

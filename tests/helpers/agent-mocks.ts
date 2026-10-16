@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import { resolveOwner, type OwnerConfig } from "../../src/owner.js";
 
 // ---------------------------------------------------------------------------
 // Shared mock state + module factories for the Agent integration suites.
@@ -331,7 +332,22 @@ export const mockConfig = {
   continuity: false,
   continuityScript: null,
   city: null as string | null,
+  /** Legacy-shaped input most tests still write. `owner` is derived from it
+   *  through the PRODUCTION resolver (src/owner.ts), so these tests exercise
+   *  the back-compat path an upgraded install takes. Assign `owner` directly
+   *  to use the new shape instead; assigning `undefined` goes back to deriving. */
   identities: [] as Array<{ name: string; channels: Record<string, string>; replyPolicy: string }>,
+  web: undefined as undefined | { ownerIdentity?: string },
+  _ownerOverride: undefined as OwnerConfig | undefined,
+  get owner(): OwnerConfig | undefined {
+    if (this._ownerOverride !== undefined) return this._ownerOverride;
+    return resolveOwner({ owner: undefined, identities: this.identities, webOwnerIdentity: this.web?.ownerIdentity }).owner;
+  },
+  set owner(value: OwnerConfig | undefined) {
+    this._ownerOverride = value;
+  },
+  ownerSource: "identity" as string,
+  ownerNotices: [] as Array<{ level: "info" | "warn"; message: string }>,
   imessageProvider: null as "imsg" | null,
   imessageInboundSettleMs: 0,
   imessageInboundMaxSettleMs: 0,

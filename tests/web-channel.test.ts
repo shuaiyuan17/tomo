@@ -4,14 +4,15 @@ import { WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { WebEvents } from "../src/web/events.js";
 import { parseWebConfig } from "../src/web/config.js";
-import { selectWebOwner, webSessionId } from "../src/web/owner.js";
+import { webSessionId } from "../src/web/owner.js";
+import type { OwnerConfig } from "../src/owner.js";
 import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
 
-const owner = { name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" as const };
+const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
 const channels: WebChannel[] = [];
-function setup(identities = [owner]) {
+function setup(configured: OwnerConfig | null = owner) {
   const bus = new WatchBus();
-  const channel = new WebChannel(identities, undefined, bus);
+  const channel = new WebChannel(configured ?? undefined, bus);
   channels.push(channel);
   const handler = vi.fn(async () => true);
   channel.onMessage(handler);
@@ -30,13 +31,10 @@ describe("web configuration and owner", () => {
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain("secret-value");
     expect(diagnostic).toHaveBeenCalledOnce();
   });
-  it("requires exactly one identity unless an explicit unique owner is selected", () => {
-    const peer = { ...owner, name: "peer" };
-    expect(selectWebOwner([])).toBeUndefined();
-    expect(selectWebOwner([owner, peer])).toBeUndefined();
-    expect(selectWebOwner([owner, peer], "OWNER")).toEqual(owner);
-    expect(selectWebOwner([owner, owner], "owner")).toBeUndefined();
-    expect(selectWebOwner([owner], "missing")).toBeUndefined();
+  it("the web conversation id is derived from the owner's dm: key", () => {
+    const { channel } = setup();
+    expect(channel.ownerId).toBe(webSessionId("dm:owner"));
+    expect(setup(null).channel.ownerId).toBeNull();
   });
 });
 
@@ -77,13 +75,13 @@ describe("WebChannel", () => {
     await expect(channel.receive({ ...input, text: "different" })).rejects.toMatchObject({ status: 409 });
     expect(handler).toHaveBeenCalledOnce();
   });
-  it("rejects group/unknown targets and ambiguous owners before handoff", async () => {
+  it("rejects group/unknown targets, and input with no owner configured, before handoff", async () => {
     const { channel, handler } = setup();
     for (const targetId of [webSessionId("telegram:-1"), "dm:owner", "../config.json"]) {
       await expect(channel.receive({ requestId: randomUUID(), text: "blocked", targetId })).rejects.toMatchObject({ status: 403 });
     }
     expect(handler).not.toHaveBeenCalled();
-    const ambiguous = setup([owner, { ...owner, name: "peer" }]);
+    const ambiguous = setup(null);
     await expect(ambiguous.channel.receive({ requestId: randomUUID(), text: "blocked" })).rejects.toMatchObject({ status: 409 });
     expect(ambiguous.handler).not.toHaveBeenCalled();
   });

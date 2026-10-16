@@ -563,6 +563,14 @@ type CarryOutcome =
   /** An ownership source became unreadable; nothing was moved, retry later. */
   | { kind: "deferred" };
 
+/** The routing metadata a metadata-only stub carries into an adopted entry. */
+function stubMetadata(stub: SessionEntry): Partial<SessionEntry> {
+  return {
+    ...(stub.replyTarget ? { replyTarget: stub.replyTarget } : {}),
+    ...(stub.chatTitle ? { chatTitle: stub.chatTitle } : {}),
+  };
+}
+
 /** Get the full path to an SDK session JSONL file */
 export function getSdkSessionPath(
   sessionId: string,
@@ -1774,6 +1782,20 @@ export class SessionStore {
     return entry?.replyTarget;
   }
 
+  /**
+   * Make sure `key` has an active registry entry (a metadata-only stub when it
+   * has never run a turn). Used to pre-create the owner's `dm:` session at
+   * init / first start, so every channel added later binds to it. Writes
+   * nothing when the entry already exists.
+   */
+  ensureEntry(key: string): void {
+    this.mutateRegistry("ensureEntry", "bookkeeping", () => {
+      const before = this.registry.length;
+      this.ensureActiveEntry(key);
+      if (this.registry.length !== before) this.saveRegistryBestEffort("ensureEntry");
+    });
+  }
+
   /** Set and persist the reply target for a session key. No-op if unchanged. */
   setReplyTarget(key: string, target: ReplyTarget): void {
     // mutateRegistry's guards run BEFORE ensureActiveEntry, which would
@@ -1869,6 +1891,18 @@ export class SessionStore {
     if (idx === -1) return;
     const entry = this.registry[idx];
 
+    // NEVER TWO ACTIVE ENTRIES UNDER ONE KEY. `getEntry`/`getSdkSessionId`
+    // read the first match, so a re-key onto a key that already has an active
+    // entry would fork that conversation. A metadata-only stub (the owner's
+    // entry pre-created at init or first start, or one a reply target
+    // created) is folded into the adopted entry below; a linked session is
+    // never overwritten.
+    const existingIdx = this.registry.findIndex((e) => e.channelKey === newKey && e.unlinkedAt === null);
+    const existing = existingIdx === -1 ? undefined : this.registry[existingIdx];
+    if (existing?.sdkSessionId) {
+      throw new Error(`cannot re-key session ${oldKey} to ${newKey}: ${newKey} already has a linked session`);
+    }
+
     // Settle the old key's filenames BEFORE the entry is re-keyed: the renames
     // below move whatever `transcriptPath(oldKey)` names, and the ownership
     // check wants to see the registry as it stands now, with `oldKey` still on
@@ -1910,6 +1944,9 @@ export class SessionStore {
     // and (pre-fix) trick cleanupExpired into deleting the shared SDK file.
     const now = Date.now();
     this.registry[idx] = {
+      // The stub's metadata (reply target, title) fills in only what the
+      // adopted entry lacks; the adopted session's own state wins.
+      ...(existing ? stubMetadata(existing) : {}),
       ...entry,
       channelKey: newKey,
       lastActiveAt: now,
@@ -1929,6 +1966,8 @@ export class SessionStore {
     // history stayed on disk, reachable from no path. Same hole as the legacy
     // migration's, same answer: one more rename, no rewriting, and the bytes land
     // where every reader of `newKey` picks them up (`transcriptReadSet`).
+    if (existing) this.registry.splice(this.registry.indexOf(existing), 1);
+
     const oldStem = this.safeKey(oldKey);
     const newStem = this.safeKey(newKey);
     const sidecars: string[] = [];

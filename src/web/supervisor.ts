@@ -149,8 +149,8 @@ export class WebSupervisor implements WebLifecycle {
         this.timer = setTimeout(() => { void this.launch().catch(() => this.report("Web UI restart failed.")); }, 500 * 2 ** (this.restarts - 1));
         this.timer.unref();
       });
-      const { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, identities, ownerIdentity, port, tomoHome, externalOrigin,
+      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

@@ -168,9 +168,9 @@ describe("config file validation", () => {
     expect(config.telegramToken).toBe("tg-token");
     // Chat ids written as JSON numbers are normalized to strings.
     expect(config.channelAllowlists).toEqual({ telegram: ["12345", "-100999"] });
-    expect(config.identities).toEqual([
-      { name: "Alice", channels: { telegram: "12345" }, replyPolicy: "last-active" },
-    ]);
+    // A single legacy identity is read as the owner.
+    expect(config.owner).toEqual({ name: "Alice", telegram: ["12345"], imessage: [] });
+    expect(config.ownerSource).toBe("identity");
     expect(config.lcm).toMatchObject({ nudgeAtPct: 85, nudgeResetPct: 60 });
     expect(config.groupSecret).toBe("open-sesame");
   });
@@ -307,11 +307,45 @@ describe("config file validation", () => {
       ],
     }));
 
-    expect(config.identities).toEqual([
-      { name: "Alice", channels: { telegram: "12345" }, replyPolicy: "last-active" },
-    ]);
+    expect(config.owner).toEqual({ name: "Alice", telegram: ["12345"], imessage: [] });
     expect(configIssues.join("\n")).toContain("identities[1]");
     expect(configIssues.join("\n")).toContain("identities[2]");
+  });
+
+  it("reads the legacy single-identity shape as the owner with no issues (same dm: key)", async () => {
+    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
+      channels: {
+        telegram: { token: "t", allowlist: ["123456789"] },
+        imessage: { provider: "imsg", allowlist: ["+15555550123", "any;+;chat0000000001"] },
+      },
+      identities: [{ name: "Alex", channels: { telegram: "123456789", imessage: "+15555550123" }, replyPolicy: "last-active" }],
+      sessionModelOverrides: { "dm:alex": "claude-opus-5[1m]" },
+    }));
+    expect(configIssues).toEqual([]);
+    expect(config.owner).toEqual({ name: "Alex", telegram: ["123456789"], imessage: ["+15555550123"] });
+    expect(config.ownerSource).toBe("identity");
+    expect(config.ownerNotices).toEqual([]);
+    expect(config.sessionModelOverrides).toEqual({ "dm:alex": "claude-opus-5[1m]" });
+  });
+
+  it("parses an `owner` block, normalizing handles; `identities` alongside it is ignored", async () => {
+    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
+      owner: { name: "alex", displayName: "Alex", telegram: [123456789], imessage: ["+1 (555) 555-0123"] },
+      identities: [{ name: "Sam", channels: { telegram: "222" } }],
+    }));
+    expect(configIssues).toEqual([]);
+    expect(config.owner).toEqual({ name: "alex", displayName: "Alex", telegram: ["123456789"], imessage: ["+15555550123"] });
+    expect(config.ownerSource).toBe("owner");
+    expect(config.ownerNotices.map((n) => n.level)).toEqual(["info"]);
+  });
+
+  it("an invalid `owner` block blocks startup instead of silently falling back", async () => {
+    const { configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
+      owner: { name: "   " },
+      identities: [{ name: "Sam", channels: { telegram: "222" } }],
+    }));
+    expect(configIssues.join("\n")).toContain("owner");
+    expect(() => assertConfigValid()).toThrow();
   });
 
   it("reports malformed JSON instead of silently ignoring the file", async () => {

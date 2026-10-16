@@ -273,87 +273,58 @@ describe("LiteLLM helpers", () => {
 });
 
 describe("normalizeSendTarget", () => {
-  const identities = [{ name: "Shuai" }, { name: "Alice" }];
+  const owner = { name: "Alex", displayName: "Alexandra", telegram: ["12345"], imessage: ["+15551234567"] };
 
-  it("returns lowercase dm: key for an identity name matching config casing", () => {
-    expect(normalizeSendTarget("Shuai", identities)).toEqual({
-      sessionKey: "dm:shuai",
-      identityName: "Shuai",
-    });
+  it("returns the owner's lowercase dm: key for the owner's name, display name or \"owner\", in any casing", () => {
+    // Regression for the duplicate-session bug: a caller using the name
+    // verbatim from config ("Alex") used to spawn dm:Alex, parallel to the
+    // dm:alex built by the inbound path (router.ts lowercases).
+    for (const name of ["Alex", "alex", "ALEX", "Alexandra", "owner", "Owner"]) {
+      expect(normalizeSendTarget(name, owner)).toEqual({ sessionKey: "dm:alex", identityName: "Alex" });
+    }
   });
 
-  it("returns the same lowercase dm: key regardless of caller's casing", () => {
-    // Regression for the duplicate-session bug: caller using identity name
-    // verbatim from config ("Shuai") used to spawn dm:Shuai, parallel to the
-    // dm:shuai built by the inbound path (router.ts toLowerCases).
-    expect(normalizeSendTarget("Shuai", identities)?.sessionKey).toBe("dm:shuai");
-    expect(normalizeSendTarget("shuai", identities)?.sessionKey).toBe("dm:shuai");
-    expect(normalizeSendTarget("SHUAI", identities)?.sessionKey).toBe("dm:shuai");
-  });
-
-  it("returns null for an unknown identity name", () => {
-    expect(normalizeSendTarget("Eve", identities)).toBeNull();
+  it("returns null for any other bare name, and for any bare name with no owner", () => {
+    expect(normalizeSendTarget("Eve", owner)).toBeNull();
+    expect(normalizeSendTarget("owner", undefined)).toBeNull();
   });
 
   it("lowercases the name part of a dm: session key", () => {
-    expect(normalizeSendTarget("dm:Shuai", identities)).toEqual({ sessionKey: "dm:shuai" });
-    expect(normalizeSendTarget("dm:SHUAI", identities)).toEqual({ sessionKey: "dm:shuai" });
-    expect(normalizeSendTarget("dm:shuai", identities)).toEqual({ sessionKey: "dm:shuai" });
+    expect(normalizeSendTarget("dm:Alex", owner)).toEqual({ sessionKey: "dm:alex" });
+    expect(normalizeSendTarget("dm:ALEX", owner)).toEqual({ sessionKey: "dm:alex" });
   });
 
-  it("does not validate dm: keys against identities (cron / fallback paths may reference removed names)", () => {
-    expect(normalizeSendTarget("dm:eve", identities)).toEqual({ sessionKey: "dm:eve" });
+  it("does not validate dm: keys against the owner (cron / fallback paths may reference former identities)", () => {
+    expect(normalizeSendTarget("dm:eve", owner)).toEqual({ sessionKey: "dm:eve" });
   });
 
   it("returns channel keys unchanged (case preserved for chatId hashes)", () => {
-    expect(normalizeSendTarget("imessage:any;+;ABC123DEF", identities)).toEqual({
-      sessionKey: "imessage:any;+;ABC123DEF",
-    });
-    expect(normalizeSendTarget("telegram:-1001234567", identities)).toEqual({
-      sessionKey: "telegram:-1001234567",
-    });
+    expect(normalizeSendTarget("imessage:any;+;ABC123DEF", owner)).toEqual({ sessionKey: "imessage:any;+;ABC123DEF" });
+    expect(normalizeSendTarget("telegram:-1001234567", owner)).toEqual({ sessionKey: "telegram:-1001234567" });
   });
 
-  it("canonicalizes a raw channel key bound to an identity's DM chat (#203)", () => {
-    const bound = [
-      { name: "Shuai", channels: { telegram: "12345", imessage: "+15551234567" } },
-      { name: "Alice", channels: { telegram: "67890" } },
-    ];
-
-    // The chat's inbound traffic lives on the dm session; recording a send
-    // under the raw key would hide it from that session's recall history.
-    expect(normalizeSendTarget("telegram:12345", bound)).toEqual({
-      sessionKey: "dm:shuai",
-      identityName: "Shuai",
+  it("canonicalizes a raw channel key that is one of the owner's DM handles (#203)", () => {
+    expect(normalizeSendTarget("telegram:12345", owner)).toEqual({
+      sessionKey: "dm:alex",
+      identityName: "Alex",
       rawReplyTarget: { channelName: "telegram", chatId: "12345" },
     });
-    expect(normalizeSendTarget("imessage:+15551234567", bound)).toEqual({
-      sessionKey: "dm:shuai",
-      identityName: "Shuai",
-      rawReplyTarget: { channelName: "imessage", chatId: "+15551234567" },
-    });
-    expect(normalizeSendTarget("telegram:67890", bound)?.sessionKey).toBe("dm:alice");
-  });
-
-  it("canonicalizes iMessage chat-GUID keys by extracted identifier, like the router's inbound match", () => {
-    const bound = [{ name: "Shuai", channels: { imessage: "+15551234567" } }];
-
-    expect(normalizeSendTarget("imessage:iMessage;-;+15551234567", bound)).toEqual({
-      sessionKey: "dm:shuai",
-      identityName: "Shuai",
+    expect(normalizeSendTarget("imessage:iMessage;-;+15551234567", owner)).toEqual({
+      sessionKey: "dm:alex",
+      identityName: "Alex",
       rawReplyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" },
     });
+    // Formatting drift still canonicalizes.
+    expect(normalizeSendTarget("imessage:SMS;-;+1 (555) 123-4567", owner)?.sessionKey).toBe("dm:alex");
     // Group GUIDs (";+;") never canonicalize, even if the identifier collided.
-    expect(normalizeSendTarget("imessage:iMessage;+;+15551234567", bound)).toEqual({
+    expect(normalizeSendTarget("imessage:iMessage;+;+15551234567", owner)).toEqual({
       sessionKey: "imessage:iMessage;+;+15551234567",
     });
   });
 
-  it("leaves unbound and group channel keys raw even when identities have bindings", () => {
-    const bound = [{ name: "Shuai", channels: { telegram: "12345" } }];
-
-    expect(normalizeSendTarget("telegram:99999", bound)).toEqual({ sessionKey: "telegram:99999" });
-    expect(normalizeSendTarget("imessage:12345", bound)).toEqual({ sessionKey: "imessage:12345" });
-    expect(normalizeSendTarget("telegram:-1001234567", bound)).toEqual({ sessionKey: "telegram:-1001234567" });
+  it("leaves other chats and groups raw", () => {
+    expect(normalizeSendTarget("telegram:99999", owner)).toEqual({ sessionKey: "telegram:99999" });
+    expect(normalizeSendTarget("imessage:12345", owner)).toEqual({ sessionKey: "imessage:12345" });
+    expect(normalizeSendTarget("telegram:-1001234567", owner)).toEqual({ sessionKey: "telegram:-1001234567" });
   });
 });

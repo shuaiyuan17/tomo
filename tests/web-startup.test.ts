@@ -12,7 +12,7 @@ vi.mock("../src/runtime-paths.js", () => ({ defaultRuntimePaths: {
 } }));
 vi.mock("../src/config.js", () => ({
   config: { get web() { return { enabled: fixture.enabled, port: 0 }; },
-    identities: [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }],
+    owner: { name: "owner", telegram: ["test-owner"], imessage: [] },
     tomoHome: fixture.root, workspaceDir: `${fixture.root}/workspace`, sessionsDir: `${fixture.root}/sessions`,
     sdkSessionsDir: `${fixture.root}/sdk`, logsDir: `${fixture.root}/logs`, telegramToken: "synthetic-token",
     metrics: { enabled: false }, continuity: false,
@@ -23,6 +23,7 @@ vi.mock("../src/config.js", () => ({
 vi.mock("../src/logger.js", () => ({ log: { info: (message: string) => fixture.messages.push(message), warn: () => {}, error: () => {} } }));
 vi.mock("../src/process-handlers.js", () => ({ installBootstrapErrorHandlers: () => {}, installProcessErrorHandlers: () => {}, raiseFatal: (err: unknown) => { throw err; } }));
 vi.mock("../src/agent.js", () => ({ Agent: class {
+  prepareOwner() {}
   addChannel(channel: Channel) { fixture.registered.push(channel); channel.onMessage(async () => true); }
   async start() { for (const channel of fixture.registered) await channel.start(); }
 } }));

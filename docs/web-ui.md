@@ -6,13 +6,12 @@
 {
   "web": {
     "enabled": true,
-    "port": 9465,
-    "ownerIdentity": "owner"
+    "port": 9465
   }
 }
 ```
 
-`owner` above is a synthetic identity name: replace it with a configured identity. Omit `ownerIdentity` when exactly one identity exists. With multiple identities, chat remains disabled until a unique owner is selected and Tomo restarts. Set `enabled` to `false` to disable the UI. Invalid web settings disable only the UI and emit a diagnostic.
+The web chat is always the owner's DM session (`dm:<owner.name>`). With no owner configured, chat stays disabled (`owner_setup_required`) until one is set and Tomo restarts. `web.ownerIdentity` is only read for older configs with several `identities`, to pick which one becomes the owner. Set `enabled` to `false` to disable the UI. Invalid web settings disable only the UI and emit a diagnostic.
 
 ## Conversations
 

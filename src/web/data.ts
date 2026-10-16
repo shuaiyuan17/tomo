@@ -1,15 +1,15 @@
-import type { IdentityConfig } from "../config.js";
+import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
-import { selectWebOwner, webSessionId } from "./owner.js";
+import { webSessionId } from "./owner.js";
 import { WebError, type WebCatalog } from "./protocol.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
   sdkSessionsDir: string;
-  identities: IdentityConfig[];
-  ownerIdentity?: string;
+  /** The owner (the web UI always means the owner); undefined = setup required. */
+  owner?: OwnerConfig;
 }
 
 /** Runs in the web process. Never imports the live Agent or starts services. */
@@ -18,12 +18,13 @@ export class WebData {
 
   catalog(): WebCatalog & { keys: Map<string, string> } {
     const entries = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir);
-    const owner = selectWebOwner(this.options.identities, this.options.ownerIdentity);
-    const stableOwnerId = owner ? webSessionId(`dm:${owner.name.toLowerCase()}`) : null;
-    let ownerKey = owner ? `dm:${owner.name.toLowerCase()}` : undefined;
+    const owner = this.options.owner;
+    const stableOwnerId = owner ? webSessionId(ownerSessionKey(owner)) : null;
+    let ownerKey = owner ? ownerSessionKey(owner) : undefined;
     if (owner && !entries.some((e) => e.channelKey === ownerKey)) {
-      const legacy = Object.entries(owner.channels).flatMap(([channel, chatId]) =>
-        legacySessionKeysForBinding(entries.map((e) => e.channelKey), channel, chatId));
+      const keys = entries.map((e) => e.channelKey);
+      const legacy = [...new Set(OWNER_CHANNELS.flatMap((channel) =>
+        ownerBindings(owner, channel).flatMap((bound) => legacySessionKeysForBinding(keys, channel, bound))))];
       if (legacy.length === 1) ownerKey = legacy[0];
       if (legacy.length > 1) ownerKey = undefined;
     }

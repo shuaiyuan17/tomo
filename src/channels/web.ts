@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import type { IdentityConfig } from "../config.js";
+import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import type { Channel, CommandHandler, IncomingMessage, MessageHandler, OutgoingMessage } from "./types.js";
 import { markDefiniteFailure } from "./types.js";
 import { watchBus, type WatchBus } from "../watch/bus.js";
 import type { WatchEvent } from "../watch/protocol.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
-import { selectWebOwner, webSessionId } from "../web/owner.js";
+import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
 
@@ -18,7 +18,7 @@ export class WebChannel implements Channel {
   readonly name = "web";
   readonly events = new WebEvents();
   readonly ownerId: string | null;
-  private owner: IdentityConfig | undefined;
+  private owner: OwnerConfig | undefined;
   private handler: MessageHandler | undefined;
   private lifecycle: WebLifecycle | undefined;
   private closed = false;
@@ -29,9 +29,9 @@ export class WebChannel implements Channel {
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
 
-  constructor(identities: IdentityConfig[], ownerIdentity?: string, private readonly bus: WatchBus = watchBus) {
-    this.owner = selectWebOwner(identities, ownerIdentity);
-    this.ownerId = this.owner ? webSessionId(`dm:${this.owner.name.toLowerCase()}`) : null;
+  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus) {
+    this.owner = owner;
+    this.ownerId = this.owner ? webSessionId(ownerSessionKey(this.owner)) : null;
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
   }
   attach(lifecycle: WebLifecycle): void { this.lifecycle = lifecycle; }
@@ -137,8 +137,9 @@ export class WebChannel implements Channel {
   private sessionId(key: string): string | undefined {
     if (isGroupSessionKey(key)) return webSessionId(key);
     if (!this.owner || !this.ownerId) return;
-    if (key === `dm:${this.owner.name.toLowerCase()}` || Object.entries(this.owner.channels).some(([ch, id]) =>
-      legacySessionKeysForBinding([key], ch, id).length > 0)) return this.ownerId;
+    const owner = this.owner;
+    if (key === ownerSessionKey(owner) || OWNER_CHANNELS.some((ch) =>
+      ownerBindings(owner, ch).some((id) => legacySessionKeysForBinding([key], ch, id).length > 0))) return this.ownerId;
   }
   private observe(event: WatchEvent): void {
     if (!("sessionKey" in event) || !event.sessionKey) return;

@@ -201,8 +201,11 @@ describe("allowlist enforcement", () => {
     await agent.stop();
   });
 
-  it("allows whitelisted senders", async () => {
-    resetConfig({ channelAllowlists: { telegram: ["12345"] } });
+  it("allows the owner's DM", async () => {
+    resetConfig({
+      channelAllowlists: { telegram: ["-100555"] },
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -219,14 +222,19 @@ describe("allowlist enforcement", () => {
   // document handlers), so an excluded chat cannot make the daemon spend
   // bandwidth, CPU and disk on bytes enqueueMessage is about to drop anyway.
   // The answer has to come from the same allowlist, not a second copy of it.
-  it("registers an admission predicate backed by the router allowlist", async () => {
-    resetConfig({ channelAllowlists: { telegram: ["12345"] } });
+  it("registers an admission predicate backed by the router", async () => {
+    resetConfig({
+      channelAllowlists: { telegram: ["-100555", "999"] },
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
     expect(typeof tg.admissionPredicate).toBe("function");
     expect(tg.admissionPredicate?.("12345")).toBe(true);
+    expect(tg.admissionPredicate?.("-100555")).toBe(true);
+    // A DM entry in the allowlist is ignored: there are no guest DMs.
     expect(tg.admissionPredicate?.("999")).toBe(false);
 
     await agent.stop();
@@ -495,7 +503,7 @@ describe("identity multi-channel routing", () => {
     await agent.stop();
   });
 
-  it("routes reply to fixed channel when policy is set", async () => {
+  it("ignores a legacy fixed replyPolicy: the reply goes to the channel the owner wrote from", async () => {
     resetConfig({
       identities: [
         { name: "shuai", channels: { telegram: "12345", imessage: "+15551234567" }, replyPolicy: "telegram" },
@@ -507,15 +515,14 @@ describe("identity multi-channel routing", () => {
     agent.addChannel(tg);
     agent.addChannel(im);
 
-    mockSdk.responseFn = () => "Fixed channel reply";
+    mockSdk.responseFn = () => "Last-active reply";
 
-    // Message arrives from iMessage, but policy routes reply to telegram
     await im.simulateMessage(makeMsg({ chatId: "+15551234567", text: "Hello" }));
     await drainQueue(agent);
 
-    expect(tg.delivered.length).toBeGreaterThanOrEqual(1);
-    expect(tg.delivered[0].chatId).toBe("12345");
-    expect(im.delivered).toHaveLength(0);
+    expect(im.delivered.length).toBeGreaterThanOrEqual(1);
+    expect(im.delivered[0].chatId).toBe("+15551234567");
+    expect(tg.delivered).toHaveLength(0);
 
     await agent.stop();
   });

@@ -11,6 +11,7 @@ import { log } from "../src/logger.js";
 import {
   Agent,
   MockChannel,
+  SessionStore,
   agentEnv,
   drainQueue,
   installAgentTestHooks,
@@ -104,9 +105,10 @@ describe("DM admission (fails closed)", () => {
     await agent.stop();
   });
 
-  it("/model and /restore are refused when no identity is configured (no fail-open)", async () => {
+  it("/model and /restore do nothing when no owner is configured (no fail-open)", async () => {
     useRealAdmission();
-    // An explicitly allowlisted DM, but nobody is an owner.
+    // A DM entry in the allowlist, but nobody is the owner: the DM is not
+    // admitted at all (no guest DMs), so the commands are dropped silently.
     resetConfig({ channelAllowlists: { telegram: ["12345"] }, identities: [] });
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
     writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
@@ -117,12 +119,27 @@ describe("DM admission (fails closed)", () => {
     await tg.simulateCommand("model", "12345", "TestUser", "opus-1m", "12345");
     await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
 
-    expect(tg.sent.map((m) => m.text)).toEqual([
-      expect.stringContaining("/model is locked"),
-      expect.stringContaining("/restore is locked"),
-    ]);
+    expect(tg.sent).toEqual([]);
     const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as Record<string, unknown>;
     expect(cfg).toEqual({ model: "claude-haiku-4-5" });
+
+    await agent.stop();
+  });
+
+  it("/model is refused for a non-owner in an activated group", async () => {
+    useRealAdmission();
+    resetConfig({
+      channelAllowlists: { telegram: ["-100777"] },
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await tg.simulateCommand("model", "-100777", "Member", "opus-1m", "99999");
+    expect(tg.sent.map((m) => m.text)).toEqual([expect.stringContaining("Only the owner")]);
+    expect(JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8"))).toEqual({ model: "claude-haiku-4-5" });
 
     await agent.stop();
   });
@@ -138,7 +155,7 @@ describe("DM admission (fails closed)", () => {
     agent.addChannel(new MockChannel("imessage"));
 
     const warned = vi.mocked(log.warn).mock.calls
-      .filter(([, msg]) => typeof msg === "string" && msg.includes("No identity binds a handle"))
+      .filter(([, msg]) => typeof msg === "string" && msg.includes("No owner handle is bound"))
       .map(([fields]) => (fields as { channel: string }).channel);
     expect(warned).toEqual(["imessage"]);
     // Telegram has no allowlist: the message says DMs are ignored, not "allowlisted only".
@@ -173,6 +190,39 @@ describe("group secret and logs", () => {
     expect(everything).not.toContain("99999123");
     // passiveGroups on a channel with no allowlist are called out at startup.
     expect(vi.mocked(log.warn).mock.calls.some(([, m]) => typeof m === "string" && m.includes("passiveGroups"))).toBe(true);
+    await agent.stop();
+  });
+});
+
+describe("owner-only private delivery", () => {
+  it("a notification never falls back to another private chat when an owner exists", async () => {
+    // An owner with no reachable handle yet, and a legacy raw session from
+    // the open-channel era: before, the notification went to that stranger.
+    resetConfig({ owner: { name: "alex", telegram: [], imessage: [] } });
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    store.setSdkSessionId("telegram:99999", "sdk-stranger");
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+
+    await agent.sendNotification("version update");
+    expect(tg.sent).toEqual([]);
+
+    await agent.stop();
+  });
+
+  it("private links for any session (MCP login, elicitation) resolve to the owner's DM only", async () => {
+    resetConfig({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    store.setSdkSessionId("telegram:99999", "sdk-stranger");
+    store.setSdkSessionId("dm:sam", "sdk-former-identity");
+    store.setReplyTarget("dm:sam", { channelName: "telegram", chatId: "222" });
+    const agent = new Agent();
+    const resolve = (key: string) => (agent as unknown as { resolvePrivateReplyTarget(k: string): unknown }).resolvePrivateReplyTarget(key);
+    const owner = { channelName: "telegram", chatId: "12345" };
+    expect(resolve("telegram:99999")).toEqual(owner);
+    expect(resolve("dm:sam")).toEqual(owner);
+    expect(resolve("telegram:-100555")).toEqual(owner);
     await agent.stop();
   });
 });

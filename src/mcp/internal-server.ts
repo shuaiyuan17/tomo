@@ -24,10 +24,9 @@ export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
  * for rationale).
  */
 export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: string): McpSdkServerConfigWithInstance {
-  const identityList = config.identities.map((i) => i.name);
-  const identityHint = identityList.length > 0
-    ? `Known identity targets: ${identityList.map((n) => `"${n}"`).join(", ")}.`
-    : `No identities are configured — use a session key form instead.`;
+  const identityHint = config.owner
+    ? `The owner's DM: target "${config.owner.name}" (or "owner").`
+    : `No owner is configured — use a session key form instead.`;
   /**
    * Is the turn in flight this session's own? Resolved per tool call — the
    * server is built once per live session (live-session-manager.ts), but a
@@ -43,11 +42,11 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       tool(
         "list_sessions",
         [
-          "List all valid `send_message` targets — identities and active group chats — with metadata for picking the right one.",
+          "List all valid `send_message` targets — the owner and active group chats — with metadata for picking the right one.",
           "",
           "Use this when you're not sure which group key to send to (group titles can be vague or renamed; participants help disambiguate).",
           "",
-          "Returns: { identities: [{ name }], groups: [{ key, title?, participants? }] }. Pass the `name` (for identities) or `key` (for groups) to send_message.",
+          "Returns: { owner: { name, displayName? } | null, identities: [{ name }] (deprecated alias of owner), groups: [{ key, title?, participants? }] }. Pass the owner's `name` (or \"owner\") or a group's `key` to send_message.",
         ].join("\n"),
         {},
         async () => {
@@ -61,13 +60,13 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         },
         {
           alwaysLoad: true,
-          searchHint: "list known message targets identities groups participants",
+          searchHint: "list known message targets owner identities groups participants",
         },
       ),
       tool(
         "send_message",
         [
-          "Send a chat message to another conversation (identity DM, group chat, or back to the current session).",
+          "Send a chat message to another conversation (the owner's DM, a group chat, or back to the current session).",
           "",
           "Two modes:",
           "- `delegate` (default): describe the *intent* (e.g. \"follow up with Alice about her recent trip\"). The recipient session's Claude composes the actual message in its own voice, with full local context (participant names, recent conversation, group tone). Best for social/contextual messages. Fire-and-forget — the tool returns once dispatched, the user observes the actual sent text in the recipient channel.",
@@ -84,7 +83,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         ].join("\n"),
         {
           target: z.string().describe(
-            "Recipient. Identity name (e.g. \"alice\") or session key (e.g. \"dm:alice\", \"telegram:-1001234567\").",
+            "Recipient. The owner's name or \"owner\", or a session key (e.g. \"dm:alice\", \"telegram:-1001234567\").",
           ),
           message: z.string().min(1).max(4000).describe(
             "For `delegate`: the intent or request (the recipient's Claude composes the actual text). For `direct`: the verbatim message text.",

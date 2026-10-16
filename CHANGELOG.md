@@ -13,6 +13,17 @@
 - The group activation secret is no longer written to the log; blocked-chat debug lines carry only the last four characters of the chat id.
 - iMessage handles must match exactly in E.164 form. A number written without `+` only counts as `+1…` when it has 11 digits starting with 1; anything else no longer matches its `+`-prefixed twin in another country. Setup now asks before reading an 11-digit number such as `150 1234 5678` as a US number.
 
+
+### Single owner
+
+- **`owner` replaces `identities`.** Tomo works for one person: `owner: { name, displayName?, telegram: [...], imessage: [...] }`. Every owner DM — Telegram, iMessage, web — lands in one session, `dm:<name>`. `name` is the session id and is never rewritten; `displayName` is what Tomo calls you.
+- **Zero-data-loss upgrade.** Configs with `identities` keep working, and are read forever: a single identity is the owner, with the same `dm:<name>` session, transcripts, cron jobs, model override and web conversation id. Nothing is renamed or moved. With several identities, `web.ownerIdentity` (or else the first) becomes the owner and Tomo warns at startup; the others' sessions are left untouched, but their DMs are no longer answered. An install from before identities existed, with exactly one DM entry in its allowlists, adopts that entry as the owner.
+- **No guest DMs.** DM entries in a channel `allowlist` are ignored (with a startup warning). The allowlist only lists activated groups.
+- **The owner session exists from the start.** `tomo init` and the first daemon start create the `dm:<owner>` entry, so a channel connected later joins that session instead of starting another. A legacy per-channel owner session is adopted into it once; the owner session can no longer fork.
+- `replyPolicy` is ignored: replies go to the channel you last wrote from.
+- `list_sessions` returns `owner`; `identities` stays as a one-element alias. `send_message` accepts the owner's name, display name or `"owner"`.
+- Private notices (MCP login links, notifications) only ever go to the owner's DM when an owner is configured.
+
 **Upgrade notes — check these before restarting:**
 
 - **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Identities, bind your Telegram user ID / iMessage handle (the daemon warns at startup for every channel no identity binds).
@@ -20,6 +31,8 @@
 - **`passiveGroups` entries on a channel with no allowlist stop working** (they are not activated). The daemon now warns at startup. Fix: the same — send the secret in each group, or add the ids to that channel's `allowlist`.
 - **Earlier `/summon`s of groups that are not activated stop working**: the group's messages are refused before the summon applies. Fix: activate the group (secret or allowlist), then `/summon` again if the summon has lapsed.
 - iMessage groups on a fresh setup (no allowlist) are off until activated the same way.
+- **Friends listed as DM entries in an allowlist are no longer answered** (no guest DMs; startup warning).
+- **Several identities:** only `web.ownerIdentity` (or else the first) is answered; the others' sessions stay on disk untouched.
 
 ## 0.10.1 (2026-10-12)
 

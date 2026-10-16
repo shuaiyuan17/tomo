@@ -17,6 +17,7 @@ import { redactSecrets } from "./redact.js";
 import { log } from "./logger.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { normalizeImessageHandle } from "./sessions/keys.js";
+import { resolveOwner, type OwnerConfig, type OwnerNotice, type OwnerSource } from "./owner.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -29,10 +30,12 @@ const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
 const DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS = 4000;
 const DEFAULT_LIVE_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Legacy `identities[]` entry. Still read (forever) to derive `owner`; never
+ *  consumed at runtime. `replyPolicy` is accepted and ignored. */
 export interface IdentityConfig {
   name: string;
   channels: Record<string, string>;  // channelName → chatId
-  replyPolicy: string;               // "last-active" | channelName
+  replyPolicy: string;
 }
 
 export interface LcmConfig {
@@ -178,7 +181,14 @@ export interface TomoConfig {
   /** Optional local script to run once per continuity heartbeat and append to the heartbeat prompt. */
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
-  identities: IdentityConfig[];
+  /** The one person Tomo works for (see src/owner.ts), resolved from `owner`
+   *  or, for older files, from `identities`. Undefined = no owner: every DM is
+   *  ignored. */
+  owner: OwnerConfig | undefined;
+  /** Where `owner` came from (for `tomo status` and startup notices). */
+  ownerSource: OwnerSource;
+  /** Owner-related startup notices; the daemon logs each once. */
+  ownerNotices: OwnerNotice[];
   /** iMessage backend, from `channels.imessage.provider`. `"imsg"` (the only
    *  backend) enables the channel; `null` means iMessage is off. Kept as a
    *  named provider rather than a boolean because it is what existing config
@@ -197,7 +207,8 @@ export interface TomoConfig {
   /** Longer delay before showing iMessage typing in passive group turns. */
   imessagePassiveTypingStartDelayMs: number;
   sessionModelOverrides: Record<string, string>;
-  /** Per-channel allowlists. If set, only listed chatIds + identity-bound chatIds are allowed. */
+  /** Per-channel GROUP allowlists (activated groups). DM entries are ignored:
+   *  only the owner's DMs are answered. */
   channelAllowlists: Record<string, string[]>;
   /** Per-channel "passive" group chatIds. Tomo sees every message in these
    *  groups (no @mention required) and decides via NO_REPLY whether to respond.
@@ -635,6 +646,21 @@ function parseIdentities(raw: unknown): IdentityConfig[] {
   return identities;
 }
 
+function resolveOwnerConfig(
+  file: Record<string, unknown>,
+  channels: Record<string, ChannelEntry>,
+): Pick<TomoConfig, "owner" | "ownerSource" | "ownerNotices"> {
+  const webOwner = (file.web as { ownerIdentity?: unknown } | undefined)?.ownerIdentity;
+  const resolution = resolveOwner({
+    owner: file.owner,
+    identities: parseIdentities(file.identities),
+    webOwnerIdentity: typeof webOwner === "string" ? webOwner.trim() : undefined,
+    allowlists: Object.fromEntries(Object.entries(channels).map(([name, ch]) => [name, ch.allowlist])),
+  });
+  issues.push(...resolution.issues);
+  return { owner: resolution.owner, ownerSource: resolution.source, ownerNotices: resolution.notices };
+}
+
 const pluginEntrySchema = z.union([
   z.string().min(1, "expected a non-empty plugin path or name"),
   z
@@ -863,7 +889,7 @@ function buildConfig(): TomoConfig {
     continuityIntervalMs: Math.round(Math.max(continuityIntervalMinutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
     city: validated("city (TOMO_CITY)", z.string().nullable(), envVar("TOMO_CITY") ?? file.city, null),
-    identities: parseIdentities(file.identities),
+    ...resolveOwnerConfig(file, channels),
     imessageProvider: validated(
       "channels.imessage.provider (IMESSAGE_PROVIDER)",
       imessageProviderSchema,

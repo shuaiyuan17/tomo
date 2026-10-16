@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AdmissionPredicate, Channel, IncomingMessage, MessageReaction, OutgoingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
 import { agentEnv, mockConfig, mockWorkspace, queryState, resetMockSdk } from "./agent-mocks.js";
-import { IdentityRouter } from "../../src/router.js";
+import { OwnerRouter } from "../../src/router.js";
 
 // ---------------------------------------------------------------------------
 // Shared Agent test harness: MockChannel, message/config helpers, and the
@@ -166,11 +166,18 @@ export class MockChannel implements Channel {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CONFIG_VALUES = { ...mockConfig };
+// Copy every field EXCEPT the `owner` accessor (spreading would freeze its
+// derived value into a data property and then call the setter with it).
+const { owner: _derivedOwner, ...DEFAULT_CONFIG_VALUES } = Object.getOwnPropertyDescriptors(mockConfig) as unknown as Record<string, unknown>;
+void _derivedOwner;
+const DEFAULTS: Record<string, unknown> = Object.fromEntries(
+  Object.entries(DEFAULT_CONFIG_VALUES).map(([key, descriptor]) => [key, (descriptor as PropertyDescriptor).value]),
+);
 
 export function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
   Object.assign(mockConfig, {
-    ...DEFAULT_CONFIG_VALUES,
+    ...DEFAULTS,
+    _ownerOverride: undefined,
     sessionsDir: join(agentEnv.tmpDir, "sessions"),
     sdkSessionsDir: join(agentEnv.tmpDir, "sdk-sessions"),
     workspaceDir: join(agentEnv.tmpDir, "workspace"),
@@ -265,10 +272,10 @@ export function useRealAdmission(): void {
 }
 
 function installAdmissionSeam(): void {
-  const original = IdentityRouter.prototype.isAllowed;
-  const spy = vi.spyOn(IdentityRouter.prototype, "isAllowed");
+  const original = OwnerRouter.prototype.isAllowed;
+  const spy = vi.spyOn(OwnerRouter.prototype, "isAllowed");
   admissionState.restore = () => spy.mockRestore();
-  spy.mockImplementation(function (this: IdentityRouter, channelName: string, chatId: string) {
+  spy.mockImplementation(function (this: OwnerRouter, channelName: string, chatId: string) {
     if (admissionState.real || channelName === "web" || this.hasAllowlist(channelName)) {
       return original.call(this, channelName, chatId);
     }

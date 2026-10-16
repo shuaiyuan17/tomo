@@ -1,18 +1,28 @@
-import type { IdentityConfig } from "./config.js";
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
-import { extractImessageIdentifier, isDmSessionKey, isGroupSessionKey, legacySessionKeysForBinding, matchesChannelBinding } from "./sessions/keys.js";
+import { extractImessageIdentifier, isGroupSessionKey, legacySessionKeysForBinding } from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
-import { selectWebOwner } from "./web/owner.js";
+import { isOwnerHandle, ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "./owner.js";
 
 export interface SessionResolution {
   sessionKey: string;
   replyTarget: ReplyTarget;
+  /** The owner's name when the message routed to the owner's dm: session. */
   identityName?: string;
 }
 
-export class IdentityRouter {
+/**
+ * Admission and session routing for a single owner.
+ *
+ * - Every owner DM, on every channel (and the web UI), routes to ONE session:
+ *   `dm:<owner.name lowercased>` — the same key the old single identity used,
+ *   so an upgraded install keeps its session untouched.
+ * - Admission fails closed: a DM is admitted only from an owner handle; a
+ *   group only when it is in the channel's (group) allowlist.
+ * - Replies go to the channel the owner last wrote from.
+ */
+export class OwnerRouter {
   private allowlists: Record<string, Set<string>>;
   /** Notified when a summon lapses from group inactivity, so the dm: session's
    *  "summoned" context can be cleared. Fires at most once per lapsed summon
@@ -24,24 +34,32 @@ export class IdentityRouter {
   onSummonExpired?: (channelName: string, chatId: string, identityName: string, notifyGroup: boolean) => void;
 
   constructor(
-    private identities: IdentityConfig[],
+    private readonly ownerConfig: OwnerConfig | undefined,
     private sessions: SessionStore,
     channelAllowlists: Record<string, string[]>,
-    // Groups temporarily routed to a dm:<identity> session via /summon,
-    // keyed by raw "<channel>:<chatId>". Defaults to in-memory (tests).
+    // Groups temporarily routed to the owner's dm: session via /summon, keyed
+    // by raw "<channel>:<chatId>". Defaults to in-memory (tests).
     private summons: SummonStore = new SummonStore(null),
-    private webOwnerName?: string,
   ) {
-    // Explicit per-channel allowlists only. Identity bindings are NOT merged
-    // in: they admit DMs on their own (see isAllowed), so the presence or
-    // absence of a channel's allowlist no longer decides who may DM.
+    // Group allowlists. DM entries are kept in the set but never consulted:
+    // only the owner's DMs are answered (see isAllowed).
     this.allowlists = {};
     for (const [ch, list] of Object.entries(channelAllowlists)) {
       this.allowlists[ch] = new Set(list);
     }
   }
 
-  /** True when this channel has an explicit allowlist in config. */
+  /** The configured owner, if any. */
+  owner(): OwnerConfig | undefined {
+    return this.ownerConfig;
+  }
+
+  /** The owner's session key (`dm:<name>`), or undefined with no owner. */
+  ownerSessionKey(): string | undefined {
+    return this.ownerConfig ? ownerSessionKey(this.ownerConfig) : undefined;
+  }
+
+  /** True when this channel has an explicit (group) allowlist in config. */
   hasAllowlist(channelName: string): boolean {
     return this.allowlists[channelName] !== undefined;
   }
@@ -49,23 +67,17 @@ export class IdentityRouter {
   /**
    * Admission for an inbound (channel, chatId). FAILS CLOSED:
    *
-   * - **DM** (not a group key): admitted only when the chat belongs to a
-   *   configured identity's binding on this channel, or is listed explicitly
-   *   in the channel's allowlist. A channel with no allowlist is NOT open to
-   *   DMs any more — before, any phone number that texted the Mac got its own
-   *   owner-grade session. Unknown senders get no session and no reply.
-   * - **Group**: admitted only when listed in the channel's allowlist (the
-   *   group-secret activation path adds it). A channel with no allowlist has
-   *   no active groups, so being added to a group by a stranger does nothing.
-   * - **web**: only the authenticated owner pseudo-chat.
-   *
-   * iMessage entries are compared by handle (`matchesChannelBinding`), so a
-   * configured `+1 (555) 555-0123` still matches `iMessage;-;+15555550123`.
+   * - **DM** (not a group key): only from one of the owner's handles on this
+   *   channel. DM entries in a channel allowlist are ignored — there are no
+   *   guest DMs (they used to get their own session with owner-grade tools).
+   * - **Group**: only when listed in the channel's allowlist (the group
+   *   secret adds it). No allowlist = no active groups.
+   * - **web**: only the authenticated owner pseudo-chat, with an owner.
    */
   isAllowed(channelName: string, chatId: string): boolean {
-    if (channelName === "web") return chatId === "owner" && this.webOwner() !== undefined;
-    const allowlist = this.allowlists[channelName];
+    if (channelName === "web") return chatId === "owner" && this.ownerConfig !== undefined;
     if (isGroupSessionKey(`${channelName}:${chatId}`)) {
+      const allowlist = this.allowlists[channelName];
       if (!allowlist) return false;
       if (allowlist.has(chatId)) return true;
       // iMessage: a bare group identifier ("chat123…") matches the group under
@@ -76,13 +88,7 @@ export class IdentityRouter {
       }
       return false;
     }
-    if (this.findIdentity(channelName, chatId)) return true;
-    if (!allowlist) return false;
-    if (allowlist.has(chatId)) return true;
-    for (const entry of allowlist) {
-      if (!isGroupSessionKey(`${channelName}:${entry}`) && matchesChannelBinding(channelName, chatId, entry)) return true;
-    }
-    return false;
+    return isOwnerHandle(this.ownerConfig, channelName, chatId);
   }
 
   /** Add a chatId to a channel's in-memory allowlist (after persisting to config). */
@@ -95,15 +101,25 @@ export class IdentityRouter {
     allowlist.add(chatId);
   }
 
-  /** True when some configured identity binds a DM on this channel. */
-  hasBoundIdentity(channelName: string): boolean {
-    return this.identities.some((id) => typeof id.channels[channelName] === "string" && id.channels[channelName] !== "");
+  /** True when the owner has a handle bound on this channel. */
+  hasBoundOwner(channelName: string): boolean {
+    return ownerBindings(this.ownerConfig, channelName).length > 0;
   }
 
-  /** Mark a group as summoned: its messages route to the identity's dm: session until dismissed. */
-  summonGroup(channelName: string, chatId: string, identityName: string): void {
-    this.summons.set(`${channelName}:${chatId}`, identityName.toLowerCase());
-    log.info({ channel: channelName, chatId, identity: identityName }, "Group summoned to main session");
+  /** Is this sender the owner on this channel? FAILS CLOSED (no owner → false).
+   *  The single check behind /login, /usage, /mcp, /model, /restore, /rewind,
+   *  /summon and the pasted-OAuth-callback path. */
+  isOwnerSender(channelName: string, senderId: string | undefined): boolean {
+    return isOwnerHandle(this.ownerConfig, channelName, senderId);
+  }
+
+  /** Mark a group as summoned: its messages route to the owner's dm: session until dismissed. */
+  summonGroup(channelName: string, chatId: string): void {
+    if (!this.ownerConfig) return;
+    // The store keeps the lowercased owner name — the same value it always
+    // held for an identity, so a summon persisted before the upgrade resolves.
+    this.summons.set(`${channelName}:${chatId}`, this.ownerConfig.name.toLowerCase());
+    log.info({ channel: channelName, chatId }, "Group summoned to main session");
   }
 
   /** Hand a summoned group back to its own session. Returns false if it wasn't summoned. */
@@ -113,17 +129,12 @@ export class IdentityRouter {
     return dismissed;
   }
 
-  /** The identity (lowercased) whose main session currently owns this group, if summoned. */
+  /** The (lowercased) name whose main session currently owns this group, if summoned. */
   getSummonedIdentity(channelName: string, chatId: string): string | undefined {
     return this.resolveSummon(channelName, chatId, false);
   }
 
-  /** Find the identity bound to a sender's id on a channel (owner check for /summon). */
-  identityForSender(channelName: string, senderId: string): IdentityConfig | undefined {
-    return this.findIdentity(channelName, senderId);
-  }
-
-  /** Active summoned identity for a group, handling lazy inactivity expiry.
+  /** Active summon for a group, handling lazy inactivity expiry.
    *  `touch` resets the expiry clock and marks this as real group traffic —
    *  pass true only when routing an actual group message. On lapse the store
    *  drops the entry and `onSummonExpired` always fires so the dm: session's
@@ -146,46 +157,39 @@ export class IdentityRouter {
 
   /** Resolve a (channel, chatId, isGroup) to a session key and reply target */
   resolve(channelName: string, chatId: string, isGroup: boolean): SessionResolution {
+    const owner = this.ownerConfig;
     if (channelName === "web") {
-      const owner = this.webOwner();
       if (!owner || chatId !== "owner" || isGroup) throw new Error("Web messages require the configured owner DM");
-      const key = `dm:${owner.name.toLowerCase()}`;
       return {
-        sessionKey: this.maybeMigrate(owner, key),
+        sessionKey: this.maybeMigrate(owner),
         replyTarget: { channelName: "web", chatId: "owner" },
         identityName: owner.name,
       };
     }
     // Group chats: always separate sessions — unless summoned, in which case
-    // the turn runs on the unified dm: session. The reply target stays the
-    // identity's PRIVATE DM: direct turn output is a side-note to the owner
-    // (or NO_REPLY), and group-facing replies happen only via an explicit
+    // the turn runs on the owner's dm: session. The reply target stays the
+    // owner's PRIVATE DM: direct turn output is a side-note to the owner (or
+    // NO_REPLY), and group-facing replies happen only via an explicit
     // send_message tool call. Nothing auto-posts to the group.
     if (isGroup) {
       const summoned = this.resolveSummon(channelName, chatId, true);
       if (summoned) {
-        const dmKey = `dm:${summoned}`;
-        // /summon may be the identity's first interaction after upgrading to
-        // unified dm: keys — run the same one-time migration as the DM path,
-        // or the summon would capture a fresh empty dm: session and block the
-        // old channel-scoped session from ever migrating.
-        const identity = this.identities.find((id) => id.name.toLowerCase() === summoned);
-        const routedKey = identity ? this.maybeMigrate(identity, dmKey) : dmKey;
-        const replyTarget = this.sessions.getReplyTarget(dmKey)
-          ?? this.deriveReplyTargetFromConfig(summoned);
-        if (replyTarget) {
-          return { sessionKey: routedKey, replyTarget, identityName: summoned };
+        const isOwners = owner !== undefined && summoned === owner.name.toLowerCase();
+        const replyTarget = isOwners
+          ? this.sessions.getReplyTarget(ownerSessionKey(owner)) ?? this.deriveReplyTargetFromConfig(summoned)
+          : undefined;
+        if (isOwners && replyTarget) {
+          // /summon may be the owner's first interaction after an upgrade —
+          // run the same one-time adoption as the DM path, or the summon would
+          // capture a fresh empty dm: session.
+          return { sessionKey: this.maybeMigrate(owner), replyTarget, identityName: summoned };
         }
-        // Stale summon: the identity was renamed/removed since summons.json
-        // was written, so there is no private DM target. Falling back to the
-        // group would route dm-session output (which the prompt promises is
-        // private) into the group — drop the summon instead and route the
-        // message to the group's own session.
+        // Stale summon: it names someone who is no longer the owner, or the
+        // owner has no private DM target. Falling back to the group would
+        // route dm-session output (which the prompt promises is private) into
+        // the group — drop the summon and route to the group's own session.
         this.summons.delete(`${channelName}:${chatId}`);
-        log.warn(
-          { channel: channelName, chatId, identity: summoned },
-          "Dropped stale summon: no private reply target for identity",
-        );
+        log.warn({ channel: channelName, chatId, identity: summoned }, "Dropped stale summon: no owner private reply target for it");
       }
       return {
         sessionKey: `${channelName}:${chatId}`,
@@ -193,30 +197,25 @@ export class IdentityRouter {
       };
     }
 
-    // Find identity matching this channel + chatId
-    const identity = this.findIdentity(channelName, chatId);
-    if (!identity) {
+    if (!owner || !isOwnerHandle(owner, channelName, chatId)) {
+      // Not reachable through the gates (isAllowed refuses non-owner DMs);
+      // kept total so a caller that skips admission still gets a raw key
+      // rather than the owner's session.
       return {
         sessionKey: `${channelName}:${chatId}`,
         replyTarget: { channelName, chatId },
       };
     }
 
-    const sessionKey = `dm:${identity.name.toLowerCase()}`;
-
-    // Migrate from old channel-scoped key if needed (one-time). If the
-    // migration cannot be persisted right now, this is the legacy key: the
-    // message still reaches its conversation, and the migration is retried
-    // on the next one.
-    const routedKey = this.maybeMigrate(identity, sessionKey);
-
-    // Determine reply target based on policy
-    const replyTarget = this.resolveReplyTarget(identity, channelName, chatId);
-
-    // Persist updated reply target
+    const sessionKey = ownerSessionKey(owner);
+    // One-time adoption of a legacy per-channel session (see maybeMigrate).
+    // If the adoption cannot be persisted right now, this is the legacy key:
+    // the message still reaches its conversation, and it is retried later.
+    const routedKey = this.maybeMigrate(owner);
+    // Replies follow the owner: the channel they last wrote from.
+    const replyTarget: ReplyTarget = { channelName, chatId };
     this.sessions.setReplyTarget(sessionKey, replyTarget);
-
-    return { sessionKey: routedKey, replyTarget, identityName: identity.name };
+    return { sessionKey: routedKey, replyTarget, identityName: owner.name };
   }
 
   /** Get the current reply target for a session key (used by cron/continuity) */
@@ -225,120 +224,93 @@ export class IdentityRouter {
   }
 
   /**
-   * Read-only derivation of a reply target from identity config + replyPolicy.
-   * Used as a fallback when a dm:<identity> session has no persisted replyTarget yet
-   * (e.g. cron fires before the identity has ever received a message). Does not
-   * touch the session registry.
+   * Read-only fallback reply target for the owner's dm: session when it has
+   * no persisted one yet (a cron fires before the owner ever wrote): the
+   * owner's first Telegram id, else first iMessage handle. Undefined for any
+   * name that is not the owner. Does not touch the session registry.
    */
   deriveReplyTargetFromConfig(identityName: string): ReplyTarget | undefined {
-    const identity = this.identities.find(
-      (id) => id.name.toLowerCase() === identityName.toLowerCase(),
-    );
-    if (!identity) return undefined;
-
-    const channelNames = Object.keys(identity.channels);
-    if (channelNames.length === 0) return undefined;
-
-    // Fixed channel policy: use the configured channel if set
-    if (identity.replyPolicy !== "last-active") {
-      const fixedChatId = identity.channels[identity.replyPolicy];
-      if (fixedChatId) {
-        return { channelName: identity.replyPolicy, chatId: fixedChatId };
-      }
-    }
-
-    // last-active (or invalid fixed policy): fall back to the first bound channel
-    const first = channelNames[0];
-    return { channelName: first, chatId: identity.channels[first] };
-  }
-
-  /** Find the first active dm: session key (for continuity) */
-  findFirstDmSession(): string | undefined {
-    for (const [key] of this.sessions.listSdkSessionIds()) {
-      if (isDmSessionKey(key)) return key;
+    const owner = this.ownerConfig;
+    if (!owner || owner.name.toLowerCase() !== identityName.toLowerCase()) return undefined;
+    for (const channelName of OWNER_CHANNELS) {
+      const first = ownerBindings(owner, channelName)[0];
+      if (first) return { channelName, chatId: first };
     }
     return undefined;
   }
 
-  private findIdentity(channelName: string, chatId: string): IdentityConfig | undefined {
-    return this.identities.find((id) => matchesChannelBinding(channelName, chatId, id.channels[channelName]));
-  }
-
-  /** A local UI must never silently select one of several owners. */
-  webOwner(): IdentityConfig | undefined {
-    return selectWebOwner(this.identities, this.webOwnerName);
-  }
-
-  private resolveReplyTarget(
-    identity: IdentityConfig,
-    channelName: string,
-    chatId: string,
-  ): ReplyTarget {
-    if (identity.replyPolicy === "last-active") {
-      return { channelName, chatId };
+  /**
+   * Run the one-time legacy adoption now and make sure the owner's session
+   * entry exists, so every channel added later binds to that one session.
+   * Called once at daemon start. Writes nothing when the owner already has a
+   * linked session (the common, upgraded case) — not even a timestamp.
+   */
+  prepareOwnerSession(): string | undefined {
+    const owner = this.ownerConfig;
+    if (!owner) return undefined;
+    const key = ownerSessionKey(owner);
+    if (this.sessions.getSdkSessionId(key)) return key;
+    const routed = this.maybeMigrate(owner);
+    if (routed !== key) return routed;
+    try {
+      this.sessions.ensureEntry(key);
+    } catch (err) {
+      log.warn({ err, key }, "Could not pre-create the owner session entry; it is created on the first message instead");
     }
-
-    // Fixed channel policy: always reply on the configured channel
-    const fixedChannel = identity.replyPolicy;
-    const fixedChatId = identity.channels[fixedChannel];
-    if (fixedChatId) {
-      return { channelName: fixedChannel, chatId: fixedChatId };
-    }
-
-    // Fallback to current channel if configured default is invalid
-    return { channelName, chatId };
+    return key;
   }
 
   /**
-   * One-time migration of a channel-scoped session to the unified `dm:` key.
-   * Returns the key the message should be routed to: the unified key, or —
-   * when a migration was due but could not be persisted — the legacy key.
+   * One-time adoption of a legacy channel-scoped session into the owner's
+   * `dm:` key. Returns the key the message should be routed to: the owner key,
+   * or — when an adoption was due but could not be persisted — the legacy key.
    *
-   * Best-effort on purpose. This runs on the inbound path for every message
-   * (`router.resolve()` at receipt), and `migrateSessionKey` refuses with
-   * `SessionRegistryReadError` while the registry file cannot be read. Letting
-   * that throw here lost the message outright: the Telegram handler's
-   * rejection is swallowed, and the iMessage cursor never advances past it.
-   * Routing to the legacy key instead keeps the conversation reachable, and
-   * deliberately does NOT fall through to the unified key — a turn run there
-   * would cold-start a `dm:` session, after which the "already has a session"
-   * guard above would block this migration forever.
+   * Adoption happens ONLY while the owner key has no SDK session: once it has
+   * one, nothing is ever re-keyed into it, so it cannot fork. With more than
+   * one candidate nothing is guessed. A metadata-only stub under the owner key
+   * (the entry pre-created at init/first start) is folded into the adopted
+   * entry by the store, so there is never a second active owner entry.
+   *
+   * Best-effort on purpose: this runs on the inbound path, and
+   * `migrateSessionKey` refuses with `SessionRegistryReadError` while the
+   * registry file cannot be read. Routing to the legacy key keeps the
+   * conversation reachable; falling through to the owner key would cold-start
+   * a `dm:` session and block the adoption forever.
    */
-  private maybeMigrate(identity: IdentityConfig, sessionKey: string): string {
-    // Already has a session under the unified key
+  private maybeMigrate(owner: OwnerConfig): string {
+    const sessionKey = ownerSessionKey(owner);
     if (this.sessions.getSdkSessionId(sessionKey)) return sessionKey;
 
-    // Collect all old channel-specific keys that have an active session.
     // Matched against the live registry rather than rebuilt from the config
     // value: an iMessage binding is a handle ("+15551234567") while the
     // session it routed to is keyed by chat GUID ("imessage:any;-;+1555…").
     const activeKeys = this.sessions.listSdkSessionIds().map(([key]) => key);
-    const candidates: string[] = [];
-    for (const [chName, chId] of Object.entries(identity.channels)) {
-      candidates.push(...legacySessionKeysForBinding(activeKeys, chName, chId));
+    const candidates = new Set<string>();
+    for (const channelName of OWNER_CHANNELS) {
+      for (const bound of ownerBindings(owner, channelName)) {
+        for (const key of legacySessionKeysForBinding(activeKeys, channelName, bound)) candidates.add(key);
+      }
     }
+    const list = [...candidates];
+    if (list.length === 0) return sessionKey;
 
-    if (candidates.length === 0) return sessionKey;
-
-    if (candidates.length === 1) {
+    if (list.length === 1) {
       try {
-        this.sessions.migrateSessionKey(candidates[0], sessionKey);
+        this.sessions.migrateSessionKey(list[0], sessionKey);
       } catch (err) {
         log.warn(
-          { err, identity: identity.name, from: candidates[0], to: sessionKey },
-          "Session migration could not be persisted; routing to the existing channel-scoped session and retrying on the next message",
+          { err, from: list[0], to: sessionKey },
+          "Session adoption could not be persisted; routing to the existing channel-scoped session and retrying on the next message",
         );
-        return candidates[0];
+        return list[0];
       }
-      log.info({ identity: identity.name, from: candidates[0], to: sessionKey }, "Migrated session to unified identity");
+      log.info({ from: list[0], to: sessionKey }, "Adopted the owner's earlier per-channel session");
       return sessionKey;
     }
 
-    // Ambiguous: multiple bound channels already have sessions. Don't silently
-    // pick one — the config TUI resolves this interactively. Start fresh here.
     log.warn(
-      { identity: identity.name, candidates, unifiedKey: sessionKey },
-      "Multiple existing sessions found for identity; refusing to auto-migrate. Run `tomo config` → Identities to choose which session to keep.",
+      { candidates: list, ownerKey: sessionKey },
+      "Several earlier per-channel sessions belong to the owner; refusing to guess which to adopt. They stay on disk and searchable; the owner session starts fresh.",
     );
     return sessionKey;
   }

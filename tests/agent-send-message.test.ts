@@ -325,6 +325,7 @@ describe("send_message direct mode", () => {
   });
 
   it("attributes a summoned-group send to the summoning dm session", async () => {
+    resetConfig({ identities: [{ name: "Alice", channels: { telegram: "111" }, replyPolicy: "last-active" }] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);

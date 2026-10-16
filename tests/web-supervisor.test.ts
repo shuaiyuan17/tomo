@@ -11,14 +11,14 @@ import type { WebBootstrap } from "../src/web/protocol.js";
 let root: string;
 let channel: WebChannel;
 let supervisor: WebSupervisor;
-const identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" as const }];
+const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
 const headers = { "x-tomo-request": "1", "sec-fetch-site": "same-origin" };
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "tomo-web-process-"));
-  channel = new WebChannel(identities); channel.onMessage(async () => true);
+  channel = new WebChannel(owner); channel.onMessage(async () => true);
 });
 afterEach(async () => { await supervisor?.stop(); await channel.stop(); rmSync(root, { recursive: true, force: true }); });
-function options() { return { tomoHome: root, identities, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), port: 0 }; }
+function options() { return { tomoHome: root, owner, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), port: 0 }; }
 
 it("fails closed without blocking its channel when the token cannot be persisted", async () => {
   mkdirSync(join(root, "web-token"));

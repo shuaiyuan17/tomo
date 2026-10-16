@@ -31,8 +31,8 @@ Open the private web access link with `cat ~/.tomo/web-access.log`. It shares
 the owner's DM session; existing groups are read-only. The UI is enabled by
 default and requires the access token stored in `~/.tomo/web-token` (`0600`).
 The listener binds to `127.0.0.1`; optional Tailscale Serve access uses one exact
-HTTPS `web.externalOrigin`. Configure `web.enabled`, `web.port`, and, when
-multiple identities exist, `web.ownerIdentity` in `config.json`.
+HTTPS `web.externalOrigin`. Configure `web.enabled` and `web.port` in
+`config.json`; the web chat is always the owner's.
 See [web UI setup, security, and limits](docs/web-ui.md).
 
 That's it. Open Telegram and message your bot.
@@ -134,13 +134,14 @@ Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonica
 
 ### Multi-Channel Sessions
 
-Talk to Tomo from multiple channels using the same session. Configure identities in `tomo config` to bind your Telegram and iMessage accounts — Tomo replies on whichever channel you last used (or a fixed default).
+Tomo works for one person, the **owner**. Every owner DM — Telegram, iMessage and the web UI — lands in one session, `dm:<owner.name>`, and Tomo replies on whichever channel you last used.
 
-- DM sessions are unified across channels per identity
-- Group chats always get their own isolated session
-- **Admission fails closed.** A DM is answered only when it comes from a handle bound to your identity (or a chat listed explicitly in that channel's allowlist). Anyone else gets no reply and no session; Tomo logs one line per sender per hour. A channel with no allowlist is not open.
-- Group chats are off until activated: send the secret passphrase (configured in `tomo config` → Group chats) in the group, which adds it to the channel's allowlist
-- Enabling iMessage in `tomo config` asks for the phone number or Apple ID email you text from. Handles are compared in a normal form, so `+1 (555) 555-0123` and `iMessage;-;+15555550123` match
+- The owner's session is created up front (by `tomo init`, or on first start), so a channel connected later joins it instead of starting a new one
+- **Admission fails closed.** Only DMs from the owner's handles are answered. Anyone else gets no reply and no session; Tomo logs one line per sender per hour. A channel with no allowlist is not open
+- Group chats always get their own isolated session, and are off until activated: send the secret passphrase (`tomo config` → Group chats) in the group, which adds it to the channel's `allowlist`. The allowlist only lists groups; DM entries in it are ignored
+- iMessage handles are compared in a normal form, so `+1 (555) 555-0123` and `iMessage;-;+15555550123` match
+- `owner.name` is the session id and never changes; set `owner.displayName` for what Tomo should call you
+- Older configs with `identities` keep working: one identity is read as the owner (same session). With several, `web.ownerIdentity` (or else the first) becomes the owner and Tomo warns at startup; the others' sessions are left untouched but their DMs are no longer answered
 
 ### Tools
 
@@ -162,7 +163,7 @@ Plus a built-in `tomo-internal` MCP server:
 | Group | Tool | Capability |
 |-------|------|-----------|
 | Messaging | `send_message` | Message another session — `delegate` mode (recipient's Claude composes) or `direct` mode (verbatim text) |
-| | `list_sessions` | List identities and active group chats (titles, participants) |
+| | `list_sessions` | List the owner and active group chats (titles, participants) |
 | | `rename_group_chat` | Rename a real Telegram/iMessage group chat |
 | | `react_to_message` | React/tapback to a message in a session — latest inbound by default, or matched by text |
 | Scheduling | `schedule_create` / `schedule_list` / `schedule_remove` | Manage scheduled tasks (one-shot, interval, or cron) |
@@ -263,7 +264,7 @@ Structured logs via [pino](https://github.com/pinojs/pino):
 
 ```
 ~/.tomo/
-  config.json                 # Channels, identities, model, settings
+  config.json                 # Owner, channels, model, settings
   tomo.pid                    # PID file (when running)
   workspace/
     SOUL.md                   # Your personality config
@@ -293,21 +294,20 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     "method": "api-key",
     "apiKey": "sk-ant-..."
   },
+  "owner": {
+    "name": "yourname",
+    "displayName": "Your Name",
+    "telegram": ["123456789"],
+    "imessage": ["+15551234567"]
+  },
   "channels": {
     "telegram": {
       "token": "your-bot-token",
-      "allowlist": ["123456789"],
+      "allowlist": ["-1001234567890"],
       "passiveGroups": ["-1001234567890"]
     },
-    "imessage": { "provider": "imsg", "allowlist": ["+15551234567"] }
+    "imessage": { "provider": "imsg", "allowlist": ["any;+;<group-chat-guid>"] }
   },
-  "identities": [
-    {
-      "name": "yourname",
-      "channels": { "telegram": "123456789", "imessage": "+15551234567" },
-      "replyPolicy": "last-active"
-    }
-  ],
   "model": "claude-sonnet-5[1m]",
   "litellm": {
     "mode": "chatgpt-subscription",
@@ -342,9 +342,7 @@ To enable iMessage (the Tomo process needs Full Disk Access; advanced features a
   "channels": {
     "imessage": { "provider": "imsg", "cliPath": "/opt/homebrew/bin/imsg" }
   },
-  "identities": [
-    { "name": "yourname", "channels": { "imessage": "+15551234567" }, "replyPolicy": "last-active" }
-  ]
+  "owner": { "name": "yourname", "imessage": ["+15551234567"] }
 }
 ```
 

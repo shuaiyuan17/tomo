@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
+import { backupFileIfExistsSync, writeFileAtomicSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { OwnerRouter } from "../router.js";
 import { ownerDisplayName, type OwnerConfig } from "../owner.js";
 import { redactChatIdForLog } from "./blocked-inbound-log.js";
@@ -677,8 +677,12 @@ export class ChatCommandHandler {
 
     try {
       mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-      copyFileSync(CONFIG_BACKUP_PATH, CONFIG_PATH);
-      chmodSync(CONFIG_PATH, 0o600);
+      // Under the shared config lock, and published atomically (temp file +
+      // rename): `tomo config` or another daemon writer must never observe or
+      // merge into a half-copied file, nor write over the restore.
+      withConfigLockSync(CONFIG_PATH, () => {
+        writeFileAtomicSync(CONFIG_PATH, readFileSync(CONFIG_BACKUP_PATH, "utf-8"), { mode: 0o600 });
+      });
 
       const reason = "Restored ~/.tomo/config.json from ~/.tomo/config.json.bak";
       // Attribute the session that issued /restore so the post-restart notice

@@ -69,6 +69,23 @@ describe("config.json lost updates between `tomo config` and the daemon", () => 
   });
 });
 
+describe("concurrent group activation vs the Groups menu", () => {
+  it("the menu adding group A does not drop group B the daemon activated meanwhile; the menu's removal still applies", () => {
+    writeDisk({ channels: { telegram: { token: "t", allowlist: ["-100old", "-100gone"] } } });
+    const ui = loadConfig();
+    // Daemon: group secret activates B (src/agent.ts activateGroup).
+    const d = disk();
+    ((d.channels as Record<string, { allowlist: string[] }>).telegram.allowlist).push("-100B");
+    writeDisk(d);
+    // Menu: adds A and removes one entry, then saves its stale snapshot.
+    const tg = (ui.channels as Record<string, { allowlist: string[] }>).telegram;
+    tg.allowlist = tg.allowlist.filter((id) => id !== "-100gone");
+    tg.allowlist.push("-100A");
+    saveConfig(ui);
+    expect((disk().channels as Record<string, { allowlist: string[] }>).telegram.allowlist).toEqual(["-100old", "-100B", "-100A"]);
+  });
+});
+
 describe("threeWayMerge", () => {
   it.each([
     ["unchanged by me → theirs", { a: 1 }, { a: 1 }, { a: 2 }, { a: 2 }],
@@ -77,7 +94,10 @@ describe("threeWayMerge", () => {
     ["disjoint keys merge", { a: 1, b: 1 }, { a: 2, b: 1 }, { a: 1, b: 3 }, { a: 2, b: 3 }],
     ["their addition survives", {}, { a: 1 }, { b: 2 }, { a: 1, b: 2 }],
     ["my deletion survives", { a: 1, b: 1 }, { b: 1 }, { a: 1, b: 2 }, { b: 2 }],
-    ["arrays are atomic; mine wins when both changed", { l: [1] }, { l: [1, 2] }, { l: [1, 3] }, { l: [1, 2] }],
+    ["ordered arrays stay atomic; mine wins when both changed", { args: ["-y"] }, { args: ["-y", "a"] }, { args: ["-y", "b"] }, { args: ["-y", "a"] }],
+    ["allowlist: both additions kept", { allowlist: ["x"] }, { allowlist: ["x", "a"] }, { allowlist: ["x", "b"] }, { allowlist: ["x", "b", "a"] }],
+    ["allowlist: my removal applied, their addition kept", { allowlist: ["x", "y"] }, { allowlist: ["x"] }, { allowlist: ["x", "y", "b"] }, { allowlist: ["x", "b"] }],
+    ["owner handles merge as sets", { owner: { imessage: ["+1"] } }, { owner: { imessage: ["+1", "+2"] } }, { owner: { imessage: ["+1", "+3"] } }, { owner: { imessage: ["+1", "+3", "+2"] } }],
   ])("%s", (_name, base, mine, theirs, expected) => {
     expect(threeWayMerge(base, mine, theirs)).toEqual(expected);
   });

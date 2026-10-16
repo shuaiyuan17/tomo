@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { hostname } from "node:os";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -971,6 +972,25 @@ describe("chat commands", () => {
 
     await agent.stop();
   });
+
+  it("/restore does not replace config.json while another writer holds the config lock", async () => {
+    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "current" }, null, 2) + "\n");
+    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "backup" }, null, 2) + "\n");
+    // A live writer in another process (`tomo config` mid-save) holds the lock.
+    const lockPath = `${agentEnv.configFilePath}.lock`;
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, "owner.planted"), JSON.stringify({ pid: process.ppid, ts: Date.now(), host: hostname() }) + "\n");
+
+    await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
+
+    expect(tg.sent[0].text).toContain("restore failed");
+    expect(JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8"))).toEqual({ model: "current" });
+    await agent.stop();
+  }, 15_000);
 
   it("/restore restores config.json from config.json.bak", async () => {
     resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });

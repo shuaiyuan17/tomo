@@ -29,8 +29,8 @@ beforeEach(async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
-  agent = new Agent(); channel = new WebChannel(mockConfig.identities); provider = new MockChannel("telegram");
-  supervisor = new WebSupervisor(channel, { ...mockConfig, port: 0 });
+  agent = new Agent(); channel = new WebChannel(mockConfig.owner); provider = new MockChannel("telegram");
+  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
   expect(supervisor.status().port).toBeTypeOf("number");

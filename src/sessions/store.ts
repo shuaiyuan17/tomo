@@ -1783,6 +1783,21 @@ export class SessionStore {
   }
 
   /**
+   * Has `key` EVER had a registry entry — active, unlinked, or already
+   * forgotten? Forgetting a key always records it in the legacy-stem ledger
+   * first (see LegacyStemLedgerFile), so this survives `/new`, a timeout reset,
+   * a restart and the 30-day expiry sweep. An unreadable ledger answers `true`:
+   * callers use this to refuse an automatic merge, so unknown fails closed.
+   */
+  hasEverHadEntry(key: string): boolean {
+    this.loadRegistry();
+    if (this.registry.some((e) => e.channelKey === key)) return true;
+    const ledger = this.loadLegacyStemLedger();
+    if (!ledger.ok) return true;
+    return Object.values(ledger.stems).some((keys) => keys.includes(key));
+  }
+
+  /**
    * Make sure `key` has an active registry entry (a metadata-only stub when it
    * has never run a turn). Used to pre-create the owner's `dm:` session at
    * init / first start, so every channel added later binds to it. Writes

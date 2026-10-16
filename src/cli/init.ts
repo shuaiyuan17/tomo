@@ -309,9 +309,16 @@ export const initCommand = new Command("init")
       const ownerIdentity = deriveOwnerIdentity(personality?.userName ?? "", userId);
       const config: Record<string, unknown> = {
         channels: {
-          telegram: { token: token as string, allowlist: [userId] },
+          // No allowlist: it only lists activated groups now; the owner's DMs
+          // are admitted through `owner`.
+          telegram: { token: token as string },
         },
-        identities: [ownerIdentity],
+        owner: {
+          name: ownerIdentity.name,
+          ...(personality?.userName?.trim() ? { displayName: personality.userName.trim() } : {}),
+          telegram: [userId],
+          imessage: [],
+        },
         model,
       };
       if ((city as string)?.trim()) {
@@ -325,7 +332,7 @@ export const initCommand = new Command("init")
       p.log.success("Config saved");
       precreateOwnerSession(ownerIdentity.name);
       p.log.info(
-        `Owner identity "${ownerIdentity.name}" created — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Manage it later with \`tomo config\` → Identities.`,
+        `Owner "${ownerIdentity.name}" created (session dm:${ownerIdentity.name}) — owner-only commands (/login, /model, /summon) are bound to your Telegram ID. Add your iMessage handle later with \`tomo config\` → Owner.`,
       );
     }
 

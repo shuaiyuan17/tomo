@@ -214,7 +214,7 @@ describe("`tomo config` against a corrupt config", () => {
     // Withdrawn: every one of these is loadConfig() -> mutate -> saveConfig().
     for (const label of [
       "Anthropic authentication", "Model", "LiteLLM gateway",
-      "Channels", "Identities", "Group chats", "Sessions",
+      "Channels", "Owner", "Group chats", "Sessions",
     ]) {
       expect(r.output).not.toContain(label);
     }
@@ -232,7 +232,8 @@ describe("`tomo config` against a corrupt config", () => {
     homes.push(r.home);
 
     expect(r.output).toContain("Anthropic authentication");
-    expect(r.output).toContain("Identities");
+    expect(r.output).toContain("Owner");
+    expect(r.output).not.toContain("Identities");
     expect(r.output).toContain("Scheduled tasks");
     expect(r.status).toBe(0);
   });

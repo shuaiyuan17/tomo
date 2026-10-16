@@ -49,7 +49,7 @@ That's it. Open Telegram and message your bot.
 
 ```bash
 tomo init              # First-time setup
-tomo config            # Interactive settings (authentication, model, LiteLLM, channels, identities, groups)
+tomo config            # Interactive settings (authentication, model, LiteLLM, owner, channels, groups)
 tomo start             # Start in background (daemon)
 tomo start -f          # Start in foreground (for dev)
 tomo stop              # Stop the daemon
@@ -141,7 +141,8 @@ Tomo works for one person, the **owner**. Every owner DM — Telegram, iMessage 
 - Group chats always get their own isolated session, and are off until activated: send the secret passphrase (`tomo config` → Group chats) in the group, which adds it to the channel's `allowlist`. The allowlist only lists groups; DM entries in it are ignored
 - iMessage handles are compared in a normal form, so `+1 (555) 555-0123` and `iMessage;-;+15555550123` match
 - `owner.name` is the session id and never changes; set `owner.displayName` for what Tomo should call you
-- Older configs with `identities` keep working: one identity is read as the owner (same session). With several, `web.ownerIdentity` (or else the first) becomes the owner and Tomo warns at startup; the others' sessions are left untouched but their DMs are no longer answered
+- Older configs with `identities` keep working: one identity is read as the owner (same session). With several, `web.ownerIdentity` (or else the first) becomes the owner and Tomo warns at startup; the others' sessions are left untouched but their DMs are no longer answered. Their cron jobs keep firing into those sessions and deliver to that person's last chat (a job whose session has no reply target is skipped with a warning); `tomo config` → Owner → **Convert legacy identities** lists them and offers to disable them
+- `tomo config` → **Owner** shows your session id (read-only), display name, Telegram IDs and iMessage handles. Enabling iMessage in `tomo config` → Channels asks for your handle; going without one needs an explicit confirmation. Channels → **Groups** lists activated groups only
 
 ### Tools
 

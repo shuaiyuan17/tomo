@@ -100,7 +100,7 @@ export class ChatCommandHandler {
     if (command === "rewind") {
       const identity = this.ownerFor(channel, senderId);
       if (isGroupSessionKey(`${channel.name}:${chatId}`) || !identity) {
-        await channel.send({ chatId, text: "⚠️ /rewind is only available in a owner's private DM." });
+        await channel.send({ chatId, text: "⚠️ /rewind is only available in an owner's private DM." });
         return;
       }
       const arg = args?.trim() || "1";
@@ -277,7 +277,7 @@ export class ChatCommandHandler {
       // default to open, so a bare DM must not read the owner's subscription
       // state). A group is shared, so any member is refused regardless.
       if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
-        await channel.send({ chatId, text: "⚠️ /usage is only available in a owner's private DM." });
+        await channel.send({ chatId, text: "⚠️ /usage is only available in an owner's private DM." });
         return;
       }
       const usageIdentity = this.ownerFor(channel, senderId);
@@ -514,7 +514,7 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ /login is only available in a owner's private DM." });
+      await channel.send({ chatId, text: "⚠️ /login is only available in an owner's private DM." });
       return;
     }
 
@@ -595,7 +595,7 @@ export class ChatCommandHandler {
   ): Promise<void> {
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ /mcp is only available in a owner's private DM." });
+      await channel.send({ chatId, text: "⚠️ /mcp is only available in an owner's private DM." });
       return;
     }
 

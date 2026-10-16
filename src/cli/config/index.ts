@@ -10,7 +10,7 @@ import { CONFIG_BACKUP_PATH, CONFIG_PATH, ConfigReadError, loadConfig } from "./
 import { configModel } from "./model.js";
 import { configAutostart } from "./autostart.js";
 import { configChannels } from "./channels.js";
-import { configIdentities } from "./identities.js";
+import { configOwner } from "./owner.js";
 import { configGroups } from "./groups.js";
 import { configSessions } from "./sessions.js";
 import { configCron } from "./cron.js";
@@ -123,9 +123,9 @@ async function runConfig(): Promise<void> {
         { value: "auth", label: "Anthropic authentication", hint: "Claude subscription or API key" },
         { value: "model", label: "Model", hint: "set default model" },
         { value: "litellm", label: "LiteLLM gateway", hint: "ChatGPT subscription or custom proxy" },
+        { value: "owner", label: "Owner", hint: "who Tomo works for: your Telegram ID and iMessage handles" },
         { value: "channels", label: "Channels", hint: "manage channel connections" },
-        { value: "identities", label: "Identities", hint: "bind DMs across channels" },
-        { value: "groups", label: "Group chats", hint: "activation secret" },
+        { value: "groups", label: "Group chats", hint: "activation secret; groups are off until activated" },
         { value: "sessions", label: "Sessions", hint: "view and configure sessions" },
       ];
       // These read no config at all, so an unparseable config.json cannot
@@ -155,7 +155,7 @@ async function runConfig(): Promise<void> {
         if (choice === "auth") await configAnthropicAuth();
         if (choice === "litellm") await configLiteLlm();
         if (choice === "channels") await configChannels();
-        if (choice === "identities") await configIdentities();
+        if (choice === "owner") await configOwner();
         if (choice === "groups") await configGroups();
         if (choice === "sessions") await configSessions();
         if (choice === "cron") await configCron();

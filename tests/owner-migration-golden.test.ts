@@ -22,6 +22,7 @@ import {
   useRealAdmission,
 } from "./helpers/agent-harness.js";
 import { OwnerRouter } from "../src/router.js";
+import { CronStore } from "../src/cron/store.js";
 import { SummonStore } from "../src/sessions/summon-store.js";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
 import { webSessionId } from "../src/web/owner.js";
@@ -300,32 +301,37 @@ describe("the owner DM exists from the start and every channel binds to it", () 
     expect(snapshot(agentEnv.tmpDir)).toEqual(before);
   });
 
-  it("a pre-created owner stub cannot fork the owner session: a legacy raw session is adopted INTO it", async () => {
+  it("a raw session is never merged into an owner key that already exists (even a pre-created stub)", async () => {
     useRealAdmission();
-    // An install from before identities existed: the owner chatted on raw
-    // telegram:<id>. Then the owner entry was pre-created (e.g. by init).
     resetConfig({ identities: [{ name: "Alex", channels: { telegram: TG_ID }, replyPolicy: "last-active" }] });
     const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
     store.setSdkSessionId(`telegram:${TG_ID}`, "sdk-legacy");
-    store.append(`telegram:${TG_ID}`, { role: "user", content: "legacy history", timestamp: 1, channel: "telegram" });
     store.ensureEntry(OWNER_KEY);
-    store.setReplyTarget(OWNER_KEY, { channelName: "telegram", chatId: TG_ID });
 
     const agent = new Agent();
     agent.prepareOwner();
-    const active = registry().filter((e) => e.unlinkedAt === null);
-    expect(active.map((e) => [e.channelKey, e.sdkSessionId])).toEqual([[OWNER_KEY, "sdk-legacy"]]);
-    expect(active[0].replyTarget).toEqual({ channelName: "telegram", chatId: TG_ID });
-
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     mockSdk.responseFn = () => "ok";
-    await tg.simulateMessage(makeMsg({ chatId: TG_ID, senderId: TG_ID, text: "hello again" }));
+    await tg.simulateMessage(makeMsg({ chatId: TG_ID, senderId: TG_ID, text: "hello" }));
     await drainQueue(agent);
     await agent.stop();
-    expect(mockSdk.optionsBySession[0].options.resume).toBe("sdk-legacy");
-    expect(new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).get(OWNER_KEY).messages.map((m) => m.content))
-      .toContain("legacy history");
+
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual([OWNER_KEY]);
+    expect(mockSdk.optionsBySession[0].options.resume).toBeUndefined();
+    const active = registry().filter((e) => e.unlinkedAt === null).map((e) => [e.channelKey, e.sdkSessionId]);
+    expect(active).toEqual([[`telegram:${TG_ID}`, "sdk-legacy"], [OWNER_KEY, SDK_ID]]);
+  });
+
+  it("the store folds a metadata-only stub under the destination key instead of creating a second active entry", () => {
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    store.setSdkSessionId("telegram:1", "sdk-a");
+    store.ensureEntry(OWNER_KEY);
+    store.setReplyTarget(OWNER_KEY, { channelName: "telegram", chatId: "1" });
+    store.migrateSessionKey("telegram:1", OWNER_KEY);
+    const active = store.listAllSessions().filter((e) => e.unlinkedAt === null);
+    expect(active.map((e) => [e.channelKey, e.sdkSessionId])).toEqual([[OWNER_KEY, "sdk-a"]]);
+    expect(active[0].replyTarget).toEqual({ channelName: "telegram", chatId: "1" });
   });
 
   it("adoption refuses to re-key onto an owner key that already has a linked session", () => {
@@ -335,5 +341,111 @@ describe("the owner DM exists from the start and every channel binds to it", () 
     expect(() => store.migrateSessionKey("telegram:1", OWNER_KEY)).toThrow(/already has a linked session/);
     expect(store.getSdkSessionId(OWNER_KEY)).toBe("sdk-b");
     expect(store.getSdkSessionId("telegram:1")).toBe("sdk-a");
+  });
+});
+
+describe("adoption is one-time and carries the session's cron jobs and model override", () => {
+  const RAW = `telegram:${TG_ID}`;
+  const jobsPath = () => join(mockConfig.tomoHome, "data", "cron", "jobs.json");
+  function seedPreIdentityInstall(): void {
+    // A pre-July install adopted by rule 4: owner "owner" bound to the single
+    // Telegram DM allowlist entry; its history, a cron job and a model
+    // override all live on the raw key.
+    resetConfig({
+      owner: { name: "owner", telegram: [TG_ID], imessage: [] },
+      channelAllowlists: { telegram: [TG_ID] },
+      sessionModelOverrides: { [RAW]: "claude-opus-5[1m]" },
+    });
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({
+      channels: { telegram: { token: "t", allowlist: [TG_ID] } },
+      sessionModelOverrides: { [RAW]: "claude-opus-5[1m]" },
+    }, null, 2));
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    store.setSdkSessionId(RAW, SDK_ID);
+    store.append(RAW, { role: "user", content: "pre-identity history", timestamp: 1, channel: "telegram" });
+    mkdirSync(join(mockConfig.tomoHome, "data", "cron"), { recursive: true });
+    const cron = new CronStore(jobsPath());
+    cron.add({ name: "morning", schedule: { kind: "cron", expr: "0 9 * * *" }, message: "m", sessionKey: RAW });
+    cron.add({ name: "group", schedule: { kind: "cron", expr: "0 9 * * *" }, message: "m", sessionKey: "telegram:-100555" });
+  }
+  const jobKeys = () => new CronStore(jobsPath()).list().map((j) => [j.name, j.sessionKey]);
+
+  it("rule-4 adoption moves the cron jobs and the model override with the session (and only those)", async () => {
+    useRealAdmission();
+    seedPreIdentityInstall();
+    const agent = new Agent();
+    agent.prepareOwner();
+
+    expect(registry().filter((e) => e.unlinkedAt === null).map((e) => [e.channelKey, e.sdkSessionId])).toEqual([["dm:owner", SDK_ID]]);
+    expect(jobKeys()).toEqual([["morning", "dm:owner"], ["group", "telegram:-100555"]]);
+    expect(mockConfig.sessionModelOverrides).toEqual({ "dm:owner": "claude-opus-5[1m]" });
+    expect(JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")).sessionModelOverrides).toEqual({ "dm:owner": "claude-opus-5[1m]" });
+    expect(existsSync(join(mockConfig.tomoHome, "data", "owner-adoption-pending.json"))).toBe(false);
+
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    mockSdk.responseFn = () => "ok";
+    await tg.simulateMessage(makeMsg({ chatId: TG_ID, senderId: TG_ID, text: "hi" }));
+    await drainQueue(agent);
+    await agent.handleCronMessage("morning", "dm:owner");
+    await drainQueue(agent);
+    await agent.stop();
+    // Both the DM and the cron run resume the adopted session with its model.
+    expect(mockSdk.optionsBySession.map((o) => [o.sessionKey, o.options.resume, o.options.model]))
+      .toEqual([["dm:owner", SDK_ID, "claude-opus-5[1m]"]]);
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner", "dm:owner"]);
+  });
+
+  it("an adoption interrupted after its re-key finishes the follow-ups on the next start (idempotent)", () => {
+    seedPreIdentityInstall();
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    store.migrateSessionKey(RAW, "dm:owner");
+    writeFileSync(join(mockConfig.tomoHome, "data", "owner-adoption-pending.json"), JSON.stringify({ version: 1, from: RAW, to: "dm:owner" }));
+    new Agent().prepareOwner();
+    expect(jobKeys()).toEqual([["morning", "dm:owner"], ["group", "telegram:-100555"]]);
+    expect(mockConfig.sessionModelOverrides).toEqual({ "dm:owner": "claude-opus-5[1m]" });
+    new Agent().prepareOwner();
+    expect(jobKeys()).toEqual([["morning", "dm:owner"], ["group", "telegram:-100555"]]);
+  });
+
+  it("a cron-created raw session is never adopted after /new (repro: no dm:owner|SID-CRON-FORK)", async () => {
+    useRealAdmission();
+    seedPreIdentityInstall();
+    const agent = new Agent();
+    agent.prepareOwner();
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    store.clearSdkSessionId("dm:owner");           // /new
+    store.setSdkSessionId(RAW, "SID-CRON-FORK");   // a session some cron run created on the raw key
+
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    mockSdk.responseFn = () => "ok";
+    await tg.simulateMessage(makeMsg({ chatId: TG_ID, senderId: TG_ID, text: "after /new" }));
+    await drainQueue(agent);
+    await agent.stop();
+
+    expect(mockSdk.optionsBySession[0].options.resume).toBeUndefined();
+    expect(new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).getSdkSessionId(RAW)).toBe("SID-CRON-FORK");
+  });
+
+  it("live shape: clearing the owner's session (/new, timeout) never resumes the stale raw iMessage session", async () => {
+    useRealAdmission();
+    useLiveShape();
+    seedDataDir();
+    new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).clearSdkSessionId(OWNER_KEY);
+
+    const agent = new Agent();
+    agent.prepareOwner();
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+    mockSdk.responseFn = () => "ok";
+    await im.simulateMessage(makeMsg({ chatId: DM_GUID, senderId: HANDLE, text: "hello" }));
+    await drainQueue(agent);
+    await agent.stop();
+
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual([OWNER_KEY]);
+    expect(mockSdk.optionsBySession[0].options.resume).toBeUndefined();
+    const stale = registry().find((e) => e.channelKey === STALE_RAW && e.unlinkedAt === null);
+    expect(stale?.sdkSessionId).toBe("sdk-stale-raw");
   });
 });

@@ -40,6 +40,10 @@ export class OwnerRouter {
     // Groups temporarily routed to the owner's dm: session via /summon, keyed
     // by raw "<channel>:<chatId>". Defaults to in-memory (tests).
     private summons: SummonStore = new SummonStore(null),
+    // Performs the one-time adoption of a legacy per-channel session. The
+    // Agent passes one that also moves the session's cron jobs and model
+    // override (see Agent.adoptLegacySession); the default only re-keys.
+    private readonly adopt: (from: string, to: string) => void = (from, to) => sessions.migrateSessionKey(from, to),
   ) {
     // Group allowlists. DM entries are kept in the set but never consulted:
     // only the owner's DMs are answered (see isAllowed).
@@ -214,7 +218,9 @@ export class OwnerRouter {
     const routedKey = this.maybeMigrate(owner);
     // Replies follow the owner: the channel they last wrote from.
     const replyTarget: ReplyTarget = { channelName, chatId };
-    this.sessions.setReplyTarget(sessionKey, replyTarget);
+    // Not while an adoption is deferred: a reply-target stub under the owner
+    // key would count as "the owner key exists" and block the retry for good.
+    if (routedKey === sessionKey) this.sessions.setReplyTarget(sessionKey, replyTarget);
     return { sessionKey: routedKey, replyTarget, identityName: owner.name };
   }
 
@@ -265,8 +271,9 @@ export class OwnerRouter {
    * `dm:` key. Returns the key the message should be routed to: the owner key,
    * or — when an adoption was due but could not be persisted — the legacy key.
    *
-   * Adoption happens ONLY while the owner key has no SDK session: once it has
-   * one, nothing is ever re-keyed into it, so it cannot fork. With more than
+   * Adoption happens ONLY while the owner key has never had a registry entry
+   * (linked, unlinked or forgotten): once it has, nothing is ever re-keyed
+   * into it, so it cannot fork or be rolled back to stale history. With more than
    * one candidate nothing is guessed. A metadata-only stub under the owner key
    * (the entry pre-created at init/first start) is folded into the adopted
    * entry by the store, so there is never a second active owner entry.
@@ -280,6 +287,11 @@ export class OwnerRouter {
   private maybeMigrate(owner: OwnerConfig): string {
     const sessionKey = ownerSessionKey(owner);
     if (this.sessions.getSdkSessionId(sessionKey)) return sessionKey;
+    // ONE-TIME means one time: only while the owner key has never had any
+    // registry entry. Checking "no SDK session right now" instead re-ran the
+    // adoption after every `/new`, timeout reset or restart, and merged a
+    // months-old raw session back into the owner's conversation.
+    if (this.sessions.hasEverHadEntry(sessionKey)) return sessionKey;
 
     // Matched against the live registry rather than rebuilt from the config
     // value: an iMessage binding is a handle ("+15551234567") while the
@@ -296,7 +308,7 @@ export class OwnerRouter {
 
     if (list.length === 1) {
       try {
-        this.sessions.migrateSessionKey(list[0], sessionKey);
+        this.adopt(list[0], sessionKey);
       } catch (err) {
         log.warn(
           { err, from: list[0], to: sessionKey },

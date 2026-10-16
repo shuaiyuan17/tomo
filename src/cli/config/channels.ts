@@ -1,19 +1,11 @@
 import * as p from "@clack/prompts";
 import { loadConfig, saveConfig } from "./shared.js";
-import { enableImessageWithOwner, type PromptPort } from "./imessage-owner.js";
-
-/** @clack/prompts behind the small port the iMessage owner flow is tested through. */
-export const clackPrompts: PromptPort = {
-  text: (opts) => p.text(opts) as Promise<string | symbol>,
-  confirm: (opts) => p.confirm(opts),
-  select: (opts) => p.select(opts) as Promise<string | symbol>,
-  isCancel: (value: unknown): value is symbol => p.isCancel(value),
-  log: { info: (m) => p.log.info(m), warn: (m) => p.log.warn(m), success: (m) => p.log.success(m) },
-};
+import { currentOwner, enableImessageWithOwner } from "./owner-setup.js";
+import { clackPrompts } from "./owner.js";
+import { isDmAllowlistEntry } from "../../owner.js";
 
 function imessageOwnerHandle(cfg: Record<string, unknown>): string | undefined {
-  const identities = (Array.isArray(cfg.identities) ? cfg.identities : []) as Array<{ channels?: Record<string, string> }>;
-  return identities.map((id) => id.channels?.imessage).find((h): h is string => typeof h === "string" && h !== "");
+  return currentOwner(cfg).owner?.imessage[0];
 }
 
 export async function configChannels(): Promise<void> {
@@ -28,7 +20,7 @@ export async function configChannels(): Promise<void> {
     options.push({
       value: "telegram",
       label: "Telegram",
-      hint: tgToken ? `configured | ${tgAllow.length} allowed` : "not configured",
+      hint: tgToken ? `configured | ${tgAllow.filter((id) => !isDmAllowlistEntry("telegram", id)).length} group(s)` : "not configured",
     });
 
     // `channels.imessage.provider` is a single-valued opt-in: "imsg" enables
@@ -39,7 +31,7 @@ export async function configChannels(): Promise<void> {
     options.push({
       value: "imessage",
       label: "iMessage",
-      hint: imEnabled ? `imsg | ${imAllow.length} allowed` : "not configured",
+      hint: imEnabled ? `imsg | ${imAllow.filter((id) => !isDmAllowlistEntry("imessage", id)).length} group(s)` : "not configured",
     });
 
     options.push({ value: "back", label: "Back" });
@@ -52,7 +44,7 @@ export async function configChannels(): Promise<void> {
         message: "Telegram",
         options: [
           { value: "token", label: "Bot token", hint: tgToken ? "(set)" : "not set" },
-          { value: "allowlist", label: "Allowlist", hint: `${tgAllow.length} user(s)` },
+          { value: "allowlist", label: "Groups", hint: "activated group chats" },
           { value: "back", label: "Back" },
         ],
       });
@@ -99,10 +91,10 @@ export async function configChannels(): Promise<void> {
             hint: imEnabled ? "provider: imsg" : "imsg CLI — needs Full Disk Access",
           },
           ...(imEnabled && !ownerHandle
-            ? [{ value: "owner", label: "Set owner handle", hint: "none — every iMessage DM is ignored" }]
+            ? [{ value: "owner", label: "Set your iMessage handle", hint: "none — every iMessage DM is ignored" }]
             : []),
           { value: "imsg", label: "imsg CLI settings", hint: (channels.imessage?.cliPath as string) ?? "imsg (PATH)" },
-          { value: "allowlist", label: "Allowlist", hint: `${imAllow.length} user(s)` },
+          { value: "allowlist", label: "Groups", hint: "activated group chats" },
           { value: "back", label: "Back" },
         ],
       });
@@ -150,6 +142,20 @@ export async function configChannels(): Promise<void> {
   }
 }
 
+/** Is this a group id on the channel (what the allowlist is for)? */
+export function isGroupAllowlistEntry(channelName: string, id: string): boolean {
+  const value = id.trim();
+  if (channelName === "telegram") return /^-\d+$/.test(value);
+  if (channelName === "imessage") return value.includes(";+;") || /^chat[0-9a-z]+$/i.test(value);
+  return false;
+}
+
+/**
+ * Channels → <channel> → Groups. The allowlist lists ACTIVATED GROUPS only:
+ * DMs are answered for the owner's handles (`tomo config` → Owner) and for
+ * nobody else, so a DM entry here is ignored and shown as such. Sending the
+ * group secret in a group adds it here too.
+ */
 async function manageAllowlist(
   cfg: Record<string, unknown>,
   channels: Record<string, Record<string, unknown>>,
@@ -157,41 +163,45 @@ async function manageAllowlist(
 ): Promise<void> {
   if (!channels[channelName]) channels[channelName] = {};
   const ch = channels[channelName];
-  const allowlist = ((ch.allowlist ?? []) as string[]).slice(); // working copy
+  const allowlist = ((ch.allowlist ?? []) as unknown[]).map(String); // working copy
 
   for (;;) {
     const options: Array<{ value: string; label: string; hint?: string }> = [];
 
     if (allowlist.length === 0) {
-      p.log.info("Allowlist is empty — no group is active on this channel. Your owner identity's DMs are answered regardless.");
-    } else {
-      for (let i = 0; i < allowlist.length; i++) {
-        options.push({ value: `remove:${i}`, label: allowlist[i], hint: "select to remove" });
-      }
+      p.log.info("No group is activated on this channel. Send the group secret in a group (`tomo config` → Group chats), or add its ID here.");
+    }
+    for (let i = 0; i < allowlist.length; i++) {
+      const dm = isDmAllowlistEntry(channelName, allowlist[i]);
+      options.push({
+        value: `remove:${i}`,
+        label: allowlist[i],
+        hint: dm ? "ignored: a DM entry (only the owner's DMs are answered) — select to remove" : "select to remove",
+      });
     }
 
-    options.push({ value: "add", label: "Add user" });
+    options.push({ value: "add", label: "Add group" });
     options.push({ value: "back", label: "Back" });
 
     const choice = await p.select({
-      message: `Allowlist for ${channelName} (${allowlist.length} user${allowlist.length === 1 ? "" : "s"})`,
+      message: `Activated groups on ${channelName}`,
       options,
     });
     if (p.isCancel(choice) || choice === "back") break;
 
     if (choice === "add") {
-      const placeholder = channelName === "telegram"
-        ? "Telegram user ID (e.g. 123456789)"
-        : "Phone number or email (e.g. +15551234567)";
-      const hint = channelName === "telegram"
-        ? "Find your ID: message @userinfobot on Telegram"
-        : "A phone number/email, or a chat.db chat GUID (iMessage;-;+1555…, any;+;<hex>)";
-
-      p.log.info(hint);
-      const id = await p.text({ message: "User/chat ID to allow", placeholder });
+      p.log.info(channelName === "telegram"
+        ? "A Telegram group ID is negative, e.g. -1001234567890."
+        : "An iMessage group chat GUID, e.g. any;+;chat0123456789.");
+      const id = await p.text({ message: "Group ID", placeholder: channelName === "telegram" ? "-1001234567890" : "any;+;chat0123456789" });
       if (p.isCancel(id)) continue;
-      const val = (id as string).trim();
-      if (val && !allowlist.includes(val)) {
+      const val = String(id ?? "").trim();
+      if (!val) continue;
+      if (!isGroupAllowlistEntry(channelName, val)) {
+        p.log.warn("That is not a group ID. To be answered in DMs, add your handle under `tomo config` → Owner.");
+        continue;
+      }
+      if (!allowlist.includes(val)) {
         allowlist.push(val);
         ch.allowlist = allowlist;
         cfg.channels = channels;
@@ -200,8 +210,8 @@ async function manageAllowlist(
       }
     }
 
-    if (typeof choice === "string" && (choice as string).startsWith("remove:")) {
-      const idx = Number((choice as string).slice(7));
+    if (typeof choice === "string" && choice.startsWith("remove:")) {
+      const idx = Number(choice.slice(7));
       const removed = allowlist.splice(idx, 1)[0];
       ch.allowlist = allowlist;
       cfg.channels = channels;

@@ -23,16 +23,18 @@
 - `replyPolicy` is ignored: replies go to the channel you last wrote from.
 - `list_sessions` returns `owner`; `identities` stays as a one-element alias. `send_message` accepts the owner's name, display name or `"owner"`.
 - Private notices (MCP login links, notifications) only ever go to the owner's DM when an owner is configured.
+- **Adoption is one-time and complete.** A legacy per-channel owner session is adopted only while the owner's `dm:` key has never existed, so `/new`, a timeout reset or a restart can no longer pull an old raw session back in. The adoption moves that session's cron jobs and `sessionModelOverrides` entry with it.
+- **`tomo config` → Owner replaces Identities**: session id read-only, display name, Telegram IDs, iMessage handles, and Convert legacy identities. All setup flows (Owner, Channels → iMessage → Enable, `tomo init`) write the `owner` block, never `identities`. The Identities menu, including its Remove path that rewrote the owner's cron jobs, is gone. Channels → Allowlist is now **Groups** (group ids only; DM entries shown as ignored).
 
 **Upgrade notes — check these before restarting:**
 
-- **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Identities, bind your Telegram user ID / iMessage handle (the daemon warns at startup for every channel no identity binds).
+- **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Owner, add your Telegram user ID / iMessage handle (the daemon warns at startup for every channel the owner has no handle on).
 - **Hand-written Telegram configs with no `allowlist` whose bot sits in groups: those groups go silent.** Fix: send the group secret in each group (`tomo config` → Group chats to enable or view it), or add the group ids (negative numbers) to `channels.telegram.allowlist`.
 - **`passiveGroups` entries on a channel with no allowlist stop working** (they are not activated). The daemon now warns at startup. Fix: the same — send the secret in each group, or add the ids to that channel's `allowlist`.
 - **Earlier `/summon`s of groups that are not activated stop working**: the group's messages are refused before the summon applies. Fix: activate the group (secret or allowlist), then `/summon` again if the summon has lapsed.
 - iMessage groups on a fresh setup (no allowlist) are off until activated the same way.
 - **Friends listed as DM entries in an allowlist are no longer answered** (no guest DMs; startup warning).
-- **Several identities:** only `web.ownerIdentity` (or else the first) is answered; the others' sessions stay on disk untouched.
+- **Several identities:** only `web.ownerIdentity` (or else the first) is answered; the others' sessions stay on disk untouched. **Their cron jobs keep firing** into those sessions and deliver to that person's last chat, or are skipped with a warning when the session has no reply target. Fix: `tomo config` → Owner → Convert legacy identities lists them and offers to disable them (it never re-keys them).
 
 ## 0.10.1 (2026-10-12)
 

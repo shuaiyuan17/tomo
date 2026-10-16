@@ -10,7 +10,16 @@
 - `tomo config` → Channels → iMessage → Enable asks for the handle you text from and binds it to your identity; finishing without one needs an explicit confirmation.
 - iMessage handles are compared in one normal form, so formatting drift (`+1 (555) …`, case, `iMessage;-;` / `SMS;-;` / `any;-;` prefixes) no longer breaks the owner match.
 
-**Upgrade note:** if Tomo answered you on a channel only because that channel had no allowlist, bind your handle with `tomo config` (the daemon logs a warning at startup for any channel no identity is bound to). Groups that were active only because their channel had no allowlist need the group secret once.
+- The group activation secret is no longer written to the log; blocked-chat debug lines carry only the last four characters of the chat id.
+- iMessage handles must match exactly in E.164 form. A number written without `+` only counts as `+1…` when it has 11 digits starting with 1; anything else no longer matches its `+`-prefixed twin in another country. Setup now asks before reading an 11-digit number such as `150 1234 5678` as a US number.
+
+**Upgrade notes — check these before restarting:**
+
+- **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Identities, bind your Telegram user ID / iMessage handle (the daemon warns at startup for every channel no identity binds).
+- **Hand-written Telegram configs with no `allowlist` whose bot sits in groups: those groups go silent.** Fix: send the group secret in each group (`tomo config` → Group chats to enable or view it), or add the group ids (negative numbers) to `channels.telegram.allowlist`.
+- **`passiveGroups` entries on a channel with no allowlist stop working** (they are not activated). The daemon now warns at startup. Fix: the same — send the secret in each group, or add the ids to that channel's `allowlist`.
+- **Earlier `/summon`s of groups that are not activated stop working**: the group's messages are refused before the summon applies. Fix: activate the group (secret or allowlist), then `/summon` again if the summon has lapsed.
+- iMessage groups on a fresh setup (no allowlist) are off until activated the same way.
 
 ## 0.10.1 (2026-10-12)
 

@@ -51,7 +51,14 @@ export function checkImessageOwnerHandle(raw: string): ImessageHandleCheck {
     };
   }
   if (digits.length === 11 && digits.startsWith("1")) {
-    return { kind: "ok", handle: `+${digits}`, note: `Using +${digits}` };
+    // Ambiguous: a NANP number with its country code, OR an 11-digit
+    // national number elsewhere (a Chinese mobile "150 1234 5678"). Never
+    // assume — guessing wrong hands owner access to a stranger.
+    return {
+      kind: "confirm",
+      handle: `+${digits}`,
+      question: `No "+" given. Is +${digits} a US/Canada number? (If not, answer no and enter it with its country code, e.g. +86 150 1234 5678.)`,
+    };
   }
   return {
     kind: "error",

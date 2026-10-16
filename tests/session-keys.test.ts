@@ -50,7 +50,11 @@ describe("normalizeImessageHandle", () => {
     ["+1 (555) 555-0123", "+15555550123"],
     ["+1.555.555.0123", "+15555550123"],
     ["  +15555550123  ", "+15555550123"],
-    ["15555550123", "15555550123"],
+    ["15555550123", "+15555550123"],
+    ["1 (555) 555-0123", "+15555550123"],
+    // No "+" and not the NANP 11-digit shape: country unknown, kept bare.
+    ["4695550123", "4695550123"],
+    ["5555550123", "5555550123"],
     ["Alex@Example.COM", "alex@example.com"],
     ["iMessage;-;+15555550123", "+15555550123"],
     ["SMS;-;+1 555 555 0123", "+15555550123"],
@@ -64,7 +68,15 @@ describe("normalizeImessageHandle", () => {
     expect(normalizeImessageHandle(input)).toBe(expected);
   });
 
-  it("treats a phone number with and without its leading + as the same handle", () => {
+  it("never matches across countries: a bare number is not its +-prefixed twin (Sweden regression)", () => {
+    // Binding "4695550123" must not admit Sweden's +46 95 550 123.
+    expect(imessageHandlesMatch("4695550123", "+4695550123")).toBe(false);
+    expect(imessageHandlesMatch("4695550123", "any;-;+4695550123")).toBe(false);
+    expect(matchesChannelBinding("imessage", "any;-;+4695550123", "4695550123")).toBe(false);
+    expect(imessageHandlesMatch("+4695550123", "SMS;-;+46 95 550 123")).toBe(true);
+  });
+
+  it("treats only the NANP 11-digit shape without + as E.164", () => {
     expect(imessageHandlesMatch("+15555550123", "15555550123")).toBe(true);
     expect(imessageHandlesMatch("+1 (555) 555-0123", "SMS;-;+15555550123")).toBe(true);
     // A 10-digit number is not silently widened to +1 (setup asks instead).

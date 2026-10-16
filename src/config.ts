@@ -16,6 +16,7 @@ import { DEFAULT_MODEL } from "./models.js";
 import { redactSecrets } from "./redact.js";
 import { log } from "./logger.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
+import { normalizeImessageHandle } from "./sessions/keys.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -619,7 +620,11 @@ function parseIdentities(raw: unknown): IdentityConfig[] {
   for (const [index, entry] of entries.entries()) {
     const parsed = identitySchema.safeParse(entry);
     if (parsed.success) {
-      identities.push(parsed.data);
+      // iMessage bindings are stored in the one normal form the matchers
+      // compare exactly (E.164 for phone numbers; see normalizeImessageHandle).
+      const channels = { ...parsed.data.channels };
+      if (channels.imessage) channels.imessage = normalizeImessageHandle(channels.imessage);
+      identities.push({ ...parsed.data, channels });
     } else {
       const detail = parsed.error.issues
         .map((issue) => (issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message))

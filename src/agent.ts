@@ -16,7 +16,7 @@ import {
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { IdentityRouter, type SessionResolution } from "./router.js";
-import { BlockedInboundLog } from "./agent/blocked-inbound-log.js";
+import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
 import {
   annotateSenderName,
   autoBindHandle,
@@ -544,15 +544,24 @@ export class Agent {
     if (!this.router.hasBoundIdentity(channelName)) {
       log.warn(
         { channel: channelName },
-        "No owner handle is bound on this channel, so its DMs are ignored. Run `tomo config` and bind your handle to your owner identity.",
+        this.router.hasAllowlist(channelName)
+          ? "No identity binds a handle on this channel, so only DMs listed explicitly in its allowlist are answered. Run `tomo config` and bind your handle to your owner identity."
+          : "No identity binds a handle on this channel, so its DMs are ignored. Run `tomo config` and bind your handle to your owner identity.",
       );
     }
     if (!this.router.hasAllowlist(channelName)) {
+      const passive = config.passiveGroups[channelName] ?? [];
+      if (passive.length > 0) {
+        log.warn(
+          { channel: channelName, passiveGroups: passive.length },
+          "passiveGroups are listed for this channel, but it has no allowlist, so those groups are not active. Send the group secret in each group, or add their ids to the channel's allowlist.",
+        );
+      }
       log.info(
         { channel: channelName },
         config.groupSecret
           ? "No group is activated on this channel yet; send the group secret in a group to activate it."
-          : "Group chats on this channel are off (no group is activated and no group secret is set). Enable groups with `tomo config` → Groups.",
+          : "Group chats on this channel are off (no group is activated and no group secret is set). Enable them with `tomo config` → Group chats.",
       );
     }
   }
@@ -1421,6 +1430,15 @@ export class Agent {
     const isGroup = message.isGroup ?? false;
     const isMentioned = message.isMentioned ?? false;
 
+    // Group secret activation, BEFORE anything logs or records the text: the
+    // secret is the only way into a closed group, so it must never reach the
+    // log file (or the transcript) verbatim.
+    if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
+      log.info({ channel: channel.name, chat: redactChatIdForLog(message.chatId) }, "Group secret received");
+      await this.activateGroup(channel, message.chatId);
+      return;
+    }
+
     log.info(
       {
         channel: channel.name,
@@ -1434,15 +1452,9 @@ export class Agent {
       message.text,
     );
 
-    // Group secret activation: if message matches the secret, add group to allowlist
-    if (isGroup && config.groupSecret && message.text.trim() === config.groupSecret) {
-      await this.activateGroup(channel, message.chatId);
-      return;
-    }
-
     // Allowlist check: reject messages from unknown senders
     if (!this.router.isAllowed(channel.name, message.chatId)) {
-      log.debug({ channel: channel.name, chatId: message.chatId }, "Message blocked (not in allowlist)");
+      log.debug({ channel: channel.name, chat: redactChatIdForLog(message.chatId) }, "Message blocked (not in allowlist)");
       return;
     }
 

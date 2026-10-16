@@ -5,6 +5,7 @@ import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import type { IdentityRouter } from "../router.js";
+import { redactChatIdForLog } from "./blocked-inbound-log.js";
 import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
@@ -74,7 +75,7 @@ export class ChatCommandHandler {
     // disallowed chat can't touch routing state, and drop silently — the
     // message path never replies to chats outside the allowlist.
     if (!this.deps.router.isAllowed(channel.name, chatId)) {
-      log.debug({ channel: channel.name, chatId, command }, "Command blocked at receipt (not in allowlist)");
+      log.debug({ channel: channel.name, chat: redactChatIdForLog(chatId), command }, "Command blocked at receipt (not in allowlist)");
       return;
     }
 
@@ -369,7 +370,7 @@ export class ChatCommandHandler {
       return;
     }
     if (!this.deps.router.isAllowed(channel.name, chatId)) {
-      log.debug({ channel: channel.name, chatId }, `/${command} blocked (group not in allowlist)`);
+      log.debug({ channel: channel.name, chat: redactChatIdForLog(chatId) }, `/${command} blocked (group not in allowlist)`);
       return;
     }
 

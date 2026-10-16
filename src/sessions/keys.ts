@@ -121,25 +121,27 @@ export function normalizeImessageHandle(raw: string): string {
   if (!PHONE_SHAPED_RE.test(value)) return value;
   const digits = value.replace(/\D/g, "");
   if (!digits) return value;
-  return value.startsWith("+") ? `+${digits}` : digits;
+  if (value.startsWith("+")) return `+${digits}`;
+  // No "+": the country is unknown. Only the one unambiguous shape — 11
+  // digits starting with 1, i.e. a NANP number written with its country code
+  // — becomes E.164. Anything else stays bare digits and therefore matches
+  // nothing E.164-shaped: "4695550123" must never match Sweden's "+4695550123".
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return digits;
 }
 
 const PHONE_SHAPED_RE = /^\+?[\d\s().-]+$/;
 
 /**
- * Do two iMessage DM handles (or DM GUIDs) name the same person? Compares the
- * normal forms, and treats a phone number with and without its leading `+` as
- * the same number (`+15555550123` = `15555550123`): chat.db stores E.164, while
- * a config value may have been typed without the plus. A 10-digit number with
- * no country code is NOT widened to `+1…` here — setup asks about that.
+ * Do two iMessage DM handles (or DM GUIDs) name the same person? Their
+ * normal forms (see normalizeImessageHandle) must be EXACTLY equal. No "+"
+ * stripping: that matched numbers across countries (a bare "4695550123"
+ * against Sweden's "+4695550123").
  */
 export function imessageHandlesMatch(a: string, b: string): boolean {
   const na = normalizeImessageHandle(a);
   const nb = normalizeImessageHandle(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  const phone = /^\+?\d+$/;
-  return phone.test(na) && phone.test(nb) && na.replace("+", "") === nb.replace("+", "");
+  return na !== "" && na === nb;
 }
 
 /**

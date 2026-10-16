@@ -37,11 +37,32 @@ describe("checkImessageOwnerHandle (validation table)", () => {
     ["+1 (555) 555-0123", { kind: "ok", handle: "+15555550123" }],
     ["+15555550123", { kind: "ok", handle: "+15555550123" }],
     ["+44 20 7946 0000", { kind: "ok", handle: "+442079460000" }],
-    ["15555550123", { kind: "ok", handle: "+15555550123" }],
     ["Alex@Example.com", { kind: "ok", handle: "alex@example.com" }],
     ["  alex@example.com ", { kind: "ok", handle: "alex@example.com" }],
   ])("accepts %s", (input, expected) => {
     expect(checkImessageOwnerHandle(input)).toMatchObject(expected);
+  });
+
+  it.each([
+    // [input, expected]  — CN, UK and US, with and without "+"
+    ["+86 150 1234 5678", { kind: "ok", handle: "+8615012345678" }],
+    ["150 1234 5678", { kind: "confirm", handle: "+15012345678" }],
+    ["15012345678", { kind: "confirm", handle: "+15012345678" }],
+    ["+44 20 7946 0000", { kind: "ok", handle: "+442079460000" }],
+    ["020 7946 0000", { kind: "error" }],
+    ["+44 7700 900123", { kind: "ok", handle: "+447700900123" }],
+    ["07700 900123", { kind: "error" }],
+    ["+1 555 555 0123", { kind: "ok", handle: "+15555550123" }],
+    ["1 555 555 0123", { kind: "confirm", handle: "+15555550123" }],
+    ["(555) 555-0123", { kind: "confirm", handle: "+15555550123" }],
+  ])("country table: %s", (input, expected) => {
+    expect(checkImessageOwnerHandle(input)).toMatchObject(expected);
+  });
+
+  it("never silently turns an 11-digit number starting with 1 into a US number", async () => {
+    // A Chinese mobile typed without "+": declining the +1 question re-asks.
+    const { port } = scripted({ text: ["150 1234 5678", "+86 150 1234 5678"], confirm: [false] });
+    await expect(promptImessageOwnerHandle(port)).resolves.toEqual({ kind: "handle", handle: "+8615012345678" });
   });
 
   it("asks before assuming +1 for a 10-digit number", () => {

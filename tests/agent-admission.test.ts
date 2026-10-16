@@ -138,10 +138,41 @@ describe("DM admission (fails closed)", () => {
     agent.addChannel(new MockChannel("imessage"));
 
     const warned = vi.mocked(log.warn).mock.calls
-      .filter(([, msg]) => typeof msg === "string" && msg.includes("No owner handle is bound"))
+      .filter(([, msg]) => typeof msg === "string" && msg.includes("No identity binds a handle"))
       .map(([fields]) => (fields as { channel: string }).channel);
     expect(warned).toEqual(["imessage"]);
+    // Telegram has no allowlist: the message says DMs are ignored, not "allowlisted only".
+    expect(vi.mocked(log.warn).mock.calls.some(([, m]) => typeof m === "string" && m.includes("its DMs are ignored"))).toBe(true);
 
+    await agent.stop();
+  });
+});
+
+describe("group secret and logs", () => {
+  it("never logs the group secret, and blocked-chat debug logs carry only the id's tail", async () => {
+    useRealAdmission();
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ channels: { telegram: { token: "t" } } }));
+    resetConfig({
+      channelAllowlists: {},
+      groupSecret: "tomo-secret-xyz789",
+      passiveGroups: { telegram: ["-100555"] },
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await tg.simulateMessage(makeMsg({ chatId: "-1009876543210", text: "tomo-secret-xyz789", isGroup: true, senderName: "Alex" }));
+    await tg.simulateCommand("status", "99999123", "Stranger", undefined, "99999123");
+    await drainQueue(agent);
+
+    expect(tg.sent.map((m) => m.text)).toEqual(["Tomo activated in this group."]);
+    const everything = JSON.stringify([
+      vi.mocked(log.info).mock.calls, vi.mocked(log.debug).mock.calls, vi.mocked(log.warn).mock.calls,
+    ]);
+    expect(everything).not.toContain("tomo-secret-xyz789");
+    expect(everything).not.toContain("99999123");
+    // passiveGroups on a channel with no allowlist are called out at startup.
+    expect(vi.mocked(log.warn).mock.calls.some(([, m]) => typeof m === "string" && m.includes("passiveGroups"))).toBe(true);
     await agent.stop();
   });
 });

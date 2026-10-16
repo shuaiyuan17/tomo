@@ -792,6 +792,44 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(mockState.instances[0].closed).toBe(true);
   });
 
+  it("retries once when the SDK reports the missing conversation as an error result", async () => {
+    // Current SDKs don't throw on a failed resume: they yield an
+    // error_during_execution result with turns 0 and put the reason in
+    // `errors`, while the message is our generic execution-error text. A group
+    // whose stored session had been archived failed every turn this way.
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    let calls = 0;
+    mockState.sendImpl = async () => {
+      calls++;
+      if (calls === 1) {
+        throw new SdkResultError("Something went wrong", "error_during_execution", [
+          "No conversation found with session ID: 5a54ee9f-67d2-4ea7-963d-22f68076c89b",
+        ]);
+      }
+      return "recovered";
+    };
+
+    await expect(manager.runWithRetry({ key: "imessage:group", prompt: "hi" })).resolves.toBe("recovered");
+    expect(deps.clearSdkSessionId).toHaveBeenCalledWith("imessage:group");
+    expect(mockState.instances).toHaveLength(2);
+    expect(mockState.instances[0].closed).toBe(true);
+  });
+
+  it("does not retry other SDK error results, even ones that mention a closed session", async () => {
+    // An error result usually means the turn ran; re-running it would repeat
+    // its side effects. Only the missing-conversation reason is retried.
+    const deps = makeDeps();
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => {
+      throw new SdkResultError("Something went wrong", "error_during_execution", ["Session is closed"]);
+    };
+
+    await expect(manager.runWithRetry({ key: "imessage:group", prompt: "hi" })).rejects.toThrow();
+    expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
+    expect(mockState.instances).toHaveLength(1);
+  });
+
   /**
    * Delivery is IRREVERSIBLE, so the retry policy has to know about it.
    *

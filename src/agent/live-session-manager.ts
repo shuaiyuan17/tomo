@@ -58,6 +58,11 @@ async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boole
   }
 }
 
+/** A failed resume, as current SDKs report it: an error result, not a throw. */
+function isResumeMissingResult(err: SdkResultError): boolean {
+  return err.errors.some((e) => e.includes("No conversation found"));
+}
+
 function isRecoverableSessionError(errMsg: string): boolean {
   return errMsg.includes("No conversation found")
     || /session (?:is )?closed/i.test(errMsg)
@@ -718,9 +723,15 @@ export class LiveSessionManager {
       // not yet claimed the session included), it ends as interrupted.
       if (err instanceof TurnInterruptedError) throw err;
       if (token.interrupted) throw new TurnInterruptedError();
-      if (err instanceof SdkResultError) throw err;
+      // One exception: a resume that can't find its conversation. Current SDKs
+      // report it as an error result (error_during_execution, turns 0, the
+      // reason only in `errors`) instead of throwing, so nothing ran and the
+      // reset-and-retry below must still fire. Matched on that phrase alone.
+      if (err instanceof SdkResultError && !isResumeMissingResult(err)) throw err;
 
-      const errMsg = err instanceof Error ? err.message : "";
+      // For a missing-conversation error result the reason is in `errors`; the
+      // message is our generic execution-error text.
+      const errMsg = err instanceof SdkResultError ? err.errors.join("; ") : err instanceof Error ? err.message : "";
 
       if (this.stopping && errMsg.includes("closed")) {
         // FLUSH BEFORE CONVERTING, NOT AFTER — there is no after. Resolving

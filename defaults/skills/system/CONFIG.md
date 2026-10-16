@@ -18,27 +18,23 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
     "maxOutputChars": 8000
   },
   "groupSecret": "tomo-a1b2c3d4",
+  "owner": {
+    "name": "alice",
+    "displayName": "Alice",
+    "telegram": ["123456789"],
+    "imessage": ["+15551234567"]
+  },
   "channels": {
     "telegram": {
       "token": "123456:ABC-DEF1234ghIkl-zyx57W2v...",
-      "allowlist": ["123456789"],
+      "allowlist": ["-1001234567"],
       "passiveGroups": ["-1001234567"]
     },
     "imessage": {
       "provider": "imsg",
-      "allowlist": ["+15551234567", "iMessage;-;+15551234567"]
+      "allowlist": ["any;+;chat0123456789"]
     }
   },
-  "identities": [
-    {
-      "name": "alice",
-      "channels": {
-        "telegram": "123456789",
-        "imessage": "+15551234567"
-      },
-      "replyPolicy": "last-active"
-    }
-  ],
   "sessionModelOverrides": {
     "dm:alice": "claude-opus-5-5[1m]"
   },
@@ -87,15 +83,17 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `continuityScript` | string \| object \| null | Optional script run once per scheduled continuity heartbeat and manual `tomo continuity` trigger before the prompt is sent to Tomo. Use a string path (`"~/bin/tomo-continuity.sh"`) or `{ "path": "...", "timeoutMs": 30000, "maxOutputChars": 8000 }`. Relative paths resolve under `~/.tomo`; `~`, `$VAR`, and `${VAR}` expand. The script runs as the Tomo OS user with `TOMO_CONTINUITY=true`; stdout/stderr are appended to the heartbeat prompt and capped separately by `maxOutputChars`. Non-zero exits, missing files, and timeouts are passed to Tomo as script status instead of aborting the heartbeat. |
 | `groupSecret` | string \| null | Passphrase users send in a group chat to activate Tomo there. `null` disables group chats entirely. |
 | `channels.telegram.token` | string | BotFather token (`123456:...`). Required to enable the Telegram channel. |
-| `channels.telegram.allowlist` | string[] | Telegram user IDs (as strings) permitted to DM the bot. Identity-bound chatIds are auto-allowed even if missing here. |
+| `channels.telegram.allowlist` | string[] | ACTIVATED GROUP chat IDs (negative, as strings). Groups only: DM entries here are ignored — only the owner's DMs are answered. Sending `groupSecret` in a group adds it here. A channel with no allowlist has no active groups. |
 | `channels.telegram.passiveGroups` | string[] | Telegram group chatIds (negative IDs as strings) where Tomo should listen to every message — no `@mention` required. Tomo decides via `NO_REPLY` whether to respond. iMessage groups are always passive regardless of this list. |
 | `channels.imessage.provider` | string | `"imsg"` — the only backend, and required to enable the iMessage channel. Omit the key to leave iMessage off. Tomo needs Full Disk Access; advanced features (tapbacks, typing, unsend, rename, threaded replies) also need `imsg launch`. |
 | `channels.imessage.cliPath` | string | Optional path to the `imsg` binary. Default: `imsg` resolved from `PATH`. |
 | `channels.imessage.dbPath` | string | Optional chat.db path forwarded to `imsg rpc --db`. |
-| `channels.imessage.allowlist` | string[] | Phone numbers (`+15551234567`) or iMessage chat GUIDs (`iMessage;-;+15551234567`, `iMessage;+;chat...`). |
-| `identities[].name` | string | Unified identity name (lowercased to form the session key `dm:<name>`). |
-| `identities[].channels` | object | `{ channelName: chatId }` — maps each channel the identity uses to its chatId. |
-| `identities[].replyPolicy` | string | `"last-active"` (reply on whichever channel the identity last messaged from) or a fixed channel name like `"telegram"` / `"imessage"` (always reply there). |
+| `channels.imessage.allowlist` | string[] | ACTIVATED GROUP chat GUIDs (`any;+;chat…`). Groups only: phone numbers / DM GUIDs here are ignored — put the owner's handle in `owner.imessage`. |
+| `owner.name` | string | The one person Tomo works for. Lowercased, it IS the session id `dm:<name>` that every owner DM (Telegram, iMessage, web) shares — never change it on an existing install (history, cron jobs and model overrides are keyed by it). |
+| `owner.displayName` | string | Optional: what Tomo calls the owner. Safe to change. |
+| `owner.telegram` | string[] | The owner's Telegram user IDs. Only these get DM answers on Telegram. |
+| `owner.imessage` | string[] | The owner's iMessage phone numbers (E.164, `+15551234567`) or Apple ID emails. Only these get DM answers on iMessage. |
+| `identities` | array | Legacy, read-only for compatibility: one identity is read as the owner; with several, `web.ownerIdentity` (else the first) is. Do not add or edit it — write `owner`. `replyPolicy` is ignored: replies go to the channel the owner last used. |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). Written by `/model <name>` for the current chat and by the `tomo config` Sessions menu. |
 | `litellm.mode` | string | Optional mode label. `"anthropic-compatible"` (default) is a generic proxy; `"chatgpt-subscription"` is the tested OpenAI/ChatGPT subscription path through LiteLLM. Also settable with `TOMO_LITELLM_MODE`. |
 | `litellm.baseUrl` | string | Optional LiteLLM proxy base URL, e.g. `http://localhost:4000`. When set, Tomo still uses Claude Agent SDK but sends SDK model calls to the proxy via `ANTHROPIC_BASE_URL`. |

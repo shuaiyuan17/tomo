@@ -49,7 +49,7 @@ The `tomo cron list / add / remove` CLI is still here for human debugging (audit
 
 | Path | Purpose |
 |------|---------|
-| `~/.tomo/config.json` | Configuration (channels, identities, model, LiteLLM gateway, session model overrides) |
+| `~/.tomo/config.json` | Configuration (owner, channels, model, LiteLLM gateway, session model overrides) |
 | `~/.tomo/workspace/` | Agent working directory (cwd) |
 | `~/.tomo/workspace/memory/` | Persistent memory files |
 | `~/.tomo/workspace/memory/MEMORY.md` | Memory index (loaded every conversation) |
@@ -63,7 +63,7 @@ The `tomo cron list / add / remove` CLI is still here for human debugging (audit
 
 ## Config file
 
-`~/.tomo/config.json` holds model, channels, identities, allowlists, LiteLLM gateway settings, session model overrides, Claude Code plugins (`plugins` array — local paths or `claude plugin install` refs, loaded into every session), and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, ChatGPT subscription LiteLLM config, and env-var overrides see [CONFIG.md](CONFIG.md). Manual edits require `tomo restart` to take effect; `/model <name>` persists and applies the current session override without a restart.
+`~/.tomo/config.json` holds the `owner` (the one person whose DMs are answered — name, Telegram IDs, iMessage handles), model, channels, group allowlists (activated groups only; DM entries are ignored), LiteLLM gateway settings, session model overrides, Claude Code plugins (`plugins` array — local paths or `claude plugin install` refs, loaded into every session), and other settings. Prefer editing via `tomo config`; for the full field list, example JSON, ChatGPT subscription LiteLLM config, and env-var overrides see [CONFIG.md](CONFIG.md). Manual edits require `tomo restart` to take effect; `/model <name>` persists and applies the current session override without a restart.
 
 Before changing `~/.tomo/config.json` directly, copy the current file to `~/.tomo/config.json.bak`, then write the updated config. If the new config breaks Tomo while the harness is still reachable, the user can send `/restore` to copy `config.json.bak` back to `config.json` and restart.
 
@@ -104,14 +104,14 @@ The active mode plus group title and known participants are part of your per-ses
 ### Proactive messaging (MCP tools)
 In-process MCP tools let you message outside the current conversation:
 
-- `mcp__tomo-internal__list_sessions` — discover valid targets. Returns `{identities: [{name}], groups: [{key, title?, participants?}]}`. Group titles and participants populate as messages arrive in the group; an entry without them just hasn't seen activity since the schema landed.
+- `mcp__tomo-internal__list_sessions` — discover valid targets. Returns `{owner: {name, displayName?} | null, identities: [{name}] (deprecated alias), groups: [{key, title?, participants?}]}`. Group titles and participants populate as messages arrive in the group; an entry without them just hasn't seen activity since the schema landed.
 - `mcp__tomo-internal__send_message(target, message, mode?)` — send to a target. Two modes:
   - `delegate` (default): describe the *intent* (e.g. "follow up with Alice about her recent trip"). The recipient session's Claude composes the actual message in its own voice/context. Best for social or contextual relays. Fire-and-forget.
   - `direct`: send the verbatim text. Recipient is not triggered into a Claude turn. Best for factual broadcasts ("meeting moved to 3pm"), pasted content, or self-targeted mid-loop progress updates.
 - `mcp__tomo-internal__rename_group_chat(target, title)` — rename the real Telegram or iMessage group title. Use only when the user explicitly asks for a rename; `target` must be a group session key from `list_sessions`.
 - `mcp__tomo-internal__react_to_message(target, reaction, match?, remove?)` — react/tapback to a message: the latest inbound one Tomo has seen in that session by default, or a specific one via `match` (case-insensitive substring of its text, searched newest-first over the chat's recent messages; currently iMessage only). Latest-message state is in-memory; after a restart, wait for a new inbound message or use `match`. Usually pass the current Session key. Reactions: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`.
 
-Pass identity name (`"alice"`) or session key (`"telegram:-1001234567"`) as `target`. Call `list_sessions` first if unsure. Tool result lines (with `is_error` flag) appear in `tomo logs` immediately after the corresponding tool call.
+Pass the owner's name (`"alice"`) or `"owner"`, or a session key (`"telegram:-1001234567"`) as `target`. Call `list_sessions` first if unsure. Tool result lines (with `is_error` flag) appear in `tomo logs` immediately after the corresponding tool call.
 
 ### External MCP tools
 Users may configure additional MCP servers in `~/.tomo/config.json`; their tools appear as `mcp__<server>__<tool>`. Use them normally when relevant.

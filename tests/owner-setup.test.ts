@@ -68,6 +68,22 @@ describe("checkImessageOwnerHandle (validation table)", () => {
     expect(checkImessageOwnerHandle(input)).toMatchObject(expected);
   });
 
+  it("the +1 question for an 11-digit number starting with 1 defaults to NO; the 10-digit one to yes", async () => {
+    const seen: Array<{ message: string; initialValue?: boolean }> = [];
+    const answers = ["13812345678", "+86 138 1234 5678", "5555550123"];
+    const port: PromptPort = {
+      text: async () => answers.shift() ?? "",
+      confirm: async (o) => { seen.push(o); return false; },
+      select: async () => "",
+      isCancel: (_v: unknown): _v is symbol => false,
+      log: { info: () => {}, warn: () => {}, success: () => {} },
+    };
+    await expect(promptImessageOwnerHandles(port)).resolves.toEqual({ kind: "handles", handles: ["+8613812345678"] });
+    expect(seen.map((o) => o.initialValue)).toEqual([false]);
+    expect(checkImessageOwnerHandle("13812345678")).toMatchObject({ kind: "confirm", defaultYes: false });
+    expect(checkImessageOwnerHandle("5555550123")).toMatchObject({ kind: "confirm", defaultYes: true });
+  });
+
   it("never silently turns an 11-digit number starting with 1 into a US number", async () => {
     // A Chinese mobile typed without "+": declining the +1 question re-asks.
     const { port } = scripted({ text: ["150 1234 5678", "+86 150 1234 5678"], confirm: [false] });
@@ -79,6 +95,7 @@ describe("checkImessageOwnerHandle (validation table)", () => {
       kind: "confirm",
       handle: "+15555550123",
       question: expect.stringContaining("+15555550123"),
+      defaultYes: true,
     });
   });
 

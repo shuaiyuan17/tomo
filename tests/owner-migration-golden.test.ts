@@ -23,6 +23,7 @@ import {
 } from "./helpers/agent-harness.js";
 import { OwnerRouter } from "../src/router.js";
 import { CronStore } from "../src/cron/store.js";
+import { precreateOwnerSessionUnlessAdoptable } from "../src/cli/init-setup.js";
 import { SummonStore } from "../src/sessions/summon-store.js";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
 import { webSessionId } from "../src/web/owner.js";
@@ -479,6 +480,25 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     await drainQueue(agent);
     await agent.stop();
     expect(mockSdk.optionsBySession.map((o) => [o.sessionKey, o.options.resume])).toEqual([[RAW, SDK_ID]]);
+  });
+
+  it("tomo init on a pre-identity install does not strand the history: the first start still adopts it", async () => {
+    useRealAdmission();
+    seedPreIdentityInstall();
+    // What `tomo init --force` now does for the owner session…
+    expect(precreateOwnerSessionUnlessAdoptable({ name: "owner", telegram: [TG_ID], imessage: [] }, mockConfig.sessionsDir, mockConfig.sdkSessionsDir))
+      .toBe("deferred-to-adoption");
+    // …so the daemon's first start adopts the raw session with its cron job and model.
+    const agent = new Agent();
+    agent.prepareOwner();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    mockSdk.responseFn = () => "ok";
+    await tg.simulateMessage(makeMsg({ chatId: TG_ID, senderId: TG_ID, text: "hi again" }));
+    await drainQueue(agent);
+    await agent.stop();
+    expect(mockSdk.optionsBySession.map((o) => [o.sessionKey, o.options.resume])).toEqual([["dm:owner", SDK_ID]]);
+    expect(jobKeys()).toContainEqual(["morning", "dm:owner"]);
   });
 });
 

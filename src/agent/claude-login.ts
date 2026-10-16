@@ -215,7 +215,11 @@ export function verifyClaudeLogin(): Promise<void> {
           return;
         }
         const detail = `${stderr || stdout}`.trim().split("\n")[0]?.slice(0, 300);
-        reject(new Error(`Claude login verification failed${detail ? `: ${detail}` : ""}`));
+        const failure = new Error(`Claude login verification failed${detail ? `: ${detail}` : ""}`) as Error & { timedOut?: boolean };
+        // execFile's timeout kills the child: say so, so callers can tell a
+        // slow/unreachable service from a missing login.
+        if ((err as { killed?: boolean }).killed) failure.timedOut = true;
+        reject(failure);
       },
     );
   });

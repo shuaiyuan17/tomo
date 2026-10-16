@@ -17,7 +17,10 @@ import { ownerSessionKey, resolveOwner, type LegacyIdentity, type OwnerConfig } 
  */
 export type ImessageHandleCheck =
   | { kind: "ok"; handle: string; note?: string }
-  | { kind: "confirm"; handle: string; question: string }
+  /** `defaultYes`: what Enter means. Only the unambiguous 10-digit US/Canada
+   *  shape defaults to yes; an 11-digit number starting with 1 (every Chinese
+   *  mobile looks like that) defaults to no. */
+  | { kind: "confirm"; handle: string; question: string; defaultYes: boolean }
   | { kind: "error"; error: string };
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -53,6 +56,7 @@ export function checkImessageOwnerHandle(raw: string): ImessageHandleCheck {
       kind: "confirm",
       handle: `+1${digits}`,
       question: `No country code given. Use +1${digits} (US/Canada)?`,
+      defaultYes: true,
     };
   }
   if (digits.length === 11 && digits.startsWith("1")) {
@@ -63,6 +67,7 @@ export function checkImessageOwnerHandle(raw: string): ImessageHandleCheck {
       kind: "confirm",
       handle: `+${digits}`,
       question: `No "+" given. Is +${digits} a US/Canada number? (If not, answer no and enter it with its country code, e.g. +86 150 1234 5678.)`,
+      defaultYes: false,
     };
   }
   return {
@@ -146,7 +151,7 @@ export async function promptImessageOwnerHandles(prompts: PromptPort): Promise<O
         break;
       }
       if (check.kind === "confirm") {
-        const yes = await prompts.confirm({ message: check.question, initialValue: true });
+        const yes = await prompts.confirm({ message: check.question, initialValue: check.defaultYes });
         if (prompts.isCancel(yes)) return { kind: "cancelled" };
         if (yes !== true) {
           prompts.log.info("Enter the number with its country code, starting with +.");

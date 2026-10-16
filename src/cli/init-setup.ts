@@ -1,6 +1,8 @@
 import { execFile, spawnSync } from "node:child_process";
 import { resolveClaudeExecutable, verifyClaudeLogin } from "../agent/claude-login.js";
-import { ownerSessionKey, type OwnerConfig } from "../owner.js";
+import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
+import { SessionStore } from "../sessions/store.js";
+import { legacySessionKeysForBinding } from "../sessions/keys.js";
 import {
   deriveOwnerName,
   promptImessageOwnerHandles,
@@ -11,6 +13,8 @@ import {
 export type InitChannel = "telegram" | "imessage";
 
 export interface InitAnswers {
+  /** Write `auth` (an environment API key the user chose to save). */
+  auth?: { method: "api-key"; apiKey: string };
   userName: string;
   channels: InitChannel[];
   telegramToken?: string;
@@ -28,9 +32,9 @@ export interface InitAnswers {
  * written: the owner's DMs are admitted through `owner`, and groups stay off
  * until activated with the secret.
  */
-export function buildInitConfig(a: InitAnswers): { config: Record<string, unknown>; owner: OwnerConfig } {
+export function buildInitConfig(a: InitAnswers & { ownerName?: string }): { config: Record<string, unknown>; owner: OwnerConfig } {
   const owner: OwnerConfig = {
-    name: deriveOwnerName(a.userName),
+    name: a.ownerName ?? deriveOwnerName(a.userName),
     ...(a.userName.trim() ? { displayName: a.userName.trim() } : {}),
     telegram: a.channels.includes("telegram") && a.telegramUserId ? [a.telegramUserId] : [],
     imessage: a.channels.includes("imessage") ? [...(a.imessageHandles ?? [])] : [],
@@ -50,6 +54,7 @@ export function buildInitConfig(a: InitAnswers): { config: Record<string, unknow
   };
   if (a.city?.trim()) config.city = a.city.trim();
   if (a.groupSecret) config.groupSecret = a.groupSecret;
+  if (a.auth) config.auth = a.auth;
   return { config, owner };
 }
 
@@ -168,7 +173,24 @@ export function probeImsgCli(cliPath = "imsg"): Promise<boolean> {
 export type ClaudeRuntimeCheck =
   | { kind: "ok"; version: string; auth: "logged-in" | "api-key" }
   | { kind: "not-logged-in"; version: string }
+  /** The check itself could not run to a verdict (rate limit, network,
+   *  timeout): the login may be fine — retry, don't send the user to a
+   *  browser login. */
+  | { kind: "unverified"; version: string; reason: "rate-limited" | "network" | "timeout"; detail: string }
   | { kind: "missing"; error: string };
+
+const RATE_LIMIT_RE = /rate.?limit|\b429\b|usage limit|overloaded|\b529\b|too many requests/i;
+const NETWORK_RE = /ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|getaddrinfo|fetch failed|socket hang up|network/i;
+
+/** Why a login verification failed, when it was not about the login. */
+export function classifyVerifyFailure(err: unknown): "rate-limited" | "network" | "timeout" | undefined {
+  const e = err as { message?: unknown; timedOut?: unknown };
+  const message = typeof e?.message === "string" ? e.message : String(err);
+  if (e?.timedOut === true) return "timeout";
+  if (RATE_LIMIT_RE.test(message)) return "rate-limited";
+  if (NETWORK_RE.test(message)) return "network";
+  return undefined;
+}
 
 /**
  * `tomo init`'s prerequisite. Tomo does NOT need a separately installed and
@@ -196,7 +218,9 @@ export async function checkClaudeRuntime(deps: {
   try {
     await (deps.verifyLogin ?? verifyClaudeLogin)();
     return { kind: "ok", version, auth: "logged-in" };
-  } catch {
+  } catch (err) {
+    const reason = classifyVerifyFailure(err);
+    if (reason) return { kind: "unverified", version, reason, detail: err instanceof Error ? err.message : String(err) };
     return { kind: "not-logged-in", version };
   }
 }
@@ -205,4 +229,134 @@ export async function checkClaudeRuntime(deps: {
 export function runInteractiveClaudeLogin(): boolean {
   const res = spawnSync(resolveClaudeExecutable(), ["auth", "login"], { stdio: "inherit" });
   return res.status === 0;
+}
+
+// ---------------------------------------------------------------------------
+// `tomo init --force` on an existing install
+// ---------------------------------------------------------------------------
+
+type RawConfig = Record<string, unknown>;
+
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/**
+ * The config `tomo init` writes, MERGED onto an existing one (`--force`).
+ * Only what init asks again is replaced: the owner (for the channels picked
+ * now — the name is decided by the caller and never silently changed), the
+ * picked channels' token / provider, the model, the city if one was given,
+ * the group secret if a new one was made, and `auth` when the user chose to
+ * save an environment API key. Everything else — `auth`, model overrides,
+ * LiteLLM, web, allowlists, passive groups, `cliPath`, plugins, MCP servers,
+ * an existing group secret… — is carried over untouched.
+ */
+export function mergeInitConfig(
+  existing: RawConfig | undefined,
+  fresh: RawConfig,
+  picked: InitChannel[],
+): { config: RawConfig; kept: string[]; replaced: string[] } {
+  if (!existing || Object.keys(existing).length === 0) {
+    return { config: fresh, kept: [], replaced: Object.keys(fresh) };
+  }
+  const out = clone(existing);
+  const replaced = new Set<string>();
+
+  const freshOwner = fresh.owner as { name: string; displayName?: string; telegram: string[]; imessage: string[] };
+  const oldOwner = (typeof existing.owner === "object" && existing.owner !== null ? existing.owner : {}) as Record<string, unknown>;
+  out.owner = {
+    ...clone(oldOwner),
+    name: freshOwner.name,
+    ...(freshOwner.displayName ? { displayName: freshOwner.displayName } : {}),
+    telegram: picked.includes("telegram") ? freshOwner.telegram : (oldOwner.telegram ?? []),
+    imessage: picked.includes("imessage") ? freshOwner.imessage : (oldOwner.imessage ?? []),
+  };
+  replaced.add("owner");
+
+  const freshChannels = (fresh.channels ?? {}) as Record<string, Record<string, unknown>>;
+  if (Object.keys(freshChannels).length > 0) {
+    const channels = (out.channels && typeof out.channels === "object" ? out.channels : {}) as Record<string, Record<string, unknown>>;
+    for (const [name, entry] of Object.entries(freshChannels)) {
+      channels[name] = { ...(channels[name] ?? {}), ...entry };
+    }
+    out.channels = channels;
+    replaced.add("channels");
+  }
+  for (const key of ["model", "city", "groupSecret", "auth"] as const) {
+    if (fresh[key] !== undefined) {
+      out[key] = clone(fresh[key]);
+      replaced.add(key);
+    }
+  }
+  const kept = Object.keys(existing).filter((key) => !replaced.has(key));
+  return { config: out, kept, replaced: [...replaced] };
+}
+
+/**
+ * `owner.name` is the session id. On `--force` with an owner already set, the
+ * existing name is kept unless the user explicitly picks the new one — and
+ * is told that the old session, its history and cron jobs stay on the old key.
+ */
+export async function decideOwnerName(
+  prompts: PromptPort,
+  existingName: string | undefined,
+  newName: string,
+): Promise<string | null> {
+  if (!existingName || existingName.toLowerCase() === newName.toLowerCase()) return existingName ?? newName;
+  const choice = await prompts.select({
+    message: `Your current session id is dm:${existingName.toLowerCase()}. Keep it?`,
+    options: [
+      { value: "keep", label: `Keep dm:${existingName.toLowerCase()}`, hint: "recommended: your history, cron jobs and model override stay with you" },
+      { value: "new", label: `Start a new session id dm:${newName}`, hint: `the old session and its cron jobs stay on dm:${existingName.toLowerCase()}` },
+    ],
+  });
+  if (prompts.isCancel(choice)) return null;
+  return choice === "new" ? newName : existingName;
+}
+
+/**
+ * Pre-create the owner's `dm:` session — unless that would strand history.
+ *
+ * - The owner key already has (or had) an entry: nothing to do.
+ * - A legacy per-channel session of the owner exists (an install from before
+ *   identities, or a raw session from the open-channel era): do NOT
+ *   pre-create. An existing owner entry blocks the one-time adoption, which
+ *   is what would carry that history, its cron jobs and its model override
+ *   into `dm:<owner>`; the daemon's first start does that adoption.
+ * - Otherwise create the metadata-only entry, so every channel connected
+ *   later joins it.
+ */
+export function precreateOwnerSessionUnlessAdoptable(
+  owner: OwnerConfig,
+  sessionsDir: string,
+  sdkSessionsDir: string,
+): "exists" | "deferred-to-adoption" | "created" {
+  const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
+  const key = ownerSessionKey(owner);
+  if (store.hasEverHadEntry(key)) return "exists";
+  const active = store.listSdkSessionIds().map(([k]) => k);
+  const candidates = OWNER_CHANNELS.flatMap((channel) =>
+    ownerBindings(owner, channel).flatMap((bound) => legacySessionKeysForBinding(active, channel, bound)));
+  if (candidates.length > 0) return "deferred-to-adoption";
+  store.ensureEntry(key);
+  return "created";
+}
+
+/**
+ * The API key to offer saving into `config.auth`: one that is set only in
+ * this shell's environment. launchd (autostart) does not inherit the shell,
+ * so without saving it the daemon started at login would not have it.
+ * Undefined when there is nothing to offer (no env key, or config already
+ * holds an API key).
+ */
+export function envApiKeyNeedingSave(
+  runtime: ClaudeRuntimeCheck,
+  env: NodeJS.ProcessEnv,
+  existingConfig: Record<string, unknown> | undefined,
+): string | undefined {
+  const key = env.ANTHROPIC_API_KEY?.trim();
+  if (!key || runtime.kind !== "ok" || runtime.auth !== "api-key") return undefined;
+  const saved = (existingConfig?.auth ?? {}) as { method?: unknown; apiKey?: unknown };
+  if (saved.method === "api-key" && typeof saved.apiKey === "string" && saved.apiKey.trim()) return undefined;
+  return key;
 }

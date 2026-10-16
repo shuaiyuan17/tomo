@@ -6,14 +6,17 @@ import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
-import { backupConfigIfParseableSync, SDK_SESSIONS_DIR } from "./config/shared.js";
-import { SessionStore } from "../sessions/store.js";
-import { dmSessionKeyForIdentity } from "../sessions/keys.js";
+import { backupConfigIfParseableSync, loadConfig, saveConfig } from "./config/shared.js";
+import { currentOwner, deriveOwnerName } from "./config/owner-setup.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { DEFAULT_MODEL, PICKER_MODELS } from "../models.js";
 import {
   buildInitConfig,
   checkClaudeRuntime,
+  decideOwnerName,
+  envApiKeyNeedingSave,
+  mergeInitConfig,
+  precreateOwnerSessionUnlessAdoptable,
   ownerSummary,
   probeImsgCli,
   runChannelSetup,
@@ -89,7 +92,13 @@ export const initCommand = new Command("init")
       p.outro("Setup incomplete");
       process.exit(1);
     }
-    if (runtime.kind === "ok") {
+    if (runtime.kind === "unverified") {
+      s0.stop(`Claude Code found (${runtime.version}); login could not be checked`);
+      const why = runtime.reason === "rate-limited" ? "the Claude service is rate-limiting or overloaded"
+        : runtime.reason === "network" ? "the network or the Claude service is unreachable"
+        : "the check timed out";
+      p.log.warn(`Couldn't verify your Claude login because ${why}. That says nothing about the login itself — continuing. If Tomo doesn't answer later, retry \`tomo init\` or send /login from your owner DM.`);
+    } else if (runtime.kind === "ok") {
       s0.stop(`Claude Code ready (${runtime.version}; ${runtime.auth === "api-key" ? "using ANTHROPIC_API_KEY" : "logged in"})`);
     } else {
       s0.stop(`Claude Code found (${runtime.version}) but not logged in`);
@@ -106,8 +115,41 @@ export const initCommand = new Command("init")
       }
     }
 
+    // The current config (for --force: merged onto, never rebuilt from scratch).
+    let existingConfig: Record<string, unknown> | undefined;
+    if (existsSync(configPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(configPath, "utf-8")) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existingConfig = parsed as Record<string, unknown>;
+      } catch {
+        p.log.warn("The existing config.json does not parse; --force will replace it (it is kept as a backup only if it parses).");
+      }
+    }
+
+    // An API key only in the shell environment is invisible to the launchd
+    // autostart job: offer to save it, or say plainly that autostart lacks it.
+    let envApiKeyToSave: string | undefined;
+    const envApiKey = envApiKeyNeedingSave(runtime, process.env, existingConfig);
+    if (envApiKey) {
+      const save = await p.confirm({
+        message: "ANTHROPIC_API_KEY is set only in this shell. Save it to ~/.tomo/config.json (owner-only, 0600) so Tomo has it when it starts at login?",
+        initialValue: true,
+      });
+      if (!p.isCancel(save) && save) {
+        envApiKeyToSave = envApiKey;
+      } else {
+        p.log.warn("Not saved. Tomo started at login (launchd) will NOT see ANTHROPIC_API_KEY and will fall back to your Claude login. Save it later with `tomo config` → Anthropic authentication.");
+      }
+    }
+
     if (isReinit) {
-      p.log.info("Existing config found. Use --force to overwrite.");
+      p.log.info("Existing config found. Use --force to re-run setup (your other settings are kept).");
+      if (envApiKeyToSave) {
+        const cfg = loadConfig();
+        cfg.auth = { method: "api-key", apiKey: envApiKeyToSave };
+        saveConfig(cfg);
+        p.log.success("API key saved to config.json");
+      }
     }
 
     // 2. Safety disclaimer (first-time users only)
@@ -167,14 +209,25 @@ export const initCommand = new Command("init")
     }
     s.stop("Directory structure ready");
 
-    // 3. Workspace templates
+    // 3. Workspace templates. `--force` never overwrites the user's own
+    // personality / rules / memory files without asking.
+    const ownFiles = ["SOUL.md", "AGENT.md", "IDENTITY.md", join("memory", "MEMORY.md")]
+      .filter((f) => existsSync(join(WORKSPACE_DIR, f)));
+    let overwriteOwnFiles = false;
+    if (opts.force && ownFiles.length > 0) {
+      const ok = await p.confirm({
+        message: `Overwrite your existing ${ownFiles.join(", ")} with fresh templates? (No keeps them.)`,
+        initialValue: false,
+      });
+      overwriteOwnFiles = !p.isCancel(ok) && ok === true;
+    }
     s.start("Setting up workspace");
     const templates = ["SOUL.md", "AGENT.md", "IDENTITY.md"];
     const copied: string[] = [];
     for (const file of templates) {
       const dest = join(WORKSPACE_DIR, file);
       const src = join(DEFAULTS_DIR, file);
-      if ((!existsSync(dest) || opts.force) && existsSync(src)) {
+      if ((!existsSync(dest) || overwriteOwnFiles) && existsSync(src)) {
         let content = readFileSync(src, "utf-8");
         if (personality) {
           content = applyPersonality(file, content, personality);
@@ -205,7 +258,7 @@ export const initCommand = new Command("init")
     // MEMORY.md with initial content
     const memoryDir = join(WORKSPACE_DIR, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
-    if (!existsSync(memoryFile) || opts.force) {
+    if (!existsSync(memoryFile) || overwriteOwnFiles) {
       if (personality) {
         writeMemory(memoryDir, personality);
         copied.push("MEMORY.md");
@@ -279,7 +332,22 @@ export const initCommand = new Command("init")
         ].join("\n"));
       }
 
-      const { config, owner } = buildInitConfig({
+      // --force on an existing owner: owner.name is the session id. Keep it
+      // unless the user explicitly chooses a new one.
+      const previousOwner = existingConfig ? currentOwner(existingConfig).owner : undefined;
+      const ownerName = await decideOwnerName(initPrompts, previousOwner?.name, deriveOwnerName(personality?.userName ?? ""));
+      if (ownerName === null) {
+        p.cancel("Setup cancelled.");
+        process.exit(0);
+      }
+      // An existing group secret is kept unless a new one was just made.
+      if (!groupSecret && existingConfig?.groupSecret) {
+        p.log.info("Keeping your existing group secret and activated groups.");
+      }
+
+      const { config: freshConfig, owner } = buildInitConfig({
+        ownerName,
+        ...(envApiKeyToSave ? { auth: { method: "api-key" as const, apiKey: envApiKeyToSave } } : {}),
         userName: personality?.userName ?? "",
         channels: setup.channels,
         telegramToken: setup.telegramToken,
@@ -290,10 +358,22 @@ export const initCommand = new Command("init")
         groupSecret,
       });
 
+      const { config, kept, replaced } = mergeInitConfig(existingConfig, freshConfig, setup.channels);
       writeInitConfig(configPath, CONFIG_BACKUP_PATH, config);
-      p.log.success("Config saved");
-      precreateOwnerSession(owner.name);
-      p.note(ownerSummary(owner), "Owner");
+      p.log.success(kept.length > 0
+        ? `Config saved. Replaced: ${replaced.join(", ")}. Kept as they were: ${kept.join(", ")}.`
+        : "Config saved");
+      const finalOwner = currentOwner(config).owner ?? owner;
+      let sessionNote = "";
+      try {
+        const pre = precreateOwnerSessionUnlessAdoptable(finalOwner, SESSIONS_DIR, defaultRuntimePaths.sdkSessionsDir);
+        if (pre === "deferred-to-adoption") {
+          sessionNote = "\nYour earlier conversation will be adopted into this session (with its cron jobs and model) when Tomo starts.";
+        }
+      } catch {
+        // The daemon's first start creates it.
+      }
+      p.note(ownerSummary(finalOwner) + sessionNote, "Owner");
     }
 
     // 4b. Autostart (first-time only, macOS only)
@@ -351,20 +431,6 @@ export function writeInitConfig(configPath: string, backupPath: string, config: 
   mkdirSync(dirname(configPath), { recursive: true });
   backupConfigIfParseableSync(configPath, backupPath);
   writeJsonAtomicSync(configPath, config, { mode: 0o600 });
-}
-
-/**
- * Create the owner's `dm:<name>` session entry right away, so every channel
- * connected later (Telegram now, iMessage or the web UI later) binds to this
- * one session instead of a per-channel one. Best-effort: the daemon creates
- * it on first start anyway.
- */
-export function precreateOwnerSession(ownerName: string, sessionsDir = SESSIONS_DIR, sdkSessionsDir = SDK_SESSIONS_DIR): void {
-  try {
-    new SessionStore(sessionsDir, 20, sdkSessionsDir).ensureEntry(dmSessionKeyForIdentity(ownerName));
-  } catch {
-    // The daemon's first start creates it.
-  }
 }
 
 async function askPersonality(): Promise<Personality | null> {

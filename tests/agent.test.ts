@@ -218,23 +218,20 @@ describe("summarizeToolInput", () => {
 
 describe("model resolution", () => {
   it("maps short names to full model IDs", () => {
-    // 5.5 family, 1M by default: [1m] ids where the SDK takes the suffix
-    // (it strips it from any id, and aliases sonnet/opus/fable[1m]); Haiku
-    // 5.5 is natively 1M and has no [1m] alias in the SDK.
+    // 5.5 family, 1M by default: [1m] ids where the SDK has a [1m] alias
+    // (sonnet/opus/fable); the bundled binary handles the tag in its model
+    // lookup. Haiku 5.5 is natively 1M and has no [1m] alias.
     expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5-5[1m]");
     expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5-5[1m]");
-    expect(MODEL_ALIASES["opus-std"]).toBe("claude-opus-5-5");
     expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5-5[1m]");
     expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5-5[1m]");
-    expect(MODEL_ALIASES["sonnet-std"]).toBe("claude-sonnet-5-5");
     expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-5-5");
     expect(MODEL_ALIASES["fable"]).toBe("claude-fable-5-1[1m]");
-    expect(MODEL_ALIASES["fable-std"]).toBe("claude-fable-5-1");
     expect(DEFAULT_MODEL).toBe("claude-opus-5-5[1m]");
   });
 
   it("does not have unknown model keys", () => {
-    expect(Object.keys(MODEL_ALIASES)).toEqual(["opus", "opus-1m", "opus-std", "sonnet", "sonnet-1m", "sonnet-std", "haiku", "fable", "fable-std"]);
+    expect(Object.keys(MODEL_ALIASES)).toEqual(["opus", "opus-1m", "sonnet", "sonnet-1m", "haiku", "fable"]);
   });
 
   it("pickers offer only the 5.5 family plus Fable 5.1, 1M by default, default first", () => {

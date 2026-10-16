@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { precreateOwnerSession } from "../src/cli/init.js";
 import {
   buildInitConfig,
   checkClaudeRuntime,
+  classifyVerifyFailure,
+  decideOwnerName,
+  envApiKeyNeedingSave,
+  mergeInitConfig,
+  precreateOwnerSessionUnlessAdoptable,
   runChannelSetup,
   type InitPromptPort,
 } from "../src/cli/init-setup.js";
@@ -136,16 +140,118 @@ describe("checkClaudeRuntime (no separately installed `claude` needed)", () => {
   });
 });
 
-describe("precreateOwnerSession", () => {
-  it("creates the owner's dm: entry once, with no SDK session yet", () => {
+describe("precreateOwnerSessionUnlessAdoptable", () => {
+  function dirs() {
     const dir = mkdtempSync(join(tmpdir(), "tomo-init-owner-"));
+    return { dir, sessions: join(dir, "sessions"), sdk: join(dir, "sdk") };
+  }
+  const owner = { name: "alex", telegram: ["123456789"], imessage: [] as string[] };
+
+  it("creates the owner's dm: entry once, with no SDK session yet", () => {
+    const d = dirs();
     try {
-      precreateOwnerSession("alex", join(dir, "sessions"), join(dir, "sdk"));
-      precreateOwnerSession("alex", join(dir, "sessions"), join(dir, "sdk"));
-      const store = new SessionStore(join(dir, "sessions"), 20, join(dir, "sdk"));
+      expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("created");
+      expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("exists");
+      const store = new SessionStore(d.sessions, 20, d.sdk);
       expect(store.listAllSessions().map((e) => [e.channelKey, e.sdkSessionId])).toEqual([["dm:alex", ""]]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(d.dir, { recursive: true, force: true });
     }
+  });
+
+  it("does NOT pre-create when the owner has a legacy per-channel session with history (it would block the adoption)", () => {
+    const d = dirs();
+    try {
+      const store = new SessionStore(d.sessions, 20, d.sdk);
+      store.setSdkSessionId("telegram:123456789", "sdk-legacy");
+      expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("deferred-to-adoption");
+      expect(new SessionStore(d.sessions, 20, d.sdk).getEntry("dm:alex")).toBeUndefined();
+    } finally {
+      rmSync(d.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("tomo init --force merges onto the existing config", () => {
+  const EXISTING = {
+    auth: { method: "api-key", apiKey: "sk-test-existing" },
+    sessionModelOverrides: { "dm:alex": "claude-opus-5-5[1m]" },
+    litellm: { baseUrl: "http://localhost:4000" },
+    web: { port: 9999 },
+    groupSecret: "tomo-existing",
+    plugins: ["./p"],
+    owner: { name: "alex", displayName: "Alex", telegram: ["111"], imessage: ["+15555550123"] },
+    channels: {
+      telegram: { token: "old-token", allowlist: ["-100555"], passiveGroups: ["-100555"] },
+      imessage: { provider: "imsg", cliPath: "/opt/homebrew/bin/imsg", allowlist: ["any;+;chat1"] },
+    },
+    model: "claude-sonnet-5[1m]",
+  };
+
+  it("replaces only what init re-asked; keeps every other field, and the unpicked channel's owner handles", () => {
+    const { config: fresh } = buildInitConfig({
+      ownerName: "alex", userName: "Alex", channels: ["telegram"], telegramToken: TOKEN, telegramUserId: "222", model: "claude-opus-5-5[1m]",
+    });
+    const { config, kept, replaced } = mergeInitConfig(structuredClone(EXISTING), fresh, ["telegram"]);
+    expect(config).toEqual({
+      ...EXISTING,
+      owner: { name: "alex", displayName: "Alex", telegram: ["222"], imessage: ["+15555550123"] },
+      channels: { ...EXISTING.channels, telegram: { ...EXISTING.channels.telegram, token: TOKEN } },
+      model: "claude-opus-5-5[1m]",
+    });
+    expect(replaced.sort()).toEqual(["channels", "model", "owner"]);
+    expect(kept.sort()).toEqual(["auth", "groupSecret", "litellm", "plugins", "sessionModelOverrides", "web"]);
+  });
+
+  it("a fresh install is written as built", () => {
+    const { config: fresh } = buildInitConfig({ userName: "Alex", channels: ["telegram"], telegramToken: TOKEN, telegramUserId: "1", model: "m" });
+    expect(mergeInitConfig(undefined, fresh, ["telegram"]).config).toEqual(fresh);
+  });
+
+  it("keeps the existing owner name unless the user explicitly picks the new one", async () => {
+    const pick = (answer: string | symbol) => ({
+      ...scripted({}).port,
+      select: async () => answer,
+    });
+    expect(await decideOwnerName(pick("keep"), "alex", "sam")).toBe("alex");
+    expect(await decideOwnerName(pick("new"), "alex", "sam")).toBe("sam");
+    expect(await decideOwnerName(pick(CANCEL), "alex", "sam")).toBeNull();
+    // Same name (any case), or no previous owner: no question.
+    expect(await decideOwnerName(scripted({}).port, "Alex", "alex")).toBe("Alex");
+    expect(await decideOwnerName(scripted({}).port, undefined, "sam")).toBe("sam");
+  });
+
+  it("offers to save an API key that is only in the environment (launchd won't see it)", () => {
+    const apiKeyRuntime = { kind: "ok", version: "v", auth: "api-key" } as const;
+    expect(envApiKeyNeedingSave(apiKeyRuntime, { ANTHROPIC_API_KEY: " sk-env " }, undefined)).toBe("sk-env");
+    expect(envApiKeyNeedingSave(apiKeyRuntime, { ANTHROPIC_API_KEY: "sk-env" }, { auth: { method: "subscription" } })).toBe("sk-env");
+    // Already saved, or not using a key: nothing to offer.
+    expect(envApiKeyNeedingSave(apiKeyRuntime, { ANTHROPIC_API_KEY: "sk-env" }, { auth: { method: "api-key", apiKey: "sk-saved" } })).toBeUndefined();
+    expect(envApiKeyNeedingSave({ kind: "ok", version: "v", auth: "logged-in" }, {}, undefined)).toBeUndefined();
+  });
+
+  it("writes an environment API key to auth only when asked to", () => {
+    const withKey = buildInitConfig({ userName: "a", channels: ["telegram"], telegramToken: TOKEN, telegramUserId: "1", model: "m", auth: { method: "api-key", apiKey: "sk-test" } });
+    expect(withKey.config.auth).toEqual({ method: "api-key", apiKey: "sk-test" });
+    expect(buildInitConfig({ userName: "a", channels: ["telegram"], telegramToken: TOKEN, telegramUserId: "1", model: "m" }).config).not.toHaveProperty("auth");
+  });
+});
+
+describe("login check failures that are not about the login", () => {
+  it.each([
+    [Object.assign(new Error("Claude login verification failed"), { timedOut: true }), "timeout"],
+    [new Error("Claude login verification failed: API Error: 429 rate_limit_error"), "rate-limited"],
+    [new Error("Claude login verification failed: 529 Overloaded"), "rate-limited"],
+    [new Error("Claude login verification failed: getaddrinfo ENOTFOUND api.anthropic.com"), "network"],
+    [new Error("Claude login verification failed: Invalid API key · Please run /login"), undefined],
+  ])("%s → %s", (err, expected) => {
+    expect(classifyVerifyFailure(err)).toBe(expected);
+  });
+
+  it("reports unverified (retry), not not-logged-in, for a rate limit", async () => {
+    await expect(checkClaudeRuntime({
+      resolveExecutable: () => "/bundled/claude", version: async () => "v", env: {},
+      verifyLogin: async () => { throw new Error("Claude login verification failed: rate limit exceeded"); },
+    })).resolves.toMatchObject({ kind: "unverified", reason: "rate-limited" });
   });
 });

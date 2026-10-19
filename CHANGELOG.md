@@ -1,48 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 (2026-10-19)
+
+**Upgrade notes: check before restarting.** `owner` replaces `identities`, and a channel with no `allowlist` is no longer open. Existing configs keep working, but:
+
+- If your DMs were answered only because a channel had no allowlist, add your Telegram ID or iMessage handle in `tomo config` → Owner. The daemon warns at startup.
+- Groups on a channel with no `allowlist` go silent until activated, including `passiveGroups` and earlier `/summon`s. To activate one, send the group secret in it (`tomo config` → Group chats) or add its id to the `allowlist`.
+- DM entries in an allowlist (guest DMs) are no longer answered.
+- With several identities, only `web.ownerIdentity` (or else the first) is answered. The others' cron jobs keep firing; `tomo config` → Owner → Convert legacy identities offers to disable them.
+
+### Features
+
+- **Single owner** (#426, #427): `owner: { name, displayName?, telegram, imessage }`. Every owner DM (Telegram, iMessage, web) goes to one `dm:<name>` session. An old `identities` config keeps its session, transcripts, cron jobs and model override. Replies go to the channel you last wrote from (`replyPolicy` is ignored).
+- **5.5 models** (#427): **the default model changes** from `claude-sonnet-5[1m]` to `claude-opus-5-5[1m]`, which costs more. This applies only when `model` is unset; set `model: "sonnet"` to stay cheaper. Older ids are still accepted.
+- **Simpler `tomo init`** (#427): pick Telegram, iMessage or both, and give a validated iMessage handle. `claude` no longer has to be on PATH, and `--force` merges onto the existing config.
+- **Owner notices for hidden errors** (#420): errors kept out of a group chat, or out of silent crons and heartbeats, are sent to the owner's DM with a recovery hint, at most once per 30 minutes per chat and error type. **On by default**; turn off with `notifyOwnerOnSuppressedErrors: false`.
+
+### Bug fixes
+
+- A session whose stored conversation is gone (e.g. an archived group) resets and retries instead of failing every message (#424).
+- `/login` works under launchd by using the Agent SDK's bundled Claude Code (#421); `/usage` refreshes an expired token instead of asking you to log in again (#419).
+- MCP OAuth registers a client again when the issuer has rejected it, instead of ending on "Invalid client_id" (#417).
+- `tomo config` and the daemon no longer overwrite each other's `config.json` edits (#426).
 
 ### Security
 
-- **DM admission fails closed.** A channel without an `allowlist` used to be open: on a fresh iMessage setup any phone number or email that texted the Mac got its own session with the owner's tools. Now a DM is answered only when it comes from a handle bound to an identity (or a chat listed explicitly in the channel's allowlist). Unknown senders get no reply, no session and no registry entry; Tomo logs one info line per sender per hour with the handle redacted. iMessage no longer loads a refused chat's attachments or marks it read.
-- **Groups on a channel without an allowlist are closed** (iMessage and Telegram alike). Send the group secret in a group to activate it; that now creates the channel's allowlist.
-- `/model` and `/restore` no longer fall open when no identity is configured.
-- `tomo config` → Channels → iMessage → Enable asks for the handle you text from and binds it to your identity; finishing without one needs an explicit confirmation.
-- iMessage handles are compared in one normal form, so formatting drift (`+1 (555) …`, case, `iMessage;-;` / `SMS;-;` / `any;-;` prefixes) no longer breaks the owner match.
+- DMs need an owner handle and groups need activation. Refused chats get no reply and no session, and iMessage doesn't load their attachments (#425).
+- iMessage handles match exactly in E.164 form, so a number can't match the same digits in another country (#425).
+- `/model` and `/restore` no longer fall open without an owner, the group secret is no longer logged (#425), and login links go only to the owner's DM (#426).
 
-- The group activation secret is no longer written to the log; blocked-chat debug lines carry only the last four characters of the chat id.
-- iMessage handles must match exactly in E.164 form. A number written without `+` only counts as `+1…` when it has 11 digits starting with 1; anything else no longer matches its `+`-prefixed twin in another country. Setup now asks before reading an 11-digit number such as `150 1234 5678` as a US number.
+### Other
 
+- Dependabot updates `react` and `react-dom` together (#431).
 
-### Single owner
+### Dependencies
 
-- **`owner` replaces `identities`.** Tomo works for one person: `owner: { name, displayName?, telegram: [...], imessage: [...] }`. Every owner DM — Telegram, iMessage, web — lands in one session, `dm:<name>`. `name` is the session id and is never rewritten; `displayName` is what Tomo calls you.
-- **Zero-data-loss upgrade.** Configs with `identities` keep working, and are read forever: a single identity is the owner, with the same `dm:<name>` session, transcripts, cron jobs, model override and web conversation id. Nothing is renamed or moved. With several identities, `web.ownerIdentity` (or else the first) becomes the owner and Tomo warns at startup; the others' sessions are left untouched, but their DMs are no longer answered. An install from before identities existed, with exactly one DM entry in its allowlists, adopts that entry as the owner.
-- **No guest DMs.** DM entries in a channel `allowlist` are ignored (with a startup warning). The allowlist only lists activated groups.
-- **The owner session exists from the start.** `tomo init` and the first daemon start create the `dm:<owner>` entry, so a channel connected later joins that session instead of starting another. A legacy per-channel owner session is adopted into it once; the owner session can no longer fork.
-- `replyPolicy` is ignored: replies go to the channel you last wrote from.
-- `list_sessions` returns `owner`; `identities` stays as a one-element alias. `send_message` accepts the owner's name, display name or `"owner"`.
-- Private notices (MCP login links, notifications) only ever go to the owner's DM when an owner is configured.
-- **Adoption is one-time and complete.** A legacy per-channel owner session is adopted only while the owner's `dm:` key has never existed, so `/new`, a timeout reset or a restart can no longer pull an old raw session back in. The adoption moves that session's cron jobs and `sessionModelOverrides` entry with it.
-- **`tomo config` → Owner replaces Identities**: session id read-only, display name, Telegram IDs, iMessage handles, and Convert legacy identities. All setup flows (Owner, Channels → iMessage → Enable, `tomo init`) write the `owner` block, never `identities`. The Identities menu, including its Remove path that rewrote the owner's cron jobs, is gone. Channels → Allowlist is now **Groups** (group ids only; DM entries shown as ignored).
-
-### Setup and models
-
-- **`tomo init`** asks which channels you use — Telegram, iMessage, or both (the web UI is always on) — and for iMessage your phone number or Apple ID email, validated (country code confirmation, pasted chat IDs reduced to the handle, group IDs rejected). It writes an `owner` block (never `identities`), no DM allowlist, and creates your `dm:<name>` session right away.
-- `tomo init` no longer requires a separately installed `claude` on PATH: it checks the Claude Code binary bundled with the Agent SDK (the one sessions and `/login` use since #421), offers to log in through it, and continues with instructions if you'd rather log in later or use an API key.
-- **`tomo init --force` keeps your setup.** It merges onto the existing config and says what it replaced and what it kept (auth, model overrides, LiteLLM, web, allowlists, passive groups, `cliPath`, the group secret… stay). It keeps your owner session id unless you explicitly choose a new one, asks before overwriting SOUL/AGENT/IDENTITY/MEMORY.md, and does not pre-create the owner session when an earlier per-channel conversation exists, so the first start adopts that history.
-- `tomo init` offers to save an `ANTHROPIC_API_KEY` that is only in your shell into `config.json`, since Tomo started at login (launchd) can't see it; declining prints a clear warning. A rate limit, network problem or timeout while checking the Claude login is reported as such (retry later) instead of sending you to a browser login.
-- **Models: the 5.5 family, 1M context by default.** Default `claude-opus-5-5[1m]`. Aliases: `opus`/`opus-1m` → `claude-opus-5-5[1m]`, `sonnet`/`sonnet-1m` → `claude-sonnet-5-5[1m]`, `fable` → `claude-fable-5-1[1m]`, `haiku` → `claude-haiku-5-5` (natively 1M). Older ids are no longer offered in the pickers but are still accepted, so existing configs keep working.
-
-**Upgrade notes — check these before restarting:**
-
-- **Your own DMs go quiet** if Tomo answered you only because a channel had no allowlist. Fix: `tomo config` → Owner, add your Telegram user ID / iMessage handle (the daemon warns at startup for every channel the owner has no handle on).
-- **Hand-written Telegram configs with no `allowlist` whose bot sits in groups: those groups go silent.** Fix: send the group secret in each group (`tomo config` → Group chats to enable or view it), or add the group ids (negative numbers) to `channels.telegram.allowlist`.
-- **`passiveGroups` entries on a channel with no allowlist stop working** (they are not activated). The daemon now warns at startup. Fix: the same — send the secret in each group, or add the ids to that channel's `allowlist`.
-- **Earlier `/summon`s of groups that are not activated stop working**: the group's messages are refused before the summon applies. Fix: activate the group (secret or allowlist), then `/summon` again if the summon has lapsed.
-- iMessage groups on a fresh setup (no allowlist) are off until activated the same way.
-- **Friends listed as DM entries in an allowlist are no longer answered** (no guest DMs; startup warning).
-- **Several identities:** only `web.ownerIdentity` (or else the first) is answered; the others' sessions stay on disk untouched. **Their cron jobs keep firing** into those sessions and deliver to that person's last chat, or are skipped with a warning when the session has no reply target. Fix: `tomo config` → Owner → Convert legacy identities lists them and offers to disable them (it never re-keys them).
+- `@anthropic-ai/claude-agent-sdk` 0.3.296 → 0.3.303 (#422, #428); additive changes only.
+- Minor bumps: `react`/`react-dom` 19.3.1, `vite`, `@playwright/test`, `eslint`, `typescript-eslint`, `vitest`; transitive refresh. `npm audit`: 0 vulnerabilities.
 
 ## 0.10.1 (2026-10-12)
 

@@ -17,6 +17,14 @@ updates:
       - dependency-name: "zod"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
+      # React 19 requires react and react-dom to be the exact same version.
+      # react is a runtime dep and react-dom a dev dep, so without this group
+      # they land in separate PRs and the lone react bump breaks the web UI (#430).
+      # Must stay above dev-dependencies: a dependency joins the first group it matches.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
       dev-dependencies:
         dependency-type: development
   - package-ecosystem: github-actions

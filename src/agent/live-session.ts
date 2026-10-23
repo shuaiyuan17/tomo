@@ -689,6 +689,14 @@ export class LiveSession {
    */
   private backgroundTaskIds = new Set<string>();
   private backgroundIdleWaiters: Array<() => void> = [];
+  /**
+   * Set when the background set drains and cleared when the next turn is
+   * claimed: the CLI reports a finished task in a follow-up turn, but that
+   * turn only counts as busy from its first event, so there is a gap in which
+   * the session looks idle while the task's result is still on its way.
+   */
+  private awaitingTaskReport = false;
+  private turnStartWaiters: Array<() => void> = [];
   private parts: ResponseBlock[] = [];
   private sessionId: string | null = null;
   private alive = true;
@@ -821,6 +829,7 @@ export class LiveSession {
     }
     this.alive = false;
     this.notifyBackgroundIdle();
+    this.onTurnClaimed();
     this.inputWaiter?.();
     // Reject anything still in flight so callers fail fast instead of
     // hanging until their timeout, and wake idle waiters so a queued send()
@@ -867,6 +876,42 @@ export class LiveSession {
       };
       this.backgroundIdleWaiters.push(done);
     });
+  }
+
+  /** True between a background drain and the next SDK-initiated turn. */
+  isAwaitingTaskReport(): boolean {
+    return this.awaitingTaskReport;
+  }
+
+  /**
+   * Resolves true once a turn is claimed (or the session dies), false if
+   * `timeoutMs` elapses first.
+   */
+  async waitForTurnStart(timeoutMs: number): Promise<boolean> {
+    if (!this.alive || this.isBusy()) return true;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.turnStartWaiters = this.turnStartWaiters.filter((w) => w !== done);
+        resolve(false);
+      }, timeoutMs);
+      const done = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      this.turnStartWaiters.push(done);
+    });
+  }
+
+  /**
+   * Wakes turn-start waiters on any claim (so the retire loop re-checks
+   * isBusy), but only an SDK-initiated turn counts as the task report: a user
+   * message claiming the session first doesn't deliver the pending result.
+   */
+  private onTurnClaimed(sdkInitiated = false): void {
+    if (sdkInitiated) this.awaitingTaskReport = false;
+    const waiters = this.turnStartWaiters;
+    this.turnStartWaiters = [];
+    for (const w of waiters) w();
   }
 
   private notifyBackgroundIdle(): void {
@@ -959,6 +1004,7 @@ export class LiveSession {
     const req = this.unownedTurnFactory?.();
     if (!req) return null;
     this.currentRequest = req;
+    this.onTurnClaimed(true);
     this.unownedTurnDropLogged = false;
     this.refreshActivityTimeout();
     log.info({ session: this.sessionKey, reason }, "Routing unowned SDK turn to default delivery target");
@@ -1235,8 +1281,12 @@ export class LiveSession {
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
       const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
+      const hadTasks = this.backgroundTaskIds.size > 0;
       this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
-      if (this.backgroundTaskIds.size === 0) this.notifyBackgroundIdle();
+      if (this.backgroundTaskIds.size === 0) {
+        if (hadTasks) this.awaitingTaskReport = true;
+        this.notifyBackgroundIdle();
+      }
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
@@ -1341,6 +1391,7 @@ export class LiveSession {
         const [first, ...rest] = this.pendingSteers;
         this.pendingSteers = rest;
         this.currentRequest = first.req;
+        this.onTurnClaimed();
         this.promotedSteerText = first.text;
       } else {
         this.clearActivityTimeout();
@@ -1725,6 +1776,7 @@ export class LiveSession {
           // when the caller began waiting for it.
           if (this.turnBudget) resetTurnBudget(this.turnBudget);
           this.currentRequest = req;
+          this.onTurnClaimed();
           this.parts = [];
           this.refreshActivityTimeout();
           this.pushInput(req.message);
@@ -1920,6 +1972,8 @@ export class LiveSession {
   close(): void {
     this.alive = false;
     this.notifyBackgroundIdle();
+    this.onTurnClaimed();
+    this.onTurnClaimed();
     if (this.outstandingDelivery) this.abandonDelivery(this.outstandingDelivery);
     this.inputWaiter?.();
     this.q.close();

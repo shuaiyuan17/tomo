@@ -68,6 +68,12 @@ vi.mock("../src/agent/live-session.js", () => {
     background = false;
     bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }> = [];
     hasActiveBackgroundTasks() { return this.background; }
+    awaitingReport = false;
+    turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }> = [];
+    isAwaitingTaskReport() { return this.awaitingReport; }
+    waitForTurnStart(timeoutMs: number) {
+      return new Promise<boolean>((resolve) => this.turnWaits.push({ timeoutMs, resolve }));
+    }
     waitForBackgroundIdle(timeoutMs: number) {
       return new Promise<boolean>((resolve) => this.bgWaits.push({ timeoutMs, resolve }));
     }
@@ -141,7 +147,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
@@ -335,8 +341,42 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(session.bgWaits[0].timeoutMs).toBeGreaterThan(0);
     expect(session.bgWaits[0].timeoutMs).toBeLessThanOrEqual(PROMPT_RETIRE_BACKGROUND_WAIT_MS);
 
+    // Drained: the follow-up turn reporting the task's result hasn't started yet.
     session.background = false;
+    session.awaitingReport = true;
     session.bgWaits[0].resolve(true);
+    await flushMicrotasks();
+    expect(session.closed).toBe(false);
+    expect(session.turnWaits).toHaveLength(1);
+    expect(session.turnWaits[0].timeoutMs).toBeLessThanOrEqual(PROMPT_RETIRE_REPORT_WAIT_MS);
+
+    // It starts, runs, and ends: now the session retires.
+    session.awaitingReport = false;
+    session.busy = true;
+    session.turnWaits[0].resolve(true);
+    await flushMicrotasks();
+    expect(session.closed).toBe(false);
+    session.busy = false;
+    session.releaseIdle();
+    await flushMicrotasks();
+    expect(session.closed).toBe(true);
+  });
+
+  it("retires without the report turn once the report wait runs out", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    await manager.getOrCreateLiveSession("telegram:1");
+    const session = mockState.instances[0] as FakeSession & {
+      awaitingReport: boolean;
+      turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }>;
+    };
+    // Drained while a turn was running (result folded into it): no follow-up comes.
+    session.awaitingReport = true;
+    prompt = "v2";
+    await manager.getOrCreateLiveSession("telegram:2");
+    await flushMicrotasks();
+    expect(session.closed).toBe(false);
+    session.turnWaits[0].resolve(false);
     await flushMicrotasks();
     expect(session.closed).toBe(true);
   });

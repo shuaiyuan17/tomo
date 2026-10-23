@@ -65,6 +65,12 @@ vi.mock("../src/agent/live-session.js", () => {
     releaseIdle() { for (const r of this.idleResolvers.splice(0)) r(); }
     isAlive() { return !this.closed; }
     isBusy() { return this.busy; }
+    background = false;
+    bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }> = [];
+    hasActiveBackgroundTasks() { return this.background; }
+    waitForBackgroundIdle(timeoutMs: number) {
+      return new Promise<boolean>((resolve) => this.bgWaits.push({ timeoutMs, resolve }));
+    }
     close() { this.closed = true; }
     interruptedWith: Error | null = null;
     interrupt(err: Error) { this.interruptedWith = err; this.closed = true; mockState.onInterrupt?.(err, this); }
@@ -135,7 +141,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
@@ -306,6 +312,110 @@ describe("LiveSessionManager session lifecycle", () => {
     busySession.releaseIdle();
     await flushMicrotasks();
     expect(busySession.closed).toBe(true);
+  });
+
+  it("waits for background tasks before retiring an idle prompt-stale session", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+
+    await manager.getOrCreateLiveSession("telegram:1");
+    const session = mockState.instances[0] as FakeSession & {
+      background: boolean;
+      bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
+    };
+    // Turn over, but a background subagent it launched is still running.
+    session.background = true;
+
+    prompt = "v2";
+    await manager.getOrCreateLiveSession("telegram:2");
+    await flushMicrotasks();
+
+    expect(session.closed).toBe(false);
+    expect(session.bgWaits).toHaveLength(1);
+    expect(session.bgWaits[0].timeoutMs).toBeGreaterThan(0);
+    expect(session.bgWaits[0].timeoutMs).toBeLessThanOrEqual(PROMPT_RETIRE_BACKGROUND_WAIT_MS);
+
+    session.background = false;
+    session.bgWaits[0].resolve(true);
+    await flushMicrotasks();
+    expect(session.closed).toBe(true);
+  });
+
+  it("does not close a session whose new turn started while the background wait timed out", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    await manager.getOrCreateLiveSession("telegram:1");
+    const session = mockState.instances[0] as FakeSession & {
+      background: boolean;
+      bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
+    };
+    session.background = true;
+    prompt = "v2";
+    await manager.getOrCreateLiveSession("telegram:2");
+    await flushMicrotasks();
+
+    // A user turn starts during the wait, then the cap expires mid-turn.
+    session.busy = true;
+    session.bgWaits[0].resolve(false);
+    await flushMicrotasks();
+    expect(session.closed).toBe(false);
+
+    // Retires at the turn's idle boundary, even with the task still live.
+    session.busy = false;
+    session.releaseIdle();
+    await flushMicrotasks();
+    expect(session.closed).toBe(true);
+  });
+
+  it("starts the background wait cap at foreground idle, not when retirement was scheduled", async () => {
+    vi.useFakeTimers();
+    try {
+      let prompt = "v1";
+      const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+      await manager.getOrCreateLiveSession("telegram:1");
+      const session = mockState.instances[0] as FakeSession & {
+        background: boolean;
+        bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
+      };
+      session.busy = true;
+      prompt = "v2";
+      await manager.getOrCreateLiveSession("telegram:2");
+
+      // A turn longer than the cap, which launches a subagent just before it ends.
+      vi.setSystemTime(Date.now() + PROMPT_RETIRE_BACKGROUND_WAIT_MS + 60_000);
+      session.background = true;
+      session.busy = false;
+      session.releaseIdle();
+      await flushMicrotasks();
+
+      expect(session.closed).toBe(false);
+      expect(session.bgWaits).toHaveLength(1);
+      expect(session.bgWaits[0].timeoutMs).toBe(PROMPT_RETIRE_BACKGROUND_WAIT_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires a prompt-stale session anyway when background tasks outlive the wait cap", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+
+    await manager.getOrCreateLiveSession("telegram:1");
+    const session = mockState.instances[0] as FakeSession & {
+      background: boolean;
+      bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
+    };
+    session.background = true;
+
+    prompt = "v2";
+    await manager.getOrCreateLiveSession("telegram:2");
+    await flushMicrotasks();
+    expect(session.closed).toBe(false);
+
+    // Cap elapsed with the task still live.
+    session.bgWaits[0].resolve(false);
+    await flushMicrotasks();
+    expect(session.closed).toBe(true);
   });
 
   it("stop() also closes sessions still retiring after a prompt change", async () => {

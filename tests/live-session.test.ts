@@ -167,6 +167,43 @@ describe("LiveSession tool-result observation", () => {
   });
 });
 
+describe("LiveSession background-task tracking", () => {
+  it("tracks non-ambient tasks from background_tasks_changed and wakes waiters when the set empties", async () => {
+    const { session, harness } = makeSession({});
+    expect(session.hasActiveBackgroundTasks()).toBe(false);
+
+    harness.pushEvent({
+      type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u1",
+      tasks: [
+        { task_id: "a1", task_type: "local_agent", description: "review" },
+        { task_id: "w1", task_type: "monitor", description: "watcher", ambient: true },
+      ],
+    });
+    await waitFor(() => session.hasActiveBackgroundTasks());
+
+    const drained = session.waitForBackgroundIdle(5_000);
+    // Only the ambient watcher left: that is not activity.
+    harness.pushEvent({
+      type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u2",
+      tasks: [{ task_id: "w1", task_type: "monitor", description: "watcher", ambient: true }],
+    });
+    expect(await drained).toBe(true);
+    expect(session.hasActiveBackgroundTasks()).toBe(false);
+    session.close();
+  });
+
+  it("waitForBackgroundIdle times out while a task is still live", async () => {
+    const { session, harness } = makeSession({});
+    harness.pushEvent({
+      type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u1",
+      tasks: [{ task_id: "a1", task_type: "local_agent", description: "review" }],
+    });
+    await waitFor(() => session.hasActiveBackgroundTasks());
+    expect(await session.waitForBackgroundIdle(5)).toBe(false);
+    session.close();
+  });
+});
+
 async function waitFor(cond: () => boolean, ms = 500): Promise<void> {
   const deadline = Date.now() + ms;
   while (!cond()) {

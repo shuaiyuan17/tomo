@@ -18,6 +18,13 @@ import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.j
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
 /**
+ * How long a prompt-stale session may wait for its background tasks before it
+ * is retired anyway. Long enough for a typical subagent run, short enough that
+ * a hung task cannot pin a stale system prompt for the rest of the day.
+ */
+export const PROMPT_RETIRE_BACKGROUND_WAIT_MS = 2 * 60 * 60 * 1000;
+
+/**
  * Session-lifecycle failures that a reset-and-retry can genuinely fix:
  * a broken resume chain ("No conversation found") or the SDK child going
  * away ("Session is closed", process exit). Matched narrowly on purpose —
@@ -389,8 +396,33 @@ export class LiveSessionManager {
     // waitForIdle resolves when no turn is in flight, but a queued send()
     // woken by the same turn-completion can start a new turn before this
     // continuation runs — re-check so a live conversation is never cut.
-    while (session.isAlive() && session.isBusy()) {
-      await session.waitForIdle();
+    //
+    // Background tasks count too. A turn that launched a background subagent
+    // ends while the subagent keeps working, and close() kills it mid-run —
+    // so an edit to a prompt file (MEMORY.md, SOUL.md…) during a long agent
+    // run used to cut the agent off. Wait for the SDK to report the
+    // background set empty, but only up to a cap: a hung task must not keep
+    // a stale prompt alive forever.
+    // The cap starts at the first foreground-idle moment with background work,
+    // not when retirement was scheduled: a long turn must not use it up and
+    // leave a subagent it launched at the very end with no wait at all.
+    let backgroundDeadline: number | null = null;
+    let backgroundCapHit = false;
+    // Every exit from the wait re-checks isBusy(): a new turn can start while
+    // we wait on background tasks, and retiring then would reject it.
+    while (session.isAlive() && (session.isBusy() || (session.hasActiveBackgroundTasks() && !backgroundCapHit))) {
+      if (session.isBusy()) {
+        await session.waitForIdle();
+        continue;
+      }
+      backgroundDeadline ??= Date.now() + PROMPT_RETIRE_BACKGROUND_WAIT_MS;
+      const remaining = backgroundDeadline - Date.now();
+      if (remaining <= 0 || !(await session.waitForBackgroundIdle(remaining))) {
+        backgroundCapHit = true;
+        log.warn({ key }, "Prompt-stale session still has background tasks after the wait cap; retiring at the next idle boundary");
+      } else {
+        log.info({ key }, "Background tasks drained; prompt-stale session can retire");
+      }
     }
     this.promptStale.delete(session);
     // Replaced or closed by another path (error reset, compact reload,

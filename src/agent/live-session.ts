@@ -681,6 +681,14 @@ export class LiveSession {
   // send() callers waiting for the session to go idle (steered messages can
   // keep the session busy past the turn the agent-level queue saw finish).
   private idleWaiters: Array<() => void> = [];
+  /**
+   * Live, non-ambient background tasks (subagents, background shells,
+   * workflows) as last reported by the SDK's `background_tasks_changed`
+   * message, which carries the full set with REPLACE semantics. A turn can
+   * end while these keep running; closing the session then kills them.
+   */
+  private backgroundTaskIds = new Set<string>();
+  private backgroundIdleWaiters: Array<() => void> = [];
   private parts: ResponseBlock[] = [];
   private sessionId: string | null = null;
   private alive = true;
@@ -812,6 +820,7 @@ export class LiveSession {
       this.failTurn(err instanceof Error ? err : new Error(String(err)));
     }
     this.alive = false;
+    this.notifyBackgroundIdle();
     this.inputWaiter?.();
     // Reject anything still in flight so callers fail fast instead of
     // hanging until their timeout, and wake idle waiters so a queued send()
@@ -834,6 +843,36 @@ export class LiveSession {
     this.clearActivityTimeout();
     for (const r of requests) r.reject(err);
     this.notifyIdle();
+  }
+
+  /** True while the SDK reports live, non-ambient background tasks. */
+  hasActiveBackgroundTasks(): boolean {
+    return this.backgroundTaskIds.size > 0;
+  }
+
+  /**
+   * Resolves true once no background task is live (or the session dies),
+   * false if `timeoutMs` elapses first.
+   */
+  async waitForBackgroundIdle(timeoutMs: number): Promise<boolean> {
+    if (!this.alive || this.backgroundTaskIds.size === 0) return true;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.backgroundIdleWaiters = this.backgroundIdleWaiters.filter((w) => w !== done);
+        resolve(false);
+      }, timeoutMs);
+      const done = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      this.backgroundIdleWaiters.push(done);
+    });
+  }
+
+  private notifyBackgroundIdle(): void {
+    const waiters = this.backgroundIdleWaiters;
+    this.backgroundIdleWaiters = [];
+    for (const w of waiters) w();
   }
 
   /** Resolves when no turn is in flight (or the session dies). */
@@ -1192,6 +1231,12 @@ export class LiveSession {
 
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
       this.logToolResults(event.message.content);
+    }
+
+    if (event.type === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
+      const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
+      this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
+      if (this.backgroundTaskIds.size === 0) this.notifyBackgroundIdle();
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
@@ -1874,6 +1919,7 @@ export class LiveSession {
    */
   close(): void {
     this.alive = false;
+    this.notifyBackgroundIdle();
     if (this.outstandingDelivery) this.abandonDelivery(this.outstandingDelivery);
     this.inputWaiter?.();
     this.q.close();

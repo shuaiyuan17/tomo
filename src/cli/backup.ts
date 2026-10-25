@@ -127,10 +127,33 @@ export function workspaceBackupFilter(workspaceSrc: string): (src: string) => bo
   };
 }
 
-function copyIfExists(src: string, dest: string, opts?: { filter?: (src: string, dest: string) => boolean }): boolean {
+/**
+ * False for entries a backup cannot copy: Unix sockets, FIFOs and device
+ * nodes. Node's `cpSync` has no branch for them and throws
+ * `ERR_INTERNAL_ASSERTION` ("Unreachable code"), which aborted the whole
+ * backup and left a `<stamp>.tmp` directory behind. A long-running helper
+ * that listens on a socket inside the workspace was enough to trigger it.
+ * They carry no data, so skipping them loses nothing.
+ */
+export function isCopyableEntry(src: string): boolean {
+  let st;
+  try {
+    st = lstatSync(src);
+  } catch {
+    // Vanished between readdir and copy: let cpSync report it as before.
+    return true;
+  }
+  return !(st.isSocket() || st.isFIFO() || st.isCharacterDevice() || st.isBlockDevice());
+}
+
+export function copyIfExists(src: string, dest: string, opts?: { filter?: (src: string, dest: string) => boolean }): boolean {
   if (!existsSync(src)) return false;
   mkdirSync(dest, { recursive: true });
-  cpSync(src, dest, { recursive: true, filter: opts?.filter });
+  const userFilter = opts?.filter;
+  cpSync(src, dest, {
+    recursive: true,
+    filter: (s, d) => isCopyableEntry(s) && (userFilter ? userFilter(s, d) : true),
+  });
   return true;
 }
 

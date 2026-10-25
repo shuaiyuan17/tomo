@@ -385,7 +385,7 @@ backupCommand
     const skillsDest = join(workspaceDest, ".claude", "skills");
     if (existsSync(skillsSrc)) {
       mkdirSync(join(workspaceDest, ".claude"), { recursive: true });
-      cpSync(skillsSrc, skillsDest, { recursive: true, dereference: false });
+      cpSync(skillsSrc, skillsDest, { recursive: true, dereference: false, filter: isCopyableEntry });
       console.log("  [ok] workspace/.claude/skills/");
     }
 

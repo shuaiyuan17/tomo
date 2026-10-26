@@ -219,7 +219,12 @@ export function peekPendingNotes(agent: AgentType, sessionKey: string): string[]
   return queue.peekNotes(sessionKey);
 }
 
-export async function waitFor(assertion: () => void, timeoutMs = 250): Promise<void> {
+// The ceiling only matters when the assertion never passes: a passing wait returns
+// on the first poll that succeeds (~30ms locally for the slowest steering test).
+// 250ms was calibrated on a fast Mac; loaded CI runners took >250ms for one
+// delivery after a gate release (agent-steering, 3 red runs on 2026-10-24/26),
+// so the ceiling sits well above CI's tail instead of near local timings.
+export async function waitFor(assertion: () => void, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
   while (Date.now() <= deadline) {

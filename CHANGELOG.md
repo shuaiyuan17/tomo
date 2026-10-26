@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.1 (2026-10-26)
+
+### Bug fixes
+
+- Background subagents are no longer killed when the system prompt changes (e.g. after a workspace file edit). A stale session now waits for its background tasks to finish and report back before it is retired, for at most 2 hours, and never mid-turn (#436).
+- Backups skip sockets, FIFOs and device nodes instead of aborting and leaving a `.tmp` directory behind (#438).
+
+### Dependencies
+
+- `@anthropic-ai/claude-agent-sdk` 0.3.303 → 0.3.310 (#434, #435, #439); additive and doc-comment type changes only.
+- `zod` stays pinned at 4.4.3 (#359). `npm audit` reports GHSA-mrhx-c7xc-m3w5 (memory exhaustion on oversized constrained collections), fixed only in 4.6.6; it will be resolved when the pin can move.
+- Minor bumps: `vite` 8.3.5 (#437), `typescript-eslint` 8.72.1; transitive refresh.
+
 ## 0.11.0 (2026-10-19)
 
 **Upgrade notes: check before restarting.** `owner` replaces `identities`, and a channel with no `allowlist` is no longer open. Existing configs keep working, but:

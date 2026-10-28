@@ -8,6 +8,7 @@ import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./
 import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { formatInboundStamp } from "./inbound-markers.js";
+import { replyDrifted, SCRIPT_DRIFT_NOTE } from "./script-guard.js";
 import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
@@ -220,6 +221,12 @@ export interface TurnRunnerDeps {
   /** Append an assistant response to the session transcript. */
   appendAssistantTranscript(sessionKey: string, content: string, channelName: string): void;
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
+  /**
+   * Queue a note for the session's next turn. Used by the reply script guard
+   * (script-guard.ts) to say "you answered his Chinese in English". Optional:
+   * unwired callers simply skip the guard.
+   */
+  queuePendingNote?(sessionKey: string, note: string): void;
   /** Typing indicator with per-channel start delay (Agent.startTurnTyping). */
   startTurnTyping(channel: Channel, chatId: string, passiveListen?: boolean): StopTyping;
   /** Is `memory/private/` closed to the turn in flight on this session?
@@ -568,6 +575,10 @@ export class TurnRunner {
     // turns resolve their target only for a response that speaks, and an
     // unresolvable target must not be reported for a turn that stays silent.
     let sender: BlockSender | undefined;
+    // Reply script guard (script-guard.ts): at most one note per turn, and
+    // only for a person's message in a DM — cron and continuity turns have no
+    // inbound language to hold the reply to.
+    let scriptDriftNoted = false;
     let channelName: string | undefined;
 
     // Entries are appended in DISPATCH order, not settle order: a block takes
@@ -615,6 +626,18 @@ export class TurnRunner {
             blockPrivateMedia: () => this.deps.isPrivateMemoryBarred(spec.key),
           },
         );
+      }
+
+      if (
+        !scriptDriftNoted &&
+        spec.source === "user" &&
+        spec.key.startsWith("dm:") &&
+        this.deps.queuePendingNote &&
+        replyDrifted(spec.prompt, block)
+      ) {
+        scriptDriftNoted = true;
+        log.warn({ sessionKey: spec.key, sample: block.slice(0, 80) }, "Reply script drift: English reply to a Chinese message");
+        this.deps.queuePendingNote(spec.key, SCRIPT_DRIFT_NOTE);
       }
 
       handledAny = true;

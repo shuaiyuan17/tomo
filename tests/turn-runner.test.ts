@@ -570,3 +570,43 @@ describe("undelivered reply at turn end", () => {
     expect(r.reads()).toBe(0);
   });
 });
+
+// Reply script guard wiring (script-guard.ts): an English block answering a
+// Chinese DM queues one note for the next turn; other turns are left alone.
+describe("reply script guard", () => {
+  const english = "Nice, no commute today 😁 Got two quick questions for when you have a sec, no rush.";
+
+  function withNotes(h: Harness): Array<{ sessionKey: string; note: string }> {
+    const notes: Array<{ sessionKey: string; note: string }> = [];
+    (h.runner as unknown as { deps: TurnRunnerDeps }).deps.queuePendingNote = (sessionKey, note) => {
+      notes.push({ sessionKey, note });
+    };
+    return notes;
+  }
+
+  it("queues exactly one note when a DM reply drifts to English", async () => {
+    const h = makeHarness(async (req) => {
+      await req.onBlock?.(english);
+      await req.onBlock?.(english);
+      return `${english}\n\n${english}`;
+    });
+    const notes = withNotes(h);
+    await h.runner.runTurn(replySpec(h, { key: "dm:owner", source: "user", prompt: "嗯 今天wfh" }));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].sessionKey).toBe("dm:owner");
+    expect(h.channel.sent).toHaveLength(2); // the blocks still ship, unchanged
+  });
+
+  it("stays quiet for a Chinese reply, a cron turn, or a non-DM session", async () => {
+    for (const spec of [
+      { key: "dm:owner", source: "user" as const, prompt: "嗯 今天wfh", reply: "那正好，不用通勤 😁" },
+      { key: "dm:owner", source: "cron" as const, prompt: "每日早报", reply: english },
+      { key: "telegram:123", source: "user" as const, prompt: "嗯 今天wfh", reply: english },
+    ]) {
+      const h = makeHarness(async (req) => { await req.onBlock?.(spec.reply); return spec.reply; });
+      const notes = withNotes(h);
+      await h.runner.runTurn(replySpec(h, { key: spec.key, source: spec.source, prompt: spec.prompt }));
+      expect(notes).toHaveLength(0);
+    }
+  });
+});

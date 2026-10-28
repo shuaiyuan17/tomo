@@ -299,6 +299,7 @@ export class Agent {
         });
       },
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
+      queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
       startTurnTyping: (channel, chatId, passiveListen) => this.startTurnTyping(channel, chatId, passiveListen),
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       delivery: this.delivery,

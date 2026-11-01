@@ -101,15 +101,31 @@ describe("Agent external MCP OAuth wiring", () => {
     await agent.stop();
   });
 
-  it("does not start a sweep when no MCP server uses OAuth", async () => {
+  it("does not start a sweep when no MCP server can use OAuth", async () => {
     mockConfig.mcpServers = {
-      docs: { server: { type: "http", url: "https://docs.example/mcp" } },
+      docs: { server: { type: "http", url: "https://docs.example/mcp" }, oauthDisabled: true },
+      pat: { server: { type: "http", url: "https://pat.example/mcp", headers: { Authorization: "Bearer x" } } },
+      local: { server: { command: "mcp-local" } },
     };
     const agent = new Agent();
 
     await agent.start();
 
     expect(oauthCalls.refreshSweeps).toEqual([]);
+    await agent.stop();
+  });
+
+  // An http server with no `oauth` block may be OAuth by discovery; its token
+  // (stored after `/mcp login`) still needs refreshing.
+  it("sweeps for an unconfigured http server that may use discovered OAuth", async () => {
+    mockConfig.mcpServers = {
+      grub: { server: { type: "http", url: "https://grub.example/mcp" } },
+    };
+    const agent = new Agent();
+
+    await agent.start();
+
+    expect(oauthCalls.refreshSweeps).toEqual([mockConfig.mcpServers]);
     await agent.stop();
   });
 

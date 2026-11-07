@@ -350,9 +350,9 @@ describe("CronScheduler", () => {
   it("does not retry a stale interrupted once job, and tells the owner", async () => {
     const storeA = new CronStore(TEST_PATH);
     storeA.add({
-      name: "bedsheets",
+      name: "water-plants",
       schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
-      message: "Remind me to change the bedsheets.",
+      message: "Remind me to water the plants.",
       sessionKey: "dm:alice",
     });
     makeJobsDue();
@@ -368,7 +368,7 @@ describe("CronScheduler", () => {
     await waitFor(() => expect(second.notices).toHaveLength(1));
     schedulerB.stop();
     expect(second.calls).toHaveLength(0);
-    expect(second.notices[0]).toContain("Remind me to change the bedsheets.");
+    expect(second.notices[0]).toContain("Remind me to water the plants.");
   });
 
   it("keeps a parked one-shot unreported when there was no owner DM to tell", async () => {

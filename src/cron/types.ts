@@ -90,7 +90,8 @@ export interface InterruptedSkip {
    * `once-stale`: a one-shot whose interrupted run is older than its
    *   staleness window — too late to be worth a retry.
    * `once-retried`: a one-shot already retried once after an interruption.
+   * `once-disabled`: a one-shot disabled (by someone) while its run was in flight.
    * `resume-cap`: a recurring job was interrupted too many times running.
    */
-  reason: "once-stale" | "once-retried" | "resume-cap";
+  reason: "once-stale" | "once-retried" | "once-disabled" | "resume-cap";
 }

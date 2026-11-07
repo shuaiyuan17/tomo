@@ -636,6 +636,77 @@ describe("CronStore interrupted-run recovery", () => {
     expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
   });
 
+  it("re-judges a queued one-shot retry that never got dispatched before the next outage", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "remind me",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    expect(new CronStore(TEST_PATH).recoverInterrupted().resumed).toHaveLength(1);
+    // The daemon died again before dispatching the retry, and stayed down.
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].interruptedAt = Date.now() - DEFAULT_STALE_AFTER_MS - 60_000;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const again = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(again.skipped.map((s) => [s.job.id, s.reason])).toEqual([[job.id, "once-stale"]]);
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
+  });
+
+  it("reports, rather than resumes, a one-shot disabled while its run was in flight", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "remind me",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).setEnabled(job.id, false);
+
+    const outcome = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(outcome.resumed).toHaveLength(0);
+    expect(outcome.skipped.map((s) => s.reason)).toEqual(["once-disabled"]);
+    expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
+  });
+
+  it("a re-enabled one-shot that is interrupted and parked again is reported again", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "remind me",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    new CronStore(TEST_PATH).markInterruptNotified([job.id]);
+    expect(new CronStore(TEST_PATH).unreportedParkedOneShots()).toHaveLength(0);
+
+    new CronStore(TEST_PATH).setEnabled(job.id, true);
+    new CronStore(TEST_PATH).markStarted(job.id);
+    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
+  });
+
+  it("never skips a resumed recurring run as stale", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = addRecurring(store);
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = Date.now() - DEFAULT_STALE_AFTER_MS - 60_000;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    expect(new CronStore(TEST_PATH).skipStaleRuns()).toHaveLength(0);
+    expect(new CronStore(TEST_PATH).getDueJobs().map((j) => j.id)).toEqual([job.id]);
+  });
+
   it("disables a stale interrupted once job instead of letting it fire again", () => {
     const store = new CronStore(TEST_PATH);
     const job = store.add({

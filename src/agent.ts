@@ -2635,8 +2635,12 @@ export class Agent {
     });
   }
 
-  /** Send a direct notification to the user's DM channel (no agent query) */
-  async sendNotification(text: string): Promise<void> {
+  /**
+   * Send a direct notification to the user's DM channel (no agent query).
+   * Resolves false when there was nowhere to send it (no DM target, or its
+   * channel is not loaded) — the text was NOT delivered.
+   */
+  async sendNotification(text: string): Promise<boolean> {
     const dmKey = this.router.ownerSessionKey();
     let target: ReplyTarget | undefined;
 
@@ -2656,12 +2660,13 @@ export class Agent {
       }
     }
 
-    if (!target) { log.debug("Notification: no active DM session"); return; }
+    if (!target) { log.debug("Notification: no active DM session"); return false; }
 
     const channel = this.getChannel(target.channelName);
-    if (!channel) return;
+    if (!channel) return false;
 
     await channel.send({ chatId: target.chatId, text });
+    return true;
   }
 
   async start(): Promise<void> {

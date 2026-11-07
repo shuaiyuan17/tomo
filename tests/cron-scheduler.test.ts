@@ -209,7 +209,7 @@ describe("CronScheduler", () => {
         calls.push(msg);
         return new Promise<boolean>(() => {});
       }),
-      sendNotification: vi.fn(async (text: string) => { notices.push(text); }),
+      sendNotification: vi.fn(async (text: string) => { notices.push(text); return true; }),
     } as unknown as Agent;
     return { agent, calls, notices };
   }
@@ -369,6 +369,24 @@ describe("CronScheduler", () => {
     schedulerB.stop();
     expect(second.calls).toHaveLength(0);
     expect(second.notices[0]).toContain("Remind me to change the bedsheets.");
+  });
+
+  it("keeps a parked one-shot unreported when there was no owner DM to tell", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "nowhere", schedule: { kind: "at", at: new Date(Date.now() - 86_400_000).toISOString() },
+      message: "x", sessionKey: "dm:alice" });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    Object.assign(raw.jobs[0], { enabled: false, nextRunAt: null, lastStatus: "interrupted" });
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const sendNotification = vi.fn(async () => false);
+    const agent = { handleCronMessage: vi.fn(), sendNotification } as unknown as Agent;
+    const scheduler = new CronScheduler(agent, new CronStore(TEST_PATH));
+    scheduler.start();
+    await waitFor(() => expect(sendNotification).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 10));
+    scheduler.stop();
+    expect(new CronStore(TEST_PATH).list()[0].interruptNotifiedAt ?? null).toBeNull();
   });
 
   it("tells the owner about a one-shot an older version parked silently", async () => {

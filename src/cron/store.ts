@@ -285,6 +285,8 @@ export class CronStore {
       const next = computeNextRun(job.schedule, now);
       job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
       if (job.schedule.kind === "at") delete job.retryCount;
+      // Whoever re-enabled it has seen it; a later interruption is news again.
+      if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
       // Re-enabling adjudicates an interrupted run that recovery has ALREADY
       // settled: whoever re-enabled it has decided the job should run again,
       // so clear the state that would otherwise make the next daemon start
@@ -435,21 +437,36 @@ export class CronStore {
     const now = Date.now();
     const resumed: CronJob[] = [];
     const skipped: InterruptedSkip[] = [];
+    let changed = false;
     for (const job of this.jobs) {
-      if (!isInterrupted(job)) continue;
-      // Acknowledge the run token: this interruption is now accounted for.
-      job.lastCompletedRunId = job.lastRunId ?? null;
-      job.interruptedAt = job.lastStartedAt ?? now;
-      job.lastRunAt = job.lastStartedAt ?? now;
-      job.lastStatus = "interrupted";
       const park = (reason: InterruptedSkip["reason"]) => {
         job.enabled = false;
         job.nextRunAt = null;
         // No further fire, so no marker to carry — the state stays visible
         // through lastStatus.
         job.interruptedAt = null;
+        // A new incident: the owner has not been told about THIS one.
+        if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
         skipped.push({ job: { ...job }, reason });
+        changed = true;
       };
+      if (!isInterrupted(job)) {
+        // A one-shot an earlier start already queued for its retry, whose
+        // retry never got dispatched (the daemon went down again first).
+        // Freshness is re-judged now: after a long second outage it is too
+        // late for the retry too.
+        if (job.enabled && isSingleFire(job) && job.interruptedAt != null) {
+          const window = staleWindowMs(job);
+          if (window !== 0 && now - job.interruptedAt > window) park("once-stale");
+        }
+        continue;
+      }
+      // Acknowledge the run token: this interruption is now accounted for.
+      job.lastCompletedRunId = job.lastRunId ?? null;
+      job.interruptedAt = job.lastStartedAt ?? now;
+      job.lastRunAt = job.lastStartedAt ?? now;
+      job.lastStatus = "interrupted";
+      changed = true;
       // One-shot is a property of the SCHEDULE, not just the lifecycle flag.
       // `deleteAfterRun: false` on an "at" job only means "keep the record
       // after it fires" (schedule_create's `once: false`) — it is still a
@@ -467,7 +484,11 @@ export class CronStore {
         const startedAt = job.lastStartedAt ?? now;
         const fresh = window === 0 || now - startedAt <= window;
         const attempts = (job.resumeAttempts ?? 0) + 1;
-        if (!fresh) {
+        if (!job.enabled) {
+          // Disabled while the run was in flight: someone decided it should
+          // not run. Not retried, but not silent either.
+          park("once-disabled");
+        } else if (!fresh) {
           park("once-stale");
         } else if (attempts > ONE_SHOT_MAX_RESUMES) {
           park("once-retried");
@@ -485,7 +506,7 @@ export class CronStore {
       }
       resumed.push({ ...job });
     }
-    if (resumed.length > 0 || skipped.length > 0) this.save();
+    if (changed) this.save();
     return { resumed, skipped };
   }
 
@@ -552,6 +573,9 @@ export class CronStore {
     const skipped: StaleSkip[] = [];
     for (const job of this.jobs) {
       if (!job.enabled || job.nextRunAt === null || exclude.has(job.id) || isSingleFire(job)) continue;
+      // A resumed run (recovery left it due with the marker) is the
+      // interrupted run being finished, not a missed slot: never skip it.
+      if (job.interruptedAt != null) continue;
       const windowMs = staleWindowMs(job);
       const lateByMs = now - job.nextRunAt;
       if (windowMs === 0 || lateByMs <= windowMs) continue;

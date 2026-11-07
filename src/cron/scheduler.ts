@@ -135,7 +135,9 @@ export class CronScheduler {
           ? "Cron one-shot was interrupted by a restart too long ago to retry; disabled, owner will be told"
           : reason === "once-retried"
             ? "Cron one-shot was interrupted again after its one retry; disabled, owner will be told"
-            : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
+            : reason === "once-disabled"
+              ? "Cron one-shot was interrupted by a restart while disabled; not retried, owner will be told"
+              : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
       );
     }
     for (const job of outcome.resumed) {
@@ -180,7 +182,11 @@ export class CronScheduler {
       "Re-run one with `tomo cron enable <id>`, or remove it with `tomo cron remove <id>`.",
     ].join("\n");
     try {
-      await this.agent.sendNotification(text);
+      if (!(await this.agent.sendNotification(text))) {
+        // Nothing was delivered; leave them unreported so the next start tries again.
+        log.warn({ jobIds: parked.map((job) => job.id) }, "No owner DM to report interrupted cron one-shots to; will retry next start");
+        return;
+      }
       this.store.markInterruptNotified(parked.map((job) => job.id));
       log.info({ jobIds: parked.map((job) => job.id) }, "Told the owner about interrupted cron one-shots");
     } catch (err) {

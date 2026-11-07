@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { log } from "../logger.js";
+import { describeError } from "../error-text.js";
 import {
   AttachmentUnreadableError,
   isDefiniteFailure,
@@ -48,7 +49,7 @@ export class PartialDeliveryError extends Error {
     readonly segments: readonly DeliverySegment[],
   ) {
     const failed = segments.filter((s) => !s.delivered).length;
-    const detail = failure instanceof Error ? failure.message : String(failure);
+    const detail = describeError(failure);
     super(`Block partly delivered: ${failed} of ${segments.length} part(s) not known to have shipped — ${detail}`, { cause: failure });
     this.name = "PartialDeliveryError";
   }

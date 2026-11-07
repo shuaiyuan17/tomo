@@ -68,7 +68,7 @@ class FakeChild extends EventEmitter {
     this.emitPayload({ jsonrpc: "2.0", id, result });
   }
 
-  respondError(id: number, code: number, message: string, data?: string): void {
+  respondError(id: number, code: number, message: string, data?: unknown): void {
     this.emitPayload({ jsonrpc: "2.0", id, error: { code, message, ...(data ? { data } : {}) } });
   }
 
@@ -205,6 +205,42 @@ describe("imsg RPC framing", () => {
     await expect(channel.send({ chatId: DM_GUID, text: "hi" })).rejects.toThrow(/send failed.*Internal error.*boom/);
     expect(requests().filter((r) => r.method === "send")).toHaveLength(1);
 
+    await channel.stop();
+  });
+
+  it("serializes a structured RPC error `data` instead of logging [object Object]", async () => {
+    const data = { lane: "send", reason: "a previous mutation is still running", retryAfterMs: 250 };
+    const { channel } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 7 });
+        if (req.method === "send") return child.respondError(req.id, -32004, "Mutation lane blocked", data);
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const err = await channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error & { rpcCode?: number; rpcData?: unknown });
+    expect(err).not.toBeNull();
+    expect(err!.message).not.toContain("[object Object]");
+    expect(err!.message).toBe(`imsg rpc send failed (-32004) Mutation lane blocked: ${JSON.stringify(data)}`);
+    // Kept structured for the log line, too.
+    expect(err!.rpcCode).toBe(-32004);
+    expect(err!.rpcData).toEqual(data);
+
+    await channel.stop();
+  });
+
+  it("keeps a long string RPC `data` whole, so refusal phrases deep in it still match", async () => {
+    const data = `${"context ".repeat(400)}Could not securely open sticker directory`;
+    const { channel } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 7 });
+        if (req.method === "send") return child.respondError(req.id, -32603, "Internal error", data);
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+    await expect(channel.send({ chatId: DM_GUID, text: "hi" })).rejects.toThrow(/Could not securely open sticker directory$/);
     await channel.stop();
   });
 

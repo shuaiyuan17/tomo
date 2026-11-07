@@ -16,6 +16,7 @@ import {
   saveInboundFile,
   type SavedFileNotice,
 } from "./fileStore.js";
+import { describeError } from "../error-text.js";
 import { log } from "../logger.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
@@ -157,8 +158,20 @@ function isBareHttpUrl(part: string): boolean {
  * a dead child is a plain Error and stays ambiguous.
  */
 class ImsgRpcResponseError extends Error {
-  constructor(message?: string) {
+  /**
+   * The JSON-RPC error's `code` and `data`, kept structured so the log line
+   * (pino serializes an Error's own fields) shows them as they arrived.
+   * Named `rpc*` so describeError, which reads `code`/`data`, does not append
+   * them a second time after the message that already spells them out.
+   */
+  readonly rpcCode?: number;
+  readonly rpcData?: unknown;
+
+  constructor(message?: string, rpc?: { code?: number; data?: unknown }) {
     super(message);
+    this.name = "ImsgRpcResponseError";
+    if (rpc?.code !== undefined) this.rpcCode = rpc.code;
+    if (rpc?.data !== undefined) this.rpcData = rpc.data;
     markDefiniteFailure(this);
   }
 }
@@ -1091,7 +1104,7 @@ export class ImsgChannel implements Channel {
     });
     child.on("error", (err) => {
       log.error({ err }, "imsg rpc child failed to spawn");
-      this.handleChildDown(child, `spawn error: ${err.message}`);
+      this.handleChildDown(child, `spawn error: ${describeError(err)}`);
     });
     child.on("exit", (code, signal) => {
       this.handleChildDown(child, `exited with code ${code} signal ${signal}`);
@@ -1231,7 +1244,7 @@ export class ImsgChannel implements Channel {
         if (req) {
           this.pending.delete(id);
           clearTimeout(req.timer);
-          reject(new Error(`imsg rpc write failed for ${method}: ${err.message}`));
+          reject(new Error(`imsg rpc write failed for ${method}: ${describeError(err)}`, { cause: err }));
         }
       });
     });
@@ -1357,13 +1370,24 @@ export class ImsgChannel implements Channel {
       // answering child).
       this.writeWaiters.get(id)?.();
       if (payload.error) {
-        const error = payload.error as { code?: number; message?: string; data?: string };
-        const detail = error.data ? `: ${error.data}` : "";
+        // `data` is free-form in JSON-RPC: imsg sends a string for most
+        // refusals but an OBJECT for some (e.g. -32004 "Mutation lane
+        // blocked"), which used to be interpolated as "[object Object]".
+        const error = payload.error as { code?: number; message?: string; data?: unknown };
+        // A string is used verbatim, unclipped, exactly as before: callers
+        // match refusal phrases in it (isStickerStagingRefusal).
+        const data = error.data === undefined || error.data === null || error.data === ""
+          ? ""
+          : typeof error.data === "string" ? error.data : describeError(error.data);
+        const detail = data ? `: ${data}` : "";
         // Typed rejection: an error RESPONSE proves the child processed and
         // refused the request (nothing was sent) — callers with a fallback
         // send key on this to avoid double-delivering after ambiguous
         // failures (timeout/child-death), which reject as plain Errors.
-        req.reject(new ImsgRpcResponseError(`imsg rpc ${req.method} failed (${error.code ?? "?"}) ${error.message ?? "error"}${detail}`));
+        req.reject(new ImsgRpcResponseError(
+          `imsg rpc ${req.method} failed (${error.code ?? "?"}) ${typeof error.message === "string" ? error.message : describeError(error.message ?? "error")}${detail}`,
+          { code: error.code, data: error.data },
+        ));
       } else {
         req.resolve((payload.result ?? {}) as Record<string, unknown>);
       }
@@ -3148,9 +3172,11 @@ export class ImsgChannel implements Channel {
   /** Run `imsg status --json` and normalize the capability surface. */
   private probeStatus(): Promise<ImsgCapabilities> {
     return new Promise((resolve, reject) => {
-      execFile(this.cliPath, ["status", "--json"], { timeout: STATUS_PROBE_TIMEOUT_MS }, (err, stdout) => {
+      execFile(this.cliPath, ["status", "--json"], { timeout: STATUS_PROBE_TIMEOUT_MS }, (err, stdout, stderr) => {
         if (err) {
-          reject(new Error(`imsg status probe failed: ${err.message}`));
+          // execFile hands stderr to the callback, not to the error.
+          const withStderr = Object.assign(err, { stderr: (err as { stderr?: unknown }).stderr ?? stderr });
+          reject(new Error(`imsg status probe failed: ${describeError(withStderr)}`, { cause: err }));
           return;
         }
         try {
@@ -3163,7 +3189,7 @@ export class ImsgChannel implements Channel {
             readReceipts: parsed.read_receipts === true,
           });
         } catch (parseErr) {
-          reject(new Error(`imsg status probe returned invalid JSON: ${String(parseErr)}`));
+          reject(new Error(`imsg status probe returned invalid JSON: ${describeError(parseErr)}`, { cause: parseErr }));
         }
       });
     });

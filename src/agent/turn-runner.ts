@@ -1,5 +1,6 @@
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
+import { describeError } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
@@ -689,7 +690,9 @@ export class TurnRunner {
     }
     log.error({ err }, spec.errors.thrownLogMessage);
 
-    const detail = err instanceof Error ? err.message : String(err);
+    // Non-Error throwables (a provider's structured error object) must not
+    // reach the owner as "[object Object]"; an Error keeps its bare message.
+    const detail = err instanceof Error ? err.message : describeError(err);
     if (spec.errors.thrown === "ignore") {
       this.reportSuppressed(spec, detail);
       await stopTyping({ clear: true });

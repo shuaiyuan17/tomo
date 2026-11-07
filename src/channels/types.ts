@@ -1,3 +1,5 @@
+import { describeError } from "../error-text.js";
+
 export interface ImageAttachment {
   /** Base64-encoded image data */
   data: string;
@@ -172,7 +174,7 @@ export class AttachmentUnreadableError extends Error {
  */
 export class PartialSendError extends Error {
   constructor(readonly failure: unknown, readonly shipped: { photo: boolean }) {
-    super(`Send partly delivered: ${failure instanceof Error ? failure.message : String(failure)}`, { cause: failure });
+    super(`Send partly delivered: ${describeError(failure)}`, { cause: failure });
     this.name = "PartialSendError";
   }
 }

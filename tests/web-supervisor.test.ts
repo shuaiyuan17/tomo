@@ -65,19 +65,65 @@ it("keeps receipts and replay across a real web process crash/restart", async ()
   expect(await message.json()).toEqual({ error: "epoch_changed" });
 }, 12_000);
 
-it("isolates an occupied port and reports an actionable diagnostic without repeated restarts", async () => {
+it("reports an occupied port at error level and comes up once the port is free", async () => {
   const occupied = createServer();
   await new Promise<void>((resolve) => occupied.listen(0, "127.0.0.1", resolve));
   const port = (occupied.address() as { port: number }).port;
-  const diagnostic: string[] = [];
+  const diagnostic: Array<[string, string | undefined]> = [];
+  let open = true;
   try {
-    supervisor = new WebSupervisor(channel, { ...options(), port, diagnostic: (text) => diagnostic.push(text) });
+    supervisor = new WebSupervisor(channel, { ...options(), port, diagnostic: (text, level) => diagnostic.push([text, level]) },
+      { baseBackoffMs: 100, maxBackoffMs: 200 });
     await expect(supervisor.start()).resolves.toBeUndefined();
     expect(supervisor.status().port).toBeNull();
-    expect(supervisor.status().restarts).toBe(0);
-    expect(diagnostic.join(" ")).toContain("port is in use");
-  } finally { await new Promise<void>((resolve) => occupied.close(() => resolve())); }
-});
+    expect(diagnostic).toContainEqual(["Web UI port is in use; choose another web.port and restart.", "error"]);
+    await expect.poll(() => supervisor.status().state, { timeout: 2_000 }).toBe("backoff");
+    await new Promise<void>((resolve) => occupied.close(() => resolve())); open = false;
+    await expect.poll(() => supervisor.status().port, { timeout: 5_000 }).toBe(port);
+    expect(supervisor.status().state).toBe("running");
+  } finally { if (open) await new Promise<void>((resolve) => occupied.close(() => resolve())); }
+}, 10_000);
+
+/** A child that fails its first `failures` starts, then serves normally. */
+function flakyChild(failures: number): string {
+  const childPath = join(root, "flaky.cjs");
+  const counter = join(root, "starts");
+  writeFileSync(childPath, `
+    const fs = require("node:fs");
+    let n = 0; try { n = Number(fs.readFileSync(${JSON.stringify(counter)}, "utf8")); } catch {}
+    fs.writeFileSync(${JSON.stringify(counter)}, String(n + 1));
+    if (n < ${failures}) process.exit(1);
+    process.on("message", (m) => {
+      if (m.type === "init") process.send({ type: "ready", port: 9465, accessToken: "tomo_web_" + "a".repeat(64) });
+      if (m.type === "ping") process.send({ type: "pong" });
+    });`);
+  return childPath;
+}
+
+it("never gives up: keeps retrying with capped backoff past the old three-failure limit", async () => {
+  const diagnostic: Array<[string, string | undefined]> = [];
+  supervisor = new WebSupervisor(channel, { ...options(), diagnostic: (text, level) => diagnostic.push([text, level]) },
+    { childPath: flakyChild(6), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 20, maxBackoffMs: 80 });
+  await supervisor.start();
+  await expect.poll(() => supervisor.status().state, { timeout: 8_000 }).toBe("running");
+  expect(supervisor.status().port).toBe(9465);
+  // Exactly one error-level line, when quick restarts stopped working.
+  const errors = diagnostic.filter(([, level]) => level === "error").map(([text]) => text);
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toMatch(/Web UI down after 3 consecutive failed start\(s\); retrying in/);
+  expect(diagnostic.map(([text]) => text)).toContain("Web UI recovered after 6 consecutive failed start(s).");
+  const status = JSON.parse(readFileSync(join(root, "web-status.json"), "utf8")) as { state: string; daemonPid: number };
+  expect(status).toMatchObject({ state: "running", daemonPid: process.pid });
+}, 15_000);
+
+it("forgets consecutive failures only after the child has stayed healthy", async () => {
+  supervisor = new WebSupervisor(channel, options(),
+    { childPath: flakyChild(2), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 20, maxBackoffMs: 80, healthyResetMs: 300 });
+  await supervisor.start();
+  await expect.poll(() => supervisor.status().state, { timeout: 8_000 }).toBe("running");
+  expect(supervisor.status().restarts).toBe(2);
+  await expect.poll(() => supervisor.status().restarts, { timeout: 2_000 }).toBe(0);
+}, 12_000);
 
 it("times out a hung child, limits restart attempts, and shuts down promptly", async () => {
   const childPath = join(root, "hung.cjs");
@@ -85,7 +131,7 @@ it("times out a hung child, limits restart attempts, and shuts down promptly", a
   supervisor = new WebSupervisor(channel, options(), { childPath, startupMs: 100, heartbeatMs: 50, maxRestarts: 1 });
   const started = Date.now(); await supervisor.start();
   expect(Date.now() - started).toBeLessThan(1000);
-  await expect.poll(() => supervisor.status(), { timeout: 3_000 }).toMatchObject({ restarts: 1, pid: null, port: null });
+  await expect.poll(() => supervisor.status(), { timeout: 3_000 }).toMatchObject({ restarts: 1, pid: null, port: null, state: "failed" });
   const stopped = Date.now(); await supervisor.stop();
   expect(Date.now() - stopped).toBeLessThan(1000);
 });

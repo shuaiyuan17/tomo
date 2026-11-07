@@ -10,12 +10,20 @@ import { CronStore } from "../cron/store.js";
 import { readCronJobsSafely } from "./cron-errors.js";
 import type { CronJob } from "../cron/types.js";
 import { formatDuration, formatRelative } from "../cron/format.js";
+import { connect } from "node:net";
+import { readWebStatus, type WebStatusRecord } from "../web/status-file.js";
 
 export interface StatusReport {
   version: string;
   daemon: { pid: number | null; uptimeMs: number | null; autostart: boolean };
   configIssues: readonly string[];
   channels: Array<{ name: string; configured: boolean }>;
+  /**
+   * The web UI. `listening` is a live TCP probe of the port, so it is right
+   * even when the supervisor's record is missing or stale; `record` is that
+   * record, kept only when the running daemon wrote it. Absent when disabled.
+   */
+  web?: { port: number; listening: boolean | null; record: WebStatusRecord | null };
   sessions: Array<{ key: string; contextPct: number; queries: number; costUsd: number }>;
   cron: {
     total: number;
@@ -61,6 +69,14 @@ export async function gatherStatus(): Promise<StatusReport> {
   // what someone runs `tomo status` for when something is broken. It is still
   // never reported as "no scheduled tasks": that lie is what this PR is about.
   const { jobs, unreadablePath } = readCronJobsSafely(new CronStore());
+
+  let web: StatusReport["web"];
+  if (config.web?.enabled) {
+    const stored = readWebStatus(config.tomoHome);
+    const record = stored && daemon.pid !== null && stored.daemonPid === daemon.pid ? stored : null;
+    const port = record?.port ?? config.web.port;
+    web = { port, listening: daemon.pid === null ? null : await probePort(port), record };
+  }
   const upcoming = jobs
     .filter((j): j is CronJob & { nextRunAt: number } => j.enabled && j.nextRunAt !== null)
     .sort((a, b) => a.nextRunAt - b.nextRunAt)
@@ -74,6 +90,7 @@ export async function gatherStatus(): Promise<StatusReport> {
       { name: "telegram", configured: Boolean(config.telegramToken) },
       { name: "imessage", configured: imessageConfigured(config) },
     ],
+    ...(web ? { web } : {}),
     sessions,
     cron: {
       ...(unreadablePath ? { unreadable: unreadablePath } : {}),
@@ -108,6 +125,8 @@ export function renderStatusReport(r: StatusReport, now = Date.now()): string {
   for (const c of r.channels) {
     lines.push(`  ${c.name.padEnd(10)} ${c.configured ? "configured" : "not configured"}`);
   }
+
+  if (r.web) lines.push(`  ${"web".padEnd(10)} ${renderWeb(r.web, now)}`);
 
   lines.push("");
   if (r.sessions.length === 0) {
@@ -145,8 +164,35 @@ export function renderStatusReport(r: StatusReport, now = Date.now()): string {
   return lines.join("\n");
 }
 
+/** Can something on this machine accept a TCP connection on the port? */
+export function probePort(port: number, host = "127.0.0.1", timeoutMs = 750): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect({ port, host });
+    const done = (ok: boolean) => { socket.destroy(); resolve(ok); };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
+}
+
+function renderWeb(web: NonNullable<StatusReport["web"]>, now: number): string {
+  if (web.listening === null) return `daemon not running (port ${web.port})`;
+  if (web.listening) return `listening on 127.0.0.1:${web.port}`;
+  const rec = web.record;
+  const detail: string[] = [];
+  if (rec && rec.restarts > 0) detail.push(`${rec.restarts} consecutive failed start${rec.restarts === 1 ? "" : "s"}`);
+  if (rec?.lastError) detail.push(`last: ${rec.lastError}`);
+  const suffix = detail.length ? ` (${detail.join("; ")})` : "";
+  if (rec?.state === "starting") return `starting on port ${web.port}${suffix}`;
+  if (rec?.state === "backoff" && rec.nextRetryAt !== null) {
+    return `DOWN — retrying ${formatRelative(rec.nextRetryAt, now)}${suffix}`;
+  }
+  if (rec?.state === "failed") return `DOWN — gave up${suffix}`;
+  return `DOWN — nothing listening on port ${web.port}${suffix}`;
+}
+
 export const statusCommand = new Command("status")
-  .description("Show Tomo status: daemon, config, channels, sessions, scheduled tasks")
+  .description("Show Tomo status: daemon, config, channels, web UI, sessions, scheduled tasks")
   .action(async () => {
     console.log(renderStatusReport(await gatherStatus()));
   });

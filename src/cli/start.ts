@@ -222,7 +222,7 @@ async function startForeground(): Promise<void> {
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
-        diagnostic: (message) => log.info(message),
+        diagnostic: (message, level = "info") => log[level](message),
       }));
       agent.addChannel(web);
     } catch { log.warn("Web UI unavailable; messaging channels remain active."); }

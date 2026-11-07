@@ -103,4 +103,31 @@ describe("renderStatusReport", () => {
     const out = renderStatusReport(r, NOW);
     expect(out).toContain("no upcoming runs");
   });
+
+  describe("web UI line", () => {
+    const record = { state: "backoff" as const, port: 9465, pid: null, restarts: 4, nextRetryAt: NOW + 120_000,
+      lastError: "startup timed out", daemonPid: 4321, updatedAt: NOW };
+
+    it("is absent when the web UI is disabled", () => {
+      expect(renderStatusReport(baseReport(), NOW)).not.toContain("web ");
+    });
+
+    it("shows a listening port", () => {
+      const r = baseReport();
+      r.web = { port: 9465, listening: true, record: { ...record, state: "running", restarts: 0, nextRetryAt: null, lastError: null } };
+      expect(renderStatusReport(r, NOW)).toContain("  web        listening on 127.0.0.1:9465");
+    });
+
+    it("says DOWN with the retry time and the reason while backing off", () => {
+      const r = baseReport();
+      r.web = { port: 9465, listening: false, record };
+      expect(renderStatusReport(r, NOW)).toContain("  web        DOWN — retrying in 2m (4 consecutive failed starts; last: startup timed out)");
+    });
+
+    it("says DOWN even without a supervisor record", () => {
+      const r = baseReport();
+      r.web = { port: 9465, listening: false, record: null };
+      expect(renderStatusReport(r, NOW)).toContain("  web        DOWN — nothing listening on port 9465");
+    });
+  });
 });

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
@@ -19,7 +19,10 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
  * SDK has to see them to route their tool calls, and they carry no secrets.
  *
  * The CLI parses the file once, at startup, so the caller deletes it as soon
- * as the child has answered the SDK's initialize request (see LiveSession).
+ * as the child has answered the SDK's initialize request (see LiveSession),
+ * again when the session ends, and on process exit. Staging lives under a
+ * private per-user root, and each new staging sweeps entries left there by a
+ * process that was killed before it could clean up.
  * Token refresh is unaffected: a refreshed header reaches a running session
  * through `setMcpServers`, a control request on the child's stdin.
  */
@@ -28,21 +31,32 @@ type McpServers = NonNullable<Options["mcpServers"]>;
 
 export interface StagedMcpConfig<T extends { mcpServers?: McpServers; extraArgs?: Options["extraArgs"] }> {
   options: T;
-  /** Remove the staged file. Idempotent; never throws. */
+  /** Remove the staged file. Idempotent, retried until it succeeds; never throws. */
   dispose: () => void;
 }
 
-/** Staged directories not yet disposed — removed on process exit as a backstop. */
+/**
+ * Entries in the staging root older than this are leftovers of a process that
+ * died before it could clean up (SIGKILL, power loss) and are swept. The CLI
+ * reads its file within seconds of spawning, so a sibling daemon's live
+ * staging is never this old.
+ */
+export const STALE_STAGING_MS = 10 * 60 * 1000;
+
+/** Staged directories not yet removed — retried on dispose and on process exit. */
 const pending = new Set<string>();
 let exitHookInstalled = false;
 
-function removeDir(dir: string): void {
+/** True when the directory is gone afterwards. */
+function removeDir(dir: string): boolean {
   try {
     rmSync(dir, { recursive: true, force: true });
+    pending.delete(dir);
+    return true;
   } catch {
-    // Best effort: a leftover in the per-user temp dir is not worth a crash.
+    // Kept in `pending` so a later dispose or the exit hook tries again.
+    return false;
   }
-  pending.delete(dir);
 }
 
 function installExitHook(): void {
@@ -51,6 +65,44 @@ function installExitHook(): void {
   process.once("exit", () => {
     for (const dir of [...pending]) removeDir(dir);
   });
+}
+
+/**
+ * A per-user 0700 directory that holds nothing but staged configs, so stale
+ * ones can be found and swept. Falls back to the bare temp dir when the root
+ * is not a private directory we own (never trust a pre-planted one).
+ */
+function stagingRoot(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const root = join(tmpdir(), `tomo-mcp-config${uid === undefined ? "" : `-${uid}`}`);
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const st = lstatSync(root);
+    const owned = uid === undefined || st.uid === uid;
+    if (st.isDirectory() && !st.isSymbolicLink() && owned && (st.mode & 0o077) === 0) return root;
+  } catch {
+    // Fall through to the shared temp dir.
+  }
+  return tmpdir();
+}
+
+function sweepStale(root: string, now: number): void {
+  if (root === tmpdir()) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const dir = join(root, name);
+    if (pending.has(dir)) continue;
+    try {
+      if (now - lstatSync(dir).mtimeMs > STALE_STAGING_MS) rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Raced with its owner's own cleanup, or unreadable: leave it.
+    }
+  }
 }
 
 export function stageExternalMcpServers<T extends { mcpServers?: McpServers; extraArgs?: Options["extraArgs"] }>(
@@ -65,7 +117,9 @@ export function stageExternalMcpServers<T extends { mcpServers?: McpServers; ext
   }
   if (Object.keys(external).length === 0) return { options, dispose: () => {} };
 
-  const dir = mkdtempSync(join(tmpdir(), "tomo-mcp-"));
+  const root = stagingRoot();
+  sweepStale(root, Date.now());
+  const dir = mkdtempSync(join(root, "tomo-mcp-"));
   pending.add(dir);
   installExitHook();
   const path = join(dir, "mcp-config.json");
@@ -77,7 +131,7 @@ export function stageExternalMcpServers<T extends { mcpServers?: McpServers; ext
     throw err;
   }
 
-  let disposed = false;
+  let removed = false;
   return {
     options: {
       ...options,
@@ -85,9 +139,7 @@ export function stageExternalMcpServers<T extends { mcpServers?: McpServers; ext
       extraArgs: { ...(options.extraArgs ?? {}), "mcp-config": path },
     },
     dispose: () => {
-      if (disposed) return;
-      disposed = true;
-      removeDir(dir);
+      if (!removed) removed = removeDir(dir);
     },
   };
 }

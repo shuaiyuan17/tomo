@@ -2636,11 +2636,17 @@ export class Agent {
   }
 
   /**
-   * Send a direct notification to the user's DM channel (no agent query).
-   * Resolves false when there was nowhere to send it (no DM target, or its
-   * channel is not loaded) — the text was NOT delivered.
+   * DM the configured OWNER (no agent query). Unlike sendNotification it never
+   * falls back to some other private chat, so it is safe for content that is
+   * the owner's business only. Resolves false when nothing was sent (no
+   * owner, or no reachable owner DM).
    */
-  async sendNotification(text: string): Promise<boolean> {
+  async notifyOwner(text: string): Promise<boolean> {
+    return this.sendOwnerNotice(text, undefined);
+  }
+
+  /** Send a direct notification to the user's DM channel (no agent query) */
+  async sendNotification(text: string): Promise<void> {
     const dmKey = this.router.ownerSessionKey();
     let target: ReplyTarget | undefined;
 
@@ -2660,13 +2666,12 @@ export class Agent {
       }
     }
 
-    if (!target) { log.debug("Notification: no active DM session"); return false; }
+    if (!target) { log.debug("Notification: no active DM session"); return; }
 
     const channel = this.getChannel(target.channelName);
-    if (!channel) return false;
+    if (!channel) return;
 
     await channel.send({ chatId: target.chatId, text });
-    return true;
   }
 
   async start(): Promise<void> {

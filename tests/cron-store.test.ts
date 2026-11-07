@@ -694,6 +694,39 @@ describe("CronStore interrupted-run recovery", () => {
     expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
   });
 
+  it("a skipped interval job keeps its phase", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({ name: "daily", schedule: { kind: "every", everyMs: 86_400_000 }, message: "x", sessionKey: "dm:alice" });
+    const now = Date.now();
+    const slot = now - 7 * 3_600_000;
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = slot;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const [skip] = new CronStore(TEST_PATH).skipStaleRuns(new Set(), now);
+    expect(skip.job.id).toBe(job.id);
+    expect(new CronStore(TEST_PATH).list()[0].nextRunAt).toBe(slot + 86_400_000);
+  });
+
+  it("parks a queued one-shot retry that goes stale while the daemon keeps running", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "remind me",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    expect(new CronStore(TEST_PATH).expireStaleOneShotRetries()).toHaveLength(0);
+
+    const later = Date.now() + DEFAULT_STALE_AFTER_MS + 60_000;
+    expect(new CronStore(TEST_PATH).expireStaleOneShotRetries(new Set(), later).map((j) => j.id)).toEqual([job.id]);
+    const after = new CronStore(TEST_PATH).list()[0];
+    expect(after.enabled).toBe(false);
+    expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
+  });
+
   it("never skips a resumed recurring run as stale", () => {
     const store = new CronStore(TEST_PATH);
     const job = addRecurring(store);

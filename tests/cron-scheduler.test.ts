@@ -209,7 +209,7 @@ describe("CronScheduler", () => {
         calls.push(msg);
         return new Promise<boolean>(() => {});
       }),
-      sendNotification: vi.fn(async (text: string) => { notices.push(text); return true; }),
+      notifyOwner: vi.fn(async (text: string) => { notices.push(text); return true; }),
     } as unknown as Agent;
     return { agent, calls, notices };
   }
@@ -379,14 +379,21 @@ describe("CronScheduler", () => {
     Object.assign(raw.jobs[0], { enabled: false, nextRunAt: null, lastStatus: "interrupted" });
     writeFileSync(TEST_PATH, JSON.stringify(raw));
 
-    const sendNotification = vi.fn(async () => false);
-    const agent = { handleCronMessage: vi.fn(), sendNotification } as unknown as Agent;
+    const notifyOwner = vi.fn(async () => false);
+    const agent = { handleCronMessage: vi.fn(), notifyOwner } as unknown as Agent;
     const scheduler = new CronScheduler(agent, new CronStore(TEST_PATH));
     scheduler.start();
-    await waitFor(() => expect(sendNotification).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(1));
     await new Promise((r) => setTimeout(r, 10));
     scheduler.stop();
     expect(new CronStore(TEST_PATH).list()[0].interruptNotifiedAt ?? null).toBeNull();
+
+    // Retried later in the same process, not only on the next start.
+    notifyOwner.mockResolvedValue(true);
+    (scheduler as unknown as { nextParkedReportAt: number }).nextParkedReportAt = 0;
+    await tick(scheduler);
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(new CronStore(TEST_PATH).list()[0].interruptNotifiedAt).toBeGreaterThan(0));
   });
 
   it("tells the owner about a one-shot an older version parked silently", async () => {
@@ -423,7 +430,7 @@ describe("CronScheduler", () => {
     }
     writeFileSync(TEST_PATH, JSON.stringify(raw));
 
-    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), sendNotification: vi.fn() } as unknown as Agent;
+    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), notifyOwner: vi.fn() } as unknown as Agent;
     await tick(new CronScheduler(agent, store));
 
     const fired = (agent.handleCronMessage as ReturnType<typeof vi.fn>).mock.calls.map(([msg]) => parseTomoEvent(msg as string)!.name);

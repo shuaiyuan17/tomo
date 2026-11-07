@@ -579,7 +579,11 @@ export class CronStore {
       const windowMs = staleWindowMs(job);
       const lateByMs = now - job.nextRunAt;
       if (windowMs === 0 || lateByMs <= windowMs) continue;
-      const next = computeNextRun(job.schedule, now);
+      // `every`: keep the phase — the next slot on the job's own grid, not
+      // `now + interval` (a 09:00 daily job skipped at 16:00 stays a 09:00 job).
+      const next = job.schedule.kind === "every" && everyIntervalReason(job.schedule.everyMs) === null
+        ? job.nextRunAt + (Math.floor(lateByMs / job.schedule.everyMs) + 1) * job.schedule.everyMs
+        : computeNextRun(job.schedule, now);
       // No future slot: leave it due rather than store the dead shape
       // `enabled: true, nextRunAt: null` that nothing ever fires.
       if (next === null) continue;
@@ -589,6 +593,28 @@ export class CronStore {
     }
     if (skipped.length > 0) this.save();
     return skipped;
+  }
+
+  /**
+   * Park one-shot retries that recovery queued but that never got dispatched
+   * and are now past their staleness window — the same judgement recovery
+   * makes at startup, applied while the daemon keeps running.
+   */
+  expireStaleOneShotRetries(exclude: ReadonlySet<string> = new Set(), now = Date.now()): CronJob[] {
+    this.load();
+    const parked: CronJob[] = [];
+    for (const job of this.jobs) {
+      if (!job.enabled || !isSingleFire(job) || job.interruptedAt == null || exclude.has(job.id)) continue;
+      const window = staleWindowMs(job);
+      if (window === 0 || now - job.interruptedAt <= window) continue;
+      job.enabled = false;
+      job.nextRunAt = null;
+      job.interruptedAt = null;
+      if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
+      parked.push({ ...job });
+    }
+    if (parked.length > 0) this.save();
+    return parked;
   }
 
   /**

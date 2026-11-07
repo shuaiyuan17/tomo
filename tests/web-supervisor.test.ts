@@ -120,11 +120,11 @@ it("never gives up: keeps retrying with capped backoff past the old three-failur
 
 it("forgets consecutive failures only after the child has stayed healthy", async () => {
   supervisor = new WebSupervisor(channel, options(),
-    { childPath: flakyChild(2), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 20, maxBackoffMs: 80, healthyResetMs: 300 });
+    { childPath: flakyChild(2), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 20, maxBackoffMs: 80, healthyResetMs: 2_000 });
   await supervisor.start();
   await expect.poll(() => supervisor.status().state, { timeout: 8_000 }).toBe("running");
   expect(supervisor.status().restarts).toBe(2);
-  await expect.poll(() => supervisor.status().restarts, { timeout: 2_000 }).toBe(0);
+  await expect.poll(() => supervisor.status().restarts, { timeout: 5_000 }).toBe(0);
 }, 12_000);
 
 it("times out a hung child, limits restart attempts, and shuts down promptly", async () => {

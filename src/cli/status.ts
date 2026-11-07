@@ -74,7 +74,9 @@ export async function gatherStatus(): Promise<StatusReport> {
   if (config.web?.enabled) {
     const stored = readWebStatus(config.tomoHome);
     const record = stored && daemon.pid !== null && stored.daemonPid === daemon.pid ? stored : null;
-    const port = record?.port ?? config.web.port;
+    // The record's port is what the running daemon is serving or retrying;
+    // the config may have been edited since it started.
+    const port = record?.port ?? record?.targetPort ?? config.web.port;
     web = { port, listening: daemon.pid === null ? null : await probePort(port), record };
   }
   const upcoming = jobs
@@ -167,7 +169,8 @@ export function renderStatusReport(r: StatusReport, now = Date.now()): string {
 /** Can something on this machine accept a TCP connection on the port? */
 export function probePort(port: number, host = "127.0.0.1", timeoutMs = 750): Promise<boolean> {
   return new Promise((resolve) => {
-    const socket = connect({ port, host });
+    let socket: ReturnType<typeof connect>;
+    try { socket = connect({ port, host }); } catch { resolve(false); return; }
     const done = (ok: boolean) => { socket.destroy(); resolve(ok); };
     socket.setTimeout(timeoutMs, () => done(false));
     socket.once("connect", () => done(true));
@@ -178,15 +181,16 @@ export function probePort(port: number, host = "127.0.0.1", timeoutMs = 750): Pr
 function renderWeb(web: NonNullable<StatusReport["web"]>, now: number): string {
   if (web.listening === null) return `daemon not running (port ${web.port})`;
   const rec = web.record;
-  // A connectable port is OUR web UI only if the supervisor says so: when its
-  // child failed (typically "port in use") the listener is someone else.
-  const supervisedDown = rec !== null && rec.state !== "running" && rec.state !== "starting";
+  // A connectable port is OUR web UI only if the supervisor says its child is
+  // running: while it is starting, backing off or failed (typically "port in
+  // use"), the listener may be someone else.
+  const supervisedDown = rec !== null && rec.state !== "running";
   if (web.listening && !supervisedDown) return `listening on 127.0.0.1:${web.port}`;
   const detail: string[] = [];
   if (rec && rec.restarts > 0) detail.push(`${rec.restarts} consecutive failed start${rec.restarts === 1 ? "" : "s"}`);
   if (rec?.lastError) detail.push(`last: ${rec.lastError}`);
   const suffix = detail.length ? ` (${detail.join("; ")})` : "";
-  if (rec?.state === "starting") return `starting on port ${web.port}${suffix}`;
+  if (rec?.state === "starting") return `starting on port ${web.port}${suffix}${web.listening ? "; the port is already taken" : ""}`;
   const holder = web.listening ? `; another process holds port ${web.port}` : "";
   if (rec?.state === "backoff" && rec.nextRetryAt !== null) {
     return `DOWN — retrying ${formatRelative(rec.nextRetryAt, now)}${suffix}${holder}`;

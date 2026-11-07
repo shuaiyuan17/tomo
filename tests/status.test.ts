@@ -105,7 +105,7 @@ describe("renderStatusReport", () => {
   });
 
   describe("web UI line", () => {
-    const record = { state: "backoff" as const, port: 9465, pid: null, restarts: 4, nextRetryAt: NOW + 120_000,
+    const record = { state: "backoff" as const, port: null, targetPort: 9465, pid: null, restarts: 4, nextRetryAt: NOW + 120_000,
       lastError: "startup timed out", daemonPid: 4321, updatedAt: NOW };
 
     it("is absent when the web UI is disabled", () => {
@@ -114,7 +114,7 @@ describe("renderStatusReport", () => {
 
     it("shows a listening port", () => {
       const r = baseReport();
-      r.web = { port: 9465, listening: true, record: { ...record, state: "running", restarts: 0, nextRetryAt: null, lastError: null } };
+      r.web = { port: 9465, listening: true, record: { ...record, state: "running", port: 9465, restarts: 0, nextRetryAt: null, lastError: null } };
       expect(renderStatusReport(r, NOW)).toContain("  web        listening on 127.0.0.1:9465");
     });
 

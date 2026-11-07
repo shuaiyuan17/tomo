@@ -54,7 +54,7 @@ export class WebSupervisor implements WebLifecycle {
 
   status(): Omit<WebStatusRecord, "daemonPid" | "updatedAt"> {
     return {
-      state: this.state, port: this.boundPort, pid: this.child?.pid ?? null, restarts: this.restarts,
+      state: this.state, port: this.boundPort, targetPort: this.options.port, pid: this.child?.pid ?? null, restarts: this.restarts,
       nextRetryAt: this.nextRetryAt, lastError: this.lastError,
     };
   }

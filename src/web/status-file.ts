@@ -11,7 +11,10 @@ export type WebState = "starting" | "running" | "backoff" | "failed" | "stopped"
 
 export interface WebStatusRecord {
   state: WebState;
+  /** The port the child has bound, while it is running. */
   port: number | null;
+  /** The port the supervisor is trying to serve on (its config at daemon start). */
+  targetPort: number;
   pid: number | null;
   /** Consecutive failed starts or crashes, cleared after a healthy period. */
   restarts: number;
@@ -33,10 +36,11 @@ export function readWebStatus(tomoHome: string): WebStatusRecord | null {
   try {
     const raw = JSON.parse(readFileSync(join(tomoHome, WEB_STATUS_FILE), "utf8")) as Partial<WebStatusRecord>;
     if (!raw || typeof raw !== "object" || !STATES.includes(raw.state as WebState)) return null;
-    if (typeof raw.daemonPid !== "number" || typeof raw.updatedAt !== "number") return null;
+    if (typeof raw.daemonPid !== "number" || typeof raw.updatedAt !== "number" || !validPort(raw.targetPort)) return null;
     return {
       state: raw.state as WebState,
-      port: typeof raw.port === "number" ? raw.port : null,
+      port: validPort(raw.port) ? raw.port : null,
+      targetPort: raw.targetPort,
       pid: typeof raw.pid === "number" ? raw.pid : null,
       restarts: typeof raw.restarts === "number" ? raw.restarts : 0,
       nextRetryAt: typeof raw.nextRetryAt === "number" ? raw.nextRetryAt : null,
@@ -47,4 +51,8 @@ export function readWebStatus(tomoHome: string): WebStatusRecord | null {
   } catch {
     return null;
   }
+}
+
+function validPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65535;
 }

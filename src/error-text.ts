@@ -15,6 +15,42 @@
  * promise unsettled).
  */
 
+/**
+ * DETAIL IS FOR LOGS, NOT CHATS. `describeError` appends stderr, RPC payloads
+ * and the like — exactly what must never land in a chat, least of all a
+ * group's. Anything a person reads (`[error] …`, an owner DM, a tool result
+ * the model may quote) uses `shortErrorMessage` instead.
+ */
+const SHORT_MAX = 500;
+
+/**
+ * The bare, human-facing message: an Error's own `message` (or the
+ * `publicMessage` a channel error offers in place of one that carries
+ * protocol detail), a string as is, a structured value's `message` field.
+ * Never "[object Object]", never stderr or RPC data. Never throws.
+ */
+export function shortErrorMessage(value: unknown): string {
+  try {
+    // A thrown string is passed through whole, like an Error's message:
+    // isSafeguardError / withRecoveryHint match on it.
+    if (typeof value === "string") return value || "unknown error";
+    if (value !== null && typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      const pub = read(() => record.publicMessage);
+      if (typeof pub === "string" && pub) return clip(pub, SHORT_MAX);
+      const message = read(() => record.message);
+      // An Error's own message is passed through unclipped: it is what was
+      // always shown, and isSafeguardError / withRecoveryHint match on it.
+      if (typeof message === "string" && message) return value instanceof Error ? message : clip(message, SHORT_MAX);
+      if (value instanceof Error) return read(() => value.name) || "Error";
+      return "unknown error (details are in the log)";
+    }
+    return value === undefined || value === null ? "unknown error" : clip(String(value), SHORT_MAX);
+  } catch {
+    return "unknown error";
+  }
+}
+
 /** Diagnostic fields worth showing next to an Error's message, in order. */
 const ERROR_FIELDS = ["code", "errno", "syscall", "signal", "exitCode", "status", "stderr", "data"] as const;
 /** Per-field budget. `stderr` keeps its TAIL: the cause is usually last. */

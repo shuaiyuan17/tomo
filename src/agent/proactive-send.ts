@@ -3,6 +3,7 @@ import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage } fro
 import { IMESSAGE_SEND_EFFECTS } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { shortErrorMessage } from "../error-text.js";
 import type { ReplyTarget, SessionEntry } from "../sessions/types.js";
 import {
   isGroupSessionKey,
@@ -145,7 +146,8 @@ export class ProactiveSendService {
       // rides the text send — it modifies delivery of text, not attachments.
       let textDelivered = false;
       if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+        await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
+          .catch(logDirectSendFailure);
         textDelivered = true;
       } else if (effect) {
         effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
@@ -217,7 +219,8 @@ export class ProactiveSendService {
     } else {
       // No attachments: verbatim text (direct-mode contract), behind the
       // advisory only when the guard fired.
-      await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+      await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
+        .catch(logDirectSendFailure);
     }
 
     // What the transcript records, and what the pending note describes. On a
@@ -341,8 +344,8 @@ export class ProactiveSendService {
     try {
       await channel.setChatTitle(replyTarget.chatId, trimmedTitle);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     this.deps.setChatTitle(sessionKey, trimmedTitle);
@@ -399,8 +402,8 @@ export class ProactiveSendService {
     try {
       await channel.reactToMessage(chatId, messageId, reaction, remove);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     log.info({ sessionKey: resolved.sessionKey, channel: chatRef.channelName, reaction, remove, matched: match !== undefined || undefined }, "Reacted to message");
@@ -424,8 +427,8 @@ export class ProactiveSendService {
     try {
       await resolved.channel.editMessage!(resolved.chatId, resolved.message.id, newText);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     log.info({ sessionKey: resolved.sessionKey, channel: resolved.channel.name, matched: match !== undefined || undefined }, "Edited sent message");
@@ -444,8 +447,8 @@ export class ProactiveSendService {
     try {
       await resolved.channel.unsendMessage!(resolved.chatId, resolved.message.id);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     log.info({ sessionKey: resolved.sessionKey, channel: resolved.channel.name, matched: match !== undefined || undefined }, "Unsent message");
@@ -584,4 +587,14 @@ export class ProactiveSendService {
       messageId: message.id,
     });
   }
+}
+
+/**
+ * A direct send's rejection escapes to the MCP server, which hands only its
+ * message to the model. Log the whole error (RPC data, stderr) first, so the
+ * diagnostic is not lost, then rethrow unchanged.
+ */
+function logDirectSendFailure(err: unknown): never {
+  log.warn({ err }, "Direct send failed");
+  throw err;
 }

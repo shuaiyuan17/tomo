@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeError, safeJson } from "../src/error-text.js";
+import { describeError, safeJson, shortErrorMessage } from "../src/error-text.js";
 import { PartialDeliveryError } from "../src/agent/delivery-pipeline.js";
 import { PartialSendError } from "../src/channels/types.js";
 
@@ -51,11 +51,39 @@ describe("describeError", () => {
 });
 
 describe("partial-delivery errors", () => {
-  it("describe a structured failure instead of [object Object]", () => {
-    const failure = { code: -32004, message: "Mutation lane blocked" };
-    expect(new PartialSendError(failure, { photo: true }).message)
-      .toBe('Send partly delivered: {"code":-32004,"message":"Mutation lane blocked"}');
-    expect(new PartialDeliveryError(failure, [{ text: "a", delivered: true }, { text: "b", delivered: false }]).message)
-      .toContain('— {"code":-32004,"message":"Mutation lane blocked"}');
+  it("carry the short message (it can be shown) and keep the full detail for the log", () => {
+    const failure = Object.assign(new Error("Mutation lane blocked"), { code: -32004, stderr: "secret stderr" });
+    const send = new PartialSendError(failure, { photo: true });
+    expect(send.message).toBe("Send partly delivered: Mutation lane blocked");
+    expect(send.detail).toBe("Mutation lane blocked (code=-32004, stderr=secret stderr)");
+    const block = new PartialDeliveryError(failure, [{ text: "a", delivered: true }, { text: "b", delivered: false }]);
+    expect(block.message).toBe("Block partly delivered: 1 of 2 part(s) not known to have shipped — Mutation lane blocked");
+    expect(block.detail).toContain("stderr=secret stderr");
+    expect(new PartialSendError({ code: -32004, message: "lane busy" }, { photo: true }).message)
+      .toBe("Send partly delivered: lane busy");
+  });
+});
+
+describe("shortErrorMessage", () => {
+  it("is the bare message, never stderr, RPC data or [object Object]", () => {
+    const err = Object.assign(new Error("spawn imsg ENOENT"), { code: "ENOENT", stderr: "detail" });
+    expect(shortErrorMessage(err)).toBe("spawn imsg ENOENT");
+    expect(shortErrorMessage({ message: "refused", data: { x: 1 } })).toBe("refused");
+    expect(shortErrorMessage({ lane: "send" })).toBe("unknown error (details are in the log)");
+    expect(shortErrorMessage("plain")).toBe("plain");
+    expect(shortErrorMessage(undefined)).toBe("unknown error");
+  });
+
+  it("prefers a channel's publicMessage over a message that carries protocol detail", () => {
+    const rpc = Object.assign(new Error('imsg rpc send failed (-32004) Mutation lane blocked: {"lane":"send"}'),
+      { publicMessage: "imsg rpc send failed (-32004) Mutation lane blocked" });
+    expect(shortErrorMessage(rpc)).toBe("imsg rpc send failed (-32004) Mutation lane blocked");
+  });
+
+  it("keeps an Error's message whole (safeguard and recovery-hint matching read it) and never throws", () => {
+    const long = new Error("x".repeat(3000));
+    expect(shortErrorMessage(long)).toHaveLength(3000);
+    const hostile = { get message() { throw new Error("getter"); } };
+    expect(shortErrorMessage(hostile)).toBe("unknown error (details are in the log)");
   });
 });

@@ -1,6 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { loadPeople, personTimeZone, upsertPerson, type PeopleDirs, type PersonRecord } from "../people.js";
+import { shortErrorMessage } from "../error-text.js";
 
 export interface PeopleToolDeps {
   /**
@@ -157,7 +158,7 @@ export function buildPeopleTools(deps: PeopleToolDeps) {
           };
         } catch (err) {
           return {
-            content: [{ type: "text" as const, text: `upsert_person failed: ${err instanceof Error ? err.message : String(err)}` }],
+            content: [{ type: "text" as const, text: `upsert_person failed: ${shortErrorMessage(err)}` }],
             isError: true,
           };
         }

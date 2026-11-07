@@ -1,4 +1,4 @@
-import { describeError } from "../error-text.js";
+import { describeError, shortErrorMessage } from "../error-text.js";
 
 export interface ImageAttachment {
   /** Base64-encoded image data */
@@ -173,9 +173,14 @@ export class AttachmentUnreadableError extends Error {
  * call's error, with its own definite/ambiguous character intact.
  */
 export class PartialSendError extends Error {
+  /** Full diagnostic of `failure` (stderr, RPC data, …), for logs only. */
+  readonly detail: string;
+
   constructor(readonly failure: unknown, readonly shipped: { photo: boolean }) {
-    super(`Send partly delivered: ${describeError(failure)}`, { cause: failure });
+    // Short form in the message (it can be shown); full detail for the log.
+    super(`Send partly delivered: ${shortErrorMessage(failure)}`, { cause: failure });
     this.name = "PartialSendError";
+    this.detail = describeError(failure);
   }
 }
 

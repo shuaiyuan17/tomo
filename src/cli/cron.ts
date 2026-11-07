@@ -1,6 +1,6 @@
 import { Command } from "commander";
-import { CronStore, parseCreatableSchedule, unschedulableReason } from "../cron/store.js";
-import { formatSchedule, formatRelative } from "../cron/format.js";
+import { CronStore, DEFAULT_STALE_AFTER_MS, parseCreatableSchedule, parseStaleAfter, unschedulableReason } from "../cron/store.js";
+import { formatDuration, formatSchedule, formatRelative } from "../cron/format.js";
 import { cronAddRefusal, withCronStore } from "./cron-errors.js";
 
 const store = new CronStore();
@@ -16,7 +16,18 @@ cronCommand
   .requiredOption("--message <message>", "Message to send when triggered")
   .requiredOption("--session <key>", "Session key to deliver to (see 'Session key' in the agent system prompt)")
   .option("--once", "Delete after successful run (default: true for one-time 'at' schedules, false for recurring)")
+  .option("--stale-after <duration>",
+    `How late a missed run may still fire, e.g. "30m", "6h"; later ones are skipped (one-shots: not retried after an interruption). "0" = always catch up. Default ${formatDuration(DEFAULT_STALE_AFTER_MS)}`)
   .action((opts) => withCronStore(() => {
+    let staleAfterMs: number | undefined;
+    if (opts.staleAfter !== undefined) {
+      const parsedStale = parseStaleAfter(opts.staleAfter);
+      if (parsedStale === null) {
+        console.error(`Invalid --stale-after "${opts.staleAfter}": use a duration like 30m, 6h, 2d, or 0.`);
+        process.exit(1);
+      }
+      staleAfterMs = parsedStale;
+    }
     // Same refusal the MCP tool makes, through the same function. A schedule
     // with no future occurrence would be stored enabled with `nextRunAt: null`
     // and never fire, and "Next run: never" under a "Created job" line is not
@@ -37,6 +48,7 @@ cronCommand
       message: opts.message,
       sessionKey: opts.session,
       deleteAfterRun: opts.once,
+      ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
     });
     console.log(`Created job ${job.id}: "${job.name}"`);
     console.log(`  Schedule: ${formatSchedule(job.schedule)}`);
@@ -69,6 +81,10 @@ cronCommand
       console.log(`  Session:  ${job.sessionKey}`);
       console.log(`  Next run: ${next}`);
       console.log(`  Last run: ${last}`);
+      if (job.staleAfterMs !== undefined) {
+        console.log(`  Stale after: ${job.staleAfterMs === 0 ? "never (always catch up)" : formatDuration(job.staleAfterMs)}`);
+      }
+      if (job.lastSkippedAt) console.log(`  Last skipped (missed by too much): ${new Date(job.lastSkippedAt).toLocaleString()}`);
       console.log();
     }
   }));

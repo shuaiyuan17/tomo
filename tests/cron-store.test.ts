@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CronStore,
   CronStoreReadError,
+  DEFAULT_STALE_AFTER_MS,
   InvalidScheduleError,
   MAX_EVERY_MS,
   MAX_RESUME_ATTEMPTS,
@@ -12,6 +13,8 @@ import {
   ONE_SHOT_RETRY_DELAY_MS,
   parseScheduleString,
   parseCreatableSchedule,
+  parseStaleAfter,
+  staleWindowMs,
   unschedulableReason,
 } from "../src/cron/store.js";
 import { POLL_INTERVAL_MS } from "../src/cron/scheduler.js";
@@ -534,6 +537,13 @@ describe("CronStore", () => {
   });
 });
 
+/** Make every job's last dispatch look `agoMs` old (an outage before restart). */
+function ageStart(agoMs: number): void {
+  const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+  for (const job of raw.jobs) job.lastStartedAt = Date.now() - agoMs;
+  writeFileSync(TEST_PATH, JSON.stringify(raw));
+}
+
 describe("CronStore interrupted-run recovery", () => {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
@@ -601,7 +611,7 @@ describe("CronStore interrupted-run recovery", () => {
     expect(second.skipped).toHaveLength(0);
   });
 
-  it("disables an interrupted once job instead of letting it fire again", () => {
+  it("retries a fresh interrupted once job once, marked, then parks it", () => {
     const store = new CronStore(TEST_PATH);
     const job = store.add({
       name: "one-shot",
@@ -611,10 +621,36 @@ describe("CronStore interrupted-run recovery", () => {
     });
     store.markStarted(job.id);
 
+    const first = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(first.resumed.map((j) => j.id)).toEqual([job.id]);
+    const resumed = new CronStore(TEST_PATH).list()[0];
+    expect(resumed.enabled).toBe(true);
+    expect(resumed.interruptedAt).toBeGreaterThan(0);
+    expect(resumed.resumeAttempts).toBe(1);
+
+    // The retry is interrupted as well: parked, not retried again.
+    new CronStore(TEST_PATH).markStarted(job.id);
+    const second = new CronStore(TEST_PATH).recoverInterrupted();
+    expect(second.resumed).toHaveLength(0);
+    expect(second.skipped.map((s) => [s.job.id, s.reason])).toEqual([[job.id, "once-retried"]]);
+    expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
+  });
+
+  it("disables a stale interrupted once job instead of letting it fire again", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({
+      name: "one-shot",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "place the order",
+      sessionKey: "dm:alice",
+    });
+    store.markStarted(job.id);
+    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+
     const { resumed, skipped } = new CronStore(TEST_PATH).recoverInterrupted();
     expect(resumed).toHaveLength(0);
     expect(skipped.map((s) => s.job.id)).toEqual([job.id]);
-    expect(skipped[0].reason).toBe("once");
+    expect(skipped[0].reason).toBe("once-stale");
 
     const after = new CronStore(TEST_PATH).list()[0];
     expect(after.enabled).toBe(false);
@@ -640,11 +676,12 @@ describe("CronStore interrupted-run recovery", () => {
     });
     expect(job.deleteAfterRun).toBe(false);
     store.markStarted(job.id);
+    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
 
     const { resumed, skipped } = new CronStore(TEST_PATH).recoverInterrupted();
     expect(resumed).toHaveLength(0);
     expect(skipped.map((s) => s.job.id)).toEqual([job.id]);
-    expect(skipped[0].reason).toBe("once");
+    expect(skipped[0].reason).toBe("once-stale");
 
     const after = new CronStore(TEST_PATH).list()[0];
     expect(after.enabled).toBe(false);
@@ -856,6 +893,7 @@ describe("CronStore crash-loop cap and clock independence", () => {
       sessionKey: "dm:alice",
     });
     store.markStarted(job.id);
+    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
 
@@ -1275,5 +1313,23 @@ describe("`tomo cron add` refusal", () => {
   it("accepts a live schedule and hands back the parsed value", () => {
     const parsed = parseCreatableSchedule("every 2h");
     expect(parsed).toEqual({ kind: "ok", schedule: { kind: "every", everyMs: 7_200_000 } });
+  });
+});
+
+describe("staleness window", () => {
+  it("parses --stale-after values", () => {
+    expect(parseStaleAfter("0")).toBe(0);
+    expect(parseStaleAfter("30m")).toBe(30 * 60_000);
+    expect(parseStaleAfter("6h")).toBe(6 * 3_600_000);
+    expect(parseStaleAfter("2 days")).toBe(2 * 86_400_000);
+    expect(parseStaleAfter("soon")).toBeNull();
+    expect(parseStaleAfter("-5m")).toBeNull();
+  });
+
+  it("defaults, honours a per-job value, and ignores a damaged one", () => {
+    expect(staleWindowMs({})).toBe(DEFAULT_STALE_AFTER_MS);
+    expect(staleWindowMs({ staleAfterMs: 0 })).toBe(0);
+    expect(staleWindowMs({ staleAfterMs: 600_000 })).toBe(600_000);
+    expect(staleWindowMs({ staleAfterMs: -1 })).toBe(DEFAULT_STALE_AFTER_MS);
   });
 });

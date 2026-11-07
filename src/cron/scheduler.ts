@@ -1,9 +1,10 @@
-import { CronStore } from "./store.js";
+import { CronStore, type StaleSkip } from "./store.js";
 import type { CronJob } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { watchBus } from "../watch/bus.js";
+import { formatDuration } from "./format.js";
 
 /**
  * Due-scan cadence. Exported because it is also the floor on how often a job
@@ -44,6 +45,8 @@ export class CronScheduler {
   private pendingAcks = new Map<string, PendingAck>();
   /** Interrupted-run recovery has completed (once per process). */
   private recovered = false;
+  /** Owner notices for parked one-shots have been sent (once per process). */
+  private reportedParked = false;
 
   constructor(agent: Agent, store: CronStore = new CronStore()) {
     this.store = store;
@@ -79,12 +82,21 @@ export class CronScheduler {
     // [resumed] marker. If recovery cannot persist, skip the scan entirely
     // and retry on the next tick; a late job beats a duplicated one.
     if (!this.ensureRecovered()) return;
+    if (!this.reportedParked) {
+      this.reportedParked = true;
+      void this.reportParkedOneShots();
+    }
 
     // The scan-and-dispatch below is synchronous (execute() marks the job
     // in-flight before its first await), so overlapping ticks cannot
     // double-dispatch a job.
     let dueJobs: CronJob[];
     try {
+      // Lateness first: after downtime, recurring runs missed by more than
+      // their staleness window move to their next slot instead of all firing
+      // in this one tick.
+      const busy = new Set([...this.inFlight, ...this.pendingAcks.keys()]);
+      for (const skip of this.store.skipStaleRuns(busy)) logStaleSkip(skip);
       dueJobs = this.store
         .getDueJobs()
         .filter((job) => !this.inFlight.has(job.id) && !this.pendingAcks.has(job.id));
@@ -119,12 +131,11 @@ export class CronScheduler {
     for (const { job, reason } of outcome.skipped) {
       log.warn(
         { jobId: job.id, name: job.name, startedAt: job.lastStartedAt, runId: job.lastRunId, reason },
-        reason === "once"
-          // One-shot: the single fire it was entitled to already happened. Do
-          // not repeat it — the run may have sent the message, placed the
-          // order, etc.
-          ? "Cron one-shot was interrupted by a restart; not re-firing (disabled, re-enable to retry)"
-          : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
+        reason === "once-stale"
+          ? "Cron one-shot was interrupted by a restart too long ago to retry; disabled, owner will be told"
+          : reason === "once-retried"
+            ? "Cron one-shot was interrupted again after its one retry; disabled, owner will be told"
+            : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
       );
     }
     for (const job of outcome.resumed) {
@@ -140,6 +151,41 @@ export class CronScheduler {
       );
     }
     return true;
+  }
+
+  /**
+   * Tell the owner about one-shots parked after an interruption — a reminder
+   * that will not arrive otherwise. Direct DM, no model turn. Each job is
+   * reported once (interruptNotifiedAt); a failed send is retried on the next
+   * daemon start.
+   */
+  private async reportParkedOneShots(): Promise<void> {
+    let parked: CronJob[];
+    try {
+      parked = this.store.unreportedParkedOneShots();
+    } catch (err) {
+      log.error({ err }, "Could not read parked cron one-shots to report");
+      return;
+    }
+    if (parked.length === 0) return;
+    const lines = parked.map((job) => {
+      const started = job.lastStartedAt ?? job.lastRunAt;
+      const when = started ? ` (started ${new Date(started).toLocaleString()})` : "";
+      return `- "${job.name}" [${job.id}]${when}: ${excerpt(job.message)}`;
+    });
+    const text = [
+      `${parked.length === 1 ? "A scheduled one-time task was" : `${parked.length} scheduled one-time tasks were`} ` +
+        "interrupted by a restart and will not run on their own:",
+      ...lines,
+      "Re-run one with `tomo cron enable <id>`, or remove it with `tomo cron remove <id>`.",
+    ].join("\n");
+    try {
+      await this.agent.sendNotification(text);
+      this.store.markInterruptNotified(parked.map((job) => job.id));
+      log.info({ jobIds: parked.map((job) => job.id) }, "Told the owner about interrupted cron one-shots");
+    } catch (err) {
+      log.error({ err, jobIds: parked.map((job) => job.id) }, "Could not tell the owner about interrupted cron one-shots");
+    }
   }
 
   private async execute(jobId: string): Promise<void> {
@@ -277,4 +323,16 @@ function resumedNote(interruptedAt: number | null): string {
     `done nothing. Check current state before repeating anything with side ` +
     `effects (sending, posting, ordering, writing, submitting).`
   );
+}
+
+function logStaleSkip({ job, lateByMs, windowMs }: StaleSkip): void {
+  log.warn(
+    { jobId: job.id, name: job.name, lateByMs, windowMs, nextRunAt: job.nextRunAt },
+    `Cron run skipped: missed its slot by ${formatDuration(lateByMs)}, more than its ${formatDuration(windowMs)} staleness window; next run ${job.nextRunAt ? new Date(job.nextRunAt).toISOString() : "none"}`,
+  );
+}
+
+function excerpt(text: string, max = 120): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }

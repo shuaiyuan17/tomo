@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { CronScheduler } from "../src/cron/scheduler.js";
-import { CronStore, isInterrupted } from "../src/cron/store.js";
+import { CronStore, DEFAULT_STALE_AFTER_MS, isInterrupted } from "../src/cron/store.js";
+import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -18,6 +19,13 @@ vi.mock("../src/logger.js", () => ({
 
 const TEST_DIR = join(tmpdir(), "tomo-test-cron-scheduler");
 const TEST_PATH = join(TEST_DIR, "jobs.json");
+
+/** Make the interrupted run on disk look like it started `agoMs` ago. */
+function ageInterruptedRun(agoMs: number): void {
+  const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+  for (const job of raw.jobs) job.lastStartedAt = Date.now() - agoMs;
+  writeFileSync(TEST_PATH, JSON.stringify(raw));
+}
 
 /** Force the named jobs (all jobs when omitted) to be due now. */
 function makeJobsDue(...names: string[]): void {
@@ -193,15 +201,17 @@ describe("CronScheduler", () => {
   // memory-only, so the fresh process finds a job that is still "due".
 
   /** An agent whose cron turns never settle — stands in for a killed daemon. */
-  function hangingAgent(): { agent: Agent; calls: string[] } {
+  function hangingAgent(): { agent: Agent; calls: string[]; notices: string[] } {
     const calls: string[] = [];
+    const notices: string[] = [];
     const agent = {
       handleCronMessage: vi.fn((msg: string) => {
         calls.push(msg);
         return new Promise<boolean>(() => {});
       }),
+      sendNotification: vi.fn(async (text: string) => { notices.push(text); }),
     } as unknown as Agent;
-    return { agent, calls };
+    return { agent, calls, notices };
   }
 
   /** Bodies delivered to a recording agent, envelope stripped. */
@@ -284,9 +294,9 @@ describe("CronScheduler", () => {
     expect(storeB.list()[0].lastStatus).toBe("ok");
   });
 
-  it("never fires a once job twice across a restart", async () => {
+  it("retries a fresh interrupted once job exactly once, then parks it and tells the owner", async () => {
     const storeA = new CronStore(TEST_PATH);
-    storeA.add({
+    const job = storeA.add({
       name: "send-the-order",
       schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
       message: "Place the order.",
@@ -299,21 +309,113 @@ describe("CronScheduler", () => {
     void tick(new CronScheduler(first.agent, storeA));
     await waitFor(() => expect(first.calls).toHaveLength(1));
 
-    // Daemon 2 must not place the order a second time: the one fire this job
-    // was entitled to already happened, and it may well have succeeded.
+    // Daemon 2: the run is fresh, so it is retried once — marked, so the
+    // model checks whether the order already went through.
     const second = hangingAgent();
-    const storeB = new CronStore(TEST_PATH);
-    const schedulerB = new CronScheduler(second.agent, storeB);
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
     schedulerB.start();
-    await new Promise((r) => setTimeout(r, 50));
-    await tick(schedulerB);
+    await waitFor(() => expect(second.calls).toHaveLength(1));
     schedulerB.stop();
+    expect(bodies(second.calls)[0]).toContain("[resumed]");
+    expect(second.notices).toHaveLength(0);
 
+    // Daemon 3: the retry was interrupted too. No third fire; parked, and the
+    // owner is told instead of the job vanishing into a log line.
+    const third = hangingAgent();
+    const storeC = new CronStore(TEST_PATH);
+    const schedulerC = new CronScheduler(third.agent, storeC);
+    schedulerC.start();
+    await waitFor(() => expect(third.notices).toHaveLength(1));
+    await tick(schedulerC);
+    schedulerC.stop();
+
+    expect(third.calls).toHaveLength(0);
+    expect(third.notices[0]).toContain(`"send-the-order" [${job.id}]`);
+    expect(third.notices[0]).toContain("tomo cron enable <id>");
+    const after = new CronStore(TEST_PATH).list()[0];
+    expect(after.enabled).toBe(false);
+    expect(after.nextRunAt).toBeNull();
+    expect(after.lastStatus).toBe("interrupted");
+    expect(after.interruptNotifiedAt).toBeGreaterThan(0);
+
+    // Told once, not on every restart.
+    const fourth = hangingAgent();
+    const schedulerD = new CronScheduler(fourth.agent, new CronStore(TEST_PATH));
+    schedulerD.start();
+    await new Promise((r) => setTimeout(r, 30));
+    schedulerD.stop();
+    expect(fourth.notices).toHaveLength(0);
+  });
+
+  it("does not retry a stale interrupted once job, and tells the owner", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    storeA.add({
+      name: "bedsheets",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      message: "Remind me to change the bedsheets.",
+      sessionKey: "dm:alice",
+    });
+    makeJobsDue();
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(1));
+    // The daemon stayed down well past the job's staleness window.
+    ageInterruptedRun(DEFAULT_STALE_AFTER_MS + 60_000);
+
+    const second = hangingAgent();
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
+    schedulerB.start();
+    await waitFor(() => expect(second.notices).toHaveLength(1));
+    schedulerB.stop();
     expect(second.calls).toHaveLength(0);
-    const job = storeB.list()[0];
-    expect(job.enabled).toBe(false);
-    expect(job.nextRunAt).toBeNull();
-    expect(job.lastStatus).toBe("interrupted");
+    expect(second.notices[0]).toContain("Remind me to change the bedsheets.");
+  });
+
+  it("tells the owner about a one-shot an older version parked silently", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({
+      name: "legacy",
+      schedule: { kind: "at", at: new Date(Date.now() - 86_400_000).toISOString() },
+      message: "x",
+      sessionKey: "dm:alice",
+    });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    Object.assign(raw.jobs[0], { enabled: false, nextRunAt: null, lastStatus: "interrupted" });
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const agent = hangingAgent();
+    const scheduler = new CronScheduler(agent.agent, new CronStore(TEST_PATH));
+    scheduler.start();
+    await waitFor(() => expect(agent.notices).toHaveLength(1));
+    scheduler.stop();
+    expect(agent.notices[0]).toContain('"legacy"');
+  });
+
+  it("skips recurring runs missed by more than the staleness window instead of firing them all at once", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "brief", schedule: { kind: "every", everyMs: 86_400_000 }, message: "brief", sessionKey: "dm:alice" });
+    store.add({ name: "recent", schedule: { kind: "every", everyMs: 86_400_000 }, message: "recent", sessionKey: "dm:alice" });
+    store.add({ name: "always", schedule: { kind: "every", everyMs: 86_400_000 }, message: "always", sessionKey: "dm:alice",
+      staleAfterMs: 0 });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    const now = Date.now();
+    for (const job of raw.jobs) {
+      // "recent" missed its slot by 30 minutes; the others by 7 hours.
+      job.nextRunAt = job.name === "recent" ? now - 30 * 60_000 : now - 7 * 3_600_000;
+    }
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), sendNotification: vi.fn() } as unknown as Agent;
+    await tick(new CronScheduler(agent, store));
+
+    const fired = (agent.handleCronMessage as ReturnType<typeof vi.fn>).mock.calls.map(([msg]) => parseTomoEvent(msg as string)!.name);
+    expect(fired.sort()).toEqual(["always", "recent"]);
+    const brief = new CronStore(TEST_PATH).list().find((j) => j.name === "brief")!;
+    expect(brief.enabled).toBe(true);
+    expect(brief.nextRunAt).toBeGreaterThan(now);
+    expect(brief.lastSkippedAt).toBeGreaterThanOrEqual(now);
+    expect(brief.lastStatus).toBeNull();
+    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => typeof msg === "string" && msg.startsWith("Cron run skipped: missed its slot by 7h"))).toBe(true);
   });
 
   it("leaves the normal cadence alone across a restart with no interrupted run", async () => {
@@ -513,20 +615,16 @@ describe("CronScheduler", () => {
     admin.setEnabled(job.id, true);
     expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
 
-    // Restart: the one-shot must still be recognised as interrupted, and must
-    // not be placed a second time.
+    // Restart: the one-shot must still be recognised as interrupted, so its
+    // one retry carries the [resumed] marker rather than reading as a clean
+    // first fire.
     const second = hangingAgent();
     const storeB = new CronStore(TEST_PATH);
     const schedulerB = new CronScheduler(second.agent, storeB);
     schedulerB.start();
-    await new Promise((r) => setTimeout(r, 30));
-    await tick(schedulerB);
+    await waitFor(() => expect(second.calls).toHaveLength(1));
     schedulerB.stop();
-
-    expect(second.calls).toHaveLength(0);
-    const after = storeB.list()[0];
-    expect(after.enabled).toBe(false);
-    expect(after.lastStatus).toBe("interrupted");
+    expect(bodies(second.calls)[0]).toContain("[resumed]");
   });
 
   it("a disable/enable during a RESUMED recurring run does not erase the interruption", async () => {
@@ -591,8 +689,10 @@ describe("CronScheduler", () => {
     void tick(new CronScheduler(first.agent, storeA));
     await waitFor(() => expect(first.calls).toHaveLength(1));
 
-    // Recovery settles and disables it; the operator then decides it should
-    // run after all. That decision must stick across the next restart.
+    // Recovery settles and disables it (too old to retry); the operator then
+    // decides it should run after all. That decision must stick across the
+    // next restart.
+    ageInterruptedRun(DEFAULT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     new CronStore(TEST_PATH).setEnabled(job.id, true);
 

@@ -21,6 +21,7 @@ import {
   type FabricatedMarker,
 } from "./inbound-markers.js";
 import { silentTurnSteerNote } from "../continuity-defaults.js";
+import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
 
 export interface TurnRequest {
@@ -659,6 +660,8 @@ function buildContentBlocks(
 
 export class LiveSession {
   private q: Query;
+  /** Removes the staged external MCP config file (see mcp-config-file.ts). */
+  private disposeMcpConfig: () => void = () => {};
   // Input messages waiting for the SDK to pull them through messageGenerator.
   // The SDK pumps this eagerly (writes to the CLI as soon as we yield), which
   // is what lets steer() inject a message while a turn is in flight.
@@ -799,7 +802,20 @@ export class LiveSession {
         this.resumeState = "unknown";
       }
     }
-    this.q = query({ prompt: this.messageGenerator(), options });
+    // External MCP configs (OAuth bearer tokens among them) go to the CLI in
+    // a 0600 file rather than on its argv. The CLI reads that file once while
+    // starting up, so it is deleted as soon as the child has answered the
+    // initialize request — and in any case when the session ends.
+    const staged = stageExternalMcpServers(options);
+    this.disposeMcpConfig = staged.dispose;
+    try {
+      this.q = query({ prompt: this.messageGenerator(), options: staged.options });
+    } catch (err) {
+      staged.dispose();
+      throw err;
+    }
+    const initialized = (this.q as Partial<Pick<Query, "initializationResult">>).initializationResult?.call(this.q);
+    if (initialized) initialized.then(staged.dispose, staged.dispose);
     this.eventLoopDone = this.consumeEvents();
   }
 
@@ -828,6 +844,7 @@ export class LiveSession {
       this.failTurn(err instanceof Error ? err : new Error(String(err)));
     }
     this.alive = false;
+    this.disposeMcpConfig();
     this.notifyBackgroundIdle();
     this.onTurnClaimed();
     this.inputWaiter?.();
@@ -1971,6 +1988,7 @@ export class LiveSession {
    */
   close(): void {
     this.alive = false;
+    this.disposeMcpConfig();
     this.notifyBackgroundIdle();
     this.onTurnClaimed();
     this.onTurnClaimed();

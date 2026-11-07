@@ -1,9 +1,10 @@
-import { CronStore } from "./store.js";
+import { CronStore, type StaleSkip } from "./store.js";
 import type { CronJob } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { watchBus } from "../watch/bus.js";
+import { formatDuration } from "./format.js";
 
 /**
  * Due-scan cadence. Exported because it is also the floor on how often a job
@@ -17,6 +18,8 @@ export const POLL_INTERVAL_MS = 30_000; // Check every 30s
  * giving up must not look like "never ran".
  */
 const ACK_MAX_ATTEMPTS = 3;
+/** Retry cadence for an owner report that could not be delivered. */
+export const OWNER_REPORT_RETRY_MS = 10 * 60_000;
 
 interface PendingAck {
   ok: boolean;
@@ -44,6 +47,9 @@ export class CronScheduler {
   private pendingAcks = new Map<string, PendingAck>();
   /** Interrupted-run recovery has completed (once per process). */
   private recovered = false;
+  /** Earliest time the next owner report may be attempted. */
+  private nextOwnerReportAt = 0;
+  private reportingToOwner = false;
 
   constructor(agent: Agent, store: CronStore = new CronStore()) {
     this.store = store;
@@ -79,6 +85,35 @@ export class CronScheduler {
     // [resumed] marker. If recovery cannot persist, skip the scan entirely
     // and retry on the next tick; a late job beats a duplicated one.
     if (!this.ensureRecovered()) return;
+
+    // Lateness before the due-scan: after downtime, recurring runs missed by
+    // more than their staleness window move to their next slot instead of
+    // all firing in this one tick. Done BEFORE the owner report below so an
+    // outage's skips and parked one-shots go out as ONE message.
+    try {
+      const busy = new Set([...this.inFlight, ...this.pendingAcks.keys()]);
+      const skipped = this.store.skipStaleRuns(busy);
+      for (const skip of skipped) logStaleSkip(skip);
+      if (skipped.length > 0) this.nextOwnerReportAt = 0;
+      // A one-shot retry queued by recovery that still has not gone out
+      // (the scan or dispatch kept failing) and is now past its window.
+      const expired = this.store.expireStaleOneShotRetries(busy);
+      for (const job of expired) {
+        log.warn({ jobId: job.id, name: job.name }, "Cron one-shot retry went stale before it could run; disabled, owner will be told");
+      }
+      if (expired.length > 0) this.nextOwnerReportAt = 0;
+    } catch (err) {
+      log.error({ err }, "Cron staleness check failed");
+    }
+
+    // Tell the owner what will not happen on its own: skipped runs and parked
+    // one-shots. On the first tick, whenever something new happens, and —
+    // until a report goes through — every OWNER_REPORT_RETRY_MS.
+    if (!this.reportingToOwner && Date.now() >= this.nextOwnerReportAt) {
+      this.nextOwnerReportAt = Date.now() + OWNER_REPORT_RETRY_MS;
+      this.reportingToOwner = true;
+      void this.reportToOwner().finally(() => { this.reportingToOwner = false; });
+    }
 
     // The scan-and-dispatch below is synchronous (execute() marks the job
     // in-flight before its first await), so overlapping ticks cannot
@@ -119,12 +154,13 @@ export class CronScheduler {
     for (const { job, reason } of outcome.skipped) {
       log.warn(
         { jobId: job.id, name: job.name, startedAt: job.lastStartedAt, runId: job.lastRunId, reason },
-        reason === "once"
-          // One-shot: the single fire it was entitled to already happened. Do
-          // not repeat it — the run may have sent the message, placed the
-          // order, etc.
-          ? "Cron one-shot was interrupted by a restart; not re-firing (disabled, re-enable to retry)"
-          : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
+        reason === "once-stale"
+          ? "Cron one-shot was interrupted by a restart too long ago to retry; disabled, owner will be told"
+          : reason === "once-retried"
+            ? "Cron one-shot was interrupted again after its one retry; disabled, owner will be told"
+            : reason === "once-disabled"
+              ? "Cron one-shot was interrupted by a restart while disabled; not retried, owner will be told"
+              : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
       );
     }
     for (const job of outcome.resumed) {
@@ -140,6 +176,84 @@ export class CronScheduler {
       );
     }
     return true;
+  }
+
+  /**
+   * One DM to the owner (direct, no model turn) covering everything that will
+   * not happen on its own:
+   *
+   * - recurring runs skipped as stale — so an outage is not discovered weeks
+   *   later as "the backup never ran that night";
+   * - one-shots parked after an interruption — a reminder that would
+   *   otherwise never arrive. Each job is reported once (interruptNotifiedAt).
+   *
+   * Batched: an outage's worth of skips and parks lands in one message. Both
+   * are pending ON DISK (skipNotice, interruptNotifiedAt), so a failed DM or a
+   * restart loses nothing; a failed attempt is retried after
+   * OWNER_REPORT_RETRY_MS.
+   */
+  private async reportToOwner(): Promise<void> {
+    let parked: CronJob[];
+    let skips: CronJob[];
+    try {
+      parked = this.store.unreportedParkedOneShots();
+      skips = this.store.unreportedSkips();
+    } catch (err) {
+      log.error({ err }, "Could not read skipped or parked cron jobs to report");
+      return;
+    }
+    if (parked.length === 0 && skips.length === 0) return;
+
+    const sections: string[] = [];
+    if (skips.length > 0) {
+      sections.push([
+        `${skips.length === 1 ? "A scheduled run was" : `${skips.length} scheduled runs were`} ` +
+          "missed (Tomo was down or behind) by more than the job's catch-up window, so " +
+          `${skips.length === 1 ? "it was" : "they were"} skipped rather than run late:`,
+        ...skips.map((job) => {
+          const { lateByMs, windowMs, count } = job.skipNotice!;
+          const next = job.nextRunAt ? `; next run ${new Date(job.nextRunAt).toLocaleString()}` : "";
+          const times = count > 1 ? `${count} runs skipped, latest ` : "";
+          return `- "${job.name}" [${job.id}]: ${times}${formatDuration(lateByMs)} late, window ${formatDuration(windowMs)}${next}`;
+        }),
+        "If one is still needed, ask me to do it now. To make a job always catch up: `tomo cron edit <id> --stale-after 0`.",
+      ].join("\n"));
+    }
+    if (parked.length > 0) {
+      sections.push([
+        `${parked.length === 1 ? "A scheduled one-time task was" : `${parked.length} scheduled one-time tasks were`} ` +
+          "interrupted by a restart and will not run on their own:",
+        ...parked.map((job) => {
+          const started = job.lastStartedAt ?? job.lastRunAt;
+          const when = started ? ` (started ${new Date(started).toLocaleString()})` : "";
+          return `- "${job.name}" [${job.id}]${when}: ${excerpt(job.message)}`;
+        }),
+        "If one is still needed, ask me to do it now, or remove it with `tomo cron remove <id>`. (`tomo cron enable <id>` re-runs a dated one-shot right away; a recurring-pattern one waits for its next slot.)",
+      ].join("\n"));
+    }
+    const ids = { skipped: skips.map((job) => job.id), parked: parked.map((job) => job.id) };
+    const sentSkips = skips.map((job) => ({ id: job.id, notice: { ...job.skipNotice! } }));
+    let delivered: boolean;
+    try {
+      // Owner only: the excerpts may come from any session's jobs.
+      delivered = await this.agent.notifyOwner(sections.join("\n\n"));
+    } catch (err) {
+      log.error({ err, ...ids }, "Could not tell the owner about skipped or interrupted cron runs; will retry");
+      return;
+    }
+    if (!delivered) {
+      // Nothing was delivered; it all stays pending on disk for a later try.
+      log.warn(ids, "No owner DM to report skipped or interrupted cron runs to; will retry");
+      return;
+    }
+    log.info(ids, "Told the owner about skipped or interrupted cron runs");
+    // Each acknowledgement on its own: one failing must not re-send the other.
+    try { this.store.markSkipNoticesSent(sentSkips); } catch (err) {
+      log.error({ err, jobIds: ids.skipped }, "Could not record that skipped cron runs were reported");
+    }
+    try { this.store.markInterruptNotified(ids.parked); } catch (err) {
+      log.error({ err, jobIds: ids.parked }, "Could not record that interrupted cron one-shots were reported");
+    }
   }
 
   private async execute(jobId: string): Promise<void> {
@@ -277,4 +391,16 @@ function resumedNote(interruptedAt: number | null): string {
     `done nothing. Check current state before repeating anything with side ` +
     `effects (sending, posting, ordering, writing, submitting).`
   );
+}
+
+function logStaleSkip({ job, lateByMs, windowMs }: StaleSkip): void {
+  log.warn(
+    { jobId: job.id, name: job.name, lateByMs, windowMs, nextRunAt: job.nextRunAt },
+    `Cron run skipped: missed its slot by ${formatDuration(lateByMs)}, more than its ${formatDuration(windowMs)} staleness window; next run ${job.nextRunAt ? new Date(job.nextRunAt).toISOString() : "none"}`,
+  );
+}
+
+function excerpt(text: string, max = 120): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }

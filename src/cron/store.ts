@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
-import type { CronJob, CronSchedule, InterruptedSkip } from "./types.js";
+import type { CronJob, CronSchedule, InterruptedSkip, SkipNotice } from "./types.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { withFileLockSync } from "../file-lock.js";
@@ -21,6 +21,115 @@ export const ONE_SHOT_RETRY_DELAY_MS = 5 * 60_000;
  * (or a daemon in a crash loop) re-fires forever, once per restart.
  */
 export const MAX_RESUME_ATTEMPTS = 3;
+
+/**
+ * A one-shot interrupted mid-run (a restart, a crash) is retried this many
+ * times, and only while it is fresh (see staleWindowMs). The retry carries the
+ * [resumed] marker, which tells the model to check what the interrupted run
+ * already did before repeating anything with side effects.
+ */
+export const ONE_SHOT_MAX_RESUMES = 1;
+
+/**
+ * How long an interrupted ONE-SHOT stays worth retrying, by default. A
+ * one-shot has no period to scale against; it is usually a reminder or a
+ * hand-off someone is waiting on, and two hours still covers a restart, an
+ * update or a short outage without delivering yesterday's reminder today.
+ */
+export const ONE_SHOT_STALE_AFTER_MS = 2 * 3_600_000;
+
+/**
+ * DEFAULT STALENESS WINDOW FOR RECURRING JOBS — scales with the job's period.
+ *
+ * A missed run is worth firing late while it is still closer to its own slot
+ * than to the next one, so the window is half the period, clamped:
+ *
+ * - at most STALE_WINDOW_MAX_MS (12h): a daily job (backup, health check,
+ *   brief) still catches up after an outage of up to half a day — skipping a
+ *   backup is worse than running it late — while a longer outage does not end
+ *   with the morning's brief arriving in the evening, right before the next.
+ * - at least STALE_WINDOW_MIN_MS (5 min): a short-interval job is not skipped
+ *   over a scan that ran a little late (a busy event loop, a lock wait).
+ *
+ * A job whose period is longer than CATCH_UP_PERIOD_MS (a little over a day,
+ * so a 25-hour DST day still counts as daily) ALWAYS catches up by default:
+ * skipping it would silently drop a whole week, month, quarter or year.
+ * Likewise when the period cannot be determined.
+ *
+ * Per job: `staleAfterMs` overrides all of this (0 = always catch up).
+ */
+export const STALE_WINDOW_MAX_MS = 12 * 3_600_000;
+export const STALE_WINDOW_MIN_MS = 5 * 60_000;
+export const CATCH_UP_PERIOD_MS = 25 * 3_600_000;
+
+/**
+ * The gap from a run's slot to the one after it: the interval for `every`;
+ * for a cron expression, from `slotMs` (an occurrence — typically the missed
+ * one) to the next occurrence. So a weekday cron missed on a Thursday has a
+ * 24h period and one missed on a Friday a 72h one, and a DST day is 23 or
+ * 25h. Without `slotMs`, the next occurrence after now is the slot. Null for
+ * one-shots and for anything that cannot be evaluated.
+ */
+export function schedulePeriodMs(schedule: CronSchedule, slotMs?: number): number | null {
+  if (schedule.kind === "every") return everyIntervalReason(schedule.everyMs) === null ? schedule.everyMs : null;
+  if (schedule.kind !== "cron") return null;
+  try {
+    const cron = new Cron(schedule.expr, { timezone: schedule.tz });
+    const slot = slotMs ?? cron.nextRun()?.getTime();
+    if (slot === undefined) return null;
+    const next = cron.nextRun(new Date(slot));
+    return next ? next.getTime() - slot : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The job's staleness window in ms; 0 means "never stale" (always catch up).
+ * `slotMs` is the run being judged (defaults to the job's nextRunAt).
+ */
+export function staleWindowMs(
+  job: Pick<CronJob, "staleAfterMs" | "schedule" | "deleteAfterRun"> & { nextRunAt?: number | null },
+  slotMs: number | undefined = job.nextRunAt ?? undefined,
+): number {
+  const own = job.staleAfterMs;
+  if (typeof own === "number" && Number.isFinite(own) && own >= 0) return own;
+  if (isSingleFire(job)) return ONE_SHOT_STALE_AFTER_MS;
+  const period = schedulePeriodMs(job.schedule, slotMs);
+  if (period === null || period > CATCH_UP_PERIOD_MS) return 0;
+  return Math.min(STALE_WINDOW_MAX_MS, Math.max(STALE_WINDOW_MIN_MS, Math.floor(period / 2)));
+}
+
+/**
+ * Parse a `--stale-after` value: "0", or a whole number with a unit
+ * (s, m, h, d). Null when unusable.
+ */
+export function parseStaleAfter(text: string): number | null {
+  const trimmed = text.trim();
+  if (trimmed === "0") return 0;
+  const match = /^(\d+)\s*(s|sec|m|min|h|hr|d|day)s?$/i.exec(trimmed);
+  if (!match) return null;
+  const val = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  const ms = unit.startsWith("s") ? val * 1000
+    : unit.startsWith("m") ? val * 60_000
+    : unit.startsWith("h") ? val * 3_600_000
+    : val * 86_400_000;
+  return Number.isSafeInteger(ms) ? ms : null;
+}
+
+/** Single-fire: every `at` schedule, and anything that deletes itself after a run. */
+export function isSingleFire(job: Pick<CronJob, "deleteAfterRun" | "schedule">): boolean {
+  return job.deleteAfterRun || job.schedule.kind === "at";
+}
+
+/** A recurring run skipped because its slot was too far in the past. */
+export interface StaleSkip {
+  job: CronJob;
+  /** How late the run would have been, in ms. */
+  lateByMs: number;
+  windowMs: number;
+}
 
 /**
  * Floor for a recurring ("every") interval, in milliseconds. Kept equal to the
@@ -137,6 +246,7 @@ export class CronStore {
     message: string;
     sessionKey: string;
     deleteAfterRun?: boolean;
+    staleAfterMs?: number;
   }): CronJob {
     // The one schedule check the store itself owes: an unusable `every`
     // interval is not a state this store may represent at all (unlike a past
@@ -167,6 +277,7 @@ export class CronStore {
       lastStartedAt: null,
       lastRunId: null,
       lastCompletedRunId: null,
+      ...(opts.staleAfterMs !== undefined ? { staleAfterMs: opts.staleAfterMs } : {}),
     };
     this.jobs.push(job);
     this.save();
@@ -229,6 +340,8 @@ export class CronStore {
       const next = computeNextRun(job.schedule, now);
       job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
       if (job.schedule.kind === "at") delete job.retryCount;
+      // Whoever re-enabled it has seen it; a later interruption is news again.
+      if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
       // Re-enabling adjudicates an interrupted run that recovery has ALREADY
       // settled: whoever re-enabled it has decided the job should run again,
       // so clear the state that would otherwise make the next daemon start
@@ -254,6 +367,24 @@ export class CronStore {
       // would show as a "next run" that will never fire.
       job.nextRunAt = null;
     }
+    this.save();
+    return job;
+  }
+
+  /**
+   * Set (`ms`, 0 = always catch up) or clear (`null` = back to the default)
+   * a job's staleness window. `guard` as for setEnabled/remove.
+   */
+  setStaleAfter(id: string, ms: number | null): CronJob | undefined;
+  setStaleAfter(id: string, ms: number | null, guard: (job: CronJob) => boolean): CronJob | undefined | "refused";
+  setStaleAfter(id: string, ms: number | null, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" {
+    if (ms !== null && !(Number.isSafeInteger(ms) && ms >= 0)) throw new RangeError(`invalid staleAfterMs: ${ms}`);
+    this.load();
+    const job = this.get(id);
+    if (!job) return undefined;
+    if (guard && !guard(job)) return "refused";
+    if (ms === null) delete job.staleAfterMs;
+    else job.staleAfterMs = ms;
     this.save();
     return job;
   }
@@ -362,11 +493,13 @@ export class CronStore {
    *   disk, so they fire on the next scan — with `interruptedAt` set so the
    *   scheduler marks that fire as a resume in the event body, telling the
    *   model to check state before repeating anything with side effects.
-   * - `skipped` with reason `"once"`: single-fire jobs — `deleteAfterRun`, and
-   *   every `at` schedule regardless of that flag. Their whole point is a
-   *   single fire, and that fire already happened; whether it finished is
-   *   unknowable. Disabled with `lastStatus: "interrupted"` so a human/agent
-   *   can inspect and re-enable — never fired twice.
+   * - single-fire jobs — `deleteAfterRun`, and every `at` schedule regardless
+   *   of that flag — are `resumed` ONCE while fresh (the interrupted run
+   *   started within the job's staleness window), with the same [resumed]
+   *   marker. Otherwise they are `skipped` with reason `"once-stale"` or
+   *   `"once-retried"`: disabled with `lastStatus: "interrupted"` so a
+   *   human/agent can inspect and re-enable, and reported to the owner by the
+   *   scheduler (see unreportedParkedOneShots) — never dropped silently.
    * - `skipped` with reason `"resume-cap"`: a recurring job that has been
    *   resumed MAX_RESUME_ATTEMPTS times since its last successful run. A turn
    *   that reliably takes the daemon down (or a crash loop) would otherwise
@@ -377,30 +510,65 @@ export class CronStore {
     const now = Date.now();
     const resumed: CronJob[] = [];
     const skipped: InterruptedSkip[] = [];
+    let changed = false;
     for (const job of this.jobs) {
-      if (!isInterrupted(job)) continue;
-      // Acknowledge the run token: this interruption is now accounted for.
-      job.lastCompletedRunId = job.lastRunId ?? null;
-      job.interruptedAt = job.lastStartedAt ?? now;
-      job.lastRunAt = job.lastStartedAt ?? now;
-      job.lastStatus = "interrupted";
       const park = (reason: InterruptedSkip["reason"]) => {
         job.enabled = false;
         job.nextRunAt = null;
         // No further fire, so no marker to carry — the state stays visible
         // through lastStatus.
         job.interruptedAt = null;
+        // A new incident: the owner has not been told about THIS one.
+        if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
         skipped.push({ job: { ...job }, reason });
+        changed = true;
       };
+      if (!isInterrupted(job)) {
+        // A one-shot an earlier start already queued for its retry, whose
+        // retry never got dispatched (the daemon went down again first).
+        // Freshness is re-judged now: after a long second outage it is too
+        // late for the retry too.
+        if (job.enabled && isSingleFire(job) && job.interruptedAt != null) {
+          const window = staleWindowMs(job);
+          if (window !== 0 && now - job.interruptedAt > window) park("once-stale");
+        }
+        continue;
+      }
+      // Acknowledge the run token: this interruption is now accounted for.
+      job.lastCompletedRunId = job.lastRunId ?? null;
+      job.interruptedAt = job.lastStartedAt ?? now;
+      job.lastRunAt = job.lastStartedAt ?? now;
+      job.lastStatus = "interrupted";
+      changed = true;
       // One-shot is a property of the SCHEDULE, not just the lifecycle flag.
       // `deleteAfterRun: false` on an "at" job only means "keep the record
       // after it fires" (schedule_create's `once: false`) — it is still a
       // single-fire job, and markRun treats it as one (kind "at" never gets a
-      // recomputed nextRunAt). Resuming it here would re-fire it on THIS
-      // restart, and, because the resumed run leaves the same unacknowledged
-      // token behind if it is interrupted again, on every restart after that.
-      if (job.deleteAfterRun || job.schedule.kind === "at") {
-        park("once");
+      // recomputed nextRunAt).
+      //
+      // An interrupted one-shot is usually a reminder or a task the owner is
+      // waiting on, so parking it silently loses it. It gets ONE retry while
+      // it is fresh, carrying the [resumed] marker so the model checks what
+      // the interrupted run already did before repeating side effects. A
+      // second interruption (a turn that takes the daemon down) or a stale
+      // run is parked — and the scheduler tells the owner about it.
+      if (isSingleFire(job)) {
+        const window = staleWindowMs(job);
+        const startedAt = job.lastStartedAt ?? now;
+        const fresh = window === 0 || now - startedAt <= window;
+        const attempts = (job.resumeAttempts ?? 0) + 1;
+        if (!job.enabled) {
+          // Disabled while the run was in flight: someone decided it should
+          // not run. Not retried, but not silent either.
+          park("once-disabled");
+        } else if (!fresh) {
+          park("once-stale");
+        } else if (attempts > ONE_SHOT_MAX_RESUMES) {
+          park("once-retried");
+        } else {
+          job.resumeAttempts = attempts;
+          resumed.push({ ...job });
+        }
         continue;
       }
       const attempts = (job.resumeAttempts ?? 0) + 1;
@@ -411,7 +579,7 @@ export class CronStore {
       }
       resumed.push({ ...job });
     }
-    if (resumed.length > 0 || skipped.length > 0) this.save();
+    if (changed) this.save();
     return { resumed, skipped };
   }
 
@@ -463,6 +631,116 @@ export class CronStore {
     }
 
     this.save();
+  }
+
+  /**
+   * Skip recurring runs that are due but so far past their slot that firing
+   * now would be wrong — the daemon was down across it. Each such job moves
+   * to its next slot from `now` and does not fire for the missed one.
+   * Single-fire jobs are never skipped (they are the deliverable), nor are
+   * the ids in `exclude` (in flight, or awaiting an outcome write: their
+   * nextRunAt has not advanced yet for a reason that is not lateness).
+   */
+  skipStaleRuns(exclude: ReadonlySet<string> = new Set(), now = Date.now()): StaleSkip[] {
+    this.load();
+    const skipped: StaleSkip[] = [];
+    for (const job of this.jobs) {
+      if (!job.enabled || job.nextRunAt === null || exclude.has(job.id) || isSingleFire(job)) continue;
+      // A resumed run (recovery left it due with the marker) is the
+      // interrupted run being finished, not a missed slot: never skip it.
+      if (job.interruptedAt != null) continue;
+      const windowMs = staleWindowMs(job, job.nextRunAt);
+      const lateByMs = now - job.nextRunAt;
+      if (windowMs === 0 || lateByMs <= windowMs) continue;
+      // `every`: keep the phase — the next slot on the job's own grid, not
+      // `now + interval` (a 09:00 daily job skipped at 16:00 stays a 09:00 job).
+      const next = job.schedule.kind === "every" && everyIntervalReason(job.schedule.everyMs) === null
+        ? job.nextRunAt + (Math.floor(lateByMs / job.schedule.everyMs) + 1) * job.schedule.everyMs
+        : computeNextRun(job.schedule, now);
+      // No future slot: leave it due rather than store the dead shape
+      // `enabled: true, nextRunAt: null` that nothing ever fires.
+      if (next === null) continue;
+      job.nextRunAt = next;
+      job.lastSkippedAt = now;
+      // Durable, so the owner still hears about it after a restart or a
+      // failed DM; cleared by markSkipNoticesSent.
+      const prior = job.skipNotice ?? null;
+      job.skipNotice = { seq: (prior?.seq ?? 0) + 1, count: (prior?.count ?? 0) + 1, lateByMs, windowMs };
+      skipped.push({ job: { ...job }, lateByMs, windowMs });
+    }
+    if (skipped.length > 0) this.save();
+    return skipped;
+  }
+
+  /**
+   * Park one-shot retries that recovery queued but that never got dispatched
+   * and are now past their staleness window — the same judgement recovery
+   * makes at startup, applied while the daemon keeps running.
+   */
+  expireStaleOneShotRetries(exclude: ReadonlySet<string> = new Set(), now = Date.now()): CronJob[] {
+    this.load();
+    const parked: CronJob[] = [];
+    for (const job of this.jobs) {
+      if (!job.enabled || !isSingleFire(job) || job.interruptedAt == null || exclude.has(job.id)) continue;
+      const window = staleWindowMs(job);
+      if (window === 0 || now - job.interruptedAt <= window) continue;
+      job.enabled = false;
+      job.nextRunAt = null;
+      job.interruptedAt = null;
+      if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
+      parked.push({ ...job });
+    }
+    if (parked.length > 0) this.save();
+    return parked;
+  }
+
+  /**
+   * Interrupted one-shots that were parked (not retried) and that the owner
+   * has not been told about yet — including ones parked by older versions,
+   * which did so silently. The scheduler reports each once.
+   */
+  unreportedParkedOneShots(): CronJob[] {
+    this.load();
+    return this.jobs.filter((job) =>
+      !job.enabled && job.lastStatus === "interrupted" && isSingleFire(job) && job.interruptNotifiedAt == null);
+  }
+
+  /** Recurring jobs with a stale skip the owner has not been told about. */
+  unreportedSkips(): CronJob[] {
+    this.load();
+    return this.jobs.filter((job) => job.skipNotice != null);
+  }
+
+  /**
+   * Record that the owner was told about these skips — exactly the notices
+   * that were sent. A job skipped again since then keeps the newer skips.
+   */
+  markSkipNoticesSent(sent: ReadonlyArray<{ id: string; notice: SkipNotice }>): void {
+    if (sent.length === 0) return;
+    this.load();
+    let changed = false;
+    for (const { id, notice } of sent) {
+      const job = this.jobs.find((j) => j.id === id);
+      const current = job?.skipNotice;
+      if (!job || current == null) continue;
+      if (current.seq <= notice.seq) job.skipNotice = null;
+      else job.skipNotice = { ...current, count: Math.max(1, current.count - notice.count) };
+      changed = true;
+    }
+    if (changed) this.save();
+  }
+
+  /** Record that the owner was told about these parked one-shots. */
+  markInterruptNotified(ids: readonly string[], now = Date.now()): void {
+    if (ids.length === 0) return;
+    this.load();
+    let changed = false;
+    for (const job of this.jobs) {
+      if (!ids.includes(job.id)) continue;
+      job.interruptNotifiedAt = now;
+      changed = true;
+    }
+    if (changed) this.save();
   }
 
   getDueJobs(): CronJob[] {

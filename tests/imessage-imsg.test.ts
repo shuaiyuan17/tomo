@@ -230,6 +230,20 @@ describe("imsg RPC framing", () => {
     await channel.stop();
   });
 
+  it("keeps a long string RPC `data` whole, so refusal phrases deep in it still match", async () => {
+    const data = `${"context ".repeat(400)}Could not securely open sticker directory`;
+    const { channel } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 7 });
+        if (req.method === "send") return child.respondError(req.id, -32603, "Internal error", data);
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+    await expect(channel.send({ chatId: DM_GUID, text: "hi" })).rejects.toThrow(/Could not securely open sticker directory$/);
+    await channel.stop();
+  });
+
   it("parses payloads split across stdout chunks", async () => {
     const { channel, children } = makeChannel();
     await channel.start();

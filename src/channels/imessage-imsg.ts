@@ -1374,7 +1374,11 @@ export class ImsgChannel implements Channel {
         // refusals but an OBJECT for some (e.g. -32004 "Mutation lane
         // blocked"), which used to be interpolated as "[object Object]".
         const error = payload.error as { code?: number; message?: string; data?: unknown };
-        const data = error.data === undefined || error.data === null || error.data === "" ? "" : describeError(error.data);
+        // A string is used verbatim, unclipped, exactly as before: callers
+        // match refusal phrases in it (isStickerStagingRefusal).
+        const data = error.data === undefined || error.data === null || error.data === ""
+          ? ""
+          : typeof error.data === "string" ? error.data : describeError(error.data);
         const detail = data ? `: ${data}` : "";
         // Typed rejection: an error RESPONSE proves the child processed and
         // refused the request (nothing was sent) — callers with a fallback

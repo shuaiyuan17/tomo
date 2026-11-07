@@ -30,8 +30,23 @@ describe("describeError", () => {
     expect(safeJson(cyclic)).toBe('{"n":"1","self":"[circular]"}');
   });
 
-  it("bounds the length", () => {
+  it("bounds the length, keeping the fields and the END of stderr", () => {
     expect(describeError("x".repeat(5000)).length).toBe(2000);
+    const stderr = `${"noise ".repeat(1000)}FATAL: bridge not injected`;
+    const err = Object.assign(new Error(`Command failed: imsg status --json\n${stderr}`), { code: 1, stderr });
+    const text = describeError(err);
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(text).toContain("code=1");
+    expect(text).toContain("FATAL: bridge not injected)");
+  });
+
+  it("never throws, whatever the value's getters do", () => {
+    const hostile = new Error("send failed");
+    Object.defineProperty(hostile, "code", { get() { throw new Error("getter"); }, enumerable: true });
+    expect(describeError(hostile)).toBe("send failed");
+    const obj = { get boom() { throw new Error("getter"); } };
+    expect(describeError(obj)).toBe("(unserializable object)");
+    expect(describeError(Buffer.from("plain text"))).toBe("plain text");
   });
 });
 

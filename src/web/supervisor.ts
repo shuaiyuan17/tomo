@@ -44,6 +44,7 @@ export class WebSupervisor implements WebLifecycle {
   private lastError: string | null = null;
   private timer?: ReturnType<typeof setTimeout>;
   private healthyTimer?: ReturnType<typeof setTimeout>;
+  private portInUseReported = false;
   private unsubscribe?: () => void;
   private boundPort: number | null = null;
   private starting?: Promise<void>;
@@ -61,8 +62,13 @@ export class WebSupervisor implements WebLifecycle {
     if (this.starting) return this.starting;
     if (this.child && !this.stopping) return Promise.resolve();
     this.stopping = false;
+    // A restart pending from an earlier failure would launch a second child
+    // next to the one started here.
+    clearTimeout(this.timer);
+    this.nextRetryAt = null;
     this.restarts = 0;
     this.lastError = null;
+    this.portInUseReported = false;
     this.starting = this.launch().catch(() => { this.report("Web UI unavailable; messaging channels remain active."); })
       .finally(() => { this.starting = undefined; });
     return this.starting;
@@ -126,6 +132,7 @@ export class WebSupervisor implements WebLifecycle {
     this.report(message, this.restarts === BACKOFF_ALERT_AFTER ? "error" : "warn");
     this.timer = setTimeout(() => {
       this.nextRetryAt = null;
+      if (this.stopping || this.child) return;
       void this.launch().catch(() => this.report("Web UI restart failed.", "warn"));
     }, delay);
     this.timer.unref();
@@ -187,6 +194,7 @@ export class WebSupervisor implements WebLifecycle {
           this.boundPort = value.port;
           const recovered = this.restarts;
           this.lastError = null;
+          this.portInUseReported = false;
           this.setState("running");
           if (recovered >= BACKOFF_ALERT_AFTER) this.report(`Web UI recovered after ${recovered} consecutive failed start(s).`);
           // Consecutive failures are forgotten only after a period of health,
@@ -208,8 +216,10 @@ export class WebSupervisor implements WebLifecycle {
           // A busy port is retried too (whatever holds it may go away), but
           // it is reported at error level straight away: it usually needs a
           // config change.
+          // Error level once per outage, not on every capped retry.
           this.report(portInUse ? "Web UI port is in use; choose another web.port and restart." : "Web UI could not start.",
-            portInUse ? "error" : "warn");
+            portInUse && !this.portInUseReported ? "error" : "warn");
+          if (portInUse) this.portInUseReported = true;
           settle();
           return;
         }
@@ -238,8 +248,12 @@ export class WebSupervisor implements WebLifecycle {
           else failure(503, "service_unavailable");
         }).finally(() => { activeRpc--; });
       });
-      child.once("error", () => { this.fail("process unavailable"); this.report("Web UI process unavailable.", "warn"); child.kill("SIGKILL"); settle(); });
-      child.once("exit", () => {
+      // Runs once per child, from "exit" or from a spawn failure — after which
+      // Node does not promise an "exit" event at all.
+      let gone = false;
+      const onGone = () => {
+        if (gone) return;
+        gone = true;
         unsubscribe();
         clearInterval(heartbeat);
         settle();
@@ -249,7 +263,16 @@ export class WebSupervisor implements WebLifecycle {
         if (this.stopping) return;
         if (!this.lastError) this.fail("process exited");
         this.scheduleRestart();
+      };
+      child.once("error", () => {
+        this.fail("process unavailable");
+        this.report("Web UI process unavailable.", "warn");
+        // No pid: the spawn itself failed and no "exit" will follow.
+        if (child.pid === undefined) onGone();
+        else child.kill("SIGKILL");
+        settle();
       });
+      child.once("exit", onGone);
       const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin } = this.options;
       send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });

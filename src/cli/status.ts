@@ -177,17 +177,21 @@ export function probePort(port: number, host = "127.0.0.1", timeoutMs = 750): Pr
 
 function renderWeb(web: NonNullable<StatusReport["web"]>, now: number): string {
   if (web.listening === null) return `daemon not running (port ${web.port})`;
-  if (web.listening) return `listening on 127.0.0.1:${web.port}`;
   const rec = web.record;
+  // A connectable port is OUR web UI only if the supervisor says so: when its
+  // child failed (typically "port in use") the listener is someone else.
+  const supervisedDown = rec !== null && rec.state !== "running" && rec.state !== "starting";
+  if (web.listening && !supervisedDown) return `listening on 127.0.0.1:${web.port}`;
   const detail: string[] = [];
   if (rec && rec.restarts > 0) detail.push(`${rec.restarts} consecutive failed start${rec.restarts === 1 ? "" : "s"}`);
   if (rec?.lastError) detail.push(`last: ${rec.lastError}`);
   const suffix = detail.length ? ` (${detail.join("; ")})` : "";
   if (rec?.state === "starting") return `starting on port ${web.port}${suffix}`;
+  const holder = web.listening ? `; another process holds port ${web.port}` : "";
   if (rec?.state === "backoff" && rec.nextRetryAt !== null) {
-    return `DOWN — retrying ${formatRelative(rec.nextRetryAt, now)}${suffix}`;
+    return `DOWN — retrying ${formatRelative(rec.nextRetryAt, now)}${suffix}${holder}`;
   }
-  if (rec?.state === "failed") return `DOWN — gave up${suffix}`;
+  if (rec?.state === "failed") return `DOWN — gave up${suffix}${holder}`;
   return `DOWN — nothing listening on port ${web.port}${suffix}`;
 }
 

@@ -81,6 +81,8 @@ it("reports an occupied port at error level and comes up once the port is free",
     await new Promise<void>((resolve) => occupied.close(() => resolve())); open = false;
     await expect.poll(() => supervisor.status().port, { timeout: 5_000 }).toBe(port);
     expect(supervisor.status().state).toBe("running");
+    // One error line for the whole outage, however many retries it took.
+    expect(diagnostic.filter(([text, level]) => level === "error" && text.includes("port is in use"))).toHaveLength(1);
   } finally { if (open) await new Promise<void>((resolve) => occupied.close(() => resolve())); }
 }, 10_000);
 
@@ -144,3 +146,17 @@ it("reaps a process whose event loop hangs after it reports ready", async () => 
   expect(supervisor.status().pid).toBeTypeOf("number");
   await expect.poll(() => supervisor.status().pid, { timeout: 2000 }).toBeNull();
 });
+
+it("a start() during backoff cancels the pending restart instead of racing it", async () => {
+  supervisor = new WebSupervisor(channel, options(),
+    { childPath: flakyChild(1), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 1_500, maxBackoffMs: 1_500 });
+  await supervisor.start();
+  await expect.poll(() => supervisor.status().state, { timeout: 3_000 }).toBe("backoff");
+  await supervisor.start();
+  await expect.poll(() => supervisor.status().state, { timeout: 3_000 }).toBe("running");
+  const pid = supervisor.status().pid;
+  // Past the moment the cancelled restart would have fired.
+  await new Promise((resolve) => setTimeout(resolve, 1_800));
+  expect(supervisor.status().pid).toBe(pid);
+  expect(Number(readFileSync(join(root, "starts"), "utf8"))).toBe(2);
+}, 10_000);

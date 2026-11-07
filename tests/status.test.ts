@@ -124,6 +124,13 @@ describe("renderStatusReport", () => {
       expect(renderStatusReport(r, NOW)).toContain("  web        DOWN — retrying in 2m (4 consecutive failed starts; last: startup timed out)");
     });
 
+    it("does not mistake another process on the port for the web UI", () => {
+      const r = baseReport();
+      r.web = { port: 9465, listening: true, record: { ...record, lastError: "port in use" } };
+      expect(renderStatusReport(r, NOW)).toContain(
+        "  web        DOWN — retrying in 2m (4 consecutive failed starts; last: port in use); another process holds port 9465");
+    });
+
     it("says DOWN even without a supervisor record", () => {
       const r = baseReport();
       r.web = { port: 9465, listening: false, record: null };

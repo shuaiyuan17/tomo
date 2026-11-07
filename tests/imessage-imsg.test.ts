@@ -222,7 +222,9 @@ describe("imsg RPC framing", () => {
     const err = await channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error & { rpcCode?: number; rpcData?: unknown });
     expect(err).not.toBeNull();
     expect(err!.message).not.toContain("[object Object]");
-    expect(err!.message).toBe(`imsg rpc send failed (-32004) Mutation lane blocked: ${JSON.stringify(data)}`);
+    // The structured payload stays out of the message (which can be shown)
+    // and travels as a field the log serializer writes.
+    expect(err!.message).toBe("imsg rpc send failed (-32004) Mutation lane blocked");
     // Kept structured for the log line, too.
     expect(err!.rpcCode).toBe(-32004);
     expect(err!.rpcData).toEqual(data);

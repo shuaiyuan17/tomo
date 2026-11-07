@@ -342,8 +342,8 @@ export class ProactiveSendService {
     try {
       await channel.setChatTitle(replyTarget.chatId, trimmedTitle);
     } catch (err) {
-      const detail = shortErrorMessage(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     this.deps.setChatTitle(sessionKey, trimmedTitle);
@@ -400,8 +400,8 @@ export class ProactiveSendService {
     try {
       await channel.reactToMessage(chatId, messageId, reaction, remove);
     } catch (err) {
-      const detail = shortErrorMessage(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     log.info({ sessionKey: resolved.sessionKey, channel: chatRef.channelName, reaction, remove, matched: match !== undefined || undefined }, "Reacted to message");
@@ -425,8 +425,8 @@ export class ProactiveSendService {
     try {
       await resolved.channel.editMessage!(resolved.chatId, resolved.message.id, newText);
     } catch (err) {
-      const detail = shortErrorMessage(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     log.info({ sessionKey: resolved.sessionKey, channel: resolved.channel.name, matched: match !== undefined || undefined }, "Edited sent message");
@@ -445,8 +445,8 @@ export class ProactiveSendService {
     try {
       await resolved.channel.unsendMessage!(resolved.chatId, resolved.message.id);
     } catch (err) {
-      const detail = shortErrorMessage(err);
-      return { ok: false, error: detail };
+      log.warn({ err }, "Chat action failed");
+      return { ok: false, error: shortErrorMessage(err) };
     }
 
     log.info({ sessionKey: resolved.sessionKey, channel: resolved.channel.name, matched: match !== undefined || undefined }, "Unsent message");

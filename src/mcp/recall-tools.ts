@@ -1,6 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { SessionMessage } from "../sessions/types.js";
+import { shortErrorMessage } from "../error-text.js";
 
 /** Cap per-message excerpt length so one giant transcript entry can't blow
  *  the tool result (and the caller's context) up. */
@@ -135,7 +136,7 @@ export function buildRecallTools(deps: RecallToolDeps) {
           toTime = parseTimeBound(before, "before");
         } catch (err) {
           return {
-            content: [{ type: "text" as const, text: `recall_conversation failed: ${err instanceof Error ? err.message : String(err)}` }],
+            content: [{ type: "text" as const, text: `recall_conversation failed: ${shortErrorMessage(err)}` }],
             isError: true,
           };
         }

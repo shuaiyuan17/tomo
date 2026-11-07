@@ -31,7 +31,9 @@ const SHORT_MAX = 500;
  */
 export function shortErrorMessage(value: unknown): string {
   try {
-    if (typeof value === "string") return clip(value, SHORT_MAX) || "unknown error";
+    // A thrown string is passed through whole, like an Error's message:
+    // isSafeguardError / withRecoveryHint match on it.
+    if (typeof value === "string") return value || "unknown error";
     if (value !== null && typeof value === "object") {
       const record = value as Record<string, unknown>;
       const pub = read(() => record.publicMessage);

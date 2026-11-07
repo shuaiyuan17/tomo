@@ -8,6 +8,7 @@ import {
   type SDKMessageOrigin,
 } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
+import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
@@ -841,7 +842,7 @@ export class LiveSession {
         await this.handleEvent(event);
       }
     } catch (err) {
-      this.failTurn(err instanceof Error ? err : new Error(String(err)));
+      this.failTurn(err instanceof Error ? err : new Error(shortErrorMessage(err), { cause: err }));
     }
     this.alive = false;
     this.disposeMcpConfig();

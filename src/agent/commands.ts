@@ -695,8 +695,8 @@ export class ChatCommandHandler {
 
       this.scheduleRestart();
     } catch (err) {
-      const detail = shortErrorMessage(err);
-      await channel.send({ chatId, text: `⚠️ [error] restore failed: ${detail}` });
+      log.warn({ err }, "/restore failed");
+      await channel.send({ chatId, text: `⚠️ [error] restore failed: ${shortErrorMessage(err)}` });
     }
   }
 }

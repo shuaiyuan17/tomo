@@ -16,7 +16,7 @@ import {
   saveInboundFile,
   type SavedFileNotice,
 } from "./fileStore.js";
-import { describeError } from "../error-text.js";
+import { describeError, shortErrorMessage } from "../error-text.js";
 import { log } from "../logger.js";
 import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
@@ -1107,7 +1107,9 @@ export class ImsgChannel implements Channel {
     });
     child.on("error", (err) => {
       log.error({ err }, "imsg rpc child failed to spawn");
-      this.handleChildDown(child, `spawn error: ${describeError(err)}`);
+      // The reason ends up in the message of every pending request it
+      // rejects, so the short form; the full error is in the line above.
+      this.handleChildDown(child, `spawn error: ${shortErrorMessage(err)}`);
     });
     child.on("exit", (code, signal) => {
       this.handleChildDown(child, `exited with code ${code} signal ${signal}`);
@@ -1247,7 +1249,8 @@ export class ImsgChannel implements Channel {
         if (req) {
           this.pending.delete(id);
           clearTimeout(req.timer);
-          reject(new Error(`imsg rpc write failed for ${method}: ${describeError(err)}`, { cause: err }));
+          log.warn({ err, method }, "imsg rpc write failed");
+          reject(new Error(`imsg rpc write failed for ${method}: ${shortErrorMessage(err)}`, { cause: err }));
         }
       });
     });
@@ -1377,17 +1380,18 @@ export class ImsgChannel implements Channel {
         // refusals but an OBJECT for some (e.g. -32004 "Mutation lane
         // blocked"), which used to be interpolated as "[object Object]".
         const error = payload.error as { code?: number; message?: string; data?: unknown };
-        // A string is used verbatim, unclipped, exactly as before: callers
-        // match refusal phrases in it (isStickerStagingRefusal).
-        const data = error.data === undefined || error.data === null || error.data === ""
-          ? ""
-          : typeof error.data === "string" ? error.data : describeError(error.data);
-        const detail = data ? `: ${data}` : "";
+        // A STRING `data` is the human refusal text and stays in the message,
+        // verbatim and unclipped, exactly as before: callers match refusal
+        // phrases in it (isStickerStagingRefusal). A STRUCTURED payload is
+        // diagnostic, not prose — it is kept out of the message (which can be
+        // shown, e.g. as a send_message tool error) and travels as `rpcData`,
+        // which the log serializer writes as a field.
+        const detail = typeof error.data === "string" && error.data !== "" ? `: ${error.data}` : "";
         // Typed rejection: an error RESPONSE proves the child processed and
         // refused the request (nothing was sent) — callers with a fallback
         // send key on this to avoid double-delivering after ambiguous
         // failures (timeout/child-death), which reject as plain Errors.
-        const head = `imsg rpc ${req.method} failed (${error.code ?? "?"}) ${typeof error.message === "string" ? error.message : describeError(error.message ?? "error")}`;
+        const head = `imsg rpc ${req.method} failed (${error.code ?? "?"}) ${typeof error.message === "string" ? error.message : shortErrorMessage(error.message ?? "error")}`;
         req.reject(new ImsgRpcResponseError(`${head}${detail}`, { code: error.code, data: error.data, publicMessage: head }));
       } else {
         req.resolve((payload.result ?? {}) as Record<string, unknown>);

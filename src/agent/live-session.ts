@@ -842,6 +842,11 @@ export class LiveSession {
         await this.handleEvent(event);
       }
     } catch (err) {
+      if (!(err instanceof Error)) {
+        // The wrapper below keeps only a message; log the value itself so its
+        // other fields (stderr, data) are not lost.
+        log.warn({ thrown: err }, "SDK event loop threw a non-Error value");
+      }
       this.failTurn(err instanceof Error ? err : new Error(shortErrorMessage(err), { cause: err }));
     }
     this.alive = false;

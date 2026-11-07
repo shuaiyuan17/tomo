@@ -146,7 +146,8 @@ export class ProactiveSendService {
       // rides the text send — it modifies delivery of text, not attachments.
       let textDelivered = false;
       if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+        await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
+          .catch(logDirectSendFailure);
         textDelivered = true;
       } else if (effect) {
         effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
@@ -218,7 +219,8 @@ export class ProactiveSendService {
     } else {
       // No attachments: verbatim text (direct-mode contract), behind the
       // advisory only when the guard fired.
-      await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) });
+      await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
+        .catch(logDirectSendFailure);
     }
 
     // What the transcript records, and what the pending note describes. On a
@@ -585,4 +587,14 @@ export class ProactiveSendService {
       messageId: message.id,
     });
   }
+}
+
+/**
+ * A direct send's rejection escapes to the MCP server, which hands only its
+ * message to the model. Log the whole error (RPC data, stderr) first, so the
+ * diagnostic is not lost, then rethrow unchanged.
+ */
+function logDirectSendFailure(err: unknown): never {
+  log.warn({ err }, "Direct send failed");
+  throw err;
 }

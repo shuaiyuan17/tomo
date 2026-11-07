@@ -226,6 +226,8 @@ describe("imsg RPC framing", () => {
     // Kept structured for the log line, too.
     expect(err!.rpcCode).toBe(-32004);
     expect(err!.rpcData).toEqual(data);
+    // What a chat may be shown leaves the payload out.
+    expect((err as unknown as { publicMessage?: string }).publicMessage).toBe("imsg rpc send failed (-32004) Mutation lane blocked");
 
     await channel.stop();
   });

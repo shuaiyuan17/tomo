@@ -21,6 +21,7 @@ import {
   liteLlmModeLabel,
 } from "../litellm.js";
 import { log } from "../logger.js";
+import { shortErrorMessage } from "../error-text.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
 import type { ExternalMcpServerStatus, McpLoginStart } from "../mcp/oauth.js";
@@ -114,7 +115,7 @@ export class ChatCommandHandler {
         rewound = await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
       } catch (err) {
         log.warn({ err }, "Session rewind failed");
-        await channel.send({ chatId, text: `⚠️ Could not rewind: ${err instanceof Error ? err.message : String(err)}` });
+        await channel.send({ chatId, text: `⚠️ Could not rewind: ${shortErrorMessage(err)}` });
         return;
       }
       const dropped = rewound.droppedMessages
@@ -584,7 +585,7 @@ export class ChatCommandHandler {
       });
       this.scheduleRestart();
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = shortErrorMessage(err);
       log.warn({ err, identity: identity.name }, "Claude login command failed");
       await channel.send({ chatId, text: `⚠️ [error] Claude login failed: ${detail}` });
     }
@@ -649,7 +650,7 @@ export class ChatCommandHandler {
       });
     } catch (err) {
       log.warn({ err, serverName }, "External MCP login command failed");
-      await channel.send({ chatId, text: `⚠️ [error] MCP login failed: ${err instanceof Error ? err.message : String(err)}` });
+      await channel.send({ chatId, text: `⚠️ [error] MCP login failed: ${shortErrorMessage(err)}` });
     }
   }
 
@@ -694,7 +695,7 @@ export class ChatCommandHandler {
 
       this.scheduleRestart();
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = shortErrorMessage(err);
       await channel.send({ chatId, text: `⚠️ [error] restore failed: ${detail}` });
     }
   }

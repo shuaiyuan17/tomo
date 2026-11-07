@@ -3,6 +3,7 @@ import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage } fro
 import { IMESSAGE_SEND_EFFECTS } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { shortErrorMessage } from "../error-text.js";
 import type { ReplyTarget, SessionEntry } from "../sessions/types.js";
 import {
   isGroupSessionKey,
@@ -341,7 +342,7 @@ export class ProactiveSendService {
     try {
       await channel.setChatTitle(replyTarget.chatId, trimmedTitle);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = shortErrorMessage(err);
       return { ok: false, error: detail };
     }
 
@@ -399,7 +400,7 @@ export class ProactiveSendService {
     try {
       await channel.reactToMessage(chatId, messageId, reaction, remove);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = shortErrorMessage(err);
       return { ok: false, error: detail };
     }
 
@@ -424,7 +425,7 @@ export class ProactiveSendService {
     try {
       await resolved.channel.editMessage!(resolved.chatId, resolved.message.id, newText);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = shortErrorMessage(err);
       return { ok: false, error: detail };
     }
 
@@ -444,7 +445,7 @@ export class ProactiveSendService {
     try {
       await resolved.channel.unsendMessage!(resolved.chatId, resolved.message.id);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = shortErrorMessage(err);
       return { ok: false, error: detail };
     }
 

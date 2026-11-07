@@ -166,10 +166,13 @@ class ImsgRpcResponseError extends Error {
    */
   readonly rpcCode?: number;
   readonly rpcData?: unknown;
+  /** The message WITHOUT the RPC `data` — what shortErrorMessage shows. */
+  readonly publicMessage?: string;
 
-  constructor(message?: string, rpc?: { code?: number; data?: unknown }) {
+  constructor(message?: string, rpc?: { code?: number; data?: unknown; publicMessage?: string }) {
     super(message);
     this.name = "ImsgRpcResponseError";
+    if (rpc?.publicMessage !== undefined) this.publicMessage = rpc.publicMessage;
     if (rpc?.code !== undefined) this.rpcCode = rpc.code;
     if (rpc?.data !== undefined) this.rpcData = rpc.data;
     markDefiniteFailure(this);
@@ -1384,10 +1387,8 @@ export class ImsgChannel implements Channel {
         // refused the request (nothing was sent) — callers with a fallback
         // send key on this to avoid double-delivering after ambiguous
         // failures (timeout/child-death), which reject as plain Errors.
-        req.reject(new ImsgRpcResponseError(
-          `imsg rpc ${req.method} failed (${error.code ?? "?"}) ${typeof error.message === "string" ? error.message : describeError(error.message ?? "error")}${detail}`,
-          { code: error.code, data: error.data },
-        ));
+        const head = `imsg rpc ${req.method} failed (${error.code ?? "?"}) ${typeof error.message === "string" ? error.message : describeError(error.message ?? "error")}`;
+        req.reject(new ImsgRpcResponseError(`${head}${detail}`, { code: error.code, data: error.data, publicMessage: head }));
       } else {
         req.resolve((payload.result ?? {}) as Record<string, unknown>);
       }

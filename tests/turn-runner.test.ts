@@ -3,6 +3,7 @@ import type { Channel, OutgoingMessage, StopTypingOptions } from "../src/channel
 import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 import { isSilentReply } from "../src/agent/text-utils.js";
 import { STEER_MERGED, SdkResultError } from "../src/agent/live-session.js";
+import { PartialSendError } from "../src/channels/types.js";
 import {
   TurnRunner,
   embeddedSilentMatcher,
@@ -336,6 +337,26 @@ describe("TurnRunner reply turns", () => {
     expect(h.errorNotes).toEqual([{ sessionKey: "telegram:123", visibleError: "[error] boom" }]);
     expect(h.channel.sent).toEqual([{ chatId: "123", text: "[error] boom" }]);
     expect(h.typingStops).toEqual([{ clear: true }]);
+  });
+
+  it("never shows stderr or RPC payloads in the chat, only the short message", async () => {
+    const stderr = "FATAL: /private/path/to/secret.db is locked by pid 4242";
+    const rpcFailure = Object.assign(new Error("Mutation lane blocked"), { stderr, data: { lane: "send", token: "abc" } });
+    const h = makeHarness(async () => { throw new PartialSendError(rpcFailure, { photo: true }); });
+    await h.runner.runTurn(replySpec(h, { key: "telegram:-100123", replyChatId: "-100123" } as Partial<TurnSpec>));
+
+    const shown = h.channel.sent.map((m) => m.text).join("\n");
+    expect(shown).toContain("[error] Send partly delivered: Mutation lane blocked");
+    expect(shown).not.toContain("FATAL");
+    expect(shown).not.toContain("token");
+    expect(shown).not.toContain("stderr");
+    expect(h.errorNotes.map((n) => n.visibleError).join("\n")).not.toContain("FATAL");
+  });
+
+  it("shows a structured non-Error throwable by its message, not [object Object] or its payload", async () => {
+    const h = makeHarness(async () => { throw { message: "upstream refused", stderr: "secret detail" }; });
+    await h.runner.runTurn(replySpec(h));
+    expect(h.channel.sent).toEqual([{ chatId: "123", text: "[error] upstream refused" }]);
   });
 
   it("suppresses thrown errors entirely for passive groups (thrown: ignore)", async () => {

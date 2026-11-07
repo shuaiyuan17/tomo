@@ -32,6 +32,7 @@ import { PauseStore } from "./sessions/pause-store.js";
 import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js";
 import { log } from "./logger.js";
+import { shortErrorMessage } from "./error-text.js";
 import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { usesLcmCompact } from "./agent/sdk-options.js";
 import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
@@ -1056,7 +1057,7 @@ export class Agent {
   }
 
   private async handleMcpAuthFailure(serverName: string, err: unknown): Promise<void> {
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = shortErrorMessage(err);
     log.warn({ serverName, err }, "External MCP server omitted after OAuth failure");
 
     const target = this.findPrivateReplyTarget();
@@ -1227,7 +1228,7 @@ export class Agent {
         // so nobody hears of it unless the owner is told.
         if (!(err instanceof TurnInterruptedError)) {
           const target = this.ownerNoticeTarget(key, "A background task turn");
-          if (target) this.reportSuppressedError(key, target, err instanceof Error ? err.message : String(err));
+          if (target) this.reportSuppressedError(key, target, shortErrorMessage(err));
         }
         await stop();
       },

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { log } from "../logger.js";
-import { describeError } from "../error-text.js";
+import { describeError, shortErrorMessage } from "../error-text.js";
 import {
   AttachmentUnreadableError,
   isDefiniteFailure,
@@ -43,15 +43,19 @@ export interface DeliverySegment {
  * would have recall later deny him text that was on his phone.
  */
 export class PartialDeliveryError extends Error {
+  /** Full diagnostic of `failure` (stderr, RPC data, …), for logs only. */
+  readonly detail: string;
   constructor(
     /** The first failure, verbatim. */
     readonly failure: unknown,
     readonly segments: readonly DeliverySegment[],
   ) {
     const failed = segments.filter((s) => !s.delivered).length;
-    const detail = describeError(failure);
-    super(`Block partly delivered: ${failed} of ${segments.length} part(s) not known to have shipped — ${detail}`, { cause: failure });
+    // The message is the short form (it can be shown); the full diagnostic
+    // rides along as `detail`, an own enumerable field the log serializer keeps.
+    super(`Block partly delivered: ${failed} of ${segments.length} part(s) not known to have shipped — ${shortErrorMessage(failure)}`, { cause: failure });
     this.name = "PartialDeliveryError";
+    this.detail = describeError(failure);
   }
 }
 

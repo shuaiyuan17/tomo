@@ -1,6 +1,6 @@
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
-import { describeError } from "../error-text.js";
+import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
@@ -690,9 +690,10 @@ export class TurnRunner {
     }
     log.error({ err }, spec.errors.thrownLogMessage);
 
-    // Non-Error throwables (a provider's structured error object) must not
-    // reach the owner as "[object Object]"; an Error keeps its bare message.
-    const detail = err instanceof Error ? err.message : describeError(err);
+    // This text is SHOWN — in the chat (`[error] …`, a group's included) or in
+    // an owner notice — so it is the short message only: never stderr or RPC
+    // payloads (those are in the log line above), never "[object Object]".
+    const detail = shortErrorMessage(err);
     if (spec.errors.thrown === "ignore") {
       this.reportSuppressed(spec, detail);
       await stopTyping({ clear: true });

@@ -211,9 +211,10 @@ export class CronScheduler {
           "missed (Tomo was down or behind) by more than the job's catch-up window, so " +
           `${skips.length === 1 ? "it was" : "they were"} skipped rather than run late:`,
         ...skips.map((job) => {
-          const { lateByMs, windowMs } = job.skipNotice!;
+          const { lateByMs, windowMs, count } = job.skipNotice!;
           const next = job.nextRunAt ? `; next run ${new Date(job.nextRunAt).toLocaleString()}` : "";
-          return `- "${job.name}" [${job.id}]: ${formatDuration(lateByMs)} late, window ${formatDuration(windowMs)}${next}`;
+          const times = count > 1 ? `${count} runs skipped, latest ` : "";
+          return `- "${job.name}" [${job.id}]: ${times}${formatDuration(lateByMs)} late, window ${formatDuration(windowMs)}${next}`;
         }),
         "If one is still needed, ask me to do it now. To make a job always catch up: `tomo cron edit <id> --stale-after 0`.",
       ].join("\n"));
@@ -227,10 +228,11 @@ export class CronScheduler {
           const when = started ? ` (started ${new Date(started).toLocaleString()})` : "";
           return `- "${job.name}" [${job.id}]${when}: ${excerpt(job.message)}`;
         }),
-        "Re-run one with `tomo cron enable <id>`, or remove it with `tomo cron remove <id>`.",
+        "If one is still needed, ask me to do it now, or remove it with `tomo cron remove <id>`. (`tomo cron enable <id>` re-runs a dated one-shot right away; a recurring-pattern one waits for its next slot.)",
       ].join("\n"));
     }
     const ids = { skipped: skips.map((job) => job.id), parked: parked.map((job) => job.id) };
+    const sentSkips = skips.map((job) => ({ id: job.id, notice: { ...job.skipNotice! } }));
     let delivered: boolean;
     try {
       // Owner only: the excerpts may come from any session's jobs.
@@ -246,7 +248,7 @@ export class CronScheduler {
     }
     log.info(ids, "Told the owner about skipped or interrupted cron runs");
     // Each acknowledgement on its own: one failing must not re-send the other.
-    try { this.store.markSkipNoticesSent(ids.skipped); } catch (err) {
+    try { this.store.markSkipNoticesSent(sentSkips); } catch (err) {
       log.error({ err, jobIds: ids.skipped }, "Could not record that skipped cron runs were reported");
     }
     try { this.store.markInterruptNotified(ids.parked); } catch (err) {

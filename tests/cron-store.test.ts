@@ -1462,6 +1462,30 @@ describe("staleness window", () => {
     expect(staleWindowMs(every(HOUR, -1), from)).toBe(30 * 60_000);
   });
 
+  it("skip notices aggregate, and an acknowledgement clears only what was sent", () => {
+    mkdirSync(TEST_DIR, { recursive: true });
+    try {
+      const store = new CronStore(TEST_PATH);
+      store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+      const stale = () => {
+        const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+        raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
+        writeFileSync(TEST_PATH, JSON.stringify(raw));
+        new CronStore(TEST_PATH).skipStaleRuns();
+      };
+      stale();
+      const sent = new CronStore(TEST_PATH).unreportedSkips().map((j) => ({ id: j.id, notice: { ...j.skipNotice! } }));
+      stale(); // skipped again while that report was in flight
+      expect(new CronStore(TEST_PATH).list()[0].skipNotice).toMatchObject({ seq: 2, count: 2 });
+      new CronStore(TEST_PATH).markSkipNoticesSent(sent);
+      expect(new CronStore(TEST_PATH).list()[0].skipNotice).toMatchObject({ seq: 2, count: 1 });
+      new CronStore(TEST_PATH).markSkipNoticesSent(new CronStore(TEST_PATH).unreportedSkips().map((j) => ({ id: j.id, notice: j.skipNotice! })));
+      expect(new CronStore(TEST_PATH).list()[0].skipNotice ?? null).toBeNull();
+    } finally {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    }
+  });
+
   it("setStaleAfter sets, clears and guards a job's window", () => {
     mkdirSync(TEST_DIR, { recursive: true });
     try {

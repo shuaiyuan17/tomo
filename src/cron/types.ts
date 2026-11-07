@@ -71,13 +71,24 @@ export interface CronJob {
   staleAfterMs?: number;
   /** When a run of this job was last skipped as stale (informational). */
   lastSkippedAt?: number | null;
-  /** A stale skip the owner has not been told about yet (the latest one). */
-  skipNotice?: { lateByMs: number; windowMs: number } | null;
+  /**
+   * Stale skips the owner has not been told about yet: how many, details of
+   * the latest, and a sequence number so an acknowledgement clears only what
+   * was actually reported (a skip landing while the DM is in flight stays).
+   */
+  skipNotice?: SkipNotice | null;
   /**
    * When the owner was told this interrupted one-shot will not run again on
    * its own. Set once, so the notice is not repeated on every restart.
    */
   interruptNotifiedAt?: number | null;
+}
+
+export interface SkipNotice {
+  seq: number;
+  count: number;
+  lateByMs: number;
+  windowMs: number;
 }
 
 export type CronJobCreate = Pick<CronJob, "name" | "message" | "sessionKey"> & {

@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
-import type { CronJob, CronSchedule, InterruptedSkip } from "./types.js";
+import type { CronJob, CronSchedule, InterruptedSkip, SkipNotice } from "./types.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { withFileLockSync } from "../file-lock.js";
@@ -664,7 +664,8 @@ export class CronStore {
       job.lastSkippedAt = now;
       // Durable, so the owner still hears about it after a restart or a
       // failed DM; cleared by markSkipNoticesSent.
-      job.skipNotice = { lateByMs, windowMs };
+      const prior = job.skipNotice ?? null;
+      job.skipNotice = { seq: (prior?.seq ?? 0) + 1, count: (prior?.count ?? 0) + 1, lateByMs, windowMs };
       skipped.push({ job: { ...job }, lateByMs, windowMs });
     }
     if (skipped.length > 0) this.save();
@@ -710,14 +711,20 @@ export class CronStore {
     return this.jobs.filter((job) => job.skipNotice != null);
   }
 
-  /** Record that the owner was told about these skips. */
-  markSkipNoticesSent(ids: readonly string[]): void {
-    if (ids.length === 0) return;
+  /**
+   * Record that the owner was told about these skips — exactly the notices
+   * that were sent. A job skipped again since then keeps the newer skips.
+   */
+  markSkipNoticesSent(sent: ReadonlyArray<{ id: string; notice: SkipNotice }>): void {
+    if (sent.length === 0) return;
     this.load();
     let changed = false;
-    for (const job of this.jobs) {
-      if (!ids.includes(job.id) || job.skipNotice == null) continue;
-      job.skipNotice = null;
+    for (const { id, notice } of sent) {
+      const job = this.jobs.find((j) => j.id === id);
+      const current = job?.skipNotice;
+      if (!job || current == null) continue;
+      if (current.seq <= notice.seq) job.skipNotice = null;
+      else job.skipNotice = { ...current, count: Math.max(1, current.count - notice.count) };
       changed = true;
     }
     if (changed) this.save();

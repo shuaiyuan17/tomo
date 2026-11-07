@@ -331,7 +331,7 @@ describe("CronScheduler", () => {
 
     expect(third.calls).toHaveLength(0);
     expect(third.notices[0]).toContain(`"send-the-order" [${job.id}]`);
-    expect(third.notices[0]).toContain("tomo cron enable <id>");
+    expect(third.notices[0]).toContain("tomo cron remove <id>");
     const after = new CronStore(TEST_PATH).list()[0];
     expect(after.enabled).toBe(false);
     expect(after.nextRunAt).toBeNull();

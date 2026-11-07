@@ -225,6 +225,9 @@ export function sdkOptions(
     // skill invocable (same surface as the old `"Skill"` allowedTools entry).
     skills: "all" as const,
     ...(plugins.length > 0 ? { plugins } : {}),
+    // External entries never reach the CLI's argv: LiveSession moves them to
+    // a 0600 file before spawning (see ./mcp-config-file.ts), because an
+    // OAuth server's entry carries its bearer token.
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: [...SDK_SETTING_SOURCES],
     settings: {

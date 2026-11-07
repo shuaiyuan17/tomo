@@ -63,31 +63,39 @@ export const STALE_WINDOW_MIN_MS = 5 * 60_000;
 export const CATCH_UP_PERIOD_MS = 25 * 3_600_000;
 
 /**
- * The gap between consecutive runs: the interval for `every`, the distance
- * between the next two occurrences after `fromMs` for a cron expression (so a
- * weekday-only cron reads as daily, `0 9 1 * *` as about a month). Null for
+ * The gap from a run's slot to the one after it: the interval for `every`;
+ * for a cron expression, from `slotMs` (an occurrence — typically the missed
+ * one) to the next occurrence. So a weekday cron missed on a Thursday has a
+ * 24h period and one missed on a Friday a 72h one, and a DST day is 23 or
+ * 25h. Without `slotMs`, the next occurrence after now is the slot. Null for
  * one-shots and for anything that cannot be evaluated.
  */
-export function schedulePeriodMs(schedule: CronSchedule, fromMs: number): number | null {
+export function schedulePeriodMs(schedule: CronSchedule, slotMs?: number): number | null {
   if (schedule.kind === "every") return everyIntervalReason(schedule.everyMs) === null ? schedule.everyMs : null;
   if (schedule.kind !== "cron") return null;
   try {
-    const [a, b] = new Cron(schedule.expr, { timezone: schedule.tz }).nextRuns(2, new Date(fromMs));
-    return a && b ? b.getTime() - a.getTime() : null;
+    const cron = new Cron(schedule.expr, { timezone: schedule.tz });
+    const slot = slotMs ?? cron.nextRun()?.getTime();
+    if (slot === undefined) return null;
+    const next = cron.nextRun(new Date(slot));
+    return next ? next.getTime() - slot : null;
   } catch {
     return null;
   }
 }
 
-/** The job's staleness window in ms; 0 means "never stale" (always catch up). */
+/**
+ * The job's staleness window in ms; 0 means "never stale" (always catch up).
+ * `slotMs` is the run being judged (defaults to the job's nextRunAt).
+ */
 export function staleWindowMs(
-  job: Pick<CronJob, "staleAfterMs" | "schedule" | "deleteAfterRun">,
-  fromMs = Date.now(),
+  job: Pick<CronJob, "staleAfterMs" | "schedule" | "deleteAfterRun"> & { nextRunAt?: number | null },
+  slotMs: number | undefined = job.nextRunAt ?? undefined,
 ): number {
   const own = job.staleAfterMs;
   if (typeof own === "number" && Number.isFinite(own) && own >= 0) return own;
   if (isSingleFire(job)) return ONE_SHOT_STALE_AFTER_MS;
-  const period = schedulePeriodMs(job.schedule, fromMs);
+  const period = schedulePeriodMs(job.schedule, slotMs);
   if (period === null || period > CATCH_UP_PERIOD_MS) return 0;
   return Math.min(STALE_WINDOW_MAX_MS, Math.max(STALE_WINDOW_MIN_MS, Math.floor(period / 2)));
 }
@@ -654,6 +662,9 @@ export class CronStore {
       if (next === null) continue;
       job.nextRunAt = next;
       job.lastSkippedAt = now;
+      // Durable, so the owner still hears about it after a restart or a
+      // failed DM; cleared by markSkipNoticesSent.
+      job.skipNotice = { lateByMs, windowMs };
       skipped.push({ job: { ...job }, lateByMs, windowMs });
     }
     if (skipped.length > 0) this.save();
@@ -691,6 +702,25 @@ export class CronStore {
     this.load();
     return this.jobs.filter((job) =>
       !job.enabled && job.lastStatus === "interrupted" && isSingleFire(job) && job.interruptNotifiedAt == null);
+  }
+
+  /** Recurring jobs with a stale skip the owner has not been told about. */
+  unreportedSkips(): CronJob[] {
+    this.load();
+    return this.jobs.filter((job) => job.skipNotice != null);
+  }
+
+  /** Record that the owner was told about these skips. */
+  markSkipNoticesSent(ids: readonly string[]): void {
+    if (ids.length === 0) return;
+    this.load();
+    let changed = false;
+    for (const job of this.jobs) {
+      if (!ids.includes(job.id) || job.skipNotice == null) continue;
+      job.skipNotice = null;
+      changed = true;
+    }
+    if (changed) this.save();
   }
 
   /** Record that the owner was told about these parked one-shots. */

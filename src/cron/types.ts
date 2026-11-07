@@ -71,6 +71,8 @@ export interface CronJob {
   staleAfterMs?: number;
   /** When a run of this job was last skipped as stale (informational). */
   lastSkippedAt?: number | null;
+  /** A stale skip the owner has not been told about yet (the latest one). */
+  skipNotice?: { lateByMs: number; windowMs: number } | null;
   /**
    * When the owner was told this interrupted one-shot will not run again on
    * its own. Set once, so the notice is not repeated on every restart.

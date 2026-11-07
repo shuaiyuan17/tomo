@@ -50,8 +50,6 @@ export class CronScheduler {
   /** Earliest time the next owner report may be attempted. */
   private nextOwnerReportAt = 0;
   private reportingToOwner = false;
-  /** Stale skips not yet reported to the owner (memory only: also logged). */
-  private pendingSkips: StaleSkip[] = [];
 
   constructor(agent: Agent, store: CronStore = new CronStore()) {
     this.store = store;
@@ -96,14 +94,14 @@ export class CronScheduler {
       const busy = new Set([...this.inFlight, ...this.pendingAcks.keys()]);
       const skipped = this.store.skipStaleRuns(busy);
       for (const skip of skipped) logStaleSkip(skip);
+      if (skipped.length > 0) this.nextOwnerReportAt = 0;
       // A one-shot retry queued by recovery that still has not gone out
       // (the scan or dispatch kept failing) and is now past its window.
       const expired = this.store.expireStaleOneShotRetries(busy);
       for (const job of expired) {
         log.warn({ jobId: job.id, name: job.name }, "Cron one-shot retry went stale before it could run; disabled, owner will be told");
       }
-      if (skipped.length > 0) this.pendingSkips.push(...skipped);
-      if (skipped.length > 0 || expired.length > 0) this.nextOwnerReportAt = 0;
+      if (expired.length > 0) this.nextOwnerReportAt = 0;
     } catch (err) {
       log.error({ err }, "Cron staleness check failed");
     }
@@ -189,19 +187,21 @@ export class CronScheduler {
    * - one-shots parked after an interruption — a reminder that would
    *   otherwise never arrive. Each job is reported once (interruptNotifiedAt).
    *
-   * Batched: an outage's worth of skips and parks lands in one message. If
-   * nothing could be delivered, everything stays pending and is retried after
+   * Batched: an outage's worth of skips and parks lands in one message. Both
+   * are pending ON DISK (skipNotice, interruptNotifiedAt), so a failed DM or a
+   * restart loses nothing; a failed attempt is retried after
    * OWNER_REPORT_RETRY_MS.
    */
   private async reportToOwner(): Promise<void> {
     let parked: CronJob[];
+    let skips: CronJob[];
     try {
       parked = this.store.unreportedParkedOneShots();
+      skips = this.store.unreportedSkips();
     } catch (err) {
-      log.error({ err }, "Could not read parked cron one-shots to report");
-      parked = [];
+      log.error({ err }, "Could not read skipped or parked cron jobs to report");
+      return;
     }
-    const skips = this.pendingSkips.splice(0);
     if (parked.length === 0 && skips.length === 0) return;
 
     const sections: string[] = [];
@@ -210,11 +210,12 @@ export class CronScheduler {
         `${skips.length === 1 ? "A scheduled run was" : `${skips.length} scheduled runs were`} ` +
           "missed (Tomo was down or behind) by more than the job's catch-up window, so " +
           `${skips.length === 1 ? "it was" : "they were"} skipped rather than run late:`,
-        ...skips.map(({ job, lateByMs, windowMs }) => {
+        ...skips.map((job) => {
+          const { lateByMs, windowMs } = job.skipNotice!;
           const next = job.nextRunAt ? `; next run ${new Date(job.nextRunAt).toLocaleString()}` : "";
           return `- "${job.name}" [${job.id}]: ${formatDuration(lateByMs)} late, window ${formatDuration(windowMs)}${next}`;
         }),
-        "Run one now with `tomo cron run <id>`; make a job always catch up with `tomo cron edit <id> --stale-after 0`.",
+        "If one is still needed, ask me to do it now. To make a job always catch up: `tomo cron edit <id> --stale-after 0`.",
       ].join("\n"));
     }
     if (parked.length > 0) {
@@ -229,20 +230,27 @@ export class CronScheduler {
         "Re-run one with `tomo cron enable <id>`, or remove it with `tomo cron remove <id>`.",
       ].join("\n"));
     }
-    const ids = { skipped: skips.map((s) => s.job.id), parked: parked.map((job) => job.id) };
+    const ids = { skipped: skips.map((job) => job.id), parked: parked.map((job) => job.id) };
+    let delivered: boolean;
     try {
       // Owner only: the excerpts may come from any session's jobs.
-      if (!(await this.agent.notifyOwner(sections.join("\n\n")))) {
-        // Nothing was delivered; keep it all pending and try again later.
-        this.pendingSkips.unshift(...skips);
-        log.warn(ids, "No owner DM to report skipped or interrupted cron runs to; will retry");
-        return;
-      }
-      if (parked.length > 0) this.store.markInterruptNotified(ids.parked);
-      log.info(ids, "Told the owner about skipped or interrupted cron runs");
+      delivered = await this.agent.notifyOwner(sections.join("\n\n"));
     } catch (err) {
-      this.pendingSkips.unshift(...skips);
-      log.error({ err, ...ids }, "Could not tell the owner about skipped or interrupted cron runs");
+      log.error({ err, ...ids }, "Could not tell the owner about skipped or interrupted cron runs; will retry");
+      return;
+    }
+    if (!delivered) {
+      // Nothing was delivered; it all stays pending on disk for a later try.
+      log.warn(ids, "No owner DM to report skipped or interrupted cron runs to; will retry");
+      return;
+    }
+    log.info(ids, "Told the owner about skipped or interrupted cron runs");
+    // Each acknowledgement on its own: one failing must not re-send the other.
+    try { this.store.markSkipNoticesSent(ids.skipped); } catch (err) {
+      log.error({ err, jobIds: ids.skipped }, "Could not record that skipped cron runs were reported");
+    }
+    try { this.store.markInterruptNotified(ids.parked); } catch (err) {
+      log.error({ err, jobIds: ids.parked }, "Could not record that interrupted cron one-shots were reported");
     }
   }
 

@@ -1439,16 +1439,21 @@ describe("staleness window", () => {
     // Sub-daily: half the period, floored at 5 minutes.
     expect(staleWindowMs(every(HOUR), from)).toBe(30 * 60_000);
     expect(staleWindowMs(every(60_000), from)).toBe(5 * 60_000);
-    // Daily: half the period = 12h (the cap). Weekday-only crons read as daily.
+    // Daily: half the period = 12h (the cap).
     expect(staleWindowMs(every(24 * HOUR), from)).toBe(12 * HOUR);
-    expect(staleWindowMs(cron("0 3 * * *"), from)).toBe(12 * HOUR);
-    expect(staleWindowMs(cron("0 9 * * 1-5"), Date.UTC(2026, 10, 9, 12))).toBe(12 * HOUR);
+    expect(staleWindowMs(cron("0 3 * * *"), Date.UTC(2026, 10, 7, 3))).toBe(12 * HOUR);
+    // The period is measured FROM the missed slot: a weekday cron missed on a
+    // Thursday is daily, one missed on a Friday waits 72h for Monday.
+    expect(staleWindowMs(cron("0 9 * * 1-5"), Date.UTC(2026, 10, 12, 9))).toBe(12 * HOUR);
+    expect(staleWindowMs(cron("0 9 * * 1-5"), Date.UTC(2026, 10, 13, 9))).toBe(0);
     // Longer than a day: always catch up.
     expect(staleWindowMs(every(14 * 24 * HOUR), from)).toBe(0);
-    expect(staleWindowMs(cron("0 9 * * 1"), from)).toBe(0);
-    expect(staleWindowMs(cron("0 9 1 * *"), from)).toBe(0);
-    expect(staleWindowMs(cron("0 9 1 1,4,7,10 *"), from)).toBe(0);
-    expect(staleWindowMs(cron("0 9 1 12 *"), from)).toBe(0);
+    expect(staleWindowMs(cron("0 9 * * 1"), Date.UTC(2026, 10, 9, 9))).toBe(0);
+    expect(staleWindowMs(cron("0 9 1 * *"), Date.UTC(2026, 10, 1, 9))).toBe(0);
+    expect(staleWindowMs(cron("0 9 1 1,4,7,10 *"), Date.UTC(2026, 9, 1, 9))).toBe(0);
+    expect(staleWindowMs(cron("0 9 1 12 *"), Date.UTC(2026, 11, 1, 9))).toBe(0);
+    // No slot given: judged from the next occurrence.
+    expect(staleWindowMs(cron("0 9 1 * *"))).toBe(0);
     // One-shots: a fixed retry window.
     expect(staleWindowMs({ schedule: { kind: "at", at: "2026-11-07T10:00" }, deleteAfterRun: true }, from)).toBe(ONE_SHOT_STALE_AFTER_MS);
     // Explicit values win; a damaged one falls back to the default.

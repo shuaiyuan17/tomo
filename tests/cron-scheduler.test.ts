@@ -462,6 +462,27 @@ describe("CronScheduler", () => {
     expect(notifyOwner).toHaveBeenCalledTimes(1);
   });
 
+  it("a skip notice survives a restart before it could be delivered", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "hourly", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    // Daemon 1 skips the run but has nowhere to send the DM, then goes away.
+    const unreachable = vi.fn(async () => false);
+    await tick(new CronScheduler({ handleCronMessage: vi.fn(), notifyOwner: unreachable } as unknown as Agent, store));
+    await waitFor(() => expect(unreachable).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Daemon 2 has nothing new to skip, but still owes the owner the notice.
+    const notifyOwner = vi.fn(async () => true);
+    await tick(new CronScheduler({ handleCronMessage: vi.fn(() => Promise.resolve(true)), notifyOwner } as unknown as Agent, new CronStore(TEST_PATH)));
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(1));
+    expect((notifyOwner.mock.calls[0] as unknown as [string])[0]).toContain('"hourly"');
+    await waitFor(() => expect(new CronStore(TEST_PATH).list()[0].skipNotice ?? null).toBeNull());
+  });
+
   it("puts an outage's stale skips and parked one-shots in the same DM", async () => {
     const store = new CronStore(TEST_PATH);
     store.add({ name: "hourly", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });

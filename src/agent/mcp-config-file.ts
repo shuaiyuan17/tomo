@@ -36,10 +36,10 @@ export interface StagedMcpConfig<T extends { mcpServers?: McpServers; extraArgs?
 }
 
 /**
- * Entries in the staging root older than this are leftovers of a process that
- * died before it could clean up (SIGKILL, power loss) and are swept. The CLI
- * reads its file within seconds of spawning, so a sibling daemon's live
- * staging is never this old.
+ * Staging whose owner PID is still running (or cannot be told) is swept only
+ * once older than this — a backstop for PID reuse after a crash. The CLI reads
+ * its file within seconds of spawning, so a live sibling's staging is never
+ * this old.
  */
 export const STALE_STAGING_MS = 10 * 60 * 1000;
 
@@ -86,8 +86,27 @@ function stagingRoot(): string {
   return tmpdir();
 }
 
+const STAGING_PREFIX = "tomo-mcp-";
+
+/** Is the process that staged this directory gone? Unknown counts as alive. */
+function ownerIsDead(name: string): boolean {
+  const pid = Number(/^tomo-mcp-(\d+)-/.exec(name)?.[1]);
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+/**
+ * Remove staging left behind by a process that died before cleaning up:
+ * immediately when its owner PID is gone, otherwise once it is older than
+ * STALE_STAGING_MS. Only our own prefix, only directories, only ours.
+ */
 function sweepStale(root: string, now: number): void {
-  if (root === tmpdir()) return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   let entries: string[];
   try {
     entries = readdirSync(root);
@@ -95,10 +114,13 @@ function sweepStale(root: string, now: number): void {
     return;
   }
   for (const name of entries) {
+    if (!name.startsWith(STAGING_PREFIX)) continue;
     const dir = join(root, name);
     if (pending.has(dir)) continue;
     try {
-      if (now - lstatSync(dir).mtimeMs > STALE_STAGING_MS) rmSync(dir, { recursive: true, force: true });
+      const st = lstatSync(dir);
+      if (!st.isDirectory() || (uid !== undefined && st.uid !== uid)) continue;
+      if (ownerIsDead(name) || now - st.mtimeMs > STALE_STAGING_MS) rmSync(dir, { recursive: true, force: true });
     } catch {
       // Raced with its owner's own cleanup, or unreadable: leave it.
     }
@@ -119,7 +141,7 @@ export function stageExternalMcpServers<T extends { mcpServers?: McpServers; ext
 
   const root = stagingRoot();
   sweepStale(root, Date.now());
-  const dir = mkdtempSync(join(root, "tomo-mcp-"));
+  const dir = mkdtempSync(join(root, `${STAGING_PREFIX}${process.pid}-`));
   pending.add(dir);
   installExitHook();
   const path = join(dir, "mcp-config.json");

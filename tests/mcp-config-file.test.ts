@@ -30,8 +30,9 @@ describe("stageExternalMcpServers", () => {
     const root = dirname(dirname(first.options.extraArgs?.["mcp-config"] as string));
     first.dispose();
 
-    const stale = join(root, `tomo-mcp-test-stale-${process.pid}`);
-    const fresh = join(root, `tomo-mcp-test-fresh-${process.pid}`);
+    // Owned by this (live) process, so only age can make them stale.
+    const stale = join(root, `tomo-mcp-${process.pid}-teststale`);
+    const fresh = join(root, `tomo-mcp-${process.pid}-testfresh`);
     mkdirSync(stale, { recursive: true });
     mkdirSync(fresh, { recursive: true });
     const old = (Date.now() - STALE_STAGING_MS - 60_000) / 1000;
@@ -47,5 +48,18 @@ describe("stageExternalMcpServers", () => {
       stageExternalMcpServers({ mcpServers: { remote } }).dispose();
     }
     expect(existsSync(fresh)).toBe(false);
+  });
+
+  it("sweeps a fresh staging whose owner process is gone", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const deadPid = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]).stdout.toString();
+    const probe = stageExternalMcpServers({ mcpServers: { remote } });
+    const root = dirname(dirname(probe.options.extraArgs?.["mcp-config"] as string));
+    probe.dispose();
+
+    const orphan = join(root, `tomo-mcp-${deadPid}-testorphan`);
+    mkdirSync(orphan, { recursive: true });
+    stageExternalMcpServers({ mcpServers: { remote } }).dispose();
+    expect(existsSync(orphan)).toBe(false);
   });
 });

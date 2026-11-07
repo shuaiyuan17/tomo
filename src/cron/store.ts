@@ -31,18 +31,65 @@ export const MAX_RESUME_ATTEMPTS = 3;
 export const ONE_SHOT_MAX_RESUMES = 1;
 
 /**
- * Default staleness window. A recurring run missed by more than this — the
- * daemon was down across its slot — is skipped to the next slot rather than
- * fired late, so a long outage does not end in every missed job firing at
- * once (a "5 AM brief" delivered at noon). Two hours still covers a restart,
- * an update, or a short outage. Per job: `staleAfterMs` (0 = never stale).
+ * How long an interrupted ONE-SHOT stays worth retrying, by default. A
+ * one-shot has no period to scale against; it is usually a reminder or a
+ * hand-off someone is waiting on, and two hours still covers a restart, an
+ * update or a short outage without delivering yesterday's reminder today.
  */
-export const DEFAULT_STALE_AFTER_MS = 2 * 3_600_000;
+export const ONE_SHOT_STALE_AFTER_MS = 2 * 3_600_000;
 
-/** The job's staleness window in ms; 0 means "never stale". */
-export function staleWindowMs(job: Pick<CronJob, "staleAfterMs">): number {
+/**
+ * DEFAULT STALENESS WINDOW FOR RECURRING JOBS — scales with the job's period.
+ *
+ * A missed run is worth firing late while it is still closer to its own slot
+ * than to the next one, so the window is half the period, clamped:
+ *
+ * - at most STALE_WINDOW_MAX_MS (12h): a daily job (backup, health check,
+ *   brief) still catches up after an outage of up to half a day — skipping a
+ *   backup is worse than running it late — while a longer outage does not end
+ *   with the morning's brief arriving in the evening, right before the next.
+ * - at least STALE_WINDOW_MIN_MS (5 min): a short-interval job is not skipped
+ *   over a scan that ran a little late (a busy event loop, a lock wait).
+ *
+ * A job whose period is longer than CATCH_UP_PERIOD_MS (a little over a day,
+ * so a 25-hour DST day still counts as daily) ALWAYS catches up by default:
+ * skipping it would silently drop a whole week, month, quarter or year.
+ * Likewise when the period cannot be determined.
+ *
+ * Per job: `staleAfterMs` overrides all of this (0 = always catch up).
+ */
+export const STALE_WINDOW_MAX_MS = 12 * 3_600_000;
+export const STALE_WINDOW_MIN_MS = 5 * 60_000;
+export const CATCH_UP_PERIOD_MS = 25 * 3_600_000;
+
+/**
+ * The gap between consecutive runs: the interval for `every`, the distance
+ * between the next two occurrences after `fromMs` for a cron expression (so a
+ * weekday-only cron reads as daily, `0 9 1 * *` as about a month). Null for
+ * one-shots and for anything that cannot be evaluated.
+ */
+export function schedulePeriodMs(schedule: CronSchedule, fromMs: number): number | null {
+  if (schedule.kind === "every") return everyIntervalReason(schedule.everyMs) === null ? schedule.everyMs : null;
+  if (schedule.kind !== "cron") return null;
+  try {
+    const [a, b] = new Cron(schedule.expr, { timezone: schedule.tz }).nextRuns(2, new Date(fromMs));
+    return a && b ? b.getTime() - a.getTime() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The job's staleness window in ms; 0 means "never stale" (always catch up). */
+export function staleWindowMs(
+  job: Pick<CronJob, "staleAfterMs" | "schedule" | "deleteAfterRun">,
+  fromMs = Date.now(),
+): number {
   const own = job.staleAfterMs;
-  return typeof own === "number" && Number.isFinite(own) && own >= 0 ? own : DEFAULT_STALE_AFTER_MS;
+  if (typeof own === "number" && Number.isFinite(own) && own >= 0) return own;
+  if (isSingleFire(job)) return ONE_SHOT_STALE_AFTER_MS;
+  const period = schedulePeriodMs(job.schedule, fromMs);
+  if (period === null || period > CATCH_UP_PERIOD_MS) return 0;
+  return Math.min(STALE_WINDOW_MAX_MS, Math.max(STALE_WINDOW_MIN_MS, Math.floor(period / 2)));
 }
 
 /**
@@ -317,6 +364,24 @@ export class CronStore {
   }
 
   /**
+   * Set (`ms`, 0 = always catch up) or clear (`null` = back to the default)
+   * a job's staleness window. `guard` as for setEnabled/remove.
+   */
+  setStaleAfter(id: string, ms: number | null): CronJob | undefined;
+  setStaleAfter(id: string, ms: number | null, guard: (job: CronJob) => boolean): CronJob | undefined | "refused";
+  setStaleAfter(id: string, ms: number | null, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" {
+    if (ms !== null && !(Number.isSafeInteger(ms) && ms >= 0)) throw new RangeError(`invalid staleAfterMs: ${ms}`);
+    this.load();
+    const job = this.get(id);
+    if (!job) return undefined;
+    if (guard && !guard(job)) return "refused";
+    if (ms === null) delete job.staleAfterMs;
+    else job.staleAfterMs = ms;
+    this.save();
+    return job;
+  }
+
+  /**
    * Remove a job.
    *
    * `guard` is checked against the job as it exists AFTER the reload, inside
@@ -576,7 +641,7 @@ export class CronStore {
       // A resumed run (recovery left it due with the marker) is the
       // interrupted run being finished, not a missed slot: never skip it.
       if (job.interruptedAt != null) continue;
-      const windowMs = staleWindowMs(job);
+      const windowMs = staleWindowMs(job, job.nextRunAt);
       const lateByMs = now - job.nextRunAt;
       if (windowMs === 0 || lateByMs <= windowMs) continue;
       // `every`: keep the phase — the next slot on the job's own grid, not

@@ -64,8 +64,9 @@ export interface CronJob {
    * How late a missed run may still fire, in ms past its slot. A recurring
    * run missed by more (the daemon was down, the store unreadable) is skipped
    * to the next slot instead of firing late; an interrupted one-shot older
-   * than this is not retried. Absent = DEFAULT_STALE_AFTER_MS; 0 = never
-   * stale (always catch up, always retry once).
+   * than this is not retried. Absent = the default, which scales with the
+   * job's period (see staleWindowMs in store.ts); 0 = never stale (always
+   * catch up, always retry once).
    */
   staleAfterMs?: number;
   /** When a run of this job was last skipped as stale (informational). */

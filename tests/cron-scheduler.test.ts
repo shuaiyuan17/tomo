@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { CronScheduler } from "../src/cron/scheduler.js";
-import { CronStore, DEFAULT_STALE_AFTER_MS, isInterrupted } from "../src/cron/store.js";
+import { CronStore, ONE_SHOT_STALE_AFTER_MS, isInterrupted } from "../src/cron/store.js";
 import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";
@@ -360,7 +360,7 @@ describe("CronScheduler", () => {
     void tick(new CronScheduler(first.agent, storeA));
     await waitFor(() => expect(first.calls).toHaveLength(1));
     // The daemon stayed down well past the job's staleness window.
-    ageInterruptedRun(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageInterruptedRun(ONE_SHOT_STALE_AFTER_MS + 60_000);
 
     const second = hangingAgent();
     const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
@@ -390,7 +390,7 @@ describe("CronScheduler", () => {
 
     // Retried later in the same process, not only on the next start.
     notifyOwner.mockResolvedValue(true);
-    (scheduler as unknown as { nextParkedReportAt: number }).nextParkedReportAt = 0;
+    (scheduler as unknown as { nextOwnerReportAt: number }).nextOwnerReportAt = 0;
     await tick(scheduler);
     await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(new CronStore(TEST_PATH).list()[0].interruptNotifiedAt).toBeGreaterThan(0));
@@ -416,31 +416,89 @@ describe("CronScheduler", () => {
     expect(agent.notices[0]).toContain('"legacy"');
   });
 
-  it("skips recurring runs missed by more than the staleness window instead of firing them all at once", async () => {
+  it("after an outage: daily jobs catch up within 12h, longer periods always catch up, the rest skip, one owner DM", async () => {
+    const HOUR = 3_600_000;
+    const DAY = 24 * HOUR;
     const store = new CronStore(TEST_PATH);
-    store.add({ name: "brief", schedule: { kind: "every", everyMs: 86_400_000 }, message: "brief", sessionKey: "dm:alice" });
-    store.add({ name: "recent", schedule: { kind: "every", everyMs: 86_400_000 }, message: "recent", sessionKey: "dm:alice" });
-    store.add({ name: "always", schedule: { kind: "every", everyMs: 86_400_000 }, message: "always", sessionKey: "dm:alice",
-      staleAfterMs: 0 });
+    const every = (name: string, everyMs: number, extra: { staleAfterMs?: number } = {}) =>
+      store.add({ name, schedule: { kind: "every", everyMs }, message: name, sessionKey: "dm:alice", ...extra });
+    every("backup", DAY);                        // missed by 9h  -> window 12h: catches up
+    every("brief", DAY);                         // missed by 14h -> skipped
+    every("hourly", HOUR);                       // missed by 3h  -> window 30m: skipped
+    every("fortnightly", 14 * DAY);              // missed by 10d -> period > 1 day: catches up
+    store.add({ name: "monthly", schedule: { kind: "cron", expr: "0 9 1 * *" }, message: "monthly", sessionKey: "dm:alice" });
+    every("always", DAY, { staleAfterMs: 0 });   // missed by 14h -> explicitly always catches up
+    const lateBy: Record<string, number> = {
+      backup: 9 * HOUR, brief: 14 * HOUR, hourly: 3 * HOUR, fortnightly: 10 * DAY, monthly: 20 * DAY, always: 14 * HOUR,
+    };
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
     const now = Date.now();
-    for (const job of raw.jobs) {
-      // "recent" missed its slot by 30 minutes; the others by 7 hours.
-      job.nextRunAt = job.name === "recent" ? now - 30 * 60_000 : now - 7 * 3_600_000;
-    }
+    for (const job of raw.jobs) job.nextRunAt = now - lateBy[job.name];
     writeFileSync(TEST_PATH, JSON.stringify(raw));
 
-    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), notifyOwner: vi.fn() } as unknown as Agent;
-    await tick(new CronScheduler(agent, store));
+    const notifyOwner = vi.fn(async () => true);
+    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), notifyOwner } as unknown as Agent;
+    const scheduler = new CronScheduler(agent, store);
+    await tick(scheduler);
 
     const fired = (agent.handleCronMessage as ReturnType<typeof vi.fn>).mock.calls.map(([msg]) => parseTomoEvent(msg as string)!.name);
-    expect(fired.sort()).toEqual(["always", "recent"]);
+    expect(fired.sort()).toEqual(["always", "backup", "fortnightly", "monthly"]);
     const brief = new CronStore(TEST_PATH).list().find((j) => j.name === "brief")!;
     expect(brief.enabled).toBe(true);
     expect(brief.nextRunAt).toBeGreaterThan(now);
     expect(brief.lastSkippedAt).toBeGreaterThanOrEqual(now);
     expect(brief.lastStatus).toBeNull();
-    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => typeof msg === "string" && msg.startsWith("Cron run skipped: missed its slot by 7h"))).toBe(true);
+    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => typeof msg === "string" && msg.startsWith("Cron run skipped: missed its slot by 14h"))).toBe(true);
+
+    // The owner hears about the skips — once, in one message, not per job.
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(1));
+    const text = (notifyOwner.mock.calls[0] as unknown as [string])[0];
+    expect(text).toContain("2 scheduled runs were missed");
+    expect(text).toContain('"brief"');
+    expect(text).toContain('"hourly"');
+    expect(text).not.toContain('"backup"');
+    expect(text).toContain("--stale-after 0");
+    await tick(scheduler);
+    expect(notifyOwner).toHaveBeenCalledTimes(1);
+  });
+
+  it("puts an outage's stale skips and parked one-shots in the same DM", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "hourly", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+    store.add({ name: "legacy", schedule: { kind: "at", at: new Date(Date.now() - 86_400_000).toISOString() }, message: "y", sessionKey: "dm:alice" });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
+    Object.assign(raw.jobs[1], { enabled: false, nextRunAt: null, lastStatus: "interrupted" });
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const notifyOwner = vi.fn(async () => true);
+    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), notifyOwner } as unknown as Agent;
+    await tick(new CronScheduler(agent, store));
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(1));
+    const text = (notifyOwner.mock.calls[0] as unknown as [string])[0];
+    expect(text).toContain('"hourly"');
+    expect(text).toContain('"legacy"');
+  });
+
+  it("keeps unreported skips when the DM could not be delivered, and sends them later", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "hourly", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+
+    const notifyOwner = vi.fn(async () => false);
+    const agent = { handleCronMessage: vi.fn(() => Promise.resolve(true)), notifyOwner } as unknown as Agent;
+    const scheduler = new CronScheduler(agent, store);
+    await tick(scheduler);
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 10));
+
+    notifyOwner.mockResolvedValue(true);
+    (scheduler as unknown as { nextOwnerReportAt: number }).nextOwnerReportAt = 0;
+    await tick(scheduler);
+    await waitFor(() => expect(notifyOwner).toHaveBeenCalledTimes(2));
+    expect((notifyOwner.mock.calls[1] as unknown as [string])[0]).toContain('"hourly"');
   });
 
   it("leaves the normal cadence alone across a restart with no interrupted run", async () => {
@@ -717,7 +775,7 @@ describe("CronScheduler", () => {
     // Recovery settles and disables it (too old to retry); the operator then
     // decides it should run after all. That decision must stick across the
     // next restart.
-    ageInterruptedRun(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageInterruptedRun(ONE_SHOT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     new CronStore(TEST_PATH).setEnabled(job.id, true);
 

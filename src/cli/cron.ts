@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { CronStore, DEFAULT_STALE_AFTER_MS, parseCreatableSchedule, parseStaleAfter, unschedulableReason } from "../cron/store.js";
+import { CronStore, parseCreatableSchedule, parseStaleAfter, staleWindowMs, unschedulableReason } from "../cron/store.js";
 import { formatDuration, formatSchedule, formatRelative } from "../cron/format.js";
 import { cronAddRefusal, withCronStore } from "./cron-errors.js";
 
@@ -17,7 +17,7 @@ cronCommand
   .requiredOption("--session <key>", "Session key to deliver to (see 'Session key' in the agent system prompt)")
   .option("--once", "Delete after successful run (default: true for one-time 'at' schedules, false for recurring)")
   .option("--stale-after <duration>",
-    `How late a missed run may still fire, e.g. "30m", "6h"; later ones are skipped (one-shots: not retried after an interruption). "0" = always catch up. Default ${formatDuration(DEFAULT_STALE_AFTER_MS)}`)
+    'How late a missed run may still fire, e.g. "30m", "6h"; later ones are skipped and the owner is told (one-shots: not retried after an interruption). "0" = always catch up. Default: half the period, at most 12h, for daily-or-shorter jobs; longer periods always catch up; 2h for one-shots')
   .action((opts) => withCronStore(() => {
     let staleAfterMs: number | undefined;
     if (opts.staleAfter !== undefined) {
@@ -81,9 +81,9 @@ cronCommand
       console.log(`  Session:  ${job.sessionKey}`);
       console.log(`  Next run: ${next}`);
       console.log(`  Last run: ${last}`);
-      if (job.staleAfterMs !== undefined) {
-        console.log(`  Stale after: ${job.staleAfterMs === 0 ? "never (always catch up)" : formatDuration(job.staleAfterMs)}`);
-      }
+      const window = staleWindowMs(job);
+      const source = job.staleAfterMs === undefined ? "default" : "set";
+      console.log(`  Catch-up:  ${window === 0 ? "always (never skipped)" : `skip if more than ${formatDuration(window)} late`} (${source})`);
       if (job.lastSkippedAt) console.log(`  Last skipped (missed by too much): ${new Date(job.lastSkippedAt).toLocaleString()}`);
       console.log();
     }
@@ -122,6 +122,29 @@ cronCommand
     }
     const next = job.nextRunAt ? formatRelative(job.nextRunAt) : "never";
     console.log(`Enabled job ${job.id}: "${job.name}" — next run ${next}`);
+  }));
+
+cronCommand
+  .command("edit <id>")
+  .description("Change settings of an existing task")
+  .option("--stale-after <duration>", 'How late a missed run may still fire ("30m", "6h"), "0" = always catch up, "default" = back to the default')
+  .action((id, opts: { staleAfter?: string }) => withCronStore(() => {
+    if (opts.staleAfter === undefined) {
+      console.error("Nothing to change. Use --stale-after <duration|0|default>.");
+      process.exit(1);
+    }
+    const ms = opts.staleAfter.trim() === "default" ? null : parseStaleAfter(opts.staleAfter);
+    if (ms === null && opts.staleAfter.trim() !== "default") {
+      console.error(`Invalid --stale-after "${opts.staleAfter}": use a duration like 30m, 6h, 2d, 0, or default.`);
+      process.exit(1);
+    }
+    const job = store.setStaleAfter(id, ms);
+    if (!job) {
+      console.error(`Job ${id} not found`);
+      process.exit(1);
+    }
+    const window = staleWindowMs(job);
+    console.log(`Updated job ${job.id}: "${job.name}" — ${window === 0 ? "always catches up" : `skipped if more than ${formatDuration(window)} late`}`);
   }));
 
 cronCommand

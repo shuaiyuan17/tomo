@@ -1,6 +1,6 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { CronStore, CronStoreReadError, parseCreatableSchedule, unschedulableReason } from "../cron/store.js";
+import { CronStore, CronStoreReadError, parseCreatableSchedule, parseStaleAfter, staleWindowMs, unschedulableReason } from "../cron/store.js";
 import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
 import { MIXED_AUDIENCE_KEY } from "../agent/audience.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
@@ -98,8 +98,19 @@ export function buildCronTools(
         once: z.boolean().optional().describe(
           "Override lifecycle. Defaults to true for one-time `at` schedules and false for recurring (`every`/cron). Pass `true` to make a cron expression fire once and auto-delete; pass `false` to keep an `at` job around as a disabled record after firing.",
         ),
+        staleAfter: z.string().min(1).max(20).optional().describe(
+          'How late a missed run (Tomo was down) may still fire, e.g. "30m", "6h"; later runs are skipped and the owner is told. "0" = always catch up (use for backups and anything that must not be skipped). '
+            + "Default: half the period, at most 12h, for daily-or-shorter jobs; longer periods always catch up; 2h for one-shots (how long an interrupted one-shot is still retried).",
+        ),
       },
-      async ({ name, schedule, message, session, once }) => {
+      async ({ name, schedule, message, session, once, staleAfter }) => {
+        const staleAfterMs = staleAfter === undefined ? undefined : parseStaleAfter(staleAfter);
+        if (staleAfterMs === null) {
+          return {
+            content: [{ type: "text" as const, text: `schedule_create failed: invalid staleAfter "${staleAfter}": use a duration like 30m, 6h, 2d, or 0.` }],
+            isError: true,
+          };
+        }
         const target = session ?? callerKey();
         if (target === undefined) {
           return {
@@ -173,6 +184,7 @@ export function buildCronTools(
             message,
             sessionKey: target,
             deleteAfterRun: once,
+            ...(staleAfterMs !== undefined ? { staleAfterMs } : {}),
           });
           return {
             content: [{ type: "text" as const, text: JSON.stringify(summarizeJob(job), null, 2) }],
@@ -198,7 +210,7 @@ export function buildCronTools(
       [
         "List every scheduled task in the store. Use to audit what reminders/recurring jobs exist before adding more, or to find a job's id for removal.",
         "",
-        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus. Times are ISO-8601 in UTC.",
+        "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus, and staleAfterMs (the catch-up window: a run missed by more is skipped; 0 = always catch up). Times are ISO-8601 in UTC.",
         "",
         "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. Such a job is left disabled rather than re-fired; use `schedule_enable` to run it again, and only after checking whether the task actually completed.",
         "",
@@ -350,6 +362,9 @@ interface JobSummary {
   lastRunAt: string | null;
   lastStartedAt: string | null;
   lastStatus: CronRunStatus | null;
+  /** Effective catch-up window in ms (0 = always catch up), and whether it was set explicitly. */
+  staleAfterMs: number;
+  staleAfterSource: "set" | "default";
 }
 
 function summarizeJob(job: CronJob): JobSummary {
@@ -365,5 +380,7 @@ function summarizeJob(job: CronJob): JobSummary {
     lastRunAt: job.lastRunAt ? new Date(job.lastRunAt).toISOString() : null,
     lastStartedAt: job.lastStartedAt ? new Date(job.lastStartedAt).toISOString() : null,
     lastStatus: job.lastStatus,
+    staleAfterMs: staleWindowMs(job),
+    staleAfterSource: job.staleAfterMs === undefined ? "default" : "set",
   };
 }

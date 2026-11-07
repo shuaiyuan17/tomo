@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CronStore,
   CronStoreReadError,
-  DEFAULT_STALE_AFTER_MS,
+  ONE_SHOT_STALE_AFTER_MS,
   InvalidScheduleError,
   MAX_EVERY_MS,
   MAX_RESUME_ATTEMPTS,
@@ -648,7 +648,7 @@ describe("CronStore interrupted-run recovery", () => {
     expect(new CronStore(TEST_PATH).recoverInterrupted().resumed).toHaveLength(1);
     // The daemon died again before dispatching the retry, and stayed down.
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-    raw.jobs[0].interruptedAt = Date.now() - DEFAULT_STALE_AFTER_MS - 60_000;
+    raw.jobs[0].interruptedAt = Date.now() - ONE_SHOT_STALE_AFTER_MS - 60_000;
     writeFileSync(TEST_PATH, JSON.stringify(raw));
 
     const again = new CronStore(TEST_PATH).recoverInterrupted();
@@ -682,14 +682,14 @@ describe("CronStore interrupted-run recovery", () => {
       sessionKey: "dm:alice",
     });
     store.markStarted(job.id);
-    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageStart(ONE_SHOT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     new CronStore(TEST_PATH).markInterruptNotified([job.id]);
     expect(new CronStore(TEST_PATH).unreportedParkedOneShots()).toHaveLength(0);
 
     new CronStore(TEST_PATH).setEnabled(job.id, true);
     new CronStore(TEST_PATH).markStarted(job.id);
-    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageStart(ONE_SHOT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).unreportedParkedOneShots().map((j) => j.id)).toEqual([job.id]);
   });
@@ -698,7 +698,7 @@ describe("CronStore interrupted-run recovery", () => {
     const store = new CronStore(TEST_PATH);
     const job = store.add({ name: "daily", schedule: { kind: "every", everyMs: 86_400_000 }, message: "x", sessionKey: "dm:alice" });
     const now = Date.now();
-    const slot = now - 7 * 3_600_000;
+    const slot = now - 14 * 3_600_000;
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
     raw.jobs[0].nextRunAt = slot;
     writeFileSync(TEST_PATH, JSON.stringify(raw));
@@ -720,7 +720,7 @@ describe("CronStore interrupted-run recovery", () => {
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).expireStaleOneShotRetries()).toHaveLength(0);
 
-    const later = Date.now() + DEFAULT_STALE_AFTER_MS + 60_000;
+    const later = Date.now() + ONE_SHOT_STALE_AFTER_MS + 60_000;
     expect(new CronStore(TEST_PATH).expireStaleOneShotRetries(new Set(), later).map((j) => j.id)).toEqual([job.id]);
     const after = new CronStore(TEST_PATH).list()[0];
     expect(after.enabled).toBe(false);
@@ -733,7 +733,7 @@ describe("CronStore interrupted-run recovery", () => {
     store.markStarted(job.id);
     new CronStore(TEST_PATH).recoverInterrupted();
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-    raw.jobs[0].nextRunAt = Date.now() - DEFAULT_STALE_AFTER_MS - 60_000;
+    raw.jobs[0].nextRunAt = Date.now() - ONE_SHOT_STALE_AFTER_MS - 60_000;
     writeFileSync(TEST_PATH, JSON.stringify(raw));
 
     expect(new CronStore(TEST_PATH).skipStaleRuns()).toHaveLength(0);
@@ -749,7 +749,7 @@ describe("CronStore interrupted-run recovery", () => {
       sessionKey: "dm:alice",
     });
     store.markStarted(job.id);
-    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageStart(ONE_SHOT_STALE_AFTER_MS + 60_000);
 
     const { resumed, skipped } = new CronStore(TEST_PATH).recoverInterrupted();
     expect(resumed).toHaveLength(0);
@@ -780,7 +780,7 @@ describe("CronStore interrupted-run recovery", () => {
     });
     expect(job.deleteAfterRun).toBe(false);
     store.markStarted(job.id);
-    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageStart(ONE_SHOT_STALE_AFTER_MS + 60_000);
 
     const { resumed, skipped } = new CronStore(TEST_PATH).recoverInterrupted();
     expect(resumed).toHaveLength(0);
@@ -997,7 +997,7 @@ describe("CronStore crash-loop cap and clock independence", () => {
       sessionKey: "dm:alice",
     });
     store.markStarted(job.id);
-    ageStart(DEFAULT_STALE_AFTER_MS + 60_000);
+    ageStart(ONE_SHOT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
 
@@ -1430,10 +1430,47 @@ describe("staleness window", () => {
     expect(parseStaleAfter("-5m")).toBeNull();
   });
 
-  it("defaults, honours a per-job value, and ignores a damaged one", () => {
-    expect(staleWindowMs({})).toBe(DEFAULT_STALE_AFTER_MS);
-    expect(staleWindowMs({ staleAfterMs: 0 })).toBe(0);
-    expect(staleWindowMs({ staleAfterMs: 600_000 })).toBe(600_000);
-    expect(staleWindowMs({ staleAfterMs: -1 })).toBe(DEFAULT_STALE_AFTER_MS);
+  it("scales the default with the period, and honours a per-job value", () => {
+    const HOUR = 3_600_000;
+    const every = (everyMs: number, staleAfterMs?: number) =>
+      ({ schedule: { kind: "every" as const, everyMs }, deleteAfterRun: false, ...(staleAfterMs !== undefined ? { staleAfterMs } : {}) });
+    const cron = (expr: string) => ({ schedule: { kind: "cron" as const, expr, tz: "UTC" }, deleteAfterRun: false });
+    const from = Date.UTC(2026, 10, 7, 12);
+    // Sub-daily: half the period, floored at 5 minutes.
+    expect(staleWindowMs(every(HOUR), from)).toBe(30 * 60_000);
+    expect(staleWindowMs(every(60_000), from)).toBe(5 * 60_000);
+    // Daily: half the period = 12h (the cap). Weekday-only crons read as daily.
+    expect(staleWindowMs(every(24 * HOUR), from)).toBe(12 * HOUR);
+    expect(staleWindowMs(cron("0 3 * * *"), from)).toBe(12 * HOUR);
+    expect(staleWindowMs(cron("0 9 * * 1-5"), Date.UTC(2026, 10, 9, 12))).toBe(12 * HOUR);
+    // Longer than a day: always catch up.
+    expect(staleWindowMs(every(14 * 24 * HOUR), from)).toBe(0);
+    expect(staleWindowMs(cron("0 9 * * 1"), from)).toBe(0);
+    expect(staleWindowMs(cron("0 9 1 * *"), from)).toBe(0);
+    expect(staleWindowMs(cron("0 9 1 1,4,7,10 *"), from)).toBe(0);
+    expect(staleWindowMs(cron("0 9 1 12 *"), from)).toBe(0);
+    // One-shots: a fixed retry window.
+    expect(staleWindowMs({ schedule: { kind: "at", at: "2026-11-07T10:00" }, deleteAfterRun: true }, from)).toBe(ONE_SHOT_STALE_AFTER_MS);
+    // Explicit values win; a damaged one falls back to the default.
+    expect(staleWindowMs(every(24 * HOUR, 0), from)).toBe(0);
+    expect(staleWindowMs(every(24 * HOUR, 600_000), from)).toBe(600_000);
+    expect(staleWindowMs(every(HOUR, -1), from)).toBe(30 * 60_000);
+  });
+
+  it("setStaleAfter sets, clears and guards a job's window", () => {
+    mkdirSync(TEST_DIR, { recursive: true });
+    try {
+      const store = new CronStore(TEST_PATH);
+      const job = store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+      expect(new CronStore(TEST_PATH).setStaleAfter(job.id, 0)?.staleAfterMs).toBe(0);
+      expect(new CronStore(TEST_PATH).list()[0].staleAfterMs).toBe(0);
+      expect(new CronStore(TEST_PATH).setStaleAfter(job.id, null, () => false)).toBe("refused");
+      expect(new CronStore(TEST_PATH).setStaleAfter(job.id, null)?.staleAfterMs).toBeUndefined();
+      expect("staleAfterMs" in new CronStore(TEST_PATH).list()[0]).toBe(false);
+      expect(new CronStore(TEST_PATH).setStaleAfter("nope", 0)).toBeUndefined();
+      expect(() => new CronStore(TEST_PATH).setStaleAfter(job.id, -5)).toThrow(RangeError);
+    } finally {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    }
   });
 });

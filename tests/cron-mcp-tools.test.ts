@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CronStore, DEFAULT_STALE_AFTER_MS } from "../src/cron/store.js";
+import { CronStore, ONE_SHOT_STALE_AFTER_MS } from "../src/cron/store.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
 import { MIXED_AUDIENCE_KEY, TurnAudienceRegistry, scopedCallerKeyFor } from "../src/agent/audience.js";
 
@@ -99,6 +99,24 @@ describe("cron MCP tools", () => {
     expect(jobs[0].nextRunAt).toBeTruthy();
   });
 
+  it("schedule_create — accepts staleAfter, and reports the effective window", async () => {
+    const created = await findTool("schedule_create", "dm:alice").handler(
+      { name: "backup", schedule: "0 3 * * *", message: "run the backup", staleAfter: "0" }, {});
+    expect(created.isError).toBeFalsy();
+    const summary = JSON.parse(created.content[0].text);
+    expect(summary.staleAfterMs).toBe(0);
+    expect(summary.staleAfterSource).toBe("set");
+    expect(new CronStore(TEST_PATH).list()[0].staleAfterMs).toBe(0);
+
+    const dflt = JSON.parse((await findTool("schedule_create", "dm:alice").handler(
+      { name: "hourly", schedule: "every 1h", message: "x" }, {})).content[0].text);
+    expect(dflt).toMatchObject({ staleAfterMs: 30 * 60_000, staleAfterSource: "default" });
+
+    const bad = await findTool("schedule_create", "dm:alice").handler({ name: "x", schedule: "every 1h", message: "x", staleAfter: "soon" }, {});
+    expect(bad.isError).toBe(true);
+    expect(bad.content[0].text).toContain('invalid staleAfter "soon"');
+  });
+
   it("schedule_enable — brings back a job left disabled by an interrupted run", async () => {
     const store = new CronStore(TEST_PATH);
     const job = store.add({
@@ -112,7 +130,7 @@ describe("cron MCP tools", () => {
     // agent's only way back was to re-create the job from scratch.
     store.markStarted(job.id);
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-    raw.jobs[0].lastStartedAt = Date.now() - DEFAULT_STALE_AFTER_MS - 60_000;
+    raw.jobs[0].lastStartedAt = Date.now() - ONE_SHOT_STALE_AFTER_MS - 60_000;
     writeFileSync(TEST_PATH, JSON.stringify(raw));
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);

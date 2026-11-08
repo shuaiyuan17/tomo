@@ -41,7 +41,7 @@ Bootstrap requires the token or an existing signed cookie. Every other API, incl
 
 A private token file prevents another OS account, or a sandbox/container without access to that file, from obtaining web access. It cannot stop a process already running as the owner or an environment sharing the owner's files. Exact Host/Origin checks, same-origin Fetch Metadata, a required API header, CSRF, and a restrictive CSP also protect against hostile websites. This requires a browser that sends `Sec-Fetch-Site`; older browsers without Fetch Metadata are rejected. Chromium is covered by the browser E2E suite. Assets are packaged locally; markdown cannot execute HTML/scripts or automatically fetch remote images.
 
-HTTP, asset serving, and history reads run in a supervised process with memory, startup, IPC, and connection limits. A busy port disables the UI with an actionable diagnostic. A crashed or hung process gets three bounded retries; repeated failures disable it until restart. Messaging channels continue operating. No UI request can call a generic file, command, or Agent RPC.
+HTTP, asset serving, and history reads run in a supervised process with memory, startup, IPC, and connection limits. A busy port, a crashed process, or a hung startup is retried with capped exponential backoff (up to 5 minutes) for as long as the daemon runs; the failure counter resets after 5 minutes of health. Entering backoff logs an error, and `tomo status` shows the web line (listening, or down with the next retry time and last failure). Messaging channels continue operating. No UI request can call a generic file, command, or Agent RPC.
 
 ## Private access through Tailscale Serve
 

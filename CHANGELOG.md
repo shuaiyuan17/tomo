@@ -24,7 +24,8 @@
 ### Dependencies
 
 - `@anthropic-ai/claude-agent-sdk` 0.3.310 → 0.3.319 (#443, #446, #447, #455); additive and doc-only type changes.
-- `zod` stays pinned at 4.4.3 (#359; GHSA-mrhx-c7xc-m3w5 remains). `minimatch` stays on 10.x for now; `npm audit` reports GHSA-g3hv-75wg-m249, fixed only in the 11.x major.
+- `zod` stays pinned at 4.4.3 (#359; GHSA-mrhx-c7xc-m3w5 remains).
+- `minimatch` 10.2.6 → 11.0.5 (#454): the runtime copy is no longer affected by GHSA-g3hv-75wg-m249 (eslint's own nested copies, dev-only, still are). The only call site (the private-memory path guard) uses options 11.x still supports; the `**` matching changes can only make it deny more.
 - Minor bumps: `vitest`/`@vitest/coverage-v8` 5.1.0, `eslint` 10.14.0 (#453), `commander` 15.1.0, `@clack/prompts` 1.9.0, `typescript-eslint` 8.72.2; transitive refresh.
 
 ## 0.11.1 (2026-10-26)

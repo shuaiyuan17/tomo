@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.12.0 (2026-11-09)
+
+### Features
+
+- **Cron catch-up after downtime** (#450): **behaviour change, on by default.** A recurring run missed by more than its staleness window is skipped to its next slot instead of firing late, so a long outage no longer ends with every job firing at once. The default window is half the period (5 min to 12 h) for jobs that run daily or more often; weekly and longer jobs always catch up. Skips are reported to the owner in one DM. Set it per job with `tomo cron add/edit --stale-after <duration>` or `staleAfter` in `schedule_create`; `0` turns skipping off for that job.
+- **Interrupted one-shots are retried** (#450): a one-shot reminder cut off by a restart is retried once on startup if it started within the last 2 hours. Otherwise it is parked and the owner gets a DM saying how to re-run it, including one-shots that older versions parked silently.
+- **Web UI status in `tomo status`** (#449): shows whether the web UI is listening, or down with the failure count, last reason and next retry.
+
+### Bug fixes
+
+- The web UI supervisor no longer gives up after three failed starts; it retries forever with backoff capped at 5 minutes and logs an error when it starts backing off (#449).
+- Chats, owner notices and tool results show only the short error message; full diagnostic detail stays in the logs (#452). iMessage send errors are logged with their real detail instead of `[object Object]` (#451).
+
+### Security
+
+- OAuth bearer tokens for external MCP servers are no longer passed on the `claude` command line, where any local process could read them with `ps`. They are passed in a private temp file that is removed once the CLI has read it (#448).
+
+### Other
+
+- Test wait ceiling raised for slow CI runners (#441); web UI docs updated for the new supervisor (#456).
+
+### Dependencies
+
+- `@anthropic-ai/claude-agent-sdk` 0.3.310 → 0.3.319 (#443, #446, #447, #455); additive and doc-only type changes.
+- `zod` stays pinned at 4.4.3 (#359; GHSA-mrhx-c7xc-m3w5 remains).
+- `minimatch` 10.2.6 → 11.0.5 (#454): the runtime copy is no longer affected by GHSA-g3hv-75wg-m249 (eslint's own nested copies, dev-only, still are). The only call site (the private-memory path guard) uses options 11.x still supports; the `**` matching changes can only make it deny more.
+- Minor bumps: `vitest`/`@vitest/coverage-v8` 5.1.0, `eslint` 10.14.0 (#453), `commander` 15.1.0, `@clack/prompts` 1.9.0, `typescript-eslint` 8.72.2; transitive refresh.
+
 ## 0.11.1 (2026-10-26)
 
 ### Bug fixes

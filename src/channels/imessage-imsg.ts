@@ -415,6 +415,25 @@ interface PendingRequest {
  * refuses cleanly instead of calling `message.edit` blindly — see tomo#227 for
  * what calling it blindly did to Messages.app.
  */
+/**
+ * Messages can put a small preview at an attachment's final path before the
+ * full file lands. On 2026-11-11 two 7.5–8.9 MB PNGs were read as 235–335 KB
+ * previews (240×169 and 320×225) because the file existed and was non-empty
+ * when we first looked. A file shorter than the size imsg declares for it is
+ * not the attachment yet, so the first pass defers it to the background watch
+ * instead of reading it. The watch keeps its own completion test (chat.db
+ * transfer_state, else a size that holds across polls): by its first poll the
+ * swap is long done, and a declared size that is simply wrong then costs one
+ * poll's delay rather than the image. A converted file is exempt, since its
+ * size has no relation to the original's, and so is an attachment with no
+ * declared size, which keeps the old behaviour.
+ */
+export function shortOfDeclaredSize(onDisk: { att: Record<string, unknown>; path: string; size: number }): boolean {
+  if (typeof onDisk.att.converted_path === "string" && onDisk.path === onDisk.att.converted_path) return false;
+  const declared = onDisk.att.total_bytes ?? onDisk.att.byte_size;
+  return typeof declared === "number" && declared > 0 && onDisk.size < declared;
+}
+
 export class ImsgChannel implements Channel {
   readonly name = "imessage";
   private handlers: MessageHandler[] = [];
@@ -2461,7 +2480,7 @@ export class ImsgChannel implements Channel {
       // written. The watch only takes it once its size holds across two
       // polls. A zero-byte file is never treated as landed.
       const onDisk = await this.resolveOnDiskAttachment(att);
-      if (!onDisk || onDisk.empty || (att.missing === true && !options.recheck)) {
+      if (!onDisk || onDisk.empty || (att.missing === true && !options.recheck) || (!options.recheck && shortOfDeclaredSize(onDisk))) {
         deferred.push(att);
         continue;
       }

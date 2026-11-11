@@ -816,7 +816,7 @@ describe("imsg inbound message mapping", () => {
           mime_type: "image/heic",
           uti: "public.heic",
           original_path: heicPath,
-          total_bytes: 12845,
+          total_bytes: 20, // the fixture's real size: a shorter file is a preview and defers
           missing: false,
           is_sticker: true,
         }],
@@ -1031,6 +1031,46 @@ describe("imsg inbound message mapping", () => {
         // Delivered once — later ticks never re-deliver.
         await tick(60_000);
         expect(handler).toHaveBeenCalledTimes(2);
+        await channel.stop();
+      });
+    });
+
+    it("defers an image whose file is still the preview Messages writes before the full file", async () => {
+      // 2026-11-11: two 7.5–8.9 MB PNGs were read as 240×169 / 320×225
+      // previews, because the file existed, was non-empty and imsg did not
+      // mark it missing. A file shorter than the declared size is not it yet.
+      useFakeClock();
+      await withDir("tomo-imsg-preview-", async (dir) => {
+        const path = join(dir, "IMG_0697.png");
+        const full = Buffer.concat([pngBytes, Buffer.alloc(4096, 1)]);
+        writeFileSync(path, pngBytes); // the preview: real PNG, too short
+        const { channel, children, handler } = await setup({ imageStoreBaseDir: dir });
+
+        children[0].notifyMessage(inboundMessage({
+          guid: "preview-img-1",
+          chat_guid: GROUP_GUID,
+          is_group: true,
+          chat_name: "Weekend",
+          text: "look",
+          attachments: [{ filename: "IMG_0697.png", mime_type: "image/png", original_path: path, total_bytes: full.length }],
+        }));
+        await ioUntil(() => handler.mock.calls.length >= 1);
+        expect(handler.mock.calls[0][0].images).toBeUndefined();
+        expect(channel.pendingDeferredAttachmentWatches).toBe(1);
+
+        // Still the preview after a poll: not taken.
+        await tick(5_000);
+        await tick(5_000);
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        writeFileSync(path, full); // the full file lands
+        await tick(5_000);
+        await tick(5_000);
+        await ioUntil(() => handler.mock.calls.length >= 2);
+        const followUp = handler.mock.calls[1][0];
+        expect(followUp.images).toHaveLength(1);
+        expect(readFileSync(followUp.images![0].savedPath!).length).toBe(full.length);
+        expect(channel.pendingDeferredAttachmentWatches).toBe(0);
         await channel.stop();
       });
     });
@@ -4609,7 +4649,8 @@ describe("imsg at-least-once persist ordering", () => {
       // blocks on readFile BEFORE the dispatch side effect.
       children[0].notifyMessage(inboundMessage({
         id: 500, guid: "row-500", text: "with photo",
-        attachments: [{ mime_type: "image/png", original_path: fifoPath, total_bytes: 8, missing: false }],
+        // No declared size: a FIFO reports 0 bytes and must still reach readFile.
+        attachments: [{ mime_type: "image/png", original_path: fifoPath, missing: false }],
       }));
       await new Promise((r) => setTimeout(r, 60));
       expect(seen).toEqual([]); // still blocked in attachment load — not delivered

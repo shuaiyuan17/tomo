@@ -1058,18 +1058,44 @@ describe("imsg inbound message mapping", () => {
         expect(handler.mock.calls[0][0].images).toBeUndefined();
         expect(channel.pendingDeferredAttachmentWatches).toBe(1);
 
-        // Still the preview after a poll: not taken.
-        await tick(5_000);
-        await tick(5_000);
-        expect(handler).toHaveBeenCalledTimes(1);
-
-        writeFileSync(path, full); // the full file lands
+        await tick(500);
+        writeFileSync(path, full); // the full file replaces the preview
         await tick(5_000);
         await tick(5_000);
         await ioUntil(() => handler.mock.calls.length >= 2);
         const followUp = handler.mock.calls[1][0];
         expect(followUp.images).toHaveLength(1);
         expect(readFileSync(followUp.images![0].savedPath!).length).toBe(full.length);
+        expect(channel.pendingDeferredAttachmentWatches).toBe(0);
+        await channel.stop();
+      });
+    });
+
+    it("still delivers a complete image whose declared size is simply wrong", async () => {
+      // The size check is a first-pass guard only. If the declaration never
+      // matches (a stable file that stays short), the watch's own completion
+      // test takes it: a delay, not a lost image.
+      useFakeClock();
+      await withDir("tomo-imsg-misdeclared-", async (dir) => {
+        const path = join(dir, "odd.png");
+        writeFileSync(path, pngBytes);
+        const { channel, children, handler } = await setup({ imageStoreBaseDir: dir });
+
+        children[0].notifyMessage(inboundMessage({
+          guid: "misdeclared-1",
+          chat_guid: GROUP_GUID,
+          is_group: true,
+          chat_name: "Weekend",
+          text: "odd",
+          attachments: [{ filename: "odd.png", mime_type: "image/png", original_path: path, total_bytes: pngBytes.length + 999 }],
+        }));
+        await ioUntil(() => handler.mock.calls.length >= 1);
+        expect(channel.pendingDeferredAttachmentWatches).toBe(1);
+
+        await tick(5_000);
+        await tick(5_000);
+        await ioUntil(() => handler.mock.calls.length >= 2);
+        expect(handler.mock.calls[1][0].images).toHaveLength(1);
         expect(channel.pendingDeferredAttachmentWatches).toBe(0);
         await channel.stop();
       });

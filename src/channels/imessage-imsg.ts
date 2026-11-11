@@ -2480,7 +2480,7 @@ export class ImsgChannel implements Channel {
       // written. The watch only takes it once its size holds across two
       // polls. A zero-byte file is never treated as landed.
       const onDisk = await this.resolveOnDiskAttachment(att);
-      if (!onDisk || onDisk.empty || (att.missing === true && !options.recheck) || shortOfDeclaredSize(onDisk)) {
+      if (!onDisk || onDisk.empty || (att.missing === true && !options.recheck) || (!options.recheck && shortOfDeclaredSize(onDisk))) {
         deferred.push(att);
         continue;
       }

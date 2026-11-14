@@ -375,6 +375,10 @@ it("motion: new messages rise in, the rail transitions open and closed, and redu
   // The rail opens with a transition and is gone after closing.
   await page.getByRole("button", { name: /^Tasks/ }).click();
   await browserExpect(page.locator("#tasks-rail")).toHaveAttribute("data-state", "open");
+  // Wide screens: the rail's own box never animates (the chat would reflow every frame); its content slides.
+  const rail = await page.locator("#tasks-rail").evaluate((el) => [getComputedStyle(el).transitionProperty, getComputedStyle(el.firstElementChild!).transitionProperty]);
+  expect(rail[0]).not.toMatch(/width|padding/);
+  expect(rail[1]).toMatch(/opacity/);
   await page.getByRole("button", { name: "Close tasks" }).click();
   await browserExpect(page.locator("#tasks-rail")).toHaveCount(0);
   // With reduced motion, no animation or transition runs.

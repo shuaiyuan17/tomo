@@ -179,7 +179,7 @@
 }
 @keyframes motion-enter { from { opacity: 0; transform: translateY(6px); } }
 @keyframes motion-drop { from { opacity: 0; transform: translateY(-4px); } }
-@keyframes motion-exit { from { opacity: 0.6; max-height: 6rem; } to { opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; } }
+@keyframes motion-exit { from { opacity: 0.6; height: var(--motion-exit-from, auto); } to { opacity: 0; height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; } }
 @keyframes motion-from-right { from { opacity: 0; transform: translateX(16px); } }
 @keyframes motion-from-left { from { opacity: 0; transform: translateX(-16px); } }
 @keyframes collapsible-open { from { height: 0; opacity: 0; } to { height: var(--radix-collapsible-content-height); opacity: 1; } }

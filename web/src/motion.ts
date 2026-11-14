@@ -68,3 +68,11 @@ export function useMountedFor(open: boolean, ms = 220): { mounted: boolean; show
   }, [open, ms]);
   return { mounted, shown };
 }
+
+/**
+ * Ref for an element starting its exit: records its real height so the
+ * collapse starts from there (not from a guessed maximum).
+ */
+export function measureExit(el: HTMLElement | null): void {
+  if (el) el.style.setProperty("--motion-exit-from", `${el.offsetHeight}px`);
+}

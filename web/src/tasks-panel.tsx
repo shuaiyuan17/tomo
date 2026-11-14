@@ -4,7 +4,7 @@ import type { WebSession, WebTask } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
-import { useAppeared, useExiting } from "./motion.js";
+import { measureExit, useAppeared, useExiting } from "./motion.js";
 import { SubagentView } from "./subagent-view.js";
 import { isShellTask, shellShortName } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
@@ -68,7 +68,7 @@ function TaskCard({ task, depth, now, onOpen, motion }: { task: WebTask; depth: 
   const time = formatElapsed(elapsed(task, now));
   const running = task.state === "running";
   const shell = isShellTask(task.taskType);
-  return <li style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch, motion)}>
+  return <li ref={motion?.includes("motion-exit") ? measureExit : undefined} style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch, motion)}>
     <button type="button" title={shell ? `${shellShortName(task.description)}\n\n${task.description}\n\nOpen to see the full command` : taskKind(task)} onClick={onOpen}
       className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.06] focus-visible:outline-offset-0", "transition-[background-color,opacity] duration-200", !running && "opacity-60")}>
       <div className="flex min-w-0 items-baseline justify-between gap-2.5">
@@ -87,7 +87,7 @@ function TaskCard({ task, depth, now, onOpen, motion }: { task: WebTask; depth: 
 function FoldedShells({ tasks, depth, now, open, onToggle, onOpen, motion }:
   { tasks: WebTask[]; depth: number; now: number; open: boolean; onToggle: () => void; onOpen: (task: WebTask) => void; motion?: string }) {
   return <>
-    <li style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch, motion)}>
+    <li ref={motion?.includes("motion-exit") ? measureExit : undefined} style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch, motion)}>
       <button type="button" aria-expanded={open} onClick={onToggle}
         className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground opacity-80 transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
         <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-90")} />

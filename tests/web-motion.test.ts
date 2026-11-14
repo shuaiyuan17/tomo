@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { appendedIds } from "../web/src/motion.js";
+import { appendedIds, measureExit } from "../web/src/motion.js";
 
 describe("motion: what counts as appearing", () => {
   it("only ids appended after the known ones animate; older pages loaded above do not", () => {
@@ -48,5 +48,15 @@ describe("motion: progress bars", () => {
     const { Progress } = await import("../web/src/components/ui/progress.js");
     const html = renderToStaticMarkup(createElement(Progress, { value: 40, max: 100 }));
     expect(html).toMatch(/data-slot="progress-indicator"[^>]*transition-\[transform,background-color\]/);
+  });
+});
+
+describe("motion: exits", () => {
+  it("a card collapses from its real height", () => {
+    const props = new Map<string, string>();
+    const el = { offsetHeight: 87, style: { setProperty: (k: string, v: string) => props.set(k, v) } } as unknown as HTMLElement;
+    measureExit(el);
+    expect(props.get("--motion-exit-from")).toBe("87px");
+    expect(readFileSync(new URL("../web/src/styles.css", import.meta.url), "utf8")).toMatch(/@keyframes motion-exit \{ from \{[^}]*height: var\(--motion-exit-from/);
   });
 });

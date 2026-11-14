@@ -425,14 +425,15 @@ export function App() {
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>
       </main>
-      {/* The rail slides: on wide screens its width opens and the chat makes
-          room smoothly; on narrow ones it slides over the chat, with a dimmed
-          backdrop. It stays mounted for the closing transition. */}
+      {/* Wide screens: the rail takes its full width at once (the chat reflows
+          once, not every frame) and only its content slides and fades. Narrow
+          ones: it slides over the chat, with a dimmed backdrop. It stays
+          mounted for the closing transition. */}
       {railMotion.mounted && overlay && <div aria-hidden="true" onClick={closeTasks} data-state={railMotion.shown ? "open" : "closed"}
         className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-16" />}
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
-        className="flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 transition-[width,opacity,padding,transform] duration-[220ms] data-[state=closed]:w-0 data-[state=closed]:pl-0 data-[state=closed]:opacity-0 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:data-[state=closed]:w-[min(340px,88vw)] max-[800px]:data-[state=closed]:translate-x-full max-[800px]:data-[state=closed]:opacity-100 max-[600px]:top-16">
-        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
+        className="group/rail flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:transition-transform max-[800px]:duration-[220ms] max-[800px]:data-[state=closed]:translate-x-full max-[600px]:top-16">
+        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[801px]:group-data-[state=closed]/rail:translate-x-4 min-[801px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div></aside>}
     </div>
     {screen && <ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} />}

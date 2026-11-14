@@ -9,6 +9,9 @@ import { log } from "../logger.js";
 import { withFileLockSync } from "../file-lock.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
+/** The store file the daemon's scheduler uses. Passed explicitly to the web
+ *  process, which must read the same file and never derive it itself. */
+export const CRON_STORE_PATH = DEFAULT_STORE_PATH;
 
 /** Failed one-shot ("at") jobs retry this many times before being disabled. */
 export const ONE_SHOT_MAX_RETRIES = 2;
@@ -885,6 +888,15 @@ function readStore(path: string): { jobs: CronJob[]; revision: number } {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { jobs: [], revision: 0 };
     throw new CronStoreReadError(path, err);
   }
+  return parseCronStore(path, raw);
+}
+
+/**
+ * Parse and shape-check the text of a store file, with no I/O and no side
+ * effects. `readStore` and read-only viewers (the web Study, which reads the
+ * file itself with bounds) share it, so both refuse the same malformed files.
+ */
+export function parseCronStore(path: string, raw: string): { jobs: CronJob[]; revision: number } {
   let data: { jobs?: unknown; revision?: unknown };
   try {
     data = JSON.parse(raw);

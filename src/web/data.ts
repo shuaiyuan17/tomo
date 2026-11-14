@@ -18,7 +18,7 @@ export interface WebDataOptions {
   workspaceDir?: string;
   /** Runtime home holding config.json (Study config / MCP view). */
   tomoHome?: string;
-  /** Cron store file; defaults to the daemon scheduler's own default path. */
+  /** The scheduler's cron store file, passed by the daemon (the web process never derives it). */
   cronStorePath?: string;
 }
 

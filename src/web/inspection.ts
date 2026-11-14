@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import { CronStore } from "../cron/store.js";
+import { parseCronStore } from "../cron/store.js";
 import { formatSchedule } from "../cron/format.js";
 import type { CronJob } from "../cron/types.js";
 import { computeContextStatsFromEvents, type SdkEvent } from "../lcm/stats.js";
@@ -16,17 +16,45 @@ export function webCronJob(job: CronJob): WebCronJob {
     nextRunAt: job.nextRunAt, lastRunAt: job.lastRunAt, lastStatus: job.lastStatus, interruptedAt: job.interruptedAt ?? null };
 }
 
+/** Largest cron store the web process will read. */
+export const MAX_CRON_STORE_BYTES = 4 * 1024 * 1024;
+
 /**
- * Cron jobs, read fresh from the same store file the daemon's scheduler uses
- * (`CronStore`'s default path, so a custom TOMO_HOME reads what the daemon
- * reads). Read-only here.
+ * Cron jobs, read fresh from the store file the daemon's scheduler uses (its
+ * path is handed over by the daemon, never derived here). Read-only: the file
+ * is read asynchronously and bounded, without following a symlink or blocking
+ * on a FIFO, and parsed by the store's own side-effect-free parser, so the
+ * web process never constructs a CronStore (whose load can repair and save).
  */
 export class WebCron {
-  constructor(private readonly path?: string) {}
-  protected store(): CronStore { return new CronStore(this.path); }
-  list(): { jobs: WebCronJob[] } {
-    try { return { jobs: this.store().list().map(webCronJob) }; }
-    catch { throw new WebError(503, "cron_unavailable"); }
+  constructor(private readonly path: string | undefined) {}
+  async list(): Promise<{ jobs: WebCronJob[] }> {
+    return { jobs: (await this.read()).map(webCronJob) };
+  }
+  protected async read() {
+    if (!this.path) throw new WebError(503, "cron_unavailable");
+    let file;
+    try { file = await open(this.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw new WebError(503, "cron_unavailable");
+    }
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile()) throw new WebError(503, "cron_unavailable");
+      if (stat.size > MAX_CRON_STORE_BYTES) throw new WebError(413, "cron_store_too_large");
+      // Bounded even if the file grows after stat().
+      const bytes = Buffer.alloc(MAX_CRON_STORE_BYTES + 1);
+      let read = 0;
+      while (read < bytes.length) {
+        const { bytesRead } = await file.read(bytes, read, bytes.length - read, read);
+        if (!bytesRead) break;
+        read += bytesRead;
+      }
+      if (read > MAX_CRON_STORE_BYTES) throw new WebError(413, "cron_store_too_large");
+      try { return parseCronStore(this.path, bytes.toString("utf8", 0, read)).jobs; }
+      catch { throw new WebError(503, "cron_unavailable"); }
+    } finally { await file.close(); }
   }
 }
 

@@ -31,7 +31,7 @@ The web chat is always the owner's DM session (`dm:<owner.name>`). With no owner
 - **TODOs:** root-level `memory/TODO*.md` files with their checkbox state (nested TODO files stay browsable in Memory).
 - **Memory:** browse `MEMORY.md`, topic files and subdirectories; search literal text and open results.
 - **Context:** for the conversation selected in the sidebar (owner DM or a group): persisted window usage and breakdown, the same estimated sections as `tomo lcm stats`, retained rollup blocks as in `tomo lcm blocks`, and compactions seen since the daemon started (not a complete audit log). A missing window is unavailable, not zero.
-- **Cron:** names, schedules, target sessions, messages, next/last runs and status, read fresh from the scheduler's store.
+- **Cron:** names, schedules, target sessions, messages, next/last runs and status, read fresh from the scheduler's store file. The daemon hands the web process that path; the web process reads it asynchronously (at most 4 MiB, `413 cron_store_too_large` beyond), refuses symlinks, FIFOs and other non-regular files, and parses it with the store's own side-effect-free parser.
 - **MCP servers:** saved definitions, including disabled ones, with the state live SDK sessions report (connected, failed, needs sign-in…). Health is never probed and no connection or OAuth flow is started; no report means unknown.
 - **Config:** the saved `config.json`. Values the daemon is running with may differ until it restarts.
 

@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryReader } from "../src/workspace/memory-reader.js";
 import { CronStore } from "../src/cron/store.js";
-import { WebCron, readSessionContext } from "../src/web/inspection.js";
+import { MAX_CRON_STORE_BYTES, WebCron, readSessionContext } from "../src/web/inspection.js";
+import { execFileSync } from "node:child_process";
 import { configFields, mcpServers, WebConfigReader } from "../src/web/config-view.js";
 import { computeContextStats } from "../src/lcm/stats.js";
 import { readSummaryBlocks } from "../src/lcm/summary-reader.js";
@@ -145,17 +146,37 @@ describe("context", () => {
 });
 
 describe("cron list", () => {
-  it("lists a job's intent and run state", () => {
+  it("lists a job's intent and run state", async () => {
     const path = join(root, "data", "cron", "jobs.json");
     const store = new CronStore(path);
     const job = store.add({ name: "Example task", schedule: { kind: "every", everyMs: 60_000 }, message: "Review the test note", sessionKey: "dm:owner" });
-    expect(new WebCron(path).list().jobs).toEqual([expect.objectContaining({ id: job.id, name: "Example task", message: "Review the test note",
+    expect((await new WebCron(path).list()).jobs).toEqual([expect.objectContaining({ id: job.id, name: "Example task", message: "Review the test note",
       sessionKey: "dm:owner", scheduleLabel: "every 1m", enabled: true, lastStatus: null })]);
   });
-  it("reports an unreadable store as unavailable, not as no jobs", () => {
+  it("reports an unreadable store as unavailable, not as no jobs", async () => {
     const path = join(root, "jobs.json");
     writeFileSync(path, "{not json");
-    expect(() => new WebCron(path).list()).toThrow("cron_unavailable");
+    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 503, code: "cron_unavailable" });
+    writeFileSync(path, JSON.stringify({ jobs: [null] }));
+    await expect(new WebCron(path).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+  });
+  it("reads a missing store as no jobs, and has no path of its own", async () => {
+    expect(await new WebCron(join(root, "absent.json")).list()).toEqual({ jobs: [] });
+    await expect(new WebCron(undefined).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+  });
+  it("refuses a FIFO, a symlink and a directory without blocking", async () => {
+    const fifo = join(root, "fifo.json");
+    execFileSync("mkfifo", [fifo]);
+    await expect(new WebCron(fifo).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+    const real = join(root, "real.json"); writeFileSync(real, JSON.stringify({ version: 1, revision: 1, jobs: [] }));
+    symlinkSync(real, join(root, "link.json"));
+    await expect(new WebCron(join(root, "link.json")).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+    await expect(new WebCron(root).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+  });
+  it("refuses a store over the size bound with an explicit error", async () => {
+    const path = join(root, "big.json");
+    writeFileSync(path, JSON.stringify({ version: 1, revision: 1, jobs: [], pad: "x".repeat(MAX_CRON_STORE_BYTES) }));
+    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 413, code: "cron_store_too_large" });
   });
 });
 
@@ -235,6 +256,7 @@ describe("Study HTTP", () => {
     writeFileSync(join(root, "memory", "TODO.md"), "- [ ] A test task");
     mkdirSync(join(root, "memory", "private"));
     writeFileSync(join(root, "memory", "private", "note.md"), "PRIVATE-NEEDLE");
+    writeFileSync(join(root, "memory", "topics", "public.md"), "public NEEDLE");
     writeFileSync(join(root, "config.json"), JSON.stringify({ model: "test-model", auth: { apiKey: "sk-synthetic-secret-value-01" } }));
     writeFileSync(join(root, "index.html"), "<!doctype html>");
     const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
@@ -266,7 +288,17 @@ describe("Study HTTP", () => {
 
   it("serves real workspace data and never private memory or secrets", async () => {
     expect((await call("/todos")).value.files).toEqual([expect.objectContaining({ path: "TODO.md", content: "- [ ] A test task" })]);
-    const everything = JSON.stringify(await Promise.all(["/memory/tree", "/memory/search?q=PRIVATE", "/config", "/mcp"].map((p) => call(p))));
+    // One at a time (the server serialises disk inspections), each a real 200
+    // with content, so "no private text" is not vacuously true of an error.
+    const responses = [];
+    for (const path of ["/memory/tree", "/memory/search?q=NEEDLE", "/config", "/mcp"]) {
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      responses.push(response.value);
+    }
+    expect((responses[0].entries as unknown[]).length).toBeGreaterThan(0);
+    expect(responses[1].results).toEqual([{ path: "topics/public.md", line: 1, text: "public NEEDLE" }]);
+    const everything = JSON.stringify(responses);
     expect(everything).not.toContain("PRIVATE-NEEDLE");
     expect(everything).not.toContain("private/note.md");
     expect(everything).not.toContain("sk-synthetic-secret-value-01");

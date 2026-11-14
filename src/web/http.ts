@@ -75,7 +75,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (url.pathname === "/api/v1/memory/tree") { json(res, 200, await required(deps.data.memory).tree()); return; }
         if (url.pathname === "/api/v1/memory/file") { json(res, 200, await required(deps.data.memory).file(url.searchParams.get("path") ?? "")); return; }
         if (url.pathname === "/api/v1/memory/search") { json(res, 200, await required(deps.data.memory).search(url.searchParams.get("q") ?? "")); return; }
-        if (url.pathname === "/api/v1/cron") { json(res, 200, deps.data.cron.list()); return; }
+        if (url.pathname === "/api/v1/cron") { json(res, 200, await deps.data.cron.list()); return; }
         if (url.pathname === "/api/v1/config") { json(res, 200, await required(deps.data.config).view()); return; }
         if (url.pathname === "/api/v1/mcp") {
           const saved = await required(deps.data.config).mcp();

@@ -219,6 +219,7 @@ async function startForeground(): Promise<void> {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
       const { ownerSessionKeyReader, subagentModelReader } = await import("../web/data.js");
+      const { CRON_STORE_PATH } = await import("../cron/store.js");
       const web = new WebChannel(config.owner, undefined, { ownerKey: ownerSessionKeyReader({
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),
@@ -227,16 +228,17 @@ async function startForeground(): Promise<void> {
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
-        workspaceDir: config.workspaceDir, mcpStatus: () => agent.readMcpStatuses(),
+        workspaceDir: config.workspaceDir, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
         diagnostic: (message, level = "info") => log[level](message),
       }));
       agent.addChannel(web);
     } catch { log.warn("Web UI unavailable; messaging channels remain active."); }
   }
 
-  const { CronStore } = await import("../cron/store.js");
+  const { CronStore, CRON_STORE_PATH } = await import("../cron/store.js");
   const { readCronJobsSafely } = await import("./cron-errors.js");
-  const cronStore = new CronStore();
+  // The same path the web process is given above: one store, one file.
+  const cronStore = new CronStore(CRON_STORE_PATH);
   // The watch snapshot and the metrics scrape must not fail whole because
   // jobs.json is unreadable: dropping a `tomo watch` client or 500ing a
   // scrape hides every other thing those surfaces report. Degrade the cron

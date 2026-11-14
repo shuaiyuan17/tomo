@@ -15,6 +15,7 @@ import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
 import { splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
+import { CHAT_COMMANDS, CHAT_COMMAND_NAMES } from "./chat-commands.js";
 
 /**
  * A Bot API 400 whose description names an entity-parsing failure — the one
@@ -113,6 +114,11 @@ function formatUnsupportedDocumentNotice(
   return `[Sent an unsupported document: ${name} (${mime})]`;
 }
 
+/** Telegram `group` and `supergroup` chats are groups; `private` and `channel` are not. */
+function isGroupChatType(type: string): boolean {
+  return type === "group" || type === "supergroup";
+}
+
 export class TelegramChannel implements Channel {
   readonly name = "telegram";
   private bot: Bot;
@@ -151,7 +157,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Slash commands
-    for (const cmd of ["new", "rewind", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]) {
+    for (const cmd of CHAT_COMMAND_NAMES) {
       this.bot.command(cmd, (ctx) => this.ingest(String(ctx.chat.id), String(ctx.msg?.message_id ?? ""), async () => {
         const chatId = String(ctx.chat.id);
         const senderName = this.getSenderName(ctx);
@@ -167,7 +173,7 @@ export class TelegramChannel implements Channel {
     this.bot.on("message:text", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
       if (ctx.message.text.startsWith("/")) return;
 
-      const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+      const isGroup = isGroupChatType(ctx.chat.type);
       const isMentioned = this.checkMentioned(ctx);
 
       this.dispatch({
@@ -185,7 +191,7 @@ export class TelegramChannel implements Channel {
 
     // Photo messages
     this.bot.on("message:photo", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
-      const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+      const isGroup = isGroupChatType(ctx.chat.type);
       const isMentioned = this.checkMentioned(ctx);
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
@@ -220,7 +226,7 @@ export class TelegramChannel implements Channel {
     // exposes generic file attachments under `message:document`; we ingest
     // only the MIME types Anthropic accepts as document content blocks.
     this.bot.on("message:document", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
-      const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+      const isGroup = isGroupChatType(ctx.chat.type);
       const isMentioned = this.checkMentioned(ctx);
       const doc = ctx.message.document;
 
@@ -278,7 +284,7 @@ export class TelegramChannel implements Channel {
     // Sticker messages. We do not download sticker artwork here; the file_id
     // is enough for Tomo to understand and resend it later via STICKER:<id>.
     this.bot.on("message:sticker", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
-      const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+      const isGroup = isGroupChatType(ctx.chat.type);
       const isMentioned = this.checkMentioned(ctx);
       const sticker = ctx.message.sticker;
 
@@ -824,22 +830,7 @@ export class TelegramChannel implements Channel {
     log.info({ username: this.botUsername }, "Bot identity loaded");
 
     // Register commands with Telegram so they show in the menu
-    await this.bot.api.setMyCommands([
-      { command: "new", description: "Start a new conversation" },
-      { command: "rewind", description: "Rewind context by N user messages (default 1, owner DM only)" },
-      { command: "model", description: "Switch model (Claude aliases or LiteLLM provider/model)" },
-      { command: "restore", description: "Restore config from backup and restart" },
-      { command: "login", description: "Refresh Claude login (owner DM only)" },
-      { command: "mcp", description: "Inspect or re-authenticate external MCP servers" },
-      { command: "status", description: "Show current session status" },
-      { command: "cost", description: "Show current session costs" },
-      { command: "usage", description: "Show Claude subscription usage limits" },
-      { command: "pet", description: "Check on Tomo's pet" },
-      { command: "summon", description: "Pull your main Tomo session into this group" },
-      { command: "dismiss", description: "Hand this group back to its own Tomo session" },
-      { command: "pause", description: "Pause Tomo in this group (messages ignored until /resume)" },
-      { command: "resume", description: "Resume Tomo in this group after /pause" },
-    ]);
+    await this.bot.api.setMyCommands([...CHAT_COMMANDS]);
 
     this.startPolling();
   }

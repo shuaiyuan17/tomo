@@ -72,6 +72,7 @@ export const MAX_DEFERRED_ATTACHMENT_WATCHES = 32;
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { normalizeImessageHandle } from "../sessions/keys.js";
+import { CHAT_COMMAND_NAMES } from "./chat-commands.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
 const RECENT_MESSAGES_PER_CHAT = 50;
@@ -113,7 +114,7 @@ const DEFAULT_CAPABILITY_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 15_000, 30_000
 const DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS = 30_000;
 
 /** Slash commands recognized by all channels. */
-const KNOWN_COMMANDS = new Set(["new", "rewind", "model", "restore", "login", "mcp", "status", "cost", "usage", "pet", "summon", "dismiss", "pause", "resume"]);
+const KNOWN_COMMANDS = new Set(CHAT_COMMAND_NAMES);
 
 /**
  * True when an outbound message part is exactly one http(s) URL and nothing

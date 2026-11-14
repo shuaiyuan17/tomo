@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import { parseCronStore } from "../cron/store.js";
+import { CronStore, parseCronStore } from "../cron/store.js";
 import { formatSchedule } from "../cron/format.js";
 import type { CronJob } from "../cron/types.js";
 import { computeContextStatsFromEvents, type SdkEvent } from "../lcm/stats.js";
@@ -9,9 +10,20 @@ import { summaryBlocksFromEvents, type SummaryBlock } from "../lcm/summary-reade
 import type { SessionEntry } from "../sessions/types.js";
 import { WebError, type WebContext, type WebCronJob } from "./protocol.js";
 
+/**
+ * Optimistic concurrency over what the owner reviewed — the job's intent —
+ * not scheduler bookkeeping, so a run starting or finishing between review
+ * and confirmation does not invalidate the confirmation, while any edit to
+ * the job itself does.
+ */
+export function cronRevision(job: CronJob): string {
+  const { id, name, schedule, message, sessionKey, enabled, deleteAfterRun } = job;
+  return createHash("sha256").update(JSON.stringify({ id, name, schedule, message, sessionKey, enabled, deleteAfterRun })).digest("hex");
+}
+
 /** What the Study shows of a job: its intent and run state, never internal bookkeeping. */
 export function webCronJob(job: CronJob): WebCronJob {
-  return { id: job.id, name: job.name, enabled: job.enabled, schedule: job.schedule, scheduleLabel: formatSchedule(job.schedule),
+  return { revision: cronRevision(job), id: job.id, name: job.name, enabled: job.enabled, schedule: job.schedule, scheduleLabel: formatSchedule(job.schedule),
     message: job.message, sessionKey: job.sessionKey, deleteAfterRun: job.deleteAfterRun, createdAt: job.createdAt,
     nextRunAt: job.nextRunAt, lastRunAt: job.lastRunAt, lastStatus: job.lastStatus, interruptedAt: job.interruptedAt ?? null };
 }
@@ -23,8 +35,12 @@ export const MAX_CRON_STORE_BYTES = 4 * 1024 * 1024;
  * Cron jobs, read fresh from the store file the daemon's scheduler uses (its
  * path is handed over by the daemon, never derived here). Read-only: the file
  * is read asynchronously and bounded, without following a symlink or blocking
- * on a FIFO, and parsed by the store's own side-effect-free parser, so the
- * web process never constructs a CronStore (whose load can repair and save).
+ * on a FIFO, and parsed by the store's own side-effect-free parser, so a
+ * read never constructs a CronStore (whose load can repair and save).
+ *
+ * A confirmed change first passes the same bounded read, then goes through
+ * the store's own guarded, locked load-modify-save, exactly like `tomo cron`
+ * and the schedule tools.
  */
 export class WebCron {
   constructor(private readonly path: string | undefined) {}
@@ -55,6 +71,21 @@ export class WebCron {
       try { return parseCronStore(this.path, bytes.toString("utf8", 0, read)).jobs; }
       catch { throw new WebError(503, "cron_unavailable"); }
     } finally { await file.close(); }
+  }
+  /** Enable / disable (`enabled` given) or delete a job, if it still has the reviewed `revision`. */
+  async change(id: string, revision: string, enabled?: boolean): Promise<{ ok: true }> {
+    // Size / file-type bounds before the store's synchronous load.
+    if (!(await this.read()).some((job) => job.id === id)) throw new WebError(404, "job_not_found");
+    const guard = (job: CronJob) => cronRevision(job) === revision;
+    let result: ReturnType<CronStore["setEnabled"]> | ReturnType<CronStore["remove"]>;
+    try {
+      const store = new CronStore(this.path);
+      result = enabled === undefined ? store.remove(id, guard) : store.setEnabled(id, enabled, guard);
+    } catch { throw new WebError(503, "cron_unavailable"); }
+    if (result === "refused") throw new WebError(409, "cron_changed");
+    if (result === "unschedulable") throw new WebError(422, "unschedulable");
+    if (!result) throw new WebError(404, "job_not_found");
+    return { ok: true };
   }
 }
 

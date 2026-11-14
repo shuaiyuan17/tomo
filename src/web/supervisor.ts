@@ -242,6 +242,7 @@ export class WebSupervisor implements WebLifecycle {
             if (Buffer.byteLength(JSON.stringify(result)) > MAX_BUFFER_BYTES - 1024) result.replay = null;
             return result;
           }
+          if (input.method === "epoch") return this.channel.events.epoch;
           if (input.method === "request") return this.channel.request(input.requestId);
           if (input.method === "task") return this.channel.task(input.sessionId, input.taskId, input.output, input.command ?? false);
           if (input.method === "context-events") return this.channel.contextEvents(input.sessionId);

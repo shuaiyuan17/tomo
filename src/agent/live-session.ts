@@ -139,9 +139,6 @@ export interface TurnRequest {
   silentDelivery?: boolean;
 }
 
-/** Rejection for a request whose result was overtaken by a later one's (see attributeResult). */
-export const RESULT_OUT_OF_STEP = "Lost track of this reply: the SDK answered a later message first";
-
 export interface MessageRequest extends TurnRequest {
   message: SDKUserMessage;
 }
@@ -597,8 +594,7 @@ export class LiveSession {
    * it does for every other block.
    */
   /**
-   * WHOSE RESULT IS THIS. A result ends the current request's turn only if it
-   * is that turn's result. Results are otherwise matched by position, so one
+   * WHOSE RESULT IS THIS. Results are matched to requests by position, so one
    * extra result shifts every later reply onto the next request: on
    * 2026-11-14 a web message got "I'm not sure how to respond to that." and
    * its real reply went to a context nudge that arrived next, whose output is
@@ -610,20 +606,18 @@ export class LiveSession {
    * its own: success, `num_turns: 0`, empty text, no `user_message_uuids`,
    * `origin: { kind: "task-notification" }` (reproduced against the real CLI).
    *
-   * Three checks, from the source outward:
-   * 1. a result the CLI started for a task notification never ends a request
-   *    we sent (one with a client uuid);
-   * 2. a result that names the user messages it consumed must name the
-   *    current request (or one merged into it); naming a later steered
-   *    request means we are already one behind, so log an error, fail the
-   *    skipped requests (their outcome is unknown) and line back up on the
-   *    named one, so the shift cannot carry on to every later turn;
-   * 3. backstop for anything unstamped: a success with zero turns, no text
+   * Ignored ("foreign": the caller drops it and the current turn goes on):
+   * 1. a result the CLI started for a task notification, when the current
+   *    request is one we sent (has a client uuid);
+   * 2. backstop for anything unstamped: a success with zero turns, no text
    *    and no assistant frame this turn is nobody's answer.
    *
-   * "foreign" = not ours: the caller drops it and the current turn goes on.
+   * A stamped result that does not name the current request (nor one merged
+   * into it) is only REPORTED: it still ends the current request as before.
+   * Re-aligning on it would need delivery itself to be owned by uuid (blocks
+   * ship before the result arrives), which is a larger change.
    */
-  private async attributeResult(result: SdkResultLike): Promise<"ours" | "foreign"> {
+  private attributeResult(result: SdkResultLike): "ours" | "foreign" {
     const current = this.currentRequest;
     const mine = (current as Partial<MessageRequest> | null)?.message?.uuid;
     if (!current || !mine) return "ours"; // idle, or a turn the CLI started (claimed unowned)
@@ -634,36 +628,20 @@ export class LiveSession {
       );
       return "foreign";
     };
+    if (result.origin?.kind === "task-notification") return ignore("task-notification turn");
 
     const stamped = result.user_message_uuids ?? (result.user_message_uuid ? [result.user_message_uuid] : []);
-    const names = (req: TurnRequest) => {
-      const id = (req as Partial<MessageRequest>).message?.uuid;
-      return !!id && stamped.includes(id);
-    };
-    if (stamped.length > 0) {
-      if (names(current) || this.mergedRequests.some(names)) return "ours";
-      const ahead = this.pendingSteers.findIndex((s) => names(s.req));
-      if (ahead < 0) return ignore("names none of this session's requests");
-      log.error(
-        { session: this.sessionKey, skipped: ahead + 1 },
-        "SDK result answers a later request than the current one; failing the skipped ones and re-aligning",
-      );
-      // Their replies (if any) went out under the wrong turn; what reached
-      // the owner is unknown, so they fail visibly instead of resolving as
-      // if answered.
-      for (const req of [current, ...this.pendingSteers.slice(0, ahead).map((s) => s.req)]) {
-        await req.reject(new Error(RESULT_OUT_OF_STEP));
-      }
-      const [next] = this.pendingSteers.splice(0, ahead + 1).slice(-1);
-      this.currentRequest = next.req;
-      this.onTurnClaimed();
-      this.promotedSteerText = next.text;
-      return "ours";
+    if (stamped.length === 0) {
+      const empty = result.subtype === "success" && !result.is_error && result.num_turns === 0 && !result.result;
+      return empty && !this.turnSawAssistant ? ignore("empty zero-turn result") : "ours";
     }
-
-    if (result.origin?.kind === "task-notification") return ignore("task-notification turn");
-    const empty = result.subtype === "success" && !result.is_error && result.num_turns === 0 && !result.result;
-    if (empty && !this.turnSawAssistant) return ignore("empty zero-turn result");
+    const merged = this.mergedRequests.map((m): string | undefined => (m as Partial<MessageRequest>).message?.uuid).filter((id): id is string => !!id);
+    if (!stamped.includes(mine) && !merged.some((id) => stamped.includes(id))) {
+      log.error(
+        { session: this.sessionKey, current: mine, merged, resultUuids: stamped },
+        "SDK result names a different request than the current one; results may be out of step (ending the current request anyway)",
+      );
+    }
     return "ours";
   }
 
@@ -963,7 +941,7 @@ export class LiveSession {
 
     if (event.type === "result") {
       const result = event as unknown as SdkResultLike;
-      if (await this.attributeResult(result) === "foreign") return;
+      if (this.attributeResult(result) === "foreign") return;
       this.turnSawAssistant = false;
       this.publishTasks(this.taskTracker.endTurn());
 
@@ -1022,15 +1000,23 @@ export class LiveSession {
       // A turn that ended with NO text at all used to resolve as "I'm not
       // sure how to respond to that.", which the runner delivered. Every time
       // that line reached a channel it was a symptom (a result that belonged
-      // to another turn, 2026-11-14), never an answer, so an empty turn is
-      // silent now and the log says so.
-      if (!rendered.text && !this.droppedThinkingThisTurn && !failure) {
+      // to another turn, 2026-11-14), never an answer, so a turn with no text
+      // anywhere is silent now and the log says so.
+      // The result's own text stands in when no assistant frame carried any
+      // text (it is the turn's final text); only a turn with neither is
+      // silent. Not when frames did carry text that rendering removed (a
+      // filtered scaffold leak): the raw result would put it back.
+      const hadTextFrame = this.parts.some((part) => part.type === "text");
+      const resultText = !failure && !hadTextFrame && result.subtype === "success" && !result.is_error
+        ? result.result?.trim() ?? ""
+        : "";
+      if (!rendered.text && !resultText && !this.droppedThinkingThisTurn && !failure) {
         log.warn(
           { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
           "Turn ended with no reply text; resolving as NO_REPLY",
         );
       }
-      const response = rendered.text || "NO_REPLY";
+      const response = rendered.text || (this.droppedThinkingThisTurn ? "NO_REPLY" : resultText) || "NO_REPLY";
       this.droppedThinkingThisTurn = false;
       this.parts = [];
       this.unownedTurnDropLogged = false;

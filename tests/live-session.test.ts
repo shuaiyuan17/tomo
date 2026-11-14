@@ -97,7 +97,6 @@ const {
   LiveSession,
   MAX_MCP_AUTH_REFRESHES_PER_WINDOW,
   MCP_AUTH_REFRESH_WINDOW_MS,
-  RESULT_OUT_OF_STEP,
   STEER_MERGED,
   SdkResultError,
 } = await import("../src/agent/live-session.js");
@@ -1481,37 +1480,39 @@ describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)
     await expect(p1).resolves.toBe("hi");
   });
 
-  it("a result naming none of our messages is ignored; the one naming ours ends the turn", async () => {
+  it("a stamped result naming a different request is reported (error, both uuids) but still ends the current request", async () => {
     const { session, harness } = makeSession();
     const p1 = session.send("hello");
     await flushMicrotasks();
-    harness.pushEvent(assistantEvent("partial"));
-    harness.pushEvent(answering("00000000-0000-4000-8000-000000000000"));
-    await flushMicrotasks(20);
-    expect(session.isBusy()).toBe(true);
-    harness.pushEvent(answering(harness.uuids[0]));
-    await expect(p1).resolves.toBe("partial");
+    harness.pushEvent(assistantEvent("reply"));
+    const other = "00000000-0000-4000-8000-000000000000";
+    harness.pushEvent(answering(other));
+    await expect(p1).resolves.toBe("reply");
+    expect(vi.mocked(log.error)).toHaveBeenCalledWith(
+      expect.objectContaining({ current: harness.uuids[0], resultUuids: [other] }),
+      expect.stringContaining("out of step"),
+    );
   });
 
-  it("a result for a LATER request re-aligns: the skipped one fails as unknown, the named one gets the reply, and the next turn lines up", async () => {
+  it("a stamped result naming the current request raises no alarm", async () => {
     const { session, harness } = makeSession();
-    const p1 = session.send("first");
+    const p1 = session.send("hello", undefined, undefined, () => {});
     await flushMicrotasks();
-    const p2 = session.steer("second");
-    await flushMicrotasks();
-    const p1Failed = expect(p1).rejects.toThrow(RESULT_OUT_OF_STEP);
-    harness.pushEvent(assistantEvent("answer to second"));
-    harness.pushEvent(answering(harness.uuids[1]));
-    await p1Failed;
-    await expect(p2).resolves.toBe("answer to second");
-    expect(vi.mocked(log.error)).toHaveBeenCalledWith(expect.objectContaining({ skipped: 1 }), expect.stringContaining("re-aligning"));
-    expect(session.isBusy()).toBe(false);
+    harness.pushEvent(assistantEvent("reply"));
+    harness.pushEvent(answering(harness.uuids[0]));
+    await expect(p1).resolves.toBe("reply");
+    expect(vi.mocked(log.error)).not.toHaveBeenCalled();
+  });
 
-    const p3 = session.send("third");
+  it("a turn whose text came only in the result resolves with that text", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello");
     await flushMicrotasks();
-    harness.pushEvent(assistantEvent("answer to third"));
-    harness.pushEvent(answering(harness.uuids[2]));
-    await expect(p3).resolves.toBe("answer to third");
+    harness.pushEvent(assistantToolEvent("Bash", "t1"));
+    harness.pushEvent(toolResultEvent("t1"));
+    harness.pushEvent({ ...answering(harness.uuids[0]), result: "done, all green" });
+    await expect(p1).resolves.toBe("done, all green");
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as NO_REPLY");
   });
 
   it("a turn of ours that ends with no text resolves silent (NO_REPLY) and warns, instead of a fallback line", async () => {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IO_LIMIT, itemsFromLine, readSubagentModel, MAX_LINE_BYTES, MAX_LINE_ITEMS, MAX_PAGE_ITEMS, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
+import { BRIEF_LIMIT, IO_LIMIT, itemsFromLine, readSubagentBrief, readSubagentModel, MAX_LINE_BYTES, MAX_LINE_ITEMS, MAX_PAGE_ITEMS, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
 
 let root: string;
 let dir: string;
@@ -22,7 +22,8 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe("subagent transcript items", () => {
   it("keeps assistant text, tool calls and results; drops the prompt; clips and scrubs", () => {
-    expect(itemsFromLine(line("user", [{ type: "text", text: "secret prompt" }]), 0)).toEqual([]);
+    // The first entry (offset 0) is the brief, served separately: never repeated as an item.
+    expect(itemsFromLine(line("user", [{ type: "text", text: "the brief" }]), 0)).toEqual([]);
     const [call] = itemsFromLine(line("assistant", [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/repo/a.ts" } }]), 10);
     expect(call).toMatchObject({ kind: "tool", id: "10:0", toolUseId: "t1", name: "Read", summary: "Read /repo/a.ts" });
     const [result] = itemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "x".repeat(IO_LIMIT + 50) }] }]), 20);
@@ -113,6 +114,30 @@ describe("readSubagentPage", () => {
     expect(await readSubagentModel(dir, SDK, "a2")).toBeUndefined();
     expect(await readSubagentModel(dir, SDK, "missing")).toBeUndefined();
     expect(await readSubagentModel(dir, SDK, "../a1")).toBeUndefined();
+  });
+
+  it("the brief is the first entry only (string or text blocks), clipped; later user text is a message", async () => {
+    const userLine = (content: unknown) => JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n";
+    writeFileSync(file(), userLine("Review **PR #482**.") + text("ok") + userLine([{ type: "text", text: "Also check the tests." }]));
+    expect(await readSubagentBrief(dir, SDK, "a1")).toEqual({ text: "Review **PR #482**.", truncated: false });
+    const page = await readSubagentPage(dir, SDK, "a1", { after: 0 });
+    expect(page.items.map((i) => i.kind)).toEqual(["text", "message"]);
+    expect(page.items[1]).toMatchObject({ kind: "message", text: "Also check the tests." });
+    // Block-array brief.
+    writeFileSync(file("a2"), userLine([{ type: "text", text: "Part one." }, { type: "text", text: "Part two." }]));
+    expect((await readSubagentBrief(dir, SDK, "a2"))!.text).toBe("Part one.\n\nPart two.");
+    // A transcript whose first entry is not a user prompt (e.g. resumed): later user messages are not the brief.
+    writeFileSync(file("a3"), text("resumed") + userLine("Message after resume"));
+    expect(await readSubagentBrief(dir, SDK, "a3")).toBeUndefined();
+    // Long briefs are clipped and say so.
+    writeFileSync(file("a4"), userLine("b".repeat(BRIEF_LIMIT + 10)));
+    const long = (await readSubagentBrief(dir, SDK, "a4"))!;
+    expect(long).toMatchObject({ truncated: true });
+    expect(long.text).toHaveLength(BRIEF_LIMIT);
+    // Harness reminders on a user entry are not a message; tool results stay results.
+    const mixed = itemsFromLine(JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "<system-reminder>x</system-reminder>" },
+      { type: "tool_result", tool_use_id: "t9", content: "out" }] } }), 50);
+    expect(mixed.map((i) => i.kind)).toEqual(["result"]);
   });
 
   it("rejects bad ids, escapes and stale cursors", async () => {

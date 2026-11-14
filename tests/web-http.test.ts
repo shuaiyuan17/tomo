@@ -130,7 +130,8 @@ describe("local HTTP boundary", () => {
     new SessionStore(sessionsDir, 20, sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-1");
     mkdirSync(join(sdkSessionsDir, "sdk-1", "subagents"), { recursive: true });
     const line = (content: unknown[]) => JSON.stringify({ type: "assistant", message: { content } }) + "\n";
-    writeFileSync(join(sdkSessionsDir, "sdk-1", "subagents", "agent-a1.jsonl"), line([{ type: "text", text: "Reading the config." }]));
+    writeFileSync(join(sdkSessionsDir, "sdk-1", "subagents", "agent-a1.jsonl"),
+      JSON.stringify({ type: "user", message: { content: "Check the config" } }) + "\n" + line([{ type: "text", text: "Reading the config." }]));
     writeFileSync(join(sdkSessionsDir, "sdk-1", "subagents", "agent-zz.jsonl"), line([{ type: "text", text: "not on the board" }]));
     const task = { taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: true, startedAt: 1 };
     watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task, { ...task, taskId: "b1", taskType: "local_bash" }] });
@@ -140,6 +141,8 @@ describe("local HTTP boundary", () => {
     const body = JSON.parse(page.text);
     expect(body.items).toMatchObject([{ kind: "text", text: "Reading the config." }]);
     expect((await call(`${base}/a1/transcript?after=${body.end}`)).status).toBe(200);
+    expect(JSON.parse((await call(`${base}/a1/brief`)).text)).toEqual({ text: "Check the config", truncated: false });
+    expect((await call(`${base}/zz/brief`)).status).toBe(404);
     expect((await call(`${base}/a1/transcript?after=abc`)).status).toBe(400);
     // On disk but never shown by the panel: refused by the daemon gate.
     const refused = await call(`${base}/zz/transcript`);

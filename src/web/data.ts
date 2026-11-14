@@ -7,11 +7,11 @@ import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js
 import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
 import { isImageFiledFor } from "../channels/imageStore.js";
-import { WebError, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
+import { WebError, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
 import { MemoryReader } from "../workspace/memory-reader.js";
-import { readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
+import { readSubagentBrief, readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -220,6 +220,15 @@ export class WebData {
       return { type, bytes };
     } catch (error) { throw error instanceof WebError ? error : refuse(); }
     finally { await file?.close(); }
+  }
+
+  /** The brief of a shown subagent (sessionKey from the daemon's task gate). */
+  async subagentBrief(sessionKey: string, taskId: string): Promise<SubagentBrief> {
+    const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir)
+      .find((e) => e.channelKey === sessionKey && e.sdkSessionId);
+    const brief = entry ? await readSubagentBrief(this.options.sdkSessionsDir, entry.sdkSessionId, taskId) : undefined;
+    if (!brief) throw new WebError(404, "brief_not_found");
+    return brief;
   }
 
   async history(id: string, cursor?: string) {

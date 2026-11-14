@@ -3,7 +3,7 @@ import { open, realpath, type FileHandle } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { scrubSecretValues } from "../redact.js";
 import { summarizeToolInput } from "../agent/tool-summary.js";
-import type { SubagentItem, SubagentPage } from "./protocol.js";
+import type { SubagentBrief, SubagentItem, SubagentPage } from "./protocol.js";
 
 /**
  * Bounded, read-only pages over one subagent's transcript
@@ -22,6 +22,8 @@ export const PAGE_BYTES = 256 * 1024;
 export const MAX_LINE_BYTES = 8 * 1024 * 1024;
 export const TEXT_LIMIT = 8_000;
 export const IO_LIMIT = 4_000;
+/** The brief (first prompt) is shown in full up to this many characters. */
+export const BRIEF_LIMIT = 12_000;
 export const MAX_PAGE_ITEMS = 400;
 /** Blocks shown from one transcript entry; the rest is summarised by a marker. */
 export const MAX_LINE_ITEMS = 400;
@@ -60,7 +62,32 @@ export function itemsFromLine(line: string, offset: number): SubagentItem[] {
   let record: { type?: string; message?: { content?: unknown }; timestamp?: string };
   try { record = JSON.parse(line); } catch { return []; }
   const content = record?.message?.content;
+  // A user entry with text is a message to the subagent. The very first entry
+  // is its brief (served separately), so it is never repeated here.
+  if (record?.type === "user" && offset > 0) {
+    const said = userText(content);
+    if (said.trim()) {
+      const { text, truncated } = clip(said, TEXT_LIMIT);
+      const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
+      return [{ kind: "message", id: `${offset}:msg`, text, truncated, ...(ts ? { ts } : {}) },
+        ...(Array.isArray(content) ? itemsFromBlocks(record, content, offset) : [])];
+    }
+  }
   if (!Array.isArray(content)) return [];
+  return itemsFromBlocks(record, content, offset);
+}
+
+/** The text a user entry carries: a string, or its text blocks (tool results are not text). */
+function userText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((b): b is { type: string; text: string } => !!b && typeof b === "object" && (b as { type?: unknown }).type === "text"
+    && typeof (b as { text?: unknown }).text === "string")
+    // Harness reminders ride along on user entries; they are not messages.
+    .map((b) => b.text).filter((t) => !t.trimStart().startsWith("<system-reminder>")).join("\n\n");
+}
+
+function itemsFromBlocks(record: { type?: string; timestamp?: string }, content: unknown[], offset: number): SubagentItem[] {
   const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
   const items: SubagentItem[] = [];
   // One entry is always returned whole (pages never split a line); an entry
@@ -216,6 +243,32 @@ export async function readSubagentModel(sdkSessionsDir: string, sdkSessionId: st
       if (typeof model === "string" && MODEL_ID.test(model)) return model;
     }
     return undefined;
+  } catch { return undefined; }
+  finally { await fd?.close(); }
+}
+
+/**
+ * The brief: the text of the transcript's FIRST entry, when it is a user
+ * entry (the prompt the subagent was spawned with). Later user entries —
+ * messages sent while it ran, including after a resume — are never the
+ * brief. Clipped to BRIEF_LIMIT characters and secret-scrubbed.
+ */
+export async function readSubagentBrief(sdkSessionsDir: string, sdkSessionId: string, taskId: string): Promise<SubagentBrief | undefined> {
+  let fd: FileHandle | undefined;
+  try {
+    const path = subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId);
+    const root = await realpath(sdkSessionsDir);
+    fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!(await realpath(path)).startsWith(root + sep) || !(await fd.stat()).isFile()) return undefined;
+    const head = await readRange(fd, 0, MAX_LINE_BYTES);
+    const end = head.indexOf(0x0a);
+    if (end < 0) return undefined; // first entry not complete yet
+    let record: { type?: string; message?: { content?: unknown } };
+    try { record = JSON.parse(head.subarray(0, end).toString("utf8")); } catch { return undefined; }
+    if (record?.type !== "user") return undefined;
+    const said = userText(record.message?.content);
+    if (!said.trim()) return undefined;
+    return clip(said, BRIEF_LIMIT);
   } catch { return undefined; }
   finally { await fd?.close(); }
 }

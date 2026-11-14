@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
-import type { SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
+import { ArrowLeft, ChevronRight } from "lucide-react";
+import type { SubagentBrief, SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
+import { cn } from "@/lib/utils";
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
@@ -9,7 +10,9 @@ import { isShellTask } from "./shell.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
 import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
-import { followStep, INITIAL_TRANSCRIPT, isOutputTask, POLL_MS, transcriptReducer, viewRows, type TranscriptAction } from "./subagent.js";
+import { followStep, groupOpen, groupRows, groupSummary, INITIAL_TRANSCRIPT, isOutputTask, pendingTool, POLL_MS, transcriptReducer, viewRows,
+  type ToolRow, type TranscriptAction } from "./subagent.js";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { STATE_LABELS, taskKind } from "./tasks.js";
 
 /**
@@ -38,6 +41,8 @@ export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => vo
       <p className="m-0 mt-0.5 font-mono text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
     </div>
     {isShellTask(task.taskType) && <CommandBrief base={base} fallback={task.description} />}
+    {!isOutputTask(task.taskType) && <Brief base={base} />}
+    {task.summary && running && <p className="m-0 mx-2.5 mb-2 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">Now:</span> {task.summary}</p>}
     {isOutputTask(task.taskType) ? <OutputTail base={base} running={running} /> : <Transcript base={base} running={running} />}
   </section>;
 }
@@ -72,6 +77,8 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const stateRef = useRef(state);
   stateRef.current = state;
   const [loadingOlder, setLoadingOlder] = useState(false);
+  /** The reader's open/closed choice per tool-call group (key: first tool_use id). */
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const scroll = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const restore = useRef<number | null>(null);
@@ -133,6 +140,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const jump = () => { pinned.current = true; apply({ type: "jump" }); };
 
   const rows = viewRows(state.items);
+  const blocks = groupRows(rows);
   const gone = state.status === "gone";
   return <div ref={scroll} tabIndex={0} aria-label="Subagent transcript" onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
     className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
@@ -140,18 +148,62 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
     {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? "Loading…" : "Load earlier"}</Button>}
     {(state.status === "loading" || state.status === "missing" || state.status === "error") && !state.items.length && <Note status={state.status} />}
     {state.status === "ready" && rows.length === 0 && <p className="m-0 px-1.5 text-[13px] text-muted-foreground">{running ? "Nothing yet." : "No recorded steps."}</p>}
-    {rows.map((row) => row.kind === "text"
-      ? <div key={row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{row.text + (row.truncated ? "\n\n…" : "")}</Text></div>
-      : <Tool key={row.id}>
-          <ToolHeader title={row.summary || row.name} state={row.result ? (row.result.isError ? "error" : "done") : running ? "running" : "done"} />
-          <ToolContent>
-            <ToolSection label="Input" text={row.input} truncated={row.inputTruncated} />
-            {row.result && <ToolSection label={row.result.isError ? "Error" : "Output"} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
-          </ToolContent>
-        </Tool>)}
+    {blocks.map((block, index) => {
+      const last = index === blocks.length - 1;
+      if (block.kind === "text") return <div key={block.row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div>;
+      if (block.kind === "message") return <div key={block.row.id} className="my-1.5 rounded-lg border-l-2 border-primary/50 bg-muted/60 px-2.5 py-1.5">
+        <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from Tomo</p>
+        <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
+      if (block.kind === "tool") return <ToolCall key={block.row.id} row={block.row} running={running} />;
+      const open = groupOpen(openGroups, block.key, last, running);
+      const pending = running && last ? pendingTool(block.tools) : undefined;
+      return <Collapsible key={block.key} open={open} onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} className="group/calls">
+        <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground">
+          <ChevronRight className="size-3.5 shrink-0 transition-transform duration-150 group-data-[state=open]/calls:rotate-90" />
+          <span className="min-w-0 flex-1 truncate">{groupSummary(block.tools)}{pending && <> · <span className="shimmer">{pending.name}</span></>}</span>
+        </CollapsibleTrigger>
+        <CollapsibleContent className="space-y-0.5 border-l border-border/70 py-0.5 pl-1.5 ml-3">
+          {block.tools.map((row) => <ToolCall key={row.id} row={row} running={running} />)}
+        </CollapsibleContent>
+      </Collapsible>;
+    })}
     {!gone && state.mode === "browse" && <Button variant="secondary" size="sm" onClick={jump}
       className="sticky bottom-1 mx-auto mt-2 flex h-7 rounded-full text-[11px] shadow-sm">↓ Jump to latest</Button>}
   </div>;
+}
+
+/**
+ * The prompt the subagent was given, fixed above its transcript: a few lines
+ * folded, the whole text (scrollable, up to ~40% of the screen) when opened.
+ */
+function Brief({ base }: { base: string }) {
+  const [brief, setBrief] = useState<SubagentBrief>();
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<SubagentBrief>(`${base}/brief`, { signal: controller.signal }).then(setBrief, () => {});
+    return () => controller.abort();
+  }, [base]);
+  if (!brief) return null;
+  return <section aria-label="Brief" className="mx-2.5 mb-2.5 rounded-lg border bg-card/70 px-2.5 py-2">
+    <div className="mb-1 flex items-center justify-between gap-2">
+      <p className="m-0 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Brief</p>
+      <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)}
+        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? "Show less" : "Show more"}</button>
+    </div>
+    <div className={cn("markdown text-[12.5px]! leading-relaxed", open ? "max-h-[40vh] overflow-y-auto pr-1" : "line-clamp-3")}>
+      <Text>{brief.text + (brief.truncated ? "\n\n… (truncated)" : "")}</Text></div>
+  </section>;
+}
+
+function ToolCall({ row, running }: { row: ToolRow; running: boolean }) {
+  return <Tool>
+    <ToolHeader title={row.summary || row.name} state={row.result ? (row.result.isError ? "error" : "done") : running ? "running" : "done"} />
+    <ToolContent>
+      <ToolSection label="Input" text={row.input} truncated={row.inputTruncated} />
+      {row.result && <ToolSection label={row.result.isError ? "Error" : "Output"} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
+    </ToolContent>
+  </Tool>;
 }
 
 function Note({ status }: { status: Status }) {

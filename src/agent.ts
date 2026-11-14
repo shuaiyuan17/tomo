@@ -1,4 +1,3 @@
-import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -8,7 +7,6 @@ import {
   isGroupSessionKey,
   isDmSessionKey,
   dmIdentityFromSessionKey,
-  dmSessionKeyForIdentity,
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
@@ -34,8 +32,6 @@ import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js
 import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
 import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
-import { usesLcmCompact } from "./agent/sdk-options.js";
-import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
@@ -44,115 +40,29 @@ import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
+import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
-import { resolveBlockRange } from "./lcm/blocks.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
-import {
-  consumeRestartRequestFromToolResult,
-  drainRestartRequests,
-  restartWorkerInvocation,
-  takePendingRestartRequest,
-  type RestartRequest,
-  type RestartRequestDiscard,
-} from "./restart-request.js";
-import { pruneTools } from "./lcm/index.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { CronStore } from "./cron/store.js";
+import { readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
-import { spawn } from "node:child_process";
+import type { CronTurnOptions, QueuedInboundWork, RewindOutcome, UserTurnRequest } from "./agent/agent-turn-types.js";
+import { OwnerAdoption } from "./agent/owner-adoption.js";
+import { ContextNudger } from "./agent/context-nudger.js";
+import { RestartCoordinator } from "./agent/restart-coordinator.js";
+import { OwnerNotices } from "./agent/owner-notices.js";
+import { McpAuthPrompts } from "./agent/mcp-auth-prompts.js";
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
-
-interface UserTurnRequest {
-  webRequestId?: string;
-  key: string;
-  promptText: string;
-  sourceChannelName: string;
-  /** The sender's IANA time zone for this turn's stamp, when one applies —
-   *  see Agent.senderTimeZone. Undefined for a batch whose senders disagree. */
-  senderTimeZone?: string;
-  replyChannel: Channel;
-  replyChatId: string;
-  replyToMessageId?: string;
-  images?: IncomingMessage["images"];
-  documents?: IncomingMessage["documents"];
-  suppressErrors: boolean;
-  errorLogMessage: string;
-  /** Steer this turn into the session's in-flight turn (config `steering`)
-   *  instead of running through the per-session queue. */
-  steer?: boolean;
-  /** Where this turn's message(s) must be ANSWERED if the turn they steer into
-   *  is silent: the summoned GROUP key for a group message running on a dm:
-   *  session, the session's own key otherwise. Same derivation as
-   *  summonReminder, and one entry PER MESSAGE in the batch's numbering order
-   *  — a coalesced batch can mix the owner's DM with one or more summoned
-   *  groups, and the note pairs targets with those ordinals. */
-  steerAudience: string[];
-  /** True for turns where most inputs are expected to resolve to NO_REPLY. */
-  passiveListen?: boolean;
-  /** Owner DM notice for an error `suppressErrors` keeps out of the chat. */
-  ownerNotice?: OwnerNoticeTarget;
-  /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",
-   *  or a raw group key for a summoned group's messages. Session-scoped MCP
-   *  tools resolve against these, not against the session key. */
-  audiences?: string[];
-}
-
-interface CronTurnOptions {
-  /** False for silent housekeeping turns such as LCM rollups. */
-  showTyping?: boolean;
-  /** This turn restates a reply that was dropped as a thinking block; it
-   *  must not request another restate whatever it ends on. */
-  restate?: boolean;
-  /** Never deliver this turn's model output to the chat. The turn still runs
-   *  so housekeeping tools can complete; failures remain in logs/pending
-   *  operational context. */
-  suppressDelivery?: boolean;
-  /** Deliver to this exact channel/chat instead of resolving from the
-   *  session's reply target. Set when the caller named a specific chat
-   *  (delegate sends to a raw channel:chatId target canonicalized to a dm
-   *  session key). */
-  deliveryTarget?: ReplyTarget;
-  /** When this turn is handed to an active summoned dm session, resolve only
-   *  once that turn has actually run, instead of once it has been queued.
-   *  Callers that record a completion (CronScheduler.markRun advances or
-   *  deletes the job) must set this, or they record success before any work
-   *  happens. Off by default because the delegate path calls this from inside
-   *  a session turn that the handoff target may be waiting on — see
-   *  processCronMessage. */
-  waitForHandoff?: boolean;
-  /** Graceful shutdown ended the turn without a real outcome (see
-   *  TurnSpec.onShutdown). Carried through every handoff. */
-  onShutdown?: (kind: ShutdownTurnEnd) => void;
-  /** The cron job's name, for the owner notice when its failure is kept out
-   *  of a group (see agent/owner-error-notice.ts). */
-  jobName?: string;
-  /** The audience this turn carries from the session that ASKED for it —
-   *  `send_message(mode: "delegate")`, or a group's background turn handed to
-   *  the summoning dm: session. Registered in the TurnAudienceRegistry for the
-   *  turn's duration, so its session-scoped MCP tools resolve against the
-   *  origin rather than the session key it happens to run on. Left undefined
-   *  for harness-originated turns (the cron scheduler, LCM nudges), which the
-   *  owner owns outright. */
-  audiences?: string[];
-}
-
-interface QueuedInboundWork {
-  sessionKey: string;
-  items: InboundItem[];
-  steer: boolean;
-}
 
 /**
  * Deadlines for the two channel-side shutdown steps. Both exist because
@@ -176,16 +86,6 @@ const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
  */
 const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
 
-/** What a /rewind did — see ChatCommandDeps.rewindSession. */
-type RewindOutcome = {
-  count: number;
-  preview: string;
-  stoppedTurn: boolean;
-  droppedMessages: number;
-  /** A stuck first turn was stopped; there was no earlier history to fork. */
-  nothingToRewind?: boolean;
-};
-
 /**
  * How long after start the full legacy-transcript migration status is logged
  * again.
@@ -197,16 +97,6 @@ type RewindOutcome = {
  * than a "first N keys" counter because it needs no hook on the message path.
  */
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
-
-// Context-usage percentage at which the nudge escalates from a daily rollup
-// (config.lcm.nudgeAtPct) to a full lcm compact.
-const COMPACT_NUDGE_PCT = 80;
-
-// Prune-first only when the dry run shows enough reclaimable volume to
-// plausibly drop usage below the reset threshold; otherwise skip straight to
-// the daily rollup rung. chars/4 is fine here because tool output is mostly
-// ASCII (JSON, logs, file contents).
-const PRUNE_NUDGE_MIN_FRAC = 0.10;
 
 export class Agent {
   private channels: Channel[] = [];
@@ -241,15 +131,15 @@ export class Agent {
   // /pause state: raw group keys whose inbound messages are dropped at receipt.
   private pauses: PauseStore;
   private modelOverrides = new Map<string, string>();
-  // Context-usage hysteresis: the highest nudge level already fired for the
-  // current over-threshold episode. Cleared when usage drops back below
-  // config.lcm.nudgeResetPct.
-  private contextNudged = new Map<string, ContextNudgeLatch>();
+  private readonly ownerAdoption: OwnerAdoption;
+  private readonly contextNudger: ContextNudger;
+  private readonly restarts: RestartCoordinator;
+  private readonly ownerNotices: OwnerNotices;
+  private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
   private liveSessionManager: LiveSessionManager;
-  private restartInFlight = false;
   /**
    * Set the moment `stop()` begins. A deferred restart claimed after that
    * point would spawn a helper that brings the daemon straight back up — so
@@ -262,7 +152,7 @@ export class Agent {
   private readonly lastGoodTurnAt = new Map<string, number>();
   /** Owner DMs for errors kept out of a chat (rate-limited). */
   private readonly ownerErrorNotifier = new OwnerErrorNotifier({
-    send: (text, report) => this.sendOwnerNotice(text, report.deliverTo),
+    send: (text, report) => this.ownerNotices.sendOwnerNotice(text, report.deliverTo),
     enabled: () => config.notifyOwnerOnSuppressedErrors !== false,
   });
   private proactive: ProactiveSendService;
@@ -284,6 +174,20 @@ export class Agent {
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir);
+    this.ownerAdoption = new OwnerAdoption(this.sessions, this.modelOverrides);
+    this.contextNudger = new ContextNudger(
+      this.sessions,
+      (message, sessionKey, options) => this.handleCronMessage(message, sessionKey, options),
+    );
+    this.restarts = new RestartCoordinator({
+      isStopping: () => this.stopping,
+      queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
+    });
+    this.mcpAuthPrompts = new McpAuthPrompts({
+      resolvePrivateReplyTarget: (key) => this.resolvePrivateReplyTarget(key),
+      findPrivateReplyTarget: () => this.findPrivateReplyTarget(),
+      getChannel: (name) => this.getChannel(name),
+    });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
     this.delivery = new DeliveryPipeline({
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
@@ -322,7 +226,15 @@ export class Agent {
       config.summonExpiryMinutes * 60_000,
     );
     this.router = new OwnerRouter(config.owner, this.sessions, config.channelAllowlists, summons,
-      (from, to) => this.adoptLegacySession(from, to));
+      (from, to) => this.ownerAdoption.adoptLegacySession(from, to));
+    this.ownerNotices = new OwnerNotices({
+      sessions: this.sessions,
+      router: this.router,
+      getChannel: (name) => this.getChannel(name),
+      isStopping: () => this.stopping,
+      lastGoodTurnAt: this.lastGoodTurnAt,
+      ownerErrorNotifier: this.ownerErrorNotifier,
+    });
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
@@ -346,7 +258,7 @@ export class Agent {
     });
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
-      onServerAuthError: (serverName, err) => this.handleMcpAuthFailure(serverName, err),
+      onServerAuthError: (serverName, err) => this.mcpAuthPrompts.handleMcpAuthFailure(serverName, err),
       onServerAuthReady: (serverName, server) =>
         this.liveSessionManager.hotMountExternalMcpServer(serverName, server),
     });
@@ -376,7 +288,7 @@ export class Agent {
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
       buildExternalMcpServers: (key) => this.mcpOAuthManager.buildServersWithAuth(
         config.mcpServers ?? {},
-        (serverName, url) => this.forwardMcpAuthorizeUrl(key, serverName, url),
+        (serverName, url) => this.mcpAuthPrompts.forwardMcpAuthorizeUrl(key, serverName, url),
         // Interactive OAuth may wait ten minutes for a browser callback. Never
         // put chat/session revival behind that wait: the auth flow continues in
         // the background and the server joins a later live session.
@@ -385,7 +297,7 @@ export class Agent {
       buildGroupContext: (key) => this.buildGroupContext(key),
       isOwnAudienceTurn: (key) => this.isOwnAudienceTurn(key),
       scopedCallerKey: (key) => this.scopedCallerKey(key),
-      handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
+      handleMcpElicitation: (key, request) => this.mcpAuthPrompts.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       handleToolResult: (key, toolName, content, isError) => {
         this.handleToolResult(key, toolName, content, isError);
@@ -550,77 +462,6 @@ export class Agent {
     this.channels.push(channel);
   }
 
-  /** Written before an adoption and removed once its cron jobs and model
-   *  override have moved too; a leftover means "finish the follow-ups". */
-  private get adoptionMarkerPath(): string {
-    return join(config.tomoHome, "data", "owner-adoption-pending.json");
-  }
-
-  /**
-   * The one-time adoption of a legacy per-channel session into the owner's
-   * `dm:` key, WITH everything that is keyed by the session: its cron jobs
-   * (`data/cron/jobs.json`) and its `sessionModelOverrides` entry. Moving only
-   * the registry entry left the jobs on the raw key — the next run forked a
-   * fresh session there — and dropped the owner's model.
-   *
-   * Order is what makes it safe to interrupt: a marker naming (from, to) is
-   * written first, then the registry re-key (the step that can refuse, in
-   * which case the marker is removed and the router retries later), then the
-   * follow-ups, then the marker is removed. Both follow-ups are idempotent, and
-   * `prepareOwner` finishes any marker left behind by a crash.
-   */
-  private adoptLegacySession(from: string, to: string): void {
-    const marker = this.adoptionMarkerPath;
-    mkdirSync(join(config.tomoHome, "data"), { recursive: true });
-    writeJsonAtomicSync(marker, { version: 1, from, to, at: Date.now() }, { mode: 0o600 });
-    try {
-      this.sessions.migrateSessionKey(from, to);
-    } catch (err) {
-      rmSync(marker, { force: true });
-      throw err;
-    }
-    this.finishAdoption(from, to);
-  }
-
-  /** Move cron jobs and the model override from `from` to `to`; idempotent. */
-  private finishAdoption(from: string, to: string): void {
-    try {
-      const moved = new CronStore(join(config.tomoHome, "data", "cron", "jobs.json")).rewriteSessionKey(from, to);
-      if (moved > 0) log.info({ from, to, jobs: moved }, "Moved cron jobs with the adopted session");
-      this.moveModelOverride(from, to);
-      rmSync(this.adoptionMarkerPath, { force: true });
-    } catch (err) {
-      log.warn({ err, from, to }, "Adopted session's cron jobs / model override not moved yet; retrying on next start");
-    }
-  }
-
-  private moveModelOverride(from: string, to: string): void {
-    // Under the shared config lock, re-reading inside it: `tomo config` may be
-    // saving at the same moment (see saveConfig's field-level merge).
-    withConfigLockSync(CONFIG_PATH, () => {
-      if (!existsSync(CONFIG_PATH)) return;
-      const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>;
-      const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-      if (overrides[from] === undefined) return;
-      if (overrides[to] === undefined) overrides[to] = overrides[from];
-      delete overrides[from];
-      cfg.sessionModelOverrides = overrides;
-      backupConfigFile();
-      writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
-    });
-    const live = config.sessionModelOverrides;
-    if (live[from] !== undefined) {
-      if (live[to] === undefined) live[to] = live[from];
-      delete live[from];
-      log.info({ from, to }, "Moved the model override with the adopted session");
-    }
-    const loaded = this.modelOverrides.get(from);
-    if (loaded !== undefined) {
-      if (!this.modelOverrides.has(to)) this.modelOverrides.set(to, loaded);
-      this.modelOverrides.delete(from);
-    }
-  }
-
   /**
    * Daemon start: log the owner notices once (multi-identity pick, legacy
    * adoption, no owner, ignored allowlist DM entries), adopt a legacy
@@ -640,21 +481,7 @@ export class Agent {
         "DM entries in this channel's allowlist are ignored: the allowlist only activates groups, and only the owner's DMs are answered.",
       );
     }
-    // An adoption interrupted after its re-key: finish moving its cron jobs
-    // and model override (the re-key itself is in the registry already).
-    if (existsSync(this.adoptionMarkerPath)) {
-      try {
-        const pending = JSON.parse(readFileSync(this.adoptionMarkerPath, "utf-8")) as { from?: unknown; to?: unknown };
-        if (typeof pending.from === "string" && typeof pending.to === "string"
-          && this.sessions.getEntry(pending.to)?.migratedFrom === pending.from) {
-          this.finishAdoption(pending.from, pending.to);
-        } else {
-          rmSync(this.adoptionMarkerPath, { force: true });
-        }
-      } catch (err) {
-        log.warn({ err }, "Unreadable owner adoption marker left in place");
-      }
-    }
+    this.ownerAdoption.finishInterruptedAdoption();
     const key = this.router.prepareOwnerSession();
     if (key) log.info({ sessionKey: key }, "Owner session ready");
   }
@@ -1047,74 +874,6 @@ export class Agent {
     const title = this.sessions.getEntry(audience)?.chatTitle;
     return title ? `the group "${title}" (${audience})` : `the group ${audience}`;
   }
-  private async forwardMcpAuthorizeUrl(key: string, serverName: string, url: string): Promise<void> {
-    const target = this.resolvePrivateReplyTarget(key);
-    if (!target) throw new Error(`No private reply target is available for MCP OAuth login (${serverName})`);
-    const channel = this.getChannel(target.channelName);
-    if (!channel) throw new Error(`Channel "${target.channelName}" is not connected for MCP OAuth login (${serverName})`);
-
-    await channel.send({
-      chatId: target.chatId,
-      text: [
-        `MCP login required for ${serverName}.`,
-        "",
-        url,
-        "",
-        "Open the link and finish login. If the browser is on another device, paste the full localhost redirect URL back into this private DM so Tomo can complete the callback.",
-        "The current turn will continue without this server. After login, Tomo will attach it to live sessions automatically; if runtime hot-mounting is unavailable, the next session will use it.",
-      ].join("\n"),
-    });
-  }
-
-  private async handleMcpAuthFailure(serverName: string, err: unknown): Promise<void> {
-    const detail = shortErrorMessage(err);
-    log.warn({ serverName, err }, "External MCP server omitted after OAuth failure");
-
-    const target = this.findPrivateReplyTarget();
-    if (!target) return;
-    const channel = this.getChannel(target.channelName);
-    if (!channel) return;
-
-    await channel.send({
-      chatId: target.chatId,
-      text: `MCP server "${serverName}" is unavailable because OAuth failed or timed out: ${detail}. Continuing without that server.`,
-    });
-  }
-
-  private async handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult> {
-    const target = this.resolvePrivateReplyTarget(key);
-    if (!target) {
-      log.warn({ key, server: request.serverName }, "MCP elicitation requested but no private reply target is available");
-      return { action: "decline" };
-    }
-
-    const channel = this.getChannel(target.channelName);
-    if (!channel) {
-      log.warn({ key, channelName: target.channelName, server: request.serverName }, "MCP elicitation requested but channel is not connected");
-      return { action: "decline" };
-    }
-
-    if (request.mode === "url" && request.url) {
-      const lines = [
-        `MCP login required for ${request.serverName}.`,
-        request.message,
-        "",
-        request.url,
-        "",
-        "Open the link and finish login. If Tomo does not continue automatically, retry your request after login completes.",
-      ];
-      await channel.send({ chatId: target.chatId, text: lines.filter(Boolean).join("\n") });
-      log.info({ key, server: request.serverName }, "Forwarded MCP login URL to user");
-      return { action: "accept" };
-    }
-
-    await channel.send({
-      chatId: target.chatId,
-      text: `MCP server ${request.serverName} requested additional input, but Tomo can only forward browser login links right now.`,
-    });
-    log.warn({ key, server: request.serverName, mode: request.mode }, "Declined unsupported MCP elicitation");
-    return { action: "decline" };
-  }
 
   private resolveDeliveryTargetForSession(
     sessionKey: string,
@@ -1275,167 +1034,9 @@ export class Agent {
     return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(owner.name);
   }
 
-  /**
-   * Single context-pressure nudge path, evaluated once per completed turn:
-   * runWithRetry covers owned turns (user, cron, continuity); unowned SDK
-   * background turns call it from their resolve handler. Skips when SDK
-   * auto-compact owns this session.
-   *
-   * The prune → daily → compact ladder shares one hysteresis latch, so a turn
-   * queues exactly one housekeeping turn: first try deterministic
-   * `tomo lcm prune-tools` when enough bulky tool output is reclaimable, then
-   * `tomo lcm daily`, then the lcm compact skill at COMPACT_NUDGE_PCT. The
-   * latch re-arms when usage drops back below nudgeResetPct.
-   *
-   * The nudge goes through handleCronMessage so it runs in the per-session
-   * queue. Calling runWithRetry directly here would overlap with the next
-   * user message's send() and stomp LiveSession's single currentRequest slot,
-   * silently swallowing one of the two responses.
-   *
-   * Callers that hold the turn's session pass its lastResult explicitly —
-   * the compact-trigger reload may have already dropped the session from
-   * liveSessions, and the latch must still see the result to stay accurate.
-   */
+  /** Context-pressure nudge after a completed turn — see ContextNudger. */
   private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessionManager.lastResult(key)): void {
-    if (!usesLcmCompact(key)) return;
-    if (!ctx || ctx.contextMax <= 0) return;
-    // A turn whose context reading failed carries an approximation of its OWN
-    // tokens over the last known window — a small fraction of a full session.
-    // Acting on it would read as "the session just emptied", clear the latch,
-    // and re-issue housekeeping that has already run. An unknown reading is
-    // not a low one: skip the turn and leave the latch where it is.
-    if (ctx.contextEstimated) {
-      log.debug({ key }, "Context nudge skipped (usage reading unavailable this turn)");
-      return;
-    }
-
-    const usedFrac = ctx.contextUsed / ctx.contextMax;
-    const nudged = this.contextNudged.get(key);
-    const thresholds = {
-      nudgeAtPct: config.lcm.nudgeAtPct,
-      nudgeResetPct: config.lcm.nudgeResetPct,
-      compactNudgePct: COMPACT_NUDGE_PCT,
-    };
-    const compactFrac = Math.max(COMPACT_NUDGE_PCT, config.lcm.nudgeAtPct) / 100;
-    const shouldPrecheckContextNudge = usedFrac >= config.lcm.nudgeAtPct / 100 &&
-      usedFrac < compactFrac &&
-      (!nudged || nudged === "prune");
-    let sid: string | undefined;
-    let prunableTokens = 0;
-    let prunableSufficient = false;
-    let dailyRangeAvailable = true;
-
-    if (shouldPrecheckContextNudge) {
-      sid = this.sessions.getSdkSessionId(key);
-      if (!sid) return;
-      if (!nudged) {
-        const dry = pruneTools({ sdkSessionId: sid, sdkSessionsDir: config.sdkSessionsDir, dryRun: true });
-        prunableTokens = dry.success ? Math.ceil(dry.totalCharsRemoved / 4) : 0;
-        prunableSufficient = prunableTokens >= PRUNE_NUDGE_MIN_FRAC * ctx.contextMax;
-      }
-      if (nudged === "prune" || !prunableSufficient) {
-        dailyRangeAvailable = resolveBlockRange(sid, "daily", undefined, config.sdkSessionsDir) !== null;
-      }
-    }
-
-    const decision = decideContextNudge({
-      usedFrac,
-      latchState: nudged,
-      prunableSufficient,
-      dailyRangeAvailable,
-      thresholds,
-    });
-
-    if (decision.kind === "none") {
-      if (decision.newLatch === null && nudged) {
-        this.contextNudged.delete(key);
-      }
-      return;
-    }
-
-    // Latched BEFORE dispatch (the nudge turn must not re-trigger itself) and
-    // rolled back below if the turn never happened — see the .then()/.catch().
-    const latch = decision.newLatch;
-    if (latch) {
-      this.contextNudged.set(key, latch);
-    }
-    // Undo that arming — but only if the latch is still OURS: a later turn may
-    // have escalated it (prune → daily → compact) while this nudge was in
-    // flight, and clearing that one would re-issue a rung the session has
-    // already moved past.
-    const rollBackLatch = (why: string): void => {
-      if (!latch || this.contextNudged.get(key) !== latch) return;
-      this.contextNudged.delete(key);
-      log.warn({ key, latch }, why);
-    };
-
-    const pct = Math.round(usedFrac * 100);
-    const groupNote = isGroupSessionKey(key)
-      ? " This is a group session — scope the rollup to this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere."
-      : "";
-    const compactNudgeText = () => formatTomoEvent(
-      "context-nudge",
-      `Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Use the lcm compact skill to free up space before the next user message.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
-      { name: "compact" },
-    );
-
-    let nudge: string;
-    if (decision.kind === "compact") {
-      nudge = compactNudgeText();
-      if (decision.reason === "daily-empty") {
-        log.info({ key, usedPct: `${pct}%` }, "Context nudge (daily rollup empty; escalating to lcm compact)");
-      } else {
-        log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm compact)");
-      }
-    } else if (decision.kind === "daily") {
-      nudge = formatTomoEvent(
-        "context-nudge",
-        `Context usage is at ${pct}% of the window. Please run \`tomo lcm daily --session-id ${sid} --summary "<today-so-far>"\` to roll up today's activity. Two things to know: (1) the daily compact OVERRIDES today's existing daily block — it does not append; write a fresh summary covering the whole day. (2) The command preserves the last ${config.lcm.dailyFreshTail} raw events as fresh tail.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
-        { name: "daily" },
-      );
-      log.info({ key, usedPct: `${pct}%` }, "Context nudge (agent should run lcm daily)");
-    } else if (decision.kind === "prune") {
-      nudge = formatTomoEvent(
-        "context-nudge",
-        `Context usage is at ${pct}% (${ctx.contextUsed}/${ctx.contextMax} tokens). Bulky tool results are holding roughly ${prunableTokens} reclaimable tokens. Run \`tomo lcm prune-tools --session-id ${sid}\` to stub them out — this is cheaper than a rollup and loses nothing conversational.${groupNote} After it finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
-        { name: "prune" },
-      );
-      log.info({ key, usedPct: `${pct}%`, prunableTokens }, "Context nudge (agent should run lcm prune-tools)");
-    } else {
-      return;
-    }
-
-    // ALWAYS suppressed, in every session type. A context nudge (compact /
-    // daily / prune-tools) is internal housekeeping: it runs an `lcm` command
-    // and has nothing to say to anyone. It used to rely on the prompt's
-    // closing "reply NO_REPLY", which only worked while delivery happened at
-    // END of turn and that trailing token suppressed the whole turn. Per-block
-    // delivery ships an early narration block ("Compacting context…") as soon
-    // as it completes, before the NO_REPLY that was meant to silence it — and
-    // a sent message cannot be recalled. Silence here must not depend on the
-    // model's cooperation.
-    this.handleCronMessage(nudge, key, {
-      showTyping: false,
-      suppressDelivery: true,
-    }).then((ok) => {
-      if (ok) return;
-      // handleCronMessage does not REJECT on failure — it resolves false (no
-      // deliverable target, the turn ended on an error result, the queue threw
-      // and was swallowed). Leaving the latch set on that answer means the
-      // housekeeping never ran AND nothing will ask for it again until usage
-      // falls back below nudgeResetPct, which is precisely what it cannot do
-      // with the rollup unwritten. Roll the latch back so the next completed
-      // turn re-evaluates the ladder from where it actually stands.
-      rollBackLatch("Context nudge turn failed; latch cleared for a retry");
-    }).catch((err) => {
-      // And a REJECTION is the same outcome with a louder failure mode. That
-      // handleCronMessage cannot currently reject is a property of ITS
-      // implementation (a terminal `.catch(() => false)`), not of this call
-      // site, and a latch stuck on for the rest of the session's life is too
-      // quiet a thing to leave resting on that.
-      log.warn({ err, key }, "Compact nudge failed");
-      rollBackLatch("Context nudge turn threw; latch cleared for a retry");
-    });
+    this.contextNudger.maybeNudgeCompact(key, ctx);
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
@@ -2324,177 +1925,19 @@ export class Agent {
     this.pendingNotesQueue.queueError(sessionKey, visibleError);
   }
 
-  /**
-   * A session-originated `tomo restart` is acknowledged only when its Bash
-   * result comes back through the SDK event stream. Starting the helper here
-   * gives us an exact persistence boundary instead of racing daemon shutdown
-   * against an arbitrary timer.
-   *
-   * ASSUMPTION, worth stating because nothing enforces it: we treat the
-   * arrival of the streamed `tool_result` event as proof that the SDK child
-   * has already written that result to its transcript. There is no flush
-   * handshake — the event says the child produced the result, not that it
-   * durably recorded it. If the child batches its JSONL writes, a restart
-   * fired on this event could still race the write, which would land us back
-   * in #257 with a narrower window. The end-of-turn fallback is strictly safer
-   * on that axis (the turn is over, so the write has happened), and this path
-   * exists because it is *sooner*. Revisit if the SDK ever exposes a flush.
-   *
-   * `BashOutput` is accepted alongside `Bash`: a backgrounded
-   * `tomo restart &`-style invocation returns its marker through the
-   * background-output tool, not the original call.
-   */
+  /** Restart handshake on a Bash result — see RestartCoordinator. */
   private handleToolResult(
     sessionKey: string,
     toolName: string,
     content: unknown,
     isError: boolean,
   ): void {
-    if ((toolName !== "Bash" && toolName !== "BashOutput") || isError) return;
-    if (this.stopping) {
-      // Same rule as handleTurnComplete: a stop in progress outranks a restart.
-      this.drainRestartRequests(sessionKey, "shutting-down");
-      return;
-    }
-    const request = consumeRestartRequestFromToolResult(
-      content,
-      sessionKey,
-      undefined,
-      undefined,
-      (discarded) => this.logRestartRequestDiscard(sessionKey, discarded),
-    );
-    if (!request) return;
-
-    if (this.restartInFlight) {
-      // DRAIN, don't just return. This marker's own file is already consumed,
-      // but a second `tomo restart` in the same turn leaves a second file, and
-      // returning here left it on disk: the restart completes, and within the
-      // TTL the next turn's fallback claims the straggler and restarts AGAIN,
-      // announcing the older reason.
-      const alsoDropped = this.drainRestartRequests(sessionKey, "superseded");
-      this.queuePendingErrorNote(
-        sessionKey,
-        alsoDropped > 0
-          ? `A Tomo restart was already in progress; ${alsoDropped + 1} duplicate restart requests were ignored.`
-          : "A Tomo restart was already in progress; the duplicate restart request was ignored.",
-      );
-      return;
-    }
-    this.restartInFlight = true;
-    this.launchAcknowledgedRestart(request);
+    this.restarts.handleToolResult(sessionKey, toolName, content, isError);
   }
 
-  /**
-   * Throw away restart requests this daemon will not honour, and say so.
-   *
-   * `superseded`: a restart is not a queue — once one is in flight, every
-   * other request for that session is answered by it, and leaving a file
-   * behind means the daemon comes back up and restarts a second time off a
-   * request nobody is waiting on. `shutting-down`: a restart would resurrect a
-   * daemon that was deliberately stopped. Returns how many were dropped; every
-   * one is reported through the discard log, including the one that would
-   * otherwise have been acted on.
-   */
-  private drainRestartRequests(sessionKey: string, reason: "superseded" | "shutting-down"): number {
-    return drainRestartRequests(
-      sessionKey,
-      reason,
-      undefined,
-      (discarded) => this.logRestartRequestDiscard(sessionKey, discarded),
-    );
-  }
-
-  private logRestartRequestDiscard(sessionKey: string, discarded: RestartRequestDiscard): void {
-    log.warn(
-      {
-        sessionKey,
-        reason: discarded.reason,
-        ...("request" in discarded ? { requestId: discarded.request.id, requestedAt: discarded.request.requestedAt } : {}),
-      },
-      "Discarded a restart request without restarting",
-    );
-  }
-
-  /**
-   * Fallback for a restart whose marker never came back.
-   *
-   * The handshake in `handleToolResult` needs the marker line to survive into
-   * the Bash tool result, and the model writes the command: `tomo restart
-   * >/dev/null`, a redirect into a log, or `... | tail -1` all discard it. The
-   * CLI has already told the owner a restart is coming, so the turn ending is
-   * the backstop — later than the acknowledgement boundary #257 wants, but
-   * still after the SDK recorded the tool result, and infinitely better than
-   * silently doing nothing. A request claimed here is one that mid-turn
-   * acknowledgement missed, so log it: a rising rate means the model has
-   * settled on a redirecting invocation and the happy path has gone dark.
-   */
+  /** End-of-turn restart fallback — see RestartCoordinator. */
   private handleTurnComplete(sessionKey: string): void {
-    if (this.stopping) {
-      // `tomo stop` MUST NOT be undone by a restart. The completion signal
-      // fires on shutdown exits too (that is the point of the `finally`), so
-      // without this a session that had just asked for a restart would have
-      // its request claimed here and spawn a helper that brings the daemon
-      // straight back up — the user's stop silently reversed.
-      this.drainRestartRequests(sessionKey, "shutting-down");
-      return;
-    }
-    if (this.restartInFlight) {
-      // Same reason as the marker path: claim and drop rather than leave the
-      // file for the post-restart daemon to act on.
-      this.drainRestartRequests(sessionKey, "superseded");
-      return;
-    }
-    const request = takePendingRestartRequest(
-      sessionKey,
-      undefined,
-      (discarded) => this.logRestartRequestDiscard(sessionKey, discarded),
-    );
-    if (!request) return;
-    log.warn(
-      { sessionKey, requestId: request.id },
-      "Restart request never appeared in a Bash result; restarting at end of turn",
-    );
-    this.restartInFlight = true;
-    this.launchAcknowledgedRestart(request);
-  }
-
-  private launchAcknowledgedRestart(request: RestartRequest): void {
-    const cliPath = process.argv[1];
-    if (!cliPath) {
-      this.reportScheduledRestartFailure(request.sessionKey, "CLI entry point is unavailable");
-      return;
-    }
-
-    const worker = restartWorkerInvocation(request, cliPath);
-    const child = spawn(worker.command, worker.args, {
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-      env: worker.env,
-    });
-    let stderr = "";
-    let failureReported = false;
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr = `${stderr}${String(chunk)}`.slice(-2_000);
-    });
-    const reportFailure = (detail: string) => {
-      if (failureReported) return;
-      failureReported = true;
-      this.reportScheduledRestartFailure(request.sessionKey, detail);
-    };
-    child.once("error", (err) => reportFailure(err.message));
-    child.once("exit", (code, signal) => {
-      if (code === 0) return;
-      const detail = stderr.trim() || `restart helper exited with ${signal ? `signal ${signal}` : `code ${code ?? "unknown"}`}`;
-      reportFailure(detail);
-    });
-    child.unref();
-  }
-
-  private reportScheduledRestartFailure(sessionKey: string, detail: string): void {
-    this.restartInFlight = false;
-    const message = `Scheduled Tomo restart failed: ${detail}`;
-    log.error({ sessionKey, detail }, "Scheduled restart failed");
-    this.queuePendingErrorNote(sessionKey, message);
+    this.restarts.handleTurnComplete(sessionKey);
   }
 
   /** Drain notes queued for this session and return them as a prefix. */
@@ -2558,132 +2001,27 @@ export class Agent {
     });
   }
 
-  /**
-   * Owner-notice target for a failure kept out of a chat (see
-   * agent/owner-error-notice.ts). `groupKey` names the group a summoned turn
-   * belongs to when it runs on the owner's dm: session.
-   *
-   * - a group: reported to the owner's DM (resolveOwnerNoticeTarget), never
-   *   the group — or, for a summoned group, to the dm: session it ran on;
-   * - an identity's dm: session: reported IN that DM — the error was held
-   *   back there, so this is the only visible trace of it;
-   * - a raw private chat (not an identity): reported to the owner, not to
-   *   whoever that chat belongs to.
-   *
-   * Callers attach a target only where the turn's policy suppresses errors;
-   * an error delivered visibly is never reported again.
-   */
+  /** See OwnerNotices.ownerNoticeTarget. */
   private ownerNoticeTarget(sessionKey: string, turnKind: string, groupKey?: string): OwnerNoticeTarget {
-    const noticeKey = groupKey !== undefined && isGroupSessionKey(groupKey) ? groupKey : sessionKey;
-    // The turn ran on an identity's dm: session (its own turn, or a summoned
-    // group's): the notice goes to THAT identity's DM, where /rewind works.
-    const ranOnDm = isDmSessionKey(sessionKey);
-    const deliver = ranOnDm ? { rewindable: true, deliverTo: sessionKey } : {};
-    if (isGroupSessionKey(noticeKey)) {
-      const title = this.sessions.getEntry(noticeKey)?.chatTitle;
-      return {
-        noticeKey,
-        label: title ? `group "${title}" (${noticeKey})` : `group ${noticeKey}`,
-        turnKind,
-        ...deliver,
-      };
-    }
-    if (ranOnDm) return { noticeKey, label: `this DM session (${noticeKey})`, turnKind, ...deliver };
-    return { noticeKey, label: `private chat ${noticeKey}`, turnKind };
-  }
-
-  /**
-   * Where an owner notice goes — resolved STRICTLY through the configured
-   * owner, never through a raw session key. A notice carries a group's
-   * title, key, error text and session id; `sendNotification`'s fallback to
-   * "the first private chat with a session" could hand that to whoever else
-   * has messaged Tomo privately.
-   *
-   * `deliverTo` (a dm: session the turn ran on) must be the owner's session;
-   * any other dm: key (a former identity's) gets no notice.
-   *
-   * Undefined when there is no owner or no owner DM on a loaded channel.
-   */
-  private resolveOwnerNoticeTarget(deliverTo: string | undefined): { channel: Channel; chatId: string } | undefined {
-    const owner = config.owner;
-    const ownerKey = this.router.ownerSessionKey();
-    if (!owner || !ownerKey) return undefined;
-    if (deliverTo !== undefined && dmSessionKeyForIdentity(dmIdentityFromSessionKey(deliverTo) ?? "") !== ownerKey) return undefined;
-    // The persisted last-active target is used only while it is still one of
-    // the owner's CURRENT private handles — a rebinding, or a group id, must
-    // not carry a notice somewhere else.
-    const isPrivateBinding = (t: ReplyTarget | undefined): t is ReplyTarget => t !== undefined
-      && isOwnerHandle(owner, t.channelName, t.chatId);
-    const persisted = this.router.getReplyTarget(ownerKey);
-    const configured = this.router.deriveReplyTargetFromConfig(owner.name);
-    const target = isPrivateBinding(persisted) ? persisted : isPrivateBinding(configured) ? configured : undefined;
-    if (!target) return undefined;
-    const channel = this.getChannel(target.channelName);
-    return channel ? { channel, chatId: target.chatId } : undefined;
-  }
-
-  /** Deliver an owner notice; false (nothing sent) when no owner target. */
-  private async sendOwnerNotice(text: string, deliverTo: string | undefined): Promise<boolean> {
-    const target = this.resolveOwnerNoticeTarget(deliverTo);
-    if (!target) {
-      log.warn({ deliverTo }, "Owner error notice dropped: no configured owner identity with a reachable DM");
-      return false;
-    }
-    await target.channel.send({ chatId: target.chatId, text });
-    return true;
+    return this.ownerNotices.ownerNoticeTarget(sessionKey, turnKind, groupKey);
   }
 
   /** Fire-and-forget owner DM for a suppressed error; never throws. */
   private reportSuppressedError(sessionKey: string, target: OwnerNoticeTarget, detail: string): void {
-    // A turn torn down by shutdown is not a failure worth a DM.
-    if (this.stopping) return;
-    const sdkSessionId = this.sessions.getSdkSessionId(sessionKey);
-    const lastGoodTurnAt = this.lastGoodTurnAt.get(sessionKey);
-    void this.ownerErrorNotifier.report({
-      ...target,
-      detail,
-      ...(sdkSessionId ? { sdkSessionId } : {}),
-      ...(lastGoodTurnAt !== undefined ? { lastGoodTurnAt } : {}),
-    });
+    this.ownerNotices.reportSuppressedError(sessionKey, target, detail);
   }
 
   /**
-   * DM the configured OWNER (no agent query). Unlike sendNotification it never
-   * falls back to some other private chat, so it is safe for content that is
-   * the owner's business only. Resolves false when nothing was sent (no
-   * owner, or no reachable owner DM).
+   * DM the configured OWNER (no agent query); never falls back to another
+   * private chat. Resolves false when nothing was sent.
    */
   async notifyOwner(text: string): Promise<boolean> {
-    return this.sendOwnerNotice(text, undefined);
+    return this.ownerNotices.notifyOwner(text);
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */
   async sendNotification(text: string): Promise<void> {
-    const dmKey = this.router.ownerSessionKey();
-    let target: ReplyTarget | undefined;
-
-    if (dmKey) {
-      const identityName = dmIdentityFromSessionKey(dmKey);
-      target = this.router.getReplyTarget(dmKey)
-        ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
-        ?? privateReplyTargetFromSessionKey(dmKey);
-    }
-
-    if (!target && !config.owner) {
-      // No owner at all — find the first DM (non-group) session across all
-      // channels. With an owner, a notification never goes to anyone else.
-      for (const [key] of this.sessions.listSdkSessionIds()) {
-        const parsed = privateReplyTargetFromSessionKey(key);
-        if (parsed) { target = parsed; break; }
-      }
-    }
-
-    if (!target) { log.debug("Notification: no active DM session"); return; }
-
-    const channel = this.getChannel(target.channelName);
-    if (!channel) return;
-
-    await channel.send({ chatId: target.chatId, text });
+    return this.ownerNotices.sendNotification(text);
   }
 
   async start(): Promise<void> {

@@ -39,6 +39,10 @@ src/
     bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn
     setting-sources.ts      # which settings files the query loads (and the hook guard scans)
     #  plus: session-queue, pending-notes-queue, send-target, permissions, text-utils, claude-login
+    #  Agent collaborators (held by agent.ts, deps injected): owner-adoption (legacy owner
+    #    session adoption), context-nudger (nudge dispatch + latch), restart-coordinator
+    #    (session-requested restarts), owner-notices (owner DMs without a model call),
+    #    mcp-auth-prompts (MCP OAuth chat prompts), agent-turn-types (turn request shapes)
   owner.ts            # The single `owner` (config shape, resolution from legacy `identities`, handle matching)
   router.ts           # OwnerRouter — admission, session key resolution, summons
   people.ts           # People registry — person records, alias/handle resolution, auto-binding

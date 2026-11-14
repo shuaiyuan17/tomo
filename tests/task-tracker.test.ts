@@ -79,6 +79,22 @@ describe("TaskTracker — background_tasks_changed (REPLACE)", () => {
     expect(t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "failed" })).toBeUndefined();
   });
 
+  it("an end report naming a newer run advances it; the end stays terminal through a level of that run", () => {
+    const { t } = tracker();
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "x" }));
+    t.apply({ subtype: "task_notification", task_id: "a", run_id: "r2", status: "completed" });
+    expect(t.list()[0]).toMatchObject({ runId: "r2", status: "completed" });
+    // Out of order: a late r1 progress, then a level still listing the task under r2, then a stale r1 level.
+    expect(t.apply({ subtype: "task_progress", task_id: "a", run_id: "r1", description: "x", last_tool_name: "Old" })).toBeUndefined();
+    t.apply(level({ task_id: "a", run_id: "r2", task_type: "local_agent", description: "x" }));
+    expect(t.list()[0]).toMatchObject({ runId: "r2", status: "completed" });
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "x" }));
+    expect(t.list()[0]).toMatchObject({ runId: "r2", status: "completed" });
+    // Only a newer run clears it.
+    t.apply(level({ task_id: "a", run_id: "r3", task_type: "local_agent", description: "x" }));
+    expect(t.list()[0].status).toBeUndefined();
+  });
+
   it("clips text and bounds the number of tracked tasks", () => {
     const { t } = tracker();
     t.apply(level({ task_id: "a", task_type: "local_agent", description: "y".repeat(5_000) }));

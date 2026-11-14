@@ -215,6 +215,33 @@ describe("web task panel feed", () => {
       expect(channel.snapshot().tasks).toEqual([]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  it("after the registry switches, sends triggered by other sessions, capacity or the timer never carry the old owner tasks", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    const { ownerSessionKeyReader } = await import("../src/web/data.js");
+    const root = mkdtempSync(join(tmpdir(), "tomo-web-gate-"));
+    vi.useFakeTimers({ now: 0, toFake: ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "Date"] });
+    try {
+      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
+      store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
+      const { channel, bus, events } = setup(owner, ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }));
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l1", "legacy secret"), live("l2", "legacy secret")] });
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l2", "legacy secret")] }); // l1 ended, retained
+      store.setSdkSessionId("dm:owner", "sdk-owner"); // the catalog now hides the legacy session
+      const from = events.length;
+      // 1. another session's event; 2. a capacity reallocation; 3. the retention timer.
+      bus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [live("g1")] });
+      bus.publish({ type: "tasks", sessionKey: "telegram:-2", tasks: Array.from({ length: 64 }, (_, i) => live(`h${i}`)) });
+      vi.advanceTimersByTime(TASK_RETENTION_MS + OWNER_KEY_CHECK_MS);
+      const sent = JSON.stringify(events.slice(from));
+      expect(sent).not.toContain("legacy secret");
+      expect(events.slice(from).some((e) => e.type === "tasks" && e.sessionId === channel.ownerId && e.tasks.length === 0)).toBe(true);
+      expect(JSON.stringify(channel.snapshot())).not.toContain("legacy secret");
+    } finally { vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); }
+  });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();

@@ -35,6 +35,12 @@ function trapTab(container: HTMLElement, event: KeyboardEvent) {
   if (event.shiftKey && (document.activeElement === first || !inside)) { event.preventDefault(); last.focus(); }
   else if (!event.shiftKey && (document.activeElement === last || !inside)) { event.preventDefault(); first.focus(); }
 }
+const COMPOSER_MAX_HEIGHT = 240;
+function fitComposer(element: HTMLTextAreaElement | null) {
+  if (!element) return;
+  element.style.height = "auto";
+  element.style.height = `${Math.min(element.scrollHeight, COMPOSER_MAX_HEIGHT)}px`;
+}
 function storedTasksOpen(): boolean {
   try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
 }
@@ -89,13 +95,21 @@ export function App() {
   const running = runningCount(web.tasks);
   const tasksButton = useRef<HTMLButtonElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
-  // The composer grows with its text, up to a cap (then it scrolls).
-  useLayoutEffect(() => {
+  // The composer grows with its text, up to a cap (then it scrolls). Text
+  // changes and width changes (window, rail, rotation) both re-measure.
+  useLayoutEffect(() => { fitComposer(input.current); }, [draft]);
+  useEffect(() => {
     const element = input.current;
-    if (!element) return;
-    element.style.height = "auto";
-    element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
-  }, [draft]);
+    if (!element || typeof ResizeObserver === "undefined") return;
+    let width = element.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (element.clientWidth === width) return; // our own height change
+      width = element.clientWidth;
+      fitComposer(element);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
   const rail = useRef<HTMLElement>(null);
   const overlay = useMediaQuery(OVERLAY_QUERY);
   const modal = tasksOpen && overlay;
@@ -219,7 +233,7 @@ export function App() {
     <div className="workspace">
       <aside className="sidebar" aria-label="Conversation details" inert={modal}>
         <p className="eyebrow">Your conversations</p>
-        <label htmlFor="session">Session</label>
+        <div className="session-label"><label htmlFor="session">Session</label><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         <select id="session" value={selectedId} disabled={!web.bootstrap?.sessions.length} onChange={(e) => { setSelected(e.target.value); setFeedback(""); }}>
           {!web.bootstrap?.sessions.length && <option value="">No session available</option>}
           {web.bootstrap?.sessions.map((s) => <option value={s.id} key={s.id}>{s.title}{s.kind === "group" ? " · read-only" : ""}</option>)}
@@ -230,10 +244,8 @@ export function App() {
           {hasContext && <progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" />}
           <p className="session-note">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
-        <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
       <main id="conversation" className="conversation" tabIndex={-1} inert={modal}>
-        <div className="conversation-heading"><div><p className="eyebrow">{session?.kind === "group" ? "Group history" : "A conversation with Tomo"}</p><h1>{session?.kind === "group" ? session.title : "Room to think."}</h1></div><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         {web.bootstrap?.setupRequired && <div className="notice" role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className="notice" role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
         <div className="transcript" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={() => { const e = scroll.current!; atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 80; }}>

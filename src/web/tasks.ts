@@ -23,6 +23,12 @@ const LABEL_LIMIT = 40;
 export interface TaskBoardOptions {
   now?: () => number;
   retainMs?: number;
+  /**
+   * May the browser see this session right now? Read synchronously at every
+   * send (see `publish`), never cached: the owner-key rule can change at any
+   * moment, and nothing already sent can be taken back.
+   */
+  visible?: (sessionId: string) => boolean;
 }
 
 /**
@@ -41,27 +47,31 @@ export class TaskBoard {
   private readonly now: () => number;
   private readonly retainMs: number;
 
-  constructor(private readonly publish: (sessionId: string, tasks: WebTask[]) => void, options: TaskBoardOptions = {}) {
+  private readonly visible: (sessionId: string) => boolean;
+
+  constructor(private readonly send: (sessionId: string, tasks: WebTask[]) => void, options: TaskBoardOptions = {}) {
     this.now = options.now ?? Date.now;
     this.retainMs = options.retainMs ?? TASK_RETENTION_MS;
+    this.visible = options.visible ?? (() => true);
   }
 
   /**
-   * Exactly what the browser has been sent (the visible board), in a compact
-   * form — short description and summary — whose size is bounded by
-   * MAX_SNAPSHOT_TASK_BYTES, so it is never truncated. `visible` drops
-   * sessions the browser may not read.
+   * The reconnect snapshot: passes the same gate as every update, then
+   * returns exactly what the browser now holds, in a compact form (short
+   * description and summary) bounded by MAX_SNAPSHOT_TASK_BYTES, so it is
+   * never truncated.
    */
-  snapshot(visible: (sessionId: string) => boolean = () => true): WebTask[] {
-    return [...this.shown].filter(([sessionId]) => visible(sessionId)).flatMap(([, tasks]) => tasks)
+  snapshot(): WebTask[] {
+    this.publish();
+    return [...this.shown.values()].flat()
       .map((task) => ({ ...task, description: clip(task.description, SNAPSHOT_DESCRIPTION_LIMIT),
         ...(task.summary !== undefined ? { summary: clip(task.summary, SNAPSHOT_SUMMARY_LIMIT) } : {}) }));
   }
 
-  /** Forget a session's tasks (its source changed); the browser is told at once. */
+  /** Forget a session's stored tasks (its source changed). */
   clear(sessionId: string): void {
     if (!this.sessions.delete(sessionId)) return;
-    this.refresh();
+    this.publish();
   }
 
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
@@ -103,9 +113,6 @@ export class TaskBoard {
     this.store(sessionId, next);
   }
 
-  /** Drop expired ended tasks now. Exposed for the timer and for tests. */
-  prune(): void { this.refresh(); }
-
   dispose(): void { clearTimeout(this.timer); this.timer = undefined; }
 
   private store(sessionId: string, next: Map<string, WebTask>): void {
@@ -116,18 +123,22 @@ export class TaskBoard {
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
     if (kept.length) this.sessions.set(sessionId, new Map(kept.map((task) => [task.taskId, task])));
     else this.sessions.delete(sessionId);
-    this.refresh();
+    this.publish();
   }
 
   /**
-   * Expire ended tasks, share the board's capacity fairly, and publish every
-   * session whose visible list changed. Capacity goes to running non-ambient
-   * tasks first,
-   * round-robin across sessions so one busy session cannot crowd out another;
-   * ended tasks fill what is left. A running task that does not fit stays
-   * stored here and appears as soon as there is room.
+   * THE GATE. Every send to the browser — after an event, a capacity change,
+   * the retention timer, an owner-key re-check, or a reconnect snapshot —
+   * goes through here, and nowhere else calls `send`.
+   *
+   * It expires ended tasks, reads each session's visibility once, now,
+   * and shares the board's capacity among the VISIBLE sessions only: running
+   * non-ambient tasks first, round-robin across sessions so one busy session
+   * cannot crowd out another; ended tasks next; watchers last. A session that
+   * is not visible is sent as empty. A running task that does not fit stays
+   * stored and appears as soon as there is room.
    */
-  private refresh(): void {
+  publish(): void {
     const now = this.now();
     for (const [sessionId, tasks] of [...this.sessions]) {
       for (const [id, task] of tasks) {
@@ -135,7 +146,8 @@ export class TaskBoard {
       }
       if (!tasks.size) this.sessions.delete(sessionId);
     }
-    const ids = [...this.sessions.keys()].sort();
+    const visible = new Map([...new Set([...this.sessions.keys(), ...this.shown.keys()])].map((id) => [id, this.visible(id)]));
+    const ids = [...this.sessions.keys()].filter((id) => visible.get(id)).sort();
     const picked = new Map<string, WebTask[]>(ids.map((id) => [id, []]));
     let room = MAX_BOARD_TASKS;
     // Activity first: running, then recently ended; watchers (ambient) only
@@ -157,7 +169,7 @@ export class TaskBoard {
       const before = this.shown.get(id) ?? [];
       if (JSON.stringify(before) === JSON.stringify(list)) continue;
       if (list.length) this.shown.set(id, list); else this.shown.delete(id);
-      this.publish(id, list.map((task) => ({ ...task })));
+      this.send(id, list.map((task) => ({ ...task })));
     }
     this.schedule();
   }
@@ -170,7 +182,7 @@ export class TaskBoard {
       for (const task of tasks.values()) if (task.endedAt !== undefined) next = Math.min(next, task.endedAt + this.retainMs);
     }
     if (next === Infinity) return;
-    this.timer = setTimeout(() => { this.timer = undefined; this.prune(); }, Math.max(0, next - this.now()));
+    this.timer = setTimeout(() => { this.timer = undefined; this.publish(); }, Math.max(0, next - this.now()));
     this.timer.unref?.();
   }
 }

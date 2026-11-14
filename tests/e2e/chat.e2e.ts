@@ -226,3 +226,16 @@ it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe over
   await browserExpect(page.getByRole("button", { name: /^Tasks/ })).toBeFocused();
   await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
 });
+
+it("the composer re-fits its height when only its width changes", async () => {
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("word ".repeat(60).trim());
+  const wide = await input.evaluate((el) => el.getBoundingClientRect().height);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await browserExpect.poll(() => input.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(wide);
+  const narrow = await input.evaluate((el) => el.getBoundingClientRect().height);
+  // Fits its content: no inner scrolling below the cap.
+  expect(await input.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeLessThanOrEqual(1);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await browserExpect.poll(() => input.evaluate((el) => el.getBoundingClientRect().height)).toBeLessThan(narrow);
+});

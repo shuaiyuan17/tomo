@@ -89,6 +89,17 @@ export class TaskTracker {
   private change(ended: TaskChange["ended"]): TaskChange { return { tasks: this.list(), ended }; }
 
   /**
+   * The one rule for every edge event (start, progress, updated,
+   * notification): the task as that frame should see it, or undefined when
+   * the task is unknown or the frame names an older run (late).
+   */
+  private edge(taskId: string, runId: string | undefined): WatchTask | undefined {
+    const old = this.tasks.get(taskId);
+    if (!old || this.late(old, runId)) return undefined;
+    return this.advance(old, runId);
+  }
+
+  /**
    * Any frame naming a newer run moves the task to it — not only the level —
    * so that an end report of the older run, arriving after, is seen as late.
    * A new run starts clean: its clock, progress and end status are its own.
@@ -146,8 +157,8 @@ export class TaskTracker {
   private applyStarted(message: Extract<TaskSystemMessage, { subtype: "task_started" }>): TaskChange | undefined {
     const old = this.tasks.get(message.task_id);
     if (old) {
-      if (this.late(old, message.run_id)) return undefined;
-      const current = this.advance(old, message.run_id);
+      const current = this.edge(message.task_id, message.run_id);
+      if (!current) return undefined;
       this.tasks.set(old.taskId, { ...current,
         ...(message.subagent_type && !current.subagentType ? { subagentType: message.subagent_type } : {}),
         ...(message.parent_task_id && !current.parentTaskId ? { parentTaskId: message.parent_task_id } : {}),
@@ -175,8 +186,8 @@ export class TaskTracker {
 
   private applyProgress(message: Extract<TaskSystemMessage, { subtype: "task_progress" }>): TaskChange | undefined {
     const old = this.tasks.get(message.task_id);
-    if (!old || this.late(old, message.run_id)) return undefined;
-    const current = this.advance(old, message.run_id);
+    const current = this.edge(message.task_id, message.run_id);
+    if (!old || !current) return undefined;
     const next: WatchTask = { ...current,
       ...(message.last_tool_name ? { lastTool: clip(message.last_tool_name, 128) } : {}),
       ...(message.summary ? { summary: text(message.summary) } : {}),
@@ -194,8 +205,8 @@ export class TaskTracker {
 
   private applyUpdated(message: Extract<TaskSystemMessage, { subtype: "task_updated" }>): TaskChange | undefined {
     const old = this.tasks.get(message.task_id);
-    if (!old || this.late(old, message.run_id)) return undefined;
-    const current = this.advance(old, message.run_id);
+    const current = this.edge(message.task_id, message.run_id);
+    if (!old || !current) return undefined;
     const patch = message.patch ?? {};
     const status = endStatus(patch.status);
     if (status && !current.background) {
@@ -214,17 +225,19 @@ export class TaskTracker {
     if (!status) return undefined;
     const old = this.tasks.get(message.task_id);
     if (!old) return { tasks: this.list(), ended: [{ taskId: message.task_id, status }] };
-    if (this.late(old, message.run_id)) return undefined;
+    const current = this.edge(message.task_id, message.run_id);
+    if (!current) return undefined;
     const usage = {
       ...(typeof message.usage?.total_tokens === "number" ? { totalTokens: message.usage.total_tokens } : {}),
       ...(typeof message.usage?.tool_uses === "number" ? { toolUses: message.usage.tool_uses } : {}),
     };
-    if (!old.background) {
+    if (!current.background) {
       this.tasks.delete(old.taskId);
       return this.change([{ taskId: old.taskId, status }]);
     }
     // Still in the level: it leaves with the next background_tasks_changed.
-    this.tasks.set(old.taskId, { ...old, ...usage, status });
+    // The status is terminal for this run; only a newer run clears it.
+    this.tasks.set(old.taskId, { ...current, ...usage, status });
     return this.change([]);
   }
 }

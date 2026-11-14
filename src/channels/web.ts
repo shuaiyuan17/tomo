@@ -50,7 +50,7 @@ export class WebChannel implements Channel {
     this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
     this.tasks = new TaskBoard((sessionId, tasks) => {
       try { this.events.publish({ type: "tasks", sessionId, tasks }); } catch { /* An oversized panel update never fails the Agent. */ }
-    }, { now });
+    }, { now, visible: (sessionId) => this.taskSessionVisible(sessionId) });
     this.owner = owner;
     this.ownerId = this.owner ? webSessionId(ownerSessionKey(this.owner)) : null;
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
@@ -108,7 +108,6 @@ export class WebChannel implements Channel {
   snapshot() {
     const requests = [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request }));
     const blocks = [...this.blocks];
-    this.checkOwnerTaskKey();
     const tasks = this.tasks.snapshot();
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
   }
@@ -175,27 +174,27 @@ export class WebChannel implements Channel {
    * every legacy key bound to the owner, which the catalog may be hiding.
    */
   /**
-   * The owner-key rule can change without any task event (the registry
-   * gained the canonical key, or a second legacy key appeared). The moment it
-   * no longer names the key the owner's board entry came from, that entry is
-   * cleared and the browser told — it is not left until the next event.
+   * The board's send gate asks this, synchronously, before every send: groups
+   * are always readable in the browser; the owner's entry only while the key
+   * that filled it is still the one the catalog rule picks (read fresh).
    */
-  private checkOwnerTaskKey(): void {
-    if (this.ownerTaskKey === undefined || this.ownerTaskKey === this.ownerKey()) return;
-    this.ownerTaskKey = undefined;
-    clearInterval(this.ownerKeyTimer);
-    this.ownerKeyTimer = undefined;
-    if (this.ownerId) this.tasks.clear(this.ownerId);
+  private taskSessionVisible(sessionId: string): boolean {
+    if (sessionId !== this.ownerId) return true;
+    return this.ownerTaskKey !== undefined && this.ownerTaskKey === this.ownerKey();
   }
   private observeTasks(key: string, sessionId: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
     if (!isGroupSessionKey(key)) {
       const ownerKey = this.ownerKey();
       if (!ownerKey || key !== ownerKey) return;
       if (this.ownerTaskKey !== key) {
-        this.tasks.clear(sessionId);
+        // Another key now feeds the owner entry: its stored tasks are not ours.
         this.ownerTaskKey = key;
-        clearInterval(this.ownerKeyTimer);
-        this.ownerKeyTimer = setInterval(() => this.checkOwnerTaskKey(), OWNER_KEY_CHECK_MS);
+        this.tasks.clear(sessionId);
+      }
+      // The rule can change with no task event at all; re-run the gate so a
+      // hidden owner entry is withdrawn from the browser promptly.
+      if (!this.ownerKeyTimer) {
+        this.ownerKeyTimer = setInterval(() => this.tasks.publish(), OWNER_KEY_CHECK_MS);
         this.ownerKeyTimer.unref?.();
       }
     }

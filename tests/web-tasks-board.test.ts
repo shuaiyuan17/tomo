@@ -72,7 +72,7 @@ describe("TaskBoard", () => {
     for (let i = 0; i < 5; i++) b.apply(`g${i}`, Array.from({ length: 60 }, (_, n) => task(`t${i}-${n}`)));
     expect(b.snapshot()).toHaveLength(MAX_BOARD_TASKS);
     // The watcher in "s" yields its place to running work elsewhere.
-    expect(b.snapshot((id) => id === "s").map((t) => t.taskId)).toEqual(["x"]);
+    expect(b.snapshot().filter((t) => t.sessionId === "s").map((t) => t.taskId)).toEqual(["x"]);
     b.dispose();
   });
 
@@ -121,6 +121,29 @@ describe("TaskBoard", () => {
     b.apply("c", []);
     // Ended tasks still outrank watchers; watchers fill only what is left.
     expect(b.snapshot().filter((t) => !t.ambient)).toHaveLength(MAX_BOARD_TASKS);
+    b.dispose();
+  });
+
+  it("every send passes the visibility gate, read at send time", () => {
+    vi.useFakeTimers({ now: 0 });
+    let hidden = false;
+    const published: Array<[string, WebTask[]]> = [];
+    const b = new TaskBoard((id, tasks) => published.push([id, tasks]), { visible: (id) => !(hidden && id === "secret") });
+    b.apply("secret", [task("s1")]);
+    b.apply("secret", [task("s2")]); // s1 ended, retained
+    hidden = true;
+    const from = published.length;
+    // Triggers that are not about "secret" at all: another session's event, the retention timer, a snapshot.
+    b.apply("other", [task("o1")]);
+    vi.advanceTimersByTime(TASK_RETENTION_MS);
+    expect(b.snapshot().some((t) => t.sessionId === "secret")).toBe(false);
+    const after = published.slice(from);
+    expect(after.filter(([id]) => id === "secret").every(([, tasks]) => tasks.length === 0)).toBe(true);
+    expect(after.some(([id, tasks]) => id === "secret" && tasks.length === 0)).toBe(true);
+    // Visible again: the gate lets the stored, still-live task back out.
+    hidden = false;
+    b.publish();
+    expect(b.snapshot().filter((t) => t.sessionId === "secret").map((t) => t.taskId)).toEqual(["s2"]);
     b.dispose();
   });
 

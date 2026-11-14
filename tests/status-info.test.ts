@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { getRunningPid, getDaemonStatus, isPidAlive } from "../src/cli/status-info.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-status-info");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-status-info-"));
 const PID_FILE = join(TEST_DIR, "tomo.pid");
 
 describe("status-info", () => {

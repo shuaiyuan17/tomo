@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionStore } from "../src/sessions/store.js";
 import { RECALL_FOREIGN_AUDIENCE_REFUSAL, buildRecallTools, formatRecallResults } from "../src/mcp/recall-tools.js";
 import type { SessionMessage } from "../src/sessions/types.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-recall-mcp");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-recall-mcp-"));
 const SESSION_KEY = "dm:alice";
 
 interface ToolHandle {

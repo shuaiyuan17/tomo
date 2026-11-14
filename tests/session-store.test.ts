@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { SessionStore as SessionStoreImpl } from "../src/sessions/store.js";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { SessionMessage } from "../src/sessions/types.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-sessions");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-sessions-"));
 
 class SessionStore extends SessionStoreImpl {
   constructor(

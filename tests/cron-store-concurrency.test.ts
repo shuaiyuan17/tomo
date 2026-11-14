@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -26,7 +26,7 @@ vi.mock("../src/fs-utils.js", async (importOriginal) => {
 
 const { CronStore, isInterrupted } = await import("../src/cron/store.js");
 
-const TEST_DIR = join(tmpdir(), "tomo-test-cron-concurrency");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-concurrency-"));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 function revision(): number {

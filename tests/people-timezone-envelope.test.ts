@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // The sender's local clock on the INBOUND MESSAGE ENVELOPE, end to end: a real
@@ -21,14 +20,22 @@ const HOST_TZ = "America/Los_Angeles";
 const ORIGINAL_TZ = process.env.TZ;
 process.env.TZ = HOST_TZ;
 
+// One unique directory per run, created before the hoisted vi.mock factories
+// below read it (a fixed name would collide with a concurrent vitest run).
+const TMP = await vi.hoisted(async () => {
+  const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  return { home: fs.mkdtempSync(path.join(os.tmpdir(), "tomo-test-people-timezone-")) };
+});
+
 // The people registry resolves its directories from `defaultRuntimePaths`
 // (src/people.ts `defaultPeopleDirs`), which the Agent does not let a caller
 // override. Point it at a tmp home so the real registry is never touched.
 vi.mock("../src/runtime-paths.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/runtime-paths.js")>();
   const path = await import("node:path");
-  const os = await import("node:os");
-  const home = path.join(os.tmpdir(), "tomo-test-people-timezone");
+  const home = TMP.home;
   return {
     ...actual,
     defaultRuntimePaths: actual.createRuntimePaths({
@@ -55,7 +62,7 @@ import {
 
 installAgentTestHooks();
 
-const HOME = join(tmpdir(), "tomo-test-people-timezone");
+const HOME = TMP.home;
 const MEMORY = join(HOME, "workspace", "memory");
 const GROUP_CHAT_ID = "-1002000";
 const OWNER = { name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" as const };

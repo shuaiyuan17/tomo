@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PetStore } from "../src/mcp/pet-store.js";
 import { buildPetTools } from "../src/mcp/pet-tools.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-pet");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-pet-"));
 const TEST_PATH = join(TEST_DIR, "pet.json");
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;

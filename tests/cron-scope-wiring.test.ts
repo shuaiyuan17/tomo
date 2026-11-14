@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -27,7 +27,7 @@ vi.mock("../src/cron/scope.js", async (importOriginal) => {
 const { CronStore } = await import("../src/cron/store.js");
 const { buildCronTools } = await import("../src/mcp/cron-tools.js");
 
-const TEST_DIR = join(tmpdir(), "tomo-test-cron-scope-wiring");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-scope-wiring-"));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 interface ToolHandle {

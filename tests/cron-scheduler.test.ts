@@ -4,7 +4,7 @@ import { CronStore, ONE_SHOT_STALE_AFTER_MS, isInterrupted } from "../src/cron/s
 import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -17,7 +17,7 @@ vi.mock("../src/logger.js", () => ({
   },
 }));
 
-const TEST_DIR = join(tmpdir(), "tomo-test-cron-scheduler");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-scheduler-"));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 /** Make the interrupted run on disk look like it started `agoMs` ago. */

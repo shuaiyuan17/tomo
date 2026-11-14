@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { PauseStore } from "../src/sessions/pause-store.js";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-pause-store");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-pause-store-"));
 const FILE = join(TEST_DIR, "pauses.json");
 
 describe("PauseStore", () => {

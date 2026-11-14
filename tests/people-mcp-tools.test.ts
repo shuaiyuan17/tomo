@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { buildPeopleTools } from "../src/mcp/people-tools.js";
 import type { PeopleDirs } from "../src/people.js";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-people-tools");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-people-tools-"));
 const dirs: PeopleDirs = {
   publicDir: join(TEST_DIR, "people"),
   privateDir: join(TEST_DIR, "private", "people"),

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -17,7 +17,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 const { log } = await import("../src/logger.js");
 const { loadPeople } = await import("../src/people.js");
 
-const TEST_DIR = join(tmpdir(), "tomo-test-people-warn-once");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-people-warn-once-"));
 const warn = log.warn as unknown as ReturnType<typeof vi.fn>;
 
 const GOOD = `---

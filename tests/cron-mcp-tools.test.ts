@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CronStore, ONE_SHOT_STALE_AFTER_MS } from "../src/cron/store.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
 import { MIXED_AUDIENCE_KEY, TurnAudienceRegistry, scopedCallerKeyFor } from "../src/agent/audience.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-cron-mcp");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-mcp-"));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 interface ToolHandle {

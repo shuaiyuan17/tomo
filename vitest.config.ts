@@ -8,9 +8,7 @@ export default defineConfig({
   test: {
     // An agent's isolated worktree lives INSIDE the repo (`.claude/worktrees/
     // <agent>/`) and carries a full copy of tests/. Left behind, it makes vitest
-    // run every suite twice, and the suites that pin a fixed tmp path
-    // (cron-store, rollup-cooldown, status-cron) then race each other and fail
-    // nondeterministically — which looked like flakiness for two days.
+    // run every suite twice.
     exclude: [...configDefaults.exclude, ".claude/worktrees/**"],
     env: {
       // Tell src/logger.ts to log through an in-process destination instead of

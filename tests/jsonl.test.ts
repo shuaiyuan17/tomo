@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { iterateJsonlBackwardsSync, readJsonlTailSync, readFirstJsonlRecordSync } from "../src/jsonl.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-jsonl");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-jsonl-"));
 
 describe("jsonl backward reading", () => {
   beforeEach(() => {

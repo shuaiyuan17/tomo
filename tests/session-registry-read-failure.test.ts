@@ -3,12 +3,12 @@ import {
   SessionStore as SessionStoreImpl,
   SessionRegistryReadError,
 } from "../src/sessions/store.js";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { SessionStore as RawSessionStore } from "../src/sessions/store.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-registry-read-failure");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-registry-read-failure-"));
 const REGISTRY = join(TEST_DIR, "_sessions.json");
 
 class SessionStore extends SessionStoreImpl {

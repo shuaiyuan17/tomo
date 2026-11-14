@@ -20,12 +20,12 @@ import { compactSession } from "../src/lcm/compact.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { config as mockedConfig } from "../src/config.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
-import { writeFileSync, readFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdirSync, mkdtempSync, unlinkSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
-const SDK_SESSIONS_DIR = join(tmpdir(), `tomo-test-blocks-sdk-${process.pid}`);
+const SDK_SESSIONS_DIR = mkdtempSync(join(tmpdir(), "tomo-test-blocks-sdk-"));
 
 function resolveBlockRange(sessionId: string, level: BlockLevel, period?: string) {
   return resolveBlockRangeImpl(sessionId, level, period, SDK_SESSIONS_DIR);

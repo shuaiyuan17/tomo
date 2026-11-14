@@ -4,11 +4,11 @@ import { resolveOwner, type LegacyIdentity } from "../src/owner.js";
 import { rawSessionKeyForBinding } from "../src/sessions/keys.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { SummonStore } from "../src/sessions/summon-store.js";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-router");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-router-"));
 
 /** Build the router the way the daemon does for a legacy `identities` config:
  *  through the production owner resolver. */

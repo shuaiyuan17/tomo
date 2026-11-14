@@ -242,6 +242,14 @@ export interface TomoConfig {
   /** Steer messages that arrive while a turn is in flight into that turn at the
    *  next tool-call boundary, instead of queueing them behind it. Default true. */
   steering: boolean;
+  /** Persist inbound messages to a durable inbox before acknowledging them, so
+   *  messages waiting behind a turn survive a crash or restart and are
+   *  replayed on the next start. Default true. */
+  inbox: boolean;
+  /** Oldest unprocessed inbox message the next start still answers, in
+   *  minutes. Older ones are recorded in the transcript as not processed
+   *  instead of being answered late. Default 360 (6 hours). */
+  inboxReplayMaxAgeMinutes: number;
   /** Deliver the model's `thinking` content blocks to the chat alongside its
    *  `text` blocks. Default false.
    *
@@ -958,6 +966,13 @@ function buildConfig(): TomoConfig {
     ),
     maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
+    inbox: validated("inbox (TOMO_INBOX)", boolLike, envVar("TOMO_INBOX") ?? file.inbox, true),
+    inboxReplayMaxAgeMinutes: validated(
+      "inboxReplayMaxAgeMinutes (TOMO_INBOX_REPLAY_MAX_AGE_MINUTES)",
+      nonNegativeInt,
+      envVar("TOMO_INBOX_REPLAY_MAX_AGE_MINUTES") ?? file.inboxReplayMaxAgeMinutes,
+      360,
+    ),
     showThinking: validated("showThinking (TOMO_SHOW_THINKING)", boolLike, envVar("TOMO_SHOW_THINKING") ?? file.showThinking, false),
     notifyOwnerOnSuppressedErrors: validated(
       "notifyOwnerOnSuppressedErrors (TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS)",

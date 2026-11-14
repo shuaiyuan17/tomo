@@ -360,6 +360,11 @@ export const mockConfig = {
   groupSecret: null as string | null,
   groupShellAllowlist: [] as string[],
   steering: true,
+  /** Off by default here so the pre-inbox shutdown/recording suites keep
+   *  pinning the in-memory path (which is also the fallback when a write to
+   *  the inbox fails). tests/durable-inbox-agent.test.ts turns it on. */
+  inbox: false,
+  inboxReplayMaxAgeMinutes: 360,
   notifyOwnerOnSuppressedErrors: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,

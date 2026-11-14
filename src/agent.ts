@@ -35,6 +35,7 @@ import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agen
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
+import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
@@ -137,6 +138,12 @@ export class Agent {
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
+  /**
+   * Durable record of every accepted inbound message until a turn consumes
+   * it (see DurableInbox). Undefined when `config.inbox` is off or the log
+   * could not be opened — the in-memory path then runs exactly as before.
+   */
+  private inbox: DurableInbox | undefined;
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
   private liveSessionManager: LiveSessionManager;
@@ -189,6 +196,13 @@ export class Agent {
       getChannel: (name) => this.getChannel(name),
     });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
+    if (config.inbox) {
+      try {
+        this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
+      } catch (err) {
+        log.error({ err }, "Durable inbox unavailable; inbound messages are held in memory only");
+      }
+    }
     this.delivery = new DeliveryPipeline({
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
     });
@@ -645,8 +659,41 @@ export class Agent {
     // message waits (in-flight turn, iMessage settle window) re-route it.
     const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
     if (channel.name === "web") resolution.replyTarget = { channelName: "web", chatId: message.id };
-    const sessionKey = resolution.sessionKey;
 
+    // DURABLE CUSTODY. Persist before the `true` below reaches the channel:
+    // that answer is what makes imsg commit its cursor, and Telegram has
+    // already confirmed the update. From here a crash replays the message on
+    // the next start instead of losing it. Web turns are bound to a live HTTP
+    // request that does not survive a restart (the browser sees the failure
+    // and can resend), and the group secret must never be written to disk.
+    let inboxId: string | undefined;
+    if (this.inbox && channel.name !== "web" && !(config.groupSecret && message.text.trim() === config.groupSecret)) {
+      const persisted = this.inbox.accept(channel.name, message, resolution);
+      if (persisted.status === "duplicate") {
+        log.info({ channel: channel.name, messageId: message.id }, "Inbound message already in the durable inbox; not dispatching it twice");
+        return true;
+      }
+      if (persisted.status === "accepted") inboxId = persisted.id;
+    }
+
+    const accepted = this.dispatchInbound(channel, message, resolution, inboxId);
+    // Refused only past the shutdown drain. A durably persisted message is
+    // still ours — the next start replays it — so custody stands.
+    return accepted || inboxId !== undefined;
+  }
+
+  /**
+   * Hand an accepted message to the batcher or the per-session queue. Shared
+   * by live ingress and the durable-inbox replay, so a replayed message takes
+   * exactly the path it would have taken the first time.
+   */
+  private dispatchInbound(
+    channel: Channel,
+    message: IncomingMessage,
+    resolution: SessionResolution,
+    inboxId: string | undefined,
+  ): boolean {
+    const isGroup = message.isGroup ?? false;
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
     // Web turns have their own outlet: never steer them into a provider turn.
     // Provider batching stays intact; its steering guard refuses a live web turn.
@@ -656,11 +703,11 @@ export class Agent {
       // Through processInboundItems (not handleMessage directly) so the
       // allowlist and /pause state are re-checked at processing time — this
       // task can wait behind an in-flight turn, and both can change meanwhile.
-      this.enqueueInboundForSession(sessionKey, [{ channel, message, resolution }]);
+      this.enqueueInboundForSession(resolution.sessionKey, [{ channel, message, resolution, ...(inboxId ? { inboxId } : {}) }]);
       return true;
     }
 
-    return this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
+    return this.batcher.enqueue(resolution.sessionKey, channel, message, canCoalesce, resolution, inboxId);
   }
 
   private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
@@ -721,6 +768,8 @@ export class Agent {
     for (const item of items) {
       if (!allowed.includes(item)) item.channel.settleMessage?.(item.message.id, "refused");
     }
+    // A deliberate drop is a consumption: it must not come back after a restart.
+    this.inbox?.markDone(inboxIdsOf(items.filter((item) => !allowed.includes(item))));
     if (allowed.length === 0) return;
 
     // Receipt-time routing remains stable in the ordinary direction: a
@@ -739,11 +788,20 @@ export class Agent {
       return;
     }
 
-    if (routed.length === 1) {
-      await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution);
-      return;
+    // From here a turn (or a steer into one) owns these messages. A crash past
+    // this point is NOT replayed — the turn may already have acted — and the
+    // next start tells the session instead (see replayInbox).
+    const inboxIds = inboxIdsOf(routed);
+    this.inbox?.markStarted(inboxIds);
+    try {
+      if (routed.length === 1) {
+        await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution);
+        return;
+      }
+      await this.handleBatchedMessages(routed, steer);
+    } finally {
+      this.inbox?.markDone(inboxIds);
     }
-    await this.handleBatchedMessages(routed, steer);
   }
 
   /**
@@ -1438,7 +1496,7 @@ export class Agent {
    * summonReminder, which is appended to the prompt but kept out of transcripts.
    */
   private formatGroupText(
-    channel: Channel,
+    channel: Pick<Channel, "name">,
     message: IncomingMessage,
     sessionKey: string,
     people: PeopleSnapshot,
@@ -2027,6 +2085,12 @@ export class Agent {
   async start(): Promise<void> {
     log.info({ channels: this.channels.length }, "Starting Tomo");
     await Promise.all(this.channels.map((ch) => ch.start()));
+    try {
+      this.replayInbox();
+    } catch (err) {
+      // Replay is recovery, never a startup prerequisite.
+      log.error({ err }, "Durable inbox replay failed");
+    }
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
@@ -2197,6 +2261,7 @@ export class Agent {
           CHANNEL_TEARDOWN_TIMEOUT_MS,
           () => Promise.all(this.channels.map((ch) => ch.teardown())),
         );
+        this.inbox?.close();
       }
     }
   }
@@ -2297,12 +2362,27 @@ export class Agent {
     this.recordInboundItems(pending);
   }
 
-  /** Append `<user message>` + the not-processed marker for each item. */
-  private recordInboundItems(pending: Map<string, InboundItem[]>): void {
+  /**
+   * Append `<user message>` + the not-processed marker for each item.
+   *
+   * Items still pending in the durable inbox are skipped: the next start
+   * replays them, and recording them here as well would put the message in
+   * the transcript twice with a marker that turns out to be false.
+   */
+  private recordInboundItems(
+    pending: Map<string, Array<Pick<InboundItem, "message" | "inboxId"> & { channel: Pick<Channel, "name"> }>>,
+    marker: string = SHUTDOWN_NOT_PROCESSED,
+  ): void {
     // One read for the whole drain: this runs during shutdown, where every
     // avoidable synchronous file read delays the exit.
     const people = createPeopleSnapshot();
-    for (const [key, items] of pending) {
+    for (const [key, all] of pending) {
+      const items = all.filter((it) => !(it.inboxId && this.inbox?.isPending(it.inboxId) && marker === SHUTDOWN_NOT_PROCESSED));
+      const leftForReplay = all.length - items.length;
+      if (leftForReplay > 0) {
+        log.info({ sessionKey: key, count: leftForReplay }, "Inbound messages left in the durable inbox for replay on next start");
+      }
+      if (items.length === 0) continue;
       for (const { channel, message } of items) {
         this.sessions.append(key, {
           role: "user",
@@ -2314,16 +2394,89 @@ export class Agent {
         });
         this.sessions.append(key, {
           role: "assistant",
-          content: SHUTDOWN_NOT_PROCESSED,
+          content: marker,
           channel: channel.name,
           ...(channel.name === "web" ? { requestId: message.id } : {}),
           timestamp: Date.now(),
         });
       }
+      this.inbox?.markDone(inboxIdsOf(items));
       log.info(
         { sessionKey: key, count: items.length },
         "Recorded inbound messages shutdown will not process",
       );
     }
   }
+
+  /**
+   * Settle what the durable inbox still holds from the previous run. Called
+   * once, from start(), after the channels are up (a replayed turn has to be
+   * able to reply).
+   *
+   * - `received` → dispatched again through the normal ingress path, so they
+   *   coalesce, steer and settle exactly as they would have. The session is
+   *   told the messages are being answered late.
+   * - `started` → NOT re-run: the turn that was consuming them may already
+   *   have called tools or sent part of a reply. The session gets a note to
+   *   check before assuming they were answered.
+   * - too old (`inboxReplayMaxAgeMinutes`), or their channel is gone → the
+   *   transcript records them with a not-processed marker, as a graceful
+   *   shutdown would have.
+   */
+  private replayInbox(): void {
+    if (!this.inbox) return;
+    const records = this.inbox.pending();
+    if (records.length === 0) return;
+
+    const maxAgeMs = config.inboxReplayMaxAgeMinutes * 60_000;
+    const now = Date.now();
+    const interrupted = new Map<string, InboxRecord[]>();
+    const stale = new Map<string, Array<{ channel: Pick<Channel, "name">; message: IncomingMessage; inboxId: string }>>();
+    const replay: Array<{ rec: InboxRecord; channel: Channel }> = [];
+    for (const rec of records) {
+      const key = rec.resolution.sessionKey;
+      if (rec.status === "started") {
+        interrupted.set(key, [...(interrupted.get(key) ?? []), rec]);
+        continue;
+      }
+      const channel = this.getChannel(rec.channel);
+      if (!channel || maxAgeMs <= 0 || now - rec.receivedAt > maxAgeMs) {
+        stale.set(key, [...(stale.get(key) ?? []), { channel: channel ?? { name: rec.channel }, message: restoreMessage({ ...rec.message, images: undefined, documents: undefined }), inboxId: rec.id }]);
+        continue;
+      }
+      replay.push({ rec, channel });
+    }
+
+    for (const [key, recs] of interrupted) {
+      const oldest = new Date(recs[0].receivedAt).toISOString();
+      this.queuePendingNote(key, formatTomoEvent(
+        "inbox",
+        `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}. `
+          + "Your reply may be missing or incomplete; check the conversation before assuming it was answered.",
+        { name: "interrupted" },
+      ));
+      this.inbox.markDone(recs.map((r) => r.id));
+      log.warn({ sessionKey: key, count: recs.length }, "Durable inbox: turn was interrupted by a restart; session notified, not re-run");
+    }
+
+    if (stale.size > 0) this.recordInboundItems(stale, INBOX_STALE_NOT_PROCESSED);
+
+    const perSession = new Map<string, number>();
+    for (const { rec } of replay) perSession.set(rec.resolution.sessionKey, (perSession.get(rec.resolution.sessionKey) ?? 0) + 1);
+    for (const [key, count] of perSession) {
+      this.queuePendingNote(key, formatTomoEvent(
+        "inbox",
+        `${count === 1 ? "The next message" : `The next ${count} messages`} arrived before Tomo restarted and ${count === 1 ? "is" : "are"} being answered late.`,
+        { name: "replay" },
+      ));
+      log.info({ sessionKey: key, count }, "Durable inbox: replaying messages received before the restart");
+    }
+    for (const { rec, channel } of replay) {
+      this.dispatchInbound(channel, restoreMessage(rec.message), rec.resolution, rec.id);
+    }
+  }
+}
+
+function inboxIdsOf(items: ReadonlyArray<{ inboxId?: string }>): string[] {
+  return items.flatMap((item) => (item.inboxId ? [item.inboxId] : []));
 }

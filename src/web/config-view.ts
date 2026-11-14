@@ -22,36 +22,53 @@ function secretShaped(value: string): boolean {
   if (scrubSecretValues(value) !== value) return true;
   try { const url = new URL(value); return !!(url.username || url.password || url.search); } catch { return false; }
 }
-function mcpServerPath(path: string[]): boolean {
-  return (path[0] === "mcpServers" && path.length >= 3) || (path[0] === "mcp" && path[1] === "servers" && path.length >= 4);
+
+/**
+ * The ONLY config paths whose string values are shown (`*` = any one
+ * segment). An allowlist, not a denylist of secret-looking names: names that
+ * hide a credential cannot be enumerated (`accesskey`, `signingkey`, …), so a
+ * string anywhere else — including any field added later — shows as masked.
+ * Picked from the fields `config.ts` reads: models, modes, channel / chat /
+ * session identifiers, time zone, paths and tool names. A string on this list
+ * is still masked if it looks like a credential.
+ */
+export const SHOWN_STRING_PATHS = [
+  "model", "effort", "city", "timezone", "workspaceDir",
+  "sessionModelOverrides.*",
+  "owner.name", "owner.telegram", "owner.imessage", "owner.timezone",
+  "identities.*.name", "identities.*.replyPolicy", "identities.*.channels.*",
+  "channels.*.provider", "channels.*.cliPath", "channels.*.dbPath", "channels.*.allowlist", "channels.*.passiveGroups",
+  "lcm.groupCompactStyle", "litellm.mode",
+  "web.ownerIdentity", "web.externalOrigin",
+  "writeRoots", "denyPaths", "denyReadPaths", "groupShellAllowlist", "mcpAllowedTools",
+  "agentProfiles.*.bash", "agentProfiles.*.writeRoots", "agentProfiles.*.denyPaths", "agentProfiles.*.denyReadPaths",
+  "plugins", "plugins.*", "plugins.*.path", "plugins.*.name",
+  "continuityScript", "continuityScript.path",
+  "mcpServers.*.type", "mcp.servers.*.type",
+].map((pattern) => pattern.split("."));
+function matches(pattern: string[], path: string[]): boolean {
+  return pattern.length === path.length && pattern.every((part, i) => part === "*" || part === path[i]);
 }
-/** Words that mask a config value when any word of any path segment is one
- *  of them. Stricter than the log rule (`isSecretFieldName`, which lets a bare
- *  `key` through because logs use it for session keys): a config display
- *  would rather over-mask than show a credential. */
-const CONFIG_SECRET_WORDS = new Set(["key", "keys", "apikey", "apikeys", "token", "tokens", "secret", "secrets", "password", "passwords",
-  "passwd", "pwd", "pass", "auth", "authorization", "bearer", "credential", "credentials", "cookie", "cookies", "dsn", "signature", "privatekey"]);
-/** Run-together lowercase names (`accesstoken`, `clientsecret`) carry no word boundary to split on. */
-const CONFIG_SECRET_SUFFIXES = ["token", "secret", "password", "passwd", "apikey", "credential", "credentials", "cookie", "dsn"];
-/** Words of a field name, case-insensitive, split at camelCase, `_`, `-`, `.` and spaces. */
-function nameWords(name: string): string[] {
-  return name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .split(/[^A-Za-z0-9]+/).filter(Boolean).map((word) => word.toLowerCase());
+export function showsStringAt(path: string[]): boolean {
+  return SHOWN_STRING_PATHS.some((pattern) => matches(pattern, path));
 }
-export function isConfigSecretName(name: string): boolean {
-  if (isSecretFieldName(name)) return true;
-  const words = nameWords(name);
-  if (words.some((word) => CONFIG_SECRET_WORDS.has(word))) return true;
-  return words.some((word) => CONFIG_SECRET_SUFFIXES.some((suffix) => word.endsWith(suffix)));
+/** A credential-looking name: numbers and booleans under such a name stay masked too. */
+function secretName(segment: string): boolean {
+  return isSecretFieldName(segment) || /key|token|secret|pass|pwd|auth|credential|cookie|dsn|signature|bearer/i.test(segment);
 }
-/** Masking is decided per leaf: a secret-named segment anywhere on the path
- *  (`isConfigSecretName`), an opaque MCP value, or a value that looks like a
- *  credential. Values are shown only when none applies. */
+/** Per leaf. Strings: shown only on an allowlisted path and not credential-shaped.
+ *  Numbers / booleans: shown unless a path segment names a credential or it
+ *  is an opaque MCP value. Objects that reach the depth limit: masked. */
 function masked(path: string[], value: unknown): boolean {
-  if (path.some((segment) => isConfigSecretName(segment))) return true;
   if (mcpServerPath(path) && !SAFE_MCP_KEYS.has(path[path[0] === "mcp" ? 3 : 2])) return true;
   const values = Array.isArray(value) ? value : [value];
-  return values.some((item) => typeof item === "string" && secretShaped(item));
+  if (values.some((item) => typeof item === "string")) {
+    return !showsStringAt(path) || values.some((item) => typeof item === "string" && secretShaped(item));
+  }
+  return path.some(secretName);
+}
+function mcpServerPath(path: string[]): boolean {
+  return (path[0] === "mcpServers" && path.length >= 3) || (path[0] === "mcp" && path[1] === "servers" && path.length >= 4);
 }
 function isSet(value: unknown): boolean { return value !== undefined && value !== null && value !== "" && !(Array.isArray(value) && !value.length); }
 
@@ -67,7 +84,9 @@ export function configFields(value: Record<string, unknown>): { fields: WebConfi
       return;
     }
     const secret = masked(path, current) || (!scalar(current) && !leafArray);
-    fields.push({ path, secret, set: isSet(current), ...(secret ? {} : { value: current as WebConfigField["value"] }) });
+    // A masked string tells its length (a hint that it is set and roughly what), never its content.
+    const length = secret && typeof current === "string" ? current.length : undefined;
+    fields.push({ path, secret, set: isSet(current), ...(length !== undefined ? { length } : {}), ...(secret ? {} : { value: current as WebConfigField["value"] }) });
   };
   for (const [key, child] of Object.entries(value)) visit(child, [key]);
   return { fields, truncated };

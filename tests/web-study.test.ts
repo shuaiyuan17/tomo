@@ -6,7 +6,7 @@ import { MemoryReader } from "../src/workspace/memory-reader.js";
 import { CronStore } from "../src/cron/store.js";
 import { MAX_CRON_STORE_BYTES, WebCron, readSessionContext } from "../src/web/inspection.js";
 import { execFileSync } from "node:child_process";
-import { configFields, isConfigSecretName, mcpServers, WebConfigReader } from "../src/web/config-view.js";
+import { configFields, mcpServers, WebConfigReader } from "../src/web/config-view.js";
 import { computeContextStats } from "../src/lcm/stats.js";
 import { readSummaryBlocks } from "../src/lcm/summary-reader.js";
 import { McpLiveStatus } from "../src/mcp/live-status.js";
@@ -204,7 +204,7 @@ describe("config view", () => {
     expect(at("model")).toMatchObject({ secret: false, value: "claude-opus-5-5" });
     expect(at("web.port")).toMatchObject({ secret: false, value: 9465 });
     expect(at("channels.telegram.allowlist")).toMatchObject({ secret: false, value: ["12345"] });
-    expect(at("channels.telegram.token")).toEqual({ path: ["channels", "telegram", "token"], secret: true, set: true });
+    expect(at("channels.telegram.token")).toEqual({ path: ["channels", "telegram", "token"], secret: true, set: true, length: secrets[0].length });
     expect(at("groupSecret")).toMatchObject({ secret: true, set: true });
     expect(at("litellm.baseUrl")).toMatchObject({ secret: true });
     // Every MCP value except the safe list is opaque, whatever its key is called.
@@ -214,21 +214,38 @@ describe("config view", () => {
     expect(at("mcpServers.remote.url")).toMatchObject({ secret: true });
   });
 
-  it("masks every credential-shaped name, including a bare `key`", () => {
+  it("shows strings only on allowlisted paths; any other string is masked with a length hint", () => {
     const value = "plain-looking-value";
-    const config = { provider: { key: value }, Provider: { KEY: value }, a: { api_key: value, "api-key": value, apiKey: value, stripe_secret_key: value },
-      b: { token: value, accessToken: value, accesstoken: value, AUTH: value, auth_header: value, Credential: value, sessionCookie: value,
-        sentry_dsn: value, DSN: value, password: value, db_pass: value, keys: [value] }, shown: { model: value, port: 1 } };
+    const config = {
+      model: "claude-opus-5-5", timezone: "America/Los_Angeles", steering: true, maxTurns: 40,
+      provider: { key: value }, aws: { accesskey: value, signingkey: value, region: "us-west-2" },
+      someNewFeature: { label: value, enabled: true, limit: 3 }, notes: value,
+      identities: [{ name: "owner", replyPolicy: "last-active", channels: { telegram: "12345" } }],
+      sessionModelOverrides: { "dm:owner": "claude-fable-5-2" },
+      channels: { imessage: { provider: "imsg", inboundSettleMs: 1500, allowlist: ["+15550001"] } },
+    };
     const { fields } = configFields(config);
-    expect(fields.filter((f) => !f.secret).map((f) => f.path.join("."))).toEqual(["shown.model", "shown.port"]);
-    expect(JSON.stringify(fields.filter((f) => f.path[0] !== "shown"))).not.toContain(value);
-    expect(fields.find((f) => f.path.join(".") === "provider.key")).toEqual({ path: ["provider", "key"], secret: true, set: true });
+    const at = (path: string) => fields.find((f) => f.path.join(".") === path)!;
+    // Unknown fields (including ones added in the future) are masked by default.
+    expect(at("provider.key")).toEqual({ path: ["provider", "key"], secret: true, set: true, length: value.length });
+    expect(at("aws.accesskey")).toMatchObject({ secret: true, length: value.length });
+    expect(at("aws.signingkey")).toMatchObject({ secret: true });
+    expect(at("aws.region")).toMatchObject({ secret: true });
+    expect(at("someNewFeature.label")).toMatchObject({ secret: true });
+    expect(at("notes")).toMatchObject({ secret: true });
+    expect(JSON.stringify(fields)).not.toContain(value);
+    // Allowlisted strings, numbers and booleans are shown as they are.
+    for (const [path, shown] of Object.entries({ model: "claude-opus-5-5", timezone: "America/Los_Angeles", steering: true, maxTurns: 40,
+      "someNewFeature.enabled": true, "someNewFeature.limit": 3, "identities.0.name": "owner", "identities.0.replyPolicy": "last-active",
+      "identities.0.channels.telegram": "12345", "sessionModelOverrides.dm:owner": "claude-fable-5-2", "channels.imessage.provider": "imsg",
+      "channels.imessage.inboundSettleMs": 1500 })) {
+      expect(at(path), path).toMatchObject({ secret: false, value: shown });
+    }
+    expect(at("channels.imessage.allowlist")).toMatchObject({ secret: false, value: ["+15550001"] });
   });
-  it.each(["key", "KEY", "api_key", "apiKey", "my-key", "dsn", "SENTRY_DSN", "authToken", "clientsecret", "cookie", "Credential"])("treats %s as secret", (name) => {
-    expect(isConfigSecretName(name)).toBe(true);
-  });
-  it.each(["model", "port", "timezone", "allowlist", "enabled", "provider", "monkeyPatch"])("shows %s", (name) => {
-    expect(isConfigSecretName(name)).toBe(false);
+  it("masks an allowlisted string that looks like a credential, and numbers under a credential name", () => {
+    const { fields } = configFields({ model: "sk-ant-api03-synthetic-0000000000000000", auth: { pin: 1234 }, tokenTtl: 5 });
+    expect(fields.map((f) => [f.path.join("."), f.secret])).toEqual([["model", true], ["auth.pin", true], ["tokenTtl", true]]);
   });
 
   it("lists saved MCP servers, including disabled ones, without their values", () => {

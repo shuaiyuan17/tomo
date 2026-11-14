@@ -97,7 +97,7 @@ export interface WebContext {
   /** Compactions seen on the watch bus since the daemon started (not a full audit log). */
   recentCompactions?: WebCompaction[];
 }
-export interface WebConfigField { path: string[]; secret: boolean; set: boolean; value?: string | number | boolean | null | Array<string | number | boolean | null> | Record<string, never> }
+export interface WebConfigField { path: string[]; secret: boolean; set: boolean; /** Length of a masked string. */ length?: number; value?: string | number | boolean | null | Array<string | number | boolean | null> | Record<string, never> }
 export interface WebConfigView { missing: boolean; modifiedAt: number | null; fields: WebConfigField[]; truncated: boolean }
 export type McpConnectionState = "connected" | "failed" | "needs-auth" | "pending" | "disabled";
 export interface WebMcpServer { name: string; enabled: boolean; type: string; oauth: boolean; timeout: number | null; alwaysLoad: boolean; configured: string[] }

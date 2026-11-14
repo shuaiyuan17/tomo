@@ -19,7 +19,7 @@ const INTRO: Record<StudyPage, string> = {
   context: "How full the selected conversation's context window is, and what has been rolled up.",
   cron: "Scheduled jobs and when they last ran.",
   mcp: "External tool servers in config.json, and what live sessions report about them.",
-  config: "The saved config.json. Secrets appear only as set or not set.",
+  config: "The saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
 };
 
 const card = "rounded-xl border bg-card shadow-xs";
@@ -300,7 +300,8 @@ function Mcp({ reload }: { reload: number }) {
 }
 
 function formatValue(field: WebConfigField): ReactNode {
-  if (field.secret) return <span className="flex items-center gap-1.5 text-muted-foreground"><Lock className="size-3" />{field.set ? "Set" : "Not set"}</span>;
+  if (field.secret) return <span className="flex items-center gap-1.5 text-muted-foreground"><Lock className="size-3" />
+    {!field.set ? "Not set" : field.length !== undefined ? <><span aria-hidden="true" className="font-mono tracking-widest">•••</span><span className="sr-only">Hidden</span><span className="font-mono text-[11px]">{field.length} chars</span></> : "Set"}</span>;
   const value = field.value;
   if (value === undefined || value === null || value === "") return <span className="text-muted-foreground">—</span>;
   if (Array.isArray(value)) return value.length ? <span className="font-mono text-xs [overflow-wrap:anywhere]">{value.map(String).join(", ")}</span> : <span className="text-muted-foreground">empty</span>;

@@ -369,6 +369,8 @@ Environment variables override config file values:
 | `TOMO_WORKSPACE` | Override workspace directory |
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
+| `TOMO_INBOX` | Override the durable inbox. Defaults to `true`; set `false` to hold waiting messages in memory only. |
+| `TOMO_INBOX_REPLAY_MAX_AGE_MINUTES` | Oldest waiting message answered after a restart (default: `360`; `0` = never replay, only record). |
 | `TOMO_SAVE_INBOUND_FILES` | Override storage of inbound attachments that are neither images nor supported documents. Defaults to whatever `saveInboundImages` is. |
 | `TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS` | Tell the owner when a failure is kept out of a chat: passive-group turns, group cron/background turns, and silent housekeeping/heartbeat turns on the owner's own DM (an error already shown in a chat is not repeated). Group failures are reported in the owner's DM, never in the group; DM failures in that DM. Each notice names the session, the kind of error, a one-line excerpt and a recovery hint (`/login` for auth failures). At most one notice per session and error kind per 30 minutes; the next one says how many failures were folded in. Defaults to `true` (config key `notifyOwnerOnSuppressedErrors`); set `false` to keep these failures in the log only. |
 | `TOMO_SHOW_THINKING` | Deliver the model's thinking blocks to the chat, prefixed with `💭`. Defaults to `false`; with it off, a thinking block that still has text in it is delivered unprefixed, as a `text` block would be. |
@@ -491,6 +493,17 @@ Because the config contains channel credentials and may now contain an Anthropic
 ### Steering
 
 By default, messages you send while Tomo is mid-task are steered into the in-flight turn at the next tool-call boundary — so "stop", "wait", or extra context reaches the model immediately instead of waiting for the current turn to finish. If the turn has no tool calls left, the message runs as its own follow-up turn right after. iMessage fragment settling still applies before injection; system-originated turns (cron, continuity) keep their normal queued behavior. Set `"steering": false` or `TOMO_STEERING=false` to keep mid-turn messages queued behind the active turn.
+
+### Durable Inbox
+
+Every message Tomo accepts is written to `~/.tomo/data/inbox.jsonl` (fsynced) before the channel is told it was received, and stays there until a turn has consumed it. If the daemon crashes, is killed or restarts while messages are waiting behind a turn, the next start answers them, with a note to the model that they are late. Messages that pile up still coalesce into one turn, as they would have live.
+
+- A redelivered message (same channel, chat and message id) is answered once.
+- A turn that was already running when the daemon died is not re-run, because it may have called tools or sent part of a reply already. The session is told to check instead.
+- A message older than `inboxReplayMaxAgeMinutes` (default `360`) is recorded in the transcript as not processed rather than answered late.
+- Web UI requests, the group secret and attachment bytes are never written there; attachments are reloaded from their saved copies (`saveInboundImages` / `saveInboundFiles`), and one that was never saved is dropped with a note.
+
+Set `"inbox": false` or `TOMO_INBOX=false` to turn it off. Waiting messages are then held in memory, and a graceful shutdown records them as not processed.
 
 ### LiteLLM / ChatGPT Subscription Models
 

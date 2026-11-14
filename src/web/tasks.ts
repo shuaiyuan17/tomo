@@ -72,6 +72,21 @@ export class TaskBoard {
   }
 
 
+  /**
+   * A task the browser can see right now, by its browser session id: the
+   * slot it is stored under and its type. Uses the same one-snapshot router
+   * as `publish`, so nothing hidden from the panel can be opened.
+   */
+  locate(sessionId: string, taskId: string): { slot: string; task: WebTask } | undefined {
+    const route = this.router();
+    for (const [slot, tasks] of this.sessions) {
+      if (route(slot) !== sessionId) continue;
+      const task = tasks.get(taskId);
+      if (task) return { slot, task: { ...task, sessionId } };
+    }
+    return undefined;
+  }
+
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
     const now = this.now();
     const old = this.sessions.get(sessionId) ?? new Map<string, WebTask>();

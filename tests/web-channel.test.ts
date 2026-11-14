@@ -11,9 +11,10 @@ import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
 
 const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
 const channels: WebChannel[] = [];
-function setup(configured: OwnerConfig | null = owner, ownerKey?: () => string | undefined) {
+function setup(configured: OwnerConfig | null = owner, ownerKey?: () => string | undefined,
+  taskOutput?: (key: string, id: string) => Promise<{ output: string; size: number } | undefined>) {
   const bus = new WatchBus();
-  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey });
+  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey, taskOutput });
   channels.push(channel);
   const handler = vi.fn(async () => true);
   channel.onMessage(handler);
@@ -283,6 +284,23 @@ describe("web task panel feed", () => {
       const ids = channel.snapshot().tasks.filter((t) => t.sessionId === channel.ownerId).map((t) => t.taskId);
       expect(ids.includes("legacy-task") && ids.includes("canonical-task")).toBe(false);
     }
+  });
+  it("opens only tasks the panel's gate shows, and reads output only for shell/monitor tasks", async () => {
+    let current: string | undefined = "dm:owner";
+    const reads: Array<[string, string]> = [];
+    const { channel, bus } = setup(owner, () => current, async (key, id) => { reads.push([key, id]); return { output: "tail", size: 4 }; });
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1"), { ...live("b1"), taskType: "local_bash" }] });
+    bus.publish({ type: "tasks", sessionKey: "dm:peer", tasks: [live("p1")] });
+    const ownerId = channel.ownerId!;
+    expect(await channel.task(ownerId, "a1", false)).toEqual({ sessionKey: "dm:owner", taskType: "local_agent" });
+    expect(await channel.task(ownerId, "b1", true)).toMatchObject({ output: { output: "tail", size: 4 } });
+    expect(reads).toEqual([["dm:owner", "b1"]]);
+    await expect(channel.task(ownerId, "a1", true)).rejects.toMatchObject({ status: 400, code: "no_task_output" });
+    await expect(channel.task(ownerId, "p1", false)).rejects.toMatchObject({ status: 404 });
+    await expect(channel.task(webSessionId("dm:peer"), "p1", false)).rejects.toMatchObject({ status: 404 });
+    // Hidden by the owner rule: the same task can no longer be opened.
+    current = undefined;
+    await expect(channel.task(ownerId, "a1", false)).rejects.toMatchObject({ status: 404 });
   });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();

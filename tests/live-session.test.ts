@@ -69,6 +69,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
       },
       close: () => { done = true; wake?.(); },
       getContextUsage: async () => ({ totalTokens: 100, maxTokens: 1000, percentage: 10, categories: [] }),
+      getTaskOutput: async (taskId: string) => taskId === "b1" ? { output: "line 1\nline 2", size: 4096 } : { output: 7 },
     };
     if (mcpRuntime.available) {
       queryHandle.setMcpServers = async (servers: Record<string, unknown>) => {
@@ -257,6 +258,14 @@ describe("LiveSession background-task tracking", () => {
     session.close();
     expect(seen.at(-1)!.tasks).toEqual([]);
     unsubscribe();
+  });
+
+  it("reads a shell task's output tail through the runtime Query, and nothing once closed", async () => {
+    const { session } = makeSession({});
+    expect(await session.getTaskOutput("b1")).toEqual({ output: "line 1\nline 2", size: 4096 });
+    expect(await session.getTaskOutput("bad-shape")).toBeUndefined();
+    session.close();
+    expect(await session.getTaskOutput("b1")).toBeUndefined();
   });
 
   it("close() wakes a pending background waiter", async () => {

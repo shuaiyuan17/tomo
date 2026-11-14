@@ -1449,6 +1449,21 @@ export class LiveSession {
   }
 
   /**
+   * The end of a shell or Monitor task's output (the SDK's `get_task_output`
+   * control request: at most the last 8 KiB, read-only, no model turn). The
+   * method is present on the runtime Query but not in its type declarations,
+   * so it is probed like setMcpServers. Undefined when unavailable.
+   */
+  async getTaskOutput(taskId: string): Promise<{ output: string; size: number } | undefined> {
+    if (!this.alive) return undefined;
+    const runtimeQuery = this.q as unknown as { getTaskOutput?: (id: string) => Promise<{ output?: unknown; size?: unknown }> };
+    if (typeof runtimeQuery.getTaskOutput !== "function") return undefined;
+    const value = await runtimeQuery.getTaskOutput.call(this.q, taskId);
+    if (!value || typeof value.output !== "string") return undefined;
+    return { output: value.output, size: typeof value.size === "number" ? value.size : Buffer.byteLength(value.output) };
+  }
+
+  /**
    * Retire the session. Everything here is SYNCHRONOUS on purpose: shutdown
    * has a few seconds at most, and both of the things that used to be left
    * asynchronous cost the owner transcript entries.

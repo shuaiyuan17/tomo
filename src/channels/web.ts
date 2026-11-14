@@ -9,8 +9,10 @@ import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { selectOwnerSessionKey } from "../web/data.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebEvent, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
+/** Task types whose output tail the SDK serves (`get_task_output`). */
+const OUTPUT_TASK_TYPES = new Set(["local_bash", "monitor"]);
 /** How often the owner-key rule is re-read while owner tasks are shown. */
 export const OWNER_KEY_CHECK_MS = 1_000;
 
@@ -33,6 +35,7 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -42,7 +45,10 @@ export class WebChannel implements Channel {
   private ownerKeyTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus,
-    options: { now?: () => number; ownerKey?: () => string | undefined } = {}) {
+    options: { now?: () => number; ownerKey?: () => string | undefined;
+      /** Reads a shell/Monitor task's output tail from the live session of `sessionKey`. */
+      taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined> } = {}) {
+    this.taskOutput = options.taskOutput;
     const now = options.now ?? Date.now;
     // Without registry access the catalog would pick the canonical key.
     this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
@@ -108,6 +114,22 @@ export class WebChannel implements Channel {
     const blocks = [...this.blocks];
     const tasks = this.tasks.snapshot();
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
+  }
+
+  /**
+   * Where the browser may read a task it was shown: only a task the panel's
+   * send gate would show in `sessionId` right now. Shell and Monitor tasks
+   * also return their output tail, read from the live SDK session.
+   */
+  async task(sessionId: string, taskId: string, output: boolean): Promise<WebTaskAccess> {
+    const found = this.tasks.locate(sessionId, taskId);
+    if (!found) throw new WebError(404, "task_not_found");
+    const access: WebTaskAccess = { sessionKey: found.slot, taskType: found.task.taskType };
+    if (!output) return access;
+    if (!OUTPUT_TASK_TYPES.has(found.task.taskType)) throw new WebError(400, "no_task_output");
+    const value = await this.taskOutput?.(found.slot, taskId).catch(() => undefined);
+    if (!value) throw new WebError(503, "task_output_unavailable");
+    return { ...access, output: { output: value.output.slice(-16 * 1024), size: value.size } };
   }
 
   async send(message: OutgoingMessage): Promise<void> {

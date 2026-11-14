@@ -45,6 +45,15 @@ export interface WebTask {
   totalTokens?: number;
   toolUses?: number;
 }
+/** One entry of a subagent's transcript, as the read-only task view shows it. */
+export type SubagentItem =
+  | { kind: "text"; id: string; text: string; truncated: boolean; ts?: number }
+  | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number }
+  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean };
+/** A byte window of complete transcript lines: page back with `before=start`, tail with `after=end`. */
+export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
+/** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
+export interface TaskOutput { output: string; size: number }
 export type WebEvent =
   | { type: "block"; sessionId: string; requestId: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
@@ -72,7 +81,12 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
   z.object({ method: z.literal("request"), requestId: z.uuid() }).strict(),
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
+  /** A task the browser was shown, by its browser session: where to read it. */
+  z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean() }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
 export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
+/** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
+export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput }

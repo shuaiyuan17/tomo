@@ -1946,6 +1946,11 @@ export class Agent {
   }
 
   /** Channel + per-session vitals snapshot for the watch server. */
+  /** Read-only: a background shell's full command, by its tool_use id (web task view). */
+  readToolCommand(sessionKey: string, toolUseId: string): string | undefined {
+    return this.liveSessionManager.toolCommand(sessionKey, toolUseId);
+  }
+
   /** Read-only: a shell/Monitor task's output tail (web task view). */
   readTaskOutput(sessionKey: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);

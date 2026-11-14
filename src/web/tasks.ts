@@ -1,4 +1,5 @@
 import { clip, type TaskEndStatus, type WatchTask } from "../watch/protocol.js";
+import { redactCommand } from "./redact-command.js";
 import type { WebTask } from "./protocol.js";
 
 /** An ended task stays on the board this long, shown as ended, then goes. */
@@ -48,6 +49,8 @@ export class TaskBoard {
   private shown = new Map<string, WebTask[]>();
   /** For each shown browser session: task id → the slot it came from. */
   private shownSlots = new Map<string, Map<string, string>>();
+  /** tool_use id per slot and task (never published; used to read a shell's full command). */
+  private toolUses = new Map<string, Map<string, string>>();
   /** Models learned per slot and task (kept across REPLACE updates). */
   private models = new Map<string, Map<string, string>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -99,6 +102,9 @@ export class TaskBoard {
     if (task) { this.sessions.get(slot)!.set(taskId, { ...task, model }); this.publish(); }
   }
 
+  /** The tool_use id a task was started by, if known. */
+  toolUseOf(slot: string, taskId: string): string | undefined { return this.toolUses.get(slot)?.get(taskId); }
+
   /** Whether the board still holds this task (live or recently ended). */
   holds(slot: string, taskId: string): boolean { return this.sessions.get(slot)?.has(taskId) ?? false; }
 
@@ -112,6 +118,7 @@ export class TaskBoard {
     for (const task of live) {
       // Bounded fields keep the snapshot size a guarantee (see above).
       if (!TASK_ID.test(task.taskId)) continue;
+      if (task.toolUseId) { const uses = this.toolUses.get(sessionId) ?? new Map<string, string>(); uses.set(task.taskId, task.toolUseId); this.toolUses.set(sessionId, uses); }
       const previous = old.get(task.taskId);
       const reported = task.status;
       next.set(task.taskId, {
@@ -120,7 +127,8 @@ export class TaskBoard {
         taskType: clip(task.taskType, LABEL_LIMIT),
         ...(task.subagentType ? { subagentType: clip(task.subagentType, LABEL_LIMIT) } : {}),
         ...(this.models.get(sessionId)?.get(task.taskId) ? { model: this.models.get(sessionId)!.get(task.taskId)! } : {}),
-        description: clip(task.description, 200),
+        // Shell commands are redacted here, before any send (see redact-command.ts).
+        description: clip(task.taskType === "local_bash" ? redactCommand(task.description) : task.description, 200),
         ...(task.parentTaskId && TASK_ID.test(task.parentTaskId) ? { parentTaskId: task.parentTaskId } : {}),
         ambient: task.ambient,
         startedAt: task.startedAt,
@@ -177,6 +185,11 @@ export class TaskBoard {
         if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) tasks.delete(id);
       }
       if (!tasks.size) this.sessions.delete(sessionId);
+    }
+    for (const [slot, uses] of [...this.toolUses]) {
+      const tasks = this.sessions.get(slot);
+      for (const id of [...uses.keys()]) if (!tasks?.has(id)) uses.delete(id);
+      if (!uses.size) this.toolUses.delete(slot);
     }
     for (const [slot, models] of [...this.models]) {
       const tasks = this.sessions.get(slot);

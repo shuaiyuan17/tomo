@@ -344,6 +344,27 @@ describe("web task panel feed", () => {
       expect(before).toBeGreaterThan(0);
     } finally { vi.useRealTimers(); }
   });
+  it("redacts shell commands before any send, and serves the full command (redacted) from the live session", async () => {
+    const bus = new WatchBus();
+    const commands = new Map([["toolu_1", "cd /repo && GITHUB_TOKEN=s3cr3t gh pr list --limit 5 && echo " + "x".repeat(400)]]);
+    const channel = new WebChannel(owner, bus, { toolCommand: (_key, id) => commands.get(id) });
+    channels.push(channel);
+    const events: WebEvent[] = [];
+    channel.events.subscribe(({ event }) => events.push(event));
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+      { ...live("b1", "GITHUB_TOKEN=s3cr3t gh pr list"), taskType: "local_bash", toolUseId: "toolu_1" },
+      { ...live("b2", "API_KEY=zzz npm test"), taskType: "local_bash" },
+      live("a1") ] });
+    expect(JSON.stringify(events)).not.toContain("s3cr3t");
+    expect(JSON.stringify(channel.snapshot())).not.toContain("s3cr3t");
+    const full = await channel.task(channel.ownerId!, "b1", false, true);
+    expect(full.command!.text).toContain("gh pr list --limit 5");
+    expect(full.command!.text).not.toContain("s3cr3t");
+    expect(full.command!.text.length).toBeGreaterThan(400);
+    // No live command (e.g. after a restart): the redacted description, marked truncated.
+    expect((await channel.task(channel.ownerId!, "b2", false, true)).command).toEqual({ text: "API_KEY=••• npm test", truncated: true });
+    await expect(channel.task(channel.ownerId!, "a1", false, true)).rejects.toMatchObject({ status: 400 });
+  });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();

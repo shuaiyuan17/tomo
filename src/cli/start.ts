@@ -222,6 +222,7 @@ async function startForeground(): Promise<void> {
       const web = new WebChannel(config.owner, undefined, { ownerKey: ownerSessionKeyReader({
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),
+        toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }) });
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,

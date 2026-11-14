@@ -1,4 +1,5 @@
 import { clip, type TaskEndStatus, type WatchTask } from "../watch/protocol.js";
+import { redactCommand } from "../web/redact-command.js";
 
 /** Text carried per task is short: it renders as one or two lines. */
 export const TASK_TEXT_LIMIT = 200;
@@ -15,7 +16,7 @@ type Usage = { total_tokens?: number; tool_uses?: number };
 /** The SDK `system` subtypes this tracker reads, with only the fields it uses. */
 export type TaskSystemMessage =
   | { subtype: "background_tasks_changed"; tasks?: LevelEntry[] }
-  | { subtype: "task_started"; task_id: string; run_id?: string; task_type?: string; subagent_type?: string;
+  | { subtype: "task_started"; task_id: string; run_id?: string; tool_use_id?: string; task_type?: string; subagent_type?: string;
       description?: string; parent_task_id?: string; ambient?: boolean; is_backgrounded?: boolean }
   | { subtype: "task_progress"; task_id: string; run_id?: string; subagent_type?: string; description?: string;
       last_tool_name?: string; summary?: string; usage?: Usage }
@@ -36,6 +37,13 @@ function endStatus(value: string | undefined): TaskEndStatus | undefined {
   return undefined;
 }
 const text = (value: string | undefined) => clip((value ?? "").replace(/\s+/g, " ").trim(), TASK_TEXT_LIMIT);
+/**
+ * A task's description. A shell task's is its command line: redacted
+ * (best effort, see web/redact-command.ts) on the FULL text before it is
+ * clipped, so a cut can never leave half of a secret value unmasked.
+ */
+const describeTask = (value: string | undefined, taskType: string | undefined) =>
+  text(taskType === "local_bash" ? redactCommand((value ?? "").replace(/\s+/g, " ")) : value);
 
 /**
  * Merges the SDK's task streams into one per-session list.
@@ -158,7 +166,7 @@ export class TaskTracker {
         ...(entry.run_id ? { runId: entry.run_id } : {}),
         taskType: entry.task_type ?? base.taskType,
         ...(entry.subagent_type ? { subagentType: entry.subagent_type } : {}),
-        description: entry.description !== undefined ? text(entry.description) : base.description,
+        description: entry.description !== undefined ? describeTask(entry.description, entry.task_type ?? base.taskType) : base.description,
         ...(entry.parent_task_id ? { parentTaskId: entry.parent_task_id } : {}),
         ambient: entry.ambient === true,
         background: true,
@@ -181,8 +189,9 @@ export class TaskTracker {
       this.tasks.set(old.taskId, { ...current,
         ...(message.subagent_type && !current.subagentType ? { subagentType: message.subagent_type } : {}),
         ...(message.parent_task_id && !current.parentTaskId ? { parentTaskId: message.parent_task_id } : {}),
+        ...(typeof message.tool_use_id === "string" && !current.toolUseId ? { toolUseId: message.tool_use_id.slice(0, 128) } : {}),
         taskType: current.taskType || message.task_type || "",
-        description: current.description || text(message.description) });
+        description: current.description || describeTask(message.description, current.taskType || message.task_type) });
       return this.change([]);
     }
     // A background task joins the level before its task_started. One that is
@@ -196,8 +205,9 @@ export class TaskTracker {
       ...(message.run_id ? { runId: message.run_id } : {}),
       taskType: message.task_type ?? "local_agent",
       ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
-      description: text(message.description),
+      description: describeTask(message.description, message.task_type ?? "local_agent"),
       ...(message.parent_task_id ? { parentTaskId: message.parent_task_id } : {}),
+      ...(typeof message.tool_use_id === "string" ? { toolUseId: message.tool_use_id.slice(0, 128) } : {}),
       ambient: message.ambient === true,
       background: false,
       startedAt: this.now(),
@@ -236,7 +246,7 @@ export class TaskTracker {
       return this.change([{ taskId: old.taskId, status }]);
     }
     this.tasks.set(old.taskId, { ...current,
-      ...(patch.description ? { description: text(patch.description) } : {}),
+      ...(patch.description ? { description: describeTask(patch.description, current.taskType) } : {}),
       ...(patch.is_backgrounded ? { background: true } : {}),
       ...(status ? { status } : {}) });
     return this.change([]);

@@ -963,6 +963,17 @@ export class LiveSession {
     }
   }
 
+  /** Recent Bash commands by tool_use id (bounded), for the web task view's full command. */
+  private toolCommands = new Map<string, string>();
+  private rememberCommand(block: { id?: string; name: string; input?: Record<string, unknown> }): void {
+    const command = block.input?.command;
+    if (!block.id || block.name !== "Bash" || typeof command !== "string") return;
+    this.toolCommands.set(block.id, command.slice(0, 64 * 1024));
+    if (this.toolCommands.size > 256) this.toolCommands.delete(this.toolCommands.keys().next().value!);
+  }
+  /** The full command of a Bash tool call seen in this session, if remembered. */
+  getToolCommand(toolUseId: string): string | undefined { return this.toolCommands.get(toolUseId); }
+
   private publishTasks(change: TaskChange | undefined): void {
     if (!change || !this.sessionKey) return;
     watchBus.publish({
@@ -975,6 +986,7 @@ export class LiveSession {
     block: { id?: string; name: string; input?: Record<string, unknown> },
     agent?: string,
   ): void {
+    this.rememberCommand(block);
     if (block.id) this.pendingToolStarts.set(block.id, Date.now());
     watchBus.publish({
       type: "tool.start",

@@ -788,6 +788,7 @@ export class LiveSessionManager {
         // So the sink writes what it delivered first; the sink also tells
         // TurnRunner it has recorded, which suppresses the NO_REPLY entry.
         const recorded = req.flushOnShutdown?.() ?? false;
+        req.onShutdownInterrupted?.();
         log.info(
           { key, flushedBlocks: recorded },
           "Session closed during shutdown; preserving SDK session link",

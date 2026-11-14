@@ -219,7 +219,9 @@ describe("CronScheduler", () => {
     return calls.map((msg) => parseTomoEvent(msg)!.body);
   }
 
-  it("does not silently re-fire a recurring job interrupted by a restart", async () => {
+  // POLICY (2026-11-14): an interrupted run is never re-run automatically —
+  // after a crash or kill exactly as after a graceful restart.
+  it("never re-fires a recurring job a crash interrupted; tells the owner once and waits for the next slot", async () => {
     const storeA = new CronStore(TEST_PATH);
     storeA.add({
       name: "quiet-hours",
@@ -244,57 +246,30 @@ describe("CronScheduler", () => {
     const second = hangingAgent();
     const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
     schedulerB.start();
-    await waitFor(() => expect(second.calls).toHaveLength(1));
-    schedulerB.stop();
-
-    // Exactly one fire, and it announces itself as a resume so the model
-    // checks state instead of blindly redoing non-idempotent work.
-    expect(second.calls).toHaveLength(1);
-    const [body] = bodies(second.calls);
-    expect(body).toContain("[resumed]");
-    expect(body).toContain("never reported completion");
-    expect(body).toContain("Do the upgrade.");
-  });
-
-  it("marks the resumed fire only once — a later normal fire is unmarked", async () => {
-    const storeA = new CronStore(TEST_PATH);
-    storeA.add({
-      name: "quiet-hours",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "Do the upgrade.",
-      sessionKey: "dm:alice",
-    });
-    makeJobsDue();
-
-    const first = hangingAgent();
-    void tick(new CronScheduler(first.agent, storeA));
-    await waitFor(() => expect(first.calls).toHaveLength(1));
-
-    // Daemon 2 delivers the resumed fire and completes it normally.
-    const calls: string[] = [];
-    const agentB = {
-      handleCronMessage: vi.fn((msg: string) => {
-        calls.push(msg);
-        return Promise.resolve(true);
-      }),
-    } as unknown as Agent;
-    const storeB = new CronStore(TEST_PATH);
-    const schedulerB = new CronScheduler(agentB, storeB);
-    schedulerB.start();
-    await waitFor(() => expect(calls).toHaveLength(1));
-    schedulerB.stop();
-    await waitFor(() => expect(storeB.list()[0].lastStatus).toBe("ok"));
-    expect(bodies(calls)[0]).toContain("[resumed]");
-
-    // Next cadence tick: an ordinary run again.
-    makeJobsDue();
+    await waitFor(() => expect(second.notices).toHaveLength(1));
     await tick(schedulerB);
-    expect(calls).toHaveLength(2);
-    expect(bodies(calls)[1]).not.toContain("[resumed]");
-    expect(storeB.list()[0].lastStatus).toBe("ok");
+    schedulerB.stop();
+
+    expect(second.calls).toHaveLength(0);
+    expect(second.notices[0]).toContain('"quiet-hours"');
+    expect(second.notices[0]).toContain("did NOT finish");
+    expect(second.notices[0]).toContain("time unknown");
+    const after = new CronStore(TEST_PATH).list()[0];
+    expect(after.lastStatus).toBe("interrupted");
+    expect(after.nextRunAt).toBeGreaterThan(Date.now());
+    expect(after.interruptNotice ?? null).toBeNull();
+
+    // Told once.
+    const third = hangingAgent();
+    const schedulerC = new CronScheduler(third.agent, new CronStore(TEST_PATH));
+    schedulerC.start();
+    await new Promise((r) => setTimeout(r, 30));
+    schedulerC.stop();
+    expect(third.notices).toHaveLength(0);
+    expect(third.calls).toHaveLength(0);
   });
 
-  it("retries a fresh interrupted once job exactly once, then parks it and tells the owner", async () => {
+  it("parks a one-shot a crash interrupted, however fresh, and asks the owner — never retried", async () => {
     const storeA = new CronStore(TEST_PATH);
     const job = storeA.add({
       name: "send-the-order",
@@ -309,29 +284,17 @@ describe("CronScheduler", () => {
     void tick(new CronScheduler(first.agent, storeA));
     await waitFor(() => expect(first.calls).toHaveLength(1));
 
-    // Daemon 2: the run is fresh, so it is retried once — marked, so the
-    // model checks whether the order already went through.
     const second = hangingAgent();
     const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
     schedulerB.start();
-    await waitFor(() => expect(second.calls).toHaveLength(1));
+    await waitFor(() => expect(second.notices).toHaveLength(1));
+    await tick(schedulerB);
     schedulerB.stop();
-    expect(bodies(second.calls)[0]).toContain("[resumed]");
-    expect(second.notices).toHaveLength(0);
 
-    // Daemon 3: the retry was interrupted too. No third fire; parked, and the
-    // owner is told instead of the job vanishing into a log line.
-    const third = hangingAgent();
-    const storeC = new CronStore(TEST_PATH);
-    const schedulerC = new CronScheduler(third.agent, storeC);
-    schedulerC.start();
-    await waitFor(() => expect(third.notices).toHaveLength(1));
-    await tick(schedulerC);
-    schedulerC.stop();
-
-    expect(third.calls).toHaveLength(0);
-    expect(third.notices[0]).toContain(`"send-the-order" [${job.id}]`);
-    expect(third.notices[0]).toContain("tomo cron remove <id>");
+    expect(second.calls).toHaveLength(0);
+    expect(second.notices[0]).toContain(`"send-the-order" [${job.id}]`);
+    expect(second.notices[0]).toContain("Should I run it again?");
+    expect(second.notices[0]).toContain("tomo cron remove <id>");
     const after = new CronStore(TEST_PATH).list()[0];
     expect(after.enabled).toBe(false);
     expect(after.nextRunAt).toBeNull();
@@ -339,12 +302,96 @@ describe("CronScheduler", () => {
     expect(after.interruptNotifiedAt).toBeGreaterThan(0);
 
     // Told once, not on every restart.
-    const fourth = hangingAgent();
-    const schedulerD = new CronScheduler(fourth.agent, new CronStore(TEST_PATH));
-    schedulerD.start();
+    const third = hangingAgent();
+    const schedulerC = new CronScheduler(third.agent, new CronStore(TEST_PATH));
+    schedulerC.start();
     await new Promise((r) => setTimeout(r, 30));
-    schedulerD.stop();
-    expect(fourth.notices).toHaveLength(0);
+    schedulerC.stop();
+    expect(third.notices).toHaveLength(0);
+  });
+
+  it("reports every unreported interruption of a recurring job, with its count, in the one DM", async () => {
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({ name: "rec", schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:alice" });
+    // Two crashes before any report went out.
+    store.markStarted(job.id);
+    new CronStore(TEST_PATH).recoverInterrupted();
+    new CronStore(TEST_PATH).markStarted(job.id);
+
+    const next = hangingAgent();
+    const scheduler = new CronScheduler(next.agent, new CronStore(TEST_PATH));
+    scheduler.start();
+    await waitFor(() => expect(next.notices).toHaveLength(1));
+    await tick(scheduler);
+    scheduler.stop();
+    expect(next.notices[0]).toContain('"rec"');
+    expect(next.notices[0]).toContain("interrupted 2 times");
+    expect(next.notices[0].match(/started /g)).toHaveLength(2);
+    expect(next.calls).toHaveLength(0);
+  });
+
+  it("after a crash, the owner report also covers the slots missed during the downtime", async () => {
+    const store = new CronStore(TEST_PATH);
+    const hour = 3_600_000;
+    const job = store.add({ name: "hourly", schedule: { kind: "every", everyMs: hour }, message: "x", sessionKey: "dm:alice" });
+    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    raw.jobs[0].nextRunAt = Date.now() - 4.5 * hour;
+    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    new CronStore(TEST_PATH).markStarted(job.id); // ...and the daemon died
+
+    const next = hangingAgent();
+    const scheduler = new CronScheduler(next.agent, new CronStore(TEST_PATH));
+    scheduler.start();
+    await waitFor(() => expect(next.notices).toHaveLength(1));
+    await tick(scheduler);
+    scheduler.stop();
+    expect(next.notices[0]).toContain('"hourly"');
+    expect(next.notices[0]).toContain("4 later scheduled runs missed while Tomo was down");
+    expect(next.notices[0]).toMatch(/missed while Tomo was down \(.+ to .+\), not run/);
+    expect(next.calls).toHaveLength(0);
+  });
+
+  it("an unexpected owner-report rejection is caught at the call site, not left unhandled", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      new CronStore(TEST_PATH).add({ name: "rec", schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:alice" });
+      const next = hangingAgent();
+      const scheduler = new CronScheduler(next.agent, new CronStore(TEST_PATH));
+      (scheduler as unknown as { reportToOwner(): Promise<void> }).reportToOwner = () => Promise.reject(new Error("report blew up"));
+      await tick(scheduler);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+      expect(vi.mocked(log.error)).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        "Cron owner report failed unexpectedly; will retry",
+      );
+      // The guard was released, so a later tick can try again.
+      expect((scheduler as unknown as { reportingToOwner: boolean }).reportingToOwner).toBe(false);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("reports parked one-shots and interrupted recurring runs in ONE owner DM", async () => {
+    const storeA = new CronStore(TEST_PATH);
+    storeA.add({ name: "rec", schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:alice" });
+    storeA.add({ name: "once", schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() }, message: "y", sessionKey: "dm:bob" });
+    makeJobsDue();
+    const first = hangingAgent();
+    void tick(new CronScheduler(first.agent, storeA));
+    await waitFor(() => expect(first.calls).toHaveLength(2));
+
+    const second = hangingAgent();
+    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
+    schedulerB.start();
+    await waitFor(() => expect(second.notices).toHaveLength(1));
+    await tick(schedulerB);
+    schedulerB.stop();
+    expect(second.notices[0]).toContain('"rec"');
+    expect(second.notices[0]).toContain('"once"');
+    expect(second.calls).toHaveLength(0);
   });
 
   it("does not retry a stale interrupted once job, and tells the owner", async () => {
@@ -597,12 +644,12 @@ describe("CronScheduler", () => {
     // ...and nothing overwrote the file we could not read.
     expect(readFileSync(TEST_PATH, "utf-8")).toBe("{ this is not json");
 
-    // The file is readable again: recovery lands and the job fires exactly
-    // once, with its marker.
+    // The file is readable again: recovery lands, settles the interrupted
+    // run, and the job is NOT re-fired.
     writeFileSync(TEST_PATH, goodFile);
-    void tick(schedulerB);
-    await waitFor(() => expect(second.calls).toHaveLength(1));
-    expect(bodies(second.calls)[0]).toContain("[resumed]");
+    await tick(schedulerB);
+    expect(second.calls).toHaveLength(0);
+    expect(new CronStore(TEST_PATH).list()[0].lastStatus).toBe("interrupted");
   });
 
   it("does not record an error when the turn succeeded and only the write failed", async () => {
@@ -719,64 +766,17 @@ describe("CronScheduler", () => {
     admin.setEnabled(job.id, true);
     expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
 
-    // Restart: the one-shot must still be recognised as interrupted, so its
-    // one retry carries the [resumed] marker rather than reading as a clean
-    // first fire.
+    // Restart: the one-shot must still be recognised as interrupted — parked
+    // and reported, not fired as if it had never run.
     const second = hangingAgent();
     const storeB = new CronStore(TEST_PATH);
     const schedulerB = new CronScheduler(second.agent, storeB);
     schedulerB.start();
-    await waitFor(() => expect(second.calls).toHaveLength(1));
+    await waitFor(() => expect(second.notices).toHaveLength(1));
+    await tick(schedulerB);
     schedulerB.stop();
-    expect(bodies(second.calls)[0]).toContain("[resumed]");
-  });
-
-  it("a disable/enable during a RESUMED recurring run does not erase the interruption", async () => {
-    const store = new CronStore(TEST_PATH);
-    const job = store.add({
-      name: "quiet-hours",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "Do the upgrade.",
-      sessionKey: "dm:alice",
-    });
-    makeJobsDue();
-
-    // Run 1 dies mid-turn.
-    const first = hangingAgent();
-    void tick(new CronScheduler(first.agent, store));
-    await waitFor(() => expect(first.calls).toHaveLength(1));
-
-    // Daemon 2 settles it and delivers the resumed fire — which also hangs.
-    const second = hangingAgent();
-    const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
-    schedulerB.start();
-    await waitFor(() => expect(second.calls).toHaveLength(1));
-    schedulerB.stop();
-    expect(bodies(second.calls)[0]).toContain("[resumed]");
-
-    // The toggle lands while that RESUMED run is still in flight. recovery
-    // leaves `lastStatus: "interrupted"` on a resumed recurring job, so a
-    // status-only gate would treat this live run as settled, acknowledge its
-    // token, and lose the interruption entirely.
-    const admin = new CronStore(TEST_PATH);
-    admin.setEnabled(job.id, false);
-    admin.setEnabled(job.id, true);
-    expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
-
-    // Daemon 3 must still see an interrupted run, and its fire must carry the
-    // marker. (Re-enabling pushed nextRunAt forward, so make it due again —
-    // the marker is persisted and waits for whenever the job next runs.)
-    const third = hangingAgent();
-    const storeC = new CronStore(TEST_PATH);
-    const schedulerC = new CronScheduler(third.agent, storeC);
-    schedulerC.start();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(storeC.list()[0].resumeAttempts).toBe(2);
-    makeJobsDue();
-    void tick(schedulerC);
-    await waitFor(() => expect(third.calls).toHaveLength(1));
-    schedulerC.stop();
-    expect(bodies(third.calls)[0]).toContain("[resumed]");
+    expect(second.calls).toHaveLength(0);
+    expect(storeB.list()[0].lastStatus).toBe("interrupted");
   });
 
   it("re-enabling a settled interrupted job clears it for good", async () => {

@@ -1,5 +1,5 @@
 import { CronStore, type StaleSkip } from "./store.js";
-import type { CronJob } from "./types.js";
+import type { CronJob, InterruptedRun } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
@@ -81,8 +81,9 @@ export class CronScheduler {
     // memory-only and nextRunAt only advances when a run completes, so a scan
     // that runs before recovery lands re-fires whatever was mid-turn when the
     // daemon went down (`tomo restart` from inside a cron turn being the
-    // common case) — a one-shot a second time, a recurring job without its
-    // [resumed] marker. If recovery cannot persist, skip the scan entirely
+    // common case) — re-running work that may have partly happened, which
+    // the policy forbids (see CronStore.recoverInterrupted). If recovery
+    // cannot persist, skip the scan entirely
     // and retry on the next tick; a late job beats a duplicated one.
     if (!this.ensureRecovered()) return;
 
@@ -95,13 +96,6 @@ export class CronScheduler {
       const skipped = this.store.skipStaleRuns(busy);
       for (const skip of skipped) logStaleSkip(skip);
       if (skipped.length > 0) this.nextOwnerReportAt = 0;
-      // A one-shot retry queued by recovery that still has not gone out
-      // (the scan or dispatch kept failing) and is now past its window.
-      const expired = this.store.expireStaleOneShotRetries(busy);
-      for (const job of expired) {
-        log.warn({ jobId: job.id, name: job.name }, "Cron one-shot retry went stale before it could run; disabled, owner will be told");
-      }
-      if (expired.length > 0) this.nextOwnerReportAt = 0;
     } catch (err) {
       log.error({ err }, "Cron staleness check failed");
     }
@@ -112,7 +106,13 @@ export class CronScheduler {
     if (!this.reportingToOwner && Date.now() >= this.nextOwnerReportAt) {
       this.nextOwnerReportAt = Date.now() + OWNER_REPORT_RETRY_MS;
       this.reportingToOwner = true;
-      void this.reportToOwner().finally(() => { this.reportingToOwner = false; });
+      // Caught HERE, at the call site: reportToOwner handles its expected
+      // failures itself, but anything unexpected escaping it must not become
+      // an unhandled rejection that takes the daemon down. Everything it would
+      // have reported is still pending on disk and is retried later.
+      void this.reportToOwner()
+        .catch((err: unknown) => { log.error({ err }, "Cron owner report failed unexpectedly; will retry"); })
+        .finally(() => { this.reportingToOwner = false; });
     }
 
     // The scan-and-dispatch below is synchronous (execute() marks the job
@@ -151,28 +151,20 @@ export class CronScheduler {
       return false;
     }
     this.recovered = true;
-    for (const { job, reason } of outcome.skipped) {
+    // Never re-run automatically (see CronStore.recoverInterrupted): both
+    // kinds are reported to the owner by reportToOwner.
+    for (const { job, reason } of outcome.parked) {
       log.warn(
         { jobId: job.id, name: job.name, startedAt: job.lastStartedAt, runId: job.lastRunId, reason },
-        reason === "once-stale"
-          ? "Cron one-shot was interrupted by a restart too long ago to retry; disabled, owner will be told"
-          : reason === "once-retried"
-            ? "Cron one-shot was interrupted again after its one retry; disabled, owner will be told"
-            : reason === "once-disabled"
-              ? "Cron one-shot was interrupted by a restart while disabled; not retried, owner will be told"
-              : "Cron job was interrupted on every recent resume; disabled to break the crash loop",
+        reason === "once-disabled"
+          ? "Cron one-shot was interrupted while disabled; parked, owner will be told"
+          : "Cron one-shot was interrupted before it finished; parked (not re-run), owner will be asked",
       );
     }
-    for (const job of outcome.resumed) {
+    for (const job of outcome.recurring) {
       log.warn(
-        {
-          jobId: job.id,
-          name: job.name,
-          startedAt: job.lastStartedAt,
-          runId: job.lastRunId,
-          attempt: job.resumeAttempts,
-        },
-        "Cron run was interrupted by a restart; next fire will be marked as resumed",
+        { jobId: job.id, name: job.name, startedAt: job.lastStartedAt, runId: job.lastRunId, nextRunAt: job.nextRunAt },
+        "Cron run was interrupted before it finished; recorded as interrupted, waiting for the next normal slot (no catch-up)",
       );
     }
     return true;
@@ -195,14 +187,16 @@ export class CronScheduler {
   private async reportToOwner(): Promise<void> {
     let parked: CronJob[];
     let skips: CronJob[];
+    let interrupted: CronJob[];
     try {
       parked = this.store.unreportedParkedOneShots();
       skips = this.store.unreportedSkips();
+      interrupted = this.store.unreportedInterruptedRecurring();
     } catch (err) {
       log.error({ err }, "Could not read skipped or parked cron jobs to report");
       return;
     }
-    if (parked.length === 0 && skips.length === 0) return;
+    if (parked.length === 0 && skips.length === 0 && interrupted.length === 0) return;
 
     const sections: string[] = [];
     if (skips.length > 0) {
@@ -222,17 +216,56 @@ export class CronScheduler {
     if (parked.length > 0) {
       sections.push([
         `${parked.length === 1 ? "A scheduled one-time task was" : `${parked.length} scheduled one-time tasks were`} ` +
-          "interrupted by a restart and will not run on their own:",
+          "interrupted by a restart and did NOT finish. It may have partly run, so it will not be re-run on its own:",
         ...parked.map((job) => {
           const started = job.lastStartedAt ?? job.lastRunAt;
-          const when = started ? ` (started ${new Date(started).toLocaleString()})` : "";
+          const interrupted = job.lastRunAt != null && job.lastRunAt !== started ? job.lastRunAt : null;
+          const when = started
+            ? ` (started ${new Date(started).toLocaleString()}${interrupted ? `, interrupted ${new Date(interrupted).toLocaleString()}` : ""})`
+            : "";
           return `- "${job.name}" [${job.id}]${when}: ${excerpt(job.message)}`;
         }),
-        "If one is still needed, ask me to do it now, or remove it with `tomo cron remove <id>`. (`tomo cron enable <id>` re-runs a dated one-shot right away; a recurring-pattern one waits for its next slot.)",
+        "Should I run it again? Tell me and I will do it now, or remove it with `tomo cron remove <id>`. (`tomo cron enable <id>` re-runs a dated one-shot right away; a recurring-pattern one waits for its next slot.)",
       ].join("\n"));
     }
-    const ids = { skipped: skips.map((job) => job.id), parked: parked.map((job) => job.id) };
+    if (interrupted.length > 0) {
+      sections.push([
+        `${interrupted.length === 1 ? "A recurring task's run was" : `${interrupted.length} recurring tasks' runs were`} ` +
+          "interrupted by a restart and did NOT finish. It may have partly run. It will not be re-run; " +
+          `${interrupted.length === 1 ? "the job continues" : "the jobs continue"} at the next normal time:`,
+        ...interrupted.map((job) => {
+          const { count, runs } = job.interruptNotice!;
+          const describe = ({ startedAt, interruptedAt, missed }: InterruptedRun) => {
+            const started = startedAt ? `started ${new Date(startedAt).toLocaleString()}, ` : "";
+            const stopped = interruptedAt
+              ? `interrupted ${new Date(interruptedAt).toLocaleString()}`
+              : "interrupted when Tomo went down (time unknown)";
+            const gap = missed && missed.count > 0
+              ? ` — ${missed.count} later scheduled run${missed.count === 1 ? "" : "s"} missed while Tomo was down (${
+                missed.count === 1
+                  ? new Date(missed.from).toLocaleString()
+                  : `${new Date(missed.from).toLocaleString()} to ${new Date(missed.to).toLocaleString()}`
+              }), not run`
+              : "";
+            return `${started}${stopped}${gap}`;
+          };
+          const times = count > 1 ? `interrupted ${count} times${runs.length < count ? ` (latest ${runs.length} shown)` : ""}: ` : "";
+          const next = job.nextRunAt ? `; next run ${new Date(job.nextRunAt).toLocaleString()}` : "";
+          return `- "${job.name}" [${job.id}]: ${times}${runs.map(describe).join("; ")}${next}`;
+        }),
+        "If the missed run is still needed, ask me to do it now.",
+      ].join("\n"));
+    }
+    const ids = {
+      skipped: skips.map((job) => job.id),
+      parked: parked.map((job) => job.id),
+      interrupted: interrupted.map((job) => job.id),
+    };
     const sentSkips = skips.map((job) => ({ id: job.id, notice: { ...job.skipNotice! } }));
+    const sentInterrupts = interrupted.map((job) => ({
+      id: job.id,
+      notice: { ...job.interruptNotice!, runs: [...job.interruptNotice!.runs] },
+    }));
     let delivered: boolean;
     try {
       // Owner only: the excerpts may come from any session's jobs.
@@ -254,6 +287,9 @@ export class CronScheduler {
     try { this.store.markInterruptNotified(ids.parked); } catch (err) {
       log.error({ err, jobIds: ids.parked }, "Could not record that interrupted cron one-shots were reported");
     }
+    try { this.store.markRecurringInterruptNoticesSent(sentInterrupts); } catch (err) {
+      log.error({ err, jobIds: ids.interrupted }, "Could not record that interrupted recurring cron runs were reported");
+    }
   }
 
   private async execute(jobId: string): Promise<void> {
@@ -264,6 +300,9 @@ export class CronScheduler {
     // which replaces the object `job` points at.
     const { name, message, sessionKey } = job;
     const interruptedAt = job.interruptedAt ?? null;
+    // What markStarted overwrites, for rolling it back if shutdown refuses the
+    // turn before it ever reaches the model.
+    const prior = { lastStartedAt: job.lastStartedAt ?? null, interruptedAt, lastStatus: job.lastStatus };
 
     // Everything past this point is inside the try, so no failure — including
     // a markStarted write error — can leave the job wedged in `inFlight`
@@ -274,8 +313,7 @@ export class CronScheduler {
       // synchronous, so it lands on disk within the same synchronous stretch
       // as the in-flight guard: a daemon killed at any point from here on
       // leaves an unacknowledged run token, which recovery reads on the next
-      // start. It also clears interruptedAt, so the marker below is delivered
-      // exactly once.
+      // start, and settles it as interrupted (never re-run automatically).
       const runId = this.store.markStarted(jobId);
       if (runId === undefined) {
         // Removed between the due-scan and dispatch (concurrent CLI/tool call).
@@ -286,7 +324,7 @@ export class CronScheduler {
 
       const cronMessage = formatTomoEvent(
         "cron",
-        `Scheduled task "${name}" triggered. ${message}` + resumedNote(interruptedAt),
+        `Scheduled task "${name}" triggered. ${message}`,
         { name },
       );
       // The turn's outcome and the recording of that outcome are separate
@@ -296,16 +334,54 @@ export class CronScheduler {
       // failure-retry path and runs twice). So the outcome is captured first
       // and persisted second, by a path that cannot invent an error.
       let ok: boolean;
+      let shutdown: "refused" | "interrupted" | undefined;
       try {
         // handleCronMessage never rejects — it reports the turn's outcome so
         // real agent failures land in lastStatus instead of reading as "ok".
         // waitForHandoff makes a run that is handed to a summoned session
         // resolve when that turn actually completes, not when it is queued.
-        ok = await this.agent.handleCronMessage(cronMessage, sessionKey, { waitForHandoff: true, jobName: name });
+        ok = await this.agent.handleCronMessage(cronMessage, sessionKey, {
+          waitForHandoff: true,
+          jobName: name,
+          onShutdown: (kind) => { shutdown = kind; },
+        });
       } catch (err) {
         // Unreachable by contract; a broken contract must not read as success.
         log.error({ err, jobId, runId }, "Cron turn rejected");
         ok = false;
+      }
+      // GRACEFUL SHUTDOWN IS NOT AN OUTCOME (audit P0-6). Before this, a run
+      // cut short by `tomo restart`/`update`/`stop` resolved as a successful
+      // NO_REPLY and was acked "ok" — a one-shot deleted with nothing
+      // delivered, a recurring job's half-done run recorded as complete.
+      //
+      // - refused before it reached the model: nothing happened, so
+      //   markStarted is rolled back and the job simply runs after the
+      //   restart, as scheduled;
+      // - cut short mid-turn (whoever asked for the restart, the job's own
+      //   turn included): it may have partly run, so it is NEVER re-run
+      //   automatically. A one-shot is parked and the owner is asked after the
+      //   restart; a recurring job records "interrupted" and waits for its
+      //   next normal slot.
+      if (shutdown === "refused") {
+        try {
+          this.store.rollbackStarted(jobId, runId, prior);
+          log.warn({ jobId, runId }, "Cron run refused by shutdown before it started; left due for after the restart");
+        } catch (err) {
+          log.error({ err, jobId, runId }, "Could not roll back a cron run refused by shutdown; recovery will treat it as interrupted");
+        }
+        return;
+      }
+      if (shutdown === "interrupted") {
+        try {
+          this.store.markInterruptedByShutdown(jobId, runId);
+          log.warn({ jobId, runId }, "Cron run cut short by shutdown; recorded as interrupted, will not be re-run automatically");
+        } catch (err) {
+          // The token stays unacknowledged; restart recovery settles it.
+          log.error({ err, jobId, runId }, "Could not record a cron run cut short by shutdown; restart recovery will settle it");
+        }
+        watchBus.publish({ type: "cron.done", jobId, name, ok: false });
+        return;
       }
       watchBus.publish({ type: "cron.done", jobId, name, ok });
       if (ok) {
@@ -373,24 +449,6 @@ export class CronScheduler {
       }
     }
   }
-}
-
-/**
- * Body suffix for a fire that is standing in for a run the previous daemon
- * never finished. The model has no other way to tell this apart from a normal
- * trigger, and the work may be half-done — say so explicitly rather than
- * letting a non-idempotent task (an order, an email, a message, a submission)
- * be repeated as if it had never happened.
- */
-function resumedNote(interruptedAt: number | null): string {
-  if (interruptedAt === null) return "";
-  return (
-    `\n\n[resumed] A previous run of this task started at ` +
-    `${new Date(interruptedAt).toISOString()} and never reported completion — ` +
-    `the daemon restarted mid-run. It may have finished, partly finished, or ` +
-    `done nothing. Check current state before repeating anything with side ` +
-    `effects (sending, posting, ordering, writing, submitting).`
-  );
 }
 
 function logStaleSkip({ job, lateByMs, windowMs }: StaleSkip): void {

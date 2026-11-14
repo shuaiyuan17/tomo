@@ -82,6 +82,38 @@ export interface CronJob {
    * its own. Set once, so the notice is not repeated on every restart.
    */
   interruptNotifiedAt?: number | null;
+  /**
+   * When a run of this job was last interrupted (restart, crash, kill).
+   * Unlike `lastStatus`, kept after later runs — the history of the
+   * interruption.
+   */
+  lastInterruptedAt?: number | null;
+  /**
+   * A RECURRING job's interrupted run the owner has not been told about yet.
+   * Durable, so the report survives a failed DM or another restart; `seq`
+   * makes an acknowledgement clear only what was actually reported.
+   */
+  interruptNotice?: InterruptNotice | null;
+}
+
+export interface InterruptNotice {
+  seq: number;
+  /** Interruptions not yet reported — a running total, never overwritten. */
+  count: number;
+  /** Each unreported interruption, oldest first (the newest
+   *  MAX_INTERRUPT_NOTICE_RUNS are kept; `count` stays exact). */
+  runs: InterruptedRun[];
+}
+
+export interface InterruptedRun {
+  startedAt: number | null;
+  /** Null when the daemon was not alive to see it (crash / kill). */
+  interruptedAt: number | null;
+  /**
+   * Later slots of this job that fell inside the downtime and were NOT run
+   * (no catch-up): how many, and the first and last of them. Absent when none.
+   */
+  missed?: { count: number; from: number; to: number };
 }
 
 export interface SkipNotice {
@@ -97,15 +129,13 @@ export type CronJobCreate = Pick<CronJob, "name" | "message" | "sessionKey"> & {
   staleAfterMs?: number;
 };
 
-/** A job recovery declined to fire again, and why. */
+/** A single-fire job recovery parked, and why. */
 export interface InterruptedSkip {
   job: CronJob;
   /**
-   * `once-stale`: a one-shot whose interrupted run is older than its
-   *   staleness window — too late to be worth a retry.
-   * `once-retried`: a one-shot already retried once after an interruption.
-   * `once-disabled`: a one-shot disabled (by someone) while its run was in flight.
-   * `resume-cap`: a recurring job was interrupted too many times running.
+   * `once-interrupted`: a single-fire job whose run was interrupted — parked,
+   *   never re-run automatically; the owner is asked.
+   * `once-disabled`: the same, for one disabled while its run was in flight.
    */
-  reason: "once-stale" | "once-retried" | "once-disabled" | "resume-cap";
+  reason: "once-interrupted" | "once-disabled";
 }

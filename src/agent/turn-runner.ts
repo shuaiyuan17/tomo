@@ -59,7 +59,16 @@ export interface RunWithRetryRequest {
    * Returns true if anything was recorded.
    */
   flushOnShutdown?: () => boolean;
+  /**
+   * Shutdown closed the session under this turn mid-flight and its rejection
+   * is being converted into a bare NO_REPLY (see LiveSessionManager). Lets the
+   * caller tell that apart from a turn that really ended silently.
+   */
+  onShutdownInterrupted?: () => void;
 }
+
+/** How graceful shutdown ended a turn — see `TurnSpec.onShutdown`. */
+export type ShutdownTurnEnd = "refused" | "interrupted";
 
 export { DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
@@ -208,6 +217,17 @@ export interface TurnSpec {
    * another one, whatever it ends on — one repair per episode, no chain.
    */
   restate?: boolean;
+  /**
+   * Graceful shutdown ended this turn, and its result is not a real outcome:
+   *
+   * - `"refused"`: the prompt never reached the model (`SHUTDOWN_NOT_PROCESSED`);
+   * - `"interrupted"`: the turn was mid-flight when its live session closed,
+   *   and LiveSessionManager resolved it as a bare NO_REPLY — which otherwise
+   *   reads as a successful silent turn.
+   *
+   * The cron scheduler uses it to avoid recording either as a finished run.
+   */
+  onShutdown?: (kind: ShutdownTurnEnd) => void;
 }
 
 /**
@@ -354,6 +374,7 @@ export class TurnRunner {
         onBlockAbandoned: sink.onBlockAbandoned,
         hasShipped: sink.hasShipped,
         flushOnShutdown: sink.flushBlockTranscript,
+        ...(spec.onShutdown ? { onShutdownInterrupted: () => spec.onShutdown?.("interrupted") } : {}),
         ...(reply
           ? {
             images: reply.images,
@@ -440,6 +461,7 @@ export class TurnRunner {
     // marker is a note to the transcript, not a reply, and the channels are
     // about to stop anyway. `false`: the turn did not run.
     if (response === SHUTDOWN_NOT_PROCESSED) {
+      spec.onShutdown?.("refused");
       await stopTyping({ clear: true });
       return false;
     }

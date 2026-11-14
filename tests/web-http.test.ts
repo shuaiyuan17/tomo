@@ -57,6 +57,7 @@ beforeEach(async () => {
       if (input.method === "request") return channel.request(input.requestId);
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
+      if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
   const response = await call(`/api/v1/bootstrap?t=${accessToken}`);
@@ -166,9 +167,23 @@ describe("local HTTP boundary", () => {
     // Other APIs still require the header.
     expect((await call("/api/v1/sessions", { headers: img })).status).toBe(403);
   });
+  it("serves plan usage through the daemon, passing a forced refresh", async () => {
+    const usage = vi.spyOn(channel, "usage");
+    const plain = await call("/api/v1/usage");
+    expect(plain.status).toBe(200);
+    expect(JSON.parse(plain.text)).toMatchObject({ state: "unavailable", windows: [] });
+    await call("/api/v1/usage?refresh=1");
+    expect(usage.mock.calls).toEqual([[false], [true]]);
+  });
+  it("turns a daemon that misses the usage deadline into a named timeout state", async () => {
+    vi.spyOn(channel, "usage").mockRejectedValueOnce(new (await import("../src/web/protocol.js")).WebError(503, "daemon_timeout"));
+    const res = await call("/api/v1/usage");
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text)).toMatchObject({ state: "timeout", windows: [] });
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
-      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`]) {
+      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage"]) {
       const result = await call(path, { headers: { cookie: undefined } });
       expect(result.status).toBe(401); expect(result.text).toBe('{"error":"authentication_required"}');
     }

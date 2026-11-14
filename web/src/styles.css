@@ -43,6 +43,7 @@
   --ring: #526346;
   --shimmer-base: #70665d;
   --shimmer-glint: #c3cfaf;
+  --warn: #a8661f;
   --radius: 0.75rem;
   /* Serif for the brand and Tomo's replies; Chinese always in PingFang (sans). */
   --font-serif: "Source Serif 4", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif;
@@ -71,6 +72,7 @@
   --ring: #c9a97a;
   --shimmer-base: #6f675c;
   --shimmer-glint: #fbf6ec;
+  --warn: #e0a15a;
 }
 
 @theme inline {
@@ -92,6 +94,7 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-warn: var(--warn);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);

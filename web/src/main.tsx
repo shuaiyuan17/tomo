@@ -7,6 +7,7 @@ import { Text } from "./markdown.js";
 import { MessageBody } from "./message-body.js";
 import { findQuoted, parseReply } from "./reply.js";
 import { TasksPanel } from "./tasks-panel.js";
+import { PlanUsage } from "./plan-usage.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
@@ -316,7 +317,7 @@ export function App() {
       </div>
     </header>
     <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
-      <aside className="flex w-[272px] shrink-0 flex-col gap-1 border-r px-6 py-8 max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
+      <aside className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
         aria-label="Conversation details" inert={modal}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5 max-[600px]:mb-0 max-[600px]:flex-row max-[600px]:gap-1">
           {([[null, "Conversation", MessageCircle], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
@@ -353,6 +354,7 @@ export function App() {
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
+        <PlanUsage ready={!!web.bootstrap} />
         {/* Theme: pinned to the bottom of the sidebar; in the phone-width top bar, one button at its end that cycles. */}
         <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:hidden">
           <span className="eyebrow">Theme</span>

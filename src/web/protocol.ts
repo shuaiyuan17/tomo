@@ -66,6 +66,45 @@ export interface SubagentBrief { text: string; truncated: boolean }
 export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
 export interface TaskOutput { output: string; size: number }
+/** One subscription usage window for the Plan usage card. */
+export interface WebUsageWindow {
+  id: string; label: string; group: "session" | "weekly" | "other"; scoped: boolean;
+  /** 0–100, or null. */
+  percent: number | null;
+  /** ms epoch, or null. */
+  resetsAt: number | null;
+  active: boolean; elevated: boolean;
+}
+/**
+ * Claude subscription usage, as the `/usage` command reads it. `state` names
+ * what happened: ok, empty (the endpoint returned no windows), or why it
+ * failed (no_token, network, timeout, http_error, …).
+ */
+export interface WebUsage {
+  state: "ok" | "empty" | "api_key" | "no_token" | "credentials_unreadable" | "token_expired" | "refresh_pending"
+    | "unauthorized" | "network" | "timeout" | "http_error" | "bad_response" | "unavailable";
+  message?: string;
+  windows: WebUsageWindow[];
+  plan?: string;
+  /** When the daemon last asked the endpoint (ms epoch). */
+  fetchedAt: number;
+  /** When the windows shown were read (ms epoch); null if never. */
+  updatedAt: number | null;
+  /** The windows are from an earlier read; the last attempt failed. */
+  stale?: boolean;
+  /** A forced refresh before this is served from cache. */
+  nextRefreshAt: number;
+  /** When the cached value expires (ms epoch): the card schedules its next read from this. */
+  expiresAt: number;
+  /** The daemon's clock when it answered: the browser converts every time above to its own clock with it. */
+  serverNow: number;
+}
+/**
+ * RPC deadline for `usage`: under the HTTP socket timeout (30 s), above the
+ * daemon's own usage deadline, so a slow endpoint becomes a "timeout" state
+ * rather than a dropped connection.
+ */
+export const USAGE_RPC_TIMEOUT_MS = 24_000;
 export type WebEvent =
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
@@ -137,6 +176,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("mcp-status") }).strict(),
   /** Compactions of one browser session seen on the watch bus. */
   z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
+  z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),

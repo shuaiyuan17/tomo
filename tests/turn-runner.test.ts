@@ -591,3 +591,25 @@ describe("undelivered reply at turn end", () => {
     expect(r.reads()).toBe(0);
   });
 });
+
+// LiveSession.renderBlock already drops a block ending in a bare NO_REPLY
+// before it reaches onBlock, and DeliveryPipeline's block sender refuses to
+// send one; TurnRunner checks again per block. This pins the TurnRunner layer
+// on its own, with a silentMatcher that would not catch it.
+describe("per-block trailing NO_REPLY in TurnRunner.onBlock", () => {
+  it("does not record a dropped NO_REPLY block as delivered (on-delivery transcript)", async () => {
+    // DeliveryPipeline's block sender would also refuse to send it, but the
+    // transcript slot is reserved here, before the send: only this check keeps
+    // the narration out of the record of what reached the chat.
+    const h = makeHarness(async (req) => {
+      await req.onBlock?.("Compacting context…\nNO_REPLY");
+      await req.onBlock?.("the real answer");
+      return "Compacting context…\nNO_REPLY\n\nthe real answer";
+    });
+
+    await h.runner.runTurn(sendSpec(h, { silentMatcher: () => false }));
+
+    expect(h.channel.sent.map((m) => m.text)).toEqual(["the real answer"]);
+    expect(h.transcript.map((t) => t.content)).toEqual(["the real answer"]);
+  });
+});

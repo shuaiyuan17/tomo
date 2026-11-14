@@ -112,9 +112,12 @@ function isImessageGroupGuid(id: string): boolean {
  * untouched. A value with no digits and no `@` is returned trimmed.
  */
 export function normalizeImessageHandle(raw: string): string {
-  let value = raw.trim().replace(HANDLE_URI_SCHEME_RE, "").trim();
+  let value = raw.trim();
   if (isImessageGroupGuid(value)) return value;
   if (value.includes(";-;")) value = (extractImessageIdentifier(value) ?? value).trim();
+  // After the GUID is reduced: the scheme can sit on the handle inside it
+  // (`iMessage;-;tel:+1…`) as well as on a bare handle.
+  value = value.replace(HANDLE_URI_SCHEME_RE, "").trim();
   if (value.includes("@")) return value.toLowerCase();
   // Only phone-shaped values are reduced to digits; anything else (a chat
   // identifier, a business-chat URN) stays as it is, so two unrelated ids

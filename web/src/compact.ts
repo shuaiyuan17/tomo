@@ -23,6 +23,9 @@ export function compactButton(opts: { ownerSession: boolean; running: number; re
   const { request } = opts;
   if (request?.state === "accepted") return { state: "requested", label: "Compact requested…" };
   if (request?.state === "done" && opts.now - opts.seenAt < COMPACT_DONE_MS) return { state: "done", label: "Compacted" };
+  if (request?.state === "unverified" && opts.now - opts.seenAt < COMPACT_NOTICE_MS) {
+    return { state: "ready", label: "Compact context", note: "Tomo finished, but no drop in context is visible yet — it may have skipped (tasks running)." };
+  }
   if (opts.running > 0) return { state: "busy", label: `${opts.running} ${opts.running === 1 ? "task" : "tasks"} running — wait for ${opts.running === 1 ? "it" : "them"} to finish` };
   const recent = opts.now - opts.seenAt < COMPACT_NOTICE_MS;
   if (request?.state === "failed" && recent) return { state: "ready", label: "Compact context", note: "The compact didn't finish. Try again." };

@@ -197,7 +197,8 @@ export interface WebTaskAccess { sessionKey: string; taskType: string; output?: 
 export interface WebCompactResult { status: "queued" | "already_requested"; requestId: string }
 /**
  * The latest compact request and where it stands: accepted (queued for
- * Tomo), declined (refused: tasks were running), done (Tomo's housekeeping
- * turn finished), failed (it did not).
+ * Tomo), declined (refused: tasks were running), done (the turn finished and
+ * the recorded context clearly dropped), unverified (the turn finished but
+ * no drop is visible — Tomo may have skipped it), failed (it did not finish).
  */
-export interface WebCompactState { requestId: string; state: "accepted" | "declined" | "done" | "failed"; at: number }
+export interface WebCompactState { requestId: string; state: "accepted" | "declined" | "done" | "unverified" | "failed"; at: number }

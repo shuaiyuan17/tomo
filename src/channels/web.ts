@@ -53,7 +53,7 @@ export class WebChannel implements Channel {
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
-  private readonly compact: ((sessionKey: string, onSettled: (ok: boolean) => void) => "queued" | "already_requested" | "no_owner") | undefined;
+  private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
@@ -82,7 +82,7 @@ export class WebChannel implements Channel {
       /** A Bash tool call's full command from the live session, by tool_use id. */
       toolCommand?: (sessionKey: string, toolUseId: string) => string | undefined;
       /** Queue an owner-requested compact of the given (owner) session; the agent runs it and reports back. */
-      compact?: (sessionKey: string, onSettled: (ok: boolean) => void) => "queued" | "already_requested" | "no_owner";
+      compact?: (sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner";
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
       /** Durable receipts; loaded here, before any request is accepted. */
@@ -253,8 +253,8 @@ export class WebChannel implements Channel {
       this.setCompactState({ requestId, state: "declined", at: Date.now() });
       throw new WebError(409, "tasks_running");
     }
-    const status = this.compact(key, (ok) => {
-      if (this.compactState?.requestId === requestId) this.setCompactState({ requestId, state: ok ? "done" : "failed", at: Date.now() });
+    const status = this.compact(key, (outcome) => {
+      if (this.compactState?.requestId === requestId) this.setCompactState({ requestId, state: outcome, at: Date.now() });
     });
     if (status === "no_owner") throw new WebError(409, "owner_setup_required");
     if (status === "already_requested") return { status, requestId: this.compactState?.requestId ?? requestId };

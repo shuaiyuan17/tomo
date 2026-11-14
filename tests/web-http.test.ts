@@ -183,7 +183,7 @@ describe("local HTTP boundary", () => {
     expect(JSON.parse(res.text)).toMatchObject({ state: "timeout", windows: [] });
   });
   it("compact requests need CSRF and the epoch, reach the owner's compact, and are refused while tasks run", async () => {
-    const compact = vi.fn((_key: string, _settled: (ok: boolean) => void) => "queued" as const);
+    const compact = vi.fn((_key: string, _settled: (outcome: "done" | "unverified" | "failed") => void) => "queued" as const);
     (channel as unknown as { compact: typeof compact }).compact = compact;
     const post = (headers: Record<string, string | undefined>) => call("/api/v1/compact-request", { method: "POST", headers, body: "{}" });
     expect((await post({ ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);

@@ -36,15 +36,16 @@ describe("owner-requested compact", () => {
     expect(text).toContain("NO_REPLY");
     finish(true);
     await new Promise((r) => setTimeout(r, 0));
-    expect(settled).toHaveBeenCalledWith(true);
+    // The turn finished but no context drop was recorded: not reported as done.
+    expect(settled).toHaveBeenCalledWith("unverified");
     expect(nudger.requestCompact("dm:owner")).toBe("queued");
   });
 
   it("the web channel targets the owner conversation the browser shows, refuses while tasks run, and publishes each request's state", async () => {
     const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
     const bus = new WatchBus();
-    const settle: Array<(ok: boolean) => void> = [];
-    const compact = vi.fn((_key: string, onSettled: (ok: boolean) => void) => { settle.push(onSettled); return "queued" as const; });
+    const settle: Array<(outcome: "done" | "unverified" | "failed") => void> = [];
+    const compact = vi.fn((_key: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => { settle.push(onSettled); return "queued" as const; });
     // A legacy owner key, as the catalog rule picks it before the canonical one exists.
     const channel = new WebChannel(owner, bus, { compact, ownerKey: () => "telegram:test-owner" });
     channels.push(channel);
@@ -57,7 +58,7 @@ describe("owner-requested compact", () => {
     expect(first.status).toBe("queued");
     expect(compact.mock.calls[0][0]).toBe("telegram:test-owner");
     expect(channel.snapshot().compact).toMatchObject({ requestId: first.requestId, state: "accepted" });
-    settle[0](true);
+    settle[0]("done");
     expect(channel.snapshot().compact).toMatchObject({ requestId: first.requestId, state: "done" });
     bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [task("w", { ambient: true }), task("a")] });
     expect(() => channel.requestCompact()).toThrow(expect.objectContaining({ status: 409, code: "tasks_running" }));
@@ -67,8 +68,17 @@ describe("owner-requested compact", () => {
   });
 });
 
+describe("compact outcome", () => {
+  it("done only when the recorded context clearly dropped", async () => {
+    const { compactOutcome } = await import("../src/agent/context-nudger.js");
+    expect(compactOutcome(150_000, 40_000)).toBe("done");
+    expect(compactOutcome(150_000, 149_000)).toBe("unverified");
+    expect(compactOutcome(0, 0)).toBe("unverified");
+  });
+});
+
 describe("compact button state", () => {
-  const req = (state: "accepted" | "declined" | "done" | "failed") => ({ requestId: "r", state, at: 0 });
+  const req = (state: "accepted" | "declined" | "done" | "unverified" | "failed") => ({ requestId: "r", state, at: 0 });
   it("follows the server's request state", () => {
     expect(compactButton({ ownerSession: false, running: 0, seenAt: 0, now: 0 }).state).toBe("hidden");
     expect(compactButton({ ownerSession: true, running: 0, seenAt: 0, now: 0 })).toEqual({ state: "ready", label: "Compact context" });
@@ -78,6 +88,7 @@ describe("compact button state", () => {
     expect(compactButton({ ownerSession: true, running: 0, request: req("done"), seenAt: 0, now: COMPACT_DONE_MS }).state).toBe("ready");
     expect(compactButton({ ownerSession: true, running: 0, request: req("failed"), seenAt: 0, now: 1 })).toMatchObject({ state: "ready", note: expect.stringContaining("didn't finish") });
     expect(compactButton({ ownerSession: true, running: 0, request: req("declined"), seenAt: 0, now: 1 })).toMatchObject({ note: expect.stringContaining("Tasks were running") });
+    expect(compactButton({ ownerSession: true, running: 0, request: req("unverified"), seenAt: 0, now: 1 })).toMatchObject({ state: "ready", note: expect.stringContaining("may have skipped") });
     expect(compactError("tasks_running")).toContain("Tasks are still running");
   });
 });

@@ -346,8 +346,9 @@ it("asks Tomo to compact from the context card, after a confirm; greyed out whil
   await page.getByRole("button", { name: "Compact context" }).click();
   await page.getByRole("button", { name: "Compact", exact: true }).click();
   await browserExpect.poll(() => mockSdk.promptsBySession.length).toBe(1);
-  // The server reports the request done once Tomo's housekeeping turn finishes.
-  await browserExpect(page.getByText("Compacted")).toBeVisible();
+  // The turn finished but the mock's context did not drop: reported as unverified, never as "Compacted".
+  await browserExpect(page.getByText(/may have skipped/)).toBeVisible();
+  await browserExpect(page.getByText("Compacted")).toHaveCount(0);
   expect(mockSdk.promptsBySession[0].sessionKey).toBe("dm:owner");
   expect(JSON.stringify(mockSdk.promptsBySession[0])).toContain("The owner requested a compact from the web UI.");
   expect(provider.delivered).toHaveLength(0);

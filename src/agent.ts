@@ -1084,7 +1084,7 @@ export class Agent {
    * ContextNudger.requestCompact). `sessionKey` is the owner conversation the
    * web shows (its catalog rule, possibly a legacy key), chosen by the caller.
    */
-  requestOwnerCompact(sessionKey: string, onSettled?: (ok: boolean) => void): "queued" | "already_requested" | "no_owner" {
+  requestOwnerCompact(sessionKey: string, onSettled?: (outcome: "done" | "unverified" | "failed") => void): "queued" | "already_requested" | "no_owner" {
     if (!config.owner) return "no_owner";
     return this.contextNudger.requestCompact(sessionKey, onSettled);
   }

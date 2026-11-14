@@ -123,6 +123,21 @@ export class SdkResultError extends Error {
  * reply says the turn was stopped. The message must not match the manager's
  * "session closed" patterns.
  */
+/**
+ * Owner browser input that was going to join a running turn, but the turn
+ * stopped being eligible (background work took over, a group was summoned in,
+ * the turn ended) before injection. Thrown BEFORE anything reaches the SDK, so
+ * the input is handed back to the session's FIFO queue as its own turn —
+ * never sent around that queue. Not a failure: nothing is delivered or
+ * recorded for it.
+ */
+export class SteerDeclinedError extends Error {
+  constructor() {
+    super("Steer declined: the running turn is no longer eligible");
+    this.name = "SteerDeclinedError";
+  }
+}
+
 export class TurnInterruptedError extends Error {
   constructor(message = "Turn stopped by /rewind.") {
     super(message);

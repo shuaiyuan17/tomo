@@ -695,7 +695,10 @@ export class SessionStore {
     }
 
     const file: PendingNotesFile = { version: 1, notes: data };
-    writeJsonAtomicSync(this.pendingNotesPath, file);
+    // fsynced: a queued note is something a later turn was promised (e.g. the
+    // interrupted-web-request notice, which is only recorded as given once
+    // this returns).
+    writeJsonAtomicSync(this.pendingNotesPath, file, { fsync: true });
   }
 
   // --- SDK Session Registry ---

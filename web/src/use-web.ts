@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
 import type { WebEvent, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
+import { trimRequests } from "./pending.js";
 
 export function useWeb() {
   const [bootstrap, setBootstrap] = useState<WebBootstrap>();
@@ -15,9 +16,24 @@ export function useWeb() {
     try { const value = await readBootstrap(); setBootstrap(value); return value; }
     catch (error) { if (error instanceof ApiError && error.status === 401) setConnection("locked"); throw error; }
   }, []);
-  const discardRecordedBlocks = useCallback((requestIds: Set<string>) => {
-    setBlocks((old) => old.some((block) => requestIds.has(block.requestId))
-      ? old.filter((block) => !requestIds.has(block.requestId)) : old);
+  /** Drops live blocks the canonical history now records. A block belongs to
+   *  the turn that wrote it (`turnId`), which differs from its request when the
+   *  request joined a running turn. */
+  const discardRecordedBlocks = useCallback((recordedIds: Set<string>) => {
+    setBlocks((old) => old.some((block) => recordedIds.has(block.turnId ?? block.requestId))
+      ? old.filter((block) => !recordedIds.has(block.turnId ?? block.requestId)) : old);
+  }, []);
+  /** The POST answer for a message this tab sent: its bubble shows at once,
+   *  before the request event or the transcript catches up (#381). */
+  const acceptRequest = useCallback((request: WebRequest) => {
+    setRequests((old) => {
+      const known = old.find((r) => r.requestId === request.requestId);
+      return trimRequests([...old.filter((r) => r.requestId !== request.requestId), { ...request, ...known, text: known ? known.text : request.text }]);
+    });
+  }, []);
+  /** The daemon's answer to a mutation of an existing request (dismiss): it replaces the local copy. */
+  const applyRequest = useCallback((request: WebRequest) => {
+    setRequests((old) => trimRequests([...old.filter((r) => r.requestId !== request.requestId), request]));
   }, []);
   useEffect(() => {
     const controller = new AbortController();
@@ -40,7 +56,7 @@ export function useWeb() {
     const update = (event: WebEvent) => {
       if (event.type === "block") setBlocks((old) => [...old.filter((b) => b.id !== event.id), event]);
       if (event.type === "request") {
-        setRequests((old) => [...old.filter((r) => r.requestId !== event.request.requestId), event.request].slice(-128));
+        setRequests((old) => trimRequests([...old.filter((r) => r.requestId !== event.request.requestId), event.request]));
         if (!["queued", "running"].includes(event.request.state)) refresh();
       }
       if (event.type === "invalidate") refresh();
@@ -70,5 +86,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, tasks, revision, discardRecordedBlocks, refreshBootstrap };
+  return { bootstrap, connection, blocks, requests, activity, tasks, revision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { ReplyContext, TurnRequest } from "./live-session.js";
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
 import { shortErrorMessage } from "../error-text.js";
@@ -5,6 +7,7 @@ import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
+import { SteerDeclinedError } from "./sdk-result.js";
 import { endsWithTrailingNoReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { isNothingSent, partsSent } from "../channels/types.js";
@@ -14,6 +17,10 @@ import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
+  replyContext?: ReplyContext;
+  onJoined?: TurnRequest["onJoined"];
+  /** See SteerJoin.onHandedOff. */
+  onHandedOff?: () => void;
   key: string;
   prompt: string;
   images?: Array<{ data: string; mediaType: string }>;
@@ -239,6 +246,14 @@ export interface OwnerNoticeTarget {
 }
 
 export interface TurnSpec {
+  replyContext?: ReplyContext;
+  joined?: boolean;
+  /** Owner web input reached the SDK's input queue (steer). From then on it
+   *  may have run, echo or not: never retried, and a failure is reported as
+   *  "outcome unknown", not as a definite failure. */
+  handedOff?: boolean;
+  /** Graceful shutdown converted this turn into NO_REPLY mid-flight. */
+  shutdownInterrupted?: boolean;
   requestId?: string;
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
@@ -292,9 +307,11 @@ export interface TurnSpec {
  */
 export interface TurnRunnerDeps {
   drainPendingNotes(sessionKey: string): string;
+  /** Put drained notes back: the turn they were drained for never ran. */
+  restorePendingNotes?(sessionKey: string, drained: string): void;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
-  appendAssistantTranscript(sessionKey: string, content: string, channelName: string): void;
+  appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
   /** Typing indicator with per-channel start delay (Agent.startTurnTyping). */
   startTurnTyping(channel: Channel, chatId: string, passiveListen?: boolean): StopTyping;
@@ -389,8 +406,11 @@ export class TurnRunner {
     const startedAt = Date.now();
     watchBus.publish({ type: "turn.start", sessionKey: spec.key, source: spec.source, ...(spec.requestId ? { requestId: spec.requestId } : {}) });
     let ok = false;
+    let declined = false;
+    let notes = "";
     try {
-      const prompt = this.deps.drainPendingNotes(spec.key)
+      notes = this.deps.drainPendingNotes(spec.key);
+      const prompt = notes
         + (spec.stampChannelName !== undefined
           ? injectTimestamp(spec.prompt, spec.stampChannelName, spec.stampSenderTimeZone)
           : spec.prompt);
@@ -398,18 +418,33 @@ export class TurnRunner {
       ok = await this.runDelivery(spec, prompt, stopTyping);
       return ok;
     } catch (err) {
+      // A steer declined before injection never became a turn: the caller
+      // hands it back to the session queue. Nothing to deliver or record.
+      if (err instanceof SteerDeclinedError) {
+        declined = true;
+        // Nothing reached the model: the notes drained for it go back.
+        if (notes) this.deps.restorePendingNotes?.(spec.key, notes);
+        await stopTyping({ clear: true });
+        if (spec.requestId) watchBus.publish({ type: "turn.requeue", sessionKey: spec.key, requestId: spec.requestId });
+        throw err;
+      }
       ok = await this.handleThrownError(spec, err, stopTyping);
       return ok;
     } finally {
-      this.deps.recordTurnOutcome?.(spec.key, ok);
-      watchBus.publish({
-        type: "turn.end",
-        ...(spec.requestId ? { requestId: spec.requestId } : {}),
-        sessionKey: spec.key,
-        source: spec.source,
-        ok,
-        durationMs: Date.now() - startedAt,
-      });
+      if (!declined) {
+        this.deps.recordTurnOutcome?.(spec.key, ok);
+        watchBus.publish({
+          type: "turn.end",
+          ...(spec.requestId ? { requestId: spec.requestId } : {}),
+          sessionKey: spec.key,
+          source: spec.source,
+          ok,
+          // Handed to the SDK, then the turn failed or was cut short: it may
+          // or may not have run. Never retried; the browser says so.
+          ...(spec.handedOff && (!ok || spec.shutdownInterrupted) ? { uncertain: true } : {}),
+          durationMs: Date.now() - startedAt,
+        });
+      }
     }
   }
 
@@ -421,6 +456,13 @@ export class TurnRunner {
    * same way. What is left for after the turn is only what genuinely needs the
    * whole response: the transcript, the log line, silence and error policy.
    */
+  private appendTranscript(spec: TurnSpec, content: string, channel: string): void {
+    if (spec.joined) return; // The original turn writes the shared reply once.
+    if (spec.requestId || spec.replyContext?.webJoined) this.deps.appendAssistantTranscript(spec.key, content, channel,
+      { requestId: spec.requestId, turnId: spec.replyContext!.turnId });
+    else this.deps.appendAssistantTranscript(spec.key, content, channel);
+  }
+
   private async runDelivery(
     spec: TurnSpec,
     prompt: string,
@@ -429,6 +471,9 @@ export class TurnRunner {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
 
+    const channel = delivery.kind === "deferred-send" ? "" : delivery.channel.name;
+    spec.replyContext = { turnId: spec.requestId ?? randomUUID(), channel, requestId: spec.requestId,
+      interactive: spec.source === "user" && delivery.kind === "reply" };
     const sink = this.makeBlockSink(spec);
     let rawResponse: string;
     try {
@@ -439,9 +484,20 @@ export class TurnRunner {
         silentDelivery: isSuppressed(delivery),
         onBlock: sink.onBlock,
         onBlockAbandoned: sink.onBlockAbandoned,
-        hasShipped: sink.hasShipped,
+        // Handed off counts as shipped: the manager must not re-run (or
+        // re-send) input the SDK may already be acting on.
+        hasShipped: () => spec.joined === true || spec.handedOff === true || sink.hasShipped(),
+        replyContext: spec.replyContext,
+        ...(spec.requestId && reply?.steer ? { onJoined: (parent: ReplyContext | undefined) => {
+          spec.joined = true;
+          watchBus.publish({ type: "turn.join", sessionKey: spec.key, requestId: spec.requestId!, turnId: parent?.turnId ?? spec.replyContext!.turnId });
+          return parent?.channel !== "web";
+        }, onHandedOff: () => {
+          spec.handedOff = true;
+          watchBus.publish({ type: "turn.handoff", sessionKey: spec.key, requestId: spec.requestId! });
+        } } : {}),
         flushOnShutdown: sink.flushBlockTranscript,
-        ...(spec.onShutdown ? { onShutdownInterrupted: () => spec.onShutdown?.("interrupted") } : {}),
+        onShutdownInterrupted: () => { spec.shutdownInterrupted = true; spec.onShutdown?.("interrupted"); },
         ...(reply
           ? {
             images: reply.images,
@@ -526,7 +582,7 @@ export class TurnRunner {
       // the joined response a false record: record the per-block entries
       // (which mark those pieces) instead.
       if (sink.withheldAny() || sink.deliveryFailed()) sink.flushBlockTranscript();
-      else this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
+      else this.appendTranscript(spec, response, reply.channel.name);
     }
 
     // SHUTDOWN REFUSED THIS TURN — the prompt never reached the model.
@@ -603,12 +659,12 @@ export class TurnRunner {
             },
           );
           if (spec.transcript === "on-delivery") {
-            this.deps.appendAssistantTranscript(spec.key, deliveredEntry(deliverText, receipt), target.channel.name);
+            this.appendTranscript(spec, deliveredEntry(deliverText, receipt), target.channel.name);
           }
         } catch (err) {
           if (spec.transcript === "on-delivery") {
-            this.deps.appendAssistantTranscript(
-              spec.key,
+            this.appendTranscript(
+              spec,
               `${DELIVERY_FAILED_MARKER}${deliverText}`,
               target.channel.name,
             );
@@ -703,7 +759,7 @@ export class TurnRunner {
     const transcript = createOrderedBlockTranscript(
       (entry) => {
         if (!channelName) return;
-        this.deps.appendAssistantTranscript(spec.key, entry, channelName);
+        this.appendTranscript(spec, entry, channelName);
         recordedAny = true;
       },
       { defer: spec.transcript !== "on-delivery" },
@@ -901,7 +957,7 @@ export class TurnRunner {
         // is also the entry that follows the turn's already-shipped blocks on a
         // turn that died mid-delivery, so recall reads back what the owner
         // actually saw: the blocks, then the failure.
-        this.deps.appendAssistantTranscript(spec.key, visibleError, target.channel.name);
+        this.appendTranscript(spec, visibleError, target.channel.name);
       }
     } finally {
       await stopTyping({ clear: true });

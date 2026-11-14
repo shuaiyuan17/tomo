@@ -1,4 +1,5 @@
-import { chmodSync, copyFileSync, existsSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, openSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export interface AtomicWriteOptions {
@@ -12,6 +13,9 @@ export interface AtomicWriteOptions {
    * rather than the whole serialize-and-write.
    */
   beforeRename?: () => void;
+  /** fsync the temp file before the rename and the directory after it, so
+   *  the new content survives a crash or power loss once this returns. */
+  fsync?: boolean;
 }
 
 export function writeFileAtomicSync(path: string, content: string, opts?: AtomicWriteOptions): void {
@@ -20,7 +24,10 @@ export function writeFileAtomicSync(path: string, content: string, opts?: Atomic
   // otherwise preserve the existing file's mode.
   const mode = opts?.mode ?? fileMode(path);
   try {
-    if (mode === undefined) {
+    if (opts?.fsync) {
+      const fd = openSync(tmp, "w", mode ?? 0o666);
+      try { writeSync(fd, content); fsyncSync(fd); } finally { closeSync(fd); }
+    } else if (mode === undefined) {
       writeFileSync(tmp, content);
     } else {
       writeFileSync(tmp, content, { mode });
@@ -28,6 +35,10 @@ export function writeFileAtomicSync(path: string, content: string, opts?: Atomic
     opts?.beforeRename?.();
     renameSync(tmp, path);
     if (mode !== undefined) chmodSync(path, mode);
+    if (opts?.fsync) {
+      // Advisory on filesystems that refuse a directory fsync.
+      try { const dir = openSync(dirname(path), "r"); try { fsyncSync(dir); } finally { closeSync(dir); } } catch { /* see above */ }
+    }
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
     throw err;

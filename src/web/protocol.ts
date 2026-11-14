@@ -25,8 +25,11 @@ export interface WebSession {
   lastActiveAt: number | null;
 }
 export interface WebCatalog { sessions: WebSession[]; ownerId: string | null; setupRequired: boolean }
-export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown";
-export interface WebRequest { requestId: string; state: RequestState; sessionId?: string }
+/** `unknown`: may or may not have run (handed to the SDK, then the turn
+ *  failed). `interrupted`: accepted, then the daemon restarted before it
+ *  settled; never re-run automatically. Neither is retried. */
+export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown" | "interrupted";
+export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean; text?: string; timestamp?: number }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
@@ -60,7 +63,7 @@ export interface SubagentPage { items: SubagentItem[]; start: number; end: numbe
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
 export interface TaskOutput { output: string; size: number }
 export type WebEvent =
-  | { type: "block"; sessionId: string; requestId: string; id: string; text: string }
+  | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
   | { type: "invalidate"; sessionId?: string }
   | { type: "tool"; sessionId: string; tool: string; state: "started" | "completed" | "failed" }
@@ -111,6 +114,8 @@ export class WebError extends Error {
 export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
   z.object({ method: z.literal("request"), requestId: z.uuid() }).strict(),
+  /** The owner dealt with an interrupted request (resent it or let it go). */
+  z.object({ method: z.literal("dismiss"), epoch: z.uuid(), requestId: z.uuid() }).strict(),
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
   /** SDK-reported MCP connection state of live sessions (bounded; never probes). */
   z.object({ method: z.literal("mcp-status") }).strict(),

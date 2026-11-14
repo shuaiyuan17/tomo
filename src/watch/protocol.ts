@@ -64,8 +64,13 @@ export type WatchEvent =
       sender?: string;
       text: string;
     }
+  | { type: "turn.join"; ts: number; sessionKey: string; requestId: string; turnId: string }
+  /** Owner web input reached the SDK input queue of a running turn. */
+  | { type: "turn.handoff"; ts: number; sessionKey: string; requestId: string }
+  /** A steer declined before injection went back to the session queue. */
+  | { type: "turn.requeue"; ts: number; sessionKey: string; requestId: string }
   | { type: "turn.start"; ts: number; sessionKey: string; source: TurnSource; requestId?: string }
-  | { type: "turn.end"; ts: number; sessionKey: string; source: TurnSource; ok: boolean; durationMs: number; requestId?: string }
+  | { type: "turn.end"; ts: number; sessionKey: string; source: TurnSource; ok: boolean; durationMs: number; requestId?: string; uncertain?: boolean }
   /** Per-query stats from the SDK result (cost, context) — follows turn.end. */
   | {
     type: "turn.stats"; ts: number; sessionKey: string; costUsd: number;

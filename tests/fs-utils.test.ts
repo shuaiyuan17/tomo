@@ -21,6 +21,20 @@ describe("fs utils", () => {
     }
   });
 
+  it("fsync mode writes the same content and keeps the file mode", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-fs-utils-"));
+    try {
+      const path = join(dir, "notes.json");
+      writeFileSync(path, "old\n");
+      chmodSync(path, 0o600);
+      writeJsonAtomicSync(path, { notes: ["a"] }, { fsync: true });
+      expect(JSON.parse(readFileSync(path, "utf-8"))).toEqual({ notes: ["a"] });
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("writes json atomically with trailing newline", () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-fs-utils-"));
     try {

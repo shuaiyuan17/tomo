@@ -22,6 +22,7 @@ import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
 import {
   STEER_MERGED,
+  SteerDeclinedError,
   cumulativeModelTokens,
   describeResultFailure,
   mainLoopUsage,
@@ -45,6 +46,7 @@ export {
   QUERY_TIMEOUT_ERROR_PREFIX,
   STEER_MERGED,
   SdkResultError,
+  SteerDeclinedError,
   TurnInterruptedError,
   describeResultFailure,
   type QueryResult,
@@ -67,7 +69,22 @@ export {
 } from "./block-render.js";
 export { summarizeToolInput } from "./tool-summary.js";
 
+export interface ReplyContext { turnId: string; channel: string; requestId?: string; webJoined?: boolean; interactive?: boolean }
+/** How owner web input joins a running turn (see LiveSession.steer). */
+export interface SteerJoin {
+  replyContext?: ReplyContext;
+  onJoined?: TurnRequest["onJoined"];
+  /** Re-checked synchronously right before injection. */
+  canJoin?: () => boolean;
+  /** Called synchronously once the input is in the SDK's input queue: from
+   *  then on it may run even with no echo, so it must never be re-sent. */
+  onHandedOff?: () => void;
+}
 export interface TurnRequest {
+  replyContext?: ReplyContext;
+  /** True opts this joined request into the existing block-delivery pipeline. */
+  onJoined?: (parent: ReplyContext | undefined) => boolean;
+  mirrorJoined?: boolean;
   resolve: (response: string) => void | Promise<void>;
   reject: (err: Error) => void | Promise<void>;
   /**
@@ -515,6 +532,11 @@ export class LiveSession {
     return this.currentRequest !== null || this.mergedRequests.length > 0 || this.pendingSteers.length > 0;
   }
 
+  /** The actual current turn, not a user request queued/merged behind system work. */
+  isInteractiveTurn(): boolean {
+    return this.currentRequest?.replyContext?.interactive === true && !this.currentRequest.silentDelivery;
+  }
+
   /**
    * Claim an SDK-initiated (unowned) turn for the session's default delivery
    * target, synchronously.
@@ -693,16 +715,28 @@ export class LiveSession {
     }
 
 
+    if (block.type === "text") this.undeliveredReplyPending = false;
+    await this.deliverCompletedBlock(req, rendered.text, outgoing);
+    // Browser clients share the same owner session: one web outlet per block,
+    // even when several requests joined. Provider delivery remains unchanged.
+    const seen = new Set([req.replyContext?.channel]);
+    for (const joined of this.mergedRequests) {
+      if (!joined.mirrorJoined || !joined.onBlock || seen.has(joined.replyContext?.channel)) continue;
+      seen.add(joined.replyContext?.channel);
+      await this.deliverCompletedBlock(joined, rendered.text, outgoing);
+    }
+  }
+
+  private async deliverCompletedBlock(req: TurnRequest, text: string, outgoing: string): Promise<void> {
     // A text block reaching the sink is the model having said its piece; any
     // earlier dropped-thinking episode is moot from here.
-    if (block.type === "text") this.undeliveredReplyPending = false;
     const outstanding: OutstandingDelivery = { req, abandoned: false };
     this.outstandingDelivery = outstanding;
     this.deliverySuspensions++;
     this.clearActivityTimeout();
     try {
       await withDeliveryTimeout(
-        Promise.resolve(onBlock(rendered.text, outgoing)),
+        Promise.resolve(req.onBlock!(text, outgoing)),
         DELIVERY_TIMEOUT_MS,
         `Block delivery timed out after ${formatTimeout(DELIVERY_TIMEOUT_MS)}`,
       );
@@ -914,7 +948,10 @@ export class LiveSession {
       // a clean run to cron.
       if (failure) await req?.reject(failure);
       else await req?.resolve(response);
-      for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
+      for (const m of this.mergedRequests) {
+        if (failure && m.onJoined) await m.reject(failure);
+        else await m.resolve(STEER_MERGED);
+      }
       this.mergedRequests = [];
       this.currentRequest = null;
       this.promotedSteerText = null;
@@ -1039,6 +1076,11 @@ export class LiveSession {
    *   - The promoted steer's own text echoed at its turn's start → the CLI
    *     batched the remaining queued steers into that promoted turn.
    */
+  private joinRequest(req: MessageRequest): void {
+    req.mirrorJoined = req.onJoined?.(this.currentRequest?.replyContext) ?? false;
+    if (req.onJoined && this.currentRequest?.replyContext) this.currentRequest.replyContext.webJoined = true;
+    this.mergedRequests.push(req);
+  }
   private matchSteerEchoes(content: unknown): void {
     if (this.pendingSteers.length === 0) return;
 
@@ -1057,14 +1099,14 @@ export class LiveSession {
           { session: this.sessionKey, count: this.pendingSteers.length },
           "Queued steered messages batched into the promoted turn",
         );
-        this.mergedRequests.push(...this.pendingSteers.map((e) => e.req));
+        for (const entry of this.pendingSteers) this.joinRequest(entry.req);
         this.pendingSteers = [];
         return;
       }
       const idx = this.pendingSteers.findIndex((e) => e.text === text);
       if (idx !== -1) {
         const [entry] = this.pendingSteers.splice(idx, 1);
-        this.mergedRequests.push(entry.req);
+        this.joinRequest(entry.req);
         log.info({ session: this.sessionKey }, "Steered message joined the in-flight turn");
       }
     }
@@ -1308,6 +1350,7 @@ export class LiveSession {
     origin?: SDKMessageOrigin,
     /** This turn's reply text will not be delivered (see TurnRequest). */
     silentDelivery?: boolean,
+    replyContext?: ReplyContext,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -1331,6 +1374,7 @@ export class LiveSession {
         ...(onBlock ? { onBlock } : {}),
         ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
         ...(silentDelivery ? { silentDelivery } : {}),
+        replyContext,
       };
       // Rejects only if the session dies before the claim; once claimed, the
       // turn's own resolve/reject settle this promise.
@@ -1360,9 +1404,19 @@ export class LiveSession {
      *  owner's dm: session. One entry per item, in the batch's own numbering
      *  order, for a coalesced batch. Defaults to this session's own key. */
     audience?: string[],
+    join: SteerJoin = {},
   ): Promise<string> {
+    const { replyContext, onJoined, canJoin, onHandedOff } = join;
     if (!this.alive) throw new Error("Session is closed");
-    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin);
+    // Ingress may have observed a different turn before asynchronous prompt /
+    // session preparation. Check at injection, with no await before enqueue.
+    // Missing audience evidence fails closed for the owner's browser input,
+    // which then goes back to the session's FIFO queue (SteerDeclinedError)
+    // rather than around it through send().
+    if (replyContext?.channel === "web" && (!this.isBusy() || !this.isInteractiveTurn() || canJoin?.() !== true)) {
+      throw new SteerDeclinedError();
+    }
+    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin, false, replyContext);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -1397,6 +1451,7 @@ export class LiveSession {
 
     return new Promise<string>((resolve, reject) => {
       const req: MessageRequest = {
+        replyContext, onJoined,
         // priority "next" is the CLI's default for queued commands; set it
         // explicitly so mid-turn injection (drained at tool boundaries via
         // getCommandsByMaxPriority("next")) doesn't depend on the default.
@@ -1416,6 +1471,7 @@ export class LiveSession {
       // what it echoes back, and matchSteerEchoes compares verbatim.
       this.pendingSteers.push({ req, text: injected });
       this.pushInput(req.message);
+      onHandedOff?.();
     });
   }
 

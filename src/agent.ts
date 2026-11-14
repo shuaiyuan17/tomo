@@ -31,7 +31,7 @@ import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js";
 import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
-import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
+import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
@@ -120,7 +120,10 @@ export class Agent {
   private queuedInbound = new Map<symbol, QueuedInboundWork>();
   /** Set once `recordUnprocessedInbound` has swept `queuedInbound`. */
   private inboundDrained = false;
-  private webRequestIds = new Map<string, string>();
+  /** Web requests whose turns are in flight per session. Several when owner
+   *  browser input joined a running turn (#382); provider batching never
+   *  steers into a session while this holds any. */
+  private webRequestIds = new Map<string, Set<string>>();
   private batcher = new InboundBatcher({
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
@@ -196,6 +199,7 @@ export class Agent {
     // time (tests replace it on the instance).
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
+      restorePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restore(sessionKey, drained),
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
       queueDeliveryFailureNote: (sessionKey, note) => this.queuePendingNote(
@@ -203,10 +207,10 @@ export class Agent {
         formatTomoEvent("errors", note, { name: "delivery" }),
       ),
       runWithRetry: (req) => this.runWithRetry(req),
-      appendAssistantTranscript: (sessionKey, content, channelName) => {
+      appendAssistantTranscript: (sessionKey, content, channelName, correlation) => {
         this.sessions.append(sessionKey, {
           role: "assistant",
-          ...(channelName === "web" ? { requestId: this.webRequestIds.get(sessionKey) } : {}),
+          ...correlation,
           content,
           channel: channelName,
           timestamp: Date.now(),
@@ -463,6 +467,37 @@ export class Agent {
   }
 
   /**
+   * Browser messages the previous run accepted and never finished (web
+   * request journal). They are NOT re-run — one may already have been handed
+   * to the model and partly acted on — so the owner's session is told once,
+   * on its next turn, and the browser shows them as interrupted.
+   */
+  /**
+   * Which of these browser requests already have their user message in the
+   * owner session's transcript (its recent tail). Read-only; a request not
+   * found keeps its interrupted text until the owner deals with it.
+   */
+  recordedWebRequests(requestIds: string[], chatId: string): Set<string> {
+    if (requestIds.length === 0) return new Set();
+    const wanted = new Set(requestIds);
+    try {
+      const key = this.router.resolve("web", chatId, false).sessionKey;
+      return new Set(this.sessions.get(key).messages.flatMap((m) => m.role === "user" && m.requestId && wanted.has(m.requestId) ? [m.requestId] : []));
+    } catch { return new Set(); }
+  }
+
+  /** Returns true once the note is durably queued (written and fsynced). */
+  noteInterruptedWebRequests(items: Array<{ timestamp: number; text?: string }>, chatId: string): boolean {
+    if (items.length === 0) return true;
+    const key = this.router.resolve("web", chatId, false).sessionKey;
+    const quoted = items.slice(-3).map((item) => item.text ? `- "${item.text.replace(/\s+/g, " ").slice(0, 160)}"` : "- (text not kept)");
+    return this.queuePendingNote(key, formatTomoEvent("web",
+      `${items.length} message${items.length === 1 ? "" : "s"} sent from the browser ${items.length === 1 ? "was" : "were"} accepted before Tomo restarted and never answered${items.length > 3 ? " (latest three)" : ""}:\n${quoted.join("\n")}\n`
+      + "They were not re-run automatically: one may already have been partly acted on. The browser marks them interrupted. If one still matters, check what was done and mention it to the owner before acting on it.",
+      { name: "interrupted" }));
+  }
+
+  /**
    * Daemon start: log the owner notices once (multi-identity pick, legacy
    * adoption, no owner, ignored allowlist DM entries), adopt a legacy
    * per-channel owner session if one is due, and make sure the owner's `dm:`
@@ -648,8 +683,18 @@ export class Agent {
     const sessionKey = resolution.sessionKey;
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
-    // Web turns have their own outlet: never steer them into a provider turn.
-    // Provider batching stays intact; its steering guard refuses a live web turn.
+    // Owner web input can join an active private user turn (#382). Replies
+    // stay on the turn's own outlet and are mirrored to the browser; group,
+    // summoned, silent and background work stays queued. LiveSession.steer
+    // checks eligibility again, synchronously, right before injection.
+    if (channel.name === "web" && config.steering && this.liveSessionManager.isBusy(sessionKey)
+      && this.isOwnAudienceTurn(sessionKey) && this.liveSessionManager.isInteractiveTurn(sessionKey)) {
+      void this.processInboundItems([{ channel, message, resolution }], true).catch((err) => {
+        channel.settleMessage?.(message.id, "unknown"); log.error({ err }, "Web steering failed");
+      });
+      return true;
+    }
+    // Provider batching never steers into a live web turn (canSteerIntoSession).
     const canCoalesce = (!isGroup || isPassiveGroup) && channel.name !== "web";
 
     if (!canCoalesce) {
@@ -740,7 +785,7 @@ export class Agent {
     }
 
     if (routed.length === 1) {
-      await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution);
+      await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded);
       return;
     }
     await this.handleBatchedMessages(routed, steer);
@@ -1040,7 +1085,10 @@ export class Agent {
   }
 
   private async runUserTurn(req: UserTurnRequest): Promise<void> {
-    if (req.webRequestId) this.webRequestIds.set(req.key, req.webRequestId);
+    if (req.webRequestId) {
+      const requests = this.webRequestIds.get(req.key) ?? new Set<string>();
+      requests.add(req.webRequestId); this.webRequestIds.set(req.key, requests);
+    }
     // Published for the duration of the turn so session-scoped MCP tools can
     // see where this turn's input actually came from. Registered per TURN, not
     // per session: turns overlap under steering, and a per-key slot let the
@@ -1052,7 +1100,10 @@ export class Agent {
       await this.runUserTurnInner(req);
     } finally {
       this.turnAudiences.end(req.key, turnId);
-      if (req.webRequestId) this.webRequestIds.delete(req.key);
+      if (req.webRequestId) {
+        const requests = this.webRequestIds.get(req.key); requests?.delete(req.webRequestId);
+        if (!requests?.size) this.webRequestIds.delete(req.key);
+      }
     }
   }
 
@@ -1143,6 +1194,7 @@ export class Agent {
     message: IncomingMessage,
     steer = false,
     receiptResolution?: SessionResolution,
+    userRecorded = false,
   ): Promise<void> {
     if (this.commands.isRestoring) {
       channel.settleMessage?.(message.id, "refused");
@@ -1201,7 +1253,7 @@ export class Agent {
     }
     this.recordLatestInboundMessage(key, channel, message);
 
-    this.sessions.append(key, {
+    if (!userRecorded) this.sessions.append(key, {
       role: "user",
       content: textForAgent,
       channel: channel.name,
@@ -1239,27 +1291,36 @@ export class Agent {
       ? `${textForAgent}\n${this.summonReminder([`${channel.name}:${message.chatId}`])}`
       : textForAgent);
 
-    await this.runUserTurn({
-      key,
-      promptText,
-      sourceChannelName: channel.name,
-      senderTimeZone: this.senderTimeZone(channel, message, people),
-      replyChannel,
-      // Reply-threading only makes sense when the reply lands in the chat the
-      // message came from — not for summoned groups (reply goes to the DM).
-      replyToMessageId: isGroup && replyChatId === message.chatId ? message.id : undefined,
-      replyChatId,
-      images: message.images,
-      documents: message.documents,
-      audiences,
-      suppressErrors: isPassiveGroup,
-      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
-      errorLogMessage: "Error handling message",
-      steer,
-      steerAudience: audience,
-      passiveListen: isPassiveGroup,
-      ...(channel.name === "web" ? { webRequestId: message.id } : {}),
-    });
+    try {
+      await this.runUserTurn({
+        key,
+        promptText,
+        sourceChannelName: channel.name,
+        senderTimeZone: this.senderTimeZone(channel, message, people),
+        replyChannel,
+        // Reply-threading only makes sense when the reply lands in the chat the
+        // message came from — not for summoned groups (reply goes to the DM).
+        replyToMessageId: isGroup && replyChatId === message.chatId ? message.id : undefined,
+        replyChatId,
+        images: message.images,
+        documents: message.documents,
+        audiences,
+        suppressErrors: isPassiveGroup,
+        ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
+        errorLogMessage: "Error handling message",
+        steer,
+        steerAudience: audience,
+        passiveListen: isPassiveGroup,
+        ...(channel.name === "web" ? { webRequestId: message.id } : {}),
+      });
+    } catch (err) {
+      if (!(err instanceof SteerDeclinedError)) throw err;
+      // Owner web input whose turn stopped being joinable before injection
+      // (nothing reached the SDK): back into the session's FIFO queue as its
+      // own turn, behind whatever is already waiting there — never around it.
+      log.info({ sessionKey: key }, "Web steer declined at injection; queued as its own turn");
+      this.enqueueInboundForSession(key, [{ channel, message, resolution, userRecorded: true }]);
+    }
   }
 
   /**
@@ -1917,8 +1978,8 @@ export class Agent {
     this.proactive.recordLatestInboundMessage(sessionKey, channel, message);
   }
 
-  private queuePendingNote(sessionKey: string, note: string): void {
-    this.pendingNotesQueue.queueNote(sessionKey, note);
+  private queuePendingNote(sessionKey: string, note: string): boolean {
+    return this.pendingNotesQueue.queueNote(sessionKey, note);
   }
 
   private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
@@ -2318,8 +2379,8 @@ export class Agent {
     // avoidable synchronous file read delays the exit.
     const people = createPeopleSnapshot();
     for (const [key, items] of pending) {
-      for (const { channel, message } of items) {
-        this.sessions.append(key, {
+      for (const { channel, message, userRecorded } of items) {
+        if (!userRecorded) this.sessions.append(key, {
           role: "user",
           content: this.formatGroupText(channel, message, key, people),
           channel: channel.name,

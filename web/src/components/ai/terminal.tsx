@@ -1,7 +1,8 @@
-/*
+/*!
  * Adapted from AI Elements `terminal.tsx` (https://github.com/vercel/ai-elements),
  * Copyright 2023 Vercel, Inc., licensed under the Apache License, Version 2.0
- * (http://www.apache.org/licenses/LICENSE-2.0).
+ * (http://www.apache.org/licenses/LICENSE-2.0; full text in web/public/THIRD_PARTY_LICENSES.txt, shipped as dist/web-assets/THIRD_PARTY_LICENSES.txt).
+ * Modified for tomo.
  * Changes: read-only (no clear/copy), escape sequences stripped to plain text
  * instead of `ansi-to-react`, follows the tail while the reader is at the
  * bottom, paper-palette styling.

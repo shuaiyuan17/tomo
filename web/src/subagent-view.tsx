@@ -6,7 +6,7 @@ import { Text } from "./markdown.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
 import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
-import { EMPTY_TRANSCRIPT, isOutputTask, mergePage, viewRows, type TranscriptState } from "./subagent.js";
+import { EMPTY_TRANSCRIPT, hasNewer, isOutputTask, mergePage, viewRows, type TranscriptState } from "./subagent.js";
 import { STATE_LABELS, taskKind } from "./tasks.js";
 
 /**
@@ -69,33 +69,43 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const restore = useRef<number | null>(null);
   const fetchPage = useCallback((query: string, signal?: AbortSignal) => api<SubagentPage>(`${base}/transcript${query}`, { signal }), [base]);
 
+  // Commit a new state synchronously too, so the loop below reads it at once.
+  const commit = useCallback((next: TranscriptState) => { stateRef.current = next; setState(next); }, []);
+  const [catchUp, setCatchUp] = useState(0);
+
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controller = new AbortController();
     const tail = async () => {
       const page = await fetchPage("", controller.signal);
-      if (!stopped) { setState(mergePage(EMPTY_TRANSCRIPT, page, "tail")); setStatus("ready"); }
+      if (!stopped) { commit(mergePage(EMPTY_TRANSCRIPT, page, "tail")); setStatus("ready"); }
     };
     const poll = async () => {
+      let progressed = false;
       try {
-        if (stateRef.current.end === 0) await tail();
+        if (stateRef.current.end === 0 && stateRef.current.size === 0) await tail();
         else {
-          const page = await fetchPage(`?after=${stateRef.current.end}`, controller.signal);
-          if (!stopped) setState((old) => mergePage(old, page, "newer"));
+          const before = stateRef.current.end;
+          const page = await fetchPage(`?after=${before}`, controller.signal);
+          if (!stopped) { commit(mergePage(stateRef.current, page, "newer")); progressed = stateRef.current.end > before; }
         }
       } catch (error) {
         if (stopped) return;
         if (error instanceof ApiError && error.status === 409) { await tail().catch(() => {}); }
-        else if (error instanceof ApiError && error.status === 404) { if (stateRef.current === EMPTY_TRANSCRIPT) setStatus("missing"); }
-        else if (stateRef.current === EMPTY_TRANSCRIPT) setStatus("error");
+        else if (error instanceof ApiError && error.status === 404) { if (stateRef.current.size === 0) setStatus("missing"); }
+        else if (stateRef.current.size === 0) setStatus("error");
       }
-      // One more read after the task ends picks up its last lines; then stop.
-      if (!stopped && running) timer = setTimeout(() => void poll(), POLL_MS);
+      if (stopped) return;
+      // Behind the file's end (a long backlog, or the end was rolled back to
+      // free memory): keep reading straight away until caught up — also after
+      // the task ended. While it runs, then poll for new lines.
+      if (progressed && hasNewer(stateRef.current)) timer = setTimeout(() => void poll(), 0);
+      else if (running) timer = setTimeout(() => void poll(), POLL_MS);
     };
     void poll();
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
-  }, [fetchPage, running]);
+  }, [fetchPage, running, commit, catchUp]);
 
   useLayoutEffect(() => {
     const element = scroll.current;
@@ -111,7 +121,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
       const page = await fetchPage(`?before=${state.start}`);
       const element = scroll.current;
       if (element) restore.current = element.scrollHeight - element.scrollTop;
-      setState((old) => mergePage(old, page, "older"));
+      commit(mergePage(stateRef.current, page, "older"));
     } catch { /* The button stays; trying again is harmless. */ }
     finally { setLoadingOlder(false); }
   };
@@ -131,6 +141,8 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
             {row.result && <ToolSection label={row.result.isError ? "Error" : "Output"} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
           </ToolContent>
         </Tool>)}
+    {status === "ready" && !running && hasNewer(state) && <Button variant="outline" size="sm" className="mx-auto mt-2 flex h-7 rounded-full text-[11px]"
+      onClick={() => setCatchUp((n) => n + 1)}>Load newer</Button>}
   </div>;
 }
 

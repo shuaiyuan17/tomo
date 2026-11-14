@@ -46,6 +46,8 @@ export class TaskBoard {
   private sessions = new Map<string, Map<string, WebTask>>();
   /** What the browser was last sent, per session (bounded by MAX_BOARD_TASKS). */
   private shown = new Map<string, WebTask[]>();
+  /** For each shown browser session: task id → the slot it came from. */
+  private shownSlots = new Map<string, Map<string, string>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly now: () => number;
   private readonly retainMs: number;
@@ -73,18 +75,16 @@ export class TaskBoard {
 
 
   /**
-   * A task the browser can see right now, by its browser session id: the
-   * slot it is stored under and its type. Uses the same one-snapshot router
-   * as `publish`, so nothing hidden from the panel can be opened.
+   * A task the browser can see right now, by its browser session id: exactly
+   * the set the last `publish` sent (expiry, the owner rule and the capacity
+   * share all applied) — re-run first, so it is current. Returns the slot it
+   * is stored under. Nothing the panel does not show can be opened.
    */
   locate(sessionId: string, taskId: string): { slot: string; task: WebTask } | undefined {
-    const route = this.router();
-    for (const [slot, tasks] of this.sessions) {
-      if (route(slot) !== sessionId) continue;
-      const task = tasks.get(taskId);
-      if (task) return { slot, task: { ...task, sessionId } };
-    }
-    return undefined;
+    this.publish();
+    const slot = this.shownSlots.get(sessionId)?.get(taskId);
+    const task = this.shown.get(sessionId)?.find((t) => t.taskId === taskId);
+    return slot !== undefined && task ? { slot, task: { ...task } } : undefined;
   }
 
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
@@ -183,10 +183,15 @@ export class TaskBoard {
       }
     }
     const out = new Map<string, WebTask[]>();
+    const slots = new Map<string, Map<string, string>>();
     for (const [slot, tasks] of picked) {
       const target = targets.get(slot)!;
       out.set(target, [...(out.get(target) ?? []), ...tasks.map((task) => ({ ...task, sessionId: target }))]);
+      const bySlot = slots.get(target) ?? new Map<string, string>();
+      for (const task of tasks) bySlot.set(task.taskId, slot);
+      slots.set(target, bySlot);
     }
+    this.shownSlots = slots;
     for (const id of new Set([...this.shown.keys(), ...out.keys()])) {
       const list = out.get(id) ?? [];
       const before = this.shown.get(id) ?? [];

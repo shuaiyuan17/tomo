@@ -147,6 +147,26 @@ describe("TaskBoard", () => {
     b.dispose();
   });
 
+  it("locate() finds only tasks the panel shows: not crowded out, not expired, not hidden", () => {
+    vi.useFakeTimers({ now: 0 });
+    let hidden = false;
+    const b = new TaskBoard(() => {}, { router: () => (slot) => (hidden && slot === "s" ? undefined : slot) });
+    b.apply("s", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`s${i}`, { startedAt: i })));
+    b.apply("t", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`t${i}`, { startedAt: i })));
+    b.apply("u", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`u${i}`, { startedAt: i })));
+    const shown = new Set(b.snapshot().map((t) => t.taskId));
+    const crowded = ["s", "t", "u"].flatMap((p) => Array.from({ length: MAX_SESSION_TASKS }, (_, i) => `${p}${i}`)).find((id) => !shown.has(id))!;
+    const session = crowded[0];
+    expect(b.locate(session, crowded)).toBeUndefined();
+    expect(b.locate("s", "s0")).toMatchObject({ slot: "s", task: { taskId: "s0" } });
+    b.apply("t", []);
+    vi.advanceTimersByTime(TASK_RETENTION_MS);
+    expect(b.locate("t", "t0")).toBeUndefined();
+    hidden = true;
+    expect(b.locate("s", "s0")).toBeUndefined();
+    b.dispose();
+  });
+
   it("drops tasks with unbounded ids", () => {
     const { b } = board();
     b.apply("s", [task("ok", { parentTaskId: "p".repeat(500) }), task("x".repeat(500))]);

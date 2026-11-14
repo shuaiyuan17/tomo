@@ -23,6 +23,8 @@ export const MAX_LINE_BYTES = 8 * 1024 * 1024;
 export const TEXT_LIMIT = 8_000;
 export const IO_LIMIT = 4_000;
 export const MAX_PAGE_ITEMS = 400;
+/** Blocks shown from one transcript entry; the rest is summarised by a marker. */
+export const MAX_LINE_ITEMS = 400;
 const TASK_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const SDK_SESSION_ID = /^[A-Za-z0-9-]{1,80}$/;
 
@@ -61,7 +63,10 @@ export function itemsFromLine(line: string, offset: number): SubagentItem[] {
   if (!Array.isArray(content)) return [];
   const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
   const items: SubagentItem[] = [];
-  content.forEach((block: unknown, index: number) => {
+  // One entry is always returned whole (pages never split a line); an entry
+  // with more blocks than the cap says how many were left out.
+  const hidden = Math.max(0, content.length - MAX_LINE_ITEMS);
+  content.slice(0, MAX_LINE_ITEMS).forEach((block: unknown, index: number) => {
     if (!block || typeof block !== "object") return;
     const b = block as Record<string, unknown>;
     const id = `${offset}:${index}`;
@@ -79,6 +84,7 @@ export function itemsFromLine(line: string, offset: number): SubagentItem[] {
       items.push({ kind: "result", id, toolUseId: b.tool_use_id, output: text, truncated, isError: b.is_error === true });
     }
   });
+  if (hidden) items.push({ kind: "text", id: `${offset}:more`, text: `… ${hidden} more entries in this step are not shown.`, truncated: true });
   return items;
 }
 
@@ -157,19 +163,23 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
     const page = cursor.after !== undefined
       ? await window(fd, size, cursor.after, Math.min(size, cursor.after + PAGE_BYTES), "forward")
       : await window(fd, size, Math.max(0, (cursor.before ?? size) - PAGE_BYTES), cursor.before ?? size, "back");
-    let items = page.lines.flatMap((line) => itemsFromLine(line.text, line.offset));
-    let start = page.start;
-    if (items.length > MAX_PAGE_ITEMS) {
-      // Keep the newest items of a backwards page, the oldest of a forward one.
-      if (cursor.after !== undefined) items = items.slice(0, MAX_PAGE_ITEMS);
-      else {
-        items = items.slice(-MAX_PAGE_ITEMS);
-        start = Number(items[0].id.split(":")[0]);
-      }
+    // Whole lines only, stopping once a page holds MAX_PAGE_ITEMS: forward
+    // pages keep their oldest lines, backward pages their newest. The cursor
+    // moves to the edge of the last line kept, so nothing is skipped.
+    const perLine = page.lines.map((line) => ({ line, items: itemsFromLine(line.text, line.offset) }));
+    const ordered = cursor.after !== undefined ? perLine : [...perLine].reverse();
+    const kept: typeof perLine = [];
+    let count = 0;
+    for (const entry of ordered) {
+      if (kept.length && count + entry.items.length > MAX_PAGE_ITEMS) break;
+      kept.push(entry);
+      count += entry.items.length;
     }
-    const end = cursor.after !== undefined && items.length === MAX_PAGE_ITEMS
-      ? Math.max(...page.lines.filter((l) => l.offset <= Number(items.at(-1)!.id.split(":")[0])).map((l) => l.offset + l.bytes))
-      : page.end;
+    if (cursor.after === undefined) kept.reverse();
+    const items = kept.flatMap((entry) => entry.items);
+    const all = kept.length === perLine.length;
+    const start = all || cursor.after !== undefined ? page.start : kept[0].line.offset;
+    const end = all || cursor.after === undefined ? page.end : kept.at(-1)!.line.offset + kept.at(-1)!.line.bytes;
     return { items, start, end, size, hasEarlier: start > 0 };
   } finally { await fd.close(); }
 }

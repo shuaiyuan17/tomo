@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IO_LIMIT, itemsFromLine, MAX_LINE_BYTES, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
+import { IO_LIMIT, itemsFromLine, MAX_LINE_BYTES, MAX_LINE_ITEMS, MAX_PAGE_ITEMS, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
 
 let root: string;
 let dir: string;
@@ -81,6 +81,28 @@ describe("readSubagentPage", () => {
     let page = forward;
     for (let i = 0; i < 4 && !page.items.length; i++) page = await readSubagentPage(dir, SDK, "a1", { after: page.end });
     expect(page.items.map((x) => (x as { text: string }).text)).toEqual(["small"]);
+  });
+
+  it("never splits an entry: a page cap moves the cursor to a line edge, and an oversized entry says what it left out", async () => {
+    const many = (n: number, tag: string) => line("assistant", Array.from({ length: n }, (_, i) => ({ type: "text", text: `${tag}${i}` })));
+    writeFileSync(file(), many(300, "a") + many(300, "b") + many(MAX_LINE_ITEMS + 50, "c"));
+    const seen: string[] = [];
+    let page = await readSubagentPage(dir, SDK, "a1", { after: 0 });
+    for (let i = 0; i < 5; i++) {
+      seen.push(...page.items.map((x) => (x as { text: string }).text));
+      if (page.end >= page.size) break;
+      page = await readSubagentPage(dir, SDK, "a1", { after: page.end });
+    }
+    expect(page.end).toBe(page.size);
+    // Every block of a and b, the first MAX_LINE_ITEMS of c, and the marker: nothing silently lost.
+    expect(seen.filter((t) => t.startsWith("a"))).toHaveLength(300);
+    expect(seen.filter((t) => t.startsWith("b"))).toHaveLength(300);
+    expect(seen.filter((t) => /^c\d/.test(t))).toHaveLength(MAX_LINE_ITEMS);
+    expect(seen.at(-1)).toBe("… 50 more entries in this step are not shown.");
+    // The newest page backwards also stops at a whole line.
+    const tail = await readSubagentPage(dir, SDK, "a1");
+    expect(tail.items.length).toBeLessThanOrEqual(MAX_PAGE_ITEMS + 1);
+    expect(tail.items[0].id.endsWith(":0")).toBe(true);
   });
 
   it("rejects bad ids, escapes and stale cursors", async () => {

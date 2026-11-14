@@ -45,6 +45,7 @@ export type TomoEventType =
   | "delegate"         // compose-and-send request from another session
   | "undelivered-reply" // the last turn ended on a reply written in a thinking block; say it as text
   | "web"              // browser-channel notice (name = interrupted)
+  | "inbox"            // durable-inbox replay after a restart (name = replay|interrupted)
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

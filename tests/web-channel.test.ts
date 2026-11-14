@@ -306,16 +306,16 @@ describe("web task panel feed", () => {
   it("looks up a subagent's model with bounded retries, also for a task that ended quickly, and caches it", async () => {
     vi.useFakeTimers({ now: 0 });
     try {
-      let model: string | undefined;
+      const found: { model?: string } = {};
       const lookups: string[] = [];
-      const { channel, bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return model; }, () => Date.now());
+      const { channel, bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return found.model; }, () => Date.now());
       bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1"), { ...live("b1"), taskType: "local_bash" }] });
       await vi.advanceTimersByTimeAsync(0);
       expect(lookups).toEqual(["a1"]);
       // The short task ends before its first assistant entry was found.
       await vi.advanceTimersByTimeAsync(500);
       bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a1", status: "completed" }] });
-      model = "claude-opus-5-5";
+      found.model = "claude-opus-5-5";
       await vi.advanceTimersByTimeAsync(600); // the 1 s retry
       expect(lookups).toEqual(["a1", "a1"]);
       const a1 = channel.snapshot().tasks.find((t) => t.taskId === "a1")!;

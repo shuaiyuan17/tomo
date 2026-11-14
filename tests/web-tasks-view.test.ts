@@ -86,4 +86,14 @@ describe("task panel view", () => {
     const one = buildTaskView([task("p"), sh("s1")], sessions, false).groups[0].rows;
     expect(one.map((r) => r.folded ? "folded" : r.task.taskId)).toEqual(["p", "s1"]);
   });
+
+  it("orphaned finished shells fold per original parent, with keys that survive updates", () => {
+    const sh = (id: string, parent: string, startedAt: number) => task(id, { taskType: "local_bash", parentTaskId: parent, state: "completed", endedAt: 1, startedAt });
+    const first = buildTaskView([sh("a1", "gone-A", 1), sh("a2", "gone-A", 2), sh("b1", "gone-B", 3), sh("b2", "gone-B", 4)], sessions, false).groups[0].rows;
+    expect(first.map((r) => [r.foldKey, r.folded?.map((t) => t.taskId)])).toEqual([["orphan:gone-A", ["a1", "a2"]], ["orphan:gone-B", ["b1", "b2"]]]);
+    const later = buildTaskView([sh("a1", "gone-A", 1), sh("a2", "gone-A", 2), sh("a3", "gone-A", 5), sh("b1", "gone-B", 3), sh("b2", "gone-B", 4)], sessions, false).groups[0].rows;
+    expect(later.map((r) => [r.foldKey, r.folded?.length])).toEqual([["orphan:gone-A", 3], ["orphan:gone-B", 2]]);
+    const nested = buildTaskView([task("p"), sh("c1", "p", 1), sh("c2", "p", 2)], sessions, false).groups[0].rows;
+    expect(nested.at(-1)!.foldKey).toBe("p");
+  });
 });

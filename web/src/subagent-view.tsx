@@ -37,7 +37,7 @@ export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => vo
         : <>{task.description || "Untitled task"}<ModelBadge model={task.model} className="align-[2px]" /></>}</h2>
       <p className="m-0 mt-0.5 font-mono text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
     </div>
-    {isShellTask(task.taskType) && task.description && <CommandBrief command={task.description} />}
+    {isShellTask(task.taskType) && <CommandBrief base={base} fallback={task.description} />}
     {isOutputTask(task.taskType) ? <OutputTail base={base} running={running} /> : <Transcript base={base} running={running} />}
   </section>;
 }

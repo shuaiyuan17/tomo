@@ -7,7 +7,9 @@ import { isShellTask } from "./shell.js";
  * A task row, or — for two or more finished shell commands under the same
  * parent — one folded row ("3 shell commands done") listing them in `folded`.
  */
-export interface TaskRow { task: WebTask; depth: number; folded?: WebTask[] }
+export interface TaskRow { task: WebTask; depth: number; folded?: WebTask[];
+  /** Stable key of a folded row: its parent's id, or `orphan:<id>` when that parent left the list. */
+  foldKey?: string }
 export interface TaskGroup { sessionId: string; title: string; kind: "dm" | "group"; rows: TaskRow[] }
 export interface TaskView { groups: TaskGroup[]; running: number; hiddenAmbient: number }
 
@@ -90,20 +92,29 @@ function tree(list: WebTask[]): TaskRow[] {
     if (placed.has(task.taskId)) return;
     placed.add(task.taskId);
     rows.push({ task, depth: Math.min(depth, MAX_TASK_DEPTH) });
-    visitAll(children.get(task.taskId) ?? [], depth + 1);
+    visitAll(children.get(task.taskId) ?? [], depth + 1, task.taskId);
   };
   // Finished shell commands under one parent fold into a single row after
   // their running siblings; running ones always show.
-  const visitAll = (siblings: WebTask[], depth: number) => {
+  // Top-level tasks whose parent left the list are grouped by that parent,
+  // never merged with another parent's or with true roots.
+  const visitAll = (siblings: WebTask[], depth: number, parentKey: string) => {
     const done = siblings.filter((t) => isShellTask(t.taskType) && t.state !== "running" && !children.has(t.taskId));
-    const folded = done.length >= 2 ? new Set(done.map((t) => t.taskId)) : new Set<string>();
+    const byParent = new Map<string, WebTask[]>();
+    for (const t of done) {
+      const key = parentKey || (t.parentTaskId ? `orphan:${t.parentTaskId}` : "root");
+      byParent.set(key, [...(byParent.get(key) ?? []), t]);
+    }
+    const folded = new Set<string>();
+    for (const list of byParent.values()) if (list.length >= 2) for (const t of list) folded.add(t.taskId);
     for (const sibling of siblings) if (!folded.has(sibling.taskId)) visit(sibling, depth);
-    if (folded.size) {
-      for (const t of done) placed.add(t.taskId);
-      rows.push({ task: done[0], depth: Math.min(depth, MAX_TASK_DEPTH), folded: done });
+    for (const [key, list] of byParent) {
+      if (list.length < 2) continue;
+      for (const t of list) placed.add(t.taskId);
+      rows.push({ task: list[0], depth: Math.min(depth, MAX_TASK_DEPTH), folded: list, foldKey: key });
     }
   };
-  visitAll(roots, 0);
+  visitAll(roots, 0, "");
   // A parent cycle has no root; show its members rather than drop them.
   for (const task of list) visit(task, 0);
   return rows;

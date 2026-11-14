@@ -15,7 +15,7 @@ type Usage = { total_tokens?: number; tool_uses?: number };
 /** The SDK `system` subtypes this tracker reads, with only the fields it uses. */
 export type TaskSystemMessage =
   | { subtype: "background_tasks_changed"; tasks?: LevelEntry[] }
-  | { subtype: "task_started"; task_id: string; run_id?: string; task_type?: string; subagent_type?: string;
+  | { subtype: "task_started"; task_id: string; run_id?: string; tool_use_id?: string; task_type?: string; subagent_type?: string;
       description?: string; parent_task_id?: string; ambient?: boolean; is_backgrounded?: boolean }
   | { subtype: "task_progress"; task_id: string; run_id?: string; subagent_type?: string; description?: string;
       last_tool_name?: string; summary?: string; usage?: Usage }
@@ -181,6 +181,7 @@ export class TaskTracker {
       this.tasks.set(old.taskId, { ...current,
         ...(message.subagent_type && !current.subagentType ? { subagentType: message.subagent_type } : {}),
         ...(message.parent_task_id && !current.parentTaskId ? { parentTaskId: message.parent_task_id } : {}),
+        ...(typeof message.tool_use_id === "string" && !current.toolUseId ? { toolUseId: message.tool_use_id.slice(0, 128) } : {}),
         taskType: current.taskType || message.task_type || "",
         description: current.description || text(message.description) });
       return this.change([]);
@@ -198,6 +199,7 @@ export class TaskTracker {
       ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
       description: text(message.description),
       ...(message.parent_task_id ? { parentTaskId: message.parent_task_id } : {}),
+      ...(typeof message.tool_use_id === "string" ? { toolUseId: message.tool_use_id.slice(0, 128) } : {}),
       ambient: message.ambient === true,
       background: false,
       startedAt: this.now(),

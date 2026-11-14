@@ -148,8 +148,8 @@ describe("TaskTracker — edge events", () => {
   it("tracks a foreground subagent from task_started until its end report, never carrying the prompt", () => {
     const { t } = tracker();
     t.apply({ subtype: "task_started", task_id: "f", task_type: "local_agent", subagent_type: "Plan", description: "plan it",
-      is_backgrounded: false, prompt: "SECRET PROMPT" } as never);
-    expect(t.list()).toMatchObject([{ taskId: "f", background: false, subagentType: "Plan" }]);
+      is_backgrounded: false, prompt: "SECRET PROMPT", tool_use_id: "toolu_9" } as never);
+    expect(t.list()).toMatchObject([{ taskId: "f", background: false, subagentType: "Plan", toolUseId: "toolu_9" }]);
     expect(JSON.stringify(t.list())).not.toContain("SECRET");
     // A background level change does not drop a foreground task.
     t.apply(level());

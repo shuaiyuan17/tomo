@@ -223,6 +223,11 @@ export class LiveSessionManager {
     return live?.isAlive() ? live.getTaskOutput(taskId) : undefined;
   }
 
+  /** A Bash tool call's full command from the key's live session (never creates one). */
+  toolCommand(key: string, toolUseId: string): string | undefined {
+    return this.liveSessions.get(key)?.getToolCommand(toolUseId);
+  }
+
   isAlive(key: string): boolean {
     return this.liveSessions.get(key)?.isAlive() ?? false;
   }

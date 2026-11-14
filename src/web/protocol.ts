@@ -85,10 +85,12 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-    taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean() }).strict(),
+    taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
 export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
-export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput }
+export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
+  /** A shell task's full command, redacted and capped (see redact-command.ts). */
+  command?: { text: string; truncated: boolean } }

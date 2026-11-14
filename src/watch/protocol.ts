@@ -36,6 +36,8 @@ export interface WatchTask {
   description: string;
   /** Unknown ids are possible (the parent may have ended); treat as no parent. */
   parentTaskId?: string;
+  /** The tool_use that started it (from task_started), for reading its full input. */
+  toolUseId?: string;
   /** Not activity (watchers, skip_transcript tasks). */
   ambient: boolean;
   /** In the SDK's background set (false: a foreground, blocking tool call). */

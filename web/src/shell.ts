@@ -12,14 +12,21 @@ export function shortenPaths(text: string): string {
       dir.split("/").filter(Boolean).length >= 2 ? `${lead}…/${last}` : match);
 }
 
-/** Split on && || ; | outside quotes. */
+/**
+ * Split on && || ; | at the top level: not inside quotes, not escaped with a
+ * backslash, not inside ( … ) or $( … ) (tracked by depth).
+ */
 function segments(line: string): Array<{ text: string; joiner: string }> {
   const out: Array<{ text: string; joiner: string }> = [];
-  let current = "", quote = "", joiner = "";
+  let current = "", quote = "", joiner = "", depth = 0;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
+    if (c === "\\" && quote !== "'") { current += c + (line[i + 1] ?? ""); i++; continue; }
     if (quote) { current += c; if (c === quote) quote = ""; continue; }
     if (c === "'" || c === '"') { quote = c; current += c; continue; }
+    if (c === "(") { depth++; current += c; continue; }
+    if (c === ")") { depth = Math.max(0, depth - 1); current += c; continue; }
+    if (depth > 0) { current += c; continue; }
     const two = line.slice(i, i + 2);
     if (two === "&&" || two === "||") { out.push({ text: current.trim(), joiner }); joiner = two; current = ""; i++; continue; }
     if (c === ";" || c === "|") { out.push({ text: current.trim(), joiner }); joiner = c; current = ""; continue; }
@@ -54,7 +61,12 @@ export const SHORT_NAME_MAX = 40;
 /** A short, single-line name for a command line; at most SHORT_NAME_MAX characters. */
 export function shellShortName(command: string): string {
   const firstLine = command.split("\n")[0];
-  const parts = segments(firstLine).map((s) => ({ ...s, name: describe(s.text) })).filter((s) => s.name);
+  let list = segments(firstLine);
+  // A leading subshell `( … )` is described by what runs inside it.
+  const sub = /^\(([\s\S]*)\)$/.exec(list[0]?.text ?? "");
+  if (sub && list.length === 1) list = segments(sub[1]);
+  else if (sub) list = [...segments(sub[1]), ...list.slice(1)];
+  const parts = list.map((s) => ({ ...s, name: describe(s.text) })).filter((s) => s.name);
   if (!parts.length) return shortenPaths(firstLine).slice(0, SHORT_NAME_MAX) || "shell";
   let name = parts[0].name!;
   const next = parts[1];

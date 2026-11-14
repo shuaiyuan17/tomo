@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { SubagentView } from "./subagent-view.js";
-import { isShellTask } from "./shell.js";
+import { isShellTask, shellShortName } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
 import { ModelBadge } from "./model-badge.js";
 import { buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
@@ -51,9 +51,9 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
         : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
           <p className="mt-1 mb-1 px-2.5 font-mono text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span className="opacity-80"> · group</span> : null}</p>
           <ul className="m-0 list-none space-y-0.5 p-0">{group.rows.map((row) => row.folded
-            ? <FoldedShells key={`folded:${row.task.parentTaskId ?? group.sessionId}`} tasks={row.folded} depth={row.depth} now={now}
-                open={!!openFolds[`${group.sessionId}/${row.task.parentTaskId ?? ""}`]}
-                onToggle={() => setOpenFolds((old) => { const k = `${group.sessionId}/${row.task.parentTaskId ?? ""}`; return { ...old, [k]: !old[k] }; })}
+            ? <FoldedShells key={`folded:${row.foldKey}`} tasks={row.folded} depth={row.depth} now={now}
+                open={!!openFolds[`${group.sessionId}/${row.foldKey}`]}
+                onToggle={() => setOpenFolds((old) => { const k = `${group.sessionId}/${row.foldKey}`; return { ...old, [k]: !old[k] }; })}
                 onOpen={(task) => setOpened({ sessionId: task.sessionId, taskId: task.taskId })} />
             : <TaskCard key={row.task.taskId} task={row.task} depth={row.depth} now={now} onOpen={() => setOpened({ sessionId: row.task.sessionId, taskId: row.task.taskId })} />)}</ul>
         </div>)}
@@ -69,7 +69,7 @@ function TaskCard({ task, depth, now, onOpen }: { task: WebTask; depth: number; 
   const running = task.state === "running";
   const shell = isShellTask(task.taskType);
   return <li style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch)}>
-    <button type="button" title={shell ? task.description : taskKind(task)} onClick={onOpen}
+    <button type="button" title={shell ? `${shellShortName(task.description)}\n\n${task.description}\n\nOpen to see the full command` : taskKind(task)} onClick={onOpen}
       className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors duration-150 hover:bg-foreground/[0.06] focus-visible:outline-offset-0", !running && "opacity-60")}>
       <div className="flex min-w-0 items-baseline justify-between gap-2.5">
         {shell ? <span className="min-w-0"><ShellPill command={task.description} /></span>

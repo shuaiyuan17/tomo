@@ -12,6 +12,12 @@ describe("shell task short names", () => {
     ["npx vitest run tests/a.test.ts", "npx vitest"],
     ["ls -la", "ls"],
     ["cd /tmp", "cd /tmp"],
+    ["(cd /tmp && npm test)", "npm test"],
+    ["(cd /tmp && npm test) && echo ok", "npm test"],
+    ["echo $(git rev-parse HEAD && date) | wc -c", "echo | wc"],
+    ["printf 'a;b|c' && git log", "printf"],
+    ["echo a\\;b && git status", "echo"],
+    ["FOO=1", "FOO=1"],
   ])("%s → %s", (command, name) => expect(shellShortName(command)).toBe(name));
 
   it("never exceeds the length cap", () => {

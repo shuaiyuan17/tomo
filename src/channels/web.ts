@@ -8,9 +8,12 @@ import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
+import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebEvent, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
+/** A shell task's full command is served up to this many characters. */
+const COMMAND_LIMIT = 16_000;
 /** Task types whose output tail the SDK serves (`get_task_output`). */
 const OUTPUT_TASK_TYPES = new Set(["local_bash", "monitor"]);
 /** A subagent whose transcript names no model yet is looked up again after these delays, then given up. */
@@ -41,6 +44,7 @@ export class WebChannel implements Channel {
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
+  private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
@@ -54,9 +58,12 @@ export class WebChannel implements Channel {
     options: { now?: () => number; ownerKey?: () => string | undefined;
       /** Reads a shell/Monitor task's output tail from the live session of `sessionKey`. */
       taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>;
+      /** A Bash tool call's full command from the live session, by tool_use id. */
+      toolCommand?: (sessionKey: string, toolUseId: string) => string | undefined;
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined> } = {}) {
     this.taskOutput = options.taskOutput;
+    this.toolCommand = options.toolCommand;
     this.taskModel = options.taskModel;
     const now = options.now ?? Date.now;
     this.now = now;
@@ -131,10 +138,19 @@ export class WebChannel implements Channel {
    * send gate would show in `sessionId` right now. Shell and Monitor tasks
    * also return their output tail, read from the live SDK session.
    */
-  async task(sessionId: string, taskId: string, output: boolean): Promise<WebTaskAccess> {
+  async task(sessionId: string, taskId: string, output: boolean, command = false): Promise<WebTaskAccess> {
     const found = this.tasks.locate(sessionId, taskId);
     if (!found) throw new WebError(404, "task_not_found");
     const access: WebTaskAccess = { sessionKey: found.slot, taskType: found.task.taskType };
+    if (command) {
+      if (found.task.taskType !== "local_bash") throw new WebError(400, "no_task_command");
+      // The full command, redacted on this side; the task's own description
+      // (redacted, 200 characters) when the live session no longer has it.
+      const toolUseId = this.tasks.toolUseOf(found.slot, taskId);
+      const raw = (toolUseId && this.toolCommand?.(found.slot, toolUseId)) || undefined;
+      const text = raw ? redactCommand(raw) : found.task.description;
+      return { ...access, command: { text: text.slice(0, COMMAND_LIMIT), truncated: !raw || text.length > COMMAND_LIMIT } };
+    }
     if (!output) return access;
     if (!OUTPUT_TASK_TYPES.has(found.task.taskType)) throw new WebError(400, "no_task_output");
     const value = await this.taskOutput?.(found.slot, taskId).catch(() => undefined);

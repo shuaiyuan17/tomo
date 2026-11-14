@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve as pathResolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve as pathResolve } from "node:path";
 import { minimatch } from "minimatch";
 import { config, RESERVED_AGENT_TYPE, type AgentProfile } from "../config.js";
 import { log } from "../logger.js";
@@ -60,6 +60,17 @@ export async function skillsCanUseTool(
 }
 
 /**
+ * Does a `path.relative` result climb OUT of its base? Only a `..` SEGMENT
+ * does: `..` itself, or `../…`. A NAME that merely starts with two dots —
+ * `..notes.md`, `...`, `..hidden/` — is a child like any other. The old
+ * `rel.startsWith("..")` read `memory/private/..notes.md` as outside private/,
+ * so the hidden file was readable from a barred turn.
+ */
+function escapesUpward(rel: string): boolean {
+  return rel === ".." || rel.startsWith("../") || rel.startsWith("..\\");
+}
+
+/**
  * Containment, CASE-SENSITIVE — the opposite of {@link isInside}, deliberately.
  *
  * This side is an ALLOW predicate: a comparison that fails to establish
@@ -72,7 +83,7 @@ export async function skillsCanUseTool(
 function isInsideExact(child: string, parent: string): boolean {
   if (child === parent) return true;
   const rel = relative(parent, child);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return rel !== "" && !escapesUpward(rel) && !isAbsolute(rel);
 }
 
 /** Does `p` really land at-or-inside `<ws>/.claude/skills`? Both sides are
@@ -667,7 +678,7 @@ function isInside(child: string, parent: string): boolean {
   const p = foldPath(parent);
   if (c === p) return true;
   const rel = relative(p, c);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return rel !== "" && !escapesUpward(rel) && !isAbsolute(rel);
 }
 
 /** How many symlink hops to follow before giving up, so a link cycle cannot
@@ -689,50 +700,84 @@ function hasTraversalSegment(p: string): boolean {
  * the allow side of the decision.
  *
  * `realpathSync` throws on a path that has not been created, and Write/Edit
- * name files that are about to exist — so realpath the deepest ancestor that
- * DOES exist and re-attach the segments below it. The ENOENT branch also asks
- * `lstat` whether the name is a DANGLING symlink: `realpathSync` reports
- * ENOENT for a link whose target is missing, indistinguishable from "not
- * there", and a plain parent-walk would then report the link's own path
- * (outside private/) for a write that follows the link into it.
+ * name files that are about to exist — so the walk ({@link walkReal}) resolves
+ * every existing prefix and attaches the rest below it, and follows a DANGLING
+ * symlink through its target: `realpathSync` reports ENOENT for a link whose
+ * target is missing, indistinguishable from "not there", and judging the
+ * link's own path (outside private/) would allow a write that follows the
+ * link into it.
  */
 function realResolve(p: string, cwd: string, canonical = false): string | null {
-  let current = abs(p, cwd);
-  const tail: string[] = [];
-  let hops = 0;
+  // `canonical` (every DENY caller) uses `.native`: the JS realpath walks the
+  // path with lstat and keeps the CALLER'S spelling of every component, so
+  // `realpathSync("/Uſers/x/workſpace")` came back as typed and the
+  // containment test never saw the canonical name. The native call is
+  // realpath(3), which returns the names as stored on disk. The ALLOW callers
+  // keep the JS spelling-preserving form on purpose: there a failed comparison
+  // denies, which is the conservative direction (see isInsideExact).
+  const rp = canonical ? realpathSync.native : realpathSync;
+  // NOT `abs()`: `path.resolve` collapses `..` LEXICALLY, before any symlink
+  // is followed, and the kernel does the opposite. `link/../secret.png` with
+  // `link -> memory/private/sub` is `<ws>/secret.png` to path.resolve and
+  // `memory/private/secret.png` to open(2). The walk below resolves in the
+  // kernel's order instead.
+  return walkReal(isAbsolute(p) ? p : `${cwd}/${p}`, rp, { hops: 0 });
+}
 
-  for (;;) {
-    try {
-      // `canonical` (every DENY caller) uses `.native`: the JS realpath walks
-      // the path with lstat and keeps the CALLER'S spelling of every
-      // component, so `realpathSync("/Uſers/x/workſpace")` came back as typed
-      // and the containment test never saw the canonical name. The native call
-      // is realpath(3), which returns the names as stored on disk. The ALLOW
-      // callers keep the JS spelling-preserving form on purpose: there a
-      // failed comparison denies, which is the conservative direction (see
-      // isInsideExact).
-      const real = canonical ? realpathSync.native(current) : realpathSync(current);
-      return tail.length > 0 ? pathResolve(real, ...tail.reverse()) : real;
-    } catch {
-      let link: string | null = null;
-      try {
-        if (lstatSync(current).isSymbolicLink()) link = readlinkSync(current);
-      } catch {
-        // Genuinely absent — fall through to the parent walk.
-      }
-      if (link !== null) {
-        if (++hops > MAX_SYMLINK_HOPS) return null;
-        // Re-resolve the target with the SAME tail, so segments below the link
-        // stay attached below its destination.
-        current = pathResolve(dirname(current), link);
-        continue;
-      }
-      const parent = dirname(current);
-      if (parent === current) return null;
-      tail.push(basename(current));
-      current = parent;
+/**
+ * Resolve `raw` (absolute, NOT normalised) segment by segment, the way the
+ * kernel does: each existing prefix is real-pathed before the next segment is
+ * applied, so a `..` steps to the parent of where a symlink really LANDED, not
+ * to the parent of its name. Once a prefix does not exist the rest is attached
+ * lexically — that is a path about to be created (Write/Edit), where there is
+ * nothing further to follow. A DANGLING symlink (realpath reports ENOENT, the
+ * same error as "no such name") is followed through its target, with the
+ * remaining segments re-attached below it, so a write that follows the link
+ * into private/ is judged by where it lands.
+ */
+function walkReal(
+  raw: string,
+  rp: (p: string) => string,
+  state: { hops: number },
+): string | null {
+  const segs = raw.split(/[/\\]+/).filter((s) => s !== "" && s !== ".");
+  let current = "/";
+  let exists = true;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i]!;
+    if (seg === "..") {
+      // `current` is already real while it exists, so this is the parent of
+      // the real directory — exactly what the kernel's `..` lookup returns.
+      current = dirname(current);
+      continue;
     }
+    const next = current === "/" ? `/${seg}` : `${current}/${seg}`;
+    if (!exists) {
+      current = next;
+      continue;
+    }
+    try {
+      current = rp(next);
+      continue;
+    } catch {
+      // Absent, not a directory, or a dangling link — see below.
+    }
+    let link: string | null = null;
+    try {
+      if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
+    } catch {
+      // Genuinely absent.
+    }
+    if (link !== null) {
+      if (++state.hops > MAX_SYMLINK_HOPS) return null;
+      const target = isAbsolute(link) ? link : `${current}/${link}`;
+      const rest = segs.slice(i + 1).join("/");
+      return walkReal(rest ? `${target}/${rest}` : target, rp, state);
+    }
+    exists = false;
+    current = next;
   }
+  return current;
 }
 
 /**
@@ -839,7 +884,7 @@ function searchFrames(rootRaw: string, ctx: { cwd: string; memoryDir: string; pr
  *  i.e. it points to a descendant of the reference dir. Used to short-circuit
  *  glob/grep checks when private/ isn't reachable from the search root. */
 function isRelativeDescendant(rel: string): boolean {
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return rel !== "" && !escapesUpward(rel) && !isAbsolute(rel);
 }
 
 /** Decide whether a Glob call rooted at `root` with pattern `pattern` could

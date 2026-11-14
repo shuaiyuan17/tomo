@@ -64,6 +64,27 @@ export class PartialDeliveryError extends Error {
  * failure marks only the pieces that are not known to have shipped; anything
  * else marks the whole block, as before.
  */
+/**
+ * What a block's send reports when it RESOLVED but did not ship every piece —
+ * an attachment withheld by policy (a private-memory path on a barred turn).
+ * Not an error: nothing failed, the harness refused on purpose, and the rest
+ * of the block went out. But the transcript must not record the withheld piece
+ * as something the reader received, so the per-piece outcome comes back here.
+ */
+export interface DeliveryReceipt {
+  segments: readonly DeliverySegment[];
+}
+
+/** The transcript entry for a block whose send resolved: the block verbatim,
+ *  or — when the send withheld pieces — each piece with the not-delivered
+ *  marker on the ones that did not ship. */
+export function deliveredEntry(block: string, receipt: DeliveryReceipt | void): string {
+  if (!receipt) return block;
+  return receipt.segments
+    .map((s) => (s.delivered ? s.text : `${DELIVERY_FAILED_MARKER}${s.text}`))
+    .join("\n");
+}
+
 export function failedDeliveryEntry(block: string, err: unknown): string {
   if (!(err instanceof PartialDeliveryError)) return `${DELIVERY_FAILED_MARKER}${block}`;
   return err.segments
@@ -181,8 +202,10 @@ export interface DeliverOptions {
  * cannot be expressed by independent per-block calls.
  */
 export interface BlockSender {
-  /** Ship one completed block. Resolves when it has reached the channel. */
-  deliver(block: string): Promise<void>;
+  /** Ship one completed block. Resolves when it has reached the channel —
+   *  with a receipt when some piece was withheld rather than sent (see
+   *  {@link DeliveryReceipt}). */
+  deliver(block: string): Promise<DeliveryReceipt | void>;
 }
 
 export function isAgentErrorResponse(response: string): boolean {
@@ -232,7 +255,7 @@ export class DeliveryPipeline {
     response: string,
     isSilent: (response: string) => boolean = isSilentReply,
     options: DeliverOptions = {},
-  ): Promise<void> {
+  ): Promise<DeliveryReceipt | void> {
     if (isAgentErrorResponse(response)) {
       const visibleError = `[error] ${withRecoveryHint(response)}`;
       if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(sessionKey, visibleError);
@@ -251,7 +274,7 @@ export class DeliveryPipeline {
       return;
     }
 
-    await this.createBlockSender(replyChannel, replyChatId, options).deliver(visible);
+    return this.createBlockSender(replyChannel, replyChatId, options).deliver(visible);
   }
 
   /**
@@ -293,7 +316,7 @@ export class DeliveryPipeline {
     };
 
     return {
-      deliver: async (block: string): Promise<void> => {
+      deliver: async (block: string): Promise<DeliveryReceipt | void> => {
         // Defence in depth: the bare-NO_REPLY drop already happened per block
         // in renderBlock, but callers that hand us raw text get it here too.
         if (endsWithTrailingNoReply(block)) return;
@@ -333,6 +356,8 @@ export class DeliveryPipeline {
         // the hot path for the overwhelming majority of blocks that carry no
         // media at all.
         const barred = (media.length > 0 || stickers.length > 0) && (options.blockPrivateMedia?.() ?? false);
+        /** Some piece was refused by policy: reported in the receipt. */
+        let withheld = false;
         for (const { path, segment } of media) {
           // Handled exactly like a file that is not there: never attempted, so
           // the segment stays not-known-delivered and the transcript records
@@ -340,6 +365,7 @@ export class DeliveryPipeline {
           // `deliverText` below and the reader still gets the words.
           if (barred && isPrivateAttachmentPath(path)) {
             log.warn({ chatId, path }, "Dropped a private-memory attachment: this turn's audience may not read memory/private/");
+            withheld = true;
             continue;
           }
           if (!existsSync(path)) continue;
@@ -403,6 +429,7 @@ export class DeliveryPipeline {
           // never attempted, recorded as not delivered.
           if (barred && isPrivateAttachmentPath(id)) {
             log.warn({ chatId, sticker: id }, "Dropped a private-memory sticker: this turn's audience may not read memory/private/");
+            withheld = true;
             continue;
           }
           try {
@@ -423,6 +450,9 @@ export class DeliveryPipeline {
         if (failure && segments.some((s) => !s.delivered)) {
           throw new PartialDeliveryError(failure.err, segments);
         }
+        // A policy refusal is not a failure (nothing to retry, no error to
+        // surface) but it IS a piece the reader did not get.
+        if (withheld) return { segments };
       },
     };
   }

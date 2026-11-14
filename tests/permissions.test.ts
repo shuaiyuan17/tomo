@@ -829,6 +829,88 @@ describe("isPrivateMemoryAccess — Unicode spellings on a real filesystem", () 
 });
 
 // ---------------------------------------------------------------------------
+// Names that START with two dots are children, not `..` (codex on #464).
+// `path.relative` gives `..notes.md` for a hidden file inside private/, and
+// `rel.startsWith("..")` read that as "outside".
+// ---------------------------------------------------------------------------
+
+describe("isPrivateMemoryAccess — dot-dot-prefixed names", () => {
+  it("denies Read/Write of a `..`-prefixed hidden file inside private/", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "memory/private/..notes.md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Read", { file_path: "/ws/memory/private/...md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Write", { file_path: "memory/private/..hidden/x.md", content: "x" }, ctx)).toBe(true);
+  });
+
+  it("denies Glob/Grep rooted at a `..`-prefixed dir inside private/ or memory/", () => {
+    expect(isPrivateMemoryAccess("Glob", { path: "memory/private/..dir", pattern: "*" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "memory/..cache", pattern: "x" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: 'MEDIA:"memory/private/..x.png"' }, ctx)).toBe(true);
+  });
+
+  it("still treats a real `..` segment as leaving the dir", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "/ws/memory/private/../../x.md" }, ctx)).toBe(false);
+  });
+
+  it("denies a hidden `..` file on a real filesystem, through the real-path arm too", () => {
+    const root = mkdtempSync(join(tmpdir(), "tomo-perm-dotdot-"));
+    try {
+      const real = { cwd: root, memoryDir: join(root, "memory"), privateDir: join(root, "memory", "private") };
+      mkdirSync(real.privateDir, { recursive: true });
+      writeFileSync(join(real.privateDir, "..notes.md"), "owner-only");
+      symlinkSync(join(real.privateDir, "..notes.md"), join(root, "innocent.md"));
+      expect(isPrivateMemoryAccess("Read", { file_path: "memory/private/..notes.md" }, real)).toBe(true);
+      expect(isPrivateMemoryAccess("Read", { file_path: "innocent.md" }, real)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `link/../x` — the kernel follows the link BEFORE applying `..`; path.resolve
+// collapses `..` first (codex on #464). With `hop -> memory/private/sub`,
+// `hop/../secret.md` opens `memory/private/secret.md`, while the lexical form
+// is `<root>/secret.md`, outside memory/ entirely, so no `..` rule fired.
+// ---------------------------------------------------------------------------
+
+describe("isPrivateMemoryAccess — `..` after a symlink resolves in kernel order", () => {
+  const root = mkdtempSync(join(tmpdir(), "tomo-perm-hop-"));
+  const real = { cwd: root, memoryDir: join(root, "memory"), privateDir: join(root, "memory", "private") };
+
+  beforeAll(() => {
+    mkdirSync(join(real.privateDir, "sub"), { recursive: true });
+    writeFileSync(join(real.privateDir, "secret.png"), "owner-only");
+    symlinkSync(join(real.privateDir, "sub"), join(root, "hop"));
+    mkdirSync(join(root, "elsewhere", "inner"), { recursive: true });
+    symlinkSync(join(root, "elsewhere", "inner"), join(root, "fine"));
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("denies Read and MEDIA of `hop/../secret.png`", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "hop/../secret.png" }, real)).toBe(true);
+    expect(isPrivateMemoryAccess("Read", { file_path: `${root}/hop/../secret.png` }, real)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: 'MEDIA:"hop/../secret.png"' }, real)).toBe(true);
+  });
+
+  it("denies a Write to a not-yet-existing file reached the same way", () => {
+    expect(isPrivateMemoryAccess("Write", { file_path: "hop/../new.md", content: "x" }, real)).toBe(true);
+    expect(isPrivateMemoryAccess("Write", { file_path: "hop/../newdir/deeper/x.md", content: "x" }, real)).toBe(true);
+  });
+
+  it("denies a Glob/Grep rooted at `hop/..`", () => {
+    expect(isPrivateMemoryAccess("Glob", { path: "hop/..", pattern: "*.png" }, real)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "hop/..", pattern: "x" }, real)).toBe(true);
+  });
+
+  it("still allows `..` through a link that lands outside memory/", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "fine/../x.md" }, real)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Audit P0-3: the SDK's `Monitor` tool runs `command` in a shell and streams
 // stdout back. On a barred turn it was the one shell the hook did not see.
 // ---------------------------------------------------------------------------

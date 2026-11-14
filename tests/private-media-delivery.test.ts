@@ -75,7 +75,7 @@ class RecordingChannel implements Channel {
   async stop(): Promise<void> {}
 }
 
-function senderFor(barred: boolean): { channel: RecordingChannel; deliver: (block: string) => Promise<void> } {
+function senderFor(barred: boolean): { channel: RecordingChannel; deliver: (block: string) => Promise<unknown> } {
   const channel = new RecordingChannel();
   const pipeline = new DeliveryPipeline({ queuePendingErrorNote: () => {} });
   const sender = pipeline.createBlockSender(channel, "-100270", { blockPrivateMedia: () => barred });
@@ -138,7 +138,9 @@ describe("reply delivery on a barred turn", () => {
     // would abort the rest of the turn's blocks over a refusal the harness
     // made on purpose.
     const { deliver } = senderFor(true);
-    await expect(deliver('MEDIA:"memory/private/diary.png"')).resolves.toBeUndefined();
+    // It RESOLVES (no throw), with a receipt naming the withheld piece.
+    const receipt = await deliver('MEDIA:"memory/private/diary.png"') as { segments: Array<{ delivered: boolean }> };
+    expect(receipt.segments.some((seg) => !seg.delivered)).toBe(true);
   });
 });
 
@@ -164,6 +166,23 @@ describe("stickers on a barred turn (audit P0-2)", () => {
     const { channel, deliver } = senderFor(true);
     await deliver(`STICKER:${PUBLIC_PIC}\nSTICKER:CAACAgIAAxkBAAEBmRVlYr4`);
     expect(stickers(channel)).toEqual([PUBLIC_PIC, "CAACAgIAAxkBAAEBmRVlYr4"]);
+  });
+
+  it("reports the withheld pieces in the receipt, so the transcript marks them", async () => {
+    const { deliveredEntry } = await import("../src/agent/delivery-pipeline.js");
+    const { deliver } = senderFor(true);
+    const block = `look\nMEDIA:"${PRIVATE_PIC}"\nSTICKER:${PRIVATE_PIC}`;
+    const receipt = await deliver(block);
+    expect(receipt).toBeDefined();
+    const entry = deliveredEntry(block, receipt);
+    expect(entry).toContain(`${DELIVERY_FAILED_MARKER}MEDIA:"${PRIVATE_PIC}"`);
+    expect(entry).toContain(`${DELIVERY_FAILED_MARKER}STICKER:${PRIVATE_PIC}`);
+    expect(entry.startsWith("look\n")).toBe(true);
+  });
+
+  it("returns no receipt when nothing was withheld", async () => {
+    const { deliver } = senderFor(true);
+    expect(await deliver(`STICKER:${PUBLIC_PIC}`)).toBeUndefined();
   });
 
   it("sends the private sticker on the owner's own turn", async () => {
@@ -232,12 +251,14 @@ describe("what the transcript records for a dropped attachment", () => {
 // ---------------------------------------------------------------------------
 
 describe("direct send into a group", () => {
-  async function directSend(target: string, text: string) {
+  async function directSend(target: string, text: string, caller = "dm:shuai") {
     const { ProactiveSendService } = await import("../src/agent/proactive-send.js");
     const channel = new RecordingChannel();
     const transcript: string[] = [];
     const service = new ProactiveSendService({
       getChannel: (name) => (name === channel.name ? channel : undefined),
+      // Only the owner's own DM is unbarred here.
+      isPrivateMemoryBarred: (key) => key !== "dm:shuai",
       getSummonedIdentity: () => undefined,
       getReplyTarget: () => undefined,
       deriveReplyTargetFromConfig: () => undefined,
@@ -247,18 +268,24 @@ describe("direct send into a group", () => {
       queuePendingNote: () => {},
       runDelegateTurn: async () => true,
     });
-    const result = await service.sendToSession(target, text, "dm:shuai");
+    const result = await service.sendToSession(target, text, caller);
     return { result, channel, transcript };
   }
 
-  it("refuses a private MEDIA or STICKER path and sends nothing at all", async () => {
+  it("refuses a private MEDIA or STICKER path asked for by a group turn, and sends nothing", async () => {
     for (const tag of [`MEDIA:"${PRIVATE_PIC}"`, `STICKER:${PRIVATE_PIC}`, `STICKER:${LINK_TO_PRIVATE}`]) {
-      const { result, channel, transcript } = await directSend("telegram:-100270", `look at this\n${tag}`);
+      const { result, channel, transcript } = await directSend("telegram:-100270", `look at this\n${tag}`, "telegram:-100270");
       expect(result.ok, tag).toBe(false);
       if (!result.ok) expect(result.error).toContain("memory/private/");
       expect(channel.sent, tag).toEqual([]);
       expect(transcript, tag).toEqual([]);
     }
+  });
+
+  it("lets the owner share a private file into a group from his own DM", async () => {
+    const { result, channel } = await directSend("telegram:-100270", `for you\nMEDIA:"${PRIVATE_PIC}"`, "dm:shuai");
+    expect(result.ok).toBe(true);
+    expect(photos(channel)).toEqual([PRIVATE_PIC]);
   });
 
   it("still sends a public attachment into the group", async () => {

@@ -43,7 +43,7 @@ import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
-import { DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
+import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
 import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
@@ -394,6 +394,7 @@ export class Agent {
     });
     this.proactive = new ProactiveSendService({
       getChannel: (name) => this.getChannel(name),
+      isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       getSummonedIdentity: (channelName, chatId) => this.router.getSummonedIdentity(channelName, chatId),
       getReplyTarget: (sessionKey) => this.router.getReplyTarget(sessionKey),
       deriveReplyTargetFromConfig: (identityName) => this.router.deriveReplyTargetFromConfig(identityName),
@@ -1189,12 +1190,12 @@ export class Agent {
         if (isAgentErrorResponse(block) || isSilentReply(block)) return;
         const slot = transcript.reserve(block);
         try {
-          await sender.deliver(outgoing);
+          const receipt = await sender.deliver(outgoing);
           // Recorded per shipped block — an unrecorded delivery is invisible
           // to recall_conversation (#203) — but recorded AFTER the send, never
           // before. Writing on intent made the transcript claim deliveries
           // that never happened (A sends, B throws, transcript shows both).
-          slot.settle(block);
+          slot.settle(deliveredEntry(block, receipt));
         } catch (err) {
           log.error({ err, key }, "Background task block delivery failed");
           // Still recorded, but MARKED: the turn composed this text, and it is

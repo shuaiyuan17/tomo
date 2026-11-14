@@ -6,7 +6,7 @@ import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
-import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, failedDeliveryEntry } from "./delivery-pipeline.js";
+import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { formatInboundStamp } from "./inbound-markers.js";
 import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
@@ -423,7 +423,11 @@ export class TurnRunner {
     // spoke. Nothing else can flush and then arrive here (the turn-died path
     // rethrows), so this guard only ever bites on shutdown.
     if (spec.transcript === "always" && reply && !sink.recordedAny()) {
-      this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
+      // The joined response would record a withheld attachment's tag as said
+      // and shipped. When a block withheld one, record the per-block entries
+      // (which mark it) instead.
+      if (sink.withheldAny()) sink.flushBlockTranscript();
+      else this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
     }
 
     // SHUTDOWN REFUSED THIS TURN — the prompt never reached the model.
@@ -487,7 +491,7 @@ export class TurnRunner {
         // was told. The error still propagates (the thrown-error path surfaces
         // it); it just no longer leaves a lie behind it.
         try {
-          await this.deps.delivery.deliverResponse(
+          const receipt = await this.deps.delivery.deliverResponse(
             spec.key,
             target.channel,
             target.chatId,
@@ -499,7 +503,7 @@ export class TurnRunner {
             },
           );
           if (spec.transcript === "on-delivery") {
-            this.deps.appendAssistantTranscript(spec.key, deliverText, target.channel.name);
+            this.deps.appendAssistantTranscript(spec.key, deliveredEntry(deliverText, receipt), target.channel.name);
           }
         } catch (err) {
           if (spec.transcript === "on-delivery") {
@@ -551,6 +555,7 @@ export class TurnRunner {
     hasShipped: () => boolean;
     flushBlockTranscript: () => boolean;
     recordedAny: () => boolean;
+    withheldAny: () => boolean;
   } {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
@@ -582,6 +587,8 @@ export class TurnRunner {
     // the post-turn `always` append, which must not record a joined response on
     // top of blocks the sink already wrote (see runDelivery).
     let recordedAny = false;
+    /** Some block resolved with a piece withheld by policy. */
+    let withheldAny = false;
     const transcript = createOrderedBlockTranscript(
       (entry) => {
         if (!channelName) return;
@@ -631,7 +638,8 @@ export class TurnRunner {
       // in the transcript.
       const slot = transcript.reserve(block);
       try {
-        await sender.deliver(outgoing);
+        const receipt = await sender.deliver(outgoing);
+        if (receipt) withheldAny = true;
         // Every delivered message must be recorded, or it is invisible to
         // recall_conversation (#203). "always" records the turn's literal
         // response instead, once, after the turn.
@@ -641,7 +649,10 @@ export class TurnRunner {
         // A-succeeds / B-throws turn the owner had only A on his phone while
         // the transcript showed both, so recall_conversation would later
         // "remember" telling him something he never received.
-        slot.settle(block);
+        //
+        // A piece WITHHELD by policy (a private attachment on a barred turn)
+        // is recorded marked, like one that failed: it did not reach anyone.
+        slot.settle(deliveredEntry(block, receipt));
       } catch (err) {
         // KNOWN LIMITATION — ambiguous-failure reordering. A throw here is
         // swallowed so a dead channel cannot abort a turn that is still doing
@@ -676,6 +687,7 @@ export class TurnRunner {
       // closed with the failure marker.
       flushBlockTranscript: () => { transcript.flushAll(); return recordedAny; },
       recordedAny: () => recordedAny,
+      withheldAny: () => withheldAny,
     };
   }
 

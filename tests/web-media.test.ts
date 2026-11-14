@@ -42,6 +42,20 @@ describe("which images the web may serve", () => {
     expect(imageSessionKeys("telegram:-100200", undefined, false)).toEqual(["telegram_-100200"]);
     expect(imageSessionKeys("dm:owner", owner, true)).toContain("imessage_any;-;+15550001111");
   });
+  it("a session id must match whole: chat 123 never claims chat 1234's images", async () => {
+    const { isImageFiledFor } = await import("../src/channels/imageStore.js");
+    const of1234 = name("telegram_-1001234");
+    expect(isImageFiledFor(of1234, ["telegram_-100123"])).toBe(false);
+    expect(isImageFiledFor(of1234, ["telegram_-1001234"])).toBe(true);
+    expect(isImageFiledFor(of1234.replace(".png", "-2.png"), ["telegram_-1001234"])).toBe(true);
+  });
+  it("matches the owner's iMessage handle through the shared normaliser", async () => {
+    const { isImageFiledFor } = await import("../src/channels/imageStore.js");
+    const keys = imageSessionKeys("dm:owner", { name: "owner", telegram: [], imessage: ["+15551234567"] }, true);
+    expect(isImageFiledFor(name("imessage_iMessage;-;15551234567"), keys)).toBe(true);
+    expect(isImageFiledFor(name("imessage_any;-;+15551234567"), keys)).toBe(true);
+    expect(isImageFiledFor(name("imessage_any;-;+15551234568"), keys)).toBe(false);
+  });
   it("sniffs real image signatures (never SVG)", () => {
     expect(sniffImageType(PNG)).toBe("image/png");
     expect(sniffImageType(Buffer.from([0xff, 0xd8, 0xff, 0xe0]))).toBe("image/jpeg");

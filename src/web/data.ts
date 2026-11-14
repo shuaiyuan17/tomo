@@ -4,7 +4,7 @@ import { basename, extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
-import { isGroupSessionKey, legacySessionKeysForBinding, parseRawSessionKey } from "../sessions/keys.js";
+import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
 import { isImageFiledFor } from "../channels/imageStore.js";
 import { WebError, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
@@ -97,8 +97,14 @@ export function imageSessionKeys(key: string, owner: OwnerConfig | undefined, is
   const keys = raw ? [`${raw.channelName}_${raw.chatId}`] : [];
   if (isOwnerSession && owner) {
     for (const id of ownerBindings(owner, "telegram")) keys.push(`telegram_${id}`);
+    // A chat GUID can carry the handle in any of its written forms; the
+    // binding is reduced with the shared normaliser (#480) and each form it
+    // stands for is tried: +E.164, bare digits, tel: URI; emails as written
+    // and lowercased.
     for (const handle of ownerBindings(owner, "imessage")) {
-      for (const service of ["any", "iMessage", "SMS", "RCS"]) keys.push(`imessage_${service};-;${handle}`);
+      const normal = normalizeImessageHandle(handle);
+      const forms = new Set([handle, normal, ...(normal.startsWith("+") ? [normal.slice(1), `tel:${normal}`] : [])]);
+      for (const form of forms) for (const service of ["any", "iMessage", "SMS", "RCS"]) keys.push(`imessage_${service};-;${form}`);
     }
   }
   return keys;

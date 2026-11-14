@@ -68,15 +68,22 @@ export function imageSessionSegment(sessionKey: string): string {
 }
 
 /**
- * Whether `filename` — as buildImagePath names it, including the "-N"
- * suffix writeWithoutOverwrite adds on a collision — was filed for one of
+ * Whether `filename` — as buildImagePath names it
+ * (`HHMMSS_<session>_<guid8>.<ext>`, plus the "-N" suffix
+ * writeWithoutOverwrite adds on a collision) — was filed for one of
  * `sessionKeys` (the meta.sessionKey values the channels pass, e.g.
- * `telegram_<chatId>` or `imessage_<chatGuid>`).
+ * `telegram_<chatId>` or `imessage_<chatGuid>`). The session part must
+ * match whole: what follows it is exactly one guid part (at most 8
+ * characters, as shortGuid makes it), so chat "123" never matches a file of
+ * chat "1234". Compared case-insensitively (handles such as emails).
  */
 export function isImageFiledFor(filename: string, sessionKeys: readonly string[]): boolean {
-  const match = /^\d{6}_(.+)$/.exec(filename);
+  const match = /^\d{6}_(.+)$/.exec(filename.toLowerCase());
   if (!match) return false;
-  return sessionKeys.some((key) => match[1].startsWith(`${imageSessionSegment(key)}_`));
+  return sessionKeys.some((key) => {
+    const segment = `${imageSessionSegment(key).toLowerCase()}_`;
+    return match[1].startsWith(segment) && /^[a-z0-9._-]{1,8}(?:-\d+)?\.[a-z0-9]+$/.test(match[1].slice(segment.length));
+  });
 }
 
 /**

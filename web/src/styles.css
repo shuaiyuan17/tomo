@@ -73,6 +73,14 @@
   --shimmer-glint: #fbf6ec;
 }
 
+/* Motion: one ease-out curve, short durations (120–250 ms); everything is
+   switched off under prefers-reduced-motion (see the end of this file). */
+@theme {
+  --ease-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --default-transition-duration: 120ms;
+  --default-transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -150,6 +158,32 @@
   .markdown input { @apply mr-1.5 accent-primary; }
   .markdown a { @apply underline; }
 }
+
+@layer components {
+  /* A new bubble or block rises slightly into place. */
+  .motion-enter { animation: motion-enter 180ms var(--ease-soft) both; }
+  /* A new task card drops in. */
+  .motion-drop { animation: motion-drop 200ms var(--ease-soft) both; }
+  /* A task card on its way out: fades and collapses so the list does not jump. */
+  .motion-exit { animation: motion-exit 200ms var(--ease-soft) both; overflow: hidden; }
+  /* Task list ↔ task view. */
+  .motion-from-right { animation: motion-from-right 200ms var(--ease-soft) both; }
+  .motion-from-left { animation: motion-from-left 200ms var(--ease-soft) both; }
+  /* Radix Collapsible content: height follows open/close. */
+  .motion-collapsible { overflow: hidden; }
+  .motion-collapsible[data-state="open"] { animation: collapsible-open 180ms var(--ease-soft); }
+  .motion-collapsible[data-state="closed"] { animation: collapsible-close 150ms var(--ease-soft); }
+  /* The send arrow hops once after a send. */
+  .motion-pop { animation: motion-pop 220ms var(--ease-soft); }
+}
+@keyframes motion-enter { from { opacity: 0; transform: translateY(6px); } }
+@keyframes motion-drop { from { opacity: 0; transform: translateY(-4px); } }
+@keyframes motion-exit { from { opacity: 0.6; max-height: 6rem; } to { opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; } }
+@keyframes motion-from-right { from { opacity: 0; transform: translateX(16px); } }
+@keyframes motion-from-left { from { opacity: 0; transform: translateX(-16px); } }
+@keyframes collapsible-open { from { height: 0; opacity: 0; } to { height: var(--radix-collapsible-content-height); opacity: 1; } }
+@keyframes collapsible-close { from { height: var(--radix-collapsible-content-height); opacity: 1; } to { height: 0; opacity: 0; } }
+@keyframes motion-pop { 40% { transform: translateY(-3px); } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }

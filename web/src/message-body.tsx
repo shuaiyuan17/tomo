@@ -35,7 +35,7 @@ function Thumbnail({ src, sticker, onOpen }: { src: string; sticker: boolean; on
   const [failed, setFailed] = useState(false);
   if (failed) return <Placeholder />;
   return <button type="button" onClick={onOpen} aria-label={sticker ? "Open sticker" : "Open image"}
-    className="overflow-hidden rounded-xl border bg-muted/40 p-0 transition-opacity duration-150 hover:opacity-90">
+    className="overflow-hidden rounded-xl border bg-muted/40 p-0 transition-opacity hover:opacity-90">
     <img src={src} alt={sticker ? "Sticker" : "Image"} loading="lazy" onError={() => setFailed(true)}
       className={cn("block max-h-[280px] max-w-[280px] object-contain", sticker && "max-h-[140px] max-w-[140px]")} /></button>;
 }
@@ -59,7 +59,7 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
     return () => { document.removeEventListener("keydown", onKey); previous?.focus(); };
   }, [onClose]);
   return <div role="dialog" aria-modal="true" aria-label="Image" onClick={onClose}
-    className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 animate-in fade-in-0 duration-150">
+    className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 animate-in fade-in-0">
     <button ref={close} type="button" aria-label="Close image" onClick={onClose}
       className="absolute top-4 right-4 grid size-10 place-items-center rounded-xl bg-black/40 text-white hover:bg-black/60"><X className="size-5" /></button>
     <img src={src} alt="Image" onClick={(e) => e.stopPropagation()} className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-2xl" />
@@ -75,6 +75,6 @@ function ReplyQuote({ reply, onClick }: { reply: ReplyContext; onClick?: () => v
   </>;
   const className = "mb-2 block w-full rounded-md border-l-2 border-muted-foreground/40 bg-foreground/[0.04] py-1 pr-2 pl-2.5 text-left";
   return onClick
-    ? <button type="button" onClick={onClick} title="Show the original message" className={cn(className, "cursor-pointer transition-colors duration-150 hover:bg-foreground/[0.07]")}>{content}</button>
+    ? <button type="button" onClick={onClick} title="Show the original message" className={cn(className, "cursor-pointer transition-colors hover:bg-foreground/[0.07]")}>{content}</button>
     : <div className={className}>{content}</div>;
 }

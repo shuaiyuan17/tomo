@@ -319,3 +319,23 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await page.keyboard.press("Escape");
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toHaveCount(0);
 });
+
+it("motion: new messages rise in, the rail transitions open and closed, and reduced motion turns it all off", async () => {
+  mockSdk.responseFn = () => "A fresh reply.";
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("hello"); await input.press("Enter");
+  const reply = page.locator("article.message.assistant").filter({ hasText: "A fresh reply." }).first();
+  await browserExpect(reply).toBeVisible();
+  // The rail opens with a transition and is gone after closing.
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(page.locator("#tasks-rail")).toHaveAttribute("data-state", "open");
+  await page.getByRole("button", { name: "Close tasks" }).click();
+  await browserExpect(page.locator("#tasks-rail")).toHaveCount(0);
+  // With reduced motion, no animation or transition runs.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const style = await page.evaluate(() => {
+    const el = document.createElement("div"); el.className = "motion-enter transition-colors"; document.body.append(el);
+    const cs = getComputedStyle(el); const out = [cs.animationName, cs.transitionDuration]; el.remove(); return out;
+  });
+  expect(style).toEqual(["none", "0s"]);
+});

@@ -75,162 +75,97 @@ describe("mentionRegex", () => {
   });
 });
 
-// Test sender name extraction (extracted from TelegramChannel.getSenderName)
-function getSenderName(from: { first_name: string; last_name?: string }): string {
-  return from.first_name + (from.last_name ? ` ${from.last_name}` : "");
+/**
+ * Drive the REAL `message:*` handlers and return what the agent receives.
+ * `bot.handleUpdate` needs `botInfo` (normally from `getMe`); setting it
+ * directly keeps this offline. Text and sticker updates make no API calls.
+ */
+async function dispatchedFor(message: Record<string, unknown>): Promise<IncomingMessage> {
+  const channel = new TelegramChannel("123456:TEST-TOKEN");
+  const bot = (channel as unknown as {
+    bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
+  }).bot;
+  bot.botInfo = {
+    id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
+    can_join_groups: true, can_read_all_group_messages: false,
+    supports_inline_queries: false, can_connect_to_business_account: false,
+    has_main_web_app: false,
+  };
+  const received: IncomingMessage[] = [];
+  channel.onMessage(async (msg) => { received.push(msg); return true; });
+  await bot.handleUpdate({
+    update_id: 1,
+    message: {
+      message_id: 5,
+      date: 1_700_000_000,
+      chat: { id: 42, type: "private" },
+      from: { id: 7, is_bot: false, first_name: "Alice" },
+      ...message,
+    },
+  });
+  expect(received).toHaveLength(1);
+  return received[0];
 }
 
-describe("getSenderName", () => {
-  it("returns first name only", () => {
-    expect(getSenderName({ first_name: "John" })).toBe("John");
+describe("sender name", () => {
+  it("returns first name only", async () => {
+    const msg = await dispatchedFor({ text: "hi", from: { id: 7, is_bot: false, first_name: "John" } });
+    expect(msg.senderName).toBe("John");
+    expect(msg.senderId).toBe("7");
   });
 
-  it("combines first and last name", () => {
-    expect(getSenderName({ first_name: "John", last_name: "Doe" })).toBe("John Doe");
+  it("combines first and last name", async () => {
+    const msg = await dispatchedFor({ text: "hi", from: { id: 7, is_bot: false, first_name: "John", last_name: "Doe" } });
+    expect(msg.senderName).toBe("John Doe");
   });
 
-  it("handles empty last name", () => {
-    expect(getSenderName({ first_name: "Alice", last_name: "" })).toBe("Alice");
+  it("handles empty last name", async () => {
+    const msg = await dispatchedFor({ text: "hi", from: { id: 7, is_bot: false, first_name: "Alice", last_name: "" } });
+    expect(msg.senderName).toBe("Alice");
   });
 });
 
-// Test group chat detection (extracted from Telegram bot handler)
-function isGroupChat(chatType: string): boolean {
-  return chatType === "group" || chatType === "supergroup";
-}
-
-describe("isGroupChat", () => {
-  it("detects group", () => {
-    expect(isGroupChat("group")).toBe(true);
+describe("group chat detection", () => {
+  it("detects group and supergroup, with the chat title", async () => {
+    for (const type of ["group", "supergroup"]) {
+      const msg = await dispatchedFor({ text: "hi", chat: { id: -100, type, title: "Crew" } });
+      expect(msg.isGroup).toBe(true);
+      expect(msg.chatTitle).toBe("Crew");
+    }
   });
 
-  it("detects supergroup", () => {
-    expect(isGroupChat("supergroup")).toBe(true);
-  });
-
-  it("rejects private chat", () => {
-    expect(isGroupChat("private")).toBe(false);
-  });
-
-  it("rejects channel", () => {
-    expect(isGroupChat("channel")).toBe(false);
+  it("rejects private chat and channel", async () => {
+    const dm = await dispatchedFor({ text: "hi" });
+    expect(dm.isGroup).toBe(false);
+    expect(dm.chatTitle).toBeUndefined();
+    const channelPost = await dispatchedFor({ text: "hi", chat: { id: -200, type: "channel", title: "News" } });
+    expect(channelPost.isGroup).toBe(false);
   });
 });
 
-function describeSticker(sticker: {
-  fileId: string;
-  emoji?: string;
-  setName?: string;
-  type?: string;
-  isAnimated?: boolean;
-  isVideo?: boolean;
-}): string {
-  const parts = [
-    `file_id=${sticker.fileId}`,
-    sticker.emoji ? `emoji=${sticker.emoji}` : undefined,
-    sticker.setName ? `set=${sticker.setName}` : undefined,
-    sticker.type ? `type=${sticker.type}` : undefined,
-    sticker.isAnimated ? "animated=true" : undefined,
-    sticker.isVideo ? "video=true" : undefined,
-  ].filter(Boolean);
-  return `[Sent a Telegram sticker: ${parts.join(", ")}; resend=STICKER:${sticker.fileId}]`;
-}
-
-describe("describeSticker", () => {
-  it("includes file_id and resend instruction", () => {
-    expect(describeSticker({ fileId: "CAAC123" })).toBe(
-      "[Sent a Telegram sticker: file_id=CAAC123; resend=STICKER:CAAC123]",
-    );
+describe("sticker description", () => {
+  const sticker = (extra: Record<string, unknown>) => ({
+    sticker: {
+      file_id: "CAAC123", file_unique_id: "u", width: 512, height: 512,
+      is_animated: false, is_video: false, type: "regular", ...extra,
+    },
   });
 
-  it("includes optional sticker metadata", () => {
-    expect(describeSticker({
-      fileId: "CAAC456",
+  it("includes file_id and resend instruction", async () => {
+    const msg = await dispatchedFor(sticker({ type: undefined }));
+    expect(msg.text).toBe("[Sent a Telegram sticker: file_id=CAAC123; resend=STICKER:CAAC123]");
+  });
+
+  it("includes optional sticker metadata", async () => {
+    const msg = await dispatchedFor(sticker({
+      file_id: "CAAC456",
       emoji: "😂",
-      setName: "funny_pack",
-      type: "regular",
-      isAnimated: true,
-      isVideo: false,
-    })).toBe(
+      set_name: "funny_pack",
+      is_animated: true,
+    }));
+    expect(msg.text).toBe(
       "[Sent a Telegram sticker: file_id=CAAC456, emoji=😂, set=funny_pack, type=regular, animated=true; resend=STICKER:CAAC456]",
     );
-  });
-});
-
-// Test streaming message flush serialization logic
-describe("streaming message flush serialization", () => {
-  it("serializes concurrent flushes to prevent duplicate sends", async () => {
-    const calls: Array<{ action: string; text: string }> = [];
-    let messageId: number | null = null;
-
-    // Simulate the fixed flush implementation with serialization
-    let flushPending = Promise.resolve();
-    let buffer = "";
-    let lastSent = "";
-
-    const flush = () => {
-      flushPending = flushPending.then(async () => {
-        if (buffer === lastSent || !buffer) return;
-        const text = buffer;
-        lastSent = text;
-
-        if (!messageId) {
-          // Simulate API delay
-          await new Promise((r) => setTimeout(r, 10));
-          messageId = 42;
-          calls.push({ action: "send", text });
-        } else {
-          calls.push({ action: "edit", text });
-        }
-      });
-      return flushPending;
-    };
-
-    // First update + flush — sends "Hello"
-    buffer = "Hello";
-    flush();
-    // Wait for first flush to complete so messageId is set
-    await flushPending;
-
-    // Second update + flush — now messageId exists, should edit
-    buffer = "Hello world";
-    flush();
-    await flushPending;
-
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toEqual({ action: "send", text: "Hello" });
-    expect(calls[1]).toEqual({ action: "edit", text: "Hello world" });
-    expect(messageId).toBe(42);
-  });
-
-  it("skips flush when buffer unchanged", async () => {
-    const calls: string[] = [];
-    let messageId: number | null = null;
-    let flushPending = Promise.resolve();
-    let buffer = "";
-    let lastSent = "";
-
-    const flush = () => {
-      flushPending = flushPending.then(async () => {
-        if (buffer === lastSent || !buffer) return;
-        const text = buffer;
-        lastSent = text;
-        if (!messageId) {
-          messageId = 1;
-          calls.push("send");
-        } else {
-          calls.push("edit");
-        }
-      });
-      return flushPending;
-    };
-
-    buffer = "Hello";
-    flush();
-    flush(); // Same buffer — should be skipped
-
-    await flushPending;
-    expect(calls).toEqual(["send"]);
   });
 });
 

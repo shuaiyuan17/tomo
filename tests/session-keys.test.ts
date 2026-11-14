@@ -56,6 +56,11 @@ describe("normalizeImessageHandle", () => {
     ["4695550123", "4695550123"],
     ["5555550123", "5555550123"],
     ["Alex@Example.COM", "alex@example.com"],
+    // URI schemes are dropped, whatever their case.
+    ["tel:+1 (555) 555-0123", "+15555550123"],
+    ["TEL:15555550123", "+15555550123"],
+    ["sms:+15555550123", "+15555550123"],
+    ["mailto:Alex@Example.COM", "alex@example.com"],
     ["iMessage;-;+15555550123", "+15555550123"],
     ["SMS;-;+1 555 555 0123", "+15555550123"],
     ["any;-;Alex@Example.com", "alex@example.com"],
@@ -206,5 +211,56 @@ describe("identity binding matchers", () => {
       { channelKey: "dm:ivy", unlinkedAt: 1, migratedFrom: "imessage:SMS;-;+15551234567", replyTarget: { channelName: "imessage", chatId: "iMessage;-;+15551234567" } },
     ];
     expect(rawSessionKeyForBinding("imessage", "+15551234567", retiredBoth, "dm:ivy")).toBe("imessage:SMS;-;+15551234567");
+  });
+});
+
+describe("URI schemes inside and outside a DM GUID", () => {
+  // The scheme is dropped AFTER the GUID is reduced, so it may sit on the
+  // handle inside the GUID as well as on a bare handle.
+  const pairs: Array<[string, string]> = [
+    ["iMessage;-;tel:+14155551234", "+14155551234"],
+    ["SMS;-;sms:+8613800138000", "+8613800138000"],
+    ["any;-;mailto:Alex@Example.COM", "alex@example.com"],
+    ["iMessage;-;+14155551234", "tel:+1 (415) 555-1234"],
+    ["any;-;alex@example.com", "MAILTO:alex@example.com"],
+  ];
+
+  it("normalizes a scheme on the handle inside a GUID", () => {
+    expect(normalizeImessageHandle("iMessage;-;tel:+14155551234")).toBe("+14155551234");
+    expect(normalizeImessageHandle("SMS;-;sms:+86 138 0013 8000")).toBe("+8613800138000");
+    expect(normalizeImessageHandle("any;-;mailto:Alex@Example.COM")).toBe("alex@example.com");
+  });
+
+  it("matchesChannelBinding matches GUID and bare handle both ways", () => {
+    for (const [guid, bare] of pairs) {
+      expect(matchesChannelBinding("imessage", guid, bare), `${guid} ← ${bare}`).toBe(true);
+      expect(matchesChannelBinding("imessage", bare, guid), `${bare} ← ${guid}`).toBe(true);
+    }
+    // Still exact across countries, and a group never matches a DM binding.
+    expect(matchesChannelBinding("imessage", "iMessage;-;tel:4155551234", "+14155551234")).toBe(false);
+    expect(matchesChannelBinding("imessage", "any;+;chat123", "tel:+14155551234")).toBe(false);
+  });
+
+  it("legacy session adoption finds the old raw key from a prefixed binding", () => {
+    const keys = [
+      "imessage:iMessage;-;tel:+14155551234",
+      "imessage:any;-;mailto:alex@example.com",
+      "imessage:any;+;chat123",
+      "imessage:iMessage;-;+14155550000",
+    ];
+    expect(legacySessionKeysForBinding(keys, "imessage", "+14155551234"))
+      .toEqual(["imessage:iMessage;-;tel:+14155551234"]);
+    expect(legacySessionKeysForBinding(keys, "imessage", "tel:+1 (415) 555-1234"))
+      .toEqual(["imessage:iMessage;-;tel:+14155551234"]);
+    expect(legacySessionKeysForBinding(keys, "imessage", "Alex@Example.com"))
+      .toEqual(["imessage:any;-;mailto:alex@example.com"]);
+  });
+
+  it("the cron hand-back key is recovered for a prefixed binding", () => {
+    const entries = [{ channelKey: "imessage:iMessage;-;tel:+14155551234", unlinkedAt: null }];
+    expect(rawSessionKeyForBinding("imessage", "+14155551234", entries))
+      .toBe("imessage:iMessage;-;tel:+14155551234");
+    expect(rawSessionKeyForBinding("imessage", "tel:+14155551234", entries))
+      .toBe("imessage:iMessage;-;tel:+14155551234");
   });
 });

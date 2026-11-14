@@ -26,7 +26,9 @@ export class PendingNotesQueue {
 
   constructor(private store: DurablePendingNotesStore) {}
 
-  queueNote(sessionKey: string, note: string): void {
+  /** Queue a note for the session's next turn. Returns false when it could
+   *  not be persisted (it is still held in memory for this process). */
+  queueNote(sessionKey: string, note: string): boolean {
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
@@ -44,8 +46,10 @@ export class PendingNotesQueue {
     this.notes.set(sessionKey, arr);
     try {
       this.store.setPendingNotes(sessionKey, arr);
+      return true;
     } catch (err) {
       log.warn({ err, sessionKey }, "Could not persist pending notes");
+      return false;
     }
   }
 
@@ -97,6 +101,25 @@ export class PendingNotesQueue {
     }
 
     return drained.map((n) => `${n}\n\n`).join("");
+  }
+
+  /**
+   * Put a drained prefix back at the FRONT of the queue: the turn it was
+   * drained for never reached the model (a declined steer). Kept as one note,
+   * so its notes stay together and ahead of anything queued since.
+   */
+  restore(sessionKey: string, drainedPrefix: string): void {
+    const note = drainedPrefix.trim();
+    if (!note) return;
+    let arr = this.notes.get(sessionKey);
+    if (!arr) {
+      try { arr = this.store.getPendingNotes(sessionKey); } catch { arr = []; }
+    }
+    arr.unshift(note);
+    this.notes.set(sessionKey, arr);
+    try { this.store.setPendingNotes(sessionKey, arr); } catch (err) {
+      log.warn({ err, sessionKey }, "Could not persist restored pending notes");
+    }
   }
 
   /** Test/support helper for observing queued durable notes without draining. */

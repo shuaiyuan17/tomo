@@ -55,6 +55,7 @@ beforeEach(async () => {
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);
+      if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
@@ -218,6 +219,17 @@ describe("local HTTP boundary", () => {
       body: JSON.stringify({ requestId: randomUUID(), text: "accepted" }) });
     expect(accepted.status).toBe(202); expect(handoff).toHaveBeenCalledOnce();
     expect(bootstrap.csrfToken).not.toBe(cookie);
+  });
+  it("routes dismiss only as a CSRF- and epoch-guarded mutation", async () => {
+    const requestId = randomUUID();
+    const blocked = await call(`/api/v1/messages/${requestId}/dismiss`, { method: "POST", headers: { ...mutationHeaders(), "x-tomo-csrf": "wrong" }, body: "{}" });
+    expect(blocked.status).toBe(403);
+    const noEpoch = await call(`/api/v1/messages/${requestId}/dismiss`, { method: "POST", headers: { ...mutationHeaders(), "x-tomo-epoch": undefined }, body: "{}" });
+    expect(noEpoch.status).toBe(409);
+    // Only an interrupted request awaiting the owner can be dismissed.
+    const notInterrupted = await call(`/api/v1/messages/${requestId}/dismiss`, { method: "POST", headers: mutationHeaders(), body: "{}" });
+    expect(notInterrupted.status).toBe(404);
+    expect(JSON.parse(notInterrupted.text).error).toBe("not_interrupted");
   });
   it("offers only owner DM and read-only groups, rejecting forged group sends", async () => {
     expect(bootstrap.sessions.map((s) => [s.kind, s.writable]).sort()).toEqual([["dm", true], ["group", false]]);

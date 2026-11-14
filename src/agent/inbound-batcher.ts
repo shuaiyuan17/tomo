@@ -8,6 +8,9 @@ export interface InboundItem {
   message: IncomingMessage;
   /** Resolution captured at receipt time so delayed batches cannot re-route. */
   resolution: SessionResolution;
+  /** The user transcript entry is already written (a declined web steer
+   *  handed back to the queue): processing must not record it again. */
+  userRecorded?: boolean;
 }
 
 /**

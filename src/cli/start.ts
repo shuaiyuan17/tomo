@@ -220,7 +220,11 @@ async function startForeground(): Promise<void> {
       const { WebSupervisor } = await import("../web/supervisor.js");
       const { ownerSessionKeyReader, subagentModelReader } = await import("../web/data.js");
       const { CRON_STORE_PATH } = await import("../cron/store.js");
-      const web = new WebChannel(config.owner, undefined, { ownerKey: ownerSessionKeyReader({
+      const { WebRequestJournal } = await import("../web/request-journal.js");
+      const { WEB_CHAT_ID } = await import("../web/protocol.js");
+      const web = new WebChannel(config.owner, undefined, {
+        journal: new WebRequestJournal(join(config.tomoHome, "data", "web", "requests.jsonl")),
+        ownerKey: ownerSessionKeyReader({
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),
         toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
@@ -232,6 +236,8 @@ async function startForeground(): Promise<void> {
         diagnostic: (message, level = "info") => log[level](message),
       }));
       agent.addChannel(web);
+      web.markRecorded(agent.recordedWebRequests(web.interruptedAwaiting(), WEB_CHAT_ID));
+      web.announceInterrupted((items) => agent.noteInterruptedWebRequests(items, WEB_CHAT_ID));
     } catch { log.warn("Web UI unavailable; messaging channels remain active."); }
   }
 

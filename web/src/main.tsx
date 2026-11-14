@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError, sendMessage } from "./api.js";
+import { api, ApiError, dismissRequest, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
@@ -9,6 +9,7 @@ import { runningCount } from "./tasks.js";
 import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun } from "lucide-react";
 import { Study } from "./study.js";
 import { STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
+import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -20,8 +21,17 @@ import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 
 const labels: Record<WebRequest["state"], string> = { queued: "Queued", running: "Tomo is working…", completed: "Completed",
-  failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted", unknown: "Outcome unknown — check the conversation before sending again" };
+  failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted",
+  unknown: "Outcome unknown — Tomo may already have acted on it. Check the conversation before sending again",
+  interrupted: "Interrupted by a restart and not answered — Tomo may have started on it. Check before sending again" };
 type Theme = "system" | "light" | "dark";
+/** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
+const refusalReasons: Record<string, string> = {
+  interrupted_backlog: "Not sent: messages interrupted by restarts are waiting for you above. Resend or dismiss them first; your draft is kept.",
+  journal_unavailable: "Not sent: Tomo cannot read its record of browser messages, so it is not taking new ones. Check the daemon log; your draft is kept.",
+  persist_failed: "Not sent: Tomo could not record the message safely. Your draft is kept; try again.",
+};
+
 
 const OVERLAY_QUERY = "(max-width: 800px)";
 function useMediaQuery(query: string): boolean {
@@ -164,10 +174,10 @@ export function App() {
     if (!element) return;
     if (restoreScroll.current !== null) { element.scrollTop = element.scrollHeight - restoreScroll.current; restoreScroll.current = null; }
     else if (atBottom.current) element.scrollTop = element.scrollHeight;
-  }, [history, web.blocks]);
+  }, [history, web.blocks, web.requests]);
 
   useEffect(() => {
-    web.discardRecordedBlocks(new Set(history.messages.filter((m) => m.role === "assistant" && m.requestId).map((m) => m.requestId!)));
+    web.discardRecordedBlocks(recordedReplyIds(history));
   }, [history, web.discardRecordedBlocks]);
 
   const remember = (id: string | null) => {
@@ -182,10 +192,19 @@ export function App() {
     setSending(true); setFeedback("Sending…"); remember(requestId);
     try {
       const request = await sendMessage({ requestId, targetId: session.id, text }, web.bootstrap, web.refreshBootstrap);
+      web.acceptRequest({ ...request, text, timestamp: Date.now() });
+      // Accepted, and it really was that message (or the owner's edit of it):
+      // only now does the interrupted one go.
+      const replaced = dismissAfterAcceptedSend(resending, text);
+      if (replaced) void dismiss(replaced, true);
+      setResending(null);
       setDraft((old) => old.trim() === text ? "" : old);
       setFeedback(labels[request.state]); remember(null); setReload((r) => r + 1); atBottom.current = true;
     } catch (err) {
-      if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
+      // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
+      const refusal = err instanceof ApiError && err.status === 503 ? refusalReasons[err.code] : undefined;
+      if (refusal) { remember(null); setFeedback(refusal); }
+      else if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
         remember(null);
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
           : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
@@ -193,12 +212,36 @@ export function App() {
       } else setFeedback(labels.unknown);
     } finally { setSending(false); }
   };
+  /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
+  const [resending, setResending] = useState<Resend | null>(null);
+  const [confirmDismiss, setConfirmDismiss] = useState<string | null>(null);
+  const dismiss = async (requestId: string, quiet = false) => {
+    if (!web.bootstrap) return;
+    setConfirmDismiss(null);
+    try { web.applyRequest(await dismissRequest(requestId, web.bootstrap, web.refreshBootstrap)); }
+    catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again."); }
+  };
+  const resend = (request: WebRequest) => {
+    setResending({ requestId: request.requestId, original: request.text ?? "" });
+    setDraft(request.text ?? ""); input.current?.focus();
+    setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
+  };
+  /** Resend / Dismiss for an interrupted request awaiting the owner, on its bubble (history or pending). */
+  const interruptedActions = (request: WebRequest | undefined) => request && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+    <span>Not answered. Tomo may have started on it — check before resending.</span>
+    <Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => resend(request)} disabled={!session?.writable}>Resend…</Button>
+    {confirmDismiss === request.requestId
+      ? <><Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => void dismiss(request.requestId)}>Dismiss it</Button>
+        <Button variant="ghost" size="sm" className="h-7 rounded-lg text-xs" onClick={() => setConfirmDismiss(null)}>Keep</Button></>
+      : <Button variant="ghost" size="sm" className="h-7 rounded-lg text-xs" onClick={() => setConfirmDismiss(request.requestId)}>Dismiss</Button>}
+  </div>;
   const checkOutcome = async () => {
     if (!uncertain) return;
     try {
       const request = await api<WebRequest>(`/messages/${uncertain}`);
       setFeedback(labels[request.state]);
-      if (request.state !== "unknown") { remember(null); if (request.state !== "refused") setDraft(""); }
+      // Unknown stays unresolved; refused and interrupted were not answered, so the draft is kept.
+      if (request.state !== "unknown") { remember(null); if (request.state !== "refused" && request.state !== "interrupted") setDraft(""); }
       setReload((r) => r + 1);
     } catch { setFeedback("Cannot check yet. Your draft is still here."); }
   };
@@ -221,8 +264,9 @@ export function App() {
       } else setHistoryStatus("error");
     }
   };
-  const durable = new Set(history.messages.filter((m) => m.role === "assistant").map((m) => m.requestId).filter(Boolean));
-  const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.requestId));
+  const durable = recordedReplyIds(history);
+  const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.turnId ?? b.requestId));
+  const pendingUsers = pendingUserMessages(web.requests, history, selectedId);
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
@@ -301,18 +345,29 @@ export function App() {
           {history.nextCursor && <Button variant="outline" size="sm" className="mx-auto mb-6 flex rounded-full text-xs" onClick={() => void older()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</Button>}
           {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">History is unavailable. <Button variant="outline" size="sm" className="rounded-lg" onClick={() => setReload((r) => r + 1)}>Try again</Button></div>}
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
-          {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
+          {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
           {history.messages.map((message) => <article className={`message ${message.role} mx-auto mb-7 max-w-[740px]`} key={message.id}>
-            <div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span></div>
-            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5")}><Text>{message.content}</Text></div></article>)}
+            <div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
+              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md font-mono text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
+            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5")}><Text>{message.content}</Text></div>
+            {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>)}
+          {pendingUsers.map((request) => <article className="message user mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
+            <div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
+              <Badge variant="outline" className="self-center rounded-md font-mono text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
+            <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text>{request.text!}</Text></div>
+            {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
           {blocks.map((block) => <article className="message assistant mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown"><Text>{block.text}</Text></div></article>)}
         </div>
         <div className="mx-auto w-full max-w-[740px]"><div className="min-h-7 pb-2 font-mono text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
+          {resending && <div className="mb-2 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
+            <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
+            <span>The original is dismissed once this one is accepted.</span>
+            <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] duration-150 focus-within:border-muted-foreground/50 focus-within:shadow-md">
             <label className="sr-only" htmlFor="message">Message Tomo</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! px-3.5 py-[7px] text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
-              onChange={(e) => setDraft(e.target.value)} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
+              onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
               onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] duration-150 hover:bg-primary/85 active:scale-[0.92] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"

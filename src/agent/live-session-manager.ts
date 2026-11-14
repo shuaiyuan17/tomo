@@ -15,6 +15,7 @@ import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
+import { SteerDeclinedError } from "./sdk-result.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -237,6 +238,10 @@ export class LiveSessionManager {
   async readMcpStatuses(): Promise<Array<{ key: string; connections: McpConnection[] | null }>> {
     const sessions = [...this.liveSessions].filter(([, session]) => session.isAlive()).slice(0, 32);
     return Promise.all(sessions.map(async ([key, session]) => ({ key, connections: await session.readMcpStatus() })));
+  }
+
+  isInteractiveTurn(key: string): boolean {
+    return this.liveSessions.get(key)?.isInteractiveTurn() ?? false;
   }
 
   /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */
@@ -714,6 +719,10 @@ export class LiveSessionManager {
         // kill it mid-flight. The owner's own exit reports for both.
         merged = req.steer === true && response === STEER_MERGED;
         return response;
+      } catch (err) {
+        // Not a turn ending either: it never started, and is re-queued.
+        if (err instanceof SteerDeclinedError) merged = true;
+        throw err;
       } finally {
         this.inFlightTurns.delete(turn);
       }
@@ -773,9 +782,13 @@ export class LiveSessionManager {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
       return await this.runTurnOnSession(key, session, steer, () => (steer
-        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience)
-        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery)));
+        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, {
+          replyContext: req.replyContext, onJoined: req.onJoined, onHandedOff: req.onHandedOff,
+          canJoin: () => this.deps.isOwnAudienceTurn(key) })
+        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext)));
     } catch (err) {
+      // Declined before injection: nothing ran. The caller re-queues it.
+      if (err instanceof SteerDeclinedError) throw err;
       // A turn the CLI ended on an error result is NOT a session error:
       // runTurnOnSession already recorded it; let it through to TurnRunner's
       // error policy untouched. Never retried — the conversation is intact,

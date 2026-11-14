@@ -141,6 +141,14 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 202, await deps.rpc({ method: "message", input: parsed.data, epoch }));
         return;
+      } else if (req.method === "POST" && /^\/api\/v1\/messages\/[a-f0-9-]{36}\/dismiss$/.test(url.pathname)) {
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
+        await body(req); // Content is unused; read so the connection stays clean.
+        const requestId = url.pathname.split("/")[4];
+        json(res, 200, await deps.rpc({ method: "dismiss", requestId, epoch }));
+        return;
       }
       throw new WebError(404, "not_found");
     } finally { active--; if (inspection) inspecting = false; }

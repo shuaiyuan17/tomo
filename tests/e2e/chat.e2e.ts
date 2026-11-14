@@ -254,7 +254,10 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
     line("user", [{ type: "text", text: "the hidden prompt" }]) +
     line("assistant", [{ type: "text", text: "Checking the release notes." }]) +
     line("assistant", [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/repo/CHANGELOG.md" } }]) +
-    line("user", [{ type: "tool_result", tool_use_id: "t1", content: "## 0.12.0 entries" }]));
+    line("user", [{ type: "tool_result", tool_use_id: "t1", content: "## 0.12.0 entries" }]) +
+    line("assistant", [{ type: "tool_use", id: "t2", name: "Grep", input: { pattern: "owner" } }]) +
+    line("user", [{ type: "tool_result", tool_use_id: "t2", content: "src/web/data.ts:24" }]) +
+    line("assistant", [{ type: "text", text: "Both look fine." }]));
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Review the release", ambient: false, background: true, startedAt: Date.now() },
   ] });
@@ -263,6 +266,10 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   const transcript = page.getByLabel("Subagent transcript");
   await browserExpect(transcript).toContainText("Checking the release notes.");
   await browserExpect(transcript).not.toContainText("the hidden prompt");
+  // Consecutive calls fold into one group; the narration around them stays visible.
+  await browserExpect(transcript).toContainText("Both look fine.");
+  await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
+  await transcript.getByRole("button", { name: /2 tool calls · Read, Grep/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
   await browserExpect(transcript).toContainText("## 0.12.0 entries");
   await page.getByRole("button", { name: "Back to tasks" }).click();

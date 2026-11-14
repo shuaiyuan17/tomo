@@ -3,7 +3,7 @@ import type { SubagentItem, SubagentPage } from "../../src/web/protocol.js";
 /** Pure state for the read-only subagent view, kept out of React so it is testable. */
 
 export interface ToolRow {
-  kind: "tool"; id: string; name: string; summary: string; input: string; inputTruncated: boolean;
+  kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean;
   result?: { output: string; truncated: boolean; isError: boolean };
 }
 export type ViewRow = { kind: "text"; id: string; text: string; truncated: boolean } | ToolRow;
@@ -112,7 +112,7 @@ export function viewRows(items: SubagentItem[]): ViewRow[] {
     if (item.kind === "text") rows.push({ kind: "text", id: item.id, text: item.text, truncated: item.truncated });
     else if (item.kind === "tool") {
       const result = results.get(item.toolUseId);
-      rows.push({ kind: "tool", id: item.id, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
+      rows.push({ kind: "tool", id: item.id, toolUseId: item.toolUseId, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
         ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError } } : {}) });
     }
   }
@@ -172,4 +172,53 @@ export async function followStep(io: {
   if (next.gen !== io.gen || next.mode !== "follow" || next.status === "gone") return null;
   if (behind(next) && next.end > current.end) return 0;
   return io.running ? POLL_MS : null;
+}
+
+/**
+ * What the transcript shows: assistant text always in full; a single tool
+ * call as its own row; a run of two or more consecutive tool calls folded
+ * into one group, keyed by its first tool_use id (stable while the run grows,
+ * so an open/closed choice survives incremental updates).
+ */
+export type ViewBlock =
+  | { kind: "text"; row: Extract<ViewRow, { kind: "text" }> }
+  | { kind: "tool"; row: ToolRow }
+  | { kind: "group"; key: string; tools: ToolRow[] };
+
+export function groupRows(rows: ViewRow[]): ViewBlock[] {
+  const blocks: ViewBlock[] = [];
+  let run: ToolRow[] = [];
+  const flush = () => {
+    if (run.length === 1) blocks.push({ kind: "tool", row: run[0] });
+    else if (run.length > 1) blocks.push({ kind: "group", key: run[0].toolUseId, tools: run });
+    run = [];
+  };
+  for (const row of rows) {
+    if (row.kind === "tool") run.push(row);
+    else { flush(); blocks.push({ kind: "text", row }); }
+  }
+  flush();
+  return blocks;
+}
+
+/** "7 tool calls · Read ×3, Bash ×2, Grep, Edit" (most used first, ties in order of first use). */
+export function groupSummary(tools: ToolRow[]): string {
+  const counts = new Map<string, number>();
+  for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
+  const names = [...counts].sort((a, b) => b[1] - a[1]).map(([name, n]) => (n > 1 ? `${name} ×${n}` : name));
+  return `${tools.length} tool calls · ${names.join(", ")}`;
+}
+
+/**
+ * Whether a group is open: the reader's own choice if made; otherwise only
+ * the last block while the task runs (the run that is still growing).
+ */
+export function groupOpen(choices: Readonly<Record<string, boolean>>, key: string, isLastBlock: boolean, running: boolean): boolean {
+  return choices[key] ?? (isLastBlock && running);
+}
+
+/** The call still waiting for its result in a running group, if any. */
+export function pendingTool(tools: ToolRow[]): ToolRow | undefined {
+  const last = tools.at(-1);
+  return last && !last.result ? last : undefined;
 }

@@ -1,9 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
+import { Text } from "./markdown.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, ChevronsUpDown, ListChecks, Monitor, Moon, Sun } from "lucide-react";
@@ -58,16 +57,6 @@ function storedTheme(): Theme {
 }
 function Mark({ className }: { className?: string }) {
   return <svg className={cn("size-10 shrink-0 fill-none stroke-primary stroke-2 [stroke-linecap:round]", className)} viewBox="0 0 40 40" aria-hidden="true"><path d="M 32 14 C 36 20, 32 32, 20 32 C 8 32, 5 22, 10 14 C 14 7, 26 6, 30 12" /></svg>;
-}
-function Text({ children }: { children: string }) {
-  return <Markdown remarkPlugins={[remarkGfm]} skipHtml components={{
-    // Remote images would disclose local reading activity. Links require a
-    // deliberate click and cannot take control of the local window.
-    img: ({ alt }) => <span className="text-[13px] text-muted-foreground">[Image: {alt || "not loaded"}]</span>,
-    a: ({ href, children }) => href && /^https?:\/\//.test(href)
-      ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> : <span>{children}</span>,
-    input: ({ checked }) => <input type="checkbox" checked={checked ?? false} disabled aria-label={checked ? "Completed task" : "Incomplete task"} />,
-  }}>{children}</Markdown>;
 }
 
 export function App() {
@@ -309,7 +298,7 @@ export function App() {
         </div>
       </main>
       {tasksOpen && <aside ref={rail} id="tasks-rail" aria-label="Tasks" {...(modal ? { role: "dialog", "aria-modal": true } : {})}
-        className="flex min-h-0 w-[300px] shrink-0 flex-col border-l pt-6 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-4 max-[800px]:shadow-2xl max-[800px]:animate-[rail-in_180ms_ease-out] max-[600px]:top-16">
+        className="flex min-h-0 w-[300px] shrink-0 flex-col border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:animate-[rail-in_180ms_ease-out] max-[600px]:top-16">
         <TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} /></aside>}
     </div>
   </div>;

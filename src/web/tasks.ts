@@ -46,6 +46,10 @@ export class TaskBoard {
   private sessions = new Map<string, Map<string, WebTask>>();
   /** What the browser was last sent, per session (bounded by MAX_BOARD_TASKS). */
   private shown = new Map<string, WebTask[]>();
+  /** For each shown browser session: task id → the slot it came from. */
+  private shownSlots = new Map<string, Map<string, string>>();
+  /** Models learned per slot and task (kept across REPLACE updates). */
+  private models = new Map<string, Map<string, string>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly now: () => number;
   private readonly retainMs: number;
@@ -72,6 +76,35 @@ export class TaskBoard {
   }
 
 
+  /**
+   * A task the browser can see right now, by its browser session id: exactly
+   * the set the last `publish` sent (expiry, the owner rule and the capacity
+   * share all applied) — re-run first, so it is current. Returns the slot it
+   * is stored under. Nothing the panel does not show can be opened.
+   */
+  locate(sessionId: string, taskId: string): { slot: string; task: WebTask } | undefined {
+    this.publish();
+    const slot = this.shownSlots.get(sessionId)?.get(taskId);
+    const task = this.shown.get(sessionId)?.find((t) => t.taskId === taskId);
+    return slot !== undefined && task ? { slot, task: { ...task } } : undefined;
+  }
+
+  /** Record a task's model (read from its transcript) and republish. */
+  setModel(slot: string, taskId: string, model: string): void {
+    const models = this.models.get(slot) ?? new Map<string, string>();
+    if (models.get(taskId) === model) return;
+    models.set(taskId, model);
+    this.models.set(slot, models);
+    const task = this.sessions.get(slot)?.get(taskId);
+    if (task) { this.sessions.get(slot)!.set(taskId, { ...task, model }); this.publish(); }
+  }
+
+  /** Whether the board still holds this task (live or recently ended). */
+  holds(slot: string, taskId: string): boolean { return this.sessions.get(slot)?.has(taskId) ?? false; }
+
+  /** Whether a task's model is already known. */
+  hasModel(slot: string, taskId: string): boolean { return this.models.get(slot)?.has(taskId) ?? false; }
+
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
     const now = this.now();
     const old = this.sessions.get(sessionId) ?? new Map<string, WebTask>();
@@ -86,6 +119,7 @@ export class TaskBoard {
         taskId: task.taskId,
         taskType: clip(task.taskType, LABEL_LIMIT),
         ...(task.subagentType ? { subagentType: clip(task.subagentType, LABEL_LIMIT) } : {}),
+        ...(this.models.get(sessionId)?.get(task.taskId) ? { model: this.models.get(sessionId)!.get(task.taskId)! } : {}),
         description: clip(task.description, 200),
         ...(task.parentTaskId && TASK_ID.test(task.parentTaskId) ? { parentTaskId: task.parentTaskId } : {}),
         ambient: task.ambient,
@@ -144,6 +178,11 @@ export class TaskBoard {
       }
       if (!tasks.size) this.sessions.delete(sessionId);
     }
+    for (const [slot, models] of [...this.models]) {
+      const tasks = this.sessions.get(slot);
+      for (const id of [...models.keys()]) if (!tasks?.has(id)) models.delete(id);
+      if (!models.size) this.models.delete(slot);
+    }
     const route = this.router();
     const targets = new Map<string, string>();
     for (const slot of this.sessions.keys()) {
@@ -168,10 +207,15 @@ export class TaskBoard {
       }
     }
     const out = new Map<string, WebTask[]>();
+    const slots = new Map<string, Map<string, string>>();
     for (const [slot, tasks] of picked) {
       const target = targets.get(slot)!;
       out.set(target, [...(out.get(target) ?? []), ...tasks.map((task) => ({ ...task, sessionId: target }))]);
+      const bySlot = slots.get(target) ?? new Map<string, string>();
+      for (const task of tasks) bySlot.set(task.taskId, slot);
+      slots.set(target, bySlot);
     }
+    this.shownSlots = slots;
     for (const id of new Set([...this.shown.keys(), ...out.keys()])) {
       const list = out.get(id) ?? [];
       const before = this.shown.get(id) ?? [];

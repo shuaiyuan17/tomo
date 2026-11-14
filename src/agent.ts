@@ -1946,6 +1946,11 @@ export class Agent {
   }
 
   /** Channel + per-session vitals snapshot for the watch server. */
+  /** Read-only: a shell/Monitor task's output tail (web task view). */
+  readTaskOutput(sessionKey: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
+    return this.liveSessionManager.taskOutput(sessionKey, taskId);
+  }
+
   watchOverview(): { channels: string[]; sessions: WatchSessionInfo[] } {
     return {
       channels: this.channels.map((ch) => ch.name),

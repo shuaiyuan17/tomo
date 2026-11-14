@@ -217,6 +217,12 @@ export class LiveSessionManager {
     return !!live?.isAlive() && live.isBusy();
   }
 
+  /** A shell/Monitor task's output tail from the key's live session; never creates one. */
+  async taskOutput(key: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() ? live.getTaskOutput(taskId) : undefined;
+  }
+
   isAlive(key: string): boolean {
     return this.liveSessions.get(key)?.isAlive() ?? false;
   }

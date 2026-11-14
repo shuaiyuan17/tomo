@@ -7,7 +7,7 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
-  type EventEnvelope, type Rpc, type WebRequest, type WebSync } from "./protocol.js";
+  type EventEnvelope, type Rpc, type WebRequest, type WebSync, type WebTaskAccess } from "./protocol.js";
 
 export interface HttpDependencies {
   accessToken: string;
@@ -76,6 +76,20 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const history = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/messages$/.exec(url.pathname);
         if (history) {
           json(res, 200, await deps.data.history(history[1], url.searchParams.get("cursor") ?? undefined));
+          return;
+        }
+        const task = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(transcript|output)$/.exec(url.pathname);
+        if (task) {
+          const [, sessionId, taskId, what] = task;
+          const access = await deps.rpc({ method: "task", sessionId, taskId, output: what === "output" }) as WebTaskAccess;
+          if (what === "output") { json(res, 200, access.output); return; }
+          const number = (name: string) => {
+            const raw = url.searchParams.get(name);
+            if (raw === null) return undefined;
+            if (!/^\d{1,15}$/.test(raw)) throw new WebError(400, "invalid_cursor");
+            return Number(raw);
+          };
+          json(res, 200, await deps.data.subagent(access.sessionKey, taskId, { before: number("before"), after: number("after") }));
           return;
         }
         const request = /^\/api\/v1\/messages\/([a-f0-9-]{36})$/.exec(url.pathname);

@@ -3,14 +3,18 @@ import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from
 import type { Channel, CommandHandler, IncomingMessage, MessageHandler, OutgoingMessage } from "./types.js";
 import { markDefiniteFailure } from "./types.js";
 import { watchBus, type WatchBus } from "../watch/bus.js";
-import type { WatchEvent } from "../watch/protocol.js";
+import type { WatchEvent, WatchTask } from "../watch/protocol.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { selectOwnerSessionKey } from "../web/data.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebEvent, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
+/** Task types whose output tail the SDK serves (`get_task_output`). */
+const OUTPUT_TASK_TYPES = new Set(["local_bash", "monitor"]);
+/** A subagent whose transcript names no model yet is looked up again after these delays, then given up. */
+export const MODEL_RETRY_DELAYS_MS = [1_000, 3_000, 10_000];
 /** How often the owner-key rule is re-read while owner tasks are shown. */
 export const OWNER_KEY_CHECK_MS = 1_000;
 
@@ -33,6 +37,11 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  private readonly taskModel: ((sessionKey: string, taskId: string) => Promise<string | undefined>) | undefined;
+  /** Model lookups in progress (or given up), per key and task. */
+  private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
+  private readonly now: () => number;
+  private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -42,8 +51,15 @@ export class WebChannel implements Channel {
   private ownerKeyTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus,
-    options: { now?: () => number; ownerKey?: () => string | undefined } = {}) {
+    options: { now?: () => number; ownerKey?: () => string | undefined;
+      /** Reads a shell/Monitor task's output tail from the live session of `sessionKey`. */
+      taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>;
+      /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
+      taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined> } = {}) {
+    this.taskOutput = options.taskOutput;
+    this.taskModel = options.taskModel;
     const now = options.now ?? Date.now;
+    this.now = now;
     // Without registry access the catalog would pick the canonical key.
     this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
     this.tasks = new TaskBoard((sessionId, tasks) => {
@@ -110,6 +126,22 @@ export class WebChannel implements Channel {
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
   }
 
+  /**
+   * Where the browser may read a task it was shown: only a task the panel's
+   * send gate would show in `sessionId` right now. Shell and Monitor tasks
+   * also return their output tail, read from the live SDK session.
+   */
+  async task(sessionId: string, taskId: string, output: boolean): Promise<WebTaskAccess> {
+    const found = this.tasks.locate(sessionId, taskId);
+    if (!found) throw new WebError(404, "task_not_found");
+    const access: WebTaskAccess = { sessionKey: found.slot, taskType: found.task.taskType };
+    if (!output) return access;
+    if (!OUTPUT_TASK_TYPES.has(found.task.taskType)) throw new WebError(400, "no_task_output");
+    const value = await this.taskOutput?.(found.slot, taskId).catch(() => undefined);
+    if (!value) throw new WebError(503, "task_output_unavailable");
+    return { ...access, output: { output: value.output.slice(-16 * 1024), size: value.size } };
+  }
+
   async send(message: OutgoingMessage): Promise<void> {
     const requestId = message.chatId;
     const receipt = this.receipts.get(requestId);
@@ -148,6 +180,8 @@ export class WebChannel implements Channel {
     this.tornDown = true;
     this.unsubscribe?.();
     this.tasks.dispose();
+    for (const lookup of this.modelLookups.values()) clearTimeout(lookup.timer);
+    this.modelLookups.clear();
     clearInterval(this.ownerKeyTimer);
     try { await this.lifecycle?.stop(); } catch { /* Optional process cleanup cannot prevent daemon shutdown. */ }
   }
@@ -185,9 +219,46 @@ export class WebChannel implements Channel {
       return ownerKey !== undefined && key === ownerKey && ownerId ? ownerId : undefined;
     };
   }
+  /**
+   * Subagents (local_agent) get their model from the first assistant entry of
+   * their transcript. Looked up when the task first appears; if that entry is
+   * not written yet, retried after MODEL_RETRY_DELAYS_MS (1 s, 3 s, 10 s) and
+   * then given up. A task that ended keeps being looked up while the panel
+   * still holds it; once it has left the panel, its retries are dropped.
+   * Other task types have no model and are never looked up.
+   */
+  private lookUpModels(key: string, tasks: WatchTask[]): void {
+    if (!this.taskModel) return;
+    // Drop lookups for tasks the board no longer holds (left the panel).
+    for (const [id, lookup] of this.modelLookups) {
+      if (!this.tasks.holds(lookup.key, lookup.taskId)) { clearTimeout(lookup.timer); this.modelLookups.delete(id); }
+    }
+    for (const task of tasks) {
+      if (task.taskType !== "local_agent" || this.tasks.hasModel(key, task.taskId)) continue;
+      const id = `${key}\0${task.taskId}`;
+      if (this.modelLookups.has(id)) continue;
+      const lookup = { key, taskId: task.taskId, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+      this.modelLookups.set(id, lookup);
+      const attempt = () => {
+        lookup.timer = undefined;
+        void this.taskModel!(key, task.taskId).then((model) => {
+          if (this.modelLookups.get(id) !== lookup || this.tornDown) return;
+          // A short task may have ended meanwhile; it still gets its badge
+          // while the panel keeps it. Once it left the panel, stop.
+          if (!this.tasks.holds(key, task.taskId)) { this.modelLookups.delete(id); return; }
+          if (model) { this.tasks.setModel(key, task.taskId, model); return; }
+          const delay = MODEL_RETRY_DELAYS_MS[lookup.attempt++];
+          if (delay !== undefined) { lookup.timer = setTimeout(attempt, delay); lookup.timer.unref?.(); }
+        }, () => {});
+      };
+      attempt();
+    }
+  }
+
   /** Every owner-bound or group key is recorded; the gate decides what is shown. */
   private observeTasks(key: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
     this.tasks.apply(key, event.tasks, event.ended);
+    this.lookUpModels(key, event.tasks);
     // The owner rule can change with no task event at all; re-run the gate so
     // a DM that stops being the owner conversation is withdrawn promptly.
     if (!isGroupSessionKey(key) && !this.ownerKeyTimer) {

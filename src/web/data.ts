@@ -3,7 +3,8 @@ import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
-import { WebError, type WebCatalog } from "./protocol.js";
+import { WebError, type SubagentPage, type WebCatalog } from "./protocol.js";
+import { readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -43,6 +44,17 @@ export function ownerSessionKeyReader(options: WebDataOptions): () => string | u
   };
 }
 
+/** The model of a session key's subagent, from its transcript (daemon side; never throws). */
+export function subagentModelReader(options: WebDataOptions): (sessionKey: string, taskId: string) => Promise<string | undefined> {
+  return async (sessionKey, taskId) => {
+    try {
+      const entry = SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir)
+        .find((e) => e.channelKey === sessionKey && e.sdkSessionId);
+      return entry ? await readSubagentModel(options.sdkSessionsDir, entry.sdkSessionId, taskId) : undefined;
+    } catch { return undefined; }
+  };
+}
+
 /** Runs in the web process. Never imports the live Agent or starts services. */
 export class WebData {
   constructor(private readonly options: WebDataOptions) {}
@@ -72,6 +84,23 @@ export class WebData {
         lastActiveAt: null, stats: { contextUsed: 0, contextMax: 0 } });
     }
     return { sessions, keys, ownerId: ownerKey ? stableOwnerId : null, setupRequired: !ownerKey };
+  }
+
+  /**
+   * A page of a subagent's transcript. `sessionKey` comes from the daemon's
+   * task gate (the task is on the board the browser was shown); the SDK
+   * session is the key's current one in the registry.
+   */
+  async subagent(sessionKey: string, taskId: string, cursor: { before?: number; after?: number }): Promise<SubagentPage> {
+    const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir)
+      .find((e) => e.channelKey === sessionKey && e.sdkSessionId);
+    if (!entry) throw new WebError(404, "transcript_not_found");
+    try { return await readSubagentPage(this.options.sdkSessionsDir, entry.sdkSessionId, taskId, cursor); }
+    catch (error) {
+      if (error instanceof SubagentReadError) throw new WebError(
+        error.code === "invalid_cursor" ? 400 : error.code === "transcript_reset" ? 409 : 404, error.code);
+      throw error;
+    }
   }
 
   async history(id: string, cursor?: string) {

@@ -240,6 +240,7 @@ export class WebSupervisor implements WebLifecycle {
             return result;
           }
           if (input.method === "request") return this.channel.request(input.requestId);
+          if (input.method === "task") return this.channel.task(input.sessionId, input.taskId, input.output);
           if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
           return this.channel.receive(input.input);
         };

@@ -55,6 +55,7 @@ beforeEach(async () => {
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);
+      if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
   const response = await call(`/api/v1/bootstrap?t=${accessToken}`);
@@ -122,8 +123,38 @@ describe("local HTTP boundary", () => {
     expect(updates).toHaveLength(1);
     expect(updates[0]).toContain('"taskId":"next"');
   });
+  it("serves a shown subagent's transcript pages and refuses tasks the panel does not show", async () => {
+    const { watchBus } = await import("../src/watch/bus.js");
+    const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+    new SessionStore(sessionsDir, 20, sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-1");
+    mkdirSync(join(sdkSessionsDir, "sdk-1", "subagents"), { recursive: true });
+    const line = (content: unknown[]) => JSON.stringify({ type: "assistant", message: { content } }) + "\n";
+    writeFileSync(join(sdkSessionsDir, "sdk-1", "subagents", "agent-a1.jsonl"), line([{ type: "text", text: "Reading the config." }]));
+    writeFileSync(join(sdkSessionsDir, "sdk-1", "subagents", "agent-zz.jsonl"), line([{ type: "text", text: "not on the board" }]));
+    const task = { taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: true, startedAt: 1 };
+    watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task, { ...task, taskId: "b1", taskType: "local_bash" }] });
+    const base = `/api/v1/sessions/${bootstrap.ownerId}/tasks`;
+    const page = await call(`${base}/a1/transcript`);
+    expect(page.status).toBe(200);
+    const body = JSON.parse(page.text);
+    expect(body.items).toMatchObject([{ kind: "text", text: "Reading the config." }]);
+    expect((await call(`${base}/a1/transcript?after=${body.end}`)).status).toBe(200);
+    expect((await call(`${base}/a1/transcript?after=abc`)).status).toBe(400);
+    // On disk but never shown by the panel: refused by the daemon gate.
+    const refused = await call(`${base}/zz/transcript`);
+    expect(refused.status).toBe(404);
+    // The browser tells "left the panel" from "not written yet" by this code.
+    expect(JSON.parse(refused.text).error).toBe("task_not_found");
+    expect(JSON.parse((await call(`${base}/b1/transcript`)).text).error).toBe("transcript_not_found");
+    // A shown task whose transcript does not exist (yet).
+    expect((await call(`${base}/b1/transcript`)).status).toBe(404);
+    // No live SDK session to read a shell tail from.
+    expect((await call(`${base}/b1/output`)).status).toBe(503);
+    expect((await call(`${base}/a1/output`)).status).toBe(400);
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
-    for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events"]) {
+    for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
+      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`]) {
       const result = await call(path, { headers: { cookie: undefined } });
       expect(result.status).toBe(401); expect(result.text).toBe('{"error":"authentication_required"}');
     }

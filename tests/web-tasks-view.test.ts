@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTaskView, runningCount, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind } from "../web/src/tasks.js";
+import { buildTaskView, modelLabel, runningCount, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind } from "../web/src/tasks.js";
 import type { WebSession, WebTask } from "../src/web/protocol.js";
 
 const session = (id: string, title: string, kind: "dm" | "group"): WebSession =>
@@ -65,5 +65,14 @@ describe("task panel view", () => {
 
   it("the topbar count includes running, non-ambient tasks only", () => {
     expect(runningCount([task("a"), task("b", { ambient: true }), task("c", { state: "completed", endedAt: 1 }), task("d", { sessionId: "g1" })])).toBe(2);
+  });
+
+  it("labels model ids briefly and leaves unknown ids readable", () => {
+    expect(modelLabel("claude-opus-5-5")).toBe("Opus 5.5");
+    expect(modelLabel("claude-fable-5-2")).toBe("Fable 5.2");
+    expect(modelLabel("claude-sonnet-4-5-20250929")).toBe("Sonnet 4.5");
+    expect(modelLabel("claude-haiku-5")).toBe("Haiku 5");
+    expect(modelLabel("claude-3-5-sonnet-20241022")).toBe("3-5-sonnet-20241022");
+    expect(modelLabel("gpt-5.6-sol")).toBe("gpt-5.6-sol");
   });
 });

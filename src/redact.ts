@@ -335,7 +335,7 @@ let warnedRedactionFailure = false;
  * Deep-redact a log record: censor secret-named fields at any depth, and run
  * the value-shaped rules over string leaves.
  *
- * String leaves matter as much as field names here. `imessage-imsg.ts` logs
+ * String leaves matter as much as field names here. `imsg-rpc.ts` logs
  * child-process RPC params, and a value like
  * `{ dbUrl: "postgres://admin:S3cret@host" }` or
  * `{ header: "Authorization: Bearer sk-ant-…" }` carries the credential under

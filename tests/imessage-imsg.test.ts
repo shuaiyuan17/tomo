@@ -964,7 +964,7 @@ describe("imsg inbound message mapping", () => {
     // The channel under test (set by setup) — used to wait for its re-checks.
     let current: ImsgChannel | null = null;
     const checksIdle = () =>
-      !current || (current as unknown as { deferredChecksInFlight: Set<unknown> }).deferredChecksInFlight.size === 0;
+      !current || (current as unknown as { intake: { deferredChecksInFlight: Set<unknown> } }).intake.deferredChecksInFlight.size === 0;
     // Advance fake time, then wait for every re-check it started to finish
     // its real IO. Use only when no re-check is expected to stay blocked.
     const tick = async (ms: number) => {
@@ -980,7 +980,7 @@ describe("imsg inbound message mapping", () => {
     };
     // Wait until the watch for `key` has a loaded follow-up queued.
     const followUpQueued = (key: string) => () => {
-      const watches = (current as unknown as { deferredWatches: Map<string, { undelivered: unknown[] }> }).deferredWatches;
+      const watches = (current as unknown as { intake: { deferredWatches: Map<string, { undelivered: unknown[] }> } }).intake.deferredWatches;
       return (watches.get(key)?.undelivered.length ?? 0) > 0;
     };
     const pngBytes = Buffer.from("89504e470d0a1a0a", "hex");
@@ -1509,7 +1509,7 @@ describe("imsg inbound message mapping", () => {
 
           // Hold the check on its first attachment's disk probe.
           let release: () => void = () => {};
-          const internals = channel as unknown as { resolveOnDiskAttachment: (att: Record<string, unknown>) => Promise<unknown> };
+          const internals = (channel as unknown as { intake: { resolveOnDiskAttachment: (att: Record<string, unknown>) => Promise<unknown> } }).intake;
           const probe = vi.spyOn(internals, "resolveOnDiskAttachment").mockImplementationOnce(
             () => new Promise((r) => { release = () => r(null); }),
           );
@@ -1824,7 +1824,7 @@ describe("imsg inbound message mapping", () => {
         }));
         await ioUntil(() => handler.mock.calls.length >= 1);
 
-        const internals = channel as unknown as { resolveOnDiskAttachment: (att: Record<string, unknown>) => Promise<unknown> };
+        const internals = (channel as unknown as { intake: { resolveOnDiskAttachment: (att: Record<string, unknown>) => Promise<unknown> } }).intake;
         const probe = vi.spyOn(internals, "resolveOnDiskAttachment").mockImplementation(() => new Promise(() => {}));
         await vi.advanceTimersByTimeAsync(5_000);
         await ioUntil(() => probe.mock.calls.length >= 1); // the check is now hung
@@ -4572,11 +4572,11 @@ describe("imsg at-least-once persist ordering", () => {
 
   it("advanceCursor refuses to skip a known-failed lower rowid, then clears on replay", () => {
     const { channel } = makeChannel();
-    const internals = channel as unknown as {
+    const internals = (channel as unknown as { rpc: {
       lastRowId: number;
       failedRowId: number | null;
       advanceCursor(rowId: number): void;
-    };
+    } }).rpc;
     internals.lastRowId = 100;
     internals.failedRowId = 200;
 
@@ -4670,7 +4670,7 @@ describe("imsg at-least-once persist ordering", () => {
       await settle();
 
       expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
-      expect((channel as unknown as { failedRowId: number | null }).failedRowId).toBeNull();
+      expect((channel as unknown as { rpc: { failedRowId: number | null } }).rpc.failedRowId).toBeNull();
       expect(children).toHaveLength(childCountBefore); // no extra restart from the stale failure
 
       // The cursor keeps advancing — not wedged.
@@ -4826,7 +4826,8 @@ describe("imsg stdin backpressure", () => {
     });
     await channel.start();
 
-    const request = (channel as unknown as { request(method: string, params: Record<string, unknown>): Promise<unknown> }).request.bind(channel);
+    const rpc = (channel as unknown as { rpc: { request(method: string, params: Record<string, unknown>): Promise<unknown> } }).rpc;
+    const request = rpc.request.bind(rpc);
     for (let i = 0; i < 256; i++) void (request("send", { chat_guid: DM_GUID, text: `x${i}` }) as Promise<unknown>).catch(() => {});
 
     await expect(request("send", { chat_guid: DM_GUID, text: "overflow" })).rejects.toThrow(/pending queue full/);
@@ -4850,9 +4851,10 @@ describe("imsg stdin backpressure", () => {
       .filter((r) => r.method === "send")
       .map((r) => r.params.text);
 
-    const request = (channel as unknown as {
+    const rpc = (channel as unknown as { rpc: {
       request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
-    }).request.bind(channel);
+    } }).rpc;
+    const request = rpc.request.bind(rpc);
 
     // The first send backpressures (write returns false), so the second send's
     // write stays QUEUED behind the un-drained first.
@@ -4891,9 +4893,10 @@ describe("imsg stdin backpressure", () => {
       .map((l) => JSON.parse(l) as RpcRequest)
       .filter((r) => r.method === "send")
       .map((r) => r.params.text);
-    const request = (channel as unknown as {
+    const rpc = (channel as unknown as { rpc: {
       request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
-    }).request.bind(channel);
+    } }).rpc;
+    const request = rpc.request.bind(rpc);
 
     // The first send parks on 'drain' (never fires; child stays alive). The
     // second send is queued behind it.
@@ -5387,7 +5390,7 @@ describe("imsg capability re-probe (#258)", () => {
     release(CAPS_FULL); // the probe resolves on a stopped channel
     await settle();
 
-    const internals = channel as unknown as { capabilities: ImsgCapabilities };
+    const internals = (channel as unknown as { rpc: { capabilities: ImsgCapabilities } }).rpc;
     expect(internals.capabilities.advancedFeatures).toBe(false); // snapshot untouched
   });
 

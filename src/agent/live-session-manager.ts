@@ -15,6 +15,8 @@ import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
+import { privateMemoryBarFor } from "./permissions.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
 /**
@@ -494,6 +496,7 @@ export class LiveSessionManager {
       onToolResult: (toolName, content, isError) => {
         this.deps.handleToolResult?.(key, toolName, content, isError);
       },
+      isTurnBarred: () => privateMemoryBarFor(isGroupSessionKey(key), () => this.deps.isOwnAudienceTurn(key)) !== null,
       ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: this.deps.getUsageBaseline(key) } } : {}),
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`

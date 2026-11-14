@@ -313,6 +313,13 @@ export interface LiveSessionSettings {
    * deltas start from `baseline` instead of 0. See `turnUsage`.
    */
   resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
+  /**
+   * Is the turn in flight barred from `memory/private/` (a group session, or a
+   * summoned group steering a `dm:` one)? Read when a background task appears:
+   * a task a barred turn leaves running is stopped when the turn ends — see
+   * `stopTasksOutlivingBarredTurn`.
+   */
+  isTurnBarred?: () => boolean;
 }
 
 /** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
@@ -777,6 +784,10 @@ export class LiveSession {
    */
   private outstandingDelivery: OutstandingDelivery | null = null;
 
+  private readonly isTurnBarred: (() => boolean) | undefined;
+  /** Background tasks that appeared while a barred turn was in flight. */
+  private barredTaskIds = new Set<string>();
+
   constructor(
     options: ReturnType<typeof sdkOptions>,
     sessionKey?: string,
@@ -792,6 +803,7 @@ export class LiveSession {
     this.onMcpAuthError = settings.onMcpAuthError;
     this.now = settings.now ?? Date.now;
     this.onToolResult = settings.onToolResult;
+    this.isTurnBarred = settings.isTurnBarred;
     const resumeFrom = settings.resumeFrom;
     if (resumeFrom) {
       const baseline = resumeFrom.baseline;
@@ -864,6 +876,32 @@ export class LiveSession {
    * Reject the in-flight turn's owner plus any merged/pending steered
    * requests, clear turn state, and wake idle waiters. No-op when idle.
    */
+  /**
+   * THE BACKSTOP FOR "NO WORK OUTLIVES A BARRED TURN" (audit P0-4).
+   *
+   * The PreToolUse guard refuses every way of STARTING background work on a
+   * barred turn (permissions.ts `outlivesTurnDenial`). A foreground task can
+   * still be moved to the background (the SDK's backgrounding control, or a
+   * future auto-background), and once the turn ends its tool calls would be
+   * judged with no turn registered — the owner's scope on a `dm:` session. So
+   * any task that appeared during a barred turn and is still live when that
+   * turn ends is stopped, BEFORE the turn resolves (and its audience is
+   * unregistered).
+   */
+  private async stopTasksOutlivingBarredTurn(): Promise<void> {
+    if (this.barredTaskIds.size === 0) return;
+    const ids = [...this.barredTaskIds].filter((id) => this.backgroundTaskIds.has(id));
+    this.barredTaskIds.clear();
+    for (const id of ids) {
+      log.warn({ session: this.sessionKey, taskId: id }, "Stopping a background task a private-memory-barred turn left running");
+      try {
+        await (this.q as Partial<Pick<Query, "stopTask">>).stopTask?.call(this.q, id);
+      } catch (err) {
+        log.warn({ err, session: this.sessionKey, taskId: id }, "Could not stop a background task left by a barred turn");
+      }
+    }
+  }
+
   private failTurn(err: Error): void {
     const requests: TurnRequest[] = [];
     if (this.currentRequest) requests.push(this.currentRequest);
@@ -1304,6 +1342,13 @@ export class LiveSession {
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
       const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
+      // Ambient ones included: whether a task may outlive a barred turn is
+      // about what it can touch, not whether it counts as activity.
+      if (this.isTurnBarred?.()) {
+        for (const t of tasks) if (!this.backgroundTaskIds.has(t.task_id)) this.barredTaskIds.add(t.task_id);
+      }
+      const liveIds = new Set(tasks.map((t) => t.task_id));
+      for (const id of this.barredTaskIds) if (!liveIds.has(id)) this.barredTaskIds.delete(id);
       const hadTasks = this.backgroundTaskIds.size > 0;
       this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
       if (this.backgroundTaskIds.size === 0) {
@@ -1397,6 +1442,7 @@ export class LiveSession {
       // than resolving with a note the block sink would deliver as if the
       // model had said it — bypassing the turn's error policy and reporting
       // a clean run to cron.
+      await this.stopTasksOutlivingBarredTurn();
       if (failure) await req?.reject(failure);
       else await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);

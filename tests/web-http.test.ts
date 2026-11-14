@@ -90,6 +90,38 @@ describe("local HTTP boundary", () => {
     expect(text.indexOf("event: snapshot")).toBeLessThan(text.indexOf("event: update"));
     expect(text).not.toContain("already settled");
   });
+  it("serves current tasks in bootstrap and the SSE snapshot, without replaying stale task lists", async () => {
+    const { watchBus } = await import("../src/watch/bus.js");
+    const task = (taskId: string) => ({ taskId, taskType: "local_agent", description: `work ${taskId}`, ambient: false, background: true, startedAt: 1 });
+    watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("old")] });
+    const cursor = channel.events.cursor();
+    watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("current")] });
+    const fresh = JSON.parse((await call("/api/v1/bootstrap")).text) as WebBootstrap;
+    expect(fresh.tasks.map((t) => [t.taskId, t.state])).toEqual([["current", "running"], ["old", "ended"]]);
+    const controller = new AbortController();
+    const response = await fetch(`http://127.0.0.1:${service.port}/api/v1/events?cursor=${cursor}`, { headers: { ...baseHeaders, cookie }, signal: controller.signal });
+    const reader = response.body!.getReader(); let text = "";
+    const timeout = setTimeout(() => controller.abort(), 500);
+    try {
+      while (!text.includes("event: snapshot")) {
+        const part = await reader.read().catch(() => ({ done: true, value: undefined }));
+        if (part.done) break;
+        text += new TextDecoder().decode(part.value);
+      }
+      watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("current"), task("next")] });
+      while (!text.includes('"taskId":"next"')) {
+        const part = await reader.read().catch(() => ({ done: true, value: undefined }));
+        if (part.done) break;
+        text += new TextDecoder().decode(part.value);
+      }
+    } finally { clearTimeout(timeout); controller.abort(); await reader.cancel().catch(() => {}); }
+    const snapshot = text.split("\n\n").find((frame) => frame.includes("event: snapshot"))!;
+    expect(snapshot).toContain('"taskId":"current"');
+    // The replayed range held a task list; only the snapshot and live updates carry tasks.
+    const updates = text.split("\n\n").filter((frame) => frame.includes("event: update") && frame.includes('"type":"tasks"'));
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toContain('"taskId":"next"');
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events"]) {
       const result = await call(path, { headers: { cookie: undefined } });

@@ -27,7 +27,7 @@ p, h1, h2 { text-wrap: pretty; }
 .connection.live i { background: var(--accent); border-color: var(--accent); }
 .theme-label select { font-size: 12px; background: transparent; }
 .workspace { display: flex; flex: 1; min-height: 0; }
-.sidebar { width: 284px; flex-shrink: 0; padding: 40px 28px; border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+.sidebar { width: 284px; flex-shrink: 0; padding: 40px 28px; border-right: 1px solid var(--line); display: flex; flex-direction: column; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 .eyebrow { margin: 0 0 16px; font: 11px/1.6 var(--mono); text-transform: uppercase; letter-spacing: 1.3px; color: var(--muted); }
 .sidebar label { font-size: 13px; margin-bottom: 8px; }
 .sidebar select { width: 100%; text-overflow: ellipsis; font-size: 13px; }
@@ -39,6 +39,29 @@ progress { appearance: none; width: 100%; height: 4px; border: none; border-radi
 progress::-webkit-progress-bar { background: var(--line); border-radius: 2px; }
 progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; }
 progress::-moz-progress-bar { background: var(--accent); }
+.tasks { flex-shrink: 0; margin-top: 32px; border-top: 1px solid var(--line); padding-top: 24px; }
+.tasks-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin-bottom: 12px; }
+.tasks-heading .eyebrow { margin: 0; }
+.sidebar .tasks-toggle { display: flex; align-items: center; gap: 6px; margin: 0; font: 10px var(--mono); color: var(--muted); cursor: pointer; }
+.tasks-toggle input { accent-color: var(--accent); margin: 0; }
+.tasks-empty { margin: 0; }
+.task-group + .task-group { margin-top: 16px; }
+.task-session { margin: 0 0 6px; font: 11px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.task-session span { opacity: .8; }
+.tasks ul { list-style: none; margin: 0; padding: 0; }
+.task { padding: 8px 0 8px 10px; border-left: 2px solid var(--accent); }
+.task + .task { margin-top: 6px; }
+.task:not(.running) { border-left-color: var(--line); opacity: .7; }
+.task.failed { border-left-color: var(--muted); }
+.task-line { display: flex; gap: 8px; align-items: baseline; }
+.task-line i { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--accent); transform: translateY(-1px); }
+.task.running .task-line i { animation: task-pulse 1.6s ease-in-out infinite; }
+.task:not(.running) .task-line i { background: transparent; border: 1px solid var(--muted); }
+.task-desc { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.task-meta { display: flex; justify-content: space-between; gap: 8px; margin: 2px 0 0 14px; font: 10px/1.6 var(--mono); color: var(--muted); }
+.task-meta span:last-child { flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.task-step { margin: 4px 0 0 14px; font-size: 12px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
+@keyframes task-pulse { 50% { opacity: .35; } }
 .local-note { margin-top: auto; padding-top: 40px; }
 .local-note .mark { width: 32px; height: 32px; }
 .local-note p { font: italic 20px/1.5 var(--serif); margin: 12px 0; color: var(--muted); }
@@ -92,5 +115,5 @@ textarea:disabled { opacity: .8; }
 @media (min-width: 1500px) { .conversation { padding-top: 48px; padding-bottom: 32px; } }
 @media (max-width: 1024px) { .topbar { padding: 0 24px; gap: 24px; } .sidebar { width: 232px; padding: 32px 20px; } .conversation { padding: 32px 28px 20px; } h1 { font-size: 34px; } .header-actions { gap: 16px; } .section-name { padding-left: 24px; } }
 @media (max-width: 800px) { .section-name { display: none; } .topbar { height: 76px; } .sidebar { width: 204px; padding: 28px 16px; } .conversation { padding: 28px 20px 16px; } .conversation-heading { flex-wrap: wrap; gap: 12px; } .scope { font-size: 10px; } .composer-footer { padding-left: 16px; } .composer-footer > span { max-width: 170px; } }
-@media (max-width: 600px) { .topbar { padding: 0 16px; gap: 12px; height: 68px; } .header-actions { gap: 8px; } .connection { font-size: 0; } .brand { font-size: 28px; } .workspace { flex-direction: column; } .sidebar { width: 100%; flex-direction: row; align-items: center; gap: 12px; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px 16px; } .sidebar > .eyebrow, .sidebar > .session-note, .context, .local-note { display: none; } .sidebar label { margin: 0; } .sidebar select { flex: 1; min-width: 0; } .conversation { padding: 20px 16px 12px; min-height: 0; width: 100%; } .conversation-heading { margin-bottom: 16px; } h1 { font-size: 30px; } .conversation-heading .eyebrow { font-size: 9px; } .empty { padding-bottom: 16px; min-height: 160px; } .empty .mark { width: 40px; height: 40px; margin-bottom: 8px; } .empty h2 { font-size: 24px; } .transcript { padding-right: 8px; } textarea { padding: 16px 16px 8px; min-height: 80px; } }
+@media (max-width: 600px) { .topbar { padding: 0 16px; gap: 12px; height: 68px; } .header-actions { gap: 8px; } .connection { font-size: 0; } .brand { font-size: 28px; } .workspace { flex-direction: column; } .sidebar { width: 100%; flex-direction: row; align-items: center; gap: 12px; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px 16px; } .sidebar { flex-wrap: wrap; } .sidebar > .eyebrow, .sidebar > .session-note, .context, .local-note { display: none; } .sidebar { overflow: visible; } .tasks { width: 100%; margin-top: 0; padding-top: 10px; max-height: 32dvh; overflow-y: auto; } .tasks-heading { margin-bottom: 6px; } .tasks-empty { font-size: 12px; } .sidebar label { margin: 0; } .sidebar select { flex: 1; min-width: 0; } .conversation { padding: 20px 16px 12px; min-height: 0; width: 100%; } .conversation-heading { margin-bottom: 16px; } h1 { font-size: 30px; } .conversation-heading .eyebrow { font-size: 9px; } .empty { padding-bottom: 16px; min-height: 160px; } .empty .mark { width: 40px; height: 40px; margin-bottom: 8px; } .empty h2 { font-size: 24px; } .transcript { padding-right: 8px; } textarea { padding: 16px 16px 8px; min-height: 80px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }

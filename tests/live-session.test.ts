@@ -222,6 +222,43 @@ describe("LiveSession background-task tracking", () => {
     session.close();
   });
 
+  it("publishes full task records to the watch bus, REPLACE per change, and an empty set on close", async () => {
+    const { watchBus } = await import("../src/watch/bus.js");
+    const seen: Array<{ tasks: Array<Record<string, unknown>>; ended?: unknown }> = [];
+    const unsubscribe = watchBus.subscribe((e) => { if (e.type === "tasks" && e.sessionKey === "test:session") seen.push(e); });
+    const { session, harness } = makeSession({});
+    harness.pushEvent({
+      type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u1",
+      tasks: [
+        { task_id: "a1", run_id: "r1", task_type: "local_agent", subagent_type: "Explore", description: "review", parent_task_id: "p0" },
+        { task_id: "w1", task_type: "monitor", description: "watcher", ambient: true },
+      ],
+    });
+    await waitFor(() => seen.length === 1);
+    expect(seen[0].tasks).toMatchObject([
+      { taskId: "a1", runId: "r1", taskType: "local_agent", subagentType: "Explore", description: "review", parentTaskId: "p0", ambient: false },
+      { taskId: "w1", taskType: "monitor", ambient: true },
+    ]);
+    expect(typeof seen[0].tasks[0].startedAt).toBe("number");
+    harness.pushEvent({ type: "system", subtype: "task_progress", session_id: "s", uuid: "u2", task_id: "a1", run_id: "r1",
+      description: "review", last_tool_name: "Grep", usage: { total_tokens: 5, tool_uses: 1, duration_ms: 1 } });
+    await waitFor(() => seen.length === 2);
+    expect(seen[1].tasks[0]).toMatchObject({ lastTool: "Grep", toolUses: 1 });
+    harness.pushEvent({ type: "system", subtype: "task_notification", session_id: "s", uuid: "u3", task_id: "a1", status: "completed",
+      output_file: "", summary: "" });
+    harness.pushEvent({
+      type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u4",
+      tasks: [{ task_id: "w1", task_type: "monitor", description: "watcher", ambient: true }],
+    });
+    await waitFor(() => seen.length === 4);
+    expect(seen[3]).toMatchObject({ tasks: [{ taskId: "w1" }], ended: [{ taskId: "a1", status: "completed" }] });
+    // The ambient watcher is not activity for the retire logic.
+    expect(session.hasActiveBackgroundTasks()).toBe(false);
+    session.close();
+    expect(seen.at(-1)!.tasks).toEqual([]);
+    unsubscribe();
+  });
+
   it("close() wakes a pending background waiter", async () => {
     const { session, harness } = makeSession({});
     harness.pushEvent({

@@ -133,6 +133,27 @@ describe("WebChannel", () => {
   });
 });
 
+describe("web task panel feed", () => {
+  const live = (taskId: string, description = `task ${taskId}`) =>
+    ({ taskId, taskType: "local_agent", description, ambient: false, background: true, startedAt: 1 });
+  it("forwards tasks only for sessions the browser can already read, as snapshot and per-session updates", () => {
+    const { channel, bus, events } = setup();
+    bus.publish({ type: "tasks", sessionKey: "dm:peer", tasks: [live("p", "another person's private work")] });
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a")] });
+    bus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [live("g")] });
+    const updates = events.filter((e) => e.type === "tasks");
+    expect(updates.map((e) => e.type === "tasks" && [e.sessionId, e.tasks.map((t) => t.taskId)])).toEqual([
+      [webSessionId("dm:owner"), ["a"]], [webSessionId("telegram:-1"), ["g"]]]);
+    expect(JSON.stringify(events)).not.toContain("private work");
+    const snapshot = channel.snapshot();
+    expect(snapshot.tasks.map((t) => [t.sessionId, t.taskId, t.state])).toEqual([
+      [webSessionId("dm:owner"), "a", "running"], [webSessionId("telegram:-1"), "g", "running"]]);
+    expect(JSON.stringify(snapshot)).not.toContain("private work");
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a", status: "completed" }] });
+    expect(channel.snapshot().tasks.find((t) => t.taskId === "a")!.state).toBe("completed");
+  });
+});
+
 it("replays bounded events and reports gaps or another epoch", () => {
   const events = new WebEvents();
   events.publish({ type: "invalidate" });

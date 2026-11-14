@@ -26,12 +26,33 @@ export type RequestState = "queued" | "running" | "completed" | "refused" | "fai
 export interface WebRequest { requestId: string; state: RequestState; sessionId?: string }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
+export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
+/** A subagent / background task for the read-only "working now" panel. */
+export interface WebTask {
+  sessionId: string;
+  taskId: string;
+  taskType: string;
+  subagentType?: string;
+  description: string;
+  parentTaskId?: string;
+  ambient: boolean;
+  /** Daemon clock, ms epoch. */
+  startedAt: number;
+  endedAt?: number;
+  state: WebTaskState;
+  lastTool?: string;
+  summary?: string;
+  totalTokens?: number;
+  toolUses?: number;
+}
 export type WebEvent =
   | { type: "block"; sessionId: string; requestId: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
   | { type: "invalidate"; sessionId?: string }
   | { type: "tool"; sessionId: string; tool: string; state: "started" | "completed" | "failed" }
-  | { type: "typing"; sessionId: string; active: boolean };
+  | { type: "typing"; sessionId: string; active: boolean }
+  /** All tasks of one session, live and recently ended. REPLACE semantics. */
+  | { type: "tasks"; sessionId: string; tasks: WebTask[] };
 export interface EventEnvelope { id: string; event: WebEvent }
 export interface WebBootstrap extends WebCatalog {
   epoch: string;
@@ -39,6 +60,8 @@ export interface WebBootstrap extends WebCatalog {
   cursor: string;
   requests: WebRequest[];
   blocks: Extract<WebEvent, { type: "block" }>[];
+  /** Every visible session's tasks; replaces the client's whole task list. */
+  tasks: WebTask[];
 }
 export class WebError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
@@ -51,5 +74,5 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }

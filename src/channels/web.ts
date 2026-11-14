@@ -7,6 +7,7 @@ import type { WatchEvent } from "../watch/protocol.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
+import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
@@ -28,8 +29,13 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  /** Live and recently ended subagents/background tasks, per visible session. */
+  readonly tasks: TaskBoard;
 
-  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus) {
+  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus, now: () => number = Date.now) {
+    this.tasks = new TaskBoard((sessionId, tasks) => {
+      try { this.events.publish({ type: "tasks", sessionId, tasks }); } catch { /* An oversized panel update never fails the Agent. */ }
+    }, { now });
     this.owner = owner;
     this.ownerId = this.owner ? webSessionId(ownerSessionKey(this.owner)) : null;
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
@@ -85,8 +91,13 @@ export class WebChannel implements Channel {
 
   request(id: string): WebRequest { return { ...(this.receipts.get(id)?.request ?? { requestId: id, state: "unknown" }) }; }
   snapshot() {
-    return { epoch: this.events.epoch, cursor: this.events.cursor(),
-      requests: [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request })), blocks: [...this.blocks] };
+    const requests = [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request }));
+    const blocks = [...this.blocks];
+    // The snapshot is one IPC frame: the task panel gets what reply blocks
+    // and receipts leave, so it can never push the frame over the limit.
+    const used = Buffer.byteLength(JSON.stringify({ requests, blocks }));
+    const tasks = this.tasks.snapshot(Math.min(MAX_SNAPSHOT_TASK_BYTES, MAX_BUFFER_BYTES - 32 * 1024 - used));
+    return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
   }
 
   async send(message: OutgoingMessage): Promise<void> {
@@ -124,6 +135,7 @@ export class WebChannel implements Channel {
   async teardown(): Promise<void> {
     this.tornDown = true;
     this.unsubscribe?.();
+    this.tasks.dispose();
     try { await this.lifecycle?.stop(); } catch { /* Optional process cleanup cannot prevent daemon shutdown. */ }
   }
   async stop(): Promise<void> { this.closeIngestion(); await this.quiesce(); await this.teardown(); }
@@ -156,6 +168,10 @@ export class WebChannel implements Channel {
       this.events.publish({ type: "invalidate", sessionId });
     } else if (event.type === "transcript" || event.type === "turn.stats") {
       this.events.publish({ type: "invalidate", sessionId });
+    } else if (event.type === "tasks") {
+      // Same visibility as tool activity: only the owner's DM and groups
+      // (both already readable in the browser) ever reach the board.
+      this.tasks.apply(sessionId, event.tasks, event.ended);
     } else if (event.type === "tool.start" || event.type === "tool.end") {
       this.events.publish({ type: "tool", sessionId, tool: event.tool.slice(0, 128),
         state: event.type === "tool.start" ? "started" : event.ok ? "completed" : "failed" });

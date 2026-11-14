@@ -4,6 +4,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
+import { TasksPanel } from "./tasks-panel.js";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 
@@ -162,6 +163,7 @@ export function App() {
           {hasContext && <progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" />}
           <p className="session-note">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
+        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} />
         <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
       <main id="conversation" className="conversation" tabIndex={-1}>

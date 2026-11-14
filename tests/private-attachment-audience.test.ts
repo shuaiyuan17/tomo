@@ -73,6 +73,31 @@ describe("transcript of a withheld private attachment", () => {
   });
 });
 
+describe("transcript when a block both withholds a private piece and fails another", () => {
+  it("still records per-piece entries, not the clean joined response", async () => {
+    resetConfig({ identities: [OWNER], passiveGroups: { telegram: [GROUP_CHAT_ID] } });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const pic = privateFile("both.png");
+    const passThrough = tg.send.bind(tg);
+    tg.send = async (msg) => {
+      if (msg.sticker) throw new Error("sticker refused");
+      return passThrough(msg);
+    };
+
+    mockSdk.responseFn = () => `words\nMEDIA:"${pic}"\nSTICKER:CAACpublic`;
+    await tg.simulateMessage(makeMsg({ chatId: GROUP_CHAT_ID, text: "@tomo go", isGroup: true, isMentioned: true, senderName: "Alice" }));
+    await drainQueue(agent);
+
+    const assistant = transcript(GROUP_KEY).filter((m) => m.role === "assistant").map((m) => m.content).join("\n");
+    expect(assistant).toContain(`[delivery failed] MEDIA:"${pic}"`);
+    expect(assistant).toContain("[delivery failed] STICKER:CAACpublic");
+    expect(assistant).not.toMatch(new RegExp(`(^|\\n)MEDIA:"`));
+    await agent.stop();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // send_message direct with a private attachment is judged by the CALLER's
 // audience, not by the target. The owner may explicitly share a private file

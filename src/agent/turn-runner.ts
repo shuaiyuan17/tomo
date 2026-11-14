@@ -6,7 +6,7 @@ import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
-import { type BlockSender, DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
+import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { formatInboundStamp } from "./inbound-markers.js";
 import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
@@ -672,6 +672,9 @@ export class TurnRunner {
         // for an ambiguous failure, which may or may not have landed. A no-op
         // if the block was already abandoned for blowing its delivery budget —
         // that outcome was recorded, in order, when we gave up on it.
+        // A block that withheld a private piece AND failed another still
+        // withheld it: the joined response must not be recorded either way.
+        if (err instanceof PartialDeliveryError && err.withheld) withheldAny = true;
         slot.settle(failedDeliveryEntry(block, err));
       }
     };

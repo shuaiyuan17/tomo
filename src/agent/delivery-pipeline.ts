@@ -49,6 +49,8 @@ export class PartialDeliveryError extends Error {
     /** The first failure, verbatim. */
     readonly failure: unknown,
     readonly segments: readonly DeliverySegment[],
+    /** Some piece was ALSO withheld by policy (not merely failed). */
+    readonly withheld = false,
   ) {
     const failed = segments.filter((s) => !s.delivered).length;
     // The message is the short form (it can be shown); the full diagnostic
@@ -448,7 +450,7 @@ export class DeliveryPipeline {
         // (a refused picture whose caption then went out as text, and no
         // other pieces) is a warn line, not a failed block.
         if (failure && segments.some((s) => !s.delivered)) {
-          throw new PartialDeliveryError(failure.err, segments);
+          throw new PartialDeliveryError(failure.err, segments, withheld);
         }
         // A policy refusal is not a failure (nothing to retry, no error to
         // surface) but it IS a piece the reader did not get.

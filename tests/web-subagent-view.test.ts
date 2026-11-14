@@ -1,53 +1,74 @@
 import { describe, expect, it } from "vitest";
-import { EMPTY_TRANSCRIPT, hasNewer, isOutputTask, MAX_KEPT_ITEMS, mergePage, preview, PREVIEW_CHARS, stripAnsi, viewRows } from "../web/src/subagent.js";
+import { behind, INITIAL_TRANSCRIPT, isOutputTask, MAX_KEPT_ITEMS, preview, PREVIEW_CHARS, stripAnsi, transcriptReducer, viewRows,
+  type TranscriptAction, type TranscriptState } from "../web/src/subagent.js";
 import type { SubagentItem, SubagentPage } from "../src/web/protocol.js";
 
 const textItem = (offset: number, text = `t${offset}`): SubagentItem => ({ kind: "text", id: `${offset}:0`, text, truncated: false });
 const page = (items: SubagentItem[], start: number, end: number, hasEarlier = start > 0, size = end): SubagentPage => ({ items, start, end, size, hasEarlier });
 
-describe("subagent view state", () => {
-  it("tail, older and newer pages merge in order without duplicates", () => {
-    let state = mergePage(EMPTY_TRANSCRIPT, page([textItem(100), textItem(200)], 100, 300), "tail");
-    state = mergePage(state, page([textItem(0), textItem(50)], 0, 100), "older");
-    expect(state).toMatchObject({ start: 0, end: 300, hasEarlier: false });
-    state = mergePage(state, page([textItem(200), textItem(300)], 300, 400), "newer");
-    expect(state.items.map((i) => i.id)).toEqual(["0:0", "50:0", "100:0", "200:0", "300:0"]);
-    expect(state.end).toBe(400);
-    // An empty poll never moves the tail cursor back.
-    expect(mergePage(state, page([], 400, 400), "newer").end).toBe(400);
+describe("subagent transcript modes", () => {
+  const T = (overrides: Partial<TranscriptState> = {}): TranscriptState => ({ ...INITIAL_TRANSCRIPT, ...overrides });
+  const run = (state: TranscriptState, ...actions: TranscriptAction[]) => actions.reduce(transcriptReducer, state);
+
+  it("follow mode: tail then append; over the cap the oldest whole lines go and Load earlier can re-read them", () => {
+    let state = run(T(), { type: "tail", gen: 0, page: page([textItem(100), textItem(200)], 100, 300) });
+    state = run(state, { type: "newer", gen: 0, page: page([textItem(200), textItem(300)], 300, 400) });
+    expect(state.items.map((i) => i.id)).toEqual(["100:0", "200:0", "300:0"]);
+    expect(state).toMatchObject({ end: 400, mode: "follow", status: "ready" });
+    const multi = (offset: number, n: number): SubagentItem[] => Array.from({ length: n }, (_, k) => ({ kind: "text", id: `${offset}:${k}`, text: "x", truncated: false }));
+    let full = run(T(), { type: "tail", gen: 0, page: page(multi(0, MAX_KEPT_ITEMS - 1), 0, 10) });
+    full = run(full, { type: "newer", gen: 0, page: page(multi(10, 3), 10, 20) });
+    expect(full.items.every((i) => i.id.startsWith("10:"))).toBe(true);
+    expect(full).toMatchObject({ start: 10, hasEarlier: true });
   });
 
-  it("keeps a bounded number of items; dropping old ones makes them pageable again", () => {
-    let state = mergePage(EMPTY_TRANSCRIPT, page(Array.from({ length: MAX_KEPT_ITEMS }, (_, i) => textItem(i * 10)), 0, MAX_KEPT_ITEMS * 10), "tail");
-    state = mergePage(state, page([textItem(MAX_KEPT_ITEMS * 10)], MAX_KEPT_ITEMS * 10, MAX_KEPT_ITEMS * 10 + 10), "newer");
+  it("a response from an older generation is dropped (interleaved requests)", () => {
+    let state = run(T(), { type: "tail", gen: 0, page: page([textItem(100)], 100, 200) });
+    const pollGen = state.gen;
+    state = run(state, { type: "browse" });
+    // The poll that was in flight when the user started browsing lands late.
+    state = run(state, { type: "newer", gen: pollGen, page: page([textItem(200)], 200, 300) });
+    expect(state.items.map((i) => i.id)).toEqual(["100:0"]);
+    // A jump bumps again: a late page from browsing is dropped too.
+    const browseGen = state.gen;
+    state = run(state, { type: "jump" });
+    state = run(state, { type: "older", gen: browseGen, page: page([textItem(0)], 0, 100) });
+    expect(state.items).toEqual([]);
+    expect(state.status).toBe("loading");
+  });
+
+  it("browse mode: polling results are refused; paging back prepends and over the cap the newest lines go", () => {
+    let state = run(T(), { type: "tail", gen: 0, page: page(Array.from({ length: MAX_KEPT_ITEMS }, (_, i) => textItem(1000 + i * 10)), 1000, 1000 + MAX_KEPT_ITEMS * 10) });
+    state = run(state, { type: "browse" });
+    expect(state.mode).toBe("browse");
+    expect(run(state, { type: "newer", gen: state.gen, page: page([textItem(99_999)], 99_999, 100_000) })).toBe(state);
+    state = run(state, { type: "older", gen: state.gen, page: page([textItem(980), textItem(990)], 980, 1000, true) });
     expect(state.items).toHaveLength(MAX_KEPT_ITEMS);
-    expect(state.items[0].id).toBe("10:0");
-    expect(state).toMatchObject({ start: 10, hasEarlier: true });
+    expect(state.items[0].id).toBe("980:0");
+    expect(state.items.at(-1)!.id).toBe(`${1000 + (MAX_KEPT_ITEMS - 3) * 10}:0`);
+    expect(state.start).toBe(980);
   });
 
-  it("paging back past the cap drops the newest lines and rolls the tail cursor back, so nothing is lost for good", () => {
-    const N = MAX_KEPT_ITEMS;
-    // The newest N lines are loaded (offsets N*10 .. 2N*10), the file ends at 2N*10.
-    let state = mergePage(EMPTY_TRANSCRIPT, page(Array.from({ length: N }, (_, i) => textItem((N + i) * 10)), N * 10, 2 * N * 10), "tail");
-    expect(hasNewer(state)).toBe(false);
-    state = mergePage(state, page([textItem((N - 2) * 10), textItem((N - 1) * 10)], (N - 2) * 10, N * 10, true, 2 * N * 10), "older");
-    expect(state.items).toHaveLength(N);
-    expect(state.items[0].id).toBe(`${(N - 2) * 10}:0`);
-    const lastKept = Number(state.items.at(-1)!.id.split(":")[0]);
-    expect(state.end).toBe(lastKept + 10);
-    expect(hasNewer(state)).toBe(true);
-    // Reading forward from the rolled-back end returns the dropped lines.
-    const again = mergePage(state, page([textItem(lastKept + 10), textItem(lastKept + 20)], lastKept + 10, 2 * N * 10, true, 2 * N * 10), "newer");
-    expect(again.items.some((i) => i.id === `${lastKept + 20}:0`)).toBe(true);
-    expect(hasNewer(again)).toBe(false);
+  it("Jump to latest returns to follow with an empty window and a new generation", () => {
+    let state = run(T(), { type: "tail", gen: 0, page: page([textItem(100)], 100, 200) }, { type: "browse" });
+    const before = state.gen;
+    state = run(state, { type: "jump" });
+    expect(state).toMatchObject({ mode: "follow", status: "loading", items: [], end: 0, gen: before + 1 });
+    state = run(state, { type: "tail", gen: state.gen, page: page([textItem(500)], 500, 600) });
+    expect(state).toMatchObject({ status: "ready", end: 600 });
+    expect(behind(state)).toBe(false);
   });
 
-  it("dropping is by whole lines", () => {
-    const multi = (offset: number, n: number): SubagentItem[] => Array.from({ length: n }, (_, i) => ({ kind: "text", id: `${offset}:${i}`, text: "x", truncated: false }));
-    let state = mergePage(EMPTY_TRANSCRIPT, page(multi(0, MAX_KEPT_ITEMS - 1), 0, 10), "tail");
-    state = mergePage(state, page(multi(10, 3), 10, 20), "newer");
-    expect(state.items.every((i) => i.id.startsWith("10:"))).toBe(true);
-    expect(state).toMatchObject({ start: 10, hasEarlier: true });
+  it("when the task leaves the panel, it says so, keeps what was read, and accepts nothing more", () => {
+    let state = run(T(), { type: "tail", gen: 0, page: page([textItem(100)], 100, 200) });
+    state = run(state, { type: "failed", gen: 0, kind: "gone" });
+    expect(state).toMatchObject({ status: "gone", items: [{ id: "100:0" }] });
+    expect(run(state, { type: "newer", gen: state.gen, page: page([textItem(200)], 200, 300) })).toBe(state);
+    expect(run(state, { type: "jump" }).status).toBe("gone");
+    // A not-yet-written transcript is "missing", not gone; with content already shown, nothing changes.
+    expect(run(T(), { type: "failed", gen: 0, kind: "missing" }).status).toBe("missing");
+    const shown = run(T(), { type: "tail", gen: 0, page: page([textItem(1)], 0, 10) });
+    expect(run(shown, { type: "failed", gen: 0, kind: "error" })).toBe(shown);
   });
 
   it("pairs tool calls with results that arrive later, and leaves unmatched calls running", () => {

@@ -8,16 +8,44 @@ export interface ToolRow {
 }
 export type ViewRow = { kind: "text"; id: string; text: string; truncated: boolean } | ToolRow;
 
+/**
+ * The transcript window has two mutually exclusive modes:
+ * - follow (default): pinned to the end; polling appends, and over the cap
+ *   the oldest lines are dropped from the front.
+ * - browse: entered by "Load earlier". Polling stops at once; paging back
+ *   prepends, and over the cap the newest lines are dropped from the back.
+ *   "Jump to latest" returns to follow: the window is cleared and reloaded
+ *   from the tail.
+ * Every request carries the generation it was made in; switching mode or
+ * jumping bumps the generation, and a response from an older one is ignored.
+ */
+export type TranscriptMode = "follow" | "browse";
+export type TranscriptStatus = "loading" | "ready" | "missing" | "error" | "gone";
 export interface TranscriptState {
+  mode: TranscriptMode;
+  gen: number;
+  status: TranscriptStatus;
   items: SubagentItem[];
-  /** Byte cursors: page back with `before=start`, tail with `after=end`. */
+  /** Byte cursors: page back with `before=start`; in follow mode, tail with `after=end`. */
   start: number;
   end: number;
-  /** File length at the last read: `end < size` means newer lines are still to load. */
+  /** File length at the last read; in follow mode, `end < size` means more to read now. */
   size: number;
   hasEarlier: boolean;
 }
-export const EMPTY_TRANSCRIPT: TranscriptState = { items: [], start: 0, end: 0, size: 0, hasEarlier: false };
+export const INITIAL_TRANSCRIPT: TranscriptState = { mode: "follow", gen: 0, status: "loading", items: [], start: 0, end: 0, size: 0, hasEarlier: false };
+/** Kept in memory per open view. */
+export const MAX_KEPT_ITEMS = 2_000;
+
+export type TranscriptAction =
+  | { type: "tail" | "newer" | "older"; gen: number; page: SubagentPage }
+  /** "Load earlier" from follow mode: stop following. */
+  | { type: "browse" }
+  /** "Jump to latest": back to follow, reload from the tail. */
+  | { type: "jump" }
+  /** A failed read. `gone`: the task left the panel (the server refuses it now). */
+  | { type: "failed"; gen: number; kind: "gone" | "missing" | "error" };
+
 const lineOf = (item: SubagentItem) => Number(item.id.split(":")[0]);
 /** Whole lines from one end of `items`, as many as fit in MAX_KEPT_ITEMS (at least one line). */
 function keepLines(items: SubagentItem[], from: "oldest" | "newest"): SubagentItem[] {
@@ -36,37 +64,42 @@ function keepLines(items: SubagentItem[], from: "oldest" | "newest"): SubagentIt
   return kept.flatMap(([, list]) => list);
 }
 
-/** True while lines after `end` exist that have not been loaded yet. */
-export function hasNewer(state: TranscriptState): boolean { return state.end < state.size; }
-/** Kept in memory per open view; older items are dropped (and can be paged back in). */
-export const MAX_KEPT_ITEMS = 2_000;
-
-/**
- * Fold a fetched page in. `tail`: the first page; `older`/`newer`: paging and
- * live append. Memory is capped at MAX_KEPT_ITEMS, and whatever is dropped can
- * always be loaded again: appending drops the oldest lines (and moves `start`
- * so "Load earlier" re-reads them); paging back drops the newest lines (and
- * moves `end` back so the tail re-reads them). Lines are dropped whole.
- */
-export function mergePage(state: TranscriptState, page: SubagentPage, mode: "tail" | "older" | "newer"): TranscriptState {
-  if (mode === "tail") return { items: page.items, start: page.start, end: page.end, size: page.size, hasEarlier: page.hasEarlier };
+export function transcriptReducer(state: TranscriptState, action: TranscriptAction): TranscriptState {
+  switch (action.type) {
+    case "browse":
+      return state.mode === "browse" ? state : { ...state, mode: "browse", gen: state.gen + 1 };
+    case "jump":
+      return { ...INITIAL_TRANSCRIPT, gen: state.gen + 1, status: state.status === "gone" ? "gone" : "loading" };
+    case "failed": {
+      if (action.gen !== state.gen) return state;
+      if (action.kind === "gone") return { ...state, status: "gone" };
+      return state.items.length ? state : { ...state, status: action.kind };
+    }
+    default: break;
+  }
+  if (action.gen !== state.gen || state.status === "gone") return state;
+  const page = action.page;
+  if (action.type === "tail") {
+    return { ...state, status: "ready", items: page.items, start: page.start, end: page.end, size: page.size, hasEarlier: page.hasEarlier };
+  }
   const seen = new Set(state.items.map((item) => item.id));
   const fresh = page.items.filter((item) => !seen.has(item.id));
-  const size = Math.max(state.size, page.size);
-  if (mode === "older") {
-    const items = [...fresh, ...state.items];
-    if (items.length <= MAX_KEPT_ITEMS) return { ...state, items, start: page.start, size, hasEarlier: page.hasEarlier };
-    const kept = keepLines(items, "oldest");
-    const keptIds = new Set(kept.map((item) => item.id));
-    const cut = lineOf(items.find((item) => !keptIds.has(item.id))!);
-    return { items: kept, start: page.start, end: Math.min(state.end, cut), size, hasEarlier: page.hasEarlier };
+  if (action.type === "newer") {
+    if (state.mode !== "follow") return state;
+    const all = [...state.items, ...fresh];
+    const items = all.length > MAX_KEPT_ITEMS ? keepLines(all, "newest") : all;
+    const dropped = items.length < all.length;
+    return { ...state, status: "ready", items, end: Math.max(state.end, page.end), size: Math.max(state.size, page.size),
+      start: dropped ? lineOf(items[0]) : state.start, hasEarlier: state.hasEarlier || dropped };
   }
-  const items = [...state.items, ...fresh];
-  const end = Math.max(state.end, page.end);
-  if (items.length <= MAX_KEPT_ITEMS) return { ...state, items, end, size };
-  const kept = keepLines(items, "newest");
-  return { items: kept, start: lineOf(kept[0]), end, size, hasEarlier: true };
+  if (state.mode !== "browse") return state;
+  const all = [...fresh, ...state.items];
+  const items = all.length > MAX_KEPT_ITEMS ? keepLines(all, "oldest") : all;
+  return { ...state, items, start: page.start, hasEarlier: page.hasEarlier };
 }
+
+/** In follow mode, more lines are already on disk than have been read. */
+export function behind(state: TranscriptState): boolean { return state.mode === "follow" && state.end < state.size; }
 
 /** Pair tool calls with their results (which may arrive on a later page). */
 export function viewRows(items: SubagentItem[]): ViewRow[] {

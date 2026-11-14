@@ -141,7 +141,11 @@ describe("local HTTP boundary", () => {
     expect((await call(`${base}/a1/transcript?after=${body.end}`)).status).toBe(200);
     expect((await call(`${base}/a1/transcript?after=abc`)).status).toBe(400);
     // On disk but never shown by the panel: refused by the daemon gate.
-    expect((await call(`${base}/zz/transcript`)).status).toBe(404);
+    const refused = await call(`${base}/zz/transcript`);
+    expect(refused.status).toBe(404);
+    // The browser tells "left the panel" from "not written yet" by this code.
+    expect(JSON.parse(refused.text).error).toBe("task_not_found");
+    expect(JSON.parse((await call(`${base}/b1/transcript`)).text).error).toBe("transcript_not_found");
     // A shown task whose transcript does not exist (yet).
     expect((await call(`${base}/b1/transcript`)).status).toBe(404);
     // No live SDK session to read a shell tail from.

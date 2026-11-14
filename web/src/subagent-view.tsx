@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
 import { api, ApiError } from "./api.js";
@@ -6,7 +6,7 @@ import { Text } from "./markdown.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
 import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
-import { EMPTY_TRANSCRIPT, hasNewer, isOutputTask, mergePage, viewRows, type TranscriptState } from "./subagent.js";
+import { behind, INITIAL_TRANSCRIPT, isOutputTask, transcriptReducer, viewRows } from "./subagent.js";
 import { STATE_LABELS, taskKind } from "./tasks.js";
 
 /**
@@ -18,7 +18,7 @@ import { STATE_LABELS, taskKind } from "./tasks.js";
  */
 export const POLL_MS = 2_000;
 
-type Status = "loading" | "ready" | "missing" | "error";
+type Status = "loading" | "ready" | "missing" | "error" | "gone";
 
 /** Read-only view of one task: a subagent's transcript, or a shell's output tail. */
 export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => void }) {
@@ -47,91 +47,103 @@ function OutputTail({ base, running }: { base: string; running: boolean }) {
     const controller = new AbortController();
     const load = async () => {
       try { const next = await api<TaskOutput>(`${base}/output`, { signal: controller.signal }); if (!stopped) { setValue(next); setStatus("ready"); } }
-      catch (error) { if (!stopped) setStatus(error instanceof ApiError && error.status === 404 ? "missing" : "error"); }
+      catch (error) {
+        if (stopped) return;
+        if (error instanceof ApiError && error.code === "task_not_found") { setStatus("gone"); return; }
+        setStatus(error instanceof ApiError && error.status === 404 ? "missing" : "error");
+      }
       if (!stopped && running) timer = setTimeout(() => void load(), POLL_MS);
     };
     void load();
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
   }, [base, running]);
   return <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 pl-1">
-    {value ? <Terminal output={value.output} size={value.size} /> : <Note status={status} />}
+    {status === "gone" && <Note status="gone" />}
+    {value ? <Terminal output={value.output} size={value.size} /> : status !== "gone" && <Note status={status} />}
   </div>;
 }
 
 function Transcript({ base, running }: { base: string; running: boolean }) {
-  const [state, setState] = useState<TranscriptState>(EMPTY_TRANSCRIPT);
-  const [status, setStatus] = useState<Status>("loading");
-  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [state, dispatch] = useReducer(transcriptReducer, INITIAL_TRANSCRIPT);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const scroll = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const restore = useRef<number | null>(null);
   const fetchPage = useCallback((query: string, signal?: AbortSignal) => api<SubagentPage>(`${base}/transcript${query}`, { signal }), [base]);
+  const fail = useCallback((gen: number, error: unknown) => {
+    // The daemon refuses a task that left the panel (expired, crowded out,
+    // hidden): say so and stop, keeping what was read.
+    const kind = error instanceof ApiError && error.code === "task_not_found" ? "gone"
+      : error instanceof ApiError && error.status === 404 ? "missing" : "error";
+    dispatch({ type: "failed", gen, kind });
+  }, []);
 
-  // Commit a new state synchronously too, so the loop below reads it at once.
-  const commit = useCallback((next: TranscriptState) => { stateRef.current = next; setState(next); }, []);
-  const [catchUp, setCatchUp] = useState(0);
-
+  // Follow mode only: load the tail, then append. While behind the file's end
+  // read on at once (also after the task ended); while running, poll.
+  const { mode, gen, status } = state;
   useEffect(() => {
+    if (mode !== "follow" || status === "gone") return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controller = new AbortController();
-    const tail = async () => {
-      const page = await fetchPage("", controller.signal);
-      if (!stopped) { commit(mergePage(EMPTY_TRANSCRIPT, page, "tail")); setStatus("ready"); }
-    };
-    const poll = async () => {
-      let progressed = false;
+    const step = async () => {
+      const current = stateRef.current;
+      if (current.gen !== gen) return;
       try {
-        if (stateRef.current.end === 0 && stateRef.current.size === 0) await tail();
-        else {
-          const before = stateRef.current.end;
-          const page = await fetchPage(`?after=${before}`, controller.signal);
-          if (!stopped) { commit(mergePage(stateRef.current, page, "newer")); progressed = stateRef.current.end > before; }
+        if (current.status === "loading" || (current.end === 0 && current.size === 0)) {
+          dispatch({ type: "tail", gen, page: await fetchPage("", controller.signal) });
+        } else {
+          dispatch({ type: "newer", gen, page: await fetchPage(`?after=${current.end}`, controller.signal) });
         }
       } catch (error) {
         if (stopped) return;
-        if (error instanceof ApiError && error.status === 409) { await tail().catch(() => {}); }
-        else if (error instanceof ApiError && error.status === 404) { if (stateRef.current.size === 0) setStatus("missing"); }
-        else if (stateRef.current.size === 0) setStatus("error");
+        if (error instanceof ApiError && error.status === 409) {
+          try { dispatch({ type: "tail", gen, page: await fetchPage("", controller.signal) }); } catch (again) { if (!stopped) fail(gen, again); }
+        } else { fail(gen, error); if (error instanceof ApiError && error.code === "task_not_found") return; }
       }
       if (stopped) return;
-      // Behind the file's end (a long backlog, or the end was rolled back to
-      // free memory): keep reading straight away until caught up — also after
-      // the task ended. While it runs, then poll for new lines.
-      if (progressed && hasNewer(stateRef.current)) timer = setTimeout(() => void poll(), 0);
-      else if (running) timer = setTimeout(() => void poll(), POLL_MS);
+      const next = stateRef.current;
+      if (next.gen !== gen || next.status === "gone") return;
+      if (behind(next) && next.end > current.end) timer = setTimeout(() => void step(), 0);
+      else if (running) timer = setTimeout(() => void step(), POLL_MS);
     };
-    void poll();
+    void step();
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
-  }, [fetchPage, running, commit, catchUp]);
+  }, [fetchPage, fail, running, mode, gen, status === "gone"]);
 
   useLayoutEffect(() => {
     const element = scroll.current;
     if (!element) return;
     if (restore.current !== null) { element.scrollTop = element.scrollHeight - restore.current; restore.current = null; }
-    else if (pinned.current) element.scrollTop = element.scrollHeight;
+    else if (pinned.current && state.mode === "follow") element.scrollTop = element.scrollHeight;
   }, [state]);
 
   const older = async () => {
-    if (loadingOlder || !state.hasEarlier) return;
+    if (loadingOlder || !state.hasEarlier || state.status === "gone") return;
+    // Leaving follow mode stops polling at once (new generation).
+    if (stateRef.current.mode === "follow") { dispatch({ type: "browse" }); stateRef.current = transcriptReducer(stateRef.current, { type: "browse" }); }
+    const { gen: browseGen, start } = stateRef.current;
     setLoadingOlder(true);
     try {
-      const page = await fetchPage(`?before=${state.start}`);
+      const page = await fetchPage(`?before=${start}`);
       const element = scroll.current;
       if (element) restore.current = element.scrollHeight - element.scrollTop;
-      commit(mergePage(stateRef.current, page, "older"));
-    } catch { /* The button stays; trying again is harmless. */ }
+      dispatch({ type: "older", gen: browseGen, page });
+    } catch (error) { fail(browseGen, error); }
     finally { setLoadingOlder(false); }
   };
+  const jump = () => { pinned.current = true; dispatch({ type: "jump" }); };
 
   const rows = viewRows(state.items);
+  const gone = state.status === "gone";
   return <div ref={scroll} tabIndex={0} aria-label="Subagent transcript" onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
     className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
-    {state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? "Loading…" : "Load earlier"}</Button>}
-    {status !== "ready" && <Note status={status} />}
-    {status === "ready" && rows.length === 0 && <p className="m-0 px-1.5 text-[13px] text-muted-foreground">{running ? "Nothing yet." : "No recorded steps."}</p>}
+    {gone && <p role="status" className="m-0 mb-2 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">This task has left the panel, so nothing more can be loaded. What was read stays here.</p>}
+    {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? "Loading…" : "Load earlier"}</Button>}
+    {(state.status === "loading" || state.status === "missing" || state.status === "error") && !state.items.length && <Note status={state.status} />}
+    {state.status === "ready" && rows.length === 0 && <p className="m-0 px-1.5 text-[13px] text-muted-foreground">{running ? "Nothing yet." : "No recorded steps."}</p>}
     {rows.map((row) => row.kind === "text"
       ? <div key={row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{row.text + (row.truncated ? "\n\n…" : "")}</Text></div>
       : <Tool key={row.id}>
@@ -141,12 +153,13 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
             {row.result && <ToolSection label={row.result.isError ? "Error" : "Output"} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
           </ToolContent>
         </Tool>)}
-    {status === "ready" && !running && hasNewer(state) && <Button variant="outline" size="sm" className="mx-auto mt-2 flex h-7 rounded-full text-[11px]"
-      onClick={() => setCatchUp((n) => n + 1)}>Load newer</Button>}
+    {!gone && state.mode === "browse" && <Button variant="secondary" size="sm" onClick={jump}
+      className="sticky bottom-1 mx-auto mt-2 flex h-7 rounded-full text-[11px] shadow-sm">↓ Jump to latest</Button>}
   </div>;
 }
 
 function Note({ status }: { status: Status }) {
-  const text = status === "loading" ? "Opening…" : status === "missing" ? "Nothing recorded for this task yet." : "This task can't be shown right now.";
+  const text = status === "loading" ? "Opening…" : status === "missing" ? "Nothing recorded for this task yet."
+    : status === "gone" ? "This task has left the panel, so nothing more can be loaded." : "This task can't be shown right now.";
   return <p className="m-0 px-1.5 text-[13px] text-muted-foreground" role="status">{text}</p>;
 }

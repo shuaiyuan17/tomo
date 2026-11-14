@@ -33,6 +33,8 @@ export interface WebTask {
   taskId: string;
   taskType: string;
   subagentType?: string;
+  /** Model id from the subagent's transcript, once known (e.g. claude-opus-5-5). */
+  model?: string;
   description: string;
   parentTaskId?: string;
   ambient: boolean;

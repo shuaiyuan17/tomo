@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { SubagentView } from "./subagent-view.js";
+import { ModelBadge } from "./model-badge.js";
 import { buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
 
 /** Read-only: shows what is running, never offers to stop it. */
@@ -54,7 +55,7 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
               <button type="button" title={taskKind(task)} onClick={() => setOpened({ sessionId: task.sessionId, taskId: task.taskId })}
                 className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors duration-150 hover:bg-foreground/[0.06] focus-visible:outline-offset-0", !running && "opacity-60")}>
               <div className="flex items-baseline justify-between gap-2.5">
-                <span className="text-[13px] leading-normal [overflow-wrap:anywhere]">{task.description || "Untitled task"}</span>
+                <span className="text-[13px] leading-normal [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>
                 {running && <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
               </div>
               <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">

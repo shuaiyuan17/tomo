@@ -183,3 +183,35 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
     return { items, start, end, size, hasEarlier: start > 0 };
   } finally { await fd.close(); }
 }
+
+/** How much of a transcript's head is read to find its model. */
+export const MODEL_HEAD_BYTES = 256 * 1024;
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
+/**
+ * The model a subagent runs on: `message.model` of the first assistant entry
+ * in its transcript (the SDK's task events carry no model). Undefined when
+ * there is none yet, or it is not a plain model id (e.g. "<synthetic>").
+ */
+export async function readSubagentModel(sdkSessionsDir: string, sdkSessionId: string, taskId: string): Promise<string | undefined> {
+  let fd: FileHandle | undefined;
+  try {
+    const path = subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId);
+    const root = await realpath(sdkSessionsDir);
+    fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!(await realpath(path)).startsWith(root + sep) || !(await fd.stat()).isFile()) return undefined;
+    const head = await readRange(fd, 0, MODEL_HEAD_BYTES);
+    const lines = head.toString("utf8").split("\n");
+    if (head.length === MODEL_HEAD_BYTES) lines.pop(); // possibly cut mid-line
+    for (const line of lines) {
+      if (!line.includes('"assistant"')) continue;
+      let record: { type?: string; message?: { model?: unknown } };
+      try { record = JSON.parse(line); } catch { continue; }
+      if (record?.type !== "assistant") continue;
+      const model = record.message?.model;
+      if (typeof model === "string" && MODEL_ID.test(model)) return model;
+    }
+    return undefined;
+  } catch { return undefined; }
+  finally { await fd?.close(); }
+}

@@ -3,6 +3,7 @@ import { ArrowLeft } from "lucide-react";
 import type { SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
+import { ModelBadge } from "./model-badge.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
 import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
@@ -31,7 +32,7 @@ export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => vo
         <ArrowLeft className="size-4" strokeWidth={1.75} />Tasks</Button>
     </div>
     <div className="mb-3 px-2.5">
-      <h2 id="subagent-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]">{task.description || "Untitled task"}</h2>
+      <h2 id="subagent-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} className="align-[2px]" /></h2>
       <p className="m-0 mt-0.5 font-mono text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
     </div>
     {isOutputTask(task.taskType) ? <OutputTail base={base} running={running} /> : <Transcript base={base} running={running} />}

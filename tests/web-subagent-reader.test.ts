@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IO_LIMIT, itemsFromLine, MAX_LINE_BYTES, MAX_LINE_ITEMS, MAX_PAGE_ITEMS, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
+import { IO_LIMIT, itemsFromLine, readSubagentModel, MAX_LINE_BYTES, MAX_LINE_ITEMS, MAX_PAGE_ITEMS, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
 
 let root: string;
 let dir: string;
@@ -103,6 +103,16 @@ describe("readSubagentPage", () => {
     const tail = await readSubagentPage(dir, SDK, "a1");
     expect(tail.items.length).toBeLessThanOrEqual(MAX_PAGE_ITEMS + 1);
     expect(tail.items[0].id.endsWith(":0")).toBe(true);
+  });
+
+  it("reads the model from the first assistant entry that names a plain model id", async () => {
+    const withModel = (model: unknown) => JSON.stringify({ type: "assistant", message: { model, content: [] } }) + "\n";
+    writeFileSync(file(), line("user", [{ type: "text", text: "prompt" }]) + withModel("<synthetic>") + withModel("claude-fable-5-2") + withModel("claude-opus-5-5"));
+    expect(await readSubagentModel(dir, SDK, "a1")).toBe("claude-fable-5-2");
+    writeFileSync(file("a2"), line("user", [{ type: "text", text: "only a prompt so far" }]));
+    expect(await readSubagentModel(dir, SDK, "a2")).toBeUndefined();
+    expect(await readSubagentModel(dir, SDK, "missing")).toBeUndefined();
+    expect(await readSubagentModel(dir, SDK, "../a1")).toBeUndefined();
   });
 
   it("rejects bad ids, escapes and stale cursors", async () => {

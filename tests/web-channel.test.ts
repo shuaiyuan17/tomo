@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
+import { MODEL_RETRY_MS, OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { WebEvents } from "../src/web/events.js";
 import { parseWebConfig } from "../src/web/config.js";
@@ -12,9 +12,10 @@ import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
 const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
 const channels: WebChannel[] = [];
 function setup(configured: OwnerConfig | null = owner, ownerKey?: () => string | undefined,
-  taskOutput?: (key: string, id: string) => Promise<{ output: string; size: number } | undefined>) {
+  taskOutput?: (key: string, id: string) => Promise<{ output: string; size: number } | undefined>,
+  taskModel?: (key: string, id: string) => Promise<string | undefined>, now?: () => number) {
   const bus = new WatchBus();
-  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey, taskOutput });
+  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey, taskOutput, taskModel, now });
   channels.push(channel);
   const handler = vi.fn(async () => true);
   channel.onMessage(handler);
@@ -301,6 +302,31 @@ describe("web task panel feed", () => {
     // Hidden by the owner rule: the same task can no longer be opened.
     current = undefined;
     await expect(channel.task(ownerId, "a1", false)).rejects.toMatchObject({ status: 404 });
+  });
+  it("looks up a subagent's model once it is written, retries politely, caches it, and skips shell tasks", async () => {
+    let clock = 0;
+    let model: string | undefined;
+    const lookups: string[] = [];
+    const { channel, bus, events } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return model; }, () => clock);
+    const publish = () => bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1"), { ...live("b1"), taskType: "local_bash" }] });
+    publish();
+    await Promise.resolve();
+    publish();
+    expect(lookups).toEqual(["a1"]);
+    model = "claude-opus-5-5";
+    clock += MODEL_RETRY_MS;
+    publish();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(lookups).toEqual(["a1", "a1"]);
+    expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")!.model).toBe("claude-opus-5-5");
+    expect(channel.snapshot().tasks.find((t) => t.taskId === "b1")!.model).toBeUndefined();
+    const last = events.filter((e) => e.type === "tasks").at(-1);
+    expect(last && last.type === "tasks" && last.tasks.find((t) => t.taskId === "a1")!.model).toBe("claude-opus-5-5");
+    // Known now: further events do not read the transcript again, and the model survives REPLACE updates.
+    clock += MODEL_RETRY_MS * 3;
+    publish();
+    expect(lookups).toHaveLength(2);
+    expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")!.model).toBe("claude-opus-5-5");
   });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();

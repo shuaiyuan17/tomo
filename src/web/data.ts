@@ -4,7 +4,7 @@ import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
 import { WebError, type SubagentPage, type WebCatalog } from "./protocol.js";
-import { readSubagentPage, SubagentReadError } from "./subagent-reader.js";
+import { readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -40,6 +40,17 @@ export function ownerSessionKeyReader(options: WebDataOptions): () => string | u
     try {
       return selectOwnerSessionKey(options.owner,
         SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey));
+    } catch { return undefined; }
+  };
+}
+
+/** The model of a session key's subagent, from its transcript (daemon side; never throws). */
+export function subagentModelReader(options: WebDataOptions): (sessionKey: string, taskId: string) => Promise<string | undefined> {
+  return async (sessionKey, taskId) => {
+    try {
+      const entry = SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir)
+        .find((e) => e.channelKey === sessionKey && e.sdkSessionId);
+      return entry ? await readSubagentModel(options.sdkSessionsDir, entry.sdkSessionId, taskId) : undefined;
     } catch { return undefined; }
   };
 }

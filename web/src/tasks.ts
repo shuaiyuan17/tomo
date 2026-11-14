@@ -97,3 +97,17 @@ function tree(list: WebTask[]): TaskRow[] {
 export function runningCount(tasks: WebTask[]): number {
   return tasks.filter((task) => task.state === "running" && !task.ambient).length;
 }
+
+/**
+ * A short label for a model id: `claude-opus-5-5` → "Opus 5.5",
+ * `claude-fable-5-2` → "Fable 5.2", `claude-sonnet-4-5-20250929` → "Sonnet 4.5".
+ * Anything else is shown as is, minus a `claude-` prefix.
+ */
+export function modelLabel(id: string): string {
+  const match = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/.exec(id);
+  if (match) {
+    const [, family, major, minor] = match;
+    return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${major}${minor !== undefined ? `.${minor}` : ""}`;
+  }
+  return id.replace(/^claude-/, "");
+}

@@ -48,6 +48,8 @@ export class TaskBoard {
   private shown = new Map<string, WebTask[]>();
   /** For each shown browser session: task id → the slot it came from. */
   private shownSlots = new Map<string, Map<string, string>>();
+  /** Models learned per slot and task (kept across REPLACE updates). */
+  private models = new Map<string, Map<string, string>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly now: () => number;
   private readonly retainMs: number;
@@ -87,6 +89,19 @@ export class TaskBoard {
     return slot !== undefined && task ? { slot, task: { ...task } } : undefined;
   }
 
+  /** Record a task's model (read from its transcript) and republish. */
+  setModel(slot: string, taskId: string, model: string): void {
+    const models = this.models.get(slot) ?? new Map<string, string>();
+    if (models.get(taskId) === model) return;
+    models.set(taskId, model);
+    this.models.set(slot, models);
+    const task = this.sessions.get(slot)?.get(taskId);
+    if (task) { this.sessions.get(slot)!.set(taskId, { ...task, model }); this.publish(); }
+  }
+
+  /** Whether a task's model is already known. */
+  hasModel(slot: string, taskId: string): boolean { return this.models.get(slot)?.has(taskId) ?? false; }
+
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
     const now = this.now();
     const old = this.sessions.get(sessionId) ?? new Map<string, WebTask>();
@@ -101,6 +116,7 @@ export class TaskBoard {
         taskId: task.taskId,
         taskType: clip(task.taskType, LABEL_LIMIT),
         ...(task.subagentType ? { subagentType: clip(task.subagentType, LABEL_LIMIT) } : {}),
+        ...(this.models.get(sessionId)?.get(task.taskId) ? { model: this.models.get(sessionId)!.get(task.taskId)! } : {}),
         description: clip(task.description, 200),
         ...(task.parentTaskId && TASK_ID.test(task.parentTaskId) ? { parentTaskId: task.parentTaskId } : {}),
         ambient: task.ambient,
@@ -158,6 +174,11 @@ export class TaskBoard {
         if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) tasks.delete(id);
       }
       if (!tasks.size) this.sessions.delete(sessionId);
+    }
+    for (const [slot, models] of [...this.models]) {
+      const tasks = this.sessions.get(slot);
+      for (const id of [...models.keys()]) if (!tasks?.has(id)) models.delete(id);
+      if (!models.size) this.models.delete(slot);
     }
     const route = this.router();
     const targets = new Map<string, string>();

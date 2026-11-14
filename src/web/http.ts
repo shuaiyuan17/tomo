@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import type { WebData } from "./data.js";
+import { SCREEN_RATES, type ScreenLoop, type ScreenRate } from "./screen.js";
 import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
@@ -18,6 +19,8 @@ export interface HttpDependencies {
   assetsDir: string;
   rpc(value: Rpc): Promise<unknown>;
   subscribe(fn: (event: EventEnvelope) => void): () => void;
+  /** The shared desktop capture loop; absent where the screen cannot be captured. */
+  screen?: ScreenLoop;
 }
 
 export async function startWebHttp(port: number, deps: HttpDependencies) {
@@ -25,6 +28,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   const access = new WebAccess(deps.accessToken, deps.now);
   const externalOrigin = webConfigSchema.shape.externalOrigin.parse(deps.externalOrigin);
   const streams = new Set<ServerResponse>();
+  const screenStreams = new Set<ServerResponse>();
   let active = 0;
   let inspecting = false;
   let boundPort = port;
@@ -61,6 +65,10 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     const session = api ? (bootstrap ? access.bootstrap(req, res, url, origin) : access.require(req, origin)) : undefined;
     if (url.pathname === "/api/v1/events" && req.method === "GET") {
       await events(url, req, res, origin);
+      return;
+    }
+    if (url.pathname === "/api/v1/screen" && req.method === "GET") {
+      await screen(url, req, res, origin);
       return;
     }
     if (active >= 8) throw new WebError(429, "request_limit");
@@ -103,7 +111,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
           const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
-          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken });
+          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen } });
           return;
         }
         if (url.pathname === "/api/v1/sessions") {
@@ -234,6 +242,41 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     } catch (error) { cleanup(); throw error; }
   }
 
+  /**
+   * Read-only view of the desktop: an SSE stream (read with fetch, so it
+   * carries the same custom header, cookie and same-origin checks as every
+   * other API) of base64 JPEG frames from the one shared capture loop. The
+   * loop runs only while a stream is open. A frame is skipped for a client
+   * that has not drained the previous one, so a slow browser never queues
+   * pictures. Nothing here accepts input.
+   */
+  async function screen(url: URL, req: IncomingMessage, res: ServerResponse, origin: string): Promise<void> {
+    const loop = deps.screen;
+    if (!loop) throw new WebError(503, "screen_unavailable");
+    const rate = Number(url.searchParams.get("fps") ?? "1") as ScreenRate;
+    if (!SCREEN_RATES.includes(rate)) throw new WebError(400, "invalid_rate");
+    const epoch = url.searchParams.get("epoch");
+    const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
+    if (!epoch || epoch !== snapshot.epoch) throw new WebError(409, "epoch_changed");
+    if (screenStreams.size >= 4) throw new WebError(429, "stream_limit");
+    if (res.destroyed) return;
+    screenStreams.add(res);
+    req.socket.setTimeout(0);
+    res.writeHead(200, { "content-type": "text/event-stream", "x-accel-buffering": "no", "cache-control": "no-store" });
+    res.flushHeaders();
+    const unsubscribe = loop.subscribe(rate, (frame) => {
+      if (res.destroyed || res.writableLength > 0) return;
+      const data = JSON.stringify({ status: frame.status, capturedAt: frame.capturedAt, ...(frame.jpeg ? { jpeg: frame.jpeg.toString("base64") } : {}) });
+      res.write(`event: frame\ndata: ${data}\n\n`);
+    });
+    const heartbeat = setInterval(() => {
+      try { access.require(req, origin); } catch { res.destroy(); return; }
+      if (res.writableLength === 0) res.write(": heartbeat\n\n");
+    }, 15_000);
+    heartbeat.unref();
+    res.once("close", () => { unsubscribe(); clearInterval(heartbeat); screenStreams.delete(res); });
+  }
+
   async function asset(path: string, res: ServerResponse): Promise<void> {
     const relative = path === "/" ? "index.html" : /^\/assets\/[A-Za-z0-9_-]+\.(js|css|woff2)$/.test(path) ? path.slice(1) : null;
     if (!relative) throw new WebError(404, "not_found");
@@ -258,10 +301,10 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     server.listen(port, "127.0.0.1", () => { server.off("error", reject); resolve(); });
   });
   // Keep runtime listener errors local even after the startup promise settles.
-  server.on("error", () => { for (const stream of streams) stream.destroy(); });
+  server.on("error", () => { for (const stream of [...streams, ...screenStreams]) stream.destroy(); });
   boundPort = (server.address() as { port: number }).port;
   return { port: boundPort, async close() {
-    for (const stream of streams) stream.destroy();
+    for (const stream of [...streams, ...screenStreams]) stream.destroy();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   } };

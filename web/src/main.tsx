@@ -9,9 +9,10 @@ import { findQuoted, parseReply } from "./reply.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun } from "lucide-react";
+import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
+import { ScreenWindow } from "./screen.js";
 import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -67,6 +68,7 @@ function fitComposer(element: HTMLTextAreaElement | null) {
 function storedTasksOpen(): boolean {
   try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
 }
+const THEMES = [["system", "System theme", SunMoon], ["light", "Light theme", Sun], ["dark", "Dark theme", Moon]] as const;
 function storedTheme(): Theme {
   try { const theme = localStorage.getItem("tomo-theme"); return theme === "light" || theme === "dark" ? theme : "system"; }
   catch { return "system"; }
@@ -89,9 +91,15 @@ function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, s
 export function App() {
   const web = useWeb();
   const [study, setStudy, studyFocus] = useStudyRoute();
+  const [screenOpen, setScreenOpen] = useState(false);
   const [selected, setSelected] = useState("");
   const selectedId = selected || web.bootstrap?.ownerId || web.bootstrap?.sessions[0]?.id || "";
   const session = web.bootstrap?.sessions.find((s) => s.id === selectedId);
+  // The screen is the owner's: offered only with the owner conversation selected.
+  const screenAllowed = !!web.bootstrap?.capabilities?.screen && session?.kind !== "group";
+  const screen = screenOpen && screenAllowed;
+  const screenButton = useRef<HTMLButtonElement>(null);
+  const closeScreen = () => { setScreenOpen(false); screenButton.current?.focus(); };
   const [history, setHistory] = useState<HistoryPage>({ messages: [], nextCursor: null });
   const [historyStatus, setHistoryStatus] = useState("loading");
   const [reload, setReload] = useState(0);
@@ -138,6 +146,7 @@ export function App() {
   }, []);
   const rail = useRef<HTMLElement>(null);
   const overlay = useMediaQuery(OVERLAY_QUERY);
+  const phone = useMediaQuery("(max-width: 600px)");
   const modal = tasksOpen && overlay;
   const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
   // On narrow screens the rail is a modal layer: focus moves into it, stays
@@ -297,16 +306,13 @@ export function App() {
           <ListChecks strokeWidth={1.75} />
           {running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{running > 99 ? "99+" : running}</span>}
         </Button>
+        {screenAllowed && <Button ref={screenButton} variant="ghost" size="icon" aria-pressed={screen} aria-controls="screen-window" title="Screen"
+          aria-label="Screen (read-only live view)" onClick={() => screen ? closeScreen() : setScreenOpen(true)}
+          className="size-10 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
+          <Monitor strokeWidth={1.75} /></Button>}
         <span role="status" className="flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground">
           <i className={cn("size-1.5 rounded-full border border-muted-foreground", web.connection === "live" && "border-primary bg-primary")} />
           <span className="max-[600px]:sr-only">{connectionLabel}</span></span>
-        <ToggleGroup type="single" aria-label="Color theme" value={theme} onValueChange={(value) => { if (value) setTheme(value as Theme); }}
-          className="rounded-xl bg-foreground/[0.05] p-0.5">
-          {([["system", "System theme", Monitor], ["light", "Light theme", Sun], ["dark", "Dark theme", Moon]] as const).map(([value, label, Icon]) =>
-            <ToggleGroupItem key={value} value={value} aria-label={label} title={label}
-              className="size-8 rounded-[10px]! px-0 text-muted-foreground hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13]">
-              <Icon strokeWidth={1.75} /></ToggleGroupItem>)}
-        </ToggleGroup>
       </div>
     </header>
     <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
@@ -323,7 +329,7 @@ export function App() {
         <p className="eyebrow mb-3 max-[600px]:hidden">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2 max-[600px]:mb-0">
           <span id="session-label" className="text-[13px] font-medium">Session</span>
-          <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
+          <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
@@ -347,6 +353,20 @@ export function App() {
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
+        {/* Theme: pinned to the bottom of the sidebar; in the phone-width top bar, one button at its end that cycles. */}
+        <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:hidden">
+          <span className="eyebrow">Theme</span>
+          <ToggleGroup type="single" aria-label="Color theme" value={theme} onValueChange={(value) => { if (value) setTheme(value as Theme); }}
+            className="rounded-xl bg-foreground/[0.05] p-0.5">
+            {THEMES.map(([value, label, Icon]) =>
+              <ToggleGroupItem key={value} value={value} aria-label={label} title={label}
+                className="size-7 rounded-[9px]! px-0 text-muted-foreground hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13] [&_svg:not([class*='size-'])]:size-3.5">
+                <Icon strokeWidth={1.75} /></ToggleGroupItem>)}
+          </ToggleGroup>
+        </div>
+        {(() => { const index = THEMES.findIndex(([value]) => value === theme); const [, label, Icon] = THEMES[index]; const next = THEMES[(index + 1) % THEMES.length];
+          return <Button variant="ghost" size="icon" className="hidden size-9 shrink-0 rounded-xl text-muted-foreground hover:bg-foreground/[0.06] max-[600px]:inline-flex"
+            aria-label={`${label}. Switch to ${next[1].toLowerCase()}`} title={label} onClick={() => setTheme(next[0])}><Icon strokeWidth={1.75} /></Button>; })()}
       </aside>
       {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
@@ -396,6 +416,7 @@ export function App() {
         <TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></aside>}
     </div>
+    {screen && <ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} />}
   </div>;
 }
 

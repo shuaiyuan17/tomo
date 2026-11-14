@@ -85,7 +85,11 @@ export interface WebBootstrap extends WebCatalog {
   blocks: Extract<WebEvent, { type: "block" }>[];
   /** Every visible session's tasks; replaces the client's whole task list. */
   tasks: WebTask[];
+  /** Optional features this daemon serves (absent on older daemons). */
+  capabilities?: { screen: boolean };
 }
+/** One tick of the read-only screen view: a JPEG when live, otherwise why there is none. */
+export interface WebScreenFrame { status: "live" | "locked" | "away" | "unconfirmed" | "unavailable" | "too_large"; capturedAt: number; jpeg?: string }
 // ---- The Study (read-only workspace inspection) ----
 export interface WebMemoryEntry { path: string; kind: "directory" | "file" }
 export interface WebMemoryTree { entries: WebMemoryEntry[]; truncated: boolean; missing: boolean }

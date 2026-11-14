@@ -1,5 +1,6 @@
 import { WebData, type WebDataOptions } from "./data.js";
 import { startWebHttp } from "./http.js";
+import { macScreenSource, ScreenLoop } from "./screen.js";
 import { WebError, type EventEnvelope, type Rpc } from "./protocol.js";
 import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
 
@@ -43,6 +44,10 @@ process.on("message", (value: Message) => {
     accessToken,
     externalOrigin: value.options.externalOrigin,
     data: new WebData(value.options),
+    // Captured here, in the web process, so frames never cross the daemon IPC
+    // and the daemon thread does no image work. Same user and GUI session as
+    // the daemon (this process is its child), so the same Screen Recording grant.
+    ...(process.platform === "darwin" ? { screen: new ScreenLoop(macScreenSource()) } : {}),
     assetsDir: value.options.assetsDir,
     subscribe(fn) { subscribers.add(fn); return () => { subscribers.delete(fn); }; },
     rpc(input: Rpc) {

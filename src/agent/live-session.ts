@@ -34,6 +34,7 @@ import { McpAuthRefresher, type McpAuthRefreshOutcome } from "./mcp-auth-refresh
 import { renderBlock, renderResponseBlocks, type ResponseBlock } from "./block-render.js";
 import { summarizeToolInput, summarizeToolResult } from "./tool-summary.js";
 import { buildContentBlocks, isTextBlock, isThinkingBlock, isToolUseBlock } from "./content-blocks.js";
+import { isTaskSystemMessage, TaskTracker, type TaskChange, type TaskSystemMessage } from "./task-tracker.js";
 
 // Re-exported so existing `./live-session.js` imports keep working.
 export {
@@ -204,6 +205,8 @@ export class LiveSession {
    * end while these keep running; closing the session then kills them.
    */
   private backgroundTaskIds = new Set<string>();
+  /** Full task records for the web "working now" panel (see task-tracker.ts). */
+  private taskTracker = new TaskTracker();
   private backgroundIdleWaiters: Array<() => void> = [];
   /**
    * Set when the background set drains and cleared when the next turn is
@@ -357,6 +360,7 @@ export class LiveSession {
     }
     this.alive = false;
     this.disposeMcpConfig();
+    this.publishTasks(this.taskTracker.reset());
     this.notifyBackgroundIdle();
     this.onTurnClaimed();
     this.inputWaiter?.();
@@ -807,6 +811,10 @@ export class LiveSession {
       this.logToolResults(event.message.content);
     }
 
+    if (isTaskSystemMessage(event as { type?: string; subtype?: string })) {
+      this.publishTasks(this.taskTracker.apply(event as unknown as TaskSystemMessage));
+    }
+
     if (event.type === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
       const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
       const hadTasks = this.backgroundTaskIds.size > 0;
@@ -837,6 +845,7 @@ export class LiveSession {
 
     if (event.type === "result") {
       const result = event as unknown as SdkResultLike;
+      this.publishTasks(this.taskTracker.endTurn());
 
       if (result.session_id) {
         this.sessionId = result.session_id;
@@ -952,6 +961,14 @@ export class LiveSession {
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
       this.logToolResults(event.message.content, agentName);
     }
+  }
+
+  private publishTasks(change: TaskChange | undefined): void {
+    if (!change || !this.sessionKey) return;
+    watchBus.publish({
+      type: "tasks", sessionKey: this.sessionKey, tasks: change.tasks,
+      ...(change.ended.length ? { ended: change.ended } : {}),
+    });
   }
 
   private publishToolStart(
@@ -1451,6 +1468,7 @@ export class LiveSession {
   close(): void {
     this.alive = false;
     this.disposeMcpConfig();
+    this.publishTasks(this.taskTracker.reset());
     this.notifyBackgroundIdle();
     this.onTurnClaimed();
     this.onTurnClaimed();

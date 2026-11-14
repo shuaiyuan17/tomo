@@ -1,18 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { WebChannel } from "../src/channels/web.js";
+import { OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { WebEvents } from "../src/web/events.js";
 import { parseWebConfig } from "../src/web/config.js";
 import { webSessionId } from "../src/web/owner.js";
+import { MAX_BOARD_TASKS, MAX_SNAPSHOT_TASK_BYTES, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS } from "../src/web/tasks.js";
 import type { OwnerConfig } from "../src/owner.js";
 import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
 
 const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
 const channels: WebChannel[] = [];
-function setup(configured: OwnerConfig | null = owner) {
+function setup(configured: OwnerConfig | null = owner, ownerKey?: () => string | undefined) {
   const bus = new WatchBus();
-  const channel = new WebChannel(configured ?? undefined, bus);
+  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey });
   channels.push(channel);
   const handler = vi.fn(async () => true);
   channel.onMessage(handler);
@@ -110,7 +111,7 @@ describe("WebChannel", () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();
     await channel.receive({ requestId, text: "large reply" });
-    for (let bytes = 0; bytes < MAX_BUFFER_BYTES - 128 * 1024; bytes += 128 * 1024) await channel.send({ chatId: requestId, text: "x".repeat(128 * 1024) });
+    for (let bytes = 0; bytes < MAX_BUFFER_BYTES - 192 * 1024 - MAX_SNAPSHOT_TASK_BYTES; bytes += 128 * 1024) await channel.send({ chatId: requestId, text: "x".repeat(128 * 1024) });
     await expect(channel.send({ chatId: requestId, text: "x".repeat(128 * 1024) })).rejects.toThrow("mailbox");
     bus.publish({ type: "turn.end", sessionKey: "dm:owner", source: "user", ok: true, durationMs: 1, requestId });
     expect(channel.request(requestId).state).toBe("failed");
@@ -133,6 +134,177 @@ describe("WebChannel", () => {
   });
 });
 
+describe("web task panel feed", () => {
+  const live = (taskId: string, description = `task ${taskId}`) =>
+    ({ taskId, taskType: "local_agent", description, ambient: false, background: true, startedAt: 1 });
+  it("forwards tasks only for sessions the browser can already read, as snapshot and per-session updates", () => {
+    const { channel, bus, events } = setup();
+    bus.publish({ type: "tasks", sessionKey: "dm:peer", tasks: [live("p", "another person's private work")] });
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a")] });
+    bus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [live("g")] });
+    const updates = events.filter((e) => e.type === "tasks");
+    expect(updates.map((e) => e.type === "tasks" && [e.sessionId, e.tasks.map((t) => t.taskId)])).toEqual([
+      [webSessionId("dm:owner"), ["a"]], [webSessionId("telegram:-1"), ["g"]]]);
+    expect(JSON.stringify(events)).not.toContain("private work");
+    const snapshot = channel.snapshot();
+    expect(snapshot.tasks.map((t) => [t.sessionId, t.taskId, t.state])).toEqual([
+      [webSessionId("dm:owner"), "a", "running"], [webSessionId("telegram:-1"), "g", "running"]]);
+    expect(JSON.stringify(snapshot)).not.toContain("private work");
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a", status: "completed" }] });
+    expect(channel.snapshot().tasks.find((t) => t.taskId === "a")!.state).toBe("completed");
+  });
+  it("uses the catalog's owner-key rule: a hidden legacy DM never reaches the panel", () => {
+    // Canonical key exists: a legacy telegram DM bound to the owner is hidden by the catalog, so its tasks are too.
+    const canonical = setup(owner, () => "dm:owner");
+    canonical.bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("legacy", "legacy secret")] });
+    canonical.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a")] });
+    expect(canonical.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["a"]);
+    expect(JSON.stringify(canonical.events)).not.toContain("legacy secret");
+    // Several legacy keys match: the catalog shows no owner session, so no DM tasks at all.
+    const ambiguous = setup(owner, () => undefined);
+    ambiguous.bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("x", "ambiguous secret")] });
+    ambiguous.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("y", "ambiguous secret")] });
+    expect(ambiguous.channel.snapshot().tasks).toEqual([]);
+    expect(JSON.stringify(ambiguous.events)).not.toContain("ambiguous secret");
+    // The single legacy key the catalog does show is used; when the rule moves on, its tasks leave the snapshot.
+    let current: string | undefined = "telegram:test-owner";
+    const single = setup(owner, () => current);
+    single.bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l")] });
+    expect(single.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["l"]);
+    current = "dm:owner";
+    expect(single.channel.snapshot().tasks).toEqual([]);
+    single.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("c")] });
+    expect(single.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["c"]);
+  });
+  it("clears the owner's tasks as soon as the owner-key rule changes, with no new event, and never re-sends them", () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let current: string | undefined = "dm:owner";
+      const { channel, bus, events } = setup(owner, () => current);
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a", "owner work")] });
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("b", "owner work")] }); // a ends, retained
+      const ownerUpdates = () => events.filter((e) => e.type === "tasks" && e.sessionId === channel.ownerId);
+      current = undefined; // e.g. a second legacy key appeared: the catalog hides the owner session
+      vi.advanceTimersByTime(OWNER_KEY_CHECK_MS);
+      expect(ownerUpdates().at(-1)).toMatchObject({ tasks: [] });
+      expect(channel.snapshot().tasks).toEqual([]);
+      const count = ownerUpdates().length;
+      vi.advanceTimersByTime(TASK_RETENTION_MS * 2);
+      expect(ownerUpdates()).toHaveLength(count);
+    } finally { vi.useRealTimers(); }
+  });
+  it("with the real registry reader, a legacy DM's tasks stop the moment the canonical key appears", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    const { ownerSessionKeyReader } = await import("../src/web/data.js");
+    const root = mkdtempSync(join(tmpdir(), "tomo-web-owner-key-"));
+    try {
+      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
+      store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
+      const { channel, bus, events } = setup(owner, ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }));
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work")] });
+      expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["l"]);
+      // The registry gains the canonical key; the very next legacy event is refused — no cache window.
+      store.setSdkSessionId("dm:owner", "sdk-owner");
+      const before = events.length;
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work"), live("m", "legacy secret")] });
+      expect(JSON.stringify(events.slice(before))).not.toContain("legacy secret");
+      expect(channel.snapshot().tasks).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it("after the registry switches, sends triggered by other sessions, capacity or the timer never carry the old owner tasks", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    const { ownerSessionKeyReader } = await import("../src/web/data.js");
+    const root = mkdtempSync(join(tmpdir(), "tomo-web-gate-"));
+    vi.useFakeTimers({ now: 0, toFake: ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "Date"] });
+    try {
+      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
+      store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
+      const { channel, bus, events } = setup(owner, ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }));
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l1", "legacy secret"), live("l2", "legacy secret")] });
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l2", "legacy secret")] }); // l1 ended, retained
+      store.setSdkSessionId("dm:owner", "sdk-owner"); // the catalog now hides the legacy session
+      const from = events.length;
+      // 1. another session's event; 2. a capacity reallocation; 3. the retention timer.
+      bus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [live("g1")] });
+      bus.publish({ type: "tasks", sessionKey: "telegram:-2", tasks: Array.from({ length: 64 }, (_, i) => live(`h${i}`)) });
+      vi.advanceTimersByTime(TASK_RETENTION_MS + OWNER_KEY_CHECK_MS);
+      const sent = JSON.stringify(events.slice(from));
+      expect(sent).not.toContain("legacy secret");
+      expect(events.slice(from).some((e) => e.type === "tasks" && e.sessionId === channel.ownerId && e.tasks.length === 0)).toBe(true);
+      expect(JSON.stringify(channel.snapshot())).not.toContain("legacy secret");
+    } finally { vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it("keeps recording a hidden DM's events, so it is correct when it becomes visible again", () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let current: string | undefined = "telegram:test-owner";
+      const { channel, bus } = setup(owner, () => current);
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("a"), live("b")] });
+      current = undefined; // hidden (e.g. ambiguous)
+      expect(channel.snapshot().tasks).toEqual([]);
+      // While hidden: a ends with a report, b keeps running.
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("b")], ended: [{ taskId: "a", status: "failed" }] });
+      current = "telegram:test-owner";
+      expect(channel.snapshot().tasks.map((t) => [t.taskId, t.state])).toEqual([["b", "running"], ["a", "failed"]]);
+      // Hidden past the retention window: the ended task is gone when it returns.
+      current = undefined;
+      vi.advanceTimersByTime(TASK_RETENTION_MS);
+      current = "telegram:test-owner";
+      expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["b"]);
+    } finally { vi.useRealTimers(); }
+  });
+  it("one send routes every key by a single owner-rule read, so a switch mid-send never merges two DMs", () => {
+    let current = "telegram:test-owner";
+    let reads = 0;
+    const { channel, bus, events } = setup(owner, () => { reads++; return current; });
+    bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("legacy-task")] });
+    current = "dm:owner";
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("canonical-task")] });
+    // From now on the rule flips on every read: a per-key read would route both DMs to the owner in one send.
+    const flip = ["telegram:test-owner", "dm:owner"];
+    const ownerKey = () => { reads++; return flip[reads % 2]; };
+    (channel as unknown as { ownerKey: () => string }).ownerKey = ownerKey;
+    for (let i = 0; i < 4; i++) {
+      const before = events.length;
+      bus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [live(`g${i}`)] });
+      for (const e of events.slice(before)) {
+        if (e.type !== "tasks" || e.sessionId !== channel.ownerId) continue;
+        const ids = e.tasks.map((t) => t.taskId);
+        expect(ids.includes("legacy-task") && ids.includes("canonical-task")).toBe(false);
+      }
+      const ids = channel.snapshot().tasks.filter((t) => t.sessionId === channel.ownerId).map((t) => t.taskId);
+      expect(ids.includes("legacy-task") && ids.includes("canonical-task")).toBe(false);
+    }
+  });
+  it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
+    const { channel, bus } = setup();
+    const requestId = randomUUID();
+    await channel.receive({ requestId, text: "large reply" });
+    await expect((async () => { for (;;) await channel.send({ chatId: requestId, text: "x".repeat(64 * 1024) }); })()).rejects.toThrow("mailbox");
+    // Worst case text: long, escaped (lone surrogates), across many groups.
+    const nasty = "\ud800".repeat(500);
+    for (let g = 0; g < 10; g++) {
+      bus.publish({ type: "tasks", sessionKey: `telegram:-${g + 1}`, tasks: Array.from({ length: 30 }, (_, i) => ({
+        ...live(`t${g}-${i}`, nasty), taskType: nasty, subagentType: nasty, lastTool: nasty, summary: nasty, parentTaskId: `t${g}-0` })) });
+    }
+    const snapshot = channel.snapshot();
+    expect(snapshot.tasks).toHaveLength(MAX_BOARD_TASKS);
+    // The reconnect snapshot keeps (a short) summary.
+    expect(snapshot.tasks.every((t) => t.summary !== undefined && t.summary.length <= SNAPSHOT_SUMMARY_LIMIT + 1)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(snapshot.tasks))).toBeLessThanOrEqual(MAX_SNAPSHOT_TASK_BYTES);
+    // The frame the supervisor sends (with replay) still fits the IPC limit.
+    expect(Buffer.byteLength(JSON.stringify({ snapshot, replay: null }))).toBeLessThan(MAX_BUFFER_BYTES - 1024);
+  });
+});
+
 it("replays bounded events and reports gaps or another epoch", () => {
   const events = new WebEvents();
   events.publish({ type: "invalidate" });
@@ -144,4 +316,14 @@ it("replays bounded events and reports gaps or another epoch", () => {
   expect(events.after(cursor)).toBeNull();
   expect(events.after("previous-epoch:1")).toBeNull();
   expect(events.after(events.cursor())).toEqual([]);
+});
+
+it("selectOwnerSessionKey: canonical first, then a single legacy key, none when ambiguous", async () => {
+  const { selectOwnerSessionKey } = await import("../src/web/data.js");
+  const two: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: ["owner@example.com"] };
+  expect(selectOwnerSessionKey(undefined, ["dm:owner"])).toBeUndefined();
+  expect(selectOwnerSessionKey(two, ["dm:owner", "telegram:test-owner"])).toBe("dm:owner");
+  expect(selectOwnerSessionKey(two, ["telegram:test-owner", "telegram:-5"])).toBe("telegram:test-owner");
+  expect(selectOwnerSessionKey(two, ["telegram:test-owner", "imessage:owner@example.com"])).toBeUndefined();
+  expect(selectOwnerSessionKey(two, [])).toBe("dm:owner");
 });

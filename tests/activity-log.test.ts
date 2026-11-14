@@ -71,6 +71,17 @@ describe("ActivityLog", () => {
     expect(lines[1]).toMatchObject({ type: "issue", msg: "not a transcript" });
   });
 
+  it("replaces task descriptions and summaries with their length when includeMessageText is false", () => {
+    activityLog = new ActivityLog({ path, bus, includeMessageText: false });
+    activityLog.start();
+    bus.publish({ type: "tasks", sessionKey: "dm:me", tasks: [{ taskId: "a", taskType: "local_agent", description: "secret plans",
+      summary: "reading diary", ambient: false, background: true, startedAt: 1 }] });
+    const line = readLines(path)[0] as { tasks: Array<Record<string, unknown>> };
+    expect(line.tasks[0]).toMatchObject({ taskId: "a", descriptionChars: 12, summaryChars: 13 });
+    expect(JSON.stringify(line)).not.toContain("secret");
+    expect(JSON.stringify(line)).not.toContain("diary");
+  });
+
   it("rotates once the live file passes maxBytes and prunes old rotations", () => {
     activityLog = new ActivityLog({ path, bus, maxBytes: 300, maxRotatedFiles: 2 });
     activityLog.start();

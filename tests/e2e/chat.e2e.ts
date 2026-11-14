@@ -193,3 +193,49 @@ it("keeps messaging operational when the optional web process dies", async () =>
   // All fixture files and browser captures stay under disposable test roots.
   expect(resolve(mockConfig.sessionsDir)).not.toContain("/.tomo/");
 });
+
+it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe overlay", async () => {
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+    { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Map the repo", ambient: false, background: true, startedAt: Date.now(), summary: "Reading src/web" },
+  ] });
+  const toggle = page.getByRole("button", { name: /^Tasks, 1 running$/ });
+  await browserExpect(toggle).toHaveAttribute("aria-pressed", "false");
+  // Desktop: pinned rail, not modal, persisted across reloads.
+  await toggle.click();
+  await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toContainText("Reading src/web");
+  await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
+  await page.reload();
+  await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toBeVisible();
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(page.locator("#tasks-rail")).toHaveCount(0);
+  // Narrow: overlay takes focus, traps it, Escape closes from anywhere and returns focus.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Tasks" });
+  await browserExpect(dialog).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Close tasks" })).toBeFocused();
+  await browserExpect(page.locator("main#conversation")).toHaveAttribute("inert", "");
+  for (let i = 0; i < 6; i++) {
+    await page.keyboard.press(i % 2 ? "Shift+Tab" : "Tab");
+    expect(await page.evaluate(() => !!document.activeElement?.closest("#tasks-rail"))).toBe(true);
+  }
+  await page.getByRole("group", { name: "Task list" }).or(page.getByLabel("Task list")).first().focus();
+  await browserExpect(page.getByLabel("Task list")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await browserExpect(dialog).toHaveCount(0);
+  await browserExpect(page.getByRole("button", { name: /^Tasks/ })).toBeFocused();
+  await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
+});
+
+it("the composer re-fits its height when only its width changes", async () => {
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("word ".repeat(60).trim());
+  const wide = await input.evaluate((el) => el.getBoundingClientRect().height);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await browserExpect.poll(() => input.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(wide);
+  const narrow = await input.evaluate((el) => el.getBoundingClientRect().height);
+  // Fits its content: no inner scrolling below the cap.
+  expect(await input.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeLessThanOrEqual(1);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await browserExpect.poll(() => input.evaluate((el) => el.getBoundingClientRect().height)).toBeLessThan(narrow);
+});

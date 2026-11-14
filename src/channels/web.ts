@@ -7,7 +7,12 @@ import type { WatchEvent } from "../watch/protocol.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
+import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
+import { selectOwnerSessionKey } from "../web/data.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
+
+/** How often the owner-key rule is re-read while owner tasks are shown. */
+export const OWNER_KEY_CHECK_MS = 1_000;
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
 interface Receipt { digest: string; request: WebRequest; settled: boolean }
@@ -28,8 +33,22 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  /** Live and recently ended subagents/background tasks, per visible session. */
+  readonly tasks: TaskBoard;
 
-  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus) {
+  /** The DM key the web catalog shows as the owner conversation (data.ts rule). */
+  private readonly ownerKey: () => string | undefined;
+  /** Re-checks the owner-key rule while the owner's board entry is filled. */
+  private ownerKeyTimer: ReturnType<typeof setInterval> | undefined;
+
+  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus,
+    options: { now?: () => number; ownerKey?: () => string | undefined } = {}) {
+    const now = options.now ?? Date.now;
+    // Without registry access the catalog would pick the canonical key.
+    this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
+    this.tasks = new TaskBoard((sessionId, tasks) => {
+      try { this.events.publish({ type: "tasks", sessionId, tasks }); } catch { /* An oversized panel update never fails the Agent. */ }
+    }, { now, router: () => this.taskRouter() });
     this.owner = owner;
     this.ownerId = this.owner ? webSessionId(ownerSessionKey(this.owner)) : null;
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
@@ -85,8 +104,10 @@ export class WebChannel implements Channel {
 
   request(id: string): WebRequest { return { ...(this.receipts.get(id)?.request ?? { requestId: id, state: "unknown" }) }; }
   snapshot() {
-    return { epoch: this.events.epoch, cursor: this.events.cursor(),
-      requests: [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request })), blocks: [...this.blocks] };
+    const requests = [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request }));
+    const blocks = [...this.blocks];
+    const tasks = this.tasks.snapshot();
+    return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
   }
 
   async send(message: OutgoingMessage): Promise<void> {
@@ -100,7 +121,9 @@ export class WebChannel implements Channel {
       throw markDefiniteFailure(new Error("Web attachments are not supported"));
     }
     const bytes = Buffer.byteLength(message.text);
-    if (this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024) {
+    // The rest of the snapshot frame is reserved for receipts and the task
+    // panel, whose worst case is fixed, so the snapshot never truncates it.
+    if (this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES) {
       this.state(requestId, "failed");
       throw markDefiniteFailure(new Error("Web mailbox full"));
     }
@@ -124,6 +147,8 @@ export class WebChannel implements Channel {
   async teardown(): Promise<void> {
     this.tornDown = true;
     this.unsubscribe?.();
+    this.tasks.dispose();
+    clearInterval(this.ownerKeyTimer);
     try { await this.lifecycle?.stop(); } catch { /* Optional process cleanup cannot prevent daemon shutdown. */ }
   }
   async stop(): Promise<void> { this.closeIngestion(); await this.quiesce(); await this.teardown(); }
@@ -141,6 +166,35 @@ export class WebChannel implements Channel {
     if (key === ownerSessionKey(owner) || OWNER_CHANNELS.some((ch) =>
       ownerBindings(owner, ch).some((id) => legacySessionKeysForBinding([key], ch, id).length > 0))) return this.ownerId;
   }
+  /**
+   * Task text reaches the browser only for sessions its catalog shows: any
+   * group, and for DMs exactly the key `selectOwnerSessionKey` picks — not
+   * every legacy key bound to the owner, which the catalog may be hiding.
+   */
+  /**
+   * The board's send gate calls this once per send: one fresh read of the
+   * owner-key rule, then a router for every key in that send. Groups always
+   * show (they are readable in the browser); a DM only when it is the key the
+   * catalog rule picks as the owner conversation in this snapshot.
+   */
+  private taskRouter(): (key: string) => string | undefined {
+    const ownerKey = this.ownerKey();
+    const ownerId = this.ownerId;
+    return (key) => {
+      if (isGroupSessionKey(key)) return webSessionId(key);
+      return ownerKey !== undefined && key === ownerKey && ownerId ? ownerId : undefined;
+    };
+  }
+  /** Every owner-bound or group key is recorded; the gate decides what is shown. */
+  private observeTasks(key: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
+    this.tasks.apply(key, event.tasks, event.ended);
+    // The owner rule can change with no task event at all; re-run the gate so
+    // a DM that stops being the owner conversation is withdrawn promptly.
+    if (!isGroupSessionKey(key) && !this.ownerKeyTimer) {
+      this.ownerKeyTimer = setInterval(() => this.tasks.publish(), OWNER_KEY_CHECK_MS);
+      this.ownerKeyTimer.unref?.();
+    }
+  }
   private observe(event: WatchEvent): void {
     if (!("sessionKey" in event) || !event.sessionKey) return;
     const sessionId = this.sessionId(event.sessionKey);
@@ -156,6 +210,8 @@ export class WebChannel implements Channel {
       this.events.publish({ type: "invalidate", sessionId });
     } else if (event.type === "transcript" || event.type === "turn.stats") {
       this.events.publish({ type: "invalidate", sessionId });
+    } else if (event.type === "tasks") {
+      this.observeTasks(event.sessionKey, event);
     } else if (event.type === "tool.start" || event.type === "tool.end") {
       this.events.publish({ type: "tool", sessionId, tool: event.tool.slice(0, 128),
         state: event.type === "tool.start" ? "started" : event.ok ? "completed" : "failed" });

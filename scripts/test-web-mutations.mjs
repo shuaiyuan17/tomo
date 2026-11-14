@@ -41,7 +41,7 @@ const cases = [
   ["provider-web-steering", "src/agent/inbound-batcher.ts", "&& this.host.canSteerIntoSession?.(sessionKey) !== false", "", "tests/web-routing.test.ts"],
   ["request-deduplication", "src/channels/web.ts", "if (previous) {", "if (previous && false) {", "tests/web-channel.test.ts"],
   ["completed-block-stream", "src/channels/web.ts", "try { this.events.publish(block); }", "try { void block; }", "tests/web-routing.test.ts"],
-  ["mailbox-limit", "src/channels/web.ts", "this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024", "false", "tests/web-channel.test.ts"],
+  ["mailbox-limit", "src/channels/web.ts", "this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES", "false", "tests/web-channel.test.ts"],
   ["ingress-close", "src/channels/web.ts", "closeIngestion(): void { this.closed = true; }", "closeIngestion(): void {}", "tests/web-channel.test.ts"],
   ["safe-tool-activity", "src/channels/web.ts", "tool: event.tool.slice(0, 128)", 'tool: "omitted"', "tests/web-channel.test.ts"],
   ["event-replay", "src/web/events.ts", "this.ring.slice(index + 1).map(({ envelope }) => envelope)", "[]", "tests/web-channel.test.ts"],

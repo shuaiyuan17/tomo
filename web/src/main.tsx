@@ -4,6 +4,8 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
+import { TasksPanel } from "./tasks-panel.js";
+import { runningCount } from "./tasks.js";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 
@@ -11,6 +13,44 @@ const labels: Record<WebRequest["state"], string> = { queued: "Queued", running:
   failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted", unknown: "Outcome unknown — check the conversation before sending again" };
 type Theme = "system" | "light" | "dark";
 
+const OVERLAY_QUERY = "(max-width: 800px)";
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const list = window.matchMedia(query);
+    const update = () => setMatches(list.matches);
+    update();
+    list.addEventListener("change", update);
+    return () => list.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
+/** Keeps Tab / Shift+Tab inside `container`. */
+function trapTab(container: HTMLElement, event: KeyboardEvent) {
+  const items = [...container.querySelectorAll<HTMLElement>("button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])")]
+    .filter((element) => !element.hasAttribute("disabled"));
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  const inside = container.contains(document.activeElement);
+  if (event.shiftKey && (document.activeElement === first || !inside)) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && (document.activeElement === last || !inside)) { event.preventDefault(); first.focus(); }
+}
+const COMPOSER_MAX_HEIGHT = 240;
+function fitComposer(element: HTMLTextAreaElement | null) {
+  if (!element) return;
+  element.style.height = "auto";
+  element.style.height = `${Math.min(element.scrollHeight, COMPOSER_MAX_HEIGHT)}px`;
+}
+function storedTasksOpen(): boolean {
+  try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
+}
+/** Checklist (lucide `list-checks` geometry), drawn inline: assets stay local. */
+function TasksIcon() {
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 2 2 4-4" /><path d="m3 7 2 2 4-4" /><path d="M13 6h8" /><path d="M13 12h8" /><path d="M13 18h8" /></svg>;
+}
+function ArrowUpIcon() {
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7" /><path d="M12 19V5" /></svg>;
+}
 function storedTheme(): Theme {
   try { const theme = localStorage.getItem("tomo-theme"); return theme === "light" || theme === "dark" ? theme : "system"; }
   catch { return "system"; }
@@ -48,6 +88,45 @@ export function App() {
   });
   const [feedback, setFeedback] = useState("");
   const [theme, setTheme] = useState<Theme>(storedTheme);
+  const [tasksOpen, setTasksOpen] = useState(storedTasksOpen);
+  useEffect(() => {
+    try { localStorage.setItem("tomo-tasks-open", tasksOpen ? "1" : "0"); } catch { /* Storage can be unavailable. */ }
+  }, [tasksOpen]);
+  const running = runningCount(web.tasks);
+  const tasksButton = useRef<HTMLButtonElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  // The composer grows with its text, up to a cap (then it scrolls). Text
+  // changes and width changes (window, rail, rotation) both re-measure.
+  useLayoutEffect(() => { fitComposer(input.current); }, [draft]);
+  useEffect(() => {
+    const element = input.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    let width = element.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (element.clientWidth === width) return; // our own height change
+      width = element.clientWidth;
+      fitComposer(element);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const rail = useRef<HTMLElement>(null);
+  const overlay = useMediaQuery(OVERLAY_QUERY);
+  const modal = tasksOpen && overlay;
+  const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
+  // On narrow screens the rail is a modal layer: focus moves into it, stays
+  // there (the content under it is inert), and Escape anywhere closes it,
+  // returning focus to the topbar button. A pinned desktop rail is not modal.
+  useEffect(() => {
+    if (!modal) return;
+    rail.current?.querySelector<HTMLElement>(".tasks-close")?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); closeTasks(); return; }
+      if (event.key === "Tab" && rail.current) trapTab(rail.current, event);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [modal]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem("tomo-theme", theme); } catch { /* Storage can be unavailable. */ }
@@ -144,14 +223,17 @@ export function App() {
     <a className="skip" href="#conversation">Skip to conversation</a>
     <header className="topbar"><a className="brand" href="/" aria-label="Tomo home"><Mark /><span>tomo<span className="brand-dot">.</span></span></a>
       <span className="section-name">Conversation</span>
-      <div className="header-actions"><span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
+      <div className="header-actions"><button ref={tasksButton} type="button" className="icon-button tasks-button" aria-pressed={tasksOpen} aria-controls="tasks-rail"
+          aria-label={`Tasks${running ? `, ${running} running` : ""}`} title="Tasks" onClick={() => setTasksOpen((open) => !open)}>
+          <TasksIcon />{running > 0 && <span className="tasks-count" aria-hidden="true">{running > 99 ? "99+" : running}</span>}</button>
+        <span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
         <label className="theme-label"><span className="sr-only">Color theme</span><select aria-label="Color theme" value={theme} onChange={(e) => setTheme(e.target.value as Theme)}><option value="system">System theme</option><option value="light">Light theme</option><option value="dark">Dark theme</option></select></label>
       </div>
     </header>
     <div className="workspace">
-      <aside className="sidebar" aria-label="Conversation details">
+      <aside className="sidebar" aria-label="Conversation details" inert={modal}>
         <p className="eyebrow">Your conversations</p>
-        <label htmlFor="session">Session</label>
+        <div className="session-label"><label htmlFor="session">Session</label><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         <select id="session" value={selectedId} disabled={!web.bootstrap?.sessions.length} onChange={(e) => { setSelected(e.target.value); setFeedback(""); }}>
           {!web.bootstrap?.sessions.length && <option value="">No session available</option>}
           {web.bootstrap?.sessions.map((s) => <option value={s.id} key={s.id}>{s.title}{s.kind === "group" ? " · read-only" : ""}</option>)}
@@ -162,10 +244,8 @@ export function App() {
           {hasContext && <progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" />}
           <p className="session-note">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
-        <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
-      <main id="conversation" className="conversation" tabIndex={-1}>
-        <div className="conversation-heading"><div><p className="eyebrow">{session?.kind === "group" ? "Group history" : "A conversation with Tomo"}</p><h1>{session?.kind === "group" ? session.title : "Room to think."}</h1></div><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
+      <main id="conversation" className="conversation" tabIndex={-1} inert={modal}>
         {web.bootstrap?.setupRequired && <div className="notice" role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className="notice" role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
         <div className="transcript" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={() => { const e = scroll.current!; atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 80; }}>
@@ -177,13 +257,15 @@ export function App() {
           {blocks.map((block) => <article className="message assistant" key={block.id}><div className="message-meta"><span>Tomo</span><span>Reply in progress</span></div><div className="markdown"><Text>{block.text}</Text></div></article>)}
         </div>
         <div className="composer-area"><div className="activity" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
-          <form onSubmit={(e) => void send(e)} className="composer"><label className="sr-only" htmlFor="message">Message Tomo</label><textarea id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={3} disabled={!session?.writable} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
-            <div className="composer-footer"><span>{session?.kind === "group" ? "View only" : "Enter to send · Shift + Enter for a new line"}</span><button className="send" type="submit" disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}>{sending ? "Sending…" : "Send"}<span aria-hidden="true">↗</span></button></div>
+          <form onSubmit={(e) => void send(e)} className="composer"><label className="sr-only" htmlFor="message">Message Tomo</label><textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+            <button className="send" type="submit" aria-label="Send" aria-busy={sending} disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUpIcon /></button>
           </form>
           {feedback && <p className="feedback" role="status">{feedback}</p>}
           {uncertain && !sending && <div className="recovery"><button onClick={() => void checkOutcome()}>Check message status</button><button onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</button></div>}
         </div>
       </main>
+      {tasksOpen && <aside ref={rail} id="tasks-rail" className="tasks-rail" aria-label="Tasks" {...(modal ? { role: "dialog", "aria-modal": true } : {})}>
+        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} onClose={closeTasks} /></aside>}
     </div>
   </div>;
 }

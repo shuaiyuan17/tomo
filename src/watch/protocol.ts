@@ -19,6 +19,38 @@ export const WATCH_PROTOCOL_VERSION = 1;
 
 export type TurnSource = "user" | "cron" | "continuity";
 
+/** How a task ended, as reported by the SDK's `task_notification`. */
+export type TaskEndStatus = "completed" | "failed" | "stopped";
+
+/**
+ * One live SDK task (subagent, background shell, monitor, workflow) of a
+ * session, as tracked by `src/agent/task-tracker.ts`. Text fields are clipped
+ * there; the subagent's prompt is never carried.
+ */
+export interface WatchTask {
+  taskId: string;
+  runId?: string;
+  /** SDK `task_type` (e.g. `local_agent`, `local_bash`, `monitor`). */
+  taskType: string;
+  subagentType?: string;
+  description: string;
+  /** Unknown ids are possible (the parent may have ended); treat as no parent. */
+  parentTaskId?: string;
+  /** Not activity (watchers, skip_transcript tasks). */
+  ambient: boolean;
+  /** In the SDK's background set (false: a foreground, blocking tool call). */
+  background: boolean;
+  /** When this process first saw the task (ms epoch). */
+  startedAt: number;
+  /** From `task_progress`. */
+  lastTool?: string;
+  summary?: string;
+  totalTokens?: number;
+  toolUses?: number;
+  /** Reported by `task_notification` while the task is still in the set. */
+  status?: TaskEndStatus;
+}
+
 export type WatchEvent =
   /** A message entered a session transcript (user inbound or Tomo outbound). */
   | {
@@ -47,6 +79,10 @@ export type WatchEvent =
   | { type: "cron.done"; ts: number; jobId: string; name: string; ok: boolean }
   | { type: "heartbeat"; ts: number }
   | { type: "compact"; ts: number; sessionKey?: string; preTokens?: number; postTokens?: number }
+  /** The session's live tasks after a change. REPLACE semantics, like the
+   *  SDK's `background_tasks_changed`. `ended` carries end reports for tasks
+   *  that already left the set (the SDK does not order the two streams). */
+  | { type: "tasks"; ts: number; sessionKey: string; tasks: WatchTask[]; ended?: { taskId: string; status: TaskEndStatus }[] }
   | { type: "issue"; ts: number; level: "warn" | "error"; msg: string }
   /** The MODEL wrote a line shaped like an inbound harness marker into its own
    *  reply. The block still ships (marked, not truncated) — see

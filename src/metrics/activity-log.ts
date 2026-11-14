@@ -10,7 +10,7 @@ export interface ActivityLogOptions {
   /** NDJSON file path, e.g. ~/.tomo/logs/activity.ndjson. */
   path: string;
   bus?: WatchBus;
-  /** When false, transcript message text is replaced by its length. Turn this
+  /** When false, transcript message text (and task descriptions/summaries) is replaced by its length. Turn this
    *  off if the log is shipped anywhere off this machine. Default true. */
   includeMessageText?: boolean;
   /** Rotate once the live file passes this size. */
@@ -85,6 +85,12 @@ export class ActivityLog {
     if (event.type === "transcript" && !this.includeMessageText) {
       const { text, ...rest } = event;
       return { ...rest, textChars: text.length };
+    }
+    if (event.type === "tasks" && !this.includeMessageText) {
+      // Task descriptions and progress summaries are model-written text about
+      // the conversation; they follow the message-text setting.
+      return { ...event, tasks: event.tasks.map(({ description, summary, ...task }) =>
+        ({ ...task, descriptionChars: description.length, ...(summary !== undefined ? { summaryChars: summary.length } : {}) })) };
     }
     return event;
   }

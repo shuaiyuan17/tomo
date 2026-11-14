@@ -218,7 +218,9 @@ async function startForeground(): Promise<void> {
     try {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
-      const web = new WebChannel(config.owner);
+      const { ownerSessionKeyReader } = await import("../web/data.js");
+      const web = new WebChannel(config.owner, undefined, { ownerKey: ownerSessionKeyReader({
+        owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }) });
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,

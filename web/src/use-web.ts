@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
-import type { WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
+import type { WebEvent, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
+import { replaceSessionTasks } from "./tasks.js";
 
 export function useWeb() {
   const [bootstrap, setBootstrap] = useState<WebBootstrap>();
@@ -8,6 +9,7 @@ export function useWeb() {
   const [blocks, setBlocks] = useState<WebSnapshot["blocks"]>([]);
   const [requests, setRequests] = useState<WebRequest[]>([]);
   const [activity, setActivity] = useState<Record<string, string>>({});
+  const [tasks, setTasks] = useState<WebTask[]>([]);
   const [revision, setRevision] = useState(0);
   const refreshBootstrap = useCallback(async () => {
     try { const value = await readBootstrap(); setBootstrap(value); return value; }
@@ -32,7 +34,7 @@ export function useWeb() {
       }, 100);
     };
     const snapshot = (value: WebSnapshot) => {
-      setBlocks(value.blocks); setRequests(value.requests); setActivity({});
+      setBlocks(value.blocks); setRequests(value.requests); setActivity({}); setTasks(value.tasks ?? []);
       setConnection("live"); refresh();
     };
     const update = (event: WebEvent) => {
@@ -44,6 +46,7 @@ export function useWeb() {
       if (event.type === "invalidate") refresh();
       if (event.type === "tool") setActivity((old) => ({ ...old,
         [event.sessionId]: `${event.tool} · ${event.state}` }));
+      if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
       if (event.type === "typing") setActivity((old) => ({ ...old, [event.sessionId]: event.active ? "Tomo is working…" : "" }));
     };
     let delay = 1_000;
@@ -67,5 +70,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, revision, discardRecordedBlocks, refreshBootstrap };
+  return { bootstrap, connection, blocks, requests, activity, tasks, revision, discardRecordedBlocks, refreshBootstrap };
 }

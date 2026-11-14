@@ -225,7 +225,7 @@ export class WebChannel implements Channel {
 
   /** Subscription usage for the browser; never fails: an unconfigured reader reads as "unavailable". */
   async usage(refresh: boolean): Promise<WebUsage> {
-    if (!this.usageReader) return { state: "unavailable", windows: [], fetchedAt: Date.now(), updatedAt: null, nextRefreshAt: Date.now(), expiresAt: Date.now() + 30 * 60_000 };
+    if (!this.usageReader) return { state: "unavailable", windows: [], fetchedAt: Date.now(), updatedAt: null, nextRefreshAt: Date.now(), expiresAt: Date.now() + 30 * 60_000, serverNow: Date.now() };
     return this.usageReader(refresh);
   }
 

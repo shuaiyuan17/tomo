@@ -4,17 +4,44 @@ import type { WebUsage, WebUsageWindow } from "../../src/web/protocol.js";
 
 /** Asked again this long after the server's cache expires (it refreshes on that request). */
 export const USAGE_MARGIN_MS = 5_000;
-/** After a failed request to Tomo, try again this soon. */
+/** After a failed request to Tomo, try again this long after that attempt. */
 export const USAGE_RETRY_MS = 60_000;
+/** Never ask again sooner than this after the last attempt (no zero-delay loops). */
+export const USAGE_MIN_GAP_MS = 5_000;
 
 /**
- * When to ask next, from what the server said: its cache expiry plus a small
- * margin — not 30 minutes from when the request started. 0 means "now".
+ * Every absolute time in the answer, moved onto the browser's clock: the
+ * daemon's clock is `serverNow` at the moment the answer arrived
+ * (`receivedAt`, local), so a skewed browser clock does not shift expiry,
+ * "updated" or reset times.
  */
-export function nextUsageDelay(usage: WebUsage | undefined, failed: boolean, now: number): number {
-  if (failed || !usage) return USAGE_RETRY_MS;
-  return Math.max(0, usage.expiresAt + USAGE_MARGIN_MS - now);
+export function localizeUsage(usage: WebUsage, receivedAt: number): WebUsage {
+  const shift = receivedAt - usage.serverNow;
+  const at = (t: number) => t + shift;
+  return { ...usage, fetchedAt: at(usage.fetchedAt), updatedAt: usage.updatedAt === null ? null : at(usage.updatedAt),
+    nextRefreshAt: at(usage.nextRefreshAt), expiresAt: at(usage.expiresAt), serverNow: receivedAt,
+    windows: usage.windows.map((w) => ({ ...w, resetsAt: w.resetsAt === null ? null : at(w.resetsAt) })) };
 }
+
+export interface UsageSchedule {
+  /** The last answer, already on the local clock (see localizeUsage). */
+  usage?: WebUsage;
+  /** The last request to Tomo failed. */
+  failed: boolean;
+  /** Local time of the last request. */
+  lastAttemptAt: number;
+}
+/**
+ * How long until the next read, all on the local clock: the cache's expiry
+ * plus a margin; after a failed request, 60 s after that attempt (so a tab
+ * coming back later retries at once); never sooner than USAGE_MIN_GAP_MS
+ * after the last attempt.
+ */
+export function nextUsageDelay(schedule: UsageSchedule, now: number): number {
+  const due = schedule.failed || !schedule.usage ? schedule.lastAttemptAt + USAGE_RETRY_MS : schedule.usage.expiresAt + USAGE_MARGIN_MS;
+  return Math.max(0, due - now, schedule.lastAttemptAt + USAGE_MIN_GAP_MS - now);
+}
+
 /** At or above this utilisation a window is shown in the warning colour. */
 export const USAGE_WARN_PERCENT = 80;
 

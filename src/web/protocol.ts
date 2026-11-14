@@ -96,6 +96,8 @@ export interface WebUsage {
   nextRefreshAt: number;
   /** When the cached value expires (ms epoch): the card schedules its next read from this. */
   expiresAt: number;
+  /** The daemon's clock when it answered: the browser converts every time above to its own clock with it. */
+  serverNow: number;
 }
 /**
  * RPC deadline for `usage`: under the HTTP socket timeout (30 s), above the

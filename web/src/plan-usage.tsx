@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { isWarn, nextUsageDelay, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "./usage.js";
+import { isWarn, localizeUsage, nextUsageDelay, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle, type UsageSchedule } from "./usage.js";
 
 /**
  * Claude subscription usage (the same numbers as `/usage`). Loads on open,
@@ -19,19 +19,22 @@ export function PlanUsage({ ready }: { ready: boolean }) {
   const [failed, setFailed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   // The latest answer, for scheduling outside React's render cycle.
-  const latest = useRef<{ usage?: WebUsage; failed: boolean }>({ failed: false });
+  const latest = useRef<UsageSchedule>({ failed: false, lastAttemptAt: 0 });
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const schedule = useCallback((load: (refresh: boolean) => Promise<void>) => {
     clearTimeout(timer.current);
     if (document.hidden) return;
-    const delay = nextUsageDelay(latest.current.usage, latest.current.failed, Date.now());
+    const delay = nextUsageDelay(latest.current, Date.now());
     timer.current = setTimeout(() => void load(false), delay);
   }, []);
   const load = useCallback(async (refresh: boolean): Promise<void> => {
     clearTimeout(timer.current);
     setLoading(true);
-    try { const value = await api<WebUsage>(`/usage${refresh ? "?refresh=1" : ""}`); latest.current = { usage: value, failed: false }; setUsage(value); setFailed(false); }
-    catch { latest.current = { ...latest.current, failed: true }; setFailed(true); }
+    const attemptAt = Date.now();
+    try {
+      const value = localizeUsage(await api<WebUsage>(`/usage${refresh ? "?refresh=1" : ""}`), Date.now());
+      latest.current = { usage: value, failed: false, lastAttemptAt: attemptAt }; setUsage(value); setFailed(false);
+    } catch { latest.current = { ...latest.current, failed: true, lastAttemptAt: attemptAt }; setFailed(true); }
     finally { setLoading(false); setNow(Date.now()); schedule(load); }
   }, [schedule]);
   // Only once the page is authenticated (bootstrap sets the cookie). Next

@@ -4,7 +4,7 @@ import { USAGE_DEADLINE_MS, USAGE_REFRESH_MIN_MS, USAGE_TIMEOUT_RETRY_MS, USAGE_
 import { USAGE_RPC_TIMEOUT_MS } from "../src/web/protocol.js";
 import { SOCKET_TIMEOUT_MS } from "../src/web/http.js";
 import { vi } from "vitest";
-import { formatSpan, isWarn, nextUsageDelay, USAGE_MARGIN_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
+import { formatSpan, isWarn, localizeUsage, nextUsageDelay, USAGE_MARGIN_MS, USAGE_MIN_GAP_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
 import type { WebUsage, WebUsageWindow } from "../src/web/protocol.js";
 
 const NOW = Date.parse("2026-07-27T22:36:00.000Z");
@@ -111,19 +111,33 @@ describe("usage deadlines", () => {
 });
 
 describe("Plan usage scheduling", () => {
-  const usage = (expiresAt: number): WebUsage => ({ state: "ok", windows: [], fetchedAt: 0, updatedAt: 0, nextRefreshAt: 0, expiresAt });
+  const answer = (o: Partial<WebUsage>): WebUsage => ({ state: "ok", windows: [], fetchedAt: 0, updatedAt: 0, nextRefreshAt: 0, expiresAt: 0, serverNow: 0, ...o });
   it("asks again at the server's expiry plus a margin, not 30 minutes after the request", () => {
     // The server's cache was filled 20 minutes before this request: it expires in 10.
-    const now = 20 * 60_000;
-    expect(nextUsageDelay(usage(USAGE_TTL_MS), false, now)).toBe(10 * 60_000 + USAGE_MARGIN_MS);
+    const local = localizeUsage(answer({ serverNow: 20 * 60_000, expiresAt: USAGE_TTL_MS }), 20 * 60_000);
+    expect(nextUsageDelay({ usage: local, failed: false, lastAttemptAt: 20 * 60_000 }, 20 * 60_000)).toBe(10 * 60_000 + USAGE_MARGIN_MS);
+  });
+  it.each([60_000, -60_000])("is unaffected by a browser clock off by %i ms", (skew) => {
+    const server = 1_000_000;
+    const browser = server + skew;
+    const local = localizeUsage(answer({ serverNow: server, expiresAt: server + 600_000, updatedAt: server - 120_000,
+      windows: [{ id: "s", label: "Session (5h)", group: "session", scoped: false, percent: 1, resetsAt: server + 3_600_000, active: false, elevated: false }] }), browser);
+    expect(nextUsageDelay({ usage: local, failed: false, lastAttemptAt: browser }, browser)).toBe(600_000 + USAGE_MARGIN_MS);
+    expect(updatedLabel(local.updatedAt, browser)).toBe("Updated 2 min ago");
+    expect(resetLabel(local.windows[0], browser)).toBe("Resets in 1h 0m");
   });
   it("a tab back after the expiry reads at once; before it, waits only until then", () => {
-    expect(nextUsageDelay(usage(1_000), false, 50_000)).toBe(0);
-    expect(nextUsageDelay(usage(100_000), false, 50_000)).toBe(50_000 + USAGE_MARGIN_MS);
+    const usage = answer({ expiresAt: 1_000 });
+    expect(nextUsageDelay({ usage, failed: false, lastAttemptAt: 0 }, 50_000)).toBe(0);
+    expect(nextUsageDelay({ usage: answer({ expiresAt: 100_000 }), failed: false, lastAttemptAt: 0 }, 50_000)).toBe(50_000 + USAGE_MARGIN_MS);
   });
-  it("retries soon after a failed request", () => {
-    expect(nextUsageDelay(undefined, true, 0)).toBe(USAGE_RETRY_MS);
-    expect(nextUsageDelay(usage(1e12), true, 0)).toBe(USAGE_RETRY_MS);
+  it("never asks again sooner than the minimum gap, even if the cache already expired", () => {
+    expect(nextUsageDelay({ usage: answer({ expiresAt: 0 }), failed: false, lastAttemptAt: 10_000 }, 10_000)).toBe(USAGE_MIN_GAP_MS);
+  });
+  it("after a failure: 60 s after that attempt; a tab back later than that retries at once", () => {
+    expect(nextUsageDelay({ failed: true, lastAttemptAt: 0 }, 0)).toBe(USAGE_RETRY_MS);
+    expect(nextUsageDelay({ failed: true, lastAttemptAt: 0 }, 45_000)).toBe(USAGE_RETRY_MS - 45_000);
+    expect(nextUsageDelay({ usage: answer({ expiresAt: 1e12 }), failed: true, lastAttemptAt: 0 }, 5 * 60_000)).toBe(0);
   });
 });
 
@@ -143,7 +157,7 @@ describe("Plan usage card helpers", () => {
       .toEqual(["Not updated yet", "Updated just now", "Updated 5 min ago", "Updated 3 h ago"]);
   });
   it("has a distinct notice per failure", () => {
-    const base = { windows: [], fetchedAt: 0, updatedAt: null, nextRefreshAt: 0, expiresAt: 0 };
+    const base = { windows: [], fetchedAt: 0, updatedAt: null, nextRefreshAt: 0, expiresAt: 0, serverNow: 0 };
     const states: WebUsage["state"][] = ["empty", "api_key", "no_token", "credentials_unreadable", "token_expired", "refresh_pending", "unauthorized", "network", "timeout", "http_error", "bad_response", "unavailable"];
     const notices = states.map((state) => usageNotice({ ...base, state }));
     expect(new Set(notices).size).toBe(states.length);

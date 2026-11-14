@@ -48,7 +48,7 @@ export class UsageCache {
         const previous = this.value?.windows.length ? this.value : undefined;
         resolve(this.decorate({ state: "timeout", message: "Claude usage unavailable: usage request timed out.", windows: previous?.windows ?? [],
           plan: previous?.plan, fetchedAt: now, updatedAt: previous?.updatedAt ?? null, stale: !!previous,
-          nextRefreshAt: 0, expiresAt: 0 }, now, now + USAGE_TIMEOUT_RETRY_MS));
+          nextRefreshAt: 0, expiresAt: 0, serverNow: now }, now, now + USAGE_TIMEOUT_RETRY_MS));
       }, USAGE_DEADLINE_MS);
       timer.unref?.();
     });
@@ -63,17 +63,17 @@ export class UsageCache {
     if (result.ok) {
       const windows = usageWindows(result.data);
       this.value = { state: windows.length ? "ok" : "empty", windows, plan: subscriptionLabel(result.subscriptionType) || undefined,
-        fetchedAt: now, updatedAt: now, nextRefreshAt: now + USAGE_REFRESH_MIN_MS, expiresAt: now + USAGE_TTL_MS };
+        fetchedAt: now, updatedAt: now, nextRefreshAt: now + USAGE_REFRESH_MIN_MS, expiresAt: now + USAGE_TTL_MS, serverNow: now };
     } else {
       const previous = this.value?.windows.length ? this.value : undefined;
       this.value = { state: result.reason, message: result.message, windows: previous?.windows ?? [], plan: previous?.plan,
         fetchedAt: now, updatedAt: previous?.updatedAt ?? null, stale: !!previous, nextRefreshAt: now + USAGE_REFRESH_MIN_MS,
-        expiresAt: now + USAGE_TTL_MS };
+        expiresAt: now + USAGE_TTL_MS, serverNow: now };
     }
     return this.decorate(this.value, now);
   }
 
   private decorate(value: WebUsage, now: number, expiresAt = this.lastAttemptAt + USAGE_TTL_MS): WebUsage {
-    return { ...value, nextRefreshAt: Math.max(now, this.lastAttemptAt + USAGE_REFRESH_MIN_MS), expiresAt };
+    return { ...value, nextRefreshAt: Math.max(now, this.lastAttemptAt + USAGE_REFRESH_MIN_MS), expiresAt, serverNow: now };
   }
 }

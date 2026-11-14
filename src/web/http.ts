@@ -134,7 +134,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
             // The daemon did not answer in time: a named state, not a dropped request.
             if (!(error instanceof WebError) || error.code !== "daemon_timeout") throw error;
             const now = Date.now();
-            json(res, 200, { state: "timeout", windows: [], fetchedAt: now, updatedAt: null, nextRefreshAt: now, expiresAt: now } satisfies WebUsage);
+            json(res, 200, { state: "timeout", windows: [], fetchedAt: now, updatedAt: null, nextRefreshAt: now, expiresAt: now, serverNow: now } satisfies WebUsage);
           }
           return;
         }

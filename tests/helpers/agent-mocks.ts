@@ -42,8 +42,6 @@ export type MockResponse = string | MockResponseBlock[];
 
 export interface MockQueryController {
   pushTaskNotificationTurn(response: MockResponse, notification?: string): void;
-  /** Push one raw SDK event (e.g. a `system`/`background_tasks_changed`). */
-  pushEvent(event: Record<string, unknown>): void;
 }
 
 /** Mutable per-file mock-SDK state. Tests write these fields directly. */
@@ -85,8 +83,6 @@ export const mockSdk = {
    *  reach the SDK `hooks` the harness installed — see
    *  tests/summon-private-memory-hook.test.ts. */
   optionsBySession: [] as Array<{ sessionKey: string; options: Record<string, unknown> }>,
-  /** Task ids passed to the query's `stopTask`, in order. */
-  stoppedTasks: [] as string[],
 };
 
 export function resetMockSdk(): void {
@@ -102,7 +98,6 @@ export function resetMockSdk(): void {
   mockSdk.mcpServerSets = [];
   mockSdk.promptsBySession = [];
   mockSdk.optionsBySession = [];
-  mockSdk.stoppedTasks = [];
 }
 
 /** Track in-flight mock queries so tests can assert no concurrency */
@@ -215,10 +210,6 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
       });
       enqueueAssistantTurnEvents(eventQueue, responseBlocks(response), wakeConsumer);
     },
-    pushEvent(event) {
-      eventQueue.push(event);
-      wakeConsumer();
-    },
   });
 
   // Background consumer: read from the prompt generator, push events to queue
@@ -297,9 +288,6 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
     close() {
       closed = true;
       wakeConsumer();
-    },
-    async stopTask(taskId: string) {
-      mockSdk.stoppedTasks.push(taskId);
     },
     async getContextUsage() {
       if (mockSdk.contextUsageFails) throw new Error("context usage unavailable");

@@ -464,15 +464,13 @@ describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
         // quietly lose whatever else the model set.
         const result = await hookFor(() => bar)({
           tool_name: "Bash",
-          // (run_in_background: true is refused on a barred turn — see the
-          // "outlives a barred turn" describe — so a foreground field set.)
-          tool_input: { command: "ls", description: "list", timeout: 5000, run_in_background: false },
+          tool_input: { command: "ls", description: "list", timeout: 5000, run_in_background: true },
         });
         expect(result.hookSpecificOutput?.updatedInput).toEqual({
           command: "SANDBOXED:ls",
           description: "list",
           timeout: 5000,
-          run_in_background: false,
+          run_in_background: true,
         });
       });
 
@@ -924,57 +922,32 @@ describe("isPrivateMemoryAccess — `..` after a symlink resolves in kernel orde
 // stdout back. On a barred turn it was the one shell the hook did not see.
 // ---------------------------------------------------------------------------
 
-describe("privateMemoryGuardHooks - no work that outlives a barred turn (P0-3/P0-4)", () => {
+describe("privateMemoryGuardHooks - Monitor, Workflow and schedulers on a barred turn (P0-3)", () => {
   const MONITOR_CAT = { tool_name: "Monitor", tool_input: { command: "cat memory/private/x", description: "d", timeout_ms: 1000 } };
   const MONITOR_WS = { tool_name: "Monitor", tool_input: { ws: { url: "wss://example.com" }, description: "d", timeout_ms: 1000 } };
-  const AGENT_DEFAULT = { tool_name: "Agent", tool_input: { description: "d", prompt: "wait, read memory/private, post it" } };
-  const AGENT_BG = { tool_name: "Agent", tool_input: { description: "d", prompt: "p", run_in_background: true } };
-  const AGENT_FG = { tool_name: "Agent", tool_input: { description: "d", prompt: "p", run_in_background: false } };
-  const AGENT_REMOTE = { tool_name: "Agent", tool_input: { description: "d", prompt: "p", run_in_background: false, isolation: "remote" } };
-  const BASH_BG = { tool_name: "Bash", tool_input: { command: "sleep 60; cat memory/private/x", run_in_background: true } };
-  const BASH_FG = { tool_name: "Bash", tool_input: { command: "ls -la /tmp", run_in_background: false } };
+  const calls = [MONITOR_CAT, MONITOR_WS, { tool_name: "Workflow", tool_input: { script: "x" } },
+    ...["CronCreate", "ScheduleWakeup", "RemoteTrigger"].map((tool_name) => ({ tool_name, tool_input: { prompt: "p" } }))];
 
   for (const bar of ["group-session", "summoned-turn"] as const) {
-    it(`refuses a background subagent on a ${bar} turn — including the SDK's default`, async () => {
-      const hook = hookFor(() => bar);
-      for (const call of [AGENT_DEFAULT, AGENT_BG, AGENT_REMOTE, { ...AGENT_BG, tool_name: "Task" }]) {
-        const result = await hook(call);
-        expect(decision(result), JSON.stringify(call)).toBe("deny");
-        expect(result.hookSpecificOutput?.permissionDecisionReason).toContain("run_in_background: false");
-      }
-    });
-
-    it(`allows a FOREGROUND subagent on a ${bar} turn`, async () => {
-      expect(await hookFor(() => bar)(AGENT_FG)).toEqual({});
-    });
-
-    it(`refuses a background shell, but still sandboxes a foreground one (${bar})`, async () => {
-      const hook = hookFor(() => bar);
-      expect(decision(await hook(BASH_BG))).toBe("deny");
-      expect(rewritten(await hook(BASH_FG))).toBe("SANDBOXED:ls -la /tmp");
-    });
-
     it(`refuses Monitor, Workflow and the schedulers on a ${bar} turn`, async () => {
       const hook = hookFor(() => bar);
-      for (const call of [MONITOR_CAT, MONITOR_WS, { tool_name: "Workflow", tool_input: { script: "x" } },
-        ...["CronCreate", "ScheduleWakeup", "RemoteTrigger"].map((tool_name) => ({ tool_name, tool_input: { prompt: "p" } }))]) {
-        expect(decision(await hook(call)), call.tool_name).toBe("deny");
+      for (const call of calls) {
+        const result = await hook(call);
+        expect(decision(result), call.tool_name).toBe("deny");
+        expect(result.hookSpecificOutput?.permissionDecisionReason, call.tool_name).toContain("schedule_create");
       }
     });
   }
 
-  it("refuses a background shell even for an allowlisted group — the exemption is about the sandbox", async () => {
+  it("refuses Monitor even for an allowlisted group — the exemption is for Bash only", async () => {
     const key = "imessage:any;+;allowlisted-group-test";
     const hook = hookFor(() => "group-session", { sessionKey: key, groupShellAllowlist: () => [key] });
-    expect(decision(await hook(BASH_BG))).toBe("deny");
-    expect(await hook(BASH_FG)).toEqual({});
+    expect(decision(await hook(MONITOR_CAT))).toBe("deny");
   });
 
-  it("leaves all of it alone on the owner's own turn", async () => {
+  it("leaves them alone on the owner's own turn", async () => {
     const hook = hookFor(() => null);
-    for (const call of [AGENT_DEFAULT, AGENT_BG, BASH_BG, MONITOR_CAT, { tool_name: "CronCreate", tool_input: {} }]) {
-      expect(await hook(call), call.tool_name).toEqual({});
-    }
+    for (const call of calls) expect(await hook(call), call.tool_name).toEqual({});
   });
 });
 

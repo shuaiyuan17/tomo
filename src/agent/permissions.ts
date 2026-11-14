@@ -289,53 +289,28 @@ export function privateMemoryBashDenial(bar: PrivateMemoryBar): string {
 export const MONITOR_TOOL = "Monitor";
 
 /**
- * NO WORK THAT OUTLIVES A BARRED TURN (audit P0-4).
+ * Tools refused outright on a barred turn (audit P0-3).
  *
- * The bar is decided per TURN: a group session's turn, or a summoned group's
- * turn on the owner's `dm:` session. Work that keeps running after that turn
- * ends — a background subagent, a background shell, a Monitor, a workflow, or
- * something scheduled to fire later — reaches this hook with no turn
- * registered, and on a `dm:` session "no turn" is the owner's own scope. A
- * summoned group could ask for "a background agent that waits a minute, reads
- * memory/private/ and posts it here", and it did exactly that.
+ * `Monitor` runs `command` in a shell and streams every stdout line back to
+ * the model — a shell the Bash arm below never saw, unsandboxed. `Workflow`
+ * runs a script of subagents. The schedulers (`CronCreate`, `ScheduleWakeup`,
+ * `RemoteTrigger`) fire a fresh SDK-initiated turn later, with no inbound
+ * audience attached, which on a `dm:` session resolves to the owner's scope.
+ * None of them is needed in a group; tomo's own `schedule_create`, which
+ * records the caller's scope, is the way to schedule from one.
  *
- * Attributing such work to the audience that started it was tried and proved
- * an endless source of holes (late reports, unattributable SDK turns, owner
- * tasks entangled with group ones). So a barred turn simply may not START
- * work that outlives it:
- *
- * - `Agent`/`Task` unless `run_in_background: false` (the SDK's default is
- *   BACKGROUND) and not `isolation: "remote"` (always background).
- * - `Bash` with `run_in_background: true`.
- * - `Monitor`, `Workflow`, and the schedulers (`CronCreate`, `ScheduleWakeup`,
- *   `RemoteTrigger`) — outright.
- *
- * A foreground subagent stays available: it runs inside the barred turn,
- * under the same hook and the same bar, and LiveSession stops any task a
- * barred turn leaves running when that turn ends (the backstop for a
- * foreground task that got backgrounded anyway). Groups rarely need background
- * work; that is the accepted cost. tomo's own `schedule_create`, which records
- * the caller's scope, is the way to schedule from a group.
+ * (Background subagents and background shells started by a summoned turn are
+ * a separate, architectural problem — audit P0-4 — tracked in its own PR.)
  *
  * Returns the denial text, or null when the call may proceed.
  */
-export function outlivesTurnDenial(toolName: string, toolInput: unknown, bar: PrivateMemoryBar): string | null {
-  const ti = (toolInput && typeof toolInput === "object" ? toolInput : {}) as Record<string, unknown>;
-  let what: string | null = null;
-  if (toolName === "Agent" || toolName === "Task") {
-    if (ti.run_in_background !== false) what = "A background subagent (run_in_background, the default)";
-    else if (ti.isolation === "remote") what = "A remote subagent (always runs in the background)";
-  } else if (toolName === "Bash") {
-    if (ti.run_in_background === true) what = "A background shell (run_in_background: true)";
-  } else if (OUTLIVES_TURN_TOOLS.has(toolName)) {
-    what = `${toolName}`;
-  }
-  if (what === null) return null;
-  return `${what} is not available on this turn: it would keep running after this turn ends, outside this turn's audience, where the private-memory bar no longer applies. Run the work in the foreground instead (for a subagent, set run_in_background: false; for a shell, omit run_in_background) so it finishes within this turn, or use schedule_create to schedule something.\n\n${privateMemoryDenialReason(bar)}`;
+export function barredToolDenial(toolName: string, bar: PrivateMemoryBar): string | null {
+  if (!BARRED_TURN_TOOLS.has(toolName)) return null;
+  return `${toolName} is not available on this turn: it runs a shell or schedules work outside this turn's private-memory bar. Use Bash (sandboxed) for shell work, or schedule_create to schedule something.\n\n${privateMemoryDenialReason(bar)}`;
 }
 
-/** Tools refused outright on a barred turn — see {@link outlivesTurnDenial}. */
-export const OUTLIVES_TURN_TOOLS: ReadonlySet<string> = new Set([
+/** See {@link barredToolDenial}. */
+export const BARRED_TURN_TOOLS: ReadonlySet<string> = new Set([
   MONITOR_TOOL, "Workflow", "CronCreate", "ScheduleWakeup", "RemoteTrigger",
 ]);
 
@@ -391,13 +366,11 @@ export function privateMemoryGuardHooks(
         // can hit the filesystem. Order does not affect the outcome.
         const reason = bar();
         if (!reason) return {};
-        // Before the Bash arm: the allowlist exemption below is about the
-        // SANDBOX, and a background shell outlives the turn whoever's it is.
-        const outlives = outlivesTurnDenial(input.tool_name, input.tool_input, reason);
+        const outlives = barredToolDenial(input.tool_name, reason);
         if (outlives) {
           log.warn(
             { key: sessionKey, tool: input.tool_name, bar: reason },
-            "Blocked work that would outlive a private-memory-barred turn",
+            "Blocked a tool that is unavailable on a private-memory-barred turn",
           );
           return {
             hookSpecificOutput: {

@@ -42,6 +42,8 @@ export type MockResponse = string | MockResponseBlock[];
 
 export interface MockQueryController {
   pushTaskNotificationTurn(response: MockResponse, notification?: string): void;
+  /** Push one raw SDK event (e.g. a `system`/`background_tasks_changed`). */
+  pushEvent(event: Record<string, unknown>): void;
 }
 
 /** Mutable per-file mock-SDK state. Tests write these fields directly. */
@@ -209,6 +211,10 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
         message: { content: [{ type: "text", text: notification }] },
       });
       enqueueAssistantTurnEvents(eventQueue, responseBlocks(response), wakeConsumer);
+    },
+    pushEvent(event) {
+      eventQueue.push(event);
+      wakeConsumer();
     },
   });
 

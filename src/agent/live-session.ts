@@ -906,6 +906,41 @@ export class LiveSession {
     return this.awaitingTaskReport;
   }
 
+  /** Background work is live, or has drained and its report turn is due. */
+  hasPendingBackgroundWork(): boolean {
+    return this.backgroundTaskIds.size > 0 || this.awaitingTaskReport;
+  }
+
+  /**
+   * Resolves once the session's background work has fully played out: no live
+   * background task, no report turn still due, and no turn in flight (the
+   * report turn itself, or any follow-up it chained) — or once the session
+   * dies. Never rejects.
+   *
+   * NOT CAPPED while tasks are live, unlike `retireWhenIdle`'s wait: the caller
+   * holds a summoned turn's narrower audience open on this, and a cap would
+   * hand a still-running subagent the owner's scope the moment it expired. A
+   * hung task keeps the narrower scope, which is the safe direction. Only the
+   * wait for the REPORT turn is bounded (`reportWaitMs`), since a drained
+   * task's result may instead have been folded into a turn already running,
+   * in which case no SDK-initiated report turn ever comes.
+   */
+  async waitForBackgroundSettled(reportWaitMs: number): Promise<void> {
+    // Chunked: setTimeout clamps anything over 2^31-1 ms to 1 ms.
+    const CHUNK_MS = 60 * 60 * 1000;
+    while (this.alive) {
+      if (this.isBusy()) {
+        await this.waitForIdle();
+      } else if (this.backgroundTaskIds.size > 0) {
+        await this.waitForBackgroundIdle(CHUNK_MS);
+      } else if (this.awaitingTaskReport) {
+        if (!(await this.waitForTurnStart(reportWaitMs)) && !this.isBusy()) return;
+      } else {
+        return;
+      }
+    }
+  }
+
   /**
    * Resolves true once a turn is claimed (or the session dies), false if
    * `timeoutMs` elapses first.

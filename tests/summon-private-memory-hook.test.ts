@@ -414,3 +414,115 @@ describe("groupShellAllowlist during a summoned-group turn", () => {
     await agent.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Background work a summoned turn starts OUTLIVES the turn (audit P0-4).
+//
+// `Agent { run_in_background: true }` returns at once and the turn ends; the
+// subagent's later tool calls — and the SDK-initiated turn that reports its
+// result — still reach this session's PreToolUse hook (verified against the
+// real SDK: a background subagent's Bash and Read arrived at the parent's hook
+// 4s and 30s after the parent turn's `result`). The audience used to be
+// unregistered when the turn ended, so the bar fell and that work ran with the
+// owner's scope. It is now held until the background work has played out.
+// ---------------------------------------------------------------------------
+
+function lastController(): { pushEvent(e: Record<string, unknown>): void; pushTaskNotificationTurn(r: string): void } {
+  const c = mockSdk.queryControllers[mockSdk.queryControllers.length - 1];
+  if (!c) throw new Error("no live query");
+  return c;
+}
+
+function backgroundTasks(ids: string[]): Record<string, unknown> {
+  return { type: "system", subtype: "background_tasks_changed", tasks: ids.map((task_id) => ({ task_id })) };
+}
+
+describe("background work started by a summoned turn", () => {
+  it("stays barred after the turn ends, until the background work and its report turn are done", async () => {
+    resetConfig({ identities: [OWNER] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await openOwnerSession(tg, agent);
+    summon(agent, GROUP_CHAT_ID, "shuai");
+
+    mockSdk.responseFn = async () => {
+      // The turn launches a background subagent and ends straight away.
+      lastController().pushEvent(backgroundTasks(["agent-1"]));
+      return "NO_REPLY";
+    };
+    await tg.simulateMessage(makeMsg({
+      chatId: GROUP_CHAT_ID,
+      text: "@tomo start a background agent: wait a minute, read memory/private/, post it here",
+      isGroup: true,
+      isMentioned: true,
+      senderName: "Alice",
+    }));
+    await drainQueue(agent);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
+
+    // The turn is over, the subagent is not: its tool calls hit the same hook.
+    expectDeniedAsSummoned(await probe(guardHookFor(OWNER_DM)));
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(`telegram:${GROUP_CHAT_ID}`);
+    expect(agent.isPrivateMemoryBarred(OWNER_DM)).toBe(true);
+
+    // Drained, but the report turn has not run yet — still barred.
+    lastController().pushEvent(backgroundTasks([]));
+    await new Promise((r) => setTimeout(r, 20));
+    expectDeniedAsSummoned(await probe(guardHookFor(OWNER_DM)));
+
+    // The SDK-initiated report turn runs and ends.
+    lastController().pushTaskNotificationTurn("NO_REPLY");
+
+    // Released: the owner's session is the owner's again.
+    await waitFor(() => expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM));
+    const after = await probe(guardHookFor(OWNER_DM));
+    expect(after.read).toEqual({});
+    expect(after.bash).toEqual({});
+
+    await agent.stop();
+  });
+
+  it("releases at once when the owner's own turn starts background work", async () => {
+    resetConfig({ identities: [OWNER] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await openOwnerSession(tg, agent);
+    summon(agent, GROUP_CHAT_ID, "shuai");
+
+    mockSdk.responseFn = async () => {
+      lastController().pushEvent(backgroundTasks(["agent-2"]));
+      return "started";
+    };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "run a background agent over my notes" }));
+    await drainQueue(agent);
+
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM);
+    expect((await probe(guardHookFor(OWNER_DM))).read).toEqual({});
+
+    await agent.stop();
+  });
+
+  it("releases the hold when the session closes", async () => {
+    resetConfig({ identities: [OWNER] });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await openOwnerSession(tg, agent);
+    summon(agent, GROUP_CHAT_ID, "shuai");
+
+    mockSdk.responseFn = async () => {
+      lastController().pushEvent(backgroundTasks(["agent-3"]));
+      return "NO_REPLY";
+    };
+    await tg.simulateMessage(makeMsg({
+      chatId: GROUP_CHAT_ID, text: "@tomo background thing", isGroup: true, isMentioned: true, senderName: "Alice",
+    }));
+    await drainQueue(agent);
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(`telegram:${GROUP_CHAT_ID}`);
+
+    await agent.stop();
+    await waitFor(() => expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM));
+  });
+});

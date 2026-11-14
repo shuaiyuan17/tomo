@@ -221,6 +221,18 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.isAlive() ?? false;
   }
 
+  /**
+   * A promise that settles once the session's background work (subagents,
+   * background shells, monitors, and the turn that reports them) has played
+   * out — or null when there is none to wait for. See
+   * LiveSession.waitForBackgroundSettled.
+   */
+  backgroundSettled(key: string): Promise<void> | null {
+    const live = this.liveSessions.get(key);
+    if (!live?.isAlive() || !live.hasPendingBackgroundWork()) return null;
+    return live.waitForBackgroundSettled(PROMPT_RETIRE_REPORT_WAIT_MS);
+  }
+
   /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */
   takeUndeliveredReply(key: string): boolean {
     return this.liveSessions.get(key)?.takeUndeliveredReply() ?? false;

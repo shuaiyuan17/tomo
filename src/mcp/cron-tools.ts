@@ -213,6 +213,7 @@ export function buildCronTools(
         "Returns an array; each entry includes id, name, lifecycle (`once`|`recurring`), enabled, schedule, message, sessionKey, nextRunAt, lastStartedAt, lastRunAt, lastStatus, and staleAfterMs (the catch-up window: a run missed by more is skipped; 0 = always catch up). Times are ISO-8601 in UTC.",
         "",
         "`lastStatus: \"interrupted\"` means a run was dispatched but the daemon restarted before it finished — the work may be partly done. Such a job is left disabled rather than re-fired; use `schedule_enable` to run it again, and only after checking whether the task actually completed.",
+        "`lastStatus: \"empty\"` means the run finished but its turn ended with no reply text (not a deliberate NO_REPLY) — scheduled like ok, worth a look.",
         "",
         "Scoped to this session: only tasks this conversation may manage are listed. If others exist, a trailing line says how many — nothing else about them. A task with an empty `sessionKey` is an orphan that fires into no conversation; it shows up here for the owner's DM so it can be cleaned up rather than staying invisible and still running.",
       ].join("\n"),

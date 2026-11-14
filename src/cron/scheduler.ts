@@ -1,5 +1,5 @@
 import { CronStore, type StaleSkip } from "./store.js";
-import type { CronJob, InterruptedRun } from "./types.js";
+import type { CronJob, CronOutcome, InterruptedRun } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
@@ -22,7 +22,7 @@ const ACK_MAX_ATTEMPTS = 3;
 export const OWNER_REPORT_RETRY_MS = 10 * 60_000;
 
 interface PendingAck {
-  ok: boolean;
+  outcome: CronOutcome;
   runId: string;
   attempts: number;
 }
@@ -335,6 +335,7 @@ export class CronScheduler {
       // and persisted second, by a path that cannot invent an error.
       let ok: boolean;
       let shutdown: "refused" | "interrupted" | undefined;
+      let empty = false;
       try {
         // handleCronMessage never rejects — it reports the turn's outcome so
         // real agent failures land in lastStatus instead of reading as "ok".
@@ -344,6 +345,7 @@ export class CronScheduler {
           waitForHandoff: true,
           jobName: name,
           onShutdown: (kind) => { shutdown = kind; },
+          onEmpty: () => { empty = true; },
         });
       } catch (err) {
         // Unreachable by contract; a broken contract must not read as success.
@@ -383,13 +385,16 @@ export class CronScheduler {
         watchBus.publish({ type: "cron.done", jobId, name, ok: false });
         return;
       }
-      watchBus.publish({ type: "cron.done", jobId, name, ok });
-      if (ok) {
+      const outcome: CronOutcome = !ok ? "error" : empty ? "empty" : "ok";
+      watchBus.publish({ type: "cron.done", jobId, name, ok: outcome === "ok" });
+      if (outcome === "ok") {
         log.info({ jobId, runId }, "Cron completed successfully");
+      } else if (outcome === "empty") {
+        log.warn({ jobId, runId }, "Cron run ended with no reply text; recorded as empty");
       } else {
         log.warn({ jobId, runId }, "Cron run completed with errors");
       }
-      this.ackRun(jobId, ok, runId);
+      this.ackRun(jobId, outcome, runId);
     } catch (err) {
       // Only reachable before the turn was dispatched (markStarted or event
       // formatting). Nothing ran, so nothing is recorded: the job stays due
@@ -405,12 +410,12 @@ export class CronScheduler {
    * retry rather than dropped — an unrecorded outcome leaves the job due,
    * which is how a completed run gets repeated.
    */
-  private ackRun(jobId: string, ok: boolean, runId: string): void {
+  private ackRun(jobId: string, outcome: CronOutcome, runId: string): void {
     try {
-      this.store.markRun(jobId, ok ? "ok" : "error");
+      this.store.markRun(jobId, outcome);
     } catch (err) {
-      log.error({ err, jobId, runId, ok }, "Could not record cron outcome; will retry");
-      this.pendingAcks.set(jobId, { ok, runId, attempts: 1 });
+      log.error({ err, jobId, runId, outcome }, "Could not record cron outcome; will retry");
+      this.pendingAcks.set(jobId, { outcome, runId, attempts: 1 });
     }
   }
 
@@ -419,7 +424,7 @@ export class CronScheduler {
     for (const [jobId, pending] of [...this.pendingAcks]) {
       if (pending.attempts < ACK_MAX_ATTEMPTS) {
         try {
-          this.store.markRun(jobId, pending.ok ? "ok" : "error");
+          this.store.markRun(jobId, pending.outcome);
           this.pendingAcks.delete(jobId);
           log.info({ jobId, runId: pending.runId }, "Recorded cron outcome on retry");
         } catch (err) {
@@ -432,10 +437,10 @@ export class CronScheduler {
       // ran, and a one-shot in particular must not come back through the
       // failure-retry path as though it never fired.
       try {
-        this.store.markUnacked(jobId, pending.ok ? "ok" : "error");
+        this.store.markUnacked(jobId, pending.outcome);
         this.pendingAcks.delete(jobId);
         log.warn(
-          { jobId, runId: pending.runId, ok: pending.ok },
+          { jobId, runId: pending.runId, outcome: pending.outcome },
           "Cron outcome could not be recorded; job disabled as finished-but-unacked",
         );
       } catch (err) {

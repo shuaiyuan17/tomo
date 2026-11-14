@@ -236,6 +236,7 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
 export function cronStatus(job: WebCronJob): { label: string; tone: "ok" | "warn" | "muted" } {
   if (job.interruptedAt) return { label: "Interrupted", tone: "warn" };
   if (job.lastStatus === "error") return { label: "Last run failed", tone: "warn" };
+  if (job.lastStatus === "empty") return { label: "Last run gave no reply", tone: "warn" };
   if (job.lastStatus === "ok") return { label: "Last run ok", tone: "ok" };
   return { label: "Not run yet", tone: "muted" };
 }

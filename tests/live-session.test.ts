@@ -12,6 +12,7 @@ type AnyEvent = Record<string, unknown>;
 
 interface Harness {
   inputs: string[];
+  uuids: Array<string | undefined>;
   priorities: Array<string | undefined>;
   origins: Array<unknown>;
   pushEvent: (e: AnyEvent) => void;
@@ -25,8 +26,9 @@ const mcpRuntime = vi.hoisted(() => ({
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-  query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string; origin?: unknown }> }) => {
+  query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string; origin?: unknown; uuid?: string }> }) => {
     const inputs: string[] = [];
+    const uuids: Array<string | undefined> = [];
     const priorities: Array<string | undefined> = [];
     const origins: Array<unknown> = [];
     const eventQueue: AnyEvent[] = [];
@@ -42,6 +44,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
           if (b.type === "text") text += b.text ?? "";
         }
         inputs.push(text);
+        uuids.push(msg.uuid);
         priorities.push(msg.priority);
         origins.push(msg.origin);
       }
@@ -49,6 +52,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 
     harnessRef.current = {
       inputs,
+      uuids,
       priorities,
       origins,
       pushEvent: (e) => { eventQueue.push(e); wake?.(); },
@@ -93,6 +97,7 @@ const {
   LiveSession,
   MAX_MCP_AUTH_REFRESHES_PER_WINDOW,
   MCP_AUTH_REFRESH_WINDOW_MS,
+  EMPTY_REPLY,
   STEER_MERGED,
   SdkResultError,
 } = await import("../src/agent/live-session.js");
@@ -1410,5 +1415,147 @@ describe("LiveSession message origin", () => {
     expect(harness.origins[2]).toBeUndefined();
     harness.pushEvent(resultEvent());
     await p3;
+  });
+});
+
+describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)", () => {
+  // What the real CLI emits on resume for a background task the previous
+  // process left running (reproduced against the CLI): a stopped
+  // task_notification, then a result of its own that ran nothing.
+  const staleNotification = { type: "system", subtype: "task_notification", task_id: "b1", status: "stopped", output_file: "/tmp/x", summary: "previous session ended" };
+  const staleResult = { ...resultEvent(), num_turns: 0, result: "", usage: { input_tokens: 0, output_tokens: 0 }, origin: { kind: "task-notification" } };
+  const answering = (...uuids: Array<string | undefined>) => ({ ...resultEvent(), user_message_uuids: uuids, user_message_uuid: uuids.at(-1) });
+
+  it("stamps a client uuid on every message it sends", async () => {
+    const { session, harness } = makeSession();
+    void session.send("one").catch(() => {});
+    await flushMicrotasks();
+    void session.steer("two").catch(() => {});
+    await flushMicrotasks();
+    expect(harness.uuids).toHaveLength(2);
+    expect(new Set(harness.uuids).size).toBe(2);
+    for (const id of harness.uuids) expect(id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it("the resume-time task-notification result does not end the web request; a nudge from another channel gets its own turn and none of the reply", async () => {
+    const { session, harness } = makeSession();
+    const web: string[] = [];
+    const nudge: string[] = [];
+    const p1 = session.send("好啊 现在看起来非常好了！", undefined, undefined, (b) => { web.push(b); });
+    await flushMicrotasks();
+    harness.pushEvent(staleNotification);
+    harness.pushEvent(staleResult);
+    await flushMicrotasks(20);
+    expect(session.isBusy()).toBe(true);
+
+    // The context nudge arrives now. Before the fix the session looked idle
+    // here, the nudge took the turn, and the real reply resolved IT (output
+    // suppressed) while the web got the fallback line.
+    const p2 = session.send("<tomo-event type=\"context-nudge\">", undefined, undefined, (b) => { nudge.push(b); });
+    await flushMicrotasks(20);
+    expect(harness.inputs).toHaveLength(1);
+
+    harness.pushEvent(assistantEvent("太好了 😁"));
+    harness.pushEvent(answering(harness.uuids[0]));
+    await expect(p1).resolves.toBe("太好了 😁");
+    expect(web).toEqual(["太好了 😁"]);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.objectContaining({ why: "task-notification turn" }), expect.any(String));
+
+    await flushMicrotasks(20);
+    expect(harness.inputs).toHaveLength(2);
+    harness.pushEvent(assistantEvent("NO_REPLY"));
+    harness.pushEvent(answering(harness.uuids[1]));
+    await expect(p2).resolves.toBe("NO_REPLY");
+    expect(nudge).not.toContain("太好了 😁");
+  });
+
+  it("backstop: an unstamped success that ran nothing and said nothing is nobody's answer", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello");
+    await flushMicrotasks();
+    harness.pushEvent({ ...resultEvent(), num_turns: 0, result: "" });
+    await flushMicrotasks(20);
+    expect(session.isBusy()).toBe(true);
+    harness.pushEvent(assistantEvent("hi"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("hi");
+  });
+
+  it("a stamped result naming a different request is reported (error, both uuids) but still ends the current request", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello");
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("reply"));
+    const other = "00000000-0000-4000-8000-000000000000";
+    harness.pushEvent(answering(other));
+    await expect(p1).resolves.toBe("reply");
+    expect(vi.mocked(log.error)).toHaveBeenCalledWith(
+      expect.objectContaining({ current: harness.uuids[0], resultUuids: [other] }),
+      expect.stringContaining("out of step"),
+    );
+  });
+
+  it("a stamped result naming the current request raises no alarm", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("reply"));
+    harness.pushEvent(answering(harness.uuids[0]));
+    await expect(p1).resolves.toBe("reply");
+    expect(vi.mocked(log.error)).not.toHaveBeenCalled();
+  });
+
+  it("a turn whose text came only in the result ships it as a block and resolves with it", async () => {
+    const { session, harness } = makeSession();
+    const shipped: string[] = [];
+    const p1 = session.send("hello", undefined, undefined, (b) => { shipped.push(b); });
+    await flushMicrotasks();
+    harness.pushEvent(assistantToolEvent("Bash", "t1"));
+    harness.pushEvent(toolResultEvent("t1"));
+    harness.pushEvent({ ...answering(harness.uuids[0]), result: "done, all green" });
+    await expect(p1).resolves.toBe("done, all green");
+    expect(shipped).toEqual(["done, all green"]);
+  });
+
+  it("result-only text goes through the same render: a scaffold leak in it is filtered", async () => {
+    const { session, harness } = makeSession();
+    const shipped: string[] = [];
+    const p1 = session.send("hello", undefined, undefined, (b) => { shipped.push(b); });
+    await flushMicrotasks();
+    harness.pushEvent(assistantToolEvent("Bash", "t1"));
+    harness.pushEvent({ ...answering(harness.uuids[0]), result: "leaked\n_end_of_dialog_\nUser: hi" });
+    await expect(p1).resolves.toBe("leaked");
+    expect(shipped).toEqual(["leaked"]);
+    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => msg === "model scaffold leak filtered")).toBe(true);
+  });
+
+  it("result text is not used when the turn's frames already carried text", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("the reply"));
+    harness.pushEvent({ ...answering(harness.uuids[0]), result: "the reply" });
+    await expect(p1).resolves.toBe("the reply");
+  });
+
+  it("a turn with no text anywhere resolves EMPTY_REPLY (silent, not a success) and warns", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello");
+    await flushMicrotasks();
+    harness.pushEvent(assistantToolEvent("Bash", "t1"));
+    harness.pushEvent(toolResultEvent("t1"));
+    harness.pushEvent(answering(harness.uuids[0]));
+    await expect(p1).resolves.toBe(EMPTY_REPLY);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as an empty reply");
+  });
+
+  it("a literal NO_REPLY from the model is an ordinary silent reply, not an empty one", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("NO_REPLY"));
+    harness.pushEvent(answering(harness.uuids[0]));
+    await expect(p1).resolves.toBe("NO_REPLY");
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as an empty reply");
   });
 });

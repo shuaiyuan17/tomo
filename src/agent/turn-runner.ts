@@ -6,7 +6,7 @@ import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
-import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
+import { EMPTY_REPLY, STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
 import { endsWithTrailingNoReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
@@ -298,6 +298,12 @@ export interface TurnSpec {
    * The cron scheduler uses it to avoid recording either as a finished run.
    */
   onShutdown?: (kind: ShutdownTurnEnd) => void;
+  /**
+   * The turn ended with no reply text anywhere, and not by the model's choice
+   * (EMPTY_REPLY). Nothing was delivered; the turn still returns true, so a
+   * caller that records outcomes (cron) uses this to record "empty", not "ok".
+   */
+  onEmpty?: () => void;
 }
 
 /**
@@ -535,10 +541,17 @@ export class TurnRunner {
       return true;
     }
 
+    // AN EMPTY REPLY IS SILENT BUT NOT A SUCCESS. The turn ended with no text
+    // anywhere and the model did not choose NO_REPLY; from here on it is
+    // handled as a NO_REPLY (nothing delivered, NO_REPLY in the transcript),
+    // and the caller is told it was empty so cron does not record "ok".
+    const empty = rawResponse === EMPTY_REPLY;
+    if (empty) spec.onEmpty?.();
+
     // The scaffold-leak filter already ran PER BLOCK in renderBlock, as each
     // block shipped — running it here over the joined response would cut every
     // later block at the first leaked marker.
-    const response = rawResponse;
+    const response = empty ? "NO_REPLY" : rawResponse;
     // One response log per turn, whatever the ingress and whether or not the
     // response ships (silent and suppressed turns still get a line). The
     // channel label comes from the delivery spec, never from resolveTarget —

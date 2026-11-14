@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
-import type { CronJob, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
+import type { CronJob, CronOutcome, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { withFileLockSync } from "../file-lock.js";
@@ -502,7 +502,7 @@ export class CronStore {
    * as if it had never fired, and a recurring job whose store is unwritable
    * cannot keep its cadence honestly anyway.
    */
-  markUnacked(id: string, status: "ok" | "error"): void {
+  markUnacked(id: string, status: CronOutcome): void {
     this.load();
     const job = this.get(id);
     if (!job) return;
@@ -557,7 +557,7 @@ export class CronStore {
     return { parked, recurring };
   }
 
-  markRun(id: string, status: "ok" | "error"): void {
+  markRun(id: string, status: CronOutcome): void {
     // Reload before mutating: jobs are added/removed by separate CLI
     // processes (tomo cron add) while the daemon's run is in flight; saving
     // the stale poll-time snapshot would silently delete them.
@@ -573,9 +573,9 @@ export class CronStore {
     job.lastCompletedRunId = job.lastRunId ?? null;
     // A run that got all the way to an outcome clears the crash-loop budget:
     // the cap exists for jobs that keep taking the daemon down mid-turn.
-    if (status === "ok") delete job.resumeAttempts;
+    if (status !== "error") delete job.resumeAttempts;
 
-    if (status === "ok" && job.deleteAfterRun) {
+    if (status !== "error" && job.deleteAfterRun) {
       this.remove(id);
       return;
     }

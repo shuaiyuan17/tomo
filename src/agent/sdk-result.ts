@@ -7,10 +7,17 @@ import type { UsageBaseline } from "../sessions/types.js";
  * turn: that turn's owner request receives (and delivers) the combined
  * response, so the steered caller gets this empty marker instead. The empty
  * string is safe as a sentinel only because send()/steer() can never
- * legitimately resolve with "" — empty turns fall back to "I'm not sure how
- * to respond to that." in the result handler.
+ * legitimately resolve with "" — a turn with no text resolves EMPTY_REPLY.
  */
 export const STEER_MERGED = "";
+/**
+ * Resolution of a turn that ended with no reply text anywhere (no text block,
+ * no result text) and that the model did not answer with a literal NO_REPLY.
+ * Silent to the channel like NO_REPLY, but NOT a successful outcome: the
+ * runner reports it (TurnSpec.onEmpty) so cron records "empty", not "ok".
+ * Never delivered or recorded as text: the runner swaps it for NO_REPLY.
+ */
+export const EMPTY_REPLY = "[empty reply]";
 export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
 
 /** Fabricated reply for a turn the CLI cut short at the max-turns limit. */
@@ -34,6 +41,15 @@ export interface SdkResultLike {
   /** `success` subtype: the final assistant text — or, with `is_error`, the API error text. */
   result?: string;
   num_turns?: number;
+  /**
+   * Client uuids of the user messages this result's turn consumed (the
+   * `uuid` stamped on each pushed SDKUserMessage). Absent on turns the CLI
+   * started itself and from older CLIs; `user_message_uuid` is the last one.
+   */
+  user_message_uuid?: string;
+  user_message_uuids?: string[];
+  /** Set when the CLI started the turn itself, e.g. `{ kind: "task-notification" }`. */
+  origin?: { kind?: string };
   duration_ms?: number;
   total_cost_usd?: number;
   usage?: Record<string, unknown>;

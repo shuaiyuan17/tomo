@@ -7,6 +7,7 @@ import {
   type SDKMessage,
   type SDKMessageOrigin,
 } from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "node:crypto";
 import { log } from "../logger.js";
 import { McpLiveStatus, type McpConnection } from "../mcp/live-status.js";
 import { shortErrorMessage } from "../error-text.js";
@@ -22,6 +23,7 @@ import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
 import {
   STEER_MERGED,
+  EMPTY_REPLY,
   SteerDeclinedError,
   cumulativeModelTokens,
   describeResultFailure,
@@ -45,6 +47,7 @@ export {
   MAX_TURNS_RESPONSE,
   QUERY_TIMEOUT_ERROR_PREFIX,
   STEER_MERGED,
+  EMPTY_REPLY,
   SdkResultError,
   SteerDeclinedError,
   TurnInterruptedError,
@@ -202,6 +205,8 @@ export class LiveSession {
   // The request that owns the in-flight turn: its callbacks receive the
   // turn's collected blocks and it resolves with the turn's full response.
   private currentRequest: TurnRequest | null = null;
+  /** Whether the turn now in flight has produced any top-level assistant frame. */
+  private turnSawAssistant = false;
   // Steered requests confirmed merged into the in-flight turn (we saw the CLI
   // echo their message back mid-turn). Resolved with STEER_MERGED at result.
   private mergedRequests: MessageRequest[] = [];
@@ -359,6 +364,11 @@ export class LiveSession {
   }
 
   private pushInput(msg: SDKUserMessage): void {
+    // A client uuid on every send: the CLI stamps it back on the assistant
+    // frames and the result of the turn that consumed it
+    // (`user_message_uuids`), which is how attributeResult tells this
+    // request's result from one the CLI produced for something else.
+    msg.uuid ??= randomUUID();
     this.inputQueue.push(msg);
     this.inputWaiter?.();
   }
@@ -585,6 +595,58 @@ export class LiveSession {
    * itself depends on the block's content — `shipBlock` decides delivery, as
    * it does for every other block.
    */
+  /**
+   * WHOSE RESULT IS THIS. Results are matched to requests by position, so one
+   * extra result shifts every later reply onto the next request: on
+   * 2026-11-14 a web message got "I'm not sure how to respond to that." and
+   * its real reply went to a context nudge that arrived next, whose output is
+   * suppressed, so the reply reached nobody.
+   *
+   * The extra result came from the CLI itself. On resume it re-delivers the
+   * notification of a background task the previous process left running
+   * (`task_notification`, status "stopped") and closes it with a result of
+   * its own: success, `num_turns: 0`, empty text, no `user_message_uuids`,
+   * `origin: { kind: "task-notification" }` (reproduced against the real CLI).
+   *
+   * Ignored ("foreign": the caller drops it and the current turn goes on):
+   * 1. a result the CLI started for a task notification, when the current
+   *    request is one we sent (has a client uuid);
+   * 2. backstop for anything unstamped: a success with zero turns, no text
+   *    and no assistant frame this turn is nobody's answer.
+   *
+   * A stamped result that does not name the current request (nor one merged
+   * into it) is only REPORTED: it still ends the current request as before.
+   * Re-aligning on it would need delivery itself to be owned by uuid (blocks
+   * ship before the result arrives), which is a larger change.
+   */
+  private attributeResult(result: SdkResultLike): "ours" | "foreign" {
+    const current = this.currentRequest;
+    const mine = (current as Partial<MessageRequest> | null)?.message?.uuid;
+    if (!current || !mine) return "ours"; // idle, or a turn the CLI started (claimed unowned)
+    const ignore = (why: string): "foreign" => {
+      log.warn(
+        { session: this.sessionKey, why, turns: result.num_turns, origin: result.origin?.kind, uuids: result.user_message_uuids },
+        "SDK result does not belong to the current request; ignoring it",
+      );
+      return "foreign";
+    };
+    if (result.origin?.kind === "task-notification") return ignore("task-notification turn");
+
+    const stamped = result.user_message_uuids ?? (result.user_message_uuid ? [result.user_message_uuid] : []);
+    if (stamped.length === 0) {
+      const empty = result.subtype === "success" && !result.is_error && result.num_turns === 0 && !result.result;
+      return empty && !this.turnSawAssistant ? ignore("empty zero-turn result") : "ours";
+    }
+    const merged = this.mergedRequests.map((m): string | undefined => (m as Partial<MessageRequest>).message?.uuid).filter((id): id is string => !!id);
+    if (!stamped.includes(mine) && !merged.some((id) => stamped.includes(id))) {
+      log.error(
+        { session: this.sessionKey, current: mine, merged, resultUuids: stamped },
+        "SDK result names a different request than the current one; results may be out of step (ending the current request anyway)",
+      );
+    }
+    return "ours";
+  }
+
   private claimFirstUnownedEvent(content: unknown[]): void {
     let reason = "assistant_event";
     let openedWithHiddenThinking = false;
@@ -658,7 +720,7 @@ export class LiveSession {
       // of these warns is the signal that the model is still composing
       // replies in thinking blocks. Remembered for the end of the turn: a
       // turn whose only content was a dropped thinking block must resolve
-      // silent, not to the "I'm not sure" fallback the runner would deliver.
+      // silent, without the "no reply text" warn an empty turn gets.
       const chars = block.text.trim().length;
       if (chars > 0) {
         this.droppedThinkingThisTurn = true;
@@ -805,6 +867,7 @@ export class LiveSession {
     // while the turn is still running", which is exactly what awaiting here
     // delivers.
     if (event.type === "assistant" && event.message?.content) {
+      this.turnSawAssistant = true;
       // CLAIM ON THE FIRST EVENT OF THE TURN, WHATEVER IT CARRIES.
       //
       // An assistant event with no owner is an SDK-initiated (autonomous /
@@ -880,6 +943,8 @@ export class LiveSession {
 
     if (event.type === "result") {
       const result = event as unknown as SdkResultLike;
+      if (this.attributeResult(result) === "foreign") return;
+      this.turnSawAssistant = false;
       this.publishTasks(this.taskTracker.endTurn());
 
       if (result.session_id) {
@@ -927,6 +992,19 @@ export class LiveSession {
       // The turn is over. Its blocks have ALREADY shipped, one by one, as they
       // completed; what is assembled here is only the response string — the
       // transcript, the log line, and the value send()/steer() resolve with.
+      // TEXT ONLY IN THE RESULT. When no assistant frame carried text but the
+      // result has some (it is the turn's final text), it becomes the turn's
+      // closing text block and goes through the same path as any other:
+      // rendered (scaffold filter, fabricated-marker advisory), shipped to the
+      // sink, and joined into the response below. Never when frames did carry
+      // text: the result repeats it.
+      if (!failure && !this.parts.some((part) => part.type === "text")) {
+        const finalText = result.result?.trim();
+        if (finalText) {
+          this.parts.push({ type: "text", text: finalText });
+          await this.shipBlock({ type: "text", text: finalText });
+        }
+      }
       const rendered = renderResponseBlocks(this.parts, this.showThinking);
       if (rendered.scaffoldFiltered) {
         log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
@@ -934,8 +1012,20 @@ export class LiveSession {
       // A turn whose only content was a dropped thinking block resolves as a
       // bare NO_REPLY — silent to the channel, honest in the transcript —
       // rather than the generic fallback, which the runner WOULD deliver.
-      const response = rendered.text
-        || (this.droppedThinkingThisTurn ? "NO_REPLY" : "I'm not sure how to respond to that.");
+      // A turn that ended with NO text at all used to resolve as "I'm not
+      // sure how to respond to that.", which the runner delivered. Every time
+      // that line reached a channel it was a symptom (a result that belonged
+      // to another turn, 2026-11-14), never an answer. Now it resolves
+      // EMPTY_REPLY: silent to the channel, reported as not-a-success.
+      // A turn the model ended on purpose (literal NO_REPLY, or a dropped
+      // thinking block) stays an ordinary silent NO_REPLY.
+      if (!rendered.text && !failure && !this.droppedThinkingThisTurn) {
+        log.warn(
+          { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
+          "Turn ended with no reply text; resolving as an empty reply",
+        );
+      }
+      const response = rendered.text || (this.droppedThinkingThisTurn ? "NO_REPLY" : EMPTY_REPLY);
       this.droppedThinkingThisTurn = false;
       this.parts = [];
       this.unownedTurnDropLogged = false;
@@ -1329,6 +1419,7 @@ export class LiveSession {
           this.currentRequest = req;
           this.onTurnClaimed();
           this.parts = [];
+          this.turnSawAssistant = false;
           this.refreshActivityTimeout();
           this.pushInput(req.message);
           return;

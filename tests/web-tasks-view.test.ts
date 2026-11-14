@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTaskView, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind } from "../web/src/tasks.js";
+import { buildTaskView, runningCount, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind } from "../web/src/tasks.js";
 import type { WebSession, WebTask } from "../src/web/protocol.js";
 
 const session = (id: string, title: string, kind: "dm" | "group"): WebSession =>
@@ -61,5 +61,9 @@ describe("task panel view", () => {
     const old = [task("a"), task("b", { sessionId: "g1" })];
     expect(replaceSessionTasks(old, "dm", [task("c")]).map((t) => t.taskId)).toEqual(["b", "c"]);
     expect(replaceSessionTasks(old, "g1", []).map((t) => t.taskId)).toEqual(["a"]);
+  });
+
+  it("the topbar count includes running, non-ambient tasks only", () => {
+    expect(runningCount([task("a"), task("b", { ambient: true }), task("c", { state: "completed", endedAt: 1 }), task("d", { sessionId: "g1" })])).toBe(2);
   });
 });

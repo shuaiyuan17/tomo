@@ -5,14 +5,15 @@ import { WatchBus } from "../src/watch/bus.js";
 import { WebEvents } from "../src/web/events.js";
 import { parseWebConfig } from "../src/web/config.js";
 import { webSessionId } from "../src/web/owner.js";
+import { MAX_BOARD_TASKS, MAX_SNAPSHOT_TASK_BYTES } from "../src/web/tasks.js";
 import type { OwnerConfig } from "../src/owner.js";
 import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
 
 const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
 const channels: WebChannel[] = [];
-function setup(configured: OwnerConfig | null = owner) {
+function setup(configured: OwnerConfig | null = owner, ownerKey?: () => string | undefined) {
   const bus = new WatchBus();
-  const channel = new WebChannel(configured ?? undefined, bus);
+  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey });
   channels.push(channel);
   const handler = vi.fn(async () => true);
   channel.onMessage(handler);
@@ -110,7 +111,7 @@ describe("WebChannel", () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();
     await channel.receive({ requestId, text: "large reply" });
-    for (let bytes = 0; bytes < MAX_BUFFER_BYTES - 128 * 1024; bytes += 128 * 1024) await channel.send({ chatId: requestId, text: "x".repeat(128 * 1024) });
+    for (let bytes = 0; bytes < MAX_BUFFER_BYTES - 192 * 1024 - MAX_SNAPSHOT_TASK_BYTES; bytes += 128 * 1024) await channel.send({ chatId: requestId, text: "x".repeat(128 * 1024) });
     await expect(channel.send({ chatId: requestId, text: "x".repeat(128 * 1024) })).rejects.toThrow("mailbox");
     bus.publish({ type: "turn.end", sessionKey: "dm:owner", source: "user", ok: true, durationMs: 1, requestId });
     expect(channel.request(requestId).state).toBe("failed");
@@ -152,6 +153,47 @@ describe("web task panel feed", () => {
     bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a", status: "completed" }] });
     expect(channel.snapshot().tasks.find((t) => t.taskId === "a")!.state).toBe("completed");
   });
+  it("uses the catalog's owner-key rule: a hidden legacy DM never reaches the panel", () => {
+    // Canonical key exists: a legacy telegram DM bound to the owner is hidden by the catalog, so its tasks are too.
+    const canonical = setup(owner, () => "dm:owner");
+    canonical.bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("legacy", "legacy secret")] });
+    canonical.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a")] });
+    expect(canonical.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["a"]);
+    expect(JSON.stringify(canonical.events)).not.toContain("legacy secret");
+    // Several legacy keys match: the catalog shows no owner session, so no DM tasks at all.
+    const ambiguous = setup(owner, () => undefined);
+    ambiguous.bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("x", "ambiguous secret")] });
+    ambiguous.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("y", "ambiguous secret")] });
+    expect(ambiguous.channel.snapshot().tasks).toEqual([]);
+    expect(JSON.stringify(ambiguous.events)).not.toContain("ambiguous secret");
+    // The single legacy key the catalog does show is used; when the rule moves on, its tasks leave the snapshot.
+    let current: string | undefined = "telegram:test-owner";
+    const single = setup(owner, () => current);
+    single.bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l")] });
+    expect(single.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["l"]);
+    current = "dm:owner";
+    expect(single.channel.snapshot().tasks).toEqual([]);
+    single.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("c")] });
+    expect(single.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["c"]);
+  });
+  it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
+    const { channel, bus } = setup();
+    const requestId = randomUUID();
+    await channel.receive({ requestId, text: "large reply" });
+    await expect((async () => { for (;;) await channel.send({ chatId: requestId, text: "x".repeat(64 * 1024) }); })()).rejects.toThrow("mailbox");
+    // Worst case text: long, escaped (lone surrogates), across many groups.
+    const nasty = "\ud800".repeat(500);
+    for (let g = 0; g < 10; g++) {
+      bus.publish({ type: "tasks", sessionKey: `telegram:-${g + 1}`, tasks: Array.from({ length: 30 }, (_, i) => ({
+        ...live(`t${g}-${i}`, nasty), taskType: nasty, subagentType: nasty, lastTool: nasty, summary: nasty, parentTaskId: `t${g}-0` })) });
+    }
+    const snapshot = channel.snapshot();
+    expect(snapshot.tasks).toHaveLength(MAX_BOARD_TASKS);
+    expect(snapshot.tasks.every((t) => t.summary === undefined)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(snapshot.tasks))).toBeLessThanOrEqual(MAX_SNAPSHOT_TASK_BYTES);
+    // The frame the supervisor sends (with replay) still fits the IPC limit.
+    expect(Buffer.byteLength(JSON.stringify({ snapshot, replay: null }))).toBeLessThan(MAX_BUFFER_BYTES - 1024);
+  });
 });
 
 it("replays bounded events and reports gaps or another epoch", () => {
@@ -165,4 +207,14 @@ it("replays bounded events and reports gaps or another epoch", () => {
   expect(events.after(cursor)).toBeNull();
   expect(events.after("previous-epoch:1")).toBeNull();
   expect(events.after(events.cursor())).toEqual([]);
+});
+
+it("selectOwnerSessionKey: canonical first, then a single legacy key, none when ambiguous", async () => {
+  const { selectOwnerSessionKey } = await import("../src/web/data.js");
+  const two: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: ["owner@example.com"] };
+  expect(selectOwnerSessionKey(undefined, ["dm:owner"])).toBeUndefined();
+  expect(selectOwnerSessionKey(two, ["dm:owner", "telegram:test-owner"])).toBe("dm:owner");
+  expect(selectOwnerSessionKey(two, ["telegram:test-owner", "telegram:-5"])).toBe("telegram:test-owner");
+  expect(selectOwnerSessionKey(two, ["telegram:test-owner", "imessage:owner@example.com"])).toBeUndefined();
+  expect(selectOwnerSessionKey(two, [])).toBe("dm:owner");
 });

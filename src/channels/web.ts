@@ -8,6 +8,7 @@ import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
+import { selectOwnerSessionKey } from "../web/data.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
@@ -32,7 +33,16 @@ export class WebChannel implements Channel {
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
-  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus, now: () => number = Date.now) {
+  /** The DM key the web catalog shows as the owner conversation (data.ts rule). */
+  private readonly ownerKey: () => string | undefined;
+  /** The DM key whose tasks currently fill the owner's board entry. */
+  private ownerTaskKey: string | undefined;
+
+  constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus,
+    options: { now?: () => number; ownerKey?: () => string | undefined } = {}) {
+    const now = options.now ?? Date.now;
+    // Without registry access the catalog would pick the canonical key.
+    this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
     this.tasks = new TaskBoard((sessionId, tasks) => {
       try { this.events.publish({ type: "tasks", sessionId, tasks }); } catch { /* An oversized panel update never fails the Agent. */ }
     }, { now });
@@ -93,10 +103,7 @@ export class WebChannel implements Channel {
   snapshot() {
     const requests = [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request }));
     const blocks = [...this.blocks];
-    // The snapshot is one IPC frame: the task panel gets what reply blocks
-    // and receipts leave, so it can never push the frame over the limit.
-    const used = Buffer.byteLength(JSON.stringify({ requests, blocks }));
-    const tasks = this.tasks.snapshot(Math.min(MAX_SNAPSHOT_TASK_BYTES, MAX_BUFFER_BYTES - 32 * 1024 - used));
+    const tasks = this.tasks.snapshot((sessionId) => sessionId !== this.ownerId || this.ownerTaskKey === this.ownerKey());
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
   }
 
@@ -111,7 +118,9 @@ export class WebChannel implements Channel {
       throw markDefiniteFailure(new Error("Web attachments are not supported"));
     }
     const bytes = Buffer.byteLength(message.text);
-    if (this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024) {
+    // The rest of the snapshot frame is reserved for receipts and the task
+    // panel, whose worst case is fixed, so the snapshot never truncates it.
+    if (this.blockBytes + bytes > MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES) {
       this.state(requestId, "failed");
       throw markDefiniteFailure(new Error("Web mailbox full"));
     }
@@ -153,6 +162,19 @@ export class WebChannel implements Channel {
     if (key === ownerSessionKey(owner) || OWNER_CHANNELS.some((ch) =>
       ownerBindings(owner, ch).some((id) => legacySessionKeysForBinding([key], ch, id).length > 0))) return this.ownerId;
   }
+  /**
+   * Task text reaches the browser only for sessions its catalog shows: any
+   * group, and for DMs exactly the key `selectOwnerSessionKey` picks — not
+   * every legacy key bound to the owner, which the catalog may be hiding.
+   */
+  private observeTasks(key: string, sessionId: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
+    if (!isGroupSessionKey(key)) {
+      const ownerKey = this.ownerKey();
+      if (!ownerKey || key !== ownerKey) return;
+      if (this.ownerTaskKey !== key) { this.tasks.clear(sessionId); this.ownerTaskKey = key; }
+    }
+    this.tasks.apply(sessionId, event.tasks, event.ended);
+  }
   private observe(event: WatchEvent): void {
     if (!("sessionKey" in event) || !event.sessionKey) return;
     const sessionId = this.sessionId(event.sessionKey);
@@ -169,9 +191,7 @@ export class WebChannel implements Channel {
     } else if (event.type === "transcript" || event.type === "turn.stats") {
       this.events.publish({ type: "invalidate", sessionId });
     } else if (event.type === "tasks") {
-      // Same visibility as tool activity: only the owner's DM and groups
-      // (both already readable in the browser) ever reach the board.
-      this.tasks.apply(sessionId, event.tasks, event.ended);
+      this.observeTasks(event.sessionKey, sessionId, event);
     } else if (event.type === "tool.start" || event.type === "tool.end") {
       this.events.publish({ type: "tool", sessionId, tool: event.tool.slice(0, 128),
         state: event.type === "tool.start" ? "started" : event.ok ? "completed" : "failed" });

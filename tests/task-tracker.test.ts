@@ -46,6 +46,17 @@ describe("TaskTracker — background_tasks_changed (REPLACE)", () => {
     expect(t.list()[0]).toMatchObject({ runId: "r3", startedAt: 2_000 });
   });
 
+  it("a level entry naming an older run does not move the run id back", () => {
+    const { t } = tracker();
+    t.apply(level({ task_id: "a", run_id: "r2", task_type: "local_agent", description: "x" }));
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "stale" }));
+    expect(t.list()[0]).toMatchObject({ runId: "r2", description: "x" });
+    // So r1's progress and end report are still recognised as late.
+    expect(t.apply({ subtype: "task_progress", task_id: "a", run_id: "r1", description: "x", last_tool_name: "Old" })).toBeUndefined();
+    expect(t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "failed" })).toBeUndefined();
+    expect(t.list()[0].status).toBeUndefined();
+  });
+
   it("clips text and bounds the number of tracked tasks", () => {
     const { t } = tracker();
     t.apply(level({ task_id: "a", task_type: "local_agent", description: "y".repeat(5_000) }));

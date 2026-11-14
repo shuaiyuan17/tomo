@@ -12,6 +12,39 @@ export interface WebDataOptions {
   owner?: OwnerConfig;
 }
 
+/**
+ * Which session key the browser shows as the owner conversation: the
+ * canonical `dm:<owner>` key when it exists; otherwise a single legacy
+ * per-channel DM key bound to the owner; none when several legacy keys match
+ * (ambiguous). Everything that exposes owner-session data to the browser —
+ * the catalog here and the task panel in channels/web.ts — must use this one
+ * rule, or a session the catalog hides could leak through another path.
+ */
+export function selectOwnerSessionKey(owner: OwnerConfig | undefined, keys: readonly string[]): string | undefined {
+  if (!owner) return undefined;
+  const canonical = ownerSessionKey(owner);
+  if (keys.includes(canonical)) return canonical;
+  const legacy = [...new Set(OWNER_CHANNELS.flatMap((channel) =>
+    ownerBindings(owner, channel).flatMap((bound) => legacySessionKeysForBinding(keys, channel, bound))))];
+  if (legacy.length > 1) return undefined;
+  return legacy[0] ?? canonical;
+}
+
+/** Reads the owner key from the session registry, cached briefly; fails closed. */
+export function ownerSessionKeyReader(options: WebDataOptions, ttlMs = 2_000, now: () => number = Date.now): () => string | undefined {
+  let cached: { at: number; key: string | undefined } | undefined;
+  return () => {
+    if (cached && now() - cached.at < ttlMs) return cached.key;
+    let key: string | undefined;
+    try {
+      key = selectOwnerSessionKey(options.owner,
+        SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey));
+    } catch { key = undefined; }
+    cached = { at: now(), key };
+    return key;
+  };
+}
+
 /** Runs in the web process. Never imports the live Agent or starts services. */
 export class WebData {
   constructor(private readonly options: WebDataOptions) {}
@@ -20,14 +53,7 @@ export class WebData {
     const entries = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir);
     const owner = this.options.owner;
     const stableOwnerId = owner ? webSessionId(ownerSessionKey(owner)) : null;
-    let ownerKey = owner ? ownerSessionKey(owner) : undefined;
-    if (owner && !entries.some((e) => e.channelKey === ownerKey)) {
-      const keys = entries.map((e) => e.channelKey);
-      const legacy = [...new Set(OWNER_CHANNELS.flatMap((channel) =>
-        ownerBindings(owner, channel).flatMap((bound) => legacySessionKeysForBinding(keys, channel, bound))))];
-      if (legacy.length === 1) ownerKey = legacy[0];
-      if (legacy.length > 1) ownerKey = undefined;
-    }
+    const ownerKey = selectOwnerSessionKey(owner, entries.map((e) => e.channelKey));
     const keys = new Map<string, string>();
     const sessions: WebCatalog["sessions"] = [];
     for (const entry of entries) {

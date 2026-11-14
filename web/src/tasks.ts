@@ -92,3 +92,8 @@ function tree(list: WebTask[]): TaskRow[] {
   for (const task of list) visit(task, 0);
   return rows;
 }
+
+/** The topbar badge: running tasks that count as activity (not watchers). */
+export function runningCount(tasks: WebTask[]): number {
+  return tasks.filter((task) => task.state === "running" && !task.ambient).length;
+}

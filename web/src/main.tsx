@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
 import { TasksPanel } from "./tasks-panel.js";
+import { runningCount } from "./tasks.js";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 
@@ -12,6 +13,12 @@ const labels: Record<WebRequest["state"], string> = { queued: "Queued", running:
   failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted", unknown: "Outcome unknown — check the conversation before sending again" };
 type Theme = "system" | "light" | "dark";
 
+function storedTasksOpen(): boolean {
+  try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
+}
+function TasksIcon() {
+  return <svg className="tasks-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h7" /><path d="M10.5 2.5v11" /></svg>;
+}
 function storedTheme(): Theme {
   try { const theme = localStorage.getItem("tomo-theme"); return theme === "light" || theme === "dark" ? theme : "system"; }
   catch { return "system"; }
@@ -49,6 +56,11 @@ export function App() {
   });
   const [feedback, setFeedback] = useState("");
   const [theme, setTheme] = useState<Theme>(storedTheme);
+  const [tasksOpen, setTasksOpen] = useState(storedTasksOpen);
+  useEffect(() => {
+    try { localStorage.setItem("tomo-tasks-open", tasksOpen ? "1" : "0"); } catch { /* Storage can be unavailable. */ }
+  }, [tasksOpen]);
+  const running = runningCount(web.tasks);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem("tomo-theme", theme); } catch { /* Storage can be unavailable. */ }
@@ -145,7 +157,10 @@ export function App() {
     <a className="skip" href="#conversation">Skip to conversation</a>
     <header className="topbar"><a className="brand" href="/" aria-label="Tomo home"><Mark /><span>tomo<span className="brand-dot">.</span></span></a>
       <span className="section-name">Conversation</span>
-      <div className="header-actions"><span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
+      <div className="header-actions"><button type="button" className="tasks-button" aria-pressed={tasksOpen} aria-controls="tasks-rail"
+          aria-label={`Working now panel${running ? `, ${running} running` : ""}`} onClick={() => setTasksOpen((open) => !open)}>
+          <TasksIcon /><span className="tasks-button-label">Working now</span>{running > 0 && <span className="tasks-count" aria-hidden="true">{running}</span>}</button>
+        <span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
         <label className="theme-label"><span className="sr-only">Color theme</span><select aria-label="Color theme" value={theme} onChange={(e) => setTheme(e.target.value as Theme)}><option value="system">System theme</option><option value="light">Light theme</option><option value="dark">Dark theme</option></select></label>
       </div>
     </header>
@@ -163,7 +178,6 @@ export function App() {
           {hasContext && <progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" />}
           <p className="session-note">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
-        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} />
         <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
       <main id="conversation" className="conversation" tabIndex={-1}>
@@ -186,6 +200,9 @@ export function App() {
           {uncertain && !sending && <div className="recovery"><button onClick={() => void checkOutcome()}>Check message status</button><button onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</button></div>}
         </div>
       </main>
+      {tasksOpen && <aside id="tasks-rail" className="tasks-rail" aria-label="Working now"
+        onKeyDown={(e) => { if (e.key === "Escape" && window.matchMedia("(max-width: 800px)").matches) setTasksOpen(false); }}>
+        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} /></aside>}
     </div>
   </div>;
 }

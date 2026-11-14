@@ -89,7 +89,9 @@ export class TaskTracker {
   private change(ended: TaskChange["ended"]): TaskChange { return { tasks: this.list(), ended }; }
 
   private late(task: WatchTask, runId: string | undefined): boolean {
-    // Run ids of one task sort in the order the runs opened; an older one is a late frame.
+    // sdk.d.ts (run_id): "The run ids of one task sort, by plain string
+    // comparison, in the order the runs opened; a frame that names a run
+    // sorting before the one a reader shows is late." The id only advances.
     return !!runId && !!task.runId && runId < task.runId;
   }
 
@@ -102,6 +104,9 @@ export class TaskTracker {
       if (seen.size + foreground >= MAX_TRACKED_TASKS) break;
       seen.add(entry.task_id);
       const old = this.tasks.get(entry.task_id);
+      // An entry naming an older run than the one shown is late: the task
+      // stays live, but nothing about it (above all its run id) goes back.
+      if (old && this.late(old, entry.run_id)) continue;
       const newRun = !!old && !!entry.run_id && !!old.runId && entry.run_id > old.runId;
       const base: WatchTask = old && !newRun ? old : { taskId: entry.task_id, taskType: "", description: "",
         ambient: false, background: true, startedAt: this.now() };

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TASK_RETENTION_MS, TaskBoard } from "../src/web/tasks.js";
+import { MAX_BOARD_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, TASK_RETENTION_MS, TaskBoard } from "../src/web/tasks.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 import type { WebTask } from "../src/web/protocol.js";
 
@@ -23,8 +23,8 @@ describe("TaskBoard", () => {
     b.apply("s1", [task("a")]);
     expect(published.at(-1)![0]).toBe("s1");
     expect(published.at(-1)![1].map((t) => `${t.taskId}:${t.state}`)).toEqual(["a:running", "b:ended"]);
-    // Snapshot: every session, live first.
-    expect(b.snapshot().map((t) => t.taskId)).toEqual(["a", "c", "b"]);
+    // Snapshot: every session.
+    expect(b.snapshot().map((t) => t.taskId)).toEqual(["a", "b", "c"]);
     // An unchanged payload publishes nothing.
     const count = published.length;
     b.apply("s2", [task("c")]);
@@ -62,13 +62,26 @@ describe("TaskBoard", () => {
     b.dispose();
   });
 
-  it("keeps the ambient flag (the panel filters) and bounds the snapshot by bytes", () => {
+  it("keeps the ambient flag; the snapshot is compact and complete; the board is capped across sessions", () => {
     const { b } = board();
-    b.apply("s", [task("w", { ambient: true }), ...Array.from({ length: 40 }, (_, i) => task(`t${i}`, { description: "d".repeat(200) }))]);
-    expect(b.snapshot().find((t) => t.taskId === "w")!.ambient).toBe(true);
-    const small = b.snapshot(2_000);
-    expect(Buffer.byteLength(JSON.stringify(small))).toBeLessThanOrEqual(2_000);
-    expect(small.length).toBeGreaterThan(0);
+    b.apply("s", [task("w", { ambient: true, summary: "progress text" }), task("x", { description: "d".repeat(200) })]);
+    const snap = b.snapshot();
+    expect(snap.find((t) => t.taskId === "w")).toMatchObject({ ambient: true });
+    expect(snap.find((t) => t.taskId === "w")!.summary).toBeUndefined();
+    expect(snap.find((t) => t.taskId === "x")!.description.length).toBe(SNAPSHOT_DESCRIPTION_LIMIT + 1);
+    for (let i = 0; i < 5; i++) b.apply(`g${i}`, Array.from({ length: 60 }, (_, n) => task(`t${i}-${n}`)));
+    expect(b.snapshot()).toHaveLength(MAX_BOARD_TASKS);
+    expect(b.snapshot((id) => id === "s")).toHaveLength(2);
+    b.dispose();
+  });
+
+  it("drops tasks with unbounded ids and clear() empties one session", () => {
+    const { b, published } = board();
+    b.apply("s", [task("ok", { parentTaskId: "p".repeat(500) }), task("x".repeat(500))]);
+    expect(b.snapshot().map((t) => [t.taskId, t.parentTaskId])).toEqual([["ok", undefined]]);
+    b.clear("s");
+    expect(published.at(-1)).toEqual(["s", []]);
+    expect(b.snapshot()).toEqual([]);
     b.dispose();
   });
 });

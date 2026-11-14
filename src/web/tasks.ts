@@ -1,12 +1,23 @@
-import type { TaskEndStatus, WatchTask } from "../watch/protocol.js";
+import { clip, type TaskEndStatus, type WatchTask } from "../watch/protocol.js";
 import type { WebTask } from "./protocol.js";
 
 /** An ended task stays on the board this long, shown as ended, then goes. */
 export const TASK_RETENTION_MS = 60_000;
 /** Per session; live tasks are kept before ended ones. */
 export const MAX_SESSION_TASKS = 64;
-/** The snapshot shares one IPC frame with the reply blocks (see channels/web.ts). */
-export const MAX_SNAPSHOT_TASK_BYTES = 160 * 1024;
+/** Across all sessions, so the snapshot below has a fixed worst-case size. */
+export const MAX_BOARD_TASKS = 128;
+/** Description length in the snapshot (live updates carry up to 200). */
+export const SNAPSHOT_DESCRIPTION_LIMIT = 80;
+/**
+ * Worst-case JSON size of `snapshot()`: MAX_BOARD_TASKS compact entries, each
+ * well under 2 KiB even when every string is escaped. channels/web.ts reserves
+ * this much of the snapshot IPC frame, so the snapshot is never truncated and
+ * the browser can treat it as the complete list.
+ */
+export const MAX_SNAPSHOT_TASK_BYTES = MAX_BOARD_TASKS * 2 * 1024;
+const TASK_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
+const LABEL_LIMIT = 40;
 
 export interface TaskBoardOptions {
   now?: () => number;
@@ -31,19 +42,22 @@ export class TaskBoard {
     this.retainMs = options.retainMs ?? TASK_RETENTION_MS;
   }
 
-  /** Every session's tasks, live first, within `maxBytes` of JSON. */
-  snapshot(maxBytes = MAX_SNAPSHOT_TASK_BYTES): WebTask[] {
-    const all = [...this.sessions.values()].flatMap((tasks) => [...tasks.values()]);
-    const live = all.filter((task) => task.endedAt === undefined).sort((a, b) => a.startedAt - b.startedAt);
-    const done = all.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
-    const result: WebTask[] = [];
-    let bytes = 2;
-    for (const task of [...live, ...done]) {
-      bytes += Buffer.byteLength(JSON.stringify(task)) + 1;
-      if (bytes > maxBytes) break;
-      result.push({ ...task });
-    }
-    return result;
+  /**
+   * Every task on the board (complete: the board itself is capped), in a
+   * compact form — short description, no progress summary — whose size is
+   * bounded by MAX_SNAPSHOT_TASK_BYTES. Summaries return with the next
+   * per-session update. `visible` drops sessions the browser may not read.
+   */
+  snapshot(visible: (sessionId: string) => boolean = () => true): WebTask[] {
+    return [...this.sessions].filter(([sessionId]) => visible(sessionId)).flatMap(([, tasks]) => [...tasks.values()])
+      .map(({ summary: _summary, ...task }) => ({ ...task, description: clip(task.description, SNAPSHOT_DESCRIPTION_LIMIT) }));
+  }
+
+  /** Forget a session's tasks (its source changed); the browser is told. */
+  clear(sessionId: string): void {
+    if (!this.sessions.delete(sessionId)) return;
+    this.publish(sessionId, []);
+    this.schedule();
   }
 
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
@@ -51,22 +65,24 @@ export class TaskBoard {
     const old = this.sessions.get(sessionId) ?? new Map<string, WebTask>();
     const next = new Map<string, WebTask>();
     for (const task of live) {
+      // Bounded fields keep the snapshot size a guarantee (see above).
+      if (!TASK_ID.test(task.taskId)) continue;
       const previous = old.get(task.taskId);
       const reported = task.status;
       next.set(task.taskId, {
         sessionId,
         taskId: task.taskId,
-        taskType: task.taskType,
-        ...(task.subagentType ? { subagentType: task.subagentType } : {}),
-        description: task.description,
-        ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
+        taskType: clip(task.taskType, LABEL_LIMIT),
+        ...(task.subagentType ? { subagentType: clip(task.subagentType, LABEL_LIMIT) } : {}),
+        description: clip(task.description, 200),
+        ...(task.parentTaskId && TASK_ID.test(task.parentTaskId) ? { parentTaskId: task.parentTaskId } : {}),
         ambient: task.ambient,
         startedAt: task.startedAt,
         // The end report can arrive while the task is still in the SDK's set.
         state: reported ?? "running",
         ...(reported ? { endedAt: previous?.endedAt ?? now } : {}),
-        ...(task.lastTool ? { lastTool: task.lastTool } : {}),
-        ...(task.summary ? { summary: task.summary } : {}),
+        ...(task.lastTool ? { lastTool: clip(task.lastTool, LABEL_LIMIT) } : {}),
+        ...(task.summary ? { summary: clip(task.summary, 200) } : {}),
         ...(task.totalTokens !== undefined ? { totalTokens: task.totalTokens } : {}),
         ...(task.toolUses !== undefined ? { toolUses: task.toolUses } : {}),
       });
@@ -95,11 +111,14 @@ export class TaskBoard {
     for (const [id, task] of next) {
       if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) next.delete(id);
     }
+    let others = 0;
+    for (const [id, tasks] of this.sessions) if (id !== sessionId) others += tasks.size;
+    const allowed = Math.max(0, Math.min(MAX_SESSION_TASKS, MAX_BOARD_TASKS - others));
     let list = [...next.values()];
-    if (list.length > MAX_SESSION_TASKS) {
+    if (list.length > allowed) {
       const live = list.filter((task) => task.endedAt === undefined);
       const done = list.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
-      list = [...live, ...done].slice(0, MAX_SESSION_TASKS);
+      list = [...live, ...done].slice(0, allowed);
     }
     const kept = new Map(list.map((task) => [task.taskId, task]));
     if (kept.size) this.sessions.set(sessionId, kept); else this.sessions.delete(sessionId);

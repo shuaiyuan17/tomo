@@ -148,6 +148,52 @@ export function isDefiniteFailure(err: unknown): boolean {
 }
 
 /**
+ * NOTHING SENT — stronger than DEFINITE. A definite failure proves the call
+ * that failed delivered nothing; it says nothing about the calls the same
+ * `send()` made BEFORE it. A long text goes out as several chunks, and a
+ * refusal on chunk 2 is definite while chunk 1 is already on the phone.
+ *
+ * A channel marks an error NOTHING SENT only when the failing `send()` put
+ * nothing at all on the wire — the first provider call was refused, or a local
+ * check failed before any call. This is the only failure the turn pipeline
+ * will re-send a whole block for: anything weaker risks a duplicate.
+ */
+const NOTHING_SENT = Symbol.for("tomo.channel.nothingSent");
+
+/** Mark `err` as: this `send()` put nothing on the wire. Implies definite. */
+export function markNothingSent<T>(err: T): T {
+  if (err !== null && typeof err === "object") {
+    markDefiniteFailure(err);
+    Object.defineProperty(err, NOTHING_SENT, { value: true, enumerable: false, configurable: true });
+  }
+  return err;
+}
+
+/** Did the channel vouch that the failed `send()` put nothing on the wire? */
+export function isNothingSent(err: unknown): boolean {
+  return err !== null && typeof err === "object" && (err as Record<symbol, unknown>)[NOTHING_SENT] === true;
+}
+
+/**
+ * PARTLY SENT: a multi-part send (chunked text) failed after `sent` of its
+ * `total` parts had already gone out. Lets the turn pipeline tell the next
+ * turn what actually arrived instead of "unknown".
+ */
+const PARTS_SENT = Symbol.for("tomo.channel.partsSent");
+
+export function markPartsSent<T>(err: T, sent: number, total: number): T {
+  if (err !== null && typeof err === "object") {
+    Object.defineProperty(err, PARTS_SENT, { value: { sent, total }, enumerable: false, configurable: true });
+  }
+  return err;
+}
+
+export function partsSent(err: unknown): { sent: number; total: number } | undefined {
+  if (err === null || typeof err !== "object") return undefined;
+  return (err as Record<symbol, { sent: number; total: number } | undefined>)[PARTS_SENT];
+}
+
+/**
  * Thrown by a channel that found an attachment file unreadable BEFORE any
  * request went out. Definite by construction (see `markDefiniteFailure`).
  */
@@ -262,6 +308,7 @@ export type AdmissionPredicate = (chatId: string) => boolean;
 export interface Channel {
   /** Channel identifier (e.g. "telegram", "imessage") */
   readonly name: string;
+
 
   /** Register a handler for incoming messages */
   onMessage(handler: MessageHandler): void;

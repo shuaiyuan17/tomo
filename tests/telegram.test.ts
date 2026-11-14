@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IncomingMessage } from "../src/channels/types.js";
+import { isNothingSent, partsSent } from "../src/channels/types.js";
 import {
   isMarkdownParseError,
   POLLING_HEALTHY_RUN_MS,
@@ -793,6 +794,53 @@ describe("TelegramChannel Markdown fallback", () => {
     ));
     await expect(channel.send({ chatId: "1", text: "hello" })).rejects.toThrow(/blocked/);
     expect(calls).toHaveLength(1);
+  });
+});
+
+// P0-5: the turn pipeline re-sends a whole block ONLY when the channel says the
+// failed send put nothing on the wire. A refusal on a LATER chunk of a long
+// text is definite for that chunk, but the earlier chunks are on the phone.
+describe("TelegramChannel reports whether a failed send put anything on the wire", () => {
+  const refusal = () => new GrammyError(
+    "Call to 'sendMessage' failed!",
+    { ok: false, error_code: 429, description: "Too Many Requests: retry after 1" },
+    "sendMessage",
+    {},
+  );
+
+  function makeChannel(failOnCall: number) {
+    const channel = new TelegramChannel("000000:test-token");
+    let call = 0;
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendMessage: async () => {
+        if (call++ === failOnCall) throw refusal();
+        return { message_id: 100 + call };
+      },
+    };
+    return channel;
+  }
+
+  it("marks a refusal of the FIRST call as nothing sent", async () => {
+    const err = await makeChannel(0).send({ chatId: "1", text: "short" }).catch((e: unknown) => e);
+    expect(isNothingSent(err)).toBe(true);
+    expect(partsSent(err)).toBeUndefined();
+  });
+
+  it("does NOT mark a refusal of a later chunk as nothing sent, and says how much went out", async () => {
+    const long = "word ".repeat(2_000); // > 4096 chars → several chunks
+    const err = await makeChannel(1).send({ chatId: "1", text: long }).catch((e: unknown) => e);
+    expect(isNothingSent(err)).toBe(false);
+    expect(partsSent(err)?.sent).toBe(1);
+    expect(partsSent(err)!.total).toBeGreaterThan(1);
+  });
+
+  it("never marks a transport failure as nothing sent", async () => {
+    const channel = new TelegramChannel("000000:test-token");
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendMessage: async () => { throw new Error("Request to 'sendMessage' timed out"); },
+    };
+    const err = await channel.send({ chatId: "1", text: "x" }).catch((e: unknown) => e);
+    expect(isNothingSent(err)).toBe(false);
   });
 });
 

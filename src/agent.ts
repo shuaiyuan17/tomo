@@ -289,6 +289,12 @@ export class Agent {
     // time (tests replace it on the instance).
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
+      // Persisted (sessions' pending-notes file): a reply the owner never got
+      // must still be known to the next turn if the daemon restarts first.
+      queueDeliveryFailureNote: (sessionKey, note) => this.queuePendingNote(
+        sessionKey,
+        formatTomoEvent("errors", note, { name: "delivery" }),
+      ),
       runWithRetry: (req) => this.runWithRetry(req),
       appendAssistantTranscript: (sessionKey, content, channelName) => {
         this.sessions.append(sessionKey, {

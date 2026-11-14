@@ -40,7 +40,7 @@ interface Recorded {
 }
 
 type PhotoFailure = "none" | "enoent" | "ambiguous" | "refused";
-type Fakes = { photo: PhotoFailure; stickerFails?: boolean; messageFailsOnce?: boolean };
+type Fakes = { photo: PhotoFailure; stickerFails?: boolean; messageFailsOnce?: boolean; messageFailsOnCall?: number };
 
 /** A Telegram channel whose sendPhoto fails the way a vanished file — or a dropped connection — does. */
 function makeTelegram(photoFailure: PhotoFailure | Fakes): { channel: TelegramChannelType; recorded: Recorded } {
@@ -49,6 +49,7 @@ function makeTelegram(photoFailure: PhotoFailure | Fakes): { channel: TelegramCh
   const recorded: Recorded = { photos: [], messages: [], stickers: [] };
   let nextId = 100;
   let messageFailures = fakes.messageFailsOnce ? 1 : 0;
+  let messageCalls = 0;
   type Opts = { caption?: string; reply_parameters?: { message_id: number } };
   (channel as unknown as { bot: { api: unknown } }).bot.api = {
     sendPhoto: async (_chatId: string | number, _file: unknown, opts?: Opts) => {
@@ -75,6 +76,9 @@ function makeTelegram(photoFailure: PhotoFailure | Fakes): { channel: TelegramCh
       return { message_id: nextId++ };
     },
     sendMessage: async (_chatId: string | number, text: string, opts?: Opts) => {
+      if (fakes.messageFailsOnCall !== undefined && messageCalls++ === fakes.messageFailsOnCall) {
+        throw new GrammyError("Call to 'sendMessage' failed!", { ok: false, error_code: 429, description: "Too Many Requests: retry after 1" }, "sendMessage", {});
+      }
       if (messageFailures > 0) {
         messageFailures--;
         throw new GrammyError("Call to 'sendMessage' failed!", { ok: false, error_code: 400, description: "Bad Request: text refused" }, "sendMessage", {});
@@ -245,6 +249,27 @@ describe("a caption survives an attachment send that fails before dispatch", () 
 
     expect(recorded.photos.map((p) => p.caption)).toEqual([undefined]);
     expect(recorded.messages.map((m) => m.text)).toEqual([longCaption]);
+  });
+
+  it("never re-sends an over-limit caption whose LATER part was refused after earlier parts landed", async () => {
+    // The caption follow-up is long enough to go out as several text parts;
+    // part 2 is refused (definite) while part 1 is already on the phone.
+    // "Definite" must not free the caption here: re-sending it would repeat
+    // part 1. A second picture is in the block to offer it a ride.
+    const second = join(home, "second.png");
+    writeFileSync(second, "not really a png");
+    const { channel, recorded } = makeTelegram({ photo: "none", messageFailsOnCall: 1 });
+    const sender = pipeline().createBlockSender(channel, "12345");
+    const longCaption = "word ".repeat(1_200).trim();
+    const block = `${longCaption}\nMEDIA:${mediaPath}\nMEDIA:${second}`;
+
+    const err = await failing(sender.deliver(block));
+    expect(err).toBeInstanceOf(PartialDeliveryError);
+
+    // Part 1 went out once; nothing of the caption was sent again — not as a
+    // caption on the second picture, not as text.
+    expect(recorded.messages).toHaveLength(1);
+    expect(recorded.photos.map((p) => p.caption)).toEqual([undefined, undefined]);
   });
 
   it("writes the failure entry in the block's own order, tags verbatim", async () => {

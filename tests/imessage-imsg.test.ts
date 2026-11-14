@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
-import { AttachmentUnreadableError } from "../src/channels/types.js";
+import { AttachmentUnreadableError, isNothingSent, partsSent } from "../src/channels/types.js";
 import { NULL_SERVICE_LOOKUP, type ServiceLookup } from "../src/channels/imsg-satellite.js";
 import { NULL_ATTACHMENT_LOOKUP } from "../src/channels/imsg-attachment-lookup.js";
 import { log } from "../src/logger.js";
@@ -204,6 +204,35 @@ describe("imsg RPC framing", () => {
 
     await expect(channel.send({ chatId: DM_GUID, text: "hi" })).rejects.toThrow(/send failed.*Internal error.*boom/);
     expect(requests().filter((r) => r.method === "send")).toHaveLength(1);
+
+    await channel.stop();
+  });
+
+  // P0-5: only a send that put NOTHING on the wire may be re-sent whole.
+  it("marks an RPC refusal of the first chunk nothing-sent, and of a later chunk partly-sent", async () => {
+    let sends = 0;
+    let failOn = 0;
+    const { channel } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 7 });
+        if (req.method === "send") {
+          if (sends++ === failOn) return child.respondError(req.id, -32603, "Internal error", "refused");
+          return child.respond(req.id, { ok: true });
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const first = await channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e);
+    expect(isNothingSent(first)).toBe(true);
+
+    sends = 0;
+    failOn = 1;
+    const later = await channel.send({ chatId: DM_GUID, text: "word ".repeat(1_700) }).then(() => null, (e: unknown) => e);
+    expect(later).not.toBeNull();
+    expect(isNothingSent(later)).toBe(false);
+    expect(partsSent(later)).toEqual({ sent: 1, total: 3 });
 
     await channel.stop();
   });

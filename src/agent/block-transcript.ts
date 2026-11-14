@@ -35,6 +35,15 @@
 export const DELIVERY_FAILED_MARKER = "[delivery failed] ";
 
 /**
+ * Prefix for a block whose send was still in flight when it was given up on —
+ * abandoned for blowing its delivery budget (a timeout), or still open when
+ * the turn died or shut down. Nothing came back either way: it may well be on
+ * the owner's phone. Recording it as "failed" would assert a non-delivery
+ * nobody observed; the honest entry is that the status is unknown.
+ */
+export const DELIVERY_UNKNOWN_MARKER = "[delivery status unknown] ";
+
+/**
  * Transcript entry — and `runWithRetry` resolution — for a turn SHUTDOWN
  * REFUSED: the prompt never reached the model at all.
  *
@@ -64,6 +73,12 @@ export interface BlockTranscriptSlot {
    * (abandoned, or force-flushed when the turn died) — first writer wins.
    */
   settle(entry: string): void;
+  /**
+   * Still waiting for its outcome? False once settled, abandoned (the block
+   * blew its delivery budget) or force-flushed (the turn died or shut down) —
+   * after which nothing may be sent for this block any more.
+   */
+  isOpen(): boolean;
 }
 
 export interface OrderedBlockTranscript {
@@ -143,16 +158,17 @@ export function createOrderedBlockTranscript(
           close(slot, entry);
           if (!defer) drain();
         },
+        isOpen: () => slot.entry === null,
       };
     },
     abandonOldest() {
       const slot = open[0];
       if (!slot) return;
-      close(slot, `${DELIVERY_FAILED_MARKER}${slot.block}`);
+      close(slot, `${DELIVERY_UNKNOWN_MARKER}${slot.block}`);
       if (!defer) drain();
     },
     flushAll() {
-      for (const slot of [...open]) close(slot, `${DELIVERY_FAILED_MARKER}${slot.block}`);
+      for (const slot of [...open]) close(slot, `${DELIVERY_UNKNOWN_MARKER}${slot.block}`);
       drain();
     },
   };

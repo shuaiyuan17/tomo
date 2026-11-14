@@ -4,6 +4,7 @@ import { describeError, shortErrorMessage } from "../error-text.js";
 import {
   AttachmentUnreadableError,
   isDefiniteFailure,
+  partsSent,
   PartialSendError,
   type Channel,
   type OutgoingMessage,
@@ -401,7 +402,12 @@ export class DeliveryPipeline {
             const partial = raw instanceof PartialSendError ? raw : null;
             const err = partial ? partial.failure : raw;
             if (partial?.shipped.photo) segment.delivered = true;
-            const definite = provablyUndelivered(err);
+            // Definite is not enough to free the caption: a captioned picture
+            // whose caption went out as several text parts may have had a
+            // LATER part refused (definite) after earlier parts landed.
+            // Re-sending the caption would repeat those, so a caption with any
+            // part already sent is "unknown", never re-sent.
+            const definite = provablyUndelivered(err) && !((partsSent(err)?.sent ?? 0) > 0);
             // A picture that shipped may have taken the reply target, whatever
             // became of its caption — so a partial send always retires it.
             noteFailure(raw, definite && partial === null);

@@ -324,6 +324,16 @@ describe("outbound delivery", () => {
 
     expect(queryState.maxConcurrent).toBe(1);
 
+    // P0-5: the failure is SURFACED — a note for the next turn, persisted so
+    // it survives a restart (a fresh store reads it back from disk), and the
+    // transcript does not claim the reply arrived.
+    const fresh = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const key = "imessage:iMessage;-;+15551112222";
+    const notes = fresh.getPendingNotes(key);
+    expect(notes.some((n) => n.includes("delivery failed") && n.includes("the reply"))).toBe(true);
+    const assistant = fresh.get(key).messages.filter((m) => m.role === "assistant").map((m) => m.content);
+    expect(assistant).toEqual(["[delivery failed] the reply"]);
+
     await agent.stop();
   });
 

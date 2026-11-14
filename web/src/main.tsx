@@ -10,6 +10,7 @@ import { TasksPanel } from "./tasks-panel.js";
 import { PlanUsage } from "./plan-usage.js";
 import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
+import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
@@ -149,7 +150,9 @@ export function App() {
   const rail = useRef<HTMLElement>(null);
   const overlay = useMediaQuery(OVERLAY_QUERY);
   const phone = useMediaQuery("(max-width: 600px)");
-  const modal = tasksOpen && overlay;
+  // The rail stays mounted through its closing transition (see motion.ts).
+  const railMotion = useMountedFor(tasksOpen);
+  const modal = tasksOpen && overlay && railMotion.mounted;
   const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
   // On narrow screens the rail is a modal layer: focus moves into it, stays
   // there (the content under it is inert), and Escape anywhere closes it,
@@ -206,6 +209,11 @@ export function App() {
     setUncertain(id);
     try { if (id) sessionStorage.setItem("tomo-pending-request", id); else sessionStorage.removeItem("tomo-pending-request"); } catch { /* Optional recovery hint. */ }
   };
+  // New messages rise in as they arrive (not on load). Web-sent ones were
+  // already shown as a pending bubble / streamed block, so they don't again.
+  const appeared = useAppeared(history.messages.map((m) => m.id), selectedId, historyStatus === "ready");
+  const webRequestIds = new Set(web.requests.map((r) => r.requestId));
+  const [sentPulse, setSentPulse] = useState(0);
   const send = async (event: FormEvent) => {
     event.preventDefault();
     if (!session?.writable || !draft.trim() || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
@@ -221,6 +229,7 @@ export function App() {
       if (replaced) void dismiss(replaced, true);
       setResending(null);
       setDraft((old) => old.trim() === text ? "" : old);
+      setSentPulse((n) => n + 1);
       setFeedback(labels[request.state]); remember(null); setReload((r) => r + 1); atBottom.current = true;
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
@@ -386,42 +395,47 @@ export function App() {
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
           {history.messages.map((message, index) => { const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
-            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
+            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
             <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
               <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} /></div>
             {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })}
-          {pendingUsers.map((request) => <article className="message user mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
+          {pendingUsers.map((request) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
             <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text!}</Text></div>
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
-          {blocks.map((block) => <article className="message assistant mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown reading"><Text breaks>{block.text}</Text></div></article>)}
+          {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown reading"><Text breaks>{block.text}</Text></div></article>)}
         </div>
         <div className="mx-auto w-full max-w-[740px]"><div className="min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>
             <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
-          <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] duration-150 focus-within:border-muted-foreground/50 focus-within:shadow-md">
+          <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
             <label className="sr-only" htmlFor="message">Message Tomo</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! px-3.5 py-[7px] text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
               onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
               onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
-              className="size-9 shrink-0 rounded-full transition-[background-color,transform] duration-150 hover:bg-primary/85 active:scale-[0.92] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
-              disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>
+              className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
+              disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp key={sentPulse} strokeWidth={2.2} className={cn(sentPulse > 0 && "motion-pop")} /></Button>
           </form>
           {feedback && <p className="feedback mt-2 text-xs text-muted-foreground" role="status">{feedback}</p>}
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>
       </main>
-      {tasksOpen && <aside ref={rail} id="tasks-rail" aria-label="Tasks" {...(modal ? { role: "dialog", "aria-modal": true } : {})}
-        className="flex min-h-0 w-[300px] shrink-0 flex-col border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:animate-[rail-in_180ms_ease-out] max-[600px]:top-16">
-        <TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
-          footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></aside>}
+      {/* The rail slides: on wide screens its width opens and the chat makes
+          room smoothly; on narrow ones it slides over the chat, with a dimmed
+          backdrop. It stays mounted for the closing transition. */}
+      {railMotion.mounted && overlay && <div aria-hidden="true" onClick={closeTasks} data-state={railMotion.shown ? "open" : "closed"}
+        className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-16" />}
+      {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
+        className="flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 transition-[width,opacity,padding,transform] duration-[220ms] data-[state=closed]:w-0 data-[state=closed]:pl-0 data-[state=closed]:opacity-0 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:data-[state=closed]:w-[min(340px,88vw)] max-[800px]:data-[state=closed]:translate-x-full max-[800px]:data-[state=closed]:opacity-100 max-[600px]:top-16">
+        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
+          footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div></aside>}
     </div>
     {screen && <ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} />}
   </div>;

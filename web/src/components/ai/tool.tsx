@@ -28,15 +28,15 @@ const stateIcon: Record<ToolState, ReactNode> = {
 
 /** One line: chevron, the call (e.g. `Read src/web/http.ts`), status. */
 export function ToolHeader({ title, state, className }: { title: string; state: ToolState; className?: string }) {
-  return <CollapsibleTrigger className={cn("flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left font-mono text-[11.5px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground", className)}>
-    <ChevronRightIcon className="size-3.5 shrink-0 transition-transform duration-150 group-data-[state=open]/tool:rotate-90" />
+  return <CollapsibleTrigger className={cn("flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left font-mono text-[11.5px] text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground", className)}>
+    <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool:rotate-90" />
     <span className="min-w-0 flex-1 truncate">{title}</span>
     {stateIcon[state]}
   </CollapsibleTrigger>;
 }
 
 export function ToolContent({ className, ...props }: ComponentProps<typeof CollapsibleContent>) {
-  return <CollapsibleContent className={cn("space-y-2.5 pt-1.5 pb-2 pl-6", className)} {...props} />;
+  return <CollapsibleContent className={cn("motion-collapsible space-y-2.5 pt-1.5 pb-2 pl-6", className)} {...props} />;
 }
 
 /** A labelled, scrollable block of text with a capped "Show more". */

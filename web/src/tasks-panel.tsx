@@ -1,16 +1,20 @@
 import { useEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { ChevronRight, TerminalIcon, X } from "lucide-react";
 import type { WebSession, WebTask } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { SubagentView } from "./subagent-view.js";
+import { isShellTask } from "./shell.js";
+import { ShellPill } from "./shell-pill.js";
 import { ModelBadge } from "./model-badge.js";
 import { buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
 
 /** Read-only: shows what is running, never offers to stop it. */
 export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void }) {
   const [showAmbient, setShowAmbient] = useState(false);
+  /** Open "N shell commands done" rows, per session and parent. */
+  const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
   const [opened, setOpened] = useState<{ sessionId: string; taskId: string }>();
   // The board drops a task a minute after it ends; an open view keeps the
   // last copy it saw (as ended) rather than vanishing under the reader.
@@ -46,25 +50,49 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
       {view.groups.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">Nothing running in the background.</p>
         : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
           <p className="mt-1 mb-1 px-2.5 font-mono text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span className="opacity-80"> · group</span> : null}</p>
-          <ul className="m-0 list-none space-y-0.5 p-0">{group.rows.map(({ task, depth }) => {
-            const step = lastStep(task);
-            const time = formatElapsed(elapsed(task, now));
-            const running = task.state === "running";
-            return <li key={task.taskId} style={{ marginLeft: depth * 16 }}
-              className={cn("relative", depth > 0 && "before:absolute before:top-2.5 before:-left-1.5 before:h-2.5 before:w-[7px] before:rounded-bl-[3px] before:border-b before:border-l before:content-['']")}>
-              <button type="button" title={taskKind(task)} onClick={() => setOpened({ sessionId: task.sessionId, taskId: task.taskId })}
-                className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors duration-150 hover:bg-foreground/[0.06] focus-visible:outline-offset-0", !running && "opacity-60")}>
-              <div className="flex items-baseline justify-between gap-2.5">
-                <span className="text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>
-                {running && <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
-              </div>
-              <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
-                {running ? <><span className="shimmer">Working</span>{step && <> · {step}</>}</> : <>{STATE_LABELS[task.state]} · {time}</>}
-              </p>
-              </button>
-            </li>;
-          })}</ul>
+          <ul className="m-0 list-none space-y-0.5 p-0">{group.rows.map((row) => row.folded
+            ? <FoldedShells key={`folded:${row.task.parentTaskId ?? group.sessionId}`} tasks={row.folded} depth={row.depth} now={now}
+                open={!!openFolds[`${group.sessionId}/${row.task.parentTaskId ?? ""}`]}
+                onToggle={() => setOpenFolds((old) => { const k = `${group.sessionId}/${row.task.parentTaskId ?? ""}`; return { ...old, [k]: !old[k] }; })}
+                onOpen={(task) => setOpened({ sessionId: task.sessionId, taskId: task.taskId })} />
+            : <TaskCard key={row.task.taskId} task={row.task} depth={row.depth} now={now} onOpen={() => setOpened({ sessionId: row.task.sessionId, taskId: row.task.taskId })} />)}</ul>
         </div>)}
     </div>
   </section>;
+}
+
+const branch = "relative before:absolute before:top-2.5 before:-left-1.5 before:h-2.5 before:w-[7px] before:rounded-bl-[3px] before:border-b before:border-l before:content-['']";
+
+function TaskCard({ task, depth, now, onOpen }: { task: WebTask; depth: number; now: number; onOpen: () => void }) {
+  const step = lastStep(task);
+  const time = formatElapsed(elapsed(task, now));
+  const running = task.state === "running";
+  const shell = isShellTask(task.taskType);
+  return <li style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch)}>
+    <button type="button" title={shell ? task.description : taskKind(task)} onClick={onOpen}
+      className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors duration-150 hover:bg-foreground/[0.06] focus-visible:outline-offset-0", !running && "opacity-60")}>
+      <div className="flex min-w-0 items-baseline justify-between gap-2.5">
+        {shell ? <span className="min-w-0"><ShellPill command={task.description} /></span>
+          : <span className="text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>}
+        {running && <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
+      </div>
+      <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
+        {running ? <><span className="shimmer">Working</span>{step && <> · {step}</>}</> : <>{STATE_LABELS[task.state]} · {time}</>}
+      </p>
+    </button>
+  </li>;
+}
+
+/** Two or more finished shell commands under one parent, folded into one row. */
+function FoldedShells({ tasks, depth, now, open, onToggle, onOpen }:
+  { tasks: WebTask[]; depth: number; now: number; open: boolean; onToggle: () => void; onOpen: (task: WebTask) => void }) {
+  return <>
+    <li style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch)}>
+      <button type="button" aria-expanded={open} onClick={onToggle}
+        className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground opacity-80 transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground">
+        <ChevronRight className={cn("size-3.5 shrink-0 transition-transform duration-150", open && "rotate-90")} />
+        <TerminalIcon className="size-3 shrink-0" aria-hidden="true" />{tasks.length} shell commands done</button>
+    </li>
+    {open && tasks.map((task) => <TaskCard key={task.taskId} task={task} depth={depth + 1} now={now} onOpen={() => onOpen(task)} />)}
+  </>;
 }

@@ -75,4 +75,15 @@ describe("task panel view", () => {
     expect(modelLabel("claude-3-5-sonnet-20241022")).toBe("3-5-sonnet-20241022");
     expect(modelLabel("gpt-5.6-sol")).toBe("gpt-5.6-sol");
   });
+
+  it("folds two or more finished shell commands under one parent into one row; running ones stay", () => {
+    const sh = (id: string, extra: Partial<WebTask> = {}) => task(id, { taskType: "local_bash", parentTaskId: "p", state: "completed", endedAt: 1, ...extra });
+    const view = buildTaskView([task("p"), sh("s1", { startedAt: 1 }), sh("s2", { startedAt: 2 }), sh("s3", { startedAt: 3, state: "running", endedAt: undefined }), sh("s4", { startedAt: 4 })], sessions, false);
+    const rows = view.groups[0].rows;
+    expect(rows.map((r) => r.folded ? `folded:${r.folded.map((t) => t.taskId).join(",")}@${r.depth}` : `${r.task.taskId}@${r.depth}`))
+      .toEqual(["p@0", "s3@1", "folded:s1,s2,s4@1"]);
+    // A single finished command is not folded.
+    const one = buildTaskView([task("p"), sh("s1")], sessions, false).groups[0].rows;
+    expect(one.map((r) => r.folded ? "folded" : r.task.taskId)).toEqual(["p", "s1"]);
+  });
 });

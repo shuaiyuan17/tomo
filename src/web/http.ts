@@ -3,11 +3,12 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import type { WebData } from "./data.js";
+import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
-  type EventEnvelope, type Rpc, type WebRequest, type WebSync, type WebTaskAccess } from "./protocol.js";
+  type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess } from "./protocol.js";
 
 export interface HttpDependencies {
   accessToken: string;
@@ -25,12 +26,15 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   const externalOrigin = webConfigSchema.shape.externalOrigin.parse(deps.externalOrigin);
   const streams = new Set<ServerResponse>();
   let active = 0;
+  let inspecting = false;
   let boundPort = port;
   const server = createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 10_000 }, (req, res) => {
     for (const [key, value] of Object.entries(securityHeaders)) res.setHeader(key, value);
     void handle(req, res).catch((error: unknown) => {
       if (res.headersSent) { res.destroy(); return; }
-      const err = error instanceof WebError ? error : new WebError(503, "service_unavailable");
+      const err = error instanceof WebError ? error : error instanceof MemoryReadError
+        ? new WebError(({ invalid_path: 400, not_found: 404, limit: 413, unavailable: 503 } as const)[error.code], `memory_${error.code}`)
+        : new WebError(503, "service_unavailable");
       json(res, err.status, { error: err.code });
       req.resume();
     });
@@ -53,6 +57,12 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       return;
     }
     if (active >= 8) throw new WebError(429, "request_limit");
+    // One bounded disk inspection (TODOs, memory, context) at a time across
+    // clients; chat, SSE and the other reads stay available meanwhile.
+    const inspection = req.method === "GET" && (url.pathname === "/api/v1/todos"
+      || url.pathname.startsWith("/api/v1/memory/") || /^\/api\/v1\/sessions\/[^/]+\/context$/.test(url.pathname));
+    if (inspection && inspecting) throw new WebError(429, "inspection_busy");
+    if (inspection) inspecting = true;
     active++;
     try {
       if (!api) {
@@ -61,6 +71,27 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         return;
       }
       if (req.method === "GET") {
+        if (url.pathname === "/api/v1/todos") { json(res, 200, await required(deps.data.memory).todos()); return; }
+        if (url.pathname === "/api/v1/memory/tree") { json(res, 200, await required(deps.data.memory).tree()); return; }
+        if (url.pathname === "/api/v1/memory/file") { json(res, 200, await required(deps.data.memory).file(url.searchParams.get("path") ?? "")); return; }
+        if (url.pathname === "/api/v1/memory/search") { json(res, 200, await required(deps.data.memory).search(url.searchParams.get("q") ?? "")); return; }
+        if (url.pathname === "/api/v1/cron") { json(res, 200, await deps.data.cron.list()); return; }
+        if (url.pathname === "/api/v1/config") { json(res, 200, await required(deps.data.config).view()); return; }
+        if (url.pathname === "/api/v1/mcp") {
+          const saved = await required(deps.data.config).mcp();
+          // Live health is whatever the SDK reports; unreachable is "unknown", never healthy.
+          const live = await deps.rpc({ method: "mcp-status" }).then((sessions) => ({ available: true, sessions: sessions as WebMcpLiveSession[] }),
+            () => ({ available: false, sessions: [] }));
+          json(res, 200, { ...saved, live });
+          return;
+        }
+        const context = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/context$/.exec(url.pathname);
+        if (context) {
+          const value = await deps.data.context(context[1]);
+          const recentCompactions = await deps.rpc({ method: "context-events", sessionId: context[1] }).catch(() => []) as WebCompaction[];
+          json(res, 200, { ...value, recentCompactions });
+          return;
+        }
         if (url.pathname === "/api/v1/bootstrap") {
           const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
@@ -112,7 +143,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         return;
       }
       throw new WebError(404, "not_found");
-    } finally { active--; }
+    } finally { active--; if (inspection) inspecting = false; }
   }
 
   async function events(url: URL, req: IncomingMessage, res: ServerResponse, origin: string): Promise<void> {
@@ -219,4 +250,9 @@ async function body(req: IncomingMessage): Promise<unknown> {
   }
   try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
   catch { throw new WebError(400, "invalid_json"); }
+}
+
+function required<T>(value: T | undefined): T {
+  if (!value) throw new WebError(503, "service_unavailable");
+  return value;
 }

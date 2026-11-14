@@ -1,5 +1,8 @@
 import { z } from "zod";
-import type { SessionMessage, SessionStats } from "../sessions/types.js";
+import type { ContextCategory, SessionMessage, SessionStats } from "../sessions/types.js";
+import type { CronRunStatus, CronSchedule } from "../cron/types.js";
+import type { ContextSection } from "../lcm/stats.js";
+import type { SummaryBlock } from "../lcm/summary-reader.js";
 
 export const WEB_CHAT_ID = "owner";
 // JSON can escape one UTF-16 code unit as six bytes (e.g. a lone surrogate).
@@ -74,6 +77,32 @@ export interface WebBootstrap extends WebCatalog {
   /** Every visible session's tasks; replaces the client's whole task list. */
   tasks: WebTask[];
 }
+// ---- The Study (read-only workspace inspection) ----
+export interface WebMemoryEntry { path: string; kind: "directory" | "file" }
+export interface WebMemoryTree { entries: WebMemoryEntry[]; truncated: boolean; missing: boolean }
+export interface WebMemoryFile { path: string; content: string; modifiedAt: number; hiddenLines: number }
+export interface WebTodos { files: Array<WebMemoryFile | { path: string; error: string }>; missing: boolean; truncated: boolean }
+export interface WebMemorySearch { results: Array<{ path: string; line: number; text: string }>; truncated: boolean; unreadable: number; missing: boolean }
+export interface WebCronJob {
+  id: string; name: string; enabled: boolean; schedule: CronSchedule; scheduleLabel: string; message: string; sessionKey: string;
+  deleteAfterRun: boolean; createdAt: number; nextRunAt: number | null; lastRunAt: number | null; lastStatus: CronRunStatus | null; interruptedAt: number | null;
+}
+export interface WebCompaction { timestamp: number; preTokens?: number; postTokens?: number }
+export interface WebContext {
+  /** Persisted usage of the last recorded turn; null when no window was ever reported. */
+  used: number | null; max: number | null; estimated: boolean; recordedAt: number | null; breakdown: ContextCategory[];
+  analysisStatus: "available" | "unavailable" | "too_large";
+  analysis: { totalMessages: number; totalTokens: number; sections: ContextSection[]; truncated: boolean } | null;
+  summaries: Array<SummaryBlock & { truncated: boolean }>; summariesTruncated: boolean;
+  /** Compactions seen on the watch bus since the daemon started (not a full audit log). */
+  recentCompactions?: WebCompaction[];
+}
+export interface WebConfigField { path: string[]; secret: boolean; set: boolean; /** Length of a masked string. */ length?: number; value?: string | number | boolean | null | Array<string | number | boolean | null> | Record<string, never> }
+export interface WebConfigView { missing: boolean; modifiedAt: number | null; fields: WebConfigField[]; truncated: boolean }
+export type McpConnectionState = "connected" | "failed" | "needs-auth" | "pending" | "disabled";
+export interface WebMcpServer { name: string; enabled: boolean; type: string; oauth: boolean; timeout: number | null; alwaysLoad: boolean; configured: string[] }
+export interface WebMcpLiveSession { sessionId: string; connections: Array<{ name: string; status: McpConnectionState }> | null }
+export interface WebMcpView { missing: boolean; servers: WebMcpServer[]; live: { available: boolean; sessions: WebMcpLiveSession[] } }
 export class WebError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
 }
@@ -83,6 +112,10 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
   z.object({ method: z.literal("request"), requestId: z.uuid() }).strict(),
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
+  /** SDK-reported MCP connection state of live sessions (bounded; never probes). */
+  z.object({ method: z.literal("mcp-status") }).strict(),
+  /** Compactions of one browser session seen on the watch bus. */
+  z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),

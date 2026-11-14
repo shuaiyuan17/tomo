@@ -38,7 +38,7 @@ vi.mock("../src/web/supervisor.js", async (original) => {
   } };
 });
 vi.mock("../src/cron/scheduler.js", () => ({ CronScheduler: class { start() {} } }));
-vi.mock("../src/cron/store.js", () => ({ CronStore: class {} }));
+vi.mock("../src/cron/store.js", () => ({ CronStore: class {}, CRON_STORE_PATH: `${fixture.root}/scheduler-cron/jobs.json` }));
 vi.mock("../src/mcp/pet-scheduler.js", () => ({ PetScheduler: class { start() {} } }));
 vi.mock("../src/continuity.js", () => ({ ContinuityRunner: class {} }));
 vi.mock("../src/version.js", () => ({ VersionChecker: class { start() {} }, getCurrentVersion: () => "test" }));
@@ -73,6 +73,24 @@ it("automatically serves the local web UI from tomo start and retains messaging 
   expect(message).toBeDefined();
   const response = await fetch(message!.slice("Web UI: ".length));
   expect(response.status).toBe(200); expect(await response.text()).toContain("Tomo — Conversation");
+});
+it("hands the web process the scheduler's cron store path explicitly", async () => {
+  // A path no homedir()-based default could produce: the web process can only
+  // read this job if the daemon passed CRON_STORE_PATH through init.
+  mkdirSync(`${fixture.root}/scheduler-cron`, { recursive: true });
+  writeFileSync(`${fixture.root}/scheduler-cron/jobs.json`, JSON.stringify({ version: 1, revision: 1, jobs: [{ id: "job-1", name: "Startup chain job",
+    enabled: true, schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:owner", deleteAfterRun: false,
+    createdAt: 1, nextRunAt: 2, lastRunAt: null, lastStatus: null }] }));
+  await startCommand.parseAsync(["--foreground"], { from: "user" });
+  const link = fixture.messages.find((line) => typeof line === "string" && line.startsWith("Web UI: http://"))!.slice("Web UI: ".length);
+  const url = new URL(link);
+  const headers = { "x-tomo-request": "1", "sec-fetch-site": "same-origin" };
+  const boot = await fetch(`${url.origin}/api/v1/bootstrap${url.search}`, { headers });
+  expect(boot.status).toBe(200);
+  const cookie = boot.headers.getSetCookie()[0].split(";")[0];
+  const cron = await fetch(`${url.origin}/api/v1/cron`, { headers: { ...headers, cookie } });
+  expect(cron.status).toBe(200);
+  expect((await cron.json() as { jobs: Array<{ name: string }> }).jobs.map((job) => job.name)).toEqual(["Startup chain job"]);
 });
 it("omits the UI when disabled", async () => {
   fixture.enabled = false;

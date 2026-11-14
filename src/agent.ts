@@ -1956,6 +1956,11 @@ export class Agent {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);
   }
 
+  /** Read-only: SDK-reported MCP connection state of live sessions (web Study). */
+  readMcpStatuses() {
+    return this.liveSessionManager.readMcpStatuses();
+  }
+
   watchOverview(): { channels: string[]; sessions: WatchSessionInfo[] } {
     return {
       channels: this.channels.map((ch) => ch.name),

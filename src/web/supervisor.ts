@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { WebChannel, WebLifecycle } from "../channels/web.js";
 import type { WebDataOptions } from "./data.js";
+import type { McpConnection } from "../mcp/live-status.js";
 import { MAX_BUFFER_BYTES, rpcSchema, WebError } from "./protocol.js";
 import { validAccessToken } from "./access.js";
 import { writeWebStatus, type WebState, type WebStatusRecord } from "./status-file.js";
@@ -14,6 +15,8 @@ export interface WebSupervisorOptions extends WebDataOptions {
   externalOrigin?: string;
   port: number;
   assetsDir?: string;
+  /** SDK-reported MCP connection state of live sessions, per daemon key. */
+  mcpStatus?: () => Promise<Array<{ key: string; connections: McpConnection[] | null }>>;
   diagnostic?: (message: string, level?: DiagnosticLevel) => void;
 }
 /** Internal timing/entry overrides allow real-process failure tests without
@@ -241,6 +244,14 @@ export class WebSupervisor implements WebLifecycle {
           }
           if (input.method === "request") return this.channel.request(input.requestId);
           if (input.method === "task") return this.channel.task(input.sessionId, input.taskId, input.output, input.command ?? false);
+          if (input.method === "context-events") return this.channel.contextEvents(input.sessionId);
+          if (input.method === "mcp-status") {
+            const live = await this.options.mcpStatus?.() ?? [];
+            return live.flatMap((entry) => {
+              const sessionId = this.channel.sessionIdFor(entry.key);
+              return sessionId ? [{ sessionId, connections: entry.connections }] : [];
+            });
+          }
           if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
           return this.channel.receive(input.input);
         };
@@ -274,8 +285,8 @@ export class WebSupervisor implements WebLifecycle {
         settle();
       });
       child.once("exit", onGone);
-      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin,
+      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

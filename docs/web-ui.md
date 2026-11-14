@@ -85,6 +85,8 @@ Use the Tailscale access link from `web-access.log` on a device in that tailnet.
 
 The UI is React + Tailwind v4 (via `@tailwindcss/vite`) + shadcn/ui (new-york style, Radix primitives, lucide icons). Components live in `web/src/components/ui` (added with the shadcn CLI, imports via the `@/` alias); colours, radius and fonts are shadcn tokens defined in `web/src/styles.css` for light and `.dark`. The app sets `.dark` on `<html>` for an explicit dark theme, or for the system theme while the OS is dark. Keep Radix menus/dialogs non-modal: modal ones inject an inline `<style>` that the CSP blocks.
 
+Type: Tomo's replies and the brand use Source Serif 4 (400/600, self-hosted Latin subset in `web/src/fonts`, SIL OFL; the licence ships in `dist/web-assets/THIRD_PARTY_LICENSES.txt`); everything else — your messages, the UI, small labels and timestamps — uses the system sans. Chinese is always PingFang SC (the serif's `unicode-range` is Latin-only and both stacks name PingFang before any generic). Monospace is kept for code, file paths, config keys, tool calls and their input/output.
+
 ```sh
 npm ci
 npm run lint

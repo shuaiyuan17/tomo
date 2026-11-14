@@ -43,13 +43,13 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
       <h2 id="tasks-heading" className="m-0 text-base font-semibold tracking-[-0.1px]">Tasks</h2>
       {close}
     </div>
-    {ambient && <label className="mb-2.5 flex cursor-pointer items-center gap-2 px-2.5 font-mono text-[10px] text-muted-foreground">
+    {ambient && <label className="mb-2.5 flex cursor-pointer items-center gap-2 px-2.5 tracking-[0.02em] text-[10px] text-muted-foreground">
       <Checkbox checked={showAmbient} onCheckedChange={(value) => setShowAmbient(value === true)} className="size-3.5 rounded-[4px]" />
       Show watchers{view.hiddenAmbient ? ` (${view.hiddenAmbient})` : ""}</label>}
     <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-0" tabIndex={0} aria-label="Task list">
       {view.groups.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">Nothing running in the background.</p>
         : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
-          <p className="mt-1 mb-1 px-2.5 font-mono text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span className="opacity-80"> · group</span> : null}</p>
+          <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span className="opacity-80"> · group</span> : null}</p>
           <ul className="m-0 list-none space-y-0.5 p-0">{group.rows.map((row) => row.folded
             ? <FoldedShells key={`folded:${row.foldKey}`} tasks={row.folded} depth={row.depth} now={now}
                 open={!!openFolds[`${group.sessionId}/${row.foldKey}`]}
@@ -74,7 +74,7 @@ function TaskCard({ task, depth, now, onOpen }: { task: WebTask; depth: number; 
       <div className="flex min-w-0 items-baseline justify-between gap-2.5">
         {shell ? <span className="min-w-0"><ShellPill command={task.description} /></span>
           : <span className="text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>}
-        {running && <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
+        {running && <span className="shrink-0 tracking-[0.02em] text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
       </div>
       <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
         {running ? <><span className="shimmer">Working</span>{step && <> · {step}</>}</> : <>{STATE_LABELS[task.state]} · {time}</>}

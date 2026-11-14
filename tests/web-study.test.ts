@@ -6,7 +6,7 @@ import { MemoryReader } from "../src/workspace/memory-reader.js";
 import { CronStore } from "../src/cron/store.js";
 import { MAX_CRON_STORE_BYTES, WebCron, readSessionContext } from "../src/web/inspection.js";
 import { execFileSync } from "node:child_process";
-import { configFields, mcpServers, WebConfigReader } from "../src/web/config-view.js";
+import { configFields, isConfigSecretName, mcpServers, WebConfigReader } from "../src/web/config-view.js";
 import { computeContextStats } from "../src/lcm/stats.js";
 import { readSummaryBlocks } from "../src/lcm/summary-reader.js";
 import { McpLiveStatus } from "../src/mcp/live-status.js";
@@ -212,6 +212,23 @@ describe("config view", () => {
     expect(at("mcpServers.search.args")).toMatchObject({ secret: true });
     expect(at("mcpServers.search.timeout")).toMatchObject({ secret: false, value: 30 });
     expect(at("mcpServers.remote.url")).toMatchObject({ secret: true });
+  });
+
+  it("masks every credential-shaped name, including a bare `key`", () => {
+    const value = "plain-looking-value";
+    const config = { provider: { key: value }, Provider: { KEY: value }, a: { api_key: value, "api-key": value, apiKey: value, stripe_secret_key: value },
+      b: { token: value, accessToken: value, accesstoken: value, AUTH: value, auth_header: value, Credential: value, sessionCookie: value,
+        sentry_dsn: value, DSN: value, password: value, db_pass: value, keys: [value] }, shown: { model: value, port: 1 } };
+    const { fields } = configFields(config);
+    expect(fields.filter((f) => !f.secret).map((f) => f.path.join("."))).toEqual(["shown.model", "shown.port"]);
+    expect(JSON.stringify(fields.filter((f) => f.path[0] !== "shown"))).not.toContain(value);
+    expect(fields.find((f) => f.path.join(".") === "provider.key")).toEqual({ path: ["provider", "key"], secret: true, set: true });
+  });
+  it.each(["key", "KEY", "api_key", "apiKey", "my-key", "dsn", "SENTRY_DSN", "authToken", "clientsecret", "cookie", "Credential"])("treats %s as secret", (name) => {
+    expect(isConfigSecretName(name)).toBe(true);
+  });
+  it.each(["model", "port", "timezone", "allowlist", "enabled", "provider", "monkeyPatch"])("shows %s", (name) => {
+    expect(isConfigSecretName(name)).toBe(false);
   });
 
   it("lists saved MCP servers, including disabled ones, without their values", () => {

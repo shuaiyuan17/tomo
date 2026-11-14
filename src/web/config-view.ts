@@ -25,11 +25,30 @@ function secretShaped(value: string): boolean {
 function mcpServerPath(path: string[]): boolean {
   return (path[0] === "mcpServers" && path.length >= 3) || (path[0] === "mcp" && path[1] === "servers" && path.length >= 4);
 }
+/** Words that mask a config value when any word of any path segment is one
+ *  of them. Stricter than the log rule (`isSecretFieldName`, which lets a bare
+ *  `key` through because logs use it for session keys): a config display
+ *  would rather over-mask than show a credential. */
+const CONFIG_SECRET_WORDS = new Set(["key", "keys", "apikey", "apikeys", "token", "tokens", "secret", "secrets", "password", "passwords",
+  "passwd", "pwd", "pass", "auth", "authorization", "bearer", "credential", "credentials", "cookie", "cookies", "dsn", "signature", "privatekey"]);
+/** Run-together lowercase names (`accesstoken`, `clientsecret`) carry no word boundary to split on. */
+const CONFIG_SECRET_SUFFIXES = ["token", "secret", "password", "passwd", "apikey", "credential", "credentials", "cookie", "dsn"];
+/** Words of a field name, case-insensitive, split at camelCase, `_`, `-`, `.` and spaces. */
+function nameWords(name: string): string[] {
+  return name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/).filter(Boolean).map((word) => word.toLowerCase());
+}
+export function isConfigSecretName(name: string): boolean {
+  if (isSecretFieldName(name)) return true;
+  const words = nameWords(name);
+  if (words.some((word) => CONFIG_SECRET_WORDS.has(word))) return true;
+  return words.some((word) => CONFIG_SECRET_SUFFIXES.some((suffix) => word.endsWith(suffix)));
+}
 /** Masking is decided per leaf: a secret-named segment anywhere on the path
- *  (shared `isSecretFieldName` rule), an opaque MCP value, or a value that
- *  looks like a credential. Values are shown only when none applies. */
+ *  (`isConfigSecretName`), an opaque MCP value, or a value that looks like a
+ *  credential. Values are shown only when none applies. */
 function masked(path: string[], value: unknown): boolean {
-  if (path.some((segment) => isSecretFieldName(segment))) return true;
+  if (path.some((segment) => isConfigSecretName(segment))) return true;
   if (mcpServerPath(path) && !SAFE_MCP_KEYS.has(path[path[0] === "mcp" ? 3 : 2])) return true;
   const values = Array.isArray(value) ? value : [value];
   return values.some((item) => typeof item === "string" && secretShaped(item));

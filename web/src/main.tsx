@@ -213,7 +213,6 @@ export function App() {
   // already shown as a pending bubble / streamed block, so they don't again.
   const appeared = useAppeared(history.messages.map((m) => m.id), selectedId, historyStatus === "ready");
   const webRequestIds = new Set(web.requests.map((r) => r.requestId));
-  const [sentPulse, setSentPulse] = useState(0);
   const send = async (event: FormEvent) => {
     event.preventDefault();
     if (!session?.writable || !draft.trim() || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
@@ -229,7 +228,6 @@ export function App() {
       if (replaced) void dismiss(replaced, true);
       setResending(null);
       setDraft((old) => old.trim() === text ? "" : old);
-      setSentPulse((n) => n + 1);
       setFeedback(labels[request.state]); remember(null); setReload((r) => r + 1); atBottom.current = true;
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
@@ -421,7 +419,7 @@ export function App() {
               onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
-              disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp key={sentPulse} strokeWidth={2.2} className={cn(sentPulse > 0 && "motion-pop")} /></Button>
+              disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>
           </form>
           {feedback && <p className="feedback mt-2 text-xs text-muted-foreground" role="status">{feedback}</p>}
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}

@@ -158,8 +158,8 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
       const open = groupOpen(openGroups, block.key, last, running);
       const pending = running && last ? pendingTool(block.tools) : undefined;
       return <Collapsible key={block.key} open={open} onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} className="group/calls">
-        <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground">
-          <ChevronRight className="size-3.5 shrink-0 transition-transform duration-150 group-data-[state=open]/calls:rotate-90" />
+        <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
+          <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]/calls:rotate-90" />
           <span className="min-w-0 flex-1 truncate">{groupSummary(block.tools)}{pending && <> · <span className="shimmer">{pending.name}</span></>}</span>
         </CollapsibleTrigger>
         <CollapsibleContent className="space-y-0.5 border-l border-border/70 py-0.5 pl-1.5 ml-3">

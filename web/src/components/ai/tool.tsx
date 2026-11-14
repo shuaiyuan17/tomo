@@ -36,7 +36,7 @@ export function ToolHeader({ title, state, className }: { title: string; state: 
 }
 
 export function ToolContent({ className, ...props }: ComponentProps<typeof CollapsibleContent>) {
-  return <CollapsibleContent className={cn("motion-collapsible space-y-2.5 pt-1.5 pb-2 pl-6", className)} {...props} />;
+  return <CollapsibleContent className={cn("space-y-2.5 pt-1.5 pb-2 pl-6", className)} {...props} />;
 }
 
 /** A labelled, scrollable block of text with a capped "Show more". */

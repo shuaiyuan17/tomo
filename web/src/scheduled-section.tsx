@@ -31,7 +31,7 @@ export function ScheduledSection({ revision, onNavigate }: { revision: number; o
       const Icon = oneShot ? CalendarClock : Repeat;
       return <li key={job.id}>
         <button type="button" onClick={() => go(cronJobHash(job.id))} title={`${job.scheduleLabel}\n${job.sessionKey}`}
-          className="block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors duration-150 hover:bg-foreground/[0.06] focus-visible:outline-offset-0">
+          className="block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.06] focus-visible:outline-offset-0">
           <span className="block text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{job.name}</span>
           <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
             <time dateTime={new Date(job.nextRunAt!).toISOString()} className="tabular-nums">{formatUntil(job.nextRunAt!, now)}</time>

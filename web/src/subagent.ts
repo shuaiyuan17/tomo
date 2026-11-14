@@ -212,11 +212,21 @@ export function groupSummary(tools: ToolRow[]): string {
 }
 
 /**
- * Whether a group is open: the reader's own choice if made; otherwise only
- * the last block while the task runs (the run that is still growing).
+ * Whether a group is open: the reader's own choice if made; otherwise closed
+ * (every group, the growing last one too: its summary line names the running call).
  */
-export function groupOpen(choices: Readonly<Record<string, boolean>>, key: string, isLastBlock: boolean, running: boolean): boolean {
-  return choices[key] ?? (isLastBlock && running);
+export function groupOpen(choices: Readonly<Record<string, boolean>>, key: string): boolean {
+  return choices[key] ?? false;
+}
+
+/**
+ * A group's summary line, split so the running part can shimmer:
+ * "5 tool calls · Read ×3, Bash" or, while a call is still running,
+ * "5 tool calls · " + "Running Bash…".
+ */
+export function groupLabel(tools: ToolRow[], pending?: ToolRow): { lead: string; running?: string } {
+  if (!pending) return { lead: groupSummary(tools) };
+  return { lead: `${tools.length} tool calls · `, running: `Running ${pending.name}…` };
 }
 
 /** The call still waiting for its result in a running group, if any. */

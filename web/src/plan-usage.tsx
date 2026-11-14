@@ -16,6 +16,13 @@ import { isWarn, localizeUsage, nextUsageDelay, RequestGate, resetLabel, splitWi
 export function PlanUsage({ ready }: { ready: boolean }) {
   const [usage, setUsage] = useState<WebUsage>();
   const [loading, setLoading] = useState(false);
+  // The refresh icon spins while loading and finishes its turn instead of
+  // snapping back when a read comes back quickly.
+  const [spinning, setSpinning] = useState(false);
+  useEffect(() => {
+    if (loading) setSpinning(true);
+    else if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) setSpinning(false);
+  }, [loading]);
   const [failed, setFailed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   // The latest answer, for scheduling outside React's render cycle.
@@ -69,13 +76,13 @@ export function PlanUsage({ ready }: { ready: boolean }) {
       <p className="eyebrow m-0" id="usage-heading">Plan usage{usage?.plan ? <span className="normal-case tracking-normal"> · {usage.plan}</span> : null}</p>
       <Button variant="ghost" size="icon" aria-label="Refresh plan usage" title="Refresh" disabled={loading} onClick={() => void load(true)}
         className="-my-1 size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-3.5">
-        <RefreshCw className={cn(loading && "animate-spin")} strokeWidth={1.75} /></Button>
+        <RefreshCw className={cn(spinning && "animate-spin")} onAnimationIteration={() => { if (!loading) setSpinning(false); }} strokeWidth={1.75} /></Button>
     </div>
     {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">Loading…</p>}
     {main.length > 0 && <div className="space-y-3.5">{main.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} />)}</div>}
     {scoped.length > 0 && <Collapsible className="group/models mt-3">
       <CollapsibleTrigger className="flex items-center gap-1 rounded-md px-0.5 py-0.5 text-[12px] text-muted-foreground transition-colors hover:text-foreground">
-        <ChevronRight className="size-3.5 transition-transform duration-150 group-data-[state=open]/models:rotate-90" />By model ({scoped.length})</CollapsibleTrigger>
+        <ChevronRight className="size-3.5 transition-transform group-data-[state=open]/models:rotate-90" />By model ({scoped.length})</CollapsibleTrigger>
       <CollapsibleContent className="mt-2.5 space-y-3">{scoped.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} compact />)}</CollapsibleContent>
     </Collapsible>}
     {notice && <p className={cn("m-0 text-[12px] leading-relaxed text-muted-foreground", main.length && "mt-3")} role="status">{usage?.stale ? `${notice} Showing the last reading.` : notice}</p>}

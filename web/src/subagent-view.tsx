@@ -10,7 +10,7 @@ import { isShellTask } from "./shell.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
 import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
-import { followStep, groupOpen, groupRows, groupSummary, INITIAL_TRANSCRIPT, isOutputTask, pendingTool, POLL_MS, transcriptReducer, viewRows,
+import { followStep, groupLabel, groupOpen, groupRows, INITIAL_TRANSCRIPT, isOutputTask, pendingTool, POLL_MS, transcriptReducer, viewRows,
   type ToolRow, type TranscriptAction } from "./subagent.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { STATE_LABELS, taskKind } from "./tasks.js";
@@ -155,12 +155,12 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
         <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from Tomo</p>
         <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
       if (block.kind === "tool") return <ToolCall key={block.row.id} row={block.row} running={running} />;
-      const open = groupOpen(openGroups, block.key, last, running);
-      const pending = running && last ? pendingTool(block.tools) : undefined;
+      const open = groupOpen(openGroups, block.key);
+      const label = groupLabel(block.tools, running && last ? pendingTool(block.tools) : undefined);
       return <Collapsible key={block.key} open={open} onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} className="group/calls">
-        <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground">
-          <ChevronRight className="size-3.5 shrink-0 transition-transform duration-150 group-data-[state=open]/calls:rotate-90" />
-          <span className="min-w-0 flex-1 truncate">{groupSummary(block.tools)}{pending && <> · <span className="shimmer">{pending.name}</span></>}</span>
+        <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
+          <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]/calls:rotate-90" />
+          <span className="min-w-0 flex-1 truncate">{label.lead}{label.running && <span className="shimmer">{label.running}</span>}</span>
         </CollapsibleTrigger>
         <CollapsibleContent className="space-y-0.5 border-l border-border/70 py-0.5 pl-1.5 ml-3">
           {block.tools.map((row) => <ToolCall key={row.id} row={row} running={running} />)}

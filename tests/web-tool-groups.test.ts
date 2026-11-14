@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupOpen, groupRows, groupSummary, pendingTool, viewRows, type ToolRow } from "../web/src/subagent.js";
+import { groupLabel, groupOpen, groupRows, groupSummary, pendingTool, viewRows, type ToolRow } from "../web/src/subagent.js";
 import type { SubagentItem } from "../src/web/protocol.js";
 
 let n = 0;
@@ -40,12 +40,16 @@ describe("tool-call groups", () => {
     expect(pendingTool(running)?.name).toBe("Bash");
   });
 
-  it("open state: the reader's choice sticks to the key; by default only the growing last group while running", () => {
-    expect(groupOpen({}, "k", true, true)).toBe(true);
-    expect(groupOpen({}, "k", false, true)).toBe(false);
-    expect(groupOpen({}, "k", true, false)).toBe(false);
-    expect(groupOpen({ k: false }, "k", true, true)).toBe(false);
-    expect(groupOpen({ k: true }, "k", false, false)).toBe(true);
+  it("a closed running group still says what it is doing: the count, then the running call", () => {
+    const running = viewRows([...call("Read", "1"), ...call("Read", "2"), ...call("Bash", "3", false)]) as ToolRow[];
+    expect(groupLabel(running, pendingTool(running))).toEqual({ lead: "3 tool calls · ", running: "Running Bash…" });
+    expect(groupLabel(running)).toEqual({ lead: groupSummary(running) });
+  });
+
+  it("open state: every group starts closed, the running last one too; the reader's choice sticks to the key", () => {
+    expect(groupOpen({}, "k")).toBe(false);
+    expect(groupOpen({ k: false }, "k")).toBe(false);
+    expect(groupOpen({ k: true }, "k")).toBe(true);
     // The key survives growth, so a stored choice keeps applying after new calls arrive.
     const before = groupRows(viewRows([...call("Read", "g1"), ...call("Read", "g2")]));
     const after = groupRows(viewRows([...call("Read", "g1"), ...call("Read", "g2"), ...call("Bash", "g3")]));

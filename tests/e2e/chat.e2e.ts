@@ -365,3 +365,27 @@ it("refuses a compact request from an earlier daemon epoch (real supervisor epoc
   expect(result).toEqual([409, "epoch_changed"]);
   expect(mockSdk.promptsBySession).toHaveLength(0);
 });
+
+it("motion: new messages rise in, the rail transitions open and closed, and reduced motion turns it all off", async () => {
+  mockSdk.responseFn = () => "A fresh reply.";
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("hello"); await input.press("Enter");
+  const reply = page.locator("article.message.assistant").filter({ hasText: "A fresh reply." }).first();
+  await browserExpect(reply).toBeVisible();
+  // The rail opens with a transition and is gone after closing.
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(page.locator("#tasks-rail")).toHaveAttribute("data-state", "open");
+  // Wide screens: the rail's own box never animates (the chat would reflow every frame); its content slides.
+  const rail = await page.locator("#tasks-rail").evaluate((el) => [getComputedStyle(el).transitionProperty, getComputedStyle(el.firstElementChild!).transitionProperty]);
+  expect(rail[0]).not.toMatch(/width|padding/);
+  expect(rail[1]).toMatch(/opacity/);
+  await page.getByRole("button", { name: "Close tasks" }).click();
+  await browserExpect(page.locator("#tasks-rail")).toHaveCount(0);
+  // With reduced motion, no animation or transition runs.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const style = await page.evaluate(() => {
+    const el = document.createElement("div"); el.className = "motion-enter transition-colors"; document.body.append(el);
+    const cs = getComputedStyle(el); const out = [cs.animationName, cs.transitionDuration]; el.remove(); return out;
+  });
+  expect(style).toEqual(["none", "0s"]);
+});

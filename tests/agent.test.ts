@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { normalizeSendTarget } from "../src/agent/send-target.js";
+import { extractAttachments, extractMedia, isSilentReply } from "../src/agent/text-utils.js";
+import { injectTimestamp } from "../src/agent/turn-runner.js";
+import { summarizeToolInput } from "../src/agent/live-session.js";
 import { DEFAULT_MODEL, MODEL_ALIASES, PICKER_MODELS, resolveModelName } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
@@ -8,11 +11,6 @@ import {
   liteLlmModeLabel,
   parseLiteLlmMode,
 } from "../src/litellm.js";
-
-// Test the silent reply detection (extracted logic)
-function isSilentReply(text: string): boolean {
-  return /^\s*NO_REPLY\s*$/i.test(text);
-}
 
 describe("isSilentReply", () => {
   it("detects NO_REPLY", () => {
@@ -40,18 +38,6 @@ describe("isSilentReply", () => {
   });
 });
 
-// Test timestamp injection (extracted logic)
-function injectTimestamp(text: string): string {
-  const now = new Date("2026-04-06T17:30:00-07:00");
-  const weekday = now.toLocaleDateString("en-US", { weekday: "short" });
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  const date = `${mm}/${dd}`;
-  const time = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
-  const tz = now.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
-  return `[${weekday} ${date} ${time} ${tz}] ${text}`;
-}
-
 describe("injectTimestamp", () => {
   it("prepends timestamp to message", () => {
     const result = injectTimestamp("hello");
@@ -63,33 +49,6 @@ describe("injectTimestamp", () => {
     expect(result).toContain("test message");
   });
 });
-
-// Test MEDIA extraction (extracted logic from agent.ts)
-const MEDIA_RE = /\bMEDIA:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
-const STICKER_RE = /\bSTICKER:\s*(?:"([^"\n]+)"|([^\s\n"]+))/gi;
-
-function extractMedia(text: string): { cleanText: string; mediaPaths: string[] } {
-  const mediaPaths: string[] = [];
-  const cleanText = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
-    mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
-    return "";
-  }).trim();
-  return { cleanText, mediaPaths };
-}
-
-function extractAttachments(text: string): { cleanText: string; mediaPaths: string[]; stickerIds: string[] } {
-  const mediaPaths: string[] = [];
-  const stickerIds: string[] = [];
-  const withoutMedia = text.replace(MEDIA_RE, (_match, quotedPath, unquotedPath) => {
-    mediaPaths.push(String(quotedPath ?? unquotedPath).trim());
-    return "";
-  });
-  const cleanText = withoutMedia.replace(STICKER_RE, (_match, quotedId, unquotedId) => {
-    stickerIds.push(String(quotedId ?? unquotedId).trim());
-    return "";
-  }).trim();
-  return { cleanText, mediaPaths, stickerIds };
-}
 
 describe("extractMedia", () => {
   it("extracts single media path", () => {
@@ -151,22 +110,6 @@ describe("extractAttachments", () => {
   });
 });
 
-// Test tool input summarization (extracted logic from agent.ts)
-function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
-  if (!input) return name;
-  switch (name) {
-    case "Read": return `Read ${input.file_path}`;
-    case "Write": return `Write ${input.file_path}`;
-    case "Edit": return `Edit ${input.file_path}`;
-    case "Bash": return `Bash: ${String(input.command).slice(0, 80)}`;
-    case "Glob": return `Glob ${input.pattern}`;
-    case "Grep": return `Grep "${input.pattern}"`;
-    case "WebSearch": return `WebSearch: ${input.query}`;
-    case "WebFetch": return `WebFetch: ${input.url}`;
-    default: return `${name}: ${JSON.stringify(input).slice(0, 100)}`;
-  }
-}
-
 describe("summarizeToolInput", () => {
   it("returns tool name when no input", () => {
     expect(summarizeToolInput("Read")).toBe("Read");
@@ -186,10 +129,10 @@ describe("summarizeToolInput", () => {
   });
 
   it("formats Bash with truncated command", () => {
-    const longCommand = "npm run build && npm test && echo done " + "x".repeat(100);
+    const longCommand = "npm run build && npm test && echo done " + "x".repeat(1000);
     const result = summarizeToolInput("Bash", { command: longCommand });
-    expect(result.startsWith("Bash: ")).toBe(true);
-    expect(result.length).toBeLessThanOrEqual(86); // "Bash: " (6) + 80
+    expect(result.startsWith("Bash: npm run build")).toBe(true);
+    expect(result.length).toBe(506); // "Bash: " (6) + 500
   });
 
   it("formats Glob with pattern", () => {
@@ -209,10 +152,22 @@ describe("summarizeToolInput", () => {
   });
 
   it("formats unknown tools with JSON truncation", () => {
-    const input = { key: "a".repeat(200) };
+    const input = { key: "a".repeat(1000) };
     const result = summarizeToolInput("CustomTool", input);
-    expect(result.startsWith("CustomTool: ")).toBe(true);
-    expect(result.length).toBeLessThanOrEqual(112); // "CustomTool: " (12) + 100
+    expect(result.startsWith('CustomTool: {"key":"aaa')).toBe(true);
+    expect(result.length).toBe(512); // "CustomTool: " (12) + 500
+  });
+
+  it("scrubs secret values before they reach the log line", () => {
+    const result = summarizeToolInput("Bash", { command: "curl -H 'Authorization: Bearer abcdef123456' https://x" });
+    expect(result.startsWith("Bash: curl")).toBe(true);
+    expect(result).not.toContain("abcdef123456");
+  });
+
+  it("formats Agent/Task with subagent type and description", () => {
+    expect(summarizeToolInput("Agent", { subagent_type: "Explore", description: "find callers" }))
+      .toBe("Agent → Explore: find callers");
+    expect(summarizeToolInput("Task", {})).toBe("Agent → ?: ");
   });
 });
 

@@ -593,7 +593,8 @@ function summarizeToolResult(content: unknown): string {
   return scrubSecretValues(JSON.stringify(content).slice(0, 500));
 }
 
-function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
+/** Exported for tests. */
+export function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
   return scrubSecretValues(describeToolInput(name, input));
 }
 

@@ -59,6 +59,7 @@ src/
   web/                # Optional supervised HTTP/SSE process, bounded RPC, local security
   sessions/           # Persistence (store.ts + transcript-names/-rotation/-order.ts, store-support.ts),
                       #   key helpers (keys.ts), summon-store.ts
+  credentials/        # Credential broker, off by default: broker.ts (request, capture), store.ts (keychain over stdin), redactor.ts (literal scrub), exec.ts (env injection)
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
                       #   (cron-, people-, recall-, pet-tools); external-config.ts, oauth.ts
   cron/               # Scheduler (30s poll → agent.handleCronMessage) + store (data/cron/jobs.json)

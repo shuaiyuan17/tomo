@@ -11,6 +11,8 @@ import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
+import { CREDENTIAL_TOOL_NAMES } from "../credentials/names.js";
+import { scrubDeep } from "../credentials/redactor.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -218,6 +220,7 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__lcm_rollup`,
       // Registered only on the owner's DM session (internal-server.ts).
       `mcp__${TOMO_INTERNAL_MCP_NAME}__home_check`,
+      ...(config.credentialBroker?.enabled ? CREDENTIAL_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`) : []),
       ...externalMcpAllowedTools,
     ],
     // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path
@@ -290,6 +293,7 @@ export function sdkOptions(
       // Which group is steering a summoned turn, so the allowlist is judged
       // against that group's key rather than the owner's dm: key.
       scopedCallerKey: sessionContext?.scopedCallerKey,
+      credentialBroker: config.credentialBroker?.enabled === true,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     env: sdkEnv,
@@ -446,8 +450,13 @@ export function buildHooksOption(args: {
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
+  /** Scrub known credentials from tool output. */
+  credentialBroker?: boolean;
 }) {
   const hooks: Record<string, unknown[]> = {};
+  if (args.credentialBroker) {
+    mergeHooks(hooks, credentialRedactionHooks());
+  }
   // The reminders count toward a wall; with no limit (0) there is none to warn about.
   if (args.turnBudget && args.maxTurns > 0) {
     mergeHooks(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
@@ -492,6 +501,29 @@ export function mergeHooks(
     into[event] = [...(into[event] ?? []), ...entries];
   }
   return into;
+}
+
+/**
+ * Replaces a tool's output when it contains a known credential, before the model
+ * or the session file gets it. Successful calls only: the CLI cannot rewrite a
+ * failed tool's output, so a Bash command that prints a value and then exits
+ * non-zero is not scrubbed (pinned in tests/e2e/credential-hooks.e2e.ts).
+ */
+export function credentialRedactionHooks() {
+  return {
+    PostToolUse: [{
+      hooks: [async (input: { tool_response?: unknown }) => {
+        const scrubbed = scrubDeep(input.tool_response);
+        if (scrubbed === input.tool_response) return {};
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PostToolUse" as const,
+            updatedToolOutput: scrubbed,
+          },
+        };
+      }],
+    }],
+  };
 }
 
 /**

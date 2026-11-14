@@ -40,8 +40,20 @@ Tomo is a single-user daemon on a machine the user owns. It runs the Claude Agen
 | Per-agent permission scoping (`agentProfiles`): write fences, secret paths, Bash modes, enforced by a `PreToolUse` hook that a bypass-permissions session cannot skip | `src/agent/permissions.ts` |
 | Harness envelopes are injection-escaped so user text cannot forge a `<tomo-event>`; model-authored inbound markers are flagged before delivery | `src/tomo-event.ts`, `src/agent/inbound-markers.ts` |
 | Secrets redacted from logs; config written `0600` | `src/logger.ts`, `src/config.ts` |
+| With `credentialBroker.enabled`: an owner's reply to a credential request reaches no transcript, log or model turn; credential tools refuse anything but the owner's own private turn. Limits below. | `src/credentials/`, `src/agent.ts` |
 
 Something that lets an untrusted input cross one of these lines is in scope. Examples: a message from a non-allowlisted sender that reaches the model, a group turn that reads a private record, a subagent that writes outside its profile, a crafted attachment that escapes the store directory.
+
+## Credential broker: what it does not stop
+
+The broker (off by default) has one job: when the owner is clearly sending a password, it does not go straight through the model. **It does not defend against a malicious or compromised model.** That model has a shell as the same user. Reports of the following are known and not vulnerabilities.
+
+- **The model can read the keychain itself.** Values are stored in the login keychain by `/usr/bin/security`, and that binary is on the item's default access list, so the agent can run `security find-generic-password -s tomo-credential-broker -a <name> -w` from Bash and expect no prompt. Nothing blocks this.
+- **chat.db holds the plaintext.** A value sent through `request_credential` stays in the Messages database until the owner deletes the message (and in iCloud Messages, if enabled), and the agent can read that database.
+- **A command given a value can do anything with it.** `run_with_secrets` scrubs the literal value from output. Any encoding or transformation, or a `curl` to another host, gets past it.
+- **Scrubbing is partial.** It covers the literal value in tool results that succeed. The CLI cannot rewrite a failed tool's output, so a Bash command that prints a value and exits non-zero is not scrubbed. Images are not scrubbed. A value is only known once stored or loaded in this process, so a replaced value stops being scrubbed after a restart. Output merged by the command itself (`2>&1`) can split a value. Printing a candidate shows whether it was redacted, which confirms a guess.
+- **Replies around the window can reach the model.** A message sent well after the five-minute timeout, or a second bubble after the captured one, is an ordinary message. A message's send time is judged with two minutes of slack, so clock skew beyond that can pass a late reply. A reply beginning with one of Tomo's slash commands runs as that command.
+- **`purpose` is written by the agent.** The prompt labels it unverified, but it can mislead the owner.
 
 ## Usually not a security bug
 

@@ -13,7 +13,7 @@ import {
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { OwnerRouter, type SessionResolution } from "./router.js";
-import { ignoredAllowlistDmEntries, isOwnerHandle, ownerSessionKey } from "./owner.js";
+import { ignoredAllowlistDmEntries, isOwnerHandle, ownerBindings, ownerSessionKey } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
 import {
   annotateSenderName,
@@ -47,6 +47,8 @@ import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryE
 import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
+import { CredentialBroker } from "./credentials/broker.js";
+import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
@@ -108,6 +110,8 @@ const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 
 export class Agent {
   private channels: Channel[] = [];
+  /** Null unless `credentialBroker.enabled`. Read by the internal MCP server. */
+  readonly credentialBroker: CredentialBroker | null;
   private sessions: SessionStore;
   private router: OwnerRouter;
   /** Owner-facing, rate-limited trace of inbound messages the admission gate refused. */
@@ -413,10 +417,33 @@ export class Agent {
         }),
     });
 
+    this.credentialBroker = this.createCredentialBroker();
+
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
       this.modelOverrides.set(key, model);
     }
+  }
+
+  /** The broker when `credentialBroker.enabled`, else null. */
+  private createCredentialBroker(): CredentialBroker | null {
+    if (!config.credentialBroker?.enabled) return null;
+    const broker = new CredentialBroker({
+      backend: new KeychainBackend(),
+      stateFile: new BrokerStateFile(join(config.tomoHome, "data", "credentials", "state.json")),
+      isOwnerSender: (channelName, senderId) => this.router.isOwnerSender(channelName, senderId),
+      ownerImessage: () => {
+        const channel = this.getChannel("imessage");
+        const chatId = ownerBindings(config.owner, "imessage")[0];
+        return channel && chatId ? { channel, chatId } : null;
+      },
+      notifySession: (sessionKey, body) => {
+        this.handleCronMessage(formatTomoEvent("credential", body, { name: "result" }), sessionKey, { showTyping: false })
+          .catch((err) => log.error({ err, sessionKey }, "Credential result turn failed to queue"));
+      },
+    });
+    void broker.primeRedaction();
+    return broker;
   }
 
   /** Look up a channel by name */
@@ -729,6 +756,12 @@ export class Agent {
       } else {
         this.blockedInbound.record(channel.name, message.chatId, isGroup);
       }
+      return true;
+    }
+
+    // Before routing, the batcher, the transcript and the log line in
+    // handleMessage: a message taken here reaches none of them.
+    if (this.credentialBroker && await this.credentialBroker.handleInbound(channel, message)) {
       return true;
     }
 
@@ -2548,6 +2581,7 @@ export class Agent {
     this.runningAgents?.freeze();
     this.detachRunningAgents?.();
     this.detachRunningAgents = undefined;
+    this.credentialBroker?.shutdown();
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;

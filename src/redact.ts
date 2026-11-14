@@ -21,6 +21,7 @@
  * name list into the paths pino understands, and `[Redacted]` (pino's default
  * censor) is what lands in the log.
  */
+import { scrubKnownSecrets } from "./credentials/redactor.js";
 
 /**
  * Substrings that make a field name a credential regardless of what surrounds
@@ -436,7 +437,8 @@ export const LOG_REDACT_PATHS: string[] = ["Authorization", "authorization", "Co
  */
 export function scrubSecretValues(text: string): string {
   if (!text) return text;
-  let out = text;
+  // Values the credential broker holds, which have no recognisable shape.
+  let out = scrubKnownSecrets(text);
   for (const [pattern, replacement] of TEXT_SECRET_PATTERNS) {
     out = out.replace(pattern, replacement);
   }

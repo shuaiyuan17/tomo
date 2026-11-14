@@ -402,6 +402,12 @@ Environment variables override config file values:
 | `TOMO_METRICS_PORT` | Metrics port (config key `metrics.port`, default: `9464`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
 
+### Credential Broker (`credentialBroker`)
+
+`{ "credentialBroker": { "enabled": true } }` keeps a password you send on request away from the model. `request_credential` asks you on your iMessage DM and takes your next message there as the value, before it reaches the transcript, the logs or the model. The value goes in the login keychain, and the agent uses it through `run_with_secrets`, which puts it in a command's environment. Known values are scrubbed from tool output and logs.
+
+This prevents accidents. It does not stop a model trying to get the value: see [SECURITY.md](SECURITY.md).
+
 ### Per-Agent Permission Scoping (`agentProfiles`)
 
 Every session runs the Claude Agent SDK in `bypassPermissions` mode, and the SDK propagates that mode into subagents — so a subagent tomo dispatches inherits your whole machine. `AgentDefinition` scopes **tools** and has no notion of a **path**, which means `tools: Read, Grep, Glob, Bash` on an agent described as "read-only reviewer" is a full shell.

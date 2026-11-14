@@ -584,6 +584,11 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  forgetMessage(chatId: string, messageId: string): void {
+    const ring = this.recentByChat.get(chatId);
+    if (ring) this.recentByChat.set(chatId, ring.filter((m) => m.id !== messageId));
+  }
+
   private recordRecentMessage(chatId: string, message: RecentChatMessage): void {
     const ring = this.recentByChat.get(chatId) ?? [];
     if (ring.some((m) => m.id === message.id)) return;

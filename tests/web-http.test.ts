@@ -56,6 +56,7 @@ beforeEach(async () => {
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
+      if (input.method === "compact") return channel.requestCompact();
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
@@ -180,6 +181,23 @@ describe("local HTTP boundary", () => {
     const res = await call("/api/v1/usage");
     expect(res.status).toBe(200);
     expect(JSON.parse(res.text)).toMatchObject({ state: "timeout", windows: [] });
+  });
+  it("compact requests need CSRF and the epoch, reach the owner's compact, and are refused while tasks run", async () => {
+    const compact = vi.fn((_key: string, _settled: (outcome: "done" | "unverified" | "failed") => void) => "queued" as const);
+    (channel as unknown as { compact: typeof compact }).compact = compact;
+    const post = (headers: Record<string, string | undefined>) => call("/api/v1/compact-request", { method: "POST", headers, body: "{}" });
+    expect((await post({ ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
+    expect((await post({ ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
+    const ok = await post(mutationHeaders());
+    expect(ok.status).toBe(202);
+    expect(JSON.parse(ok.text)).toMatchObject({ status: "queued", requestId: expect.any(String) });
+    expect(compact).toHaveBeenCalledTimes(1);
+    const { watchBus } = await import("../src/watch/bus.js");
+    watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [{ taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: true, startedAt: 1 }] });
+    const busy = await post(mutationHeaders());
+    expect(busy.status).toBe(409);
+    expect(JSON.parse(busy.text)).toEqual({ error: "tasks_running" });
+    expect(compact).toHaveBeenCalledTimes(1);
   });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",

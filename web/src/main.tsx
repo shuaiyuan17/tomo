@@ -8,6 +8,7 @@ import { MessageBody } from "./message-body.js";
 import { findQuoted, parseReply } from "./reply.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { PlanUsage } from "./plan-usage.js";
+import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
@@ -349,7 +350,11 @@ export function App() {
           </DropdownMenuContent>
         </DropdownMenu>
         <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : "The same conversation you share with Tomo across your messaging channels."}</p>
-        <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="context-heading"><p className="eyebrow mb-3" id="context-heading">Context window</p>
+        <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="context-heading">
+          <div className="mb-3 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">Context window</p>
+            <CompactButton bootstrap={web.bootstrap} refresh={web.refreshBootstrap} ownerSession={!!session && session.id === web.bootstrap?.ownerId}
+              running={web.tasks.filter((t) => t.sessionId === web.bootstrap?.ownerId && t.state === "running" && !t.ambient).length}
+              request={web.compact} /></div>
           <p className="mb-3 text-lg tabular-nums">{hasContext ? <>{usage!.contextUsed.toLocaleString()} <span className="text-xs text-muted-foreground">/ {usage!.contextMax.toLocaleString()}</span></> : "Unavailable"}</p>
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>

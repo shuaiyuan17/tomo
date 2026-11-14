@@ -179,6 +179,16 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!parsed.success || (req.method === "PATCH") !== (parsed.data.enabled !== undefined)) throw new WebError(400, "invalid_cron_change");
         json(res, 200, await deps.data.cron.change(url.pathname.split("/").at(-1)!, parsed.data.revision, parsed.data.enabled));
         return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/compact-request") {
+        // Same gate as sending a message: CSRF, the owner, the daemon epoch.
+        csrf.verify(req, session!);
+        await body(req);
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
+        json(res, 202, await deps.rpc({ method: "compact", epoch }));
+        return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/messages") {
         csrf.verify(req, session!);
         const parsed = messageInputSchema.safeParse(await body(req));

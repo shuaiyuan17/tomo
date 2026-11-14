@@ -1079,6 +1079,16 @@ export class Agent {
     return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(owner.name);
   }
 
+  /**
+   * The owner asked for a compact of their own session from the web UI (see
+   * ContextNudger.requestCompact). `sessionKey` is the owner conversation the
+   * web shows (its catalog rule, possibly a legacy key), chosen by the caller.
+   */
+  requestOwnerCompact(sessionKey: string, onSettled?: (outcome: "done" | "unverified" | "failed") => void): "queued" | "already_requested" | "no_owner" {
+    if (!config.owner) return "no_owner";
+    return this.contextNudger.requestCompact(sessionKey, onSettled);
+  }
+
   /** Context-pressure nudge after a completed turn — see ContextNudger. */
   private maybeNudgeCompact(key: string, ctx: QueryResult | null = this.liveSessionManager.lastResult(key)): void {
     this.contextNudger.maybeNudgeCompact(key, ctx);

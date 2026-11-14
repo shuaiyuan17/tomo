@@ -29,7 +29,7 @@ beforeEach(async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
-  agent = new Agent(); channel = new WebChannel(mockConfig.owner); provider = new MockChannel("telegram");
+  agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled) }); provider = new MockChannel("telegram");
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
@@ -334,4 +334,34 @@ it("shows the Plan usage card with a named state and a refresh button", async ()
   await browserExpect(card).toContainText("Usage isn't available here.");
   await card.getByRole("button", { name: "Refresh plan usage" }).click();
   await browserExpect(card).toContainText("Not updated yet");
+});
+
+it("asks Tomo to compact from the context card, after a confirm; greyed out while tasks run", async () => {
+  mockSdk.responseFn = () => "NO_REPLY";
+  const button = page.getByRole("button", { name: "Compact context" });
+  await browserExpect(button).toBeEnabled();
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [{ taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: true, startedAt: Date.now() }] });
+  await browserExpect(page.getByRole("button", { name: "1 task running — wait for it to finish" })).toBeDisabled();
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [] });
+  await page.getByRole("button", { name: "Compact context" }).click();
+  await page.getByRole("button", { name: "Compact", exact: true }).click();
+  await browserExpect.poll(() => mockSdk.promptsBySession.length).toBe(1);
+  // The turn finished but the mock's context did not drop: reported as unverified, never as "Compacted".
+  await browserExpect(page.getByText(/may have skipped/)).toBeVisible();
+  await browserExpect(page.getByText("Compacted")).toHaveCount(0);
+  expect(mockSdk.promptsBySession[0].sessionKey).toBe("dm:owner");
+  expect(JSON.stringify(mockSdk.promptsBySession[0])).toContain("The owner requested a compact from the web UI.");
+  expect(provider.delivered).toHaveLength(0);
+});
+
+it("refuses a compact request from an earlier daemon epoch (real supervisor epoch check)", async () => {
+  const result = await page.evaluate(async () => {
+    const headers = { "x-tomo-request": "1" };
+    const bootstrap = await (await fetch("/api/v1/bootstrap", { headers })).json();
+    const res = await fetch("/api/v1/compact-request", { method: "POST", headers: { ...headers, "content-type": "application/json",
+      "x-tomo-csrf": bootstrap.csrfToken, "x-tomo-epoch": crypto.randomUUID() }, body: "{}" });
+    return [res.status, (await res.json()).error];
+  });
+  expect(result).toEqual([409, "epoch_changed"]);
+  expect(mockSdk.promptsBySession).toHaveLength(0);
 });

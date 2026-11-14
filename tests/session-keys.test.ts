@@ -56,6 +56,11 @@ describe("normalizeImessageHandle", () => {
     ["4695550123", "4695550123"],
     ["5555550123", "5555550123"],
     ["Alex@Example.COM", "alex@example.com"],
+    // URI schemes are dropped, whatever their case.
+    ["tel:+1 (555) 555-0123", "+15555550123"],
+    ["TEL:15555550123", "+15555550123"],
+    ["sms:+15555550123", "+15555550123"],
+    ["mailto:Alex@Example.COM", "alex@example.com"],
     ["iMessage;-;+15555550123", "+15555550123"],
     ["SMS;-;+1 555 555 0123", "+15555550123"],
     ["any;-;Alex@Example.com", "alex@example.com"],

@@ -542,6 +542,10 @@ describe("iMessage handles: one normal form shared with sessions/keys", () => {
       [" +86 138 0013 8000 ", "+8613800138000"],
       ["iMessage;-;+14155551234", "+14155551234"],
       ["urn:biz:1234-abc", "urn:biz:1234-abc"],
+      ["tel:+14155551234", "+14155551234"],
+      ["TEL:+1 (415) 555-1234", "+14155551234"],
+      ["sms:+8613800138000", "+8613800138000"],
+      ["mailto:Foo@Bar.COM", "foo@bar.com"],
     ];
     for (const [raw, expected] of cases) {
       expect(normalizeHandle("imessage", raw)).toBe(expected);
@@ -594,6 +598,17 @@ describe("iMessage handles: one normal form shared with sessions/keys", () => {
         if (legacy(s) === legacy(sender)) expect(matchStored(s, sender), `${s} vs ${sender}`).toBe(true);
       }
     }
+  });
+
+  it("a URI scheme on either side does not stop a match", () => {
+    expect(matchStored("+14155551234", "tel:+14155551234")).toBe(true);
+    expect(matchStored("tel:+14155551234", "tel:+14155551234")).toBe(true);
+    expect(matchStored("+8613800138000", "sms:+86 138 0013 8000")).toBe(true);
+    expect(matchStored("foo@bar.com", "mailto:Foo@Bar.COM")).toBe(true);
+    expect(findPersonByHandle(
+      [parsePersonFile("---\nname: P\nimessage: +14155551234\n---\n", "/x/p.md", false)!],
+      "imessage", "tel:+14155551234",
+    )).toBeDefined();
   });
 
   it("no longer matches across countries or folds non-phone ids into digits", () => {

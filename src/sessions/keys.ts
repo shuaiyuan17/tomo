@@ -103,6 +103,7 @@ function isImessageGroupGuid(id: string): boolean {
  *
  * - a DM chat GUID (`iMessage;-;…`, `SMS;-;…`, `any;-;…`, any service) is
  *   reduced to its handle;
+ * - a `tel:` / `sms:` / `mailto:` URI scheme (any case) is dropped;
  * - an email is lowercased;
  * - a phone number keeps its digits and a leading `+` (`+1 (555) 555-0123`
  *   → `+15555550123`).
@@ -111,7 +112,7 @@ function isImessageGroupGuid(id: string): boolean {
  * untouched. A value with no digits and no `@` is returned trimmed.
  */
 export function normalizeImessageHandle(raw: string): string {
-  let value = raw.trim();
+  let value = raw.trim().replace(HANDLE_URI_SCHEME_RE, "").trim();
   if (isImessageGroupGuid(value)) return value;
   if (value.includes(";-;")) value = (extractImessageIdentifier(value) ?? value).trim();
   if (value.includes("@")) return value.toLowerCase();
@@ -131,6 +132,7 @@ export function normalizeImessageHandle(raw: string): string {
 }
 
 const PHONE_SHAPED_RE = /^\+?[\d\s().-]+$/;
+const HANDLE_URI_SCHEME_RE = /^(?:tel|sms|mailto):/i;
 
 /**
  * Do two iMessage DM handles (or DM GUIDs) name the same person? Their

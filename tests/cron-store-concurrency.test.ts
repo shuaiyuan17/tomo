@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -27,6 +27,8 @@ vi.mock("../src/fs-utils.js", async (importOriginal) => {
 const { CronStore, isInterrupted } = await import("../src/cron/store.js");
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-concurrency-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 function revision(): number {

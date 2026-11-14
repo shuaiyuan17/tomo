@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -28,6 +28,8 @@ const { CronStore } = await import("../src/cron/store.js");
 const { buildCronTools } = await import("../src/mcp/cron-tools.js");
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-scope-wiring-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 interface ToolHandle {

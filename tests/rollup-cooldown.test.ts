@@ -15,7 +15,7 @@
  * exercised directly. `rollup-cooldown-wiring.test.ts` covers the other half:
  * that production actually wires the default store up.)
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -39,6 +39,8 @@ const {
 const { log } = await import("../src/logger.js");
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-rollup-cooldown-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const FILE = join(TEST_DIR, "nudge-cooldown.json");
 const SESSION = "dm:owner";
 const KEY = `${SESSION}:daily:2026-08-28`;

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -6,6 +6,8 @@ import { spawnSync } from "node:child_process";
 import { getRunningPid, getDaemonStatus, isPidAlive } from "../src/cli/status-info.js";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-status-info-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const PID_FILE = join(TEST_DIR, "tomo.pid");
 
 describe("status-info", () => {

@@ -1,10 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { SummonStore } from "../src/sessions/summon-store.js";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-summon-store-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const FILE = join(TEST_DIR, "summons.json");
 
 describe("SummonStore", () => {

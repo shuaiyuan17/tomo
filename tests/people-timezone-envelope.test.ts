@@ -63,6 +63,8 @@ import {
 installAgentTestHooks();
 
 const HOME = TMP.home;
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(HOME, { recursive: true, force: true }));
 const MEMORY = join(HOME, "workspace", "memory");
 const GROUP_CHAT_ID = "-1002000";
 const OWNER = { name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" as const };

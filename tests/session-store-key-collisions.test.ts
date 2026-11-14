@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -26,6 +26,8 @@ const info = log.info as unknown as ReturnType<typeof vi.fn>;
 const debug = log.debug as unknown as ReturnType<typeof vi.fn>;
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "tomo-test-key-collisions-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_ROOT, { recursive: true, force: true }));
 let testDir: string;
 let counter = 0;
 

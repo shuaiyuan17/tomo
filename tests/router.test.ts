@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { OwnerRouter } from "../src/router.js";
 import { resolveOwner, type LegacyIdentity } from "../src/owner.js";
 import { rawSessionKeyForBinding } from "../src/sessions/keys.js";
@@ -9,6 +9,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-router-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 
 /** Build the router the way the daemon does for a legacy `identities` config:
  *  through the production owner resolver. */

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,6 +7,8 @@ import { RECALL_FOREIGN_AUDIENCE_REFUSAL, buildRecallTools, formatRecallResults 
 import type { SessionMessage } from "../src/sessions/types.js";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-recall-mcp-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const SESSION_KEY = "dm:alice";
 
 interface ToolHandle {

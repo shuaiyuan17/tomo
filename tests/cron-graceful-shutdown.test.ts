@@ -15,8 +15,8 @@
  *
  * Drives the real Agent, CronStore and CronScheduler over the repo's mock SDK.
  */
-import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -31,6 +31,10 @@ import { CronScheduler } from "../src/cron/scheduler.js";
 
 installAgentTestHooks();
 
+/** Every directory setup() created; removed once the file is done. */
+const tmpDirs: string[] = [];
+afterAll(() => { for (const d of tmpDirs) rmSync(d, { recursive: true, force: true }); });
+
 async function setup() {
   const agent = new Agent();
   const tg = new MockChannel("telegram");
@@ -40,7 +44,9 @@ async function setup() {
   await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
   await drainQueue(agent);
   tg.delivered.length = 0;
-  const path = join(mkdtempSync(join(tmpdir(), "cron-shutdown-")), "jobs.json");
+  const dir = mkdtempSync(join(tmpdir(), "cron-shutdown-"));
+  tmpDirs.push(dir);
+  const path = join(dir, "jobs.json");
   return { agent, tg, path, store: new CronStore(path) };
 }
 

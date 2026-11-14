@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -27,6 +27,8 @@ const TMP = await vi.hoisted(async () => {
 });
 
 const HOME = TMP.home;
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(HOME, { recursive: true, force: true }));
 const MEMORY = join(HOME, "workspace", "memory");
 const PUBLIC_PEOPLE_DIR = join(MEMORY, "people");
 

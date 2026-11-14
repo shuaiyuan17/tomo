@@ -151,9 +151,12 @@ export class ProactiveSendService {
     // stops a barred turn's send_message; this is the same rule at the outlet,
     // so it holds whatever route reached it. Judged by the turn that is ASKING,
     // not by the target: the owner in his own DM may explicitly share a
-    // private file into a group, while a group turn, a summoned turn, or the
-    // background work one of those started may not. A caller that cannot be
-    // identified is refused when the target is a group (fail closed). Checked
+    // private file into a group, while a group turn or a summoned turn may
+    // not. A caller that cannot be identified is refused when the target is a
+    // group (fail closed). NOT covered here: background work a summoned turn
+    // started that is still running after the turn ends is judged as the
+    // owner (no turn is registered then) — keeping summoned turns from
+    // starting such work is audit P0-4, draft PR #466. Checked
     // before anything is sent, so nothing is half-delivered. Sticker values
     // count: on iMessage they are file paths.
     const callerBarred = callerSessionKey === undefined

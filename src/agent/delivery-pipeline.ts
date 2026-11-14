@@ -82,8 +82,16 @@ export interface DeliveryReceipt {
  *  marker on the ones that did not ship. */
 export function deliveredEntry(block: string, receipt: DeliveryReceipt | void): string {
   if (!receipt) return block;
-  return receipt.segments
-    .map((s) => (s.delivered ? s.text : `${DELIVERY_FAILED_MARKER}${s.text}`))
+  // The receipt describes the WIRE copy, which the outlet guard may have
+  // prefixed with an advisory (inbound-markers.ts). The transcript records the
+  // model's own words, so each piece's outcome is mapped back onto the
+  // ORIGINAL block's pieces — same tags, same order, only the caption text
+  // can differ. Should they ever not line up, the whole block is marked
+  // rather than guessing which piece is which.
+  const original = planSegments(block, extractAttachments(block).cleanText.trim()).segments;
+  if (original.length !== receipt.segments.length) return `${DELIVERY_FAILED_MARKER}${block}`;
+  return original
+    .map((s, i) => (receipt.segments[i]!.delivered ? s.text : `${DELIVERY_FAILED_MARKER}${s.text}`))
     .join("\n");
 }
 

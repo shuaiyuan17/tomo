@@ -180,6 +180,19 @@ describe("stickers on a barred turn (audit P0-2)", () => {
     expect(entry.startsWith("look\n")).toBe(true);
   });
 
+  it("maps the receipt back onto the ORIGINAL block — no wire-only advisory in the transcript", async () => {
+    const { deliveredEntry } = await import("../src/agent/delivery-pipeline.js");
+    const { markFabricatedText, FABRICATED_MARKER_NOTICE } = await import("../src/agent/inbound-markers.js");
+    const { channel, deliver } = senderFor(true);
+    const block = `look\nMEDIA:"${PRIVATE_PIC}"\nSTICKER:${PUBLIC_PIC}`;
+    // The outlet guard prefixed the WIRE copy with its advisory.
+    const receipt = await deliver(markFabricatedText(block));
+    expect(channel.sent[0]?.text).toContain(FABRICATED_MARKER_NOTICE);
+    const entry = deliveredEntry(block, receipt as never);
+    expect(entry).not.toContain(FABRICATED_MARKER_NOTICE);
+    expect(entry).toBe(`look\n${DELIVERY_FAILED_MARKER}MEDIA:"${PRIVATE_PIC}"\nSTICKER:${PUBLIC_PIC}`);
+  });
+
   it("returns no receipt when nothing was withheld", async () => {
     const { deliver } = senderFor(true);
     expect(await deliver(`STICKER:${PUBLIC_PIC}`)).toBeUndefined();

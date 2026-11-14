@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { ChevronRight, FileText, Folder, Lock, RefreshCw, Search, X } from "lucide-react";
+import { ChevronRight, FileText, Folder, Lock, Pause, Play, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { ApiError, mutate, type WebBootstrap } from "./api.js";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import type { WebConfigField, WebConfigView, WebContext, WebCronJob, WebMcpView, WebMemoryFile, WebMemorySearch,
   WebMemoryTree, WebSession, WebTodos } from "../../src/web/protocol.js";
 import { Badge } from "@/components/ui/badge";
@@ -42,7 +44,10 @@ function Empty({ children }: { children: ReactNode }) {
   return <div className={cn(card, "px-5 py-8 text-center text-sm text-muted-foreground")}>{children}</div>;
 }
 
-export function Study({ page, onPage, session, reload, inert }: { page: StudyPage; onPage: (page: StudyPage) => void; session?: WebSession; reload: number; inert?: boolean }) {
+/** What a Study write needs: the page's bootstrap (CSRF token, daemon epoch) and a way to refresh it. */
+export interface Mutator { bootstrap?: WebBootstrap; refresh: () => Promise<WebBootstrap>; live: boolean }
+
+export function Study({ page, onPage, session, reload, inert, mutator }: { page: StudyPage; onPage: (page: StudyPage) => void; session?: WebSession; reload: number; inert?: boolean; mutator: Mutator }) {
   const [local, setLocal] = useState(0);
   const key = reload + local;
   return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-12 pt-7 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:px-4 max-[600px]:pt-4">
@@ -61,7 +66,7 @@ export function Study({ page, onPage, session, reload, inert }: { page: StudyPag
         {page === "todos" && <Todos reload={key} />}
         {page === "memory" && <Memory reload={key} />}
         {page === "context" && <Context session={session} reload={key} />}
-        {page === "cron" && <Cron reload={key} />}
+        {page === "cron" && <Cron reload={key} mutator={mutator} />}
         {page === "mcp" && <Mcp reload={key} />}
         {page === "config" && <Config reload={key} />}
       </div>
@@ -265,9 +270,79 @@ export function CronList({ jobs, actions }: { jobs: WebCronJob[]; actions?: (job
   return <ul className="m-0 list-none space-y-3 p-0">{sorted.map((job) => <CronJobRow key={job.id} job={job} actions={actions?.(job)} />)}</ul>;
 }
 
-function Cron({ reload }: { reload: number }) {
-  const [resource] = useResource<{ jobs: WebCronJob[] }>("/cron", reload);
-  return <Status resource={resource}>{resource.state === "ready" && <CronList jobs={resource.value.jobs} />}</Status>;
+const CRON_ERRORS: Record<string, string> = {
+  cron_changed: "This job changed since you opened it. The list has been refreshed; review it and try again.",
+  job_not_found: "This job no longer exists.",
+  unschedulable: "This schedule has no future run left, so it cannot be resumed.",
+  epoch_changed: "Tomo restarted since this page loaded. The list has been refreshed; review it and try again.",
+  cron_unavailable: "The cron store could not be read or written.",
+};
+
+type CronAction = "pause" | "resume" | "delete";
+
+/** Pause / resume / delete, each behind a confirmation naming the job. */
+function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutator; onDone: () => void }) {
+  const [open, setOpen] = useState<CronAction | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const overdueOneShot = job.schedule.kind === "at" && Date.parse(job.schedule.at) <= Date.now();
+  const disabled = !mutator.bootstrap || !mutator.live;
+  const confirm = async () => {
+    if (!open || !mutator.bootstrap) return;
+    setBusy(true); setError("");
+    try {
+      await mutate(`/cron/${encodeURIComponent(job.id)}`, open === "delete" ? "DELETE" : "PATCH",
+        { revision: job.revision, confirm: true, ...(open === "delete" ? {} : { enabled: open === "resume" }) }, mutator.bootstrap, mutator.refresh);
+      setOpen(null); onDone();
+    } catch (err) {
+      const code = err instanceof ApiError ? err.code : "unavailable";
+      setError(CRON_ERRORS[code] ?? "The change could not be confirmed. Refresh and check the job before trying again.");
+      if (code === "cron_changed" || code === "epoch_changed" || code === "job_not_found") onDone();
+    } finally { setBusy(false); }
+  };
+  const copy: Record<CronAction, { title: string; body: string; action: string }> = {
+    pause: { title: `Pause “${job.name}”?`, action: "Pause job",
+      body: "It will not run again until you resume it. A run already in progress is not stopped." },
+    resume: { title: `Resume “${job.name}”?`, action: "Resume job",
+      body: overdueOneShot ? "Its scheduled time has passed, so it will run at the scheduler's next check, within about 30 seconds." : "It will run again on its schedule." },
+    delete: { title: `Delete “${job.name}”?`, action: "Delete job",
+      body: "The job is removed from the schedule. This cannot be undone from here. A run already in progress is not stopped." },
+  };
+  const toggle: CronAction = job.enabled ? "pause" : "resume";
+  const iconButton = "size-8 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground";
+  return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(""); } }}>
+    <div className="flex shrink-0 items-center gap-1">
+      <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={iconButton} disabled={disabled} onClick={() => setOpen(toggle)}
+        aria-label={`${job.enabled ? "Pause" : "Resume"} ${job.name}`} title={job.enabled ? "Pause" : "Resume"}>{job.enabled ? <Pause strokeWidth={1.75} /> : <Play strokeWidth={1.75} />}</Button></AlertDialogTrigger>
+      <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={cn(iconButton, "hover:text-destructive")} disabled={disabled} onClick={() => setOpen("delete")}
+        aria-label={`Delete ${job.name}`} title="Delete"><Trash2 strokeWidth={1.75} /></Button></AlertDialogTrigger>
+    </div>
+    {open && <AlertDialogContent className="rounded-2xl bg-card sm:max-w-md">
+      <AlertDialogHeader>
+        <AlertDialogTitle className="font-serif text-[22px] font-normal">{copy[open].title}</AlertDialogTitle>
+        <AlertDialogDescription className="text-[13px] leading-relaxed">{copy[open].body}</AlertDialogDescription>
+      </AlertDialogHeader>
+      <dl className="m-0 grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
+        <dt className={meta}>Schedule</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.scheduleLabel}</dd>
+        <dt className={meta}>Session</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.sessionKey}</dd>
+        <dt className={meta}>Message</dt><dd className="m-0 line-clamp-3 [overflow-wrap:anywhere]">{job.message}</dd>
+      </dl>
+      {error && <p className="m-0 text-[13px] text-destructive" role="alert">{error}</p>}
+      <AlertDialogFooter>
+        <AlertDialogCancel disabled={busy} className="rounded-xl">Cancel</AlertDialogCancel>
+        <AlertDialogAction disabled={busy || !!error} onClick={(event) => { event.preventDefault(); void confirm(); }}
+          className={cn("rounded-xl", open === "delete" && "bg-destructive text-white hover:bg-destructive/90")}>{busy ? "Working…" : copy[open].action}</AlertDialogAction>
+      </AlertDialogFooter>
+    </AlertDialogContent>}
+  </AlertDialog>;
+}
+
+function Cron({ reload, mutator }: { reload: number; mutator: Mutator }) {
+  const [resource, refetch] = useResource<{ jobs: WebCronJob[] }>("/cron", reload);
+  return <Status resource={resource}>{resource.state === "ready" && <>
+    {!mutator.live && <p className={cn(meta, "mt-0 mb-3")}>Changes are available while connected.</p>}
+    <CronList jobs={resource.value.jobs} actions={(job) => <CronActions job={job} mutator={mutator} onDone={refetch} />} />
+  </>}</Status>;
 }
 
 const MCP_TONE: Record<string, string> = { connected: "bg-primary", failed: "bg-destructive", "needs-auth": "bg-destructive/70", pending: "bg-muted-foreground", disabled: "bg-border" };

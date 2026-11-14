@@ -7,7 +7,7 @@ import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
+import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
   type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess } from "./protocol.js";
 
 export interface HttpDependencies {
@@ -130,6 +130,16 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           json(res, 200, value);
           return;
         }
+      } else if ((req.method === "PATCH" || req.method === "DELETE") && /^\/api\/v1\/cron\/[A-Za-z0-9-]{1,64}$/.test(url.pathname)) {
+        // Same guards as a message: exact Origin (checkRequest), cookie,
+        // CSRF and JSON; plus the daemon epoch the page was loaded under.
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const parsed = cronChangeSchema.safeParse(await body(req));
+        if (!parsed.success || (req.method === "PATCH") !== (parsed.data.enabled !== undefined)) throw new WebError(400, "invalid_cron_change");
+        json(res, 200, await deps.data.cron.change(url.pathname.split("/").at(-1)!, parsed.data.revision, parsed.data.enabled));
+        return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/messages") {
         csrf.verify(req, session!);
         const parsed = messageInputSchema.safeParse(await body(req));

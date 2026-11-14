@@ -28,8 +28,9 @@ export async function readBootstrap(signal?: AbortSignal): Promise<WebBootstrap>
 
 /** Only a definite, pre-admission CSRF rejection may be retried. Preserve the
  * request id and epoch; an uncertain transport failure must never resubmit. */
-export async function sendMessage(input: MessageInput, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
-  const send = (csrfToken: string) => api<WebRequest>("/messages", { method: "POST", headers: {
+export async function mutate<T>(path: string, method: "POST" | "PATCH" | "DELETE", input: unknown,
+  bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<T> {
+  const send = (csrfToken: string) => api<T>(path, { method, headers: {
     "content-type": "application/json", "x-tomo-csrf": csrfToken, "x-tomo-epoch": bootstrap.epoch,
   }, body: JSON.stringify(input) });
   try { return await send(bootstrap.csrfToken); }
@@ -41,18 +42,13 @@ export async function sendMessage(input: MessageInput, bootstrap: WebBootstrap, 
   }
 }
 
+export function sendMessage(input: MessageInput, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
+  return mutate<WebRequest>("/messages", "POST", input, bootstrap, refresh);
+}
+
 /** The owner dealt with an interrupted request: its bubble goes, the record stays. */
-export async function dismissRequest(requestId: string, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
-  const send = (csrfToken: string) => api<WebRequest>(`/messages/${requestId}/dismiss`, { method: "POST", headers: {
-    "content-type": "application/json", "x-tomo-csrf": csrfToken, "x-tomo-epoch": bootstrap.epoch,
-  }, body: "{}" });
-  try { return await send(bootstrap.csrfToken); }
-  catch (error) {
-    if (!(error instanceof ApiError) || error.status !== 403 || error.code !== "invalid_csrf") throw error;
-    const fresh = await refresh();
-    if (fresh.epoch !== bootstrap.epoch) throw new ApiError(409, "epoch_changed");
-    return send(fresh.csrfToken);
-  }
+export function dismissRequest(requestId: string, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
+  return mutate<WebRequest>(`/messages/${requestId}/dismiss`, "POST", {}, bootstrap, refresh);
 }
 
 export interface StreamHandlers {

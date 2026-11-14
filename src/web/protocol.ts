@@ -87,6 +87,8 @@ export interface WebMemoryFile { path: string; content: string; modifiedAt: numb
 export interface WebTodos { files: Array<WebMemoryFile | { path: string; error: string }>; missing: boolean; truncated: boolean }
 export interface WebMemorySearch { results: Array<{ path: string; line: number; text: string }>; truncated: boolean; unreadable: number; missing: boolean }
 export interface WebCronJob {
+  /** Hash of the job's intent; a confirmed change must name the revision it reviewed. */
+  revision: string;
   id: string; name: string; enabled: boolean; schedule: CronSchedule; scheduleLabel: string; message: string; sessionKey: string;
   deleteAfterRun: boolean; createdAt: number; nextRunAt: number | null; lastRunAt: number | null; lastStatus: CronRunStatus | null; interruptedAt: number | null;
 }
@@ -106,6 +108,8 @@ export type McpConnectionState = "connected" | "failed" | "needs-auth" | "pendin
 export interface WebMcpServer { name: string; enabled: boolean; type: string; oauth: boolean; timeout: number | null; alwaysLoad: boolean; configured: string[] }
 export interface WebMcpLiveSession { sessionId: string; connections: Array<{ name: string; status: McpConnectionState }> | null }
 export interface WebMcpView { missing: boolean; servers: WebMcpServer[]; live: { available: boolean; sessions: WebMcpLiveSession[] } }
+/** A confirmed cron change: PATCH sets `enabled`, DELETE removes. */
+export const cronChangeSchema = z.object({ revision: z.string().regex(/^[a-f0-9]{64}$/), confirm: z.literal(true), enabled: z.boolean().optional() }).strict();
 export class WebError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
 }
@@ -113,6 +117,8 @@ export class WebError extends Error {
 /** This is a closed RPC protocol, never a generic method/file/command proxy. */
 export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
+  /** The daemon's current epoch, for local (web-process) mutations. */
+  z.object({ method: z.literal("epoch") }).strict(),
   z.object({ method: z.literal("request"), requestId: z.uuid() }).strict(),
   /** The owner dealt with an interrupted request (resent it or let it go). */
   z.object({ method: z.literal("dismiss"), epoch: z.uuid(), requestId: z.uuid() }).strict(),

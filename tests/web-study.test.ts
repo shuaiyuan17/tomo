@@ -243,6 +243,33 @@ describe("config view", () => {
     }
     expect(at("channels.imessage.allowlist")).toMatchObject({ secret: false, value: ["+15550001"] });
   });
+  it("shows a wildcard path's value only when it passes that path's value check", () => {
+    const { fields } = configFields({
+      sessionModelOverrides: { accesskey: "plain-looking-secret", "dm:owner": "claude-opus-5-5", "telegram:-100": "x".repeat(65) },
+      identities: [{ name: "owner", channels: { telegram: "12345", imessage: "owner@example.com", Weird_Key: "12345", slack: "xoxb-not-an-id" } }],
+      channels: { telegram: { provider: "plain-looking-secret", allowlist: ["-100200", "not an id"] }, Telegram: { provider: "imsg" } },
+      plugins: ["./plugins/local", { name: "@scope/plugin", path: "plain looking secret?" }],
+    });
+    const at = (path: string) => fields.find((f) => f.path.join(".") === path)!;
+    expect(at("sessionModelOverrides.accesskey")).toMatchObject({ secret: true, length: "plain-looking-secret".length });
+    expect(at("sessionModelOverrides.dm:owner")).toMatchObject({ secret: false, value: "claude-opus-5-5" });
+    expect(at("sessionModelOverrides.telegram:-100")).toMatchObject({ secret: true });
+    expect(at("identities.0.channels.telegram")).toMatchObject({ secret: false, value: "12345" });
+    expect(at("identities.0.channels.imessage")).toMatchObject({ secret: false, value: "owner@example.com" });
+    expect(at("identities.0.channels.slack")).toMatchObject({ secret: true });
+    expect(at("channels.telegram.provider")).toMatchObject({ secret: true });
+    expect(at("channels.Telegram.provider")).toMatchObject({ secret: true });
+    expect(at("channels.telegram.allowlist")).toMatchObject({ secret: true });
+    expect(at("plugins.0")).toMatchObject({ secret: false, value: "./plugins/local" });
+    expect(at("plugins.1.name")).toMatchObject({ secret: false, value: "@scope/plugin" });
+    expect(at("plugins.1.path")).toMatchObject({ secret: true });
+    expect(JSON.stringify(fields)).not.toContain("plain-looking-secret");
+    expect(JSON.stringify(fields)).not.toContain("xoxb-not-an-id");
+  });
+  it("never echoes a key that looks like a credential", () => {
+    const { fields } = configFields({ sessionModelOverrides: { "sk-ant-api03-synthetic000000000000000000": "claude-opus-5-5" } });
+    expect(JSON.stringify(fields)).not.toContain("sk-ant-api03");
+  });
   it("masks an allowlisted string that looks like a credential, and numbers under a credential name", () => {
     const { fields } = configFields({ model: "sk-ant-api03-synthetic-0000000000000000", auth: { pin: 1234 }, tokenTtl: 5 });
     expect(fields.map((f) => [f.path.join("."), f.secret])).toEqual([["model", true], ["auth.pin", true], ["tokenTtl", true]]);

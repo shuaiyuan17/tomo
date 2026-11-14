@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronRight, TerminalIcon, X } from "lucide-react";
 import type { WebSession, WebTask } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
@@ -11,7 +11,7 @@ import { ModelBadge } from "./model-badge.js";
 import { buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
 
 /** Read-only: shows what is running, never offers to stop it. */
-export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void }) {
+export function TasksPanel({ tasks, sessions, onClose, footer }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode }) {
   const [showAmbient, setShowAmbient] = useState(false);
   /** Open "N shell commands done" rows, per session and parent. */
   const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
@@ -57,6 +57,7 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
                 onOpen={(task) => setOpened({ sessionId: task.sessionId, taskId: task.taskId })} />
             : <TaskCard key={row.task.taskId} task={row.task} depth={row.depth} now={now} onOpen={() => setOpened({ sessionId: row.task.sessionId, taskId: row.task.taskId })} />)}</ul>
         </div>)}
+      {footer}
     </div>
   </section>;
 }

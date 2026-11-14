@@ -66,6 +66,8 @@ export type WebEvent =
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
   | { type: "invalidate"; sessionId?: string }
+  /** The cron schedule may have changed (a job fired or finished). No payload: the page re-reads /cron. */
+  | { type: "cron" }
   | { type: "tool"; sessionId: string; tool: string; state: "started" | "completed" | "failed" }
   | { type: "typing"; sessionId: string; active: boolean }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */

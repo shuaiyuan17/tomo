@@ -198,8 +198,8 @@ function allocatedSize(st: Stats): number {
  * by tomo contains no symlinks in `data/`, `sdk-sessions/` or `config.json` in
  * the first place. Preserving them here therefore changes nothing for those
  * backups; it matters only for a hand-assembled backup directory, where it is
- * also the safer reading of intent. The asymmetry on the create side is #312's
- * finding 41 and is not addressed by this PR.
+ * also the safer reading of intent. The create side still dereferences
+ * (#312, finding 41).
  *
  * Deliberately not a checksum: backups carry no manifest to check against, so
  * a hash would only prove the copy matches a source we just read — at the cost

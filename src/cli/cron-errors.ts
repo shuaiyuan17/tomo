@@ -43,8 +43,7 @@ export interface SafeCronRead {
  * corrupt hides every OTHER thing they were reporting.
  *
  * The caller gets the path back rather than a bare empty list precisely so it
- * can say "unreadable" instead of "none" — the distinction this PR exists to
- * preserve. Non-read errors still propagate.
+ * can say "unreadable" instead of "none". Non-read errors still propagate.
  */
 export function readCronJobsSafely(store: { list(): CronJob[] }): SafeCronRead {
   try {

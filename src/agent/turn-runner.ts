@@ -644,7 +644,7 @@ export class TurnRunner {
    * was to hold the last block back until `result` so a trailing NO_REPLY
    * could still cancel it; that was rejected because the final block is
    * precisely the one the owner is waiting for, and holding it would reinstate
-   * the end-of-turn latency this change exists to remove — for every turn, to
+   * the end-of-turn latency per-block delivery exists to remove — for every turn, to
    * salvage a rare one. It would not even have saved the reported cron repro,
    * where the narration is an EARLIER block than the token.
    *

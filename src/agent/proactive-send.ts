@@ -155,8 +155,7 @@ export class ProactiveSendService {
     // not. A caller that cannot be identified is refused when the target is a
     // group (fail closed). NOT covered here: background work a summoned turn
     // started that is still running after the turn ends is judged as the
-    // owner (no turn is registered then) — keeping summoned turns from
-    // starting such work is audit P0-4, draft PR #466. Checked
+    // owner (no turn is registered then); see audit P0-4. Checked
     // before anything is sent, so nothing is half-delivered. Sticker values
     // count: on iMessage they are file paths.
     const callerBarred = callerSessionKey === undefined

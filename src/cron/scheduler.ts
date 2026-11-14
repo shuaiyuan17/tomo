@@ -40,8 +40,8 @@ export class CronScheduler {
   /**
    * Runs whose turn finished but whose outcome could not be written to the
    * store. Their nextRunAt is therefore still in the past, so they would be
-   * re-dispatched on the next scan — the very duplicate this PR exists to
-   * prevent, just from a failed write instead of a restart. Held out of the
+   * re-dispatched on the next scan — a duplicate run, from a failed write
+   * instead of a restart. Held out of the
    * scan and retried on every tick.
    */
   private pendingAcks = new Map<string, PendingAck>();

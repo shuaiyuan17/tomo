@@ -58,6 +58,7 @@ tomo stop              # Stop the daemon
 tomo restart           # Restart the daemon
 tomo restart --reason "..."  # Restart and tell the agent why afterward
 tomo status            # Show PID and uptime
+tomo watch             # Live mission-control TUI (activity feed, vitals, log tail)
 tomo logs              # View logs (pretty-printed)
 tomo logs -f           # Follow logs live
 tomo sessions list     # Show active sessions
@@ -87,6 +88,8 @@ tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 | `/pet` | Check Tomo's pet's mood, growth stage, and stats |
 | `/summon` | (groups) Pull your main DM session into this group temporarily |
 | `/dismiss` | (groups) Hand the group back to its own Tomo session |
+| `/pause` | (groups) Ignore every message in this group (not read, not remembered) until `/resume`; any member can use it |
+| `/resume` | (groups) Lift a `/pause` |
 
 **Rewind** — In an owner's Telegram or iMessage DM, `/rewind` branches the conversation before the most recent recorded human message; `/rewind 3` goes back before the last three. All later context is omitted from the new branch. If the chosen message arrived while a tool call was still running, the rewind goes back to the end of the previous complete turn instead, and the reply quotes the message it rewound to. Send your edited request afterward. No model call or automatic retry is needed, so the command also works after an API refusal. If a turn is still running (for example, stuck after a refusal), `/rewind` stops it first; the stopped turn is not retried and sends nothing more, and anything queued for the conversation runs afterwards on the rewound context. It does not undo tools, file changes, messages already sent, or persistent memory. Tomo's chat transcript stays intact; the original SDK session follows the normal 30-day unlinked-session retention. Only human messages with recorded provenance in the current context can be selected; compacted or older messages without provenance cannot. Use `/new` to start fresh when that history is unavailable. Rewinding does not guarantee that a subsequent request will be accepted.
 
@@ -110,7 +113,7 @@ During `tomo init`, you choose a name, your preferred name, and a tone (chill / 
 
 File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` index is injected into every conversation. Tomo reads and writes memory files autonomously — it remembers who you are, your preferences, and past context across sessions.
 
-Files under `memory/private/` are **DM-only**: they are stripped from the index a group session sees, and a `PreToolUse` guard blocks them from `Read`/`Grep`/`Glob` and from `MEDIA:` attachments for any turn a group is steering — a group session for its whole life, and your own DM session for the duration of a `/summon`. On those turns Bash still works, but every command is run through a macOS `sandbox-exec` profile that denies `memory/private/` at the kernel level, so a path assembled inside `python3 -c` fails with `EPERM` instead of succeeding the way it would against a filter over command text. The profile is passed inline on the command line, never written to a file — a file would be one more thing the sandboxed shell could edit. If the sandbox cannot be set up, the Bash tool is withheld for the turn rather than run unsandboxed — that covers a host without `sandbox-exec`, a private directory whose real location cannot be established, and the case where the workspace's `.claude/settings.json` or an enabled plugin carries a `PreToolUse` hook: such a hook can rewrite a tool's input after Tomo's own guard has answered, so a barred turn gets no shell rather than one whose sandbox a hook might have removed. If you want a shell on group turns, keep `PreToolUse` hooks out of the workspace settings.
+Files under `memory/private/` are **DM-only**: they are stripped from the index a group session sees, and a `PreToolUse` guard blocks them from `Read`/`Grep`/`Glob` and from `MEDIA:` attachments for any turn a group is steering — a group session for its whole life, and your own DM session for the duration of a `/summon`. On those turns Bash still works, but every command is run through a macOS `sandbox-exec` profile that denies `memory/private/` at the kernel level, so a path assembled inside `python3 -c` fails with `EPERM` instead of succeeding the way it would against a filter over command text. The profile is passed inline on the command line, never written to a file — a file would be one more thing the sandboxed shell could edit. If the sandbox cannot be set up, the Bash tool is withheld for the turn rather than run unsandboxed — that covers a host without `sandbox-exec`, a private directory whose real location cannot be established, and the case where the workspace's `.claude/settings.json` or an enabled plugin carries a `PreToolUse` hook: such a hook can rewrite a tool's input after Tomo's own guard has answered, so a barred turn gets no shell rather than one whose sandbox a hook might have removed. If you want a shell on group turns, keep `PreToolUse` hooks out of the workspace settings. Groups you fully trust can be listed in `groupShellAllowlist` (session keys such as `telegram:-1001234567890`): their Bash runs unsandboxed, as in your DM, including while such a group is summoned into your DM session; the file-tool and `MEDIA:` guards still apply.
 
 The profile is one deny on one directory, not a jail — `(allow default)` is deliberate, so that git, gh, curl and the rest of the toolchain keep working on a group's turn. What that leaves reachable from a barred turn's shell is unchanged by this fence and worth knowing: the SDK transcript directory under `~/.claude/projects/` and `~/.tomo/logs/` hold results of private reads from earlier DM turns; `~/.tomo/config.json` and `data/cron/jobs.json` are writable; a hardlink to a private file made before the turn, living outside `memory/private/`, still reads. Narrowing those is a separate question from the one this fence answers, which is the directory itself.
 
@@ -263,6 +266,11 @@ Structured logs via [pino](https://github.com/pinojs/pino):
 - Token usage and cost per message
 - Context window tracking with compaction warnings
 
+### Observability
+
+- `tomo watch` opens a live terminal view of the running daemon (activity feed, vitals sidebar, chat line, log tail) over `~/.tomo/watch.sock`.
+- `"metrics": { "enabled": true }` serves Prometheus metrics on `http://127.0.0.1:9464/metrics` (`metrics.port` to change it) and writes an NDJSON activity log to `~/.tomo/logs/activity.ndjson` (`metrics.activityLog`, default `true`; `metrics.includeMessageText`, default `true` — turn it off if the log leaves this machine). A ready-made Grafana / Prometheus / Loki stack is in [`contrib/observability/`](contrib/observability/README.md).
+
 ## Architecture
 
 ```
@@ -371,11 +379,14 @@ Environment variables override config file values:
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
 | `TOMO_SAVE_INBOUND_FILES` | Override storage of inbound attachments that are neither images nor supported documents. Defaults to whatever `saveInboundImages` is. |
 | `TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS` | Tell the owner when a failure is kept out of a chat: passive-group turns, group cron/background turns, and silent housekeeping/heartbeat turns on the owner's own DM (an error already shown in a chat is not repeated). Group failures are reported in the owner's DM, never in the group; DM failures in that DM. Each notice names the session, the kind of error, a one-line excerpt and a recovery hint (`/login` for auth failures). At most one notice per session and error kind per 30 minutes; the next one says how many failures were folded in. Defaults to `true` (config key `notifyOwnerOnSuppressedErrors`); set `false` to keep these failures in the log only. |
-| `TOMO_SHOW_THINKING` | Deliver the model's thinking blocks to the chat, prefixed with `💭`. Defaults to `false`; with it off, a thinking block that still has text in it is delivered unprefixed, as a `text` block would be. |
+| `TOMO_SHOW_THINKING` | Deliver the model's thinking blocks to the chat, prefixed with `💭`. Defaults to `false`; with it off, thinking blocks are dropped (not delivered, not recorded in the transcript), and if the model put its reply in one it is told on its next step that the reply was not delivered. Read at session start. |
 | `TOMO_CONTINUITY_INTERVAL_MINUTES` | Override scheduled continuity heartbeat interval (default: `55`, minimum: `1`) |
 | `TOMO_CONTINUITY_SCRIPT` | Override the optional continuity script path |
 | `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Override continuity script timeout (default: `30000`) |
 | `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Override continuity script stdout/stderr cap (default: `8000`) |
+| `TOMO_LIVE_SESSION_TIMEOUT_MS` | Inactivity timeout for one turn (config key `liveSessionTimeoutMs`, default: `600000`, 10 minutes) |
+| `TOMO_METRICS` | Enable the metrics exporter and activity log (config key `metrics.enabled`, default: `false`) |
+| `TOMO_METRICS_PORT` | Metrics port (config key `metrics.port`, default: `9464`) |
 | `LOG_LEVEL` | Log level (default: `debug`) |
 
 ### Per-Agent Permission Scoping (`agentProfiles`)

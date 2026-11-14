@@ -219,6 +219,12 @@ async function startForeground(): Promise<void> {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
       const { ownerSessionKeyReader, subagentModelReader } = await import("../web/data.js");
+      const { UsageCache } = await import("../web/usage.js");
+      const { fetchUsage } = await import("../agent/usage.js");
+      const { litellmRoutesModel } = await import("../litellm.js");
+      // The same reader as `/usage` (Claude Code's OAuth token from the Keychain).
+      const usageCache = new UsageCache(() => fetchUsage({ authMethod: config.auth.method,
+        gatewayActive: litellmRoutesModel(config.litellm, config.model) }));
       const { CRON_STORE_PATH } = await import("../cron/store.js");
       const { WebRequestJournal } = await import("../web/request-journal.js");
       const { WEB_CHAT_ID } = await import("../web/protocol.js");
@@ -228,7 +234,8 @@ async function startForeground(): Promise<void> {
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),
         toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
-        taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }) });
+        taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
+        usage: (refresh) => usageCache.get(refresh) });
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,

@@ -328,3 +328,10 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await page.keyboard.press("Escape");
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toHaveCount(0);
 });
+
+it("shows the Plan usage card with a named state and a refresh button", async () => {
+  const card = page.getByRole("region", { name: /Plan usage/ });
+  await browserExpect(card).toContainText("Usage isn't available here.");
+  await card.getByRole("button", { name: "Refresh plan usage" }).click();
+  await browserExpect(card).toContainText("Not updated yet");
+});

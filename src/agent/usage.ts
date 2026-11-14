@@ -53,7 +53,7 @@ interface UsageLimit {
   is_active?: boolean | null;
 }
 
-interface UsageResponse {
+export interface UsageResponse {
   /** Authoritative source of truth when present/non-empty. */
   limits?: UsageLimit[] | null;
   // Legacy top-level windows — fallback for older/other account shapes that
@@ -147,6 +147,33 @@ const GATEWAY_CAVEAT =
  * error, non-200) resolves to a friendly one-line message.
  */
 export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
+  const result = await fetchUsage(deps);
+  if (!result.ok) return result.message;
+  // The format phase must not throw out of the never-throws boundary: malformed
+  // endpoint data is guarded per-field, and this catch is the final backstop.
+  try {
+    return formatUsageReport(result.data, (deps.now ?? Date.now)(), result.subscriptionType, deps.gatewayActive);
+  } catch {
+    return "Claude usage unavailable: could not parse the usage response.";
+  }
+}
+
+/** Why usage could not be read — distinct so a UI can say which. */
+export type UsageFailure =
+  | "api_key" | "no_token" | "credentials_unreadable" | "token_expired" | "refresh_pending"
+  | "unauthorized" | "network" | "timeout" | "http_error" | "bad_response";
+export type UsageResult =
+  | { ok: true; data: UsageResponse; subscriptionType?: string }
+  | { ok: false; reason: UsageFailure; message: string };
+const fail = (reason: UsageFailure, message: string): UsageResult => ({ ok: false, reason, message });
+const requestFailure = (message: string): UsageResult => fail(message === TIMEOUT_MESSAGE ? "timeout" : "network", message);
+
+/**
+ * The structured half of `/usage`: credentials (with Claude Code's delegated
+ * refresh), the request, and the parsed body — or a classified failure whose
+ * message is the same text `/usage` prints. Never throws.
+ */
+export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const now = deps.now ?? Date.now;
   const loadCredentials = deps.loadCredentials ?? readClaudeCredentials;
@@ -155,27 +182,28 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   // instead of an empty or zeroed subscription block. Authoritative config
   // signal, so it wins even if a stale Keychain OAuth token is still present.
   if (deps.authMethod === "api-key") {
-    return API_KEY_MESSAGE;
+    return fail("api_key", API_KEY_MESSAGE);
   }
 
   let creds: ClaudeCredentials;
   try {
     creds = await loadCredentials();
   } catch (err) {
-    return usageError(err);
+    const message = usageError(err);
+    return fail(/no Claude Code credentials/.test(message) ? "no_token" : "credentials_unreadable", message);
   }
 
   // Parsed JSON can be semantically malformed (e.g. a literal `null`, which is
   // typeof "object"): accessing `.claudeAiOauth` on it would throw outside any
   // catch. Guard the shape before extraction.
   if (!creds || typeof creds !== "object") {
-    return "Claude usage unavailable: Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).";
+    return fail("credentials_unreadable", "Claude usage unavailable: Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).");
   }
 
   let oauth = creds.claudeAiOauth;
   const initialToken = oauth?.accessToken;
   if (!initialToken) {
-    return "Claude usage unavailable: no Claude Code credentials found. Log in with Claude Code first.";
+    return fail("no_token", "Claude usage unavailable: no Claude Code credentials found. Log in with Claude Code first.");
   }
   let token: string = initialToken;
 
@@ -189,13 +217,13 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   let lastOutcome: RefreshOutcome | undefined;
   if (isExpired(oauth?.expiresAt, now())) {
     if (!oauth?.refreshToken) {
-      return `Claude usage unavailable: access token expired. ${RELOGIN_HINT}`;
+      return fail("token_expired", `Claude usage unavailable: access token expired. ${RELOGIN_HINT}`);
     }
     refreshAttempted = true;
     const { outcome, oauth: fresh, readFailed } = await refreshAndReload(deps, loadCredentials);
-    if (readFailed) return REREAD_FAILED_MESSAGE;
+    if (readFailed) return fail("credentials_unreadable", REREAD_FAILED_MESSAGE);
     if (!fresh?.accessToken || isExpired(fresh.expiresAt, now())) {
-      return outcome === "completed" ? REFRESH_FAILED_MESSAGE : REFRESH_PENDING_MESSAGE;
+      return outcome === "completed" ? fail("token_expired", REFRESH_FAILED_MESSAGE) : fail("refresh_pending", REFRESH_PENDING_MESSAGE);
     }
     lastOutcome = outcome;
     oauth = fresh;
@@ -203,50 +231,45 @@ export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
   }
 
   let res = await requestUsage(fetchImpl, token);
-  if (typeof res === "string") return res;
+  if (typeof res === "string") return requestFailure(res);
 
   // A 401 with a future `expiresAt` still usually means a stale token (e.g. it
   // was rotated by another Claude Code process after we read it). Give Claude
   // Code one chance to refresh, and retry once only if the token changed.
   if (res.status === 401 && oauth?.refreshToken && !refreshAttempted) {
     const { outcome, oauth: fresh, readFailed } = await refreshAndReload(deps, loadCredentials);
-    if (readFailed) return REREAD_FAILED_MESSAGE;
+    if (readFailed) return fail("credentials_unreadable", REREAD_FAILED_MESSAGE);
     lastOutcome = outcome;
     if (fresh?.accessToken && fresh.accessToken !== token && !isExpired(fresh.expiresAt, now())) {
       oauth = fresh;
       token = fresh.accessToken;
       res = await requestUsage(fetchImpl, token);
-      if (typeof res === "string") return res;
+      if (typeof res === "string") return requestFailure(res);
     }
   }
 
   if (res.status === 401 && oauth?.refreshToken) {
     // Only claim "it'll refresh next turn" when Claude Code never got to try;
     // once it ran and the token is still rejected, say so honestly.
-    return lastOutcome === "completed" ? REJECTED_AFTER_REFRESH_MESSAGE : REFRESH_PENDING_MESSAGE;
+    return lastOutcome === "completed" ? fail("unauthorized", REJECTED_AFTER_REFRESH_MESSAGE) : fail("refresh_pending", REFRESH_PENDING_MESSAGE);
   }
   if (res.status === 401 || res.status === 403) {
-    return `Claude usage unavailable: token expired or unauthorized. ${RELOGIN_HINT}`;
+    return fail("unauthorized", `Claude usage unavailable: token expired or unauthorized. ${RELOGIN_HINT}`);
   }
   if (!res.ok) {
-    return `Claude usage unavailable: usage endpoint returned HTTP ${res.status}.`;
+    return fail("http_error", `Claude usage unavailable: usage endpoint returned HTTP ${res.status}.`);
   }
 
   let data: unknown;
   try {
     data = await res.json();
   } catch (err) {
-    if (isTimeout(err)) return TIMEOUT_MESSAGE;
-    return "Claude usage unavailable: could not parse the usage response.";
+    if (isTimeout(err)) return fail("timeout", TIMEOUT_MESSAGE);
+    return fail("bad_response", "Claude usage unavailable: could not parse the usage response.");
   }
-
-  // The format phase must not throw out of the never-throws boundary: malformed
-  // endpoint data is guarded per-field, and this catch is the final backstop.
-  try {
-    return formatUsageReport(data as UsageResponse, now(), oauth?.subscriptionType, deps.gatewayActive);
-  } catch {
-    return "Claude usage unavailable: could not parse the usage response.";
-  }
+  // A body of literal `null` is not an error here: `/usage` renders it as an
+  // empty report, and the web card as "no usage data".
+  return { ok: true, data: (data ?? {}) as UsageResponse, subscriptionType: oauth?.subscriptionType };
 }
 
 /** True when a recorded `expiresAt` (ms epoch) is at or before `nowMs`. */
@@ -470,6 +493,61 @@ export function formatUsageReport(
   return lines.join("\n");
 }
 
+/** One usage window as structured data (the web card's rows). */
+export interface UsageWindowView {
+  id: string;
+  label: string;
+  /** session = the 5-hour window, weekly = 7-day; scoped = per model/surface. */
+  group: "session" | "weekly" | "other";
+  scoped: boolean;
+  /** 0–100, or null when the endpoint gave none. */
+  percent: number | null;
+  /** ms epoch, or null. */
+  resetsAt: number | null;
+  active: boolean;
+  elevated: boolean;
+}
+
+/**
+ * The same windows `/usage` prints, as data: the authoritative `limits` array
+ * when present (sorted session → weekly → other), else the legacy top-level
+ * windows. Untrusted input is narrowed per field, as in formatUsageReport.
+ */
+export function usageWindows(data: UsageResponse | null | undefined): UsageWindowView[] {
+  const d: UsageResponse = data && typeof data === "object" ? data : {};
+  const resets = (value: string | null | undefined) => {
+    const ms = typeof value === "string" ? Date.parse(value) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const limits = (Array.isArray(d.limits) ? d.limits : []).map(toSafeLimit).filter((l): l is SafeLimit => l !== null);
+  if (limits.length > 0) {
+    return [...limits].sort((a, b) => groupRank(a) - groupRank(b)).map((limit, index) => {
+      const rank = groupRank(limit);
+      return {
+        id: `${limit.kind || "limit"}:${limit.modelName}:${limit.surface}:${index}`,
+        label: limitLabel(limit),
+        group: rank === 0 ? "session" : rank === 1 ? "weekly" : "other",
+        scoped: !!(limit.modelName || limit.surface) || limit.kind.endsWith("_scoped"),
+        percent: limit.percent,
+        resetsAt: resets(limit.resetsAt),
+        active: limit.isActive,
+        elevated: isElevatedSeverity(limit.severity),
+      };
+    });
+  }
+  const legacy: Array<[string, string, UsageWindowView["group"], boolean, UsageWindow | null | undefined]> = [
+    ["five_hour", "Session (5h)", "session", false, d.five_hour],
+    ["seven_day", "Weekly (all)", "weekly", false, d.seven_day],
+    ["seven_day_opus", "Weekly · Opus", "weekly", true, d.seven_day_opus],
+    ["seven_day_sonnet", "Weekly · Sonnet", "weekly", true, d.seven_day_sonnet],
+  ];
+  return legacy.filter(([, , , , w]) => w && typeof w === "object").map(([id, label, group, scoped, w]) => ({
+    id, label, group, scoped,
+    percent: typeof w!.utilization === "number" && Number.isFinite(w!.utilization) ? w!.utilization : null,
+    resetsAt: resets(w!.resets_at), active: false, elevated: false,
+  }));
+}
+
 /**
  * Render a labeled window as up to two lines:
  *   `<label> 36%`
@@ -631,7 +709,7 @@ function formatLocalClock(resetMs: number, now: number): string {
   return `${date}, ${time}`;
 }
 
-function subscriptionLabel(subscriptionType?: string): string {
+export function subscriptionLabel(subscriptionType?: string): string {
   if (!subscriptionType) return "";
   const map: Record<string, string> = {
     max: "Max",

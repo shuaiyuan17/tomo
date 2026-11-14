@@ -18,6 +18,7 @@ import {
   type PeopleDirs,
   type PersonRecord,
 } from "../src/people.js";
+import { normalizeImessageHandle } from "../src/sessions/keys.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -521,5 +522,98 @@ describe("people store", () => {
       const dmScope = loadPeople({ includePrivate: true, dirs });
       expect(resolveSenderTimeZone(dmScope, "telegram", "Carol Example", "3000")).toBe("Asia/Tokyo");
     });
+  });
+});
+
+describe("iMessage handles: one normal form shared with sessions/keys", () => {
+  // What the imsg channel hands people.ts as senderId is already in the
+  // shared normal form (ImsgChannel.normalizeAddress → normalizeImessageHandle).
+  const wire = (raw: string) => normalizeImessageHandle(raw);
+  beforeEach(() => rmSync(TEST_DIR, { recursive: true, force: true }));
+  afterEach(() => rmSync(TEST_DIR, { recursive: true, force: true }));
+
+  it("normalizeHandle IS normalizeImessageHandle for iMessage", () => {
+    const cases: Array<[string, string]> = [
+      ["1 (415) 555-1234", "+14155551234"],
+      ["+14155551234", "+14155551234"],
+      ["+1 (415) 555-1234", "+14155551234"],
+      ["4155551234", "4155551234"],
+      ["Foo@Bar.COM", "foo@bar.com"],
+      [" +86 138 0013 8000 ", "+8613800138000"],
+      ["iMessage;-;+14155551234", "+14155551234"],
+      ["urn:biz:1234-abc", "urn:biz:1234-abc"],
+    ];
+    for (const [raw, expected] of cases) {
+      expect(normalizeHandle("imessage", raw)).toBe(expected);
+      expect(normalizeHandle("imessage", raw)).toBe(normalizeImessageHandle(raw));
+    }
+    // Other channels are only trimmed, as before.
+    expect(normalizeHandle("telegram", " 12345 ")).toBe("12345");
+  });
+
+  /** Find the record whose STORED imessage value is `stored` by a sender id. */
+  function matchStored(stored: string, sender: string): boolean {
+    const record = parsePersonFile(`---\nname: P\nimessage: ${stored}\n---\n`, "/x/p.md", false);
+    if (!record) throw new Error("fixture did not parse");
+    return findPersonByHandle([record], "imessage", wire(sender)) !== undefined;
+  }
+
+  it("records written in any earlier form still match the sender", () => {
+    // Hand-written, written by the OLD upsert ("1 (415) 555-1234" → "14155551234"),
+    // already E.164, legacy decorations, international, email, DM GUID.
+    const sender = "+14155551234";
+    for (const stored of [
+      "+1 (415) 555-1234",
+      "1 (415) 555-1234",
+      "14155551234",
+      "+14155551234",
+      "tel:+14155551234",
+      "+1 415 555 1234 (cell)",
+      "iMessage;-;+14155551234",
+    ]) {
+      expect(matchStored(stored, sender), stored).toBe(true);
+    }
+    expect(matchStored("+86 138 0013 8000", "+8613800138000")).toBe(true);
+    expect(matchStored("Foo@Bar.COM", "foo@bar.com")).toBe(true);
+    expect(matchStored("4155551234", "4155551234")).toBe(true);
+  });
+
+  it("every stored/sender pair the old people normalizer matched still matches", () => {
+    // Frozen copy of the pre-unification people.ts normalizer, as an oracle.
+    const legacy = (v: string) => {
+      const t = v.trim();
+      return t.includes("@") ? t.toLowerCase() : t.replace(/[^\d+]/g, "");
+    };
+    const stored = [
+      "+1 (415) 555-1234", "+14155551234", "+86 138 0013 8000", "+44 20 7946 0958",
+      "tel:+14155551234", "Foo@Bar.COM", "iMessage;-;+14155551234", "4155551234",
+    ];
+    const senders = ["+14155551234", "+8613800138000", "+442079460958", "foo@bar.com", "4155551234"];
+    for (const s of stored) {
+      for (const sender of senders) {
+        if (legacy(s) === legacy(sender)) expect(matchStored(s, sender), `${s} vs ${sender}`).toBe(true);
+      }
+    }
+  });
+
+  it("no longer matches across countries or folds non-phone ids into digits", () => {
+    // A bare 10-digit number has no country: it must not match +1…, and
+    // never did. (Sweden's +46 95 550 123 vs a bare 4695550123 is the
+    // case normalizeImessageHandle exists to keep apart.)
+    expect(matchStored("4155551234", "+14155551234")).toBe(false);
+    expect(matchStored("4695550123", "+4695550123")).toBe(false);
+    // The old normalizer reduced a business-chat URN to "1234".
+    expect(matchStored("urn:biz:1234-abc", "1234")).toBe(false);
+    expect(matchStored("urn:biz:1234-abc", "urn:biz:1234-abc")).toBe(true);
+  });
+
+  it("upsert and auto-bind store the shared normal form", () => {
+    const { record } = upsertPerson({ name: "Nina", imessage: "1 (415) 555-1234" }, { includePrivate: false, dirs });
+    expect(record.handles.imessage).toBe("+14155551234");
+    expect(readFileSync(record.filePath, "utf-8")).toContain("imessage: +14155551234");
+
+    writePerson(dirs.publicDir, "omar.md", "---\nname: Omar\n---\n");
+    const bound = autoBindHandle("imessage", wire("+86 138 0013 8000"), "Omar", dirs);
+    expect(bound?.handles.imessage).toBe("+8613800138000");
   });
 });

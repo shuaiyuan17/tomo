@@ -4,6 +4,7 @@ import { writeFileAtomicSync } from "./fs-utils.js";
 import { defaultRuntimePaths } from "./runtime-paths.js";
 import { log } from "./logger.js";
 import { canonicalTimeZone, validTimeZone } from "./timezone.js";
+import { normalizeImessageHandle } from "./sessions/keys.js";
 
 /**
  * People registry — structured identity records for the humans in the user's
@@ -64,15 +65,34 @@ export function defaultPeopleDirs(): PeopleDirs {
   };
 }
 
-/** Normalize a handle the same way channels normalize sender ids, so a
- *  hand-written `imessage: +1 (415) 555-1234` still matches the wire form. */
+/**
+ * Normalize a handle the same way the channel normalizes sender ids, so a
+ * hand-written `imessage: +1 (415) 555-1234` still matches the wire form.
+ * iMessage goes through `normalizeImessageHandle` (src/sessions/keys.ts), the
+ * one normal form config, the owner match and the imsg channel already use;
+ * other channels' ids are compared trimmed.
+ */
 export function normalizeHandle(channel: string, value: string): string {
-  const v = value.trim();
-  if (channel === "imessage") {
-    if (v.includes("@")) return v.toLowerCase();
-    return v.replace(/[^\d+]/g, "");
-  }
-  return v;
+  return channel === "imessage" ? normalizeImessageHandle(value) : value.trim();
+}
+
+/**
+ * The E.164 number an iMessage handle stored in a person record meant under
+ * the old people-only normalizer, which kept every digit and `+` of ANY
+ * value. Only consulted for STORED values the shared normalizer leaves
+ * alone (a `tel:` prefix, a note after the number), and only when that
+ * yields an unambiguous `+<8-15 digits>` — never bare digits, which is how
+ * the old normalizer folded `urn:biz:1234-abc` into `1234`.
+ */
+function legacyStoredImessageNumber(stored: string): string | undefined {
+  if (stored.includes("@")) return undefined;
+  const legacy = stored.trim().replace(/[^\d+]/g, "");
+  return /^\+\d{8,15}$/.test(legacy) ? legacy : undefined;
+}
+
+function storedHandleMatches(channel: string, stored: string, target: string): boolean {
+  if (normalizeHandle(channel, stored) === target) return true;
+  return channel === "imessage" && legacyStoredImessageNumber(stored) === target;
 }
 
 function normalizeName(name: string): string {
@@ -277,7 +297,7 @@ export function findPersonByHandle(people: PersonRecord[], channel: string, send
   const target = normalizeHandle(channel, senderId);
   return people.find((p) => {
     const h = p.handles[channel];
-    return h !== undefined && normalizeHandle(channel, h) === target;
+    return h !== undefined && target !== "" && storedHandleMatches(channel, h, target);
   });
 }
 

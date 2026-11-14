@@ -7,7 +7,6 @@ export const WEB_CHAT_ID = "owner";
 export const MAX_BODY_BYTES = 128 * 1024;
 export const MAX_EVENT_BYTES = 256 * 1024;
 export const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
-export const WEB_REQUEST_HEADER = "x-tomo-request";
 export const messageInputSchema = z.object({
   requestId: z.uuid(),
   targetId: z.string().max(128).optional(),

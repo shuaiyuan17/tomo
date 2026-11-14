@@ -5,7 +5,7 @@ import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
-import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
+import { endsWithTrailingNoReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { isNothingSent, partsSent } from "../channels/types.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
@@ -72,17 +72,6 @@ export interface RunWithRetryRequest {
 export type ShutdownTurnEnd = "refused" | "interrupted";
 
 export { DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-
-/**
- * Silent-reply checks. User and production send/deferred-send turns match the
- * bare token only; send/deferred-send turns strip trailing bare NO_REPLY blocks
- * before applying their matcher. The embedded matcher is retained for callers
- * that deliberately want legacy substring suppression.
- */
-export const bareSilentMatcher = isSilentReply;
-export function embeddedSilentMatcher(response: string): boolean {
-  return isSilentReply(response) || response.includes("NO_REPLY");
-}
 
 /**
  * Delivery back to the chat the turn came from (user turns). Carries the

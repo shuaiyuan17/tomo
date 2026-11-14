@@ -12,6 +12,18 @@
 //
 // Usage: npx tsx scripts/repair-session.ts <path-to-session.jsonl>
 //        The original file is preserved at <path>.bak before writing.
+//
+// RELATION TO src/lcm: there is no `tomo lcm` equivalent yet. src/lcm/compact.ts
+// no longer produces these orphans, but sessions compacted before that fix
+// can only be repaired with this script.
+//
+// KNOWN ISSUES — read before running. This is an offline maintenance script,
+// not part of the build: it is outside tsconfig, has no tests, and does not
+// share code with src/lcm. Unlike src/lcm it SILENTLY DROPS every line that
+// does not parse as JSON (src/lcm keeps them via
+// `parseJsonl(text, { preserveUnparseable: true })`), writes the file in place
+// without a temp-file rename, and overwrites any existing <path>.bak. Stop the
+// daemon (or make sure the session is not live) and keep your own copy first.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 

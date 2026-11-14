@@ -6,7 +6,6 @@ import { STEER_MERGED, SdkResultError } from "../src/agent/live-session.js";
 import { PartialSendError } from "../src/channels/types.js";
 import {
   TurnRunner,
-  embeddedSilentMatcher,
   injectTimestamp,
   originForSource,
   type RunWithRetryRequest,
@@ -250,9 +249,8 @@ describe("originForSource", () => {
 });
 
 describe("silent matchers", () => {
-  it("keeps the bare/substring inconsistency in one place", () => {
-    expect(embeddedSilentMatcher("NO_REPLY")).toBe(true);
-    expect(embeddedSilentMatcher("did the thing. NO_REPLY")).toBe(true);
+  it("the default matcher only accepts the bare token", () => {
+    expect(isSilentReply("NO_REPLY")).toBe(true);
     expect(isSilentReply("did the thing. NO_REPLY")).toBe(false);
   });
 });
@@ -312,7 +310,7 @@ describe("TurnRunner reply turns", () => {
 
   it("uses the spec's silentMatcher for reply delivery", async () => {
     const h = makeHarness(async () => "text then NO_REPLY");
-    await h.runner.runTurn(replySpec(h, { silentMatcher: embeddedSilentMatcher }));
+    await h.runner.runTurn(replySpec(h, { silentMatcher: (r: string) => r.includes("NO_REPLY") }));
 
     expect(h.channel.sent).toHaveLength(0);
   });

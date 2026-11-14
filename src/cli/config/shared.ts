@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
 import { defaultRuntimePaths } from "../../runtime-paths.js";
@@ -11,7 +11,6 @@ export const CONFIG_PATH = paths.configPath;
 export const CONFIG_BACKUP_PATH = paths.configBackupPath;
 export const SESSIONS_DIR = paths.sessionsDir;
 export const SDK_SESSIONS_DIR = paths.sdkSessionsDir;
-export const LOG_PATH = join(paths.logsDir, "tomo.log");
 
 export const MODELS = MODEL_ALIASES;
 

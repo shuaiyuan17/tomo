@@ -12,18 +12,58 @@ import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
 import { resetTurnBudget, type TurnBudget, type sdkOptions } from "./sdk-options.js";
-import { endsWithTrailingNoReply } from "./text-utils.js";
-import { filterScaffoldLeak } from "./scaffold-filter.js";
-import { scrubSecretValues } from "../redact.js";
 import {
-  detectFabricatedMarkers,
   markFabricatedText,
   recordFabricatedMarkers,
-  type FabricatedMarker,
 } from "./inbound-markers.js";
 import { silentTurnSteerNote } from "../continuity-defaults.js";
 import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
+import {
+  STEER_MERGED,
+  cumulativeModelTokens,
+  describeResultFailure,
+  mainLoopUsage,
+  tokenSum,
+  type QueryResult,
+  type SdkResultLike,
+  type TokenTotals,
+} from "./sdk-result.js";
+import { DELIVERY_TIMEOUT_MS, formatTimeout, normalizeTimeoutMs, queryTimeoutError, withDeliveryTimeout } from "./turn-timeouts.js";
+import { McpAuthRefresher, type McpAuthRefreshOutcome } from "./mcp-auth-refresh.js";
+import { renderBlock, renderResponseBlocks, type ResponseBlock } from "./block-render.js";
+import { summarizeToolInput, summarizeToolResult } from "./tool-summary.js";
+import { buildContentBlocks, isTextBlock, isThinkingBlock, isToolUseBlock } from "./content-blocks.js";
+
+// Re-exported so existing `./live-session.js` imports keep working.
+export {
+  EXECUTION_ERROR_RESPONSE,
+  MAX_BUDGET_RESPONSE,
+  MAX_TURNS_RESPONSE,
+  QUERY_TIMEOUT_ERROR_PREFIX,
+  STEER_MERGED,
+  SdkResultError,
+  TurnInterruptedError,
+  describeResultFailure,
+  type QueryResult,
+} from "./sdk-result.js";
+export { DELIVERY_TIMEOUT_MS } from "./turn-timeouts.js";
+export {
+  MAX_MCP_AUTH_REFRESHES_PER_WINDOW,
+  MCP_AUTH_REFRESH_WINDOW_MS,
+  isMcpAuthErrorText,
+  mcpServerFromToolName,
+  type McpAuthRefreshOutcome,
+} from "./mcp-auth-refresh.js";
+export {
+  THINKING_MARKER,
+  renderBlock,
+  renderResponseBlocks,
+  type BlockRender,
+  type RenderedTurn,
+  type ResponseBlock,
+} from "./block-render.js";
+export { summarizeToolInput } from "./tool-summary.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
@@ -96,195 +136,11 @@ interface OutstandingDelivery {
 export type UnownedTurnFactory = () => TurnRequest | undefined;
 
 /**
- * Sentinel resolution for a steered message that merged into the in-flight
- * turn: that turn's owner request receives (and delivers) the combined
- * response, so the steered caller gets this empty marker instead. The empty
- * string is safe as a sentinel only because send()/steer() can never
- * legitimately resolve with "" — empty turns fall back to "I'm not sure how
- * to respond to that." in the result handler.
- */
-export const STEER_MERGED = "";
-export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
-
-/** Fabricated reply for a turn the CLI cut short at the max-turns limit. */
-export const MAX_TURNS_RESPONSE = "I ran out of steps trying to complete that. Can you try a simpler request?";
-/** Fabricated reply for a turn the CLI cut short at the per-query budget. */
-export const MAX_BUDGET_RESPONSE = "I hit the spending limit for this turn before finishing.";
-/** Fabricated reply for a turn that died inside the CLI (`error_during_execution` and friends). */
-export const EXECUTION_ERROR_RESPONSE = "Something went wrong while I was working on that and the turn stopped early.";
-
-/**
- * The slice of `SDKResultMessage` the result handler reads. Typed by hand
- * rather than imported so an SDK release that adds result subtypes keeps
- * compiling — `subtype` is compared as a string and unknown values fall into
- * the generic execution-error branch.
- */
-interface SdkResultLike {
-  subtype: string;
-  is_error?: boolean;
-  /** Error subtypes: why the turn stopped. */
-  errors?: string[];
-  /** `success` subtype: the final assistant text — or, with `is_error`, the API error text. */
-  result?: string;
-  num_turns?: number;
-  duration_ms?: number;
-  total_cost_usd?: number;
-  usage?: Record<string, unknown>;
-  modelUsage?: Record<string, {
-    inputTokens?: number;
-    outputTokens?: number;
-    cacheReadInputTokens?: number;
-    cacheCreationInputTokens?: number;
-  }>;
-  session_id?: string;
-}
-
-interface TokenTotals {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheCreated: number;
-}
-
-/** Cumulative `modelUsage` summed across models; null when the result has none. */
-function cumulativeModelTokens(result: SdkResultLike): TokenTotals | null {
-  const models = result.modelUsage ? Object.values(result.modelUsage) : [];
-  if (models.length === 0) return null;
-  return models.reduce<TokenTotals>((acc, m) => ({
-    input: acc.input + (m.inputTokens ?? 0),
-    output: acc.output + (m.outputTokens ?? 0),
-    cacheRead: acc.cacheRead + (m.cacheReadInputTokens ?? 0),
-    cacheCreated: acc.cacheCreated + (m.cacheCreationInputTokens ?? 0),
-  }), { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 });
-}
-
-/** `usage`: main agent loop only, but already per-turn. */
-function tokenSum(t: TokenTotals): number {
-  return t.input + t.output + t.cacheRead + t.cacheCreated;
-}
-
-function mainLoopUsage(result: SdkResultLike): TokenTotals {
-  const u = result.usage as Record<string, number> | undefined;
-  return {
-    input: u?.input_tokens ?? 0,
-    output: u?.output_tokens ?? 0,
-    cacheRead: u?.cache_read_input_tokens ?? 0,
-    cacheCreated: u?.cache_creation_input_tokens ?? 0,
-  };
-}
-
-/**
- * A turn the CLI ended on a non-success result. Thrown (rejected) from
- * send()/steer() so the failure travels the same path as any other turn
- * error and TurnRunner's `TurnErrorPolicy` decides what the chat sees —
- * delivered to a DM, note-only for a group cron, ignored for continuity —
- * and CronScheduler records the run as failed. `message` is owner-facing
- * (or, for an API-error result, the API error text, which the delivery
- * pipeline's `isAgentErrorResponse` already classifies).
- */
-export class SdkResultError extends Error {
-  constructor(
-    message: string,
-    readonly subtype: string,
-    readonly errors: string[] = [],
-    /** `num_turns` from the result, when the SDK reported it. 0 = nothing ran. */
-    readonly numTurns?: number,
-  ) {
-    super(message);
-    this.name = "SdkResultError";
-  }
-
-  /**
-   * A resume that couldn't find its conversation, as current SDKs report it:
-   * an execution-error result with zero turns and the reason in `errors`,
-   * rather than a throw. Nothing ran, so the turn is safe to re-run on a
-   * fresh session. Every condition is required; a result that ran any turn,
-   * or failed for any other reason too, is not this.
-   */
-  get isResumeMissing(): boolean {
-    return this.subtype === "error_during_execution"
-      && this.numTurns === 0
-      && this.errors.length > 0
-      && this.errors.every((e) => e.includes("No conversation found"));
-  }
-}
-
-/**
- * The owner stopped this turn on purpose (/rewind). Not a session failure:
- * LiveSessionManager never retries it (a retry would repeat whatever the turn
- * already did), and TurnRunner delivers nothing for it — the command's own
- * reply says the turn was stopped. The message must not match the manager's
- * "session closed" patterns.
- */
-export class TurnInterruptedError extends Error {
-  constructor(message = "Turn stopped by /rewind.") {
-    super(message);
-    this.name = "TurnInterruptedError";
-  }
-}
-
-/**
- * Classify a turn-ending result. `null` for a clean success; otherwise the
- * typed error the turn should reject with.
- *
- * The SDK's result union (`SDKResultSuccess | SDKResultError`) is closed
- * today, but new error subtypes have been added before; every one so far is
- * `error_*`, so an unrecognised `error_*` subtype is treated as an execution
- * error rather than as success.
- */
-export function describeResultFailure(result: SdkResultLike): SdkResultError | null {
-  const errors = result.errors ?? [];
-  switch (result.subtype) {
-    case "success":
-      if (!result.is_error) return null;
-      return new SdkResultError(result.result?.trim() || "API Error: the turn ended on an API error", result.subtype, errors);
-    case "error_max_turns":
-      return new SdkResultError(MAX_TURNS_RESPONSE, result.subtype, errors);
-    case "error_max_budget_usd":
-      return new SdkResultError(MAX_BUDGET_RESPONSE, result.subtype, errors);
-    default:
-      return result.subtype.startsWith("error") || result.is_error
-        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors, result.num_turns)
-        : null;
-  }
-}
-
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute timeout per send()/steer()
-
-/**
  * Consecutive failed context readings before we say so out loud. One or two
  * is a blip worth ignoring; three in a row means the pressure nudges are off
  * for this session and nobody would otherwise find out.
  */
 export const ESTIMATED_READING_WARN_AFTER = 3;
-
-/**
- * How long ONE block's delivery may take before we give up on it.
- *
- * Separate from the inactivity timeout on purpose, and much shorter. The
- * inactivity timeout asks "is the MODEL still working?" and kills the session
- * when the answer is no. This one asks "is the CHANNEL still taking bytes?"
- * and answers only for this block — a wedged iMessage send loses its own
- * message and nothing else. Sixty seconds is far beyond a healthy send (tens
- * of milliseconds) and far below the ten-minute inactivity window, so it fires
- * only on a genuine hang.
- */
-export const DELIVERY_TIMEOUT_MS = 60 * 1000;
-
-/** Reject after `ms` unless `work` settles first. Always clears its timer. */
-async function withDeliveryTimeout(work: Promise<void>, ms: number, label: string): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      work,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(label)), ms);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 
 export interface LiveSessionSettings {
   timeoutMs?: number;
@@ -313,351 +169,6 @@ export interface LiveSessionSettings {
    * deltas start from `baseline` instead of 0. See `turnUsage`.
    */
   resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
-}
-
-/** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
-export type McpAuthRefreshOutcome = "refreshed" | "failed" | "skipped" | "superseded";
-
-/**
- * How many token exchanges one session may trigger from tool errors, per
- * server, within MCP_AUTH_REFRESH_WINDOW_MS.
- *
- * A RATE, not a lifetime quota. Its job is to bound the damage when
- * `isMcpAuthErrorText` misreads an unrelated upstream error — each refresh
- * re-mounts the server, so an unbounded path would exchange a token per
- * failing tool call. A lifetime quota would do that too, but it would also
- * strand a long-lived session permanently: a token stored without `expiresAt`
- * is invisible to the proactive sweep (`isExpiring` is false for it), so this
- * backstop is the ONLY thing that can renew it, and a session outliving the
- * quota would never recover.
- */
-export const MAX_MCP_AUTH_REFRESHES_PER_WINDOW = 3;
-export const MCP_AUTH_REFRESH_WINDOW_MS = 60 * 60 * 1000;
-
-/**
- * Does a failed MCP tool result look like an expired/rejected access token?
- * Matched on the strings the CLI and MCP servers actually emit for 401s.
- * Kept narrow: a false positive spends one pointless token refresh.
- */
-export function isMcpAuthErrorText(text: string): boolean {
-  return /\b401\b|unauthoriz(?:ed|ation)|re-?authoriz|invalid_token|token (?:has )?expired/i.test(text);
-}
-
-/** `mcp__<server>__<tool>` → `<server>`, or null for a non-MCP tool name. */
-export function mcpServerFromToolName(name: string | undefined): string | null {
-  if (!name?.startsWith("mcp__")) return null;
-  const rest = name.slice("mcp__".length);
-  const sep = rest.indexOf("__");
-  const server = sep === -1 ? rest : rest.slice(0, sep);
-  return server.length > 0 ? server : null;
-}
-
-/**
- * Marker prefixed to a thinking block when showThinking is on, so the reader
- * can tell the model's reasoning from its reply. Chosen over a fenced block
- * because chat channels render neither Markdown nor code fences.
- *
- * Only ever applied with the flag ON. With it off, a thinking block that
- * survives to delivery is not being shown as reasoning — it IS the message
- * (see renderBlock) — so it ships plain.
- */
-export const THINKING_MARKER = "💭 ";
-
-/** An assistant content block worth keeping for the turn response. */
-export interface ResponseBlock {
-  type: "text" | "thinking";
-  text: string;
-}
-
-/**
- * A rendered turn. Delivery units are NOT part of it: blocks ship as they
- * complete (see renderBlock), so by the time a turn is rendered there is
- * nothing left to hand a channel — only the joined text the turn-level
- * bookkeeping needs.
- */
-export interface RenderedTurn {
-  /** The kept blocks joined with "\n" — logging, transcript, error/silence checks. */
-  text: string;
-  /** True when at least one block had a training-scaffold leak stripped. */
-  scaffoldFiltered: boolean;
-}
-
-/** What one content block turns into once the per-block rules have run. */
-export type BlockRender =
-  /**
-   * Ships as one channel message.
-   *
-   * `text` is the model's words, NEVER the harness's advisory: the
-   * fabricated-marker notice is prepended on the delivery path (shipBlock) so
-   * that the transcript — built from this same field via
-   * renderResponseBlocks — stays exactly what the model wrote.
-   */
-  | { kind: "ship"; text: string; scaffoldFiltered: boolean; fabricatedMarkers: FabricatedMarker[] }
-  /** Trailing line(s) were the bare control token — the block ships nothing. */
-  | { kind: "no-reply"; scaffoldFiltered: boolean }
-  /** Wrong type for this session, or nothing left after filtering. */
-  | { kind: "empty"; scaffoldFiltered: boolean };
-
-/**
- * Decide what ONE completed content block ships, from its `type` and its
- * LENGTH alone.
- *
- * This is the ONLY place that decides what reaches a channel, and it never
- * inspects the text to judge whether it is "really" a reply. A `text` block is
- * the model's chosen words and always ships, even when it happens to read like
- * reasoning (`思考: ...`) or like tool debris (`count`).
- * `redacted_thinking` carries no readable text and is dropped at collection
- * time.
- *
- * A `thinking` block:
- *   - showThinking ON  → ships prefixed with THINKING_MARKER, so the reader can
- *     tell reasoning from reply.
- *   - showThinking OFF → the SDK is running thinking `display: "omitted"`,
- *     which strips the reasoning and leaves a signature-only block whose text
- *     is EMPTY. An empty one is the normal case and is dropped silently. A
- *     NON-EMPTY one is dropped too, with a warn that records its length; it
- *     reaches neither the channel nor the transcript.
- *
- * WHY A NON-EMPTY ONE IS NOT DELIVERED (2026-09-09, reversing the 2026-08-28
- * rule). On 2026-08-28 the non-empty thinking blocks seen under `omitted`
- * were, every one, verbatim prose the model had aimed at the owner in the
- * wrong block type, so they were shipped as messages. That reading stopped
- * being true after the 2026-09-01 model change: under `omitted` the model now
- * returns a SUMMARY of the block (short, paraphrased, punctuation-stripped)
- * rather than what it wrote, and on 2026-09-09 four of those summaries went
- * out as replies. Each replaced the reply the model had actually composed,
- * and one asserted a next step the model never planned. A paraphrase the
- * model did not write is worse than a lost message: the lost message is at
- * least absent. The warn keeps the rate visible — a model that puts replies in thinking
- * blocks needs a model-side fix (compose the reply as a text block, or send
- * it through a tool), not delivery of whatever the API hands back.
- *
- * The two remaining rules are per block by design (#292) and now also per
- * block in TIME — they run as the block completes, because that is when it
- * ships:
- *   1. scaffold-leak filter — a leak truncates its own block, not the turn, so
- *      blocks after a `<system-reminder>` slip still ship;
- *   2. bare-NO_REPLY drop — a block whose trailing line(s) are only the token
- *      is dropped WHOLE (text, MEDIA: and STICKER: alike), so housekeeping
- *      narration and its attachments never leak out of a mid-turn slip;
- *   3. fabricated-inbound-marker DETECTION — a line shaped like one of the
- *      harness's own inbound markers is reported on the result, and shipBlock
- *      prepends an advisory to the DELIVERED copy. Nothing is cut and the
- *      transcript is untouched (src/agent/inbound-markers.ts).
- */
-export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockRender {
-  // With the flag off a thinking block contributes nothing anywhere — not
-  // to delivery, not to the transcript, not to the response string. Under
-  // `omitted` its text is a summary of what the model wrote, not the words
-  // (see the header); recording it would let recall read a paraphrase back
-  // as something the model said. shipBlock logs the drop with its length.
-  if (block.type === "thinking" && !showThinking) return { kind: "empty", scaffoldFiltered: false };
-  const scaffold = filterScaffoldLeak(block.text);
-  const scaffoldFiltered = scaffold.filtered;
-  const text = scaffold.text.trim();
-  if (!text) return { kind: "empty", scaffoldFiltered };
-  if (endsWithTrailingNoReply(text)) return { kind: "no-reply", scaffoldFiltered };
-
-  return {
-    kind: "ship",
-    // Marked only when thinking is being shown AS thinking. With the flag off
-    // this block is a message, and a message does not get a 💭 on it.
-    text: block.type === "thinking" && showThinking ? `${THINKING_MARKER}${text}` : text,
-    scaffoldFiltered,
-    // Reported, not acted on, here: this is what the block WILL ship, and the
-    // guard's whole point is that the words stay. The advisory goes on in
-    // shipBlock, where "delivered" and "recorded in the transcript" part ways.
-    fabricatedMarkers: detectFabricatedMarkers(text),
-  };
-}
-
-/**
- * Join a turn's collected content blocks into its RESPONSE STRING.
- *
- * Delivery does not go through here — each block was already shipped by
- * `renderBlock` as it completed. What is left is everything that legitimately
- * needs the whole turn: the transcript, the response log line, the value
- * `send()`/`steer()` resolve with, and the end-of-turn silence and
- * agent-error checks.
- *
- * Because those checks read this string, the trailing bare NO_REPLY is still
- * represented here even though the block itself shipped nothing — otherwise a
- * housekeeping turn would render as empty and be replaced by the "I'm not sure
- * how to respond to that." fallback in the transcript.
- */
-export function renderResponseBlocks(blocks: ResponseBlock[], showThinking: boolean): RenderedTurn {
-  const rendered: string[] = [];
-  let scaffoldFiltered = false;
-  // Tracks whether the last block that carried any content was a NO_REPLY
-  // block — a TRAILING one is load-bearing (see below), a mid-turn one is not.
-  let lastKeptWasNoReply = false;
-
-  for (const block of blocks) {
-    const result = renderBlock(block, showThinking);
-    if (result.scaffoldFiltered) scaffoldFiltered = true;
-    if (result.kind === "empty") continue;
-    if (result.kind === "no-reply") {
-      lastKeptWasNoReply = true;
-      continue;
-    }
-    lastKeptWasNoReply = false;
-    rendered.push(result.text);
-  }
-
-  // NO_REPLY is Tomo's own control token, not the model's prose. A block whose
-  // trailing line(s) are the bare token MID-turn is a slip and is dropped —
-  // under per-block delivery the channels dropped it too. A TRAILING one is
-  // load-bearing: it marks the whole turn as not-for-the-channel (owner
-  // decision 2026-07-08), so exactly one is kept at the end for the delivery
-  // layer's trailing-NO_REPLY check to find.
-  const kept = lastKeptWasNoReply ? [...rendered, "NO_REPLY"] : rendered;
-
-  return { text: kept.join("\n").trim(), scaffoldFiltered };
-}
-
-function normalizeTimeoutMs(timeoutMs: number | undefined): number {
-  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-    ? Math.floor(timeoutMs)
-    : DEFAULT_TIMEOUT_MS;
-}
-
-function formatTimeout(timeoutMs: number): string {
-  if (timeoutMs % 60_000 === 0) {
-    const minutes = timeoutMs / 60_000;
-    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
-  }
-  if (timeoutMs % 1000 === 0) {
-    const seconds = timeoutMs / 1000;
-    return `${seconds} second${seconds === 1 ? "" : "s"}`;
-  }
-  return `${timeoutMs}ms`;
-}
-
-function queryTimeoutError(timeoutMs: number): string {
-  return `${QUERY_TIMEOUT_ERROR_PREFIX} ${formatTimeout(timeoutMs)}`;
-}
-
-export interface QueryResult {
-  /** Cost of this turn only (delta of the SDK's cumulative per-process total) */
-  costUsd: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
-  contextUsed: number;
-  contextMax: number;
-  contextBreakdown?: { name: string; tokens: number }[];
-  /**
-   * The SDK could not report context usage for this turn, so `contextUsed` is
-   * a crude approximation from the turn's own token counts and `contextMax` is
-   * the last reading that WAS real (0 if there has never been one). Anything
-   * that acts on the ratio — the context-nudge ladder — must skip instead.
-   */
-  contextEstimated?: boolean;
-  /**
-   * The SDK's cumulative counters after this turn — what the next resume of
-   * this SDK session must difference against. `null` when they cannot be
-   * trusted as that baseline (the totals just reset, or the result carried no
-   * `modelUsage`/session id), which makes the next resume take the
-   * conservative no-baseline path rather than charge a carried total.
-   */
-  usageBaseline?: UsageBaseline | null;
-}
-
-/**
- * Tool summaries are the daemon's highest-volume path for other people's
- * secrets: the model reads config files, token stores and `.env`s on request,
- * and these two functions put the result into a log line AND onto the watch
- * bus. Scrubbing here rather than at each call site covers both — the watch
- * publish in `publishToolStart` never goes through pino's `logMethod` hook.
- */
-function summarizeToolResult(content: unknown): string {
-  // Tool results arrive as either a string or an array of content blocks
-  // ({type:"text",text:"..."} | {type:"image",...} | etc.). We flatten to a
-  // short readable string for log lines — no need to be exhaustive.
-  if (content == null) return "(empty)";
-  if (typeof content === "string") return scrubSecretValues(content.slice(0, 500));
-  if (Array.isArray(content)) {
-    const parts: string[] = [];
-    for (const b of content) {
-      if (b && typeof b === "object") {
-        if ("text" in b && typeof (b as { text: unknown }).text === "string") {
-          parts.push((b as { text: string }).text);
-        } else if ("type" in b) {
-          parts.push(`<${(b as { type: string }).type}>`);
-        }
-      }
-    }
-    return scrubSecretValues(parts.join(" ").slice(0, 500));
-  }
-  return scrubSecretValues(JSON.stringify(content).slice(0, 500));
-}
-
-/** Exported for tests. */
-export function summarizeToolInput(name: string, input?: Record<string, unknown>): string {
-  return scrubSecretValues(describeToolInput(name, input));
-}
-
-function describeToolInput(name: string, input?: Record<string, unknown>): string {
-  if (!input) return name;
-  switch (name) {
-    case "Read": return `Read ${input.file_path}`;
-    case "Write": return `Write ${input.file_path}`;
-    case "Edit": return `Edit ${input.file_path}`;
-    case "Bash": return `Bash: ${String(input.command).slice(0, 500)}`;
-    case "Glob": return `Glob ${input.pattern}`;
-    case "Grep": return `Grep "${input.pattern}"`;
-    case "WebSearch": return `WebSearch: ${input.query}`;
-    case "WebFetch": return `WebFetch: ${input.url}`;
-    case "Agent": case "Task": return `Agent → ${input.subagent_type ?? "?"}: ${String(input.description ?? "").slice(0, 80)}`;
-    default: return `${name}: ${JSON.stringify(input).slice(0, 500)}`;
-  }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isTextBlock(block: unknown): block is { type: "text"; text: string } {
-  return isObject(block) && block.type === "text" && typeof block.text === "string";
-}
-
-function isThinkingBlock(block: unknown): block is { type: "thinking"; thinking: string } {
-  return isObject(block) && block.type === "thinking" && typeof block.thinking === "string";
-}
-
-function isToolUseBlock(block: unknown): block is { type: "tool_use"; id?: string; name: string; input?: Record<string, unknown> } {
-  return isObject(block) && block.type === "tool_use" && typeof block.name === "string";
-}
-
-type ImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
-
-function buildContentBlocks(
-  text: string,
-  images?: Array<{ data: string; mediaType: string }>,
-  documents?: Array<{ data: string; mediaType: string; filename?: string }>,
-): Array<Record<string, unknown>> {
-  const content: Array<Record<string, unknown>> = [];
-  if (images && images.length > 0) {
-    for (const img of images) {
-      content.push({
-        type: "image",
-        source: { type: "base64", media_type: img.mediaType as ImageMediaType, data: img.data },
-      });
-    }
-  }
-  if (documents && documents.length > 0) {
-    for (const doc of documents) {
-      const block: Record<string, unknown> = {
-        type: "document",
-        source: { type: "base64", media_type: doc.mediaType, data: doc.data },
-      };
-      if (doc.filename) block.title = doc.filename;
-      content.push(block);
-    }
-  }
-  content.push({ type: "text", text });
-  return content;
 }
 
 export class LiveSession {
@@ -748,12 +259,7 @@ export class LiveSession {
   private unownedTurnFactory: UnownedTurnFactory | undefined;
   private timeoutMs: number;
   private showThinking: boolean;
-  private onMcpAuthError: LiveSessionSettings["onMcpAuthError"];
-  /** Servers with a refresh attempt in flight — no duplicate concurrent asks. */
-  private mcpAuthRefreshInFlight = new Set<string>();
-  /** Per-server timestamps of exchanges actually triggered, pruned to the window. */
-  private mcpAuthRefreshAttempts = new Map<string, number[]>();
-  private now: () => number;
+  private mcpAuthRefresher: McpAuthRefresher;
   private onToolResult: LiveSessionSettings["onToolResult"];
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
@@ -790,8 +296,7 @@ export class LiveSession {
     this.unownedTurnFactory = unownedTurnFactory;
     this.timeoutMs = normalizeTimeoutMs(settings.timeoutMs);
     this.showThinking = settings.showThinking ?? false;
-    this.onMcpAuthError = settings.onMcpAuthError;
-    this.now = settings.now ?? Date.now;
+    this.mcpAuthRefresher = new McpAuthRefresher(settings.onMcpAuthError, settings.now ?? Date.now);
     this.onToolResult = settings.onToolResult;
     const resumeFrom = settings.resumeFrom;
     if (resumeFrom) {
@@ -1479,7 +984,7 @@ export class LiveSession {
           { tool: name ?? "?", ...(tr.is_error ? { is_error: true } : {}), ...(agent ? { agent } : {}) },
           `${tr.is_error ? "[ERR] " : ""}${name ?? "?"} result: ${summary}`,
         );
-        if (tr.is_error) this.reportMcpAuthError(name, summary);
+        if (tr.is_error) this.mcpAuthRefresher.report(name, summary);
         watchBus.publish({
           type: "tool.end",
           ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
@@ -1491,55 +996,6 @@ export class LiveSession {
         this.onToolResult?.(name ?? "?", tr.content, tr.is_error === true);
       }
     }
-  }
-
-  /**
-   * A mounted MCP server just rejected a tool call for authorization reasons —
-   * with harness-managed OAuth that means the Bearer token baked into this
-   * session at build time has expired. Tell the host once per server so it can
-   * refresh and re-mount; a repeat inside the same session would only queue
-   * duplicate refreshes behind the first one.
-   */
-  private reportMcpAuthError(toolName: string | undefined, resultText: string): void {
-    const notify = this.onMcpAuthError;
-    if (!notify) return;
-    const serverName = mcpServerFromToolName(toolName);
-    if (!serverName || !isMcpAuthErrorText(resultText)) return;
-    if (this.mcpAuthRefreshInFlight.has(serverName)) return;
-    if (this.recentMcpAuthRefreshes(serverName).length >= MAX_MCP_AUTH_REFRESHES_PER_WINDOW) return;
-
-    this.mcpAuthRefreshInFlight.add(serverName);
-    log.info({ serverName, tool: toolName }, "MCP tool rejected for authorization; requesting a token refresh");
-    void (async () => {
-      try {
-        const outcome = await notify(serverName);
-        // Charged only for an exchange that actually happened. `skipped`
-        // (a login owns the credential, or there is nothing to refresh) and
-        // `superseded` (a newer record landed first, and its own writer
-        // already re-mounted) leave the budget untouched, so a transient
-        // token-endpoint failure or a 401 during /mcp login does not cost
-        // this session its ability to recover later.
-        if (outcome === "refreshed" || outcome === "failed") this.chargeMcpAuthRefresh(serverName);
-        log.info({ serverName, outcome }, "MCP token refresh after an auth error settled");
-      } catch (err) {
-        this.chargeMcpAuthRefresh(serverName);
-        log.warn({ serverName, err }, "MCP auth-error notification threw");
-      } finally {
-        this.mcpAuthRefreshInFlight.delete(serverName);
-      }
-    })();
-  }
-
-  /** This server's exchanges inside the rate window, pruning older ones. */
-  private recentMcpAuthRefreshes(serverName: string): number[] {
-    const cutoff = this.now() - MCP_AUTH_REFRESH_WINDOW_MS;
-    const recent = (this.mcpAuthRefreshAttempts.get(serverName) ?? []).filter((at) => at > cutoff);
-    this.mcpAuthRefreshAttempts.set(serverName, recent);
-    return recent;
-  }
-
-  private chargeMcpAuthRefresh(serverName: string): void {
-    this.recentMcpAuthRefreshes(serverName).push(this.now());
   }
 
   /**

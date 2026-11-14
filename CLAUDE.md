@@ -27,6 +27,8 @@ src/
     turn-runner.ts          # Runs a turn with retry + NO_REPLY silent-reply policy
     live-session-manager.ts # Owns LiveSession lifecycle — create/resume, reset-and-retry
     live-session.ts         # Wraps SDK query() streaming; steering merge/promotion
+                            #   (helpers: sdk-result, block-render, turn-timeouts, mcp-auth-refresh,
+                            #   tool-summary, content-blocks — re-exported from live-session.ts)
     delivery-pipeline.ts    # Streams + finalizes outbound messages to channels
     commands.ts             # Chat slash commands (/new, /model, /summon, /login, ...)
     scaffold-filter.ts      # Strips training-scaffold leaks from outbound text

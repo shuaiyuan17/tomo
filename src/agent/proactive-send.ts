@@ -11,6 +11,7 @@ import {
   replyTargetFromRawSessionKey,
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
+import { isPrivateAttachmentPath } from "./permissions.js";
 import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
 import type { DeliverySegment } from "./delivery-pipeline.js";
 import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
@@ -141,6 +142,22 @@ export class ProactiveSendService {
     /** Per-piece outcome in model order, set only when something failed. */
     let segments: DeliverySegment[] | undefined;
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
+
+    // NO PRIVATE MEMORY INTO A GROUP, WHOEVER ASKS. The PreToolUse guard stops
+    // a barred turn's send_message, but this is the outlet itself: a group
+    // chat's participants are never entitled to `memory/private/`, so the
+    // send is refused here too — before anything goes out, so nothing is
+    // half-delivered. Sticker values count: on iMessage they are file paths.
+    if (isGroupSessionKey(sessionKey)) {
+      const privatePaths = [...mediaPaths, ...stickerIds].filter((p) => isPrivateAttachmentPath(p));
+      if (privatePaths.length > 0) {
+        log.warn({ sessionKey, count: privatePaths.length }, "Direct send refused: attachment lands in memory/private/");
+        return {
+          ok: false,
+          error: `Not sent: ${privatePaths.length === 1 ? "an attachment names" : `${privatePaths.length} attachments name`} a file under \`memory/private/\`, which is DM-only and is never sent into a group chat. Nothing was delivered.`,
+        };
+      }
+    }
     if (mediaPaths.length > 0 || stickerIds.length > 0) {
       // Send text first (matches assistant response ordering). The effect
       // rides the text send — it modifies delivery of text, not attachments.

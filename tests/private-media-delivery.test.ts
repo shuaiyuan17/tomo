@@ -142,6 +142,37 @@ describe("reply delivery on a barred turn", () => {
   });
 });
 
+describe("stickers on a barred turn (audit P0-2)", () => {
+  // On iMessage a STICKER: value is a local file path, and sendSticker falls
+  // back to a plain attachment send — so it is the same read MEDIA: is.
+  const stickers = (channel: RecordingChannel) => channel.sent.filter((m) => m.sticker).map((m) => m.sticker);
+
+  it("drops a sticker path inside private/ and still delivers the words", async () => {
+    const { channel, deliver } = senderFor(true);
+    await deliver(`look\nSTICKER:${PRIVATE_PIC}`);
+    expect(stickers(channel)).toEqual([]);
+    expect(texts(channel)).toEqual(["look"]);
+  });
+
+  it("drops one reached through a symlink, and a relative one", async () => {
+    const { channel, deliver } = senderFor(true);
+    await deliver(`STICKER:${LINK_TO_PRIVATE}\nSTICKER:"memory/private/diary.png"`);
+    expect(stickers(channel)).toEqual([]);
+  });
+
+  it("still sends a public sticker path and a Telegram file_id", async () => {
+    const { channel, deliver } = senderFor(true);
+    await deliver(`STICKER:${PUBLIC_PIC}\nSTICKER:CAACAgIAAxkBAAEBmRVlYr4`);
+    expect(stickers(channel)).toEqual([PUBLIC_PIC, "CAACAgIAAxkBAAEBmRVlYr4"]);
+  });
+
+  it("sends the private sticker on the owner's own turn", async () => {
+    const { channel, deliver } = senderFor(false);
+    await deliver(`STICKER:${PRIVATE_PIC}`);
+    expect(stickers(channel)).toEqual([PRIVATE_PIC]);
+  });
+});
+
 describe("reply delivery on an unbarred turn", () => {
   it("sends the private attachment — the owner's own DM is entitled to it", async () => {
     const { channel, deliver } = senderFor(false);
@@ -191,5 +222,48 @@ describe("what the transcript records for a dropped attachment", () => {
     // The words did reach the group, and the transcript has to say so.
     expect(entry.startsWith("words\n")).toBe(true);
     expect(entry).not.toContain(`${DELIVERY_FAILED_MARKER}words`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// send_message direct into a GROUP: the outlet refuses private attachments
+// whoever asks, before anything goes out (audit P0-2). The PreToolUse guard is
+// the first line; this is the one that holds when the caller is not barred.
+// ---------------------------------------------------------------------------
+
+describe("direct send into a group", () => {
+  async function directSend(target: string, text: string) {
+    const { ProactiveSendService } = await import("../src/agent/proactive-send.js");
+    const channel = new RecordingChannel();
+    const transcript: string[] = [];
+    const service = new ProactiveSendService({
+      getChannel: (name) => (name === channel.name ? channel : undefined),
+      getSummonedIdentity: () => undefined,
+      getReplyTarget: () => undefined,
+      deriveReplyTargetFromConfig: () => undefined,
+      appendAssistantTranscript: (_k, content) => { transcript.push(content); },
+      setChatTitle: () => {},
+      listActiveEntries: () => [],
+      queuePendingNote: () => {},
+      runDelegateTurn: async () => true,
+    });
+    const result = await service.sendToSession(target, text, "dm:shuai");
+    return { result, channel, transcript };
+  }
+
+  it("refuses a private MEDIA or STICKER path and sends nothing at all", async () => {
+    for (const tag of [`MEDIA:"${PRIVATE_PIC}"`, `STICKER:${PRIVATE_PIC}`, `STICKER:${LINK_TO_PRIVATE}`]) {
+      const { result, channel, transcript } = await directSend("telegram:-100270", `look at this\n${tag}`);
+      expect(result.ok, tag).toBe(false);
+      if (!result.ok) expect(result.error).toContain("memory/private/");
+      expect(channel.sent, tag).toEqual([]);
+      expect(transcript, tag).toEqual([]);
+    }
+  });
+
+  it("still sends a public attachment into the group", async () => {
+    const { result, channel } = await directSend("telegram:-100270", `look\nSTICKER:${PUBLIC_PIC}`);
+    expect(result.ok).toBe(true);
+    expect(channel.sent.map((m) => m.sticker ?? m.text)).toEqual(["look", PUBLIC_PIC]);
   });
 });

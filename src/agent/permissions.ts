@@ -270,6 +270,31 @@ export function privateMemoryBashDenial(bar: PrivateMemoryBar): string {
   return `${PRIVATE_MEMORY_BASH_WITHHELD}\n\n${privateMemoryDenialReason(bar)}`;
 }
 
+/** The SDK's `Monitor` tool: runs `command` in a shell and streams its stdout
+ *  back as events. A shell by another name — see privateMemoryGuardHooks. */
+export const MONITOR_TOOL = "Monitor";
+
+function hasShellCommand(toolInput: unknown): boolean {
+  return !!toolInput && typeof toolInput === "object"
+    && typeof (toolInput as Record<string, unknown>).command === "string";
+}
+
+/**
+ * SDK tools that schedule work to run AFTER the barred turn is over — a cron
+ * prompt, a wake-up, a remote trigger. Whatever they fire runs as a fresh,
+ * SDK-initiated turn on the same session, with no inbound audience attached,
+ * and on a `dm:` session that resolves to the OWNER's scope: a summoned group
+ * could ask for "a reminder in five minutes that reads memory/private/ and
+ * posts it here", and the reminder would run unbarred. Refused outright while
+ * the bar is up; tomo's own `schedule_create` (which records the caller's
+ * scope) is the way to schedule from a group.
+ */
+export const DEFERRED_WORK_TOOLS: ReadonlySet<string> = new Set(["CronCreate", "ScheduleWakeup", "RemoteTrigger"]);
+
+export function privateMemoryDeferredWorkDenial(toolName: string, bar: PrivateMemoryBar): string {
+  return `${toolName} is not available on this turn: work it schedules runs later as a turn of its own, outside this turn's audience, where the private-memory bar would no longer apply. Use the schedule_create tool to schedule something from here.\n\n${privateMemoryDenialReason(bar)}`;
+}
+
 /** PreToolUse hook that denies tool calls that could surface DM-only memory
  *  in a session that is not entitled to it. Per SDK docs, PreToolUse denies
  *  bypass canUseTool, so this enforces even in bypassPermissions mode. See
@@ -322,7 +347,25 @@ export function privateMemoryGuardHooks(
         // can hit the filesystem. Order does not affect the outcome.
         const reason = bar();
         if (!reason) return {};
-        const isBash = input.tool_name === "Bash";
+        if (DEFERRED_WORK_TOOLS.has(input.tool_name)) {
+          log.warn(
+            { key: sessionKey, tool: input.tool_name, bar: reason },
+            "Blocked scheduling deferred work on a private-memory-barred turn",
+          );
+          return {
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse" as const,
+              permissionDecision: "deny" as const,
+              permissionDecisionReason: privateMemoryDeferredWorkDenial(input.tool_name, reason),
+            },
+          };
+        }
+        // `Monitor { command }` is a shell exactly like Bash — the command runs
+        // under /bin/sh and every stdout line comes back to the model as an
+        // event — so it gets the same sandbox and the same fallback. A
+        // `Monitor { ws }` opens a WebSocket and touches no file: left alone.
+        const isBash = input.tool_name === "Bash"
+          || (input.tool_name === MONITOR_TOOL && hasShellCommand(input.tool_input));
         if (isBash) {
           // A turn belonging to an allowlisted group runs Bash UNSANDBOXED.
           // That is full trust, not a narrower hole: the Read/Edit/Glob/Grep/
@@ -332,7 +375,7 @@ export function privateMemoryGuardHooks(
           const allowlistedKey = shellAllowlistedKey(reason, sessionKey, groupShellAllowlist, scopedCallerKey);
           if (allowlistedKey) {
             log.info(
-              { key: sessionKey, allowlistedKey, bar: reason },
+              { key: sessionKey, tool: input.tool_name, allowlistedKey, bar: reason },
               "Bash allowed unsandboxed for allowlisted group",
             );
             return {};
@@ -343,7 +386,7 @@ export function privateMemoryGuardHooks(
           });
           if (sandboxed) {
             log.info(
-              { key: sessionKey, bar: reason },
+              { key: sessionKey, tool: input.tool_name, bar: reason },
               "Sandboxed Bash on a private-memory-barred turn",
             );
             return {
@@ -452,7 +495,7 @@ export function sandboxedBashInput(
  *    refused outright rather than modelled.
  *  - Grep: same logic against the `glob` filter when present, plus a root
  *    check that mirrors ripgrep's default-recursive behaviour.
- *  - `send_message`: deny when a `MEDIA:` tag in the composed message names a
+ *  - `send_message`: deny when a `MEDIA:` or `STICKER:` tag in the composed message names a
  *    path that lands in private/. THE ATTACHMENT IS THE READ — the file is
  *    opened by the channel and its contents go to the target chat, so a tool
  *    that never touches `file_path` was the way to ship `memory/private/x` into
@@ -514,7 +557,7 @@ export function isPrivateMemoryAccess(
     case SEND_MESSAGE_TOOL: {
       const message = ti.message;
       if (typeof message !== "string") return false;
-      return mediaPathsIn(message).some((p) => landsInPrivate(p, ctx));
+      return attachmentPathsIn(message).some((p) => landsInPrivate(expandTilde(p), ctx));
     }
     default:
       return false;
@@ -533,11 +576,20 @@ export function isPrivateMemoryAccess(
  */
 export const SEND_MESSAGE_TOOL = "mcp__tomo-internal__send_message";
 
-/** The `MEDIA:` paths a composed message would ship as attachments — the same
- *  extraction the delivery paths run, so guard and sender agree on what counts
- *  as a tag. */
-function mediaPathsIn(message: string): string[] {
-  return extractAttachments(message).mediaPaths;
+/** Every value a composed message would hand a channel to OPEN AND SHIP: the
+ *  `MEDIA:` paths and the `STICKER:` values — the same extraction the delivery
+ *  paths run, so guard and sender agree on what counts as a tag.
+ *
+ *  STICKERS ARE FILES TOO. On Telegram a sticker value is a `file_id` and names
+ *  nothing on disk, but on iMessage it IS a local path (`sendSticker` expands a
+ *  leading `~` and, when the native sticker RPC is unavailable, falls back to a
+ *  plain `send { file }`), so `STICKER:~/.tomo/workspace/memory/private/x.md`
+ *  shipped the file as an attachment from a turn that could not Read it. A
+ *  `file_id` judged as a path resolves under the workspace and lands nowhere
+ *  near private/, so checking every sticker value costs Telegram nothing. */
+function attachmentPathsIn(message: string): string[] {
+  const { mediaPaths, stickerIds } = extractAttachments(message);
+  return [...mediaPaths, ...stickerIds];
 }
 
 /**
@@ -552,7 +604,10 @@ function mediaPathsIn(message: string): string[] {
  * learns that what it cannot read it can still send.
  */
 export function isPrivateAttachmentPath(p: string): boolean {
-  return landsInPrivate(p, {
+  // `~` expanded first: `path.resolve` does not, so `~/.tomo/workspace/memory/
+  // private/x` resolved to `<ws>/~/.tomo/…` and passed — while the iMessage
+  // sticker sender expands it and opens the real file.
+  return landsInPrivate(expandTilde(p), {
     cwd: config.workspaceDir,
     memoryDir: MEMORY_DIR,
     privateDir: PRIVATE_MEMORY_DIR,
@@ -562,6 +617,29 @@ export function isPrivateAttachmentPath(p: string): boolean {
 /** Resolve `p` to an absolute, normalized path against `cwd` if relative. */
 function abs(p: string, cwd: string): string {
   return isAbsolute(p) ? pathResolve(p) : pathResolve(cwd, p);
+}
+
+/**
+ * The spelling a DENY comparison is made in: NFKC, then lower-cased, then NFKC
+ * again (lower-casing can leave a string that is no longer normalised).
+ *
+ * `toLowerCase()` alone was not a fold. APFS matches names under its own
+ * case/normalisation-insensitive rules, which are wider than JS lower-casing:
+ * `ſ` (U+017F LATIN SMALL LETTER LONG S) is ALREADY lower case, so
+ * `toLowerCase()` leaves it alone, while the filesystem opens
+ * `<ws>/memory/priſate/x.md` as `<ws>/memory/private/x.md` — the guard
+ * compared two different strings and allowed the read. NFKC maps `ſ` to `s`
+ * (and the Kelvin sign to `K`, the `ﬁ` ligature to `fi`, …), and composes NFD
+ * input, so an `é` typed as `e` + U+0301 compares equal to the precomposed one.
+ *
+ * NFKC over-matches some names the filesystem would treat as distinct (a
+ * full-width `／` becomes `/`). This is a deny predicate: that is the safe
+ * direction. The real-path arm ({@link realResolve}, `realpathSync.native`) is
+ * the one that reads the filesystem's own answer; this fold is what covers the
+ * segments that do not exist yet and so cannot be resolved.
+ */
+export function foldPath(p: string): string {
+  return p.normalize("NFKC").toLowerCase().normalize("NFKC");
 }
 
 /**
@@ -585,8 +663,8 @@ function abs(p: string, cwd: string): string {
  * a named public file is the intended route anyway.
  */
 function isInside(child: string, parent: string): boolean {
-  const c = child.toLowerCase();
-  const p = parent.toLowerCase();
+  const c = foldPath(child);
+  const p = foldPath(parent);
   if (c === p) return true;
   const rel = relative(p, c);
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
@@ -618,14 +696,22 @@ function hasTraversalSegment(p: string): boolean {
  * there", and a plain parent-walk would then report the link's own path
  * (outside private/) for a write that follows the link into it.
  */
-function realResolve(p: string, cwd: string): string | null {
+function realResolve(p: string, cwd: string, canonical = false): string | null {
   let current = abs(p, cwd);
   const tail: string[] = [];
   let hops = 0;
 
   for (;;) {
     try {
-      const real = realpathSync(current);
+      // `canonical` (every DENY caller) uses `.native`: the JS realpath walks
+      // the path with lstat and keeps the CALLER'S spelling of every
+      // component, so `realpathSync("/Uſers/x/workſpace")` came back as typed
+      // and the containment test never saw the canonical name. The native call
+      // is realpath(3), which returns the names as stored on disk. The ALLOW
+      // callers keep the JS spelling-preserving form on purpose: there a
+      // failed comparison denies, which is the conservative direction (see
+      // isInsideExact).
+      const real = canonical ? realpathSync.native(current) : realpathSync(current);
       return tail.length > 0 ? pathResolve(real, ...tail.reverse()) : real;
     } catch {
       let link: string | null = null;
@@ -674,7 +760,7 @@ function landsInPrivate(p: string, ctx: { cwd: string; memoryDir: string; privat
   const lexical = abs(p, ctx.cwd);
   if (isInside(lexical, ctx.privateDir)) return true;
   if (hasTraversalSegment(p) && isInside(lexical, ctx.memoryDir)) return true;
-  const real = realResolve(p, ctx.cwd);
+  const real = realResolve(p, ctx.cwd, true);
   const realPrivate = realPrivateDir(ctx);
   return real !== null && realPrivate !== null && isInside(real, realPrivate);
 }
@@ -691,20 +777,21 @@ function landsInPrivate(p: string, ctx: { cwd: string; memoryDir: string; privat
  * of the process.
  */
 const realDirCache = new Map<string, string>();
-function realDir(dir: string, cwd: string): string | null {
-  const cached = realDirCache.get(dir);
+function realDir(dir: string, cwd: string, canonical = false): string | null {
+  const cacheKey = `${canonical ? "native" : "js"}\u0000${dir}`;
+  const cached = realDirCache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const real = realResolve(dir, cwd);
-  if (real !== null && existsSync(dir)) realDirCache.set(dir, real);
+  const real = realResolve(dir, cwd, canonical);
+  if (real !== null && existsSync(dir)) realDirCache.set(cacheKey, real);
   return real;
 }
 
 function realPrivateDir(ctx: { cwd: string; privateDir: string }): string | null {
-  return realDir(ctx.privateDir, ctx.cwd);
+  return realDir(ctx.privateDir, ctx.cwd, true);
 }
 
 function realMemoryDir(ctx: { cwd: string; memoryDir: string }): string | null {
-  return realDir(ctx.memoryDir, ctx.cwd);
+  return realDir(ctx.memoryDir, ctx.cwd, true);
 }
 
 /**
@@ -732,13 +819,20 @@ interface SearchFrame {
 }
 
 function searchFrames(rootRaw: string, ctx: { cwd: string; memoryDir: string; privateDir: string }): SearchFrame[] {
-  const lexical: SearchFrame = { root: abs(rootRaw, ctx.cwd), memoryDir: ctx.memoryDir, privateDir: ctx.privateDir };
-  const real = realResolve(rootRaw, ctx.cwd);
-  if (real === null || real === lexical.root) return [lexical];
+  // Every frame is FOLDED (see foldPath): `relative()` below compares strings,
+  // and a root spelled `<ws>/memorſ…` or in another case must not read as
+  // "private/ is not reachable from here".
+  const lexical: SearchFrame = {
+    root: foldPath(abs(rootRaw, ctx.cwd)),
+    memoryDir: foldPath(ctx.memoryDir),
+    privateDir: foldPath(ctx.privateDir),
+  };
+  const real = realResolve(rootRaw, ctx.cwd, true);
+  if (real === null || foldPath(real) === lexical.root) return [lexical];
   const realMemory = realMemoryDir(ctx);
   const realPrivate = realPrivateDir(ctx);
   if (realMemory === null || realPrivate === null) return [lexical];
-  return [lexical, { root: real, memoryDir: realMemory, privateDir: realPrivate }];
+  return [lexical, { root: foldPath(real), memoryDir: foldPath(realMemory), privateDir: foldPath(realPrivate) }];
 }
 
 /** True when `rel` represents a non-empty path that doesn't escape upward —
@@ -803,7 +897,11 @@ function absolutePrivateProbes(ctx: { cwd: string; privateDir: string }): string
  *  `dot: true` so leading-dot files inside private/ aren't given a free pass. */
 function matchesAnyProbe(probes: string[], pattern: string): boolean {
   const opts = { dot: true, nocase: true } as const;
-  return probes.some((probe) => minimatch(probe, pattern, opts));
+  // `nocase` does not fold `ſ` (nor NFD against NFC), and the filesystem
+  // opens a literal `memory/priſate/` prefix as `memory/private/`. Fold both
+  // sides the way {@link isInside} does.
+  const folded = foldPath(pattern);
+  return probes.some((probe) => minimatch(foldPath(probe), folded, opts));
 }
 
 /** Decide whether a Grep call rooted at `root` with optional `glob` filter
@@ -1115,7 +1213,7 @@ export function agentProfileGuardHooks(
         if (!input.agent_id) return {};
         const agentType = input.agent_type ?? RESERVED_AGENT_TYPE;
 
-        if (input.tool_name === "Bash") {
+        if (input.tool_name === "Bash" || input.tool_name === MONITOR_TOOL) {
           const command = (input.tool_input as { command?: unknown } | null | undefined)?.command;
           log.info(
             {
@@ -1183,7 +1281,10 @@ export function agentProfileDenial(
     if (typeof p !== "string") return null;
     return writeDenial(profile, p, cwd, toolName);
   }
-  if (toolName === "Bash") {
+  // Monitor's `command` is a shell command like Bash's: a `readonly` profile
+  // that refused `Bash { command: "rm …" }` must refuse the same command
+  // handed to Monitor.
+  if (toolName === "Bash" || toolName === MONITOR_TOOL) {
     const cmd = ti.command;
     if (typeof cmd !== "string") return null;
     return bashDenial(profile, cmd, cwd);
@@ -1663,8 +1764,8 @@ function expandTilde(p: string): string {
  * compared in one spelling against a path resolved in the other never matches
  * — which fails OPEN on a writeRoot and fails open on a deny list too.
  */
-function rootSpellings(root: string, cwd: string): string[] {
-  const real = realDir(root, cwd);
+function rootSpellings(root: string, cwd: string, canonical = false): string[] {
+  const real = realDir(root, cwd, canonical);
   return real !== null && real !== root ? [root, real] : [root];
 }
 
@@ -1685,8 +1786,8 @@ function landsIn(p: string, roots: string[], cwd: string, includeAncestors: bool
   if (roots.length === 0) return false;
   const expanded = expandTilde(p);
   const lexical = abs(expanded, cwd);
-  const real = realResolve(expanded, cwd);
-  return roots.some((root) => rootSpellings(root, cwd).some((r) => {
+  const real = realResolve(expanded, cwd, true);
+  return roots.some((root) => rootSpellings(root, cwd, true).some((r) => {
     if (isInside(lexical, r)) return true;
     if (real !== null && isInside(real, r)) return true;
     if (!includeAncestors) return false;

@@ -121,7 +121,8 @@ export class TaskBoard {
 
   /**
    * Expire ended tasks, share the board's capacity fairly, and publish every
-   * session whose visible list changed. Capacity goes to running tasks first,
+   * session whose visible list changed. Capacity goes to running non-ambient
+   * tasks first,
    * round-robin across sessions so one busy session cannot crowd out another;
    * ended tasks fill what is left. A running task that does not fit stays
    * stored here and appears as soon as there is room.
@@ -137,9 +138,12 @@ export class TaskBoard {
     const ids = [...this.sessions.keys()].sort();
     const picked = new Map<string, WebTask[]>(ids.map((id) => [id, []]));
     let room = MAX_BOARD_TASKS;
-    for (const ended of [false, true]) {
+    // Activity first: running, then recently ended; watchers (ambient) only
+    // get what is left, so they never take a running task's place.
+    for (const [ambient, ended] of [[false, false], [false, true], [true, false], [true, true]] as const) {
       const queues = ids.map((id) => {
-        const tasks = [...this.sessions.get(id)!.values()].filter((task) => (task.endedAt !== undefined) === ended);
+        const tasks = [...this.sessions.get(id)!.values()]
+          .filter((task) => (task.endedAt !== undefined) === ended && task.ambient === ambient);
         return { id, tasks: ended ? tasks.sort((a, b) => b.endedAt! - a.endedAt!) : tasks.sort((a, b) => a.startedAt - b.startedAt) };
       });
       for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {

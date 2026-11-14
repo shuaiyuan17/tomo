@@ -71,6 +71,14 @@ describe("TaskTracker — background_tasks_changed (REPLACE)", () => {
     expect(t.apply({ subtype: "task_progress", task_id: "a", run_id: "r2", description: "x", last_tool_name: "Old" })).toBeUndefined();
   });
 
+  it("task_updated naming a newer run advances the run too", () => {
+    const { t } = tracker();
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "x" }));
+    t.apply({ subtype: "task_updated", task_id: "a", run_id: "r2", patch: { description: "renamed" } });
+    expect(t.list()[0]).toMatchObject({ runId: "r2", description: "renamed" });
+    expect(t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "failed" })).toBeUndefined();
+  });
+
   it("clips text and bounds the number of tracked tasks", () => {
     const { t } = tracker();
     t.apply(level({ task_id: "a", task_type: "local_agent", description: "y".repeat(5_000) }));

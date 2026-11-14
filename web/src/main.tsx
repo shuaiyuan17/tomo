@@ -38,8 +38,12 @@ function trapTab(container: HTMLElement, event: KeyboardEvent) {
 function storedTasksOpen(): boolean {
   try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
 }
+/** Checklist (lucide `list-checks` geometry), drawn inline: assets stay local. */
 function TasksIcon() {
-  return <svg className="tasks-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h7" /><path d="M10.5 2.5v11" /></svg>;
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 2 2 4-4" /><path d="m3 7 2 2 4-4" /><path d="M13 6h8" /><path d="M13 12h8" /><path d="M13 18h8" /></svg>;
+}
+function ArrowUpIcon() {
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7" /><path d="M12 19V5" /></svg>;
 }
 function storedTheme(): Theme {
   try { const theme = localStorage.getItem("tomo-theme"); return theme === "light" || theme === "dark" ? theme : "system"; }
@@ -84,6 +88,14 @@ export function App() {
   }, [tasksOpen]);
   const running = runningCount(web.tasks);
   const tasksButton = useRef<HTMLButtonElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  // The composer grows with its text, up to a cap (then it scrolls).
+  useLayoutEffect(() => {
+    const element = input.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
+  }, [draft]);
   const rail = useRef<HTMLElement>(null);
   const overlay = useMediaQuery(OVERLAY_QUERY);
   const modal = tasksOpen && overlay;
@@ -197,9 +209,9 @@ export function App() {
     <a className="skip" href="#conversation">Skip to conversation</a>
     <header className="topbar"><a className="brand" href="/" aria-label="Tomo home"><Mark /><span>tomo<span className="brand-dot">.</span></span></a>
       <span className="section-name">Conversation</span>
-      <div className="header-actions"><button ref={tasksButton} type="button" className="tasks-button" aria-pressed={tasksOpen} aria-controls="tasks-rail"
-          aria-label={`Working now panel${running ? `, ${running} running` : ""}`} onClick={() => setTasksOpen((open) => !open)}>
-          <TasksIcon /><span className="tasks-button-label">Working now</span>{running > 0 && <span className="tasks-count" aria-hidden="true">{running}</span>}</button>
+      <div className="header-actions"><button ref={tasksButton} type="button" className="icon-button tasks-button" aria-pressed={tasksOpen} aria-controls="tasks-rail"
+          aria-label={`Tasks${running ? `, ${running} running` : ""}`} title="Tasks" onClick={() => setTasksOpen((open) => !open)}>
+          <TasksIcon />{running > 0 && <span className="tasks-count" aria-hidden="true">{running > 99 ? "99+" : running}</span>}</button>
         <span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
         <label className="theme-label"><span className="sr-only">Color theme</span><select aria-label="Color theme" value={theme} onChange={(e) => setTheme(e.target.value as Theme)}><option value="system">System theme</option><option value="light">Light theme</option><option value="dark">Dark theme</option></select></label>
       </div>
@@ -233,15 +245,15 @@ export function App() {
           {blocks.map((block) => <article className="message assistant" key={block.id}><div className="message-meta"><span>Tomo</span><span>Reply in progress</span></div><div className="markdown"><Text>{block.text}</Text></div></article>)}
         </div>
         <div className="composer-area"><div className="activity" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
-          <form onSubmit={(e) => void send(e)} className="composer"><label className="sr-only" htmlFor="message">Message Tomo</label><textarea id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={3} disabled={!session?.writable} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
-            <div className="composer-footer"><span>{session?.kind === "group" ? "View only" : "Enter to send · Shift + Enter for a new line"}</span><button className="send" type="submit" disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}>{sending ? "Sending…" : "Send"}<span aria-hidden="true">↗</span></button></div>
+          <form onSubmit={(e) => void send(e)} className="composer"><label className="sr-only" htmlFor="message">Message Tomo</label><textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+            <button className="send" type="submit" aria-label="Send" aria-busy={sending} disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUpIcon /></button>
           </form>
           {feedback && <p className="feedback" role="status">{feedback}</p>}
           {uncertain && !sending && <div className="recovery"><button onClick={() => void checkOutcome()}>Check message status</button><button onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</button></div>}
         </div>
       </main>
-      {tasksOpen && <aside ref={rail} id="tasks-rail" className="tasks-rail" aria-label="Working now" {...(modal ? { role: "dialog", "aria-modal": true } : {})}>
-        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} onClose={modal ? closeTasks : undefined} /></aside>}
+      {tasksOpen && <aside ref={rail} id="tasks-rail" className="tasks-rail" aria-label="Tasks" {...(modal ? { role: "dialog", "aria-modal": true } : {})}>
+        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} onClose={closeTasks} /></aside>}
     </div>
   </div>;
 }

@@ -30,18 +30,16 @@ export function selectOwnerSessionKey(owner: OwnerConfig | undefined, keys: read
   return legacy[0] ?? canonical;
 }
 
-/** Reads the owner key from the session registry, cached briefly; fails closed. */
-export function ownerSessionKeyReader(options: WebDataOptions, ttlMs = 1_000, now: () => number = Date.now): () => string | undefined {
-  let cached: { at: number; key: string | undefined } | undefined;
+/**
+ * Reads the owner key from the session registry on every call — no cache, so
+ * a registry change is honoured by the very next task event (fails closed).
+ */
+export function ownerSessionKeyReader(options: WebDataOptions): () => string | undefined {
   return () => {
-    if (cached && now() - cached.at < ttlMs) return cached.key;
-    let key: string | undefined;
     try {
-      key = selectOwnerSessionKey(options.owner,
+      return selectOwnerSessionKey(options.owner,
         SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey));
-    } catch { key = undefined; }
-    cached = { at: now(), key };
-    return key;
+    } catch { return undefined; }
   };
 }
 

@@ -198,22 +198,22 @@ it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe over
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Map the repo", ambient: false, background: true, startedAt: Date.now(), summary: "Reading src/web" },
   ] });
-  const toggle = page.getByRole("button", { name: /Working now panel, 1 running/ });
+  const toggle = page.getByRole("button", { name: /^Tasks, 1 running$/ });
   await browserExpect(toggle).toHaveAttribute("aria-pressed", "false");
   // Desktop: pinned rail, not modal, persisted across reloads.
   await toggle.click();
-  await browserExpect(page.getByRole("complementary", { name: "Working now" })).toContainText("Reading src/web");
+  await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toContainText("Reading src/web");
   await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
   await page.reload();
-  await browserExpect(page.getByRole("complementary", { name: "Working now" })).toBeVisible();
-  await page.getByRole("button", { name: /Working now panel/ }).click();
+  await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toBeVisible();
+  await page.getByRole("button", { name: /^Tasks/ }).click();
   await browserExpect(page.locator("#tasks-rail")).toHaveCount(0);
   // Narrow: overlay takes focus, traps it, Escape closes from anywhere and returns focus.
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: /Working now panel/ }).click();
-  const dialog = page.getByRole("dialog", { name: "Working now" });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Tasks" });
   await browserExpect(dialog).toBeVisible();
-  await browserExpect(page.getByRole("button", { name: "Close working now panel" })).toBeFocused();
+  await browserExpect(page.getByRole("button", { name: "Close tasks" })).toBeFocused();
   await browserExpect(page.locator("main#conversation")).toHaveAttribute("inert", "");
   for (let i = 0; i < 6; i++) {
     await page.keyboard.press(i % 2 ? "Shift+Tab" : "Tab");
@@ -223,6 +223,6 @@ it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe over
   await browserExpect(page.getByLabel("Task list")).toBeFocused();
   await page.keyboard.press("Escape");
   await browserExpect(dialog).toHaveCount(0);
-  await browserExpect(page.getByRole("button", { name: /Working now panel/ })).toBeFocused();
+  await browserExpect(page.getByRole("button", { name: /^Tasks/ })).toBeFocused();
   await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
 });

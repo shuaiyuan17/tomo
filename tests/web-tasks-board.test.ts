@@ -71,7 +71,8 @@ describe("TaskBoard", () => {
     expect(snap.find((t) => t.taskId === "x")!.description.length).toBe(SNAPSHOT_DESCRIPTION_LIMIT + 1);
     for (let i = 0; i < 5; i++) b.apply(`g${i}`, Array.from({ length: 60 }, (_, n) => task(`t${i}-${n}`)));
     expect(b.snapshot()).toHaveLength(MAX_BOARD_TASKS);
-    expect(b.snapshot((id) => id === "s")).toHaveLength(2);
+    // The watcher in "s" yields its place to running work elsewhere.
+    expect(b.snapshot((id) => id === "s").map((t) => t.taskId)).toEqual(["x"]);
     b.dispose();
   });
 
@@ -106,6 +107,20 @@ describe("TaskBoard", () => {
     vi.advanceTimersByTime(TASK_RETENTION_MS);
     expect(b.snapshot().some((t) => t.taskId === hidden)).toBe(true);
     expect(published.filter(([id]) => id === "b").at(-1)![1].some((t) => t.taskId === hidden)).toBe(true);
+    b.dispose();
+  });
+
+  it("ambient tasks never take a running task's place", () => {
+    const { b } = board();
+    b.apply("a", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`w${i}`, { ambient: true })));
+    b.apply("b", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`b${i}`)));
+    b.apply("c", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`c${i}`)));
+    const shown = b.snapshot();
+    expect(shown).toHaveLength(MAX_BOARD_TASKS);
+    expect(shown.filter((t) => t.ambient)).toHaveLength(0);
+    b.apply("c", []);
+    // Ended tasks still outrank watchers; watchers fill only what is left.
+    expect(b.snapshot().filter((t) => !t.ambient)).toHaveLength(MAX_BOARD_TASKS);
     b.dispose();
   });
 

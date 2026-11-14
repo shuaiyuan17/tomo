@@ -1,6 +1,6 @@
 import type { WebSession, WebTask } from "../../src/web/protocol.js";
 
-/** Render logic for the "working now" panel, kept pure so it is testable. */
+/** Render logic for the Tasks panel, kept pure so it is testable. */
 
 export interface TaskRow { task: WebTask; depth: number }
 export interface TaskGroup { sessionId: string; title: string; kind: "dm" | "group"; rows: TaskRow[] }

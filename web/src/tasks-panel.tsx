@@ -16,10 +16,11 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
   }, [ticking]);
   const ambient = tasks.some((task) => task.ambient);
   return <section className="tasks" aria-labelledby="tasks-heading">
-    <div className="tasks-heading"><p className="eyebrow" id="tasks-heading">Working now{view.running ? ` · ${view.running}` : ""}</p>
-      {onClose && <button type="button" className="tasks-close" aria-label="Close working now panel" onClick={onClose}>×</button>}
-      {ambient && <label className="tasks-toggle"><input type="checkbox" checked={showAmbient} onChange={(e) => setShowAmbient(e.target.checked)} />Show watchers{view.hiddenAmbient ? ` (${view.hiddenAmbient})` : ""}</label>}
+    <div className="tasks-heading"><h2 id="tasks-heading">Tasks</h2>
+      {onClose && <button type="button" className="icon-button tasks-close" aria-label="Close tasks" title="Close" onClick={onClose}>
+        <svg className="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>}
     </div>
+    {ambient && <label className="tasks-toggle"><input type="checkbox" checked={showAmbient} onChange={(e) => setShowAmbient(e.target.checked)} />Show watchers{view.hiddenAmbient ? ` (${view.hiddenAmbient})` : ""}</label>}
     <div className="tasks-list" tabIndex={0} aria-label="Task list">
     {view.groups.length === 0 ? <p className="session-note tasks-empty">Nothing running in the background.</p>
       : view.groups.map((group) => <div className="task-group" key={group.sessionId}>
@@ -27,7 +28,7 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
         <ul>{group.rows.map(({ task, depth }) => {
           const step = lastStep(task);
           const time = formatElapsed(elapsed(task, now));
-          return <li key={task.taskId} className={`task ${task.state}${depth ? " nested" : ""}`} style={{ marginLeft: depth * 18 }} title={taskKind(task)}>
+          return <li key={task.taskId} className={`task ${task.state}${depth ? " nested" : ""}`} style={{ marginLeft: depth * 16 }} title={taskKind(task)}>
             <div className="task-line"><span className="task-desc">{task.description || "Untitled task"}</span>
               {task.state === "running" && <span className="task-time">{time}</span>}</div>
             {task.state === "running"

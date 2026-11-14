@@ -195,13 +195,14 @@ export class TaskTracker {
   private applyUpdated(message: Extract<TaskSystemMessage, { subtype: "task_updated" }>): TaskChange | undefined {
     const old = this.tasks.get(message.task_id);
     if (!old || this.late(old, message.run_id)) return undefined;
+    const current = this.advance(old, message.run_id);
     const patch = message.patch ?? {};
     const status = endStatus(patch.status);
-    if (status && !old.background) {
+    if (status && !current.background) {
       this.tasks.delete(old.taskId);
       return this.change([{ taskId: old.taskId, status }]);
     }
-    this.tasks.set(old.taskId, { ...old,
+    this.tasks.set(old.taskId, { ...current,
       ...(patch.description ? { description: text(patch.description) } : {}),
       ...(patch.is_backgrounded ? { background: true } : {}),
       ...(status ? { status } : {}) });

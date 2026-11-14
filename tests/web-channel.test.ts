@@ -193,6 +193,28 @@ describe("web task panel feed", () => {
       expect(ownerUpdates()).toHaveLength(count);
     } finally { vi.useRealTimers(); }
   });
+  it("with the real registry reader, a legacy DM's tasks stop the moment the canonical key appears", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    const { ownerSessionKeyReader } = await import("../src/web/data.js");
+    const root = mkdtempSync(join(tmpdir(), "tomo-web-owner-key-"));
+    try {
+      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
+      store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
+      const { channel, bus, events } = setup(owner, ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }));
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work")] });
+      expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["l"]);
+      // The registry gains the canonical key; the very next legacy event is refused — no cache window.
+      store.setSdkSessionId("dm:owner", "sdk-owner");
+      const before = events.length;
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work"), live("m", "legacy secret")] });
+      expect(JSON.stringify(events.slice(before))).not.toContain("legacy secret");
+      expect(channel.snapshot().tasks).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();

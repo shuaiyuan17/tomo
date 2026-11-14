@@ -121,6 +121,16 @@ describe("DurableInbox: dedup on (channel, chat, message id)", () => {
     expect(inbox.accept("imessage", msg("42", { chatId: "1" }), resolution).status).toBe("accepted");
   });
 
+  it("tells apart two hand-offs that share a provider id (attachment follow-ups)", () => {
+    const inbox = reopen();
+    expect(inbox.accept("imessage", msg("guid-1"), resolution).status).toBe("accepted");
+    expect(inbox.accept("imessage", msg("guid-1", { inboxKey: "attachments:0" }), resolution).status).toBe("accepted");
+    expect(inbox.accept("imessage", msg("guid-1", { inboxKey: "attachments:1,2" }), resolution).status).toBe("accepted");
+    expect(inbox.accept("imessage", msg("guid-1", { inboxKey: "attachments:0" }), resolution).status).toBe("duplicate");
+    // The key survives a restart, so the replayed follow-up keeps its identity.
+    expect(reopen().pending().map((r) => r.message.inboxKey)).toEqual([undefined, "attachments:0", "attachments:1,2"]);
+  });
+
   it("forgets consumed ids after the retention window", () => {
     let t = 1_000;
     const first = reopen({ now: () => t, dedupRetentionMs: 500 });
@@ -184,6 +194,18 @@ describe("DurableInbox: retention and compaction", () => {
     mkdirSync(path, { recursive: true });
     const inbox = reopen();
     expect(inbox.accept("imessage", msg("a"), resolution)).toEqual({ status: "unpersisted" });
+  });
+
+  it("a read-only instance neither compacts nor writes", () => {
+    const owner = reopen();
+    owner.accept("imessage", msg("a"), resolution);
+    const before = readFileSync(path, "utf8");
+    appendFileSync(path, "torn");
+    const reader = new DurableInbox({ path, readOnly: true });
+    expect(reader.pending().map((r) => r.message.id)).toEqual(["a"]);
+    expect(reader.accept("imessage", msg("b"), resolution)).toEqual({ status: "unpersisted" });
+    expect(readFileSync(path, "utf8")).toBe(`${before}torn`);
+    expect(readdirSync(join(dir, "data")).some((f) => f.includes(".corrupt-"))).toBe(false);
   });
 
   it("refuses new writes once closed", () => {

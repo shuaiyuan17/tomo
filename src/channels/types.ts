@@ -62,6 +62,15 @@ export interface IncomingMessage {
   isMentioned?: boolean;
   /** Group chat title */
   chatTitle?: string;
+  /**
+   * Distinguishes two hand-offs that deliberately share a provider `id` — an
+   * iMessage attachment follow-up reuses its original message's GUID so
+   * replies and reactions still target it. The durable inbox dedups on
+   * (channel, chatId, id, inboxKey), so without this the follow-up would be
+   * acknowledged and dropped as a duplicate of the original. Absent for an
+   * ordinary message.
+   */
+  inboxKey?: string;
 }
 
 export interface OutgoingMessage {

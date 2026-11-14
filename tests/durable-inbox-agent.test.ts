@@ -39,8 +39,9 @@ function inboxPath(): string {
   return join(mockConfig.tomoHome, "data", "inbox.jsonl");
 }
 
+/** Read-only: a second writer would compact the file under the agent's open descriptor. */
 function openInbox(): DurableInbox {
-  return new DurableInbox({ path: inboxPath(), fsync: false });
+  return new DurableInbox({ path: inboxPath(), readOnly: true });
 }
 
 /**
@@ -149,6 +150,49 @@ describe("durable inbox: crash and replay", () => {
     expect(text).toContain("from last week");
     expect(text).toContain(INBOX_STALE_NOT_PROCESSED);
     expect(openInbox().pending()).toEqual([]);
+    await agent.stop();
+  });
+});
+
+describe("durable inbox: identities and startup", () => {
+  it("dispatches an attachment follow-up that reuses its original message's id", async () => {
+    const { agent, channel } = await boot();
+    mockSdk.responseFn = async () => "ok";
+    await channel.simulateMessage(makeMsg({ id: "guid-9", chatId: "562", text: "look at this" }));
+    await waitFor(() => expect(channel.delivered).toHaveLength(1));
+    expect(await channel.simulateMessage(makeMsg({
+      id: "guid-9",
+      chatId: "562",
+      inboxKey: "attachments:0",
+      text: "[Attachments from an earlier message finished downloading]",
+    }))).toBe(true);
+    await waitFor(() => expect(channel.delivered).toHaveLength(2));
+    expect(mockSdk.promptsBySession.some((p) => p.text.includes("finished downloading"))).toBe(true);
+    await agent.stop();
+  });
+
+  it("replays only what the previous run left, not a message that arrives while channels start", async () => {
+    const first = await boot(60_000);
+    await first.channel.simulateMessage(makeMsg({ id: "left", chatId: "563", text: "left over" }));
+    crash(first.agent);
+
+    // A channel that ingests during its own start(), as both provider channels do.
+    class EagerChannel extends MockChannel {
+      override async start() {
+        await this.simulateMessage(makeMsg({ id: "fresh", chatId: "563", text: "brand new" }));
+      }
+    }
+    resetConfig({ inbox: true, imessageInboundSettleMs: 30 });
+    const agent = new Agent();
+    const channel = new EagerChannel("imessage");
+    agent.addChannel(channel);
+    mockSdk.responseFn = async () => "ok";
+    await agent.start();
+    await waitFor(() => expect(openInbox().pending()).toEqual([]));
+    const prompts = mockSdk.promptsBySession.map((p) => p.text).join("\n");
+    expect(prompts.split("brand new").length - 1).toBe(1);
+    expect(prompts.split("left over").length - 1).toBe(1);
+    expect(transcript("imessage:563").split("brand new").length - 1).toBe(1);
     await agent.stop();
   });
 });

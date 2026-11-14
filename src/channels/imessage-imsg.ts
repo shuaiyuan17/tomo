@@ -2140,10 +2140,15 @@ export class ImsgChannel implements Channel {
     const quote = watch.excerpt ? ` ("${watch.excerpt}")` : "";
     const header = `[Attachments from an earlier message${quote} finished downloading]`;
     const text = [header, stickerMarker, imageMarker, docMarker].filter(Boolean).join(" ");
+    // Same GUID as the original (replies/reactions target it), so give the
+    // durable inbox its own identity: which of the original's attachments this
+    // follow-up carries. Stable for the same set, distinct between follow-ups.
+    const indices = watch.entries.filter((e) => atts.includes(e.att)).map((e) => e.index);
     return {
       atts,
       message: {
         ...watch.origin,
+        inboxKey: `attachments:${indices.join(",")}`,
         text,
         images: images.length > 0 ? images : undefined,
         documents: documents.length > 0 ? documents : undefined,

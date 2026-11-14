@@ -6,11 +6,13 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import type { DocumentAttachment, ImageAttachment, IncomingMessage } from "../channels/types.js";
-import { writeFileAtomicSync } from "../fs-utils.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 import { log } from "../logger.js";
 import type { SessionResolution } from "../router.js";
@@ -106,6 +108,12 @@ export interface DurableInboxOptions {
   compactEvery?: number;
   /** fsync every append. Default true; tests may turn it off. */
   fsync?: boolean;
+  /**
+   * Inspect without owning: no compaction on load, no writes. For a reader
+   * other than the daemon (a status command, a test) — a second instance that
+   * compacted would replace the file under the daemon's open descriptor.
+   */
+  readOnly?: boolean;
   now?: () => number;
 }
 
@@ -186,6 +194,36 @@ export function restoreMessage(persisted: PersistedMessage): IncomingMessage {
   return message;
 }
 
+/**
+ * Replace `path` so that a power loss leaves either the old file or the whole
+ * new one: write and fsync a temp file, rename it over, fsync the directory.
+ * (`writeFileAtomicSync` renames without syncing, which is fine for a config
+ * file and not for a log that holds messages we have already acknowledged.)
+ */
+function writeFileDurableSync(path: string, content: string, sync: boolean): void {
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmp, "w", 0o600);
+    writeSync(fd, content);
+    if (sync) fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, path);
+  } catch (err) {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* best effort */ } }
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    throw err;
+  }
+  if (!sync) return;
+  try {
+    const dirFd = openSync(dirname(path), "r");
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  } catch {
+    // Some platforms refuse fsync on a directory; the rename itself is done.
+  }
+}
+
 export class DurableInbox {
   readonly path: string;
   private readonly live = new Map<string, InboxRecord>();
@@ -214,12 +252,17 @@ export class DurableInbox {
     this.compactEvery = opts.compactEvery ?? DEFAULT_COMPACT_EVERY;
     this.fsync = opts.fsync ?? true;
     this.now = opts.now ?? Date.now;
+    this.closed = opts.readOnly ?? false;
     this.load();
   }
 
-  /** Dedup key. Provider message ids are only unique per chat on Telegram. */
-  static idFor(channel: string, chatId: string, messageId: string): string {
-    return JSON.stringify([channel, chatId, messageId]);
+  /**
+   * Dedup key. Provider message ids are only unique per chat on Telegram, and
+   * an iMessage attachment follow-up shares its original's GUID (`inboxKey`
+   * tells them apart; see IncomingMessage.inboxKey).
+   */
+  static idFor(channel: string, chatId: string, messageId: string, inboxKey?: string): string {
+    return JSON.stringify(inboxKey ? [channel, chatId, messageId, inboxKey] : [channel, chatId, messageId]);
   }
 
   /** Is this message already known — pending or consumed? */
@@ -245,7 +288,7 @@ export class DurableInbox {
    * disk.
    */
   accept(channelName: string, message: IncomingMessage, resolution: SessionResolution): AcceptResult {
-    const id = DurableInbox.idFor(channelName, message.chatId, message.id);
+    const id = DurableInbox.idFor(channelName, message.chatId, message.id, message.inboxKey);
     if (this.has(id)) return { status: "duplicate", id };
     if (this.closed) return { status: "unpersisted" };
     const rec: RecvLine["rec"] = {
@@ -337,7 +380,7 @@ export class DurableInbox {
 
     const records = parseJsonl<LogLine>(text, { preserveUnparseable: true });
     const raw = records.filter(isRawJsonlLine);
-    if (raw.length > 0) {
+    if (raw.length > 0 && !this.closed) {
       reportRawJsonlLines(records, { file: this.path });
       this.quarantine(raw.map((line) => serializeJsonlRecord(line)));
     }
@@ -414,7 +457,7 @@ export class DurableInbox {
         closeSync(this.fd);
         this.fd = undefined;
       }
-      writeFileAtomicSync(this.path, lines.map((l) => `${JSON.stringify(l)}\n`).join(""), { mode: 0o600 });
+      writeFileDurableSync(this.path, lines.map((l) => `${JSON.stringify(l)}\n`).join(""), this.fsync);
       this.appendsSinceCompact = 0;
     } catch (err) {
       log.warn({ err, path: this.path }, "Durable inbox: compaction failed; the log keeps growing until the next one");

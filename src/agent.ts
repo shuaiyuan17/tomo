@@ -2746,9 +2746,14 @@ export class Agent {
 
   async start(): Promise<void> {
     log.info({ channels: this.channels.length }, "Starting Tomo");
+    // Snapshot what the PREVIOUS run left BEFORE any channel starts ingesting:
+    // a message accepted while another channel is still starting is already
+    // dispatched by live ingress, and replaying it too would run it twice (or
+    // misread its fresh turn as interrupted).
+    const recovered = this.inbox?.pending() ?? [];
     await Promise.all(this.channels.map((ch) => ch.start()));
     try {
-      this.replayInbox();
+      this.replayInbox(recovered);
     } catch (err) {
       // Replay is recovery, never a startup prerequisite.
       log.error({ err }, "Durable inbox replay failed");
@@ -3085,10 +3090,8 @@ export class Agent {
    *   transcript records them with a not-processed marker, as a graceful
    *   shutdown would have.
    */
-  private replayInbox(): void {
-    if (!this.inbox) return;
-    const records = this.inbox.pending();
-    if (records.length === 0) return;
+  private replayInbox(records: InboxRecord[]): void {
+    if (!this.inbox || records.length === 0) return;
 
     const maxAgeMs = config.inboxReplayMaxAgeMinutes * 60_000;
     const now = Date.now();

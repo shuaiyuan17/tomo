@@ -90,10 +90,12 @@ describe("task panel view", () => {
   it("orphaned finished shells fold per original parent, with keys that survive updates", () => {
     const sh = (id: string, parent: string, startedAt: number) => task(id, { taskType: "local_bash", parentTaskId: parent, state: "completed", endedAt: 1, startedAt });
     const first = buildTaskView([sh("a1", "gone-A", 1), sh("a2", "gone-A", 2), sh("b1", "gone-B", 3), sh("b2", "gone-B", 4)], sessions, false).groups[0].rows;
-    expect(first.map((r) => [r.foldKey, r.folded?.map((t) => t.taskId)])).toEqual([["orphan:gone-A", ["a1", "a2"]], ["orphan:gone-B", ["b1", "b2"]]]);
+    expect(first.map((r) => [r.foldKey, r.folded?.map((t) => t.taskId)])).toEqual([["gone-A", ["a1", "a2"]], ["gone-B", ["b1", "b2"]]]);
     const later = buildTaskView([sh("a1", "gone-A", 1), sh("a2", "gone-A", 2), sh("a3", "gone-A", 5), sh("b1", "gone-B", 3), sh("b2", "gone-B", 4)], sessions, false).groups[0].rows;
-    expect(later.map((r) => [r.foldKey, r.folded?.length])).toEqual([["orphan:gone-A", 3], ["orphan:gone-B", 2]]);
+    expect(later.map((r) => [r.foldKey, r.folded?.length])).toEqual([["gone-A", 3], ["gone-B", 2]]);
+    // Parent listed → parent gone: the fold keeps the same key.
     const nested = buildTaskView([task("p"), sh("c1", "p", 1), sh("c2", "p", 2)], sessions, false).groups[0].rows;
-    expect(nested.at(-1)!.foldKey).toBe("p");
+    const orphaned = buildTaskView([sh("c1", "p", 1), sh("c2", "p", 2)], sessions, false).groups[0].rows;
+    expect([nested.at(-1)!.foldKey, orphaned.at(-1)!.foldKey]).toEqual(["p", "p"]);
   });
 });

@@ -8,7 +8,7 @@ import { isShellTask } from "./shell.js";
  * parent — one folded row ("3 shell commands done") listing them in `folded`.
  */
 export interface TaskRow { task: WebTask; depth: number; folded?: WebTask[];
-  /** Stable key of a folded row: its parent's id, or `orphan:<id>` when that parent left the list. */
+  /** Stable key of a folded row: its parent's id (listed or not), or "root". */
   foldKey?: string }
 export interface TaskGroup { sessionId: string; title: string; kind: "dm" | "group"; rows: TaskRow[] }
 export interface TaskView { groups: TaskGroup[]; running: number; hiddenAmbient: number }
@@ -102,7 +102,9 @@ function tree(list: WebTask[]): TaskRow[] {
     const done = siblings.filter((t) => isShellTask(t.taskType) && t.state !== "running" && !children.has(t.taskId));
     const byParent = new Map<string, WebTask[]>();
     for (const t of done) {
-      const key = parentKey || (t.parentTaskId ? `orphan:${t.parentTaskId}` : "root");
+      // Keyed by the parent's id whether or not it is still listed, so the
+      // key does not change when a parent leaves (or comes back).
+      const key = parentKey || t.parentTaskId || "root";
       byParent.set(key, [...(byParent.get(key) ?? []), t]);
     }
     const folded = new Set<string>();

@@ -94,5 +94,10 @@ describe("readSubagentPage", () => {
     writeFileSync(join(root, "outside.jsonl"), text("outside"));
     symlinkSync(join(root, "outside.jsonl"), file("a2"));
     await expect(readSubagentPage(dir, SDK, "a2")).rejects.toMatchObject({ code: "transcript_not_found" });
+    // So is a session directory that is itself a symlink out of the projects dir.
+    mkdirSync(join(root, "elsewhere", "subagents"), { recursive: true });
+    writeFileSync(join(root, "elsewhere", "subagents", "agent-a3.jsonl"), text("outside"));
+    symlinkSync(join(root, "elsewhere"), join(dir, "sdk-linked"));
+    await expect(readSubagentPage(dir, "sdk-linked", "a3")).rejects.toMatchObject({ code: "transcript_not_found" });
   });
 });

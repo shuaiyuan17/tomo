@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isTaskSystemMessage, MAX_TRACKED_TASKS, TASK_TEXT_LIMIT, TaskTracker } from "../src/agent/task-tracker.js";
+import { isTaskSystemMessage, MAX_TRACKED_TASKS, TASK_TEXT_LIMIT, TaskTracker, TOMBSTONE_MS } from "../src/agent/task-tracker.js";
 
 function tracker() {
   let now = 1_000;
@@ -109,6 +109,30 @@ describe("TaskTracker — background_tasks_changed (REPLACE)", () => {
     t.apply({ subtype: "task_notification", task_id: "b", run_id: "r1", status: "completed" });
     expect(t.list().find((x) => x.taskId === "b")!.status).toBe("failed");
     expect(t.apply(level())!.ended).toEqual([{ taskId: "a", status: "completed" }, { taskId: "b", status: "failed" }]);
+  });
+
+  it("a late task_started of an ended foreground run does not revive it (until the tombstone expires)", () => {
+    const { t, tick } = tracker();
+    t.apply({ subtype: "task_started", task_id: "f", run_id: "r1", description: "x", is_backgrounded: false });
+    t.apply({ subtype: "task_notification", task_id: "f", run_id: "r1", status: "completed" });
+    expect(t.apply({ subtype: "task_started", task_id: "f", run_id: "r1", description: "x", is_backgrounded: false })).toBeUndefined();
+    expect(t.list()).toEqual([]);
+    // A newer run of the same task is a real start.
+    t.apply({ subtype: "task_started", task_id: "f", run_id: "r2", description: "x", is_backgrounded: false });
+    expect(t.list().map((x) => x.runId)).toEqual(["r2"]);
+    t.endTurn();
+    expect(t.apply({ subtype: "task_started", task_id: "f", run_id: "r2", description: "x", is_backgrounded: false })).toBeUndefined();
+    tick(TOMBSTONE_MS);
+    expect(t.apply({ subtype: "task_started", task_id: "f", run_id: "r2", description: "x", is_backgrounded: false })).toBeDefined();
+  });
+
+  it("an end report that supplies a missing run id records it even when the task had already ended", () => {
+    const { t } = tracker();
+    t.apply(level({ task_id: "a", task_type: "local_agent", description: "x" }));
+    t.apply({ subtype: "task_updated", task_id: "a", patch: { status: "failed" } });
+    t.apply({ subtype: "task_notification", task_id: "a", run_id: "r2", status: "completed" });
+    expect(t.list()[0]).toMatchObject({ runId: "r2", status: "failed" });
+    expect(t.apply({ subtype: "task_progress", task_id: "a", run_id: "r1", description: "x", last_tool_name: "Old" })).toBeUndefined();
   });
 
   it("clips text and bounds the number of tracked tasks", () => {

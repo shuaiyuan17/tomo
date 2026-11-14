@@ -24,13 +24,14 @@ export interface TaskBoardOptions {
   now?: () => number;
   retainMs?: number;
   /**
-   * Where a stored session (a "slot", e.g. a session key) is shown right now:
-   * the browser session id, or undefined while the browser may not see it.
-   * Read synchronously at every send (see `publish`), never cached: the
-   * owner-key rule can change at any moment, and nothing sent can be taken
-   * back. Hidden slots keep receiving events; only sending is gated.
+   * Called ONCE per send (see `publish`) to take one snapshot of who may see
+   * what; the function it returns routes each stored slot (e.g. a session
+   * key) to its browser session id, or undefined while hidden. Every slot in
+   * one send is routed by the same snapshot, so a rule change mid-send cannot
+   * merge two sources into one browser session. Never cached across sends:
+   * nothing sent can be taken back. Hidden slots keep receiving events.
    */
-  route?: (slot: string) => string | undefined;
+  router?: () => (slot: string) => string | undefined;
 }
 
 /**
@@ -49,12 +50,12 @@ export class TaskBoard {
   private readonly now: () => number;
   private readonly retainMs: number;
 
-  private readonly route: (slot: string) => string | undefined;
+  private readonly router: () => (slot: string) => string | undefined;
 
   constructor(private readonly send: (sessionId: string, tasks: WebTask[]) => void, options: TaskBoardOptions = {}) {
     this.now = options.now ?? Date.now;
     this.retainMs = options.retainMs ?? TASK_RETENTION_MS;
-    this.route = options.route ?? ((slot) => slot);
+    this.router = options.router ?? (() => (slot) => slot);
   }
 
   /**
@@ -143,9 +144,10 @@ export class TaskBoard {
       }
       if (!tasks.size) this.sessions.delete(sessionId);
     }
+    const route = this.router();
     const targets = new Map<string, string>();
     for (const slot of this.sessions.keys()) {
-      const target = this.route(slot);
+      const target = route(slot);
       if (target !== undefined) targets.set(slot, target);
     }
     const ids = [...targets.keys()].sort();

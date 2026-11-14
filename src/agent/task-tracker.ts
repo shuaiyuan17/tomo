@@ -4,6 +4,8 @@ import { clip, type TaskEndStatus, type WatchTask } from "../watch/protocol.js";
 export const TASK_TEXT_LIMIT = 200;
 /** A runaway session cannot grow one `tasks` event without bound. */
 export const MAX_TRACKED_TASKS = 64;
+/** How long an ended foreground run is remembered (as long as the panel keeps it). */
+export const TOMBSTONE_MS = 60_000;
 
 interface LevelEntry {
   task_id: string; run_id?: string; task_type?: string; subagent_type?: string;
@@ -51,6 +53,11 @@ const text = (value: string | undefined) => clip((value ?? "").replace(/\s+/g, "
  */
 export class TaskTracker {
   private tasks = new Map<string, WatchTask>();
+  /**
+   * Foreground runs that already ended, by `task_id` + `run_id`, so a late
+   * `task_started` of that same run cannot bring the row back.
+   */
+  private tombstones = new Map<string, number>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -72,7 +79,7 @@ export class TaskTracker {
     let removed = false;
     for (const task of [...this.tasks.values()]) {
       if (task.background) continue;
-      this.tasks.delete(task.taskId);
+      this.bury(task);
       removed = true;
       if (task.status) ended.push({ taskId: task.taskId, status: task.status });
     }
@@ -84,6 +91,18 @@ export class TaskTracker {
     if (this.tasks.size === 0) return undefined;
     this.tasks.clear();
     return this.change([]);
+  }
+
+  /** Drop an ended foreground task and remember its run. */
+  private bury(task: WatchTask): void {
+    this.tasks.delete(task.taskId);
+    const now = this.now();
+    for (const [key, at] of this.tombstones) if (now - at >= TOMBSTONE_MS) this.tombstones.delete(key);
+    this.tombstones.set(`${task.taskId}\0${task.runId ?? ""}`, now);
+  }
+  private buried(taskId: string, runId: string | undefined): boolean {
+    const at = this.tombstones.get(`${taskId}\0${runId ?? ""}`);
+    return at !== undefined && this.now() - at < TOMBSTONE_MS;
   }
 
   private change(ended: TaskChange["ended"]): TaskChange { return { tasks: this.list(), ended }; }
@@ -170,6 +189,8 @@ export class TaskTracker {
     // not in the level by now has already finished, so only a foreground
     // start creates a row.
     if (message.is_backgrounded !== false || this.tasks.size >= MAX_TRACKED_TASKS) return undefined;
+    // A late start of a foreground run that already ended does not revive it.
+    if (this.buried(message.task_id, message.run_id)) return undefined;
     this.tasks.set(message.task_id, {
       taskId: message.task_id,
       ...(message.run_id ? { runId: message.run_id } : {}),
@@ -211,7 +232,7 @@ export class TaskTracker {
     // As for notifications: once this run has ended, its end is not rewritten.
     const status = current.status ? undefined : endStatus(patch.status);
     if (status && !current.background) {
-      this.tasks.delete(old.taskId);
+      this.bury(current);
       return this.change([{ taskId: old.taskId, status }]);
     }
     this.tasks.set(old.taskId, { ...current,
@@ -230,13 +251,18 @@ export class TaskTracker {
     if (!current) return undefined;
     // The first end of a run is final: a repeated or conflicting late report
     // (completed, then failed) changes nothing.
-    if (current.status) return current === old ? undefined : this.change([]);
+    if (current.status) {
+      // Still record what this frame taught us (a run id the record lacked).
+      if (current === old) return undefined;
+      this.tasks.set(old.taskId, current);
+      return this.change([]);
+    }
     const usage = {
       ...(typeof message.usage?.total_tokens === "number" ? { totalTokens: message.usage.total_tokens } : {}),
       ...(typeof message.usage?.tool_uses === "number" ? { toolUses: message.usage.tool_uses } : {}),
     };
     if (!current.background) {
-      this.tasks.delete(old.taskId);
+      this.bury(current);
       return this.change([{ taskId: old.taskId, status }]);
     }
     // Still in the level: it leaves with the next background_tasks_changed.

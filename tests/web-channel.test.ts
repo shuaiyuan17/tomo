@@ -261,6 +261,29 @@ describe("web task panel feed", () => {
       expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["b"]);
     } finally { vi.useRealTimers(); }
   });
+  it("one send routes every key by a single owner-rule read, so a switch mid-send never merges two DMs", () => {
+    let current = "telegram:test-owner";
+    let reads = 0;
+    const { channel, bus, events } = setup(owner, () => { reads++; return current; });
+    bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("legacy-task")] });
+    current = "dm:owner";
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("canonical-task")] });
+    // From now on the rule flips on every read: a per-key read would route both DMs to the owner in one send.
+    const flip = ["telegram:test-owner", "dm:owner"];
+    const ownerKey = () => { reads++; return flip[reads % 2]; };
+    (channel as unknown as { ownerKey: () => string }).ownerKey = ownerKey;
+    for (let i = 0; i < 4; i++) {
+      const before = events.length;
+      bus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [live(`g${i}`)] });
+      for (const e of events.slice(before)) {
+        if (e.type !== "tasks" || e.sessionId !== channel.ownerId) continue;
+        const ids = e.tasks.map((t) => t.taskId);
+        expect(ids.includes("legacy-task") && ids.includes("canonical-task")).toBe(false);
+      }
+      const ids = channel.snapshot().tasks.filter((t) => t.sessionId === channel.ownerId).map((t) => t.taskId);
+      expect(ids.includes("legacy-task") && ids.includes("canonical-task")).toBe(false);
+    }
+  });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();

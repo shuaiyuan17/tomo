@@ -48,7 +48,7 @@ export class WebChannel implements Channel {
     this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
     this.tasks = new TaskBoard((sessionId, tasks) => {
       try { this.events.publish({ type: "tasks", sessionId, tasks }); } catch { /* An oversized panel update never fails the Agent. */ }
-    }, { now, route: (key) => this.taskRoute(key) });
+    }, { now, router: () => this.taskRouter() });
     this.owner = owner;
     this.ownerId = this.owner ? webSessionId(ownerSessionKey(this.owner)) : null;
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
@@ -172,15 +172,18 @@ export class WebChannel implements Channel {
    * every legacy key bound to the owner, which the catalog may be hiding.
    */
   /**
-   * The board's send gate asks this, synchronously, before every send: where
-   * a session key's tasks show in the browser, if anywhere. Groups always
-   * (they are readable in the browser); a DM only when it is the key the
-   * catalog rule picks as the owner conversation right now (read fresh).
+   * The board's send gate calls this once per send: one fresh read of the
+   * owner-key rule, then a router for every key in that send. Groups always
+   * show (they are readable in the browser); a DM only when it is the key the
+   * catalog rule picks as the owner conversation in this snapshot.
    */
-  private taskRoute(key: string): string | undefined {
-    if (isGroupSessionKey(key)) return webSessionId(key);
+  private taskRouter(): (key: string) => string | undefined {
     const ownerKey = this.ownerKey();
-    return ownerKey !== undefined && key === ownerKey && this.ownerId ? this.ownerId : undefined;
+    const ownerId = this.ownerId;
+    return (key) => {
+      if (isGroupSessionKey(key)) return webSessionId(key);
+      return ownerKey !== undefined && key === ownerKey && ownerId ? ownerId : undefined;
+    };
   }
   /** Every owner-bound or group key is recorded; the gate decides what is shown. */
   private observeTasks(key: string, event: Extract<WatchEvent, { type: "tasks" }>): void {

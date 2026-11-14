@@ -128,7 +128,7 @@ describe("TaskBoard", () => {
     vi.useFakeTimers({ now: 0 });
     let hidden = false;
     const published: Array<[string, WebTask[]]> = [];
-    const b = new TaskBoard((id, tasks) => published.push([id, tasks]), { route: (id) => (hidden && id === "secret" ? undefined : id) });
+    const b = new TaskBoard((id, tasks) => published.push([id, tasks]), { router: () => (id) => (hidden && id === "secret" ? undefined : id) });
     b.apply("secret", [task("s1")]);
     b.apply("secret", [task("s2")]); // s1 ended, retained
     hidden = true;
@@ -156,7 +156,7 @@ describe("TaskBoard", () => {
 
   it("routes slots to browser sessions and never leaks the slot name", () => {
     const { b, published } = board();
-    const board2 = new TaskBoard((id, tasks) => published.push([id, tasks]), { route: (slot) => (slot === "dm:secret-key" ? "owner-id" : undefined) });
+    const board2 = new TaskBoard((id, tasks) => published.push([id, tasks]), { router: () => (slot) => (slot === "dm:secret-key" ? "owner-id" : undefined) });
     board2.apply("dm:secret-key", [task("a")]);
     board2.apply("dm:other", [task("b")]);
     expect(board2.snapshot().map((t) => [t.sessionId, t.taskId])).toEqual([["owner-id", "a"]]);

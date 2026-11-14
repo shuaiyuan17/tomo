@@ -1,0 +1,34 @@
+import { describe, expect, it } from "vitest";
+import { findQuoted, parseReply } from "../web/src/reply.js";
+
+describe("reply context", () => {
+  it("parses a Chinese excerpt cut with an ellipsis and keeps only the real reply as the body", () => {
+    expect(parseReply('[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！')).toEqual({
+      reply: { verb: "replying", excerpt: "强哥的 #383 捡起来了，拆成了 3 个 PR，", truncated: true }, body: "nicenice！！" });
+  });
+  it("English, quotes inside, fullwidth delimiters restored", () => {
+    expect(parseReply('[replying to: "he said "ok" ［see #1］"] Sounds good')).toEqual({
+      reply: { verb: "replying", excerpt: 'he said "ok" [see #1]', truncated: false }, body: "Sounds good" });
+  });
+  it("no excerpt, reactions, other markers first, and no prefix", () => {
+    expect(parseReply("[replying to an earlier message] yes").reply).toEqual({ verb: "replying", excerpt: null, truncated: false });
+    expect(parseReply('[reacting to: "lunch?"] ❤️').reply!.verb).toBe("reacting");
+    expect(parseReply('[via satellite] [replying to: "where"] here')).toEqual({
+      reply: { verb: "replying", excerpt: "where", truncated: false }, body: "[via satellite] here" });
+    expect(parseReply("just text [replying to: \"x\"]")).toEqual({ body: "just text [replying to: \"x\"]" });
+  });
+  it("finds the quoted message: latest earlier match by prefix; none when it cannot", () => {
+    const messages = [
+      { id: "1", content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了" },
+      { id: "2", content: "Other\\nthing" },
+      { id: "3", content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第二版" },
+      { id: "4", content: '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！' },
+    ];
+    const { reply } = parseReply(messages[3].content);
+    expect(findQuoted(messages, 3, reply!)?.id).toBe("3");
+    expect(findQuoted(messages, 1, reply!)?.id).toBe("1");
+    expect(findQuoted(messages, 0, reply!)).toBeUndefined();
+    expect(findQuoted(messages, 3, { verb: "replying", excerpt: "nothing like this", truncated: false })).toBeUndefined();
+    expect(findQuoted(messages, 3, { verb: "replying", excerpt: null, truncated: false })).toBeUndefined();
+  });
+});

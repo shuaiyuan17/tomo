@@ -1,3 +1,6 @@
+import { constants } from "node:fs";
+import { open, realpath, type FileHandle } from "node:fs/promises";
+import { extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
@@ -64,6 +67,19 @@ export function subagentModelReader(options: WebDataOptions): (sessionKey: strin
   };
 }
 
+/** Image types the browser shows, by extension. */
+const MEDIA_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
+export const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+
+/** Paths named by the image/sticker markers in a message (see channels/imageStore.ts). */
+export function imagePaths(content: string): string[] {
+  const out: string[] = [];
+  for (const match of content.matchAll(/\[Sent (?:an image|a sticker|\d+ images|\d+ stickers), saved to:? ([^;\]]+)/g)) {
+    for (const path of match[1].split(/,\s+/)) if (path.trim().startsWith("/")) out.push(path.trim());
+  }
+  return out;
+}
+
 /** Runs in the web process. Never imports the live Agent or starts services. */
 export class WebData {
   readonly memory?: MemoryReader;
@@ -127,10 +143,49 @@ export class WebData {
     }
   }
 
+  /**
+   * Images the browser may load, per session: only paths named by an image
+   * marker in a history page this process served for that session.
+   */
+  private media = new Map<string, Set<string>>();
+
+  /**
+   * An inbound image for display, by the absolute path its marker names.
+   * Allowed only if (1) the session is visible, (2) a served history page of
+   * that session named the path, (3) its real path (symlinks resolved) is
+   * under <workspace>/memory/incoming-images and not under memory/private,
+   * (4) it is an image type the browser renders, at most MAX_MEDIA_BYTES.
+   */
+  async mediaFile(id: string, path: string): Promise<{ type: string; bytes: Buffer }> {
+    const refuse = () => new WebError(404, "media_not_found");
+    if (!this.catalog().keys.has(id) || !this.media.get(id)?.has(path) || !this.options.workspaceDir) throw refuse();
+    const type = MEDIA_TYPES[extname(path).toLowerCase()];
+    if (!type) throw refuse();
+    let file: FileHandle | undefined;
+    try {
+      const root = await realpath(join(this.options.workspaceDir, "memory", "incoming-images"));
+      const privateRoot = join(await realpath(join(this.options.workspaceDir, "memory")), "private");
+      const real = await realpath(path);
+      if (!real.startsWith(root + sep) || real.startsWith(privateRoot + sep)) throw refuse();
+      file = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size > MAX_MEDIA_BYTES) throw refuse();
+      return { type, bytes: await file.readFile() };
+    } catch (error) { throw error instanceof WebError ? error : refuse(); }
+    finally { await file?.close(); }
+  }
+
   async history(id: string, cursor?: string) {
     const key = this.catalog().keys.get(id);
     if (!key) throw new WebError(404, "session_not_found");
-    try { return await readHistoryPage(this.options, key, cursor); }
+    try {
+      const page = await readHistoryPage(this.options, key, cursor);
+      const allowed = this.media.get(id) ?? new Set<string>();
+      for (const message of page.messages) for (const path of imagePaths(message.content)) allowed.add(path);
+      if (allowed.size > 4096) allowed.clear();
+      this.media.set(id, allowed);
+      return page;
+    }
     catch (error) {
       if (error instanceof HistoryReadError) throw new WebError(
         error.code === "invalid_cursor" ? 400 : error.code === "history_changed" ? 409 : 413, error.code);

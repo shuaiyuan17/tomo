@@ -78,6 +78,11 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           json(res, 200, await deps.data.history(history[1], url.searchParams.get("cursor") ?? undefined));
           return;
         }
+        if (url.pathname === "/api/v1/usage") {
+          // Cached for 30 minutes in the daemon; refresh=1 forces a read, at most every 30 s.
+          json(res, 200, await deps.rpc({ method: "usage", refresh: url.searchParams.get("refresh") === "1" }));
+          return;
+        }
         const task = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(transcript|output)$/.exec(url.pathname);
         if (task) {
           const [, sessionId, taskId, what] = task;

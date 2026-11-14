@@ -268,3 +268,10 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await page.getByRole("button", { name: "Back to tasks" }).click();
   await browserExpect(page.getByRole("button", { name: /Review the release/ })).toBeVisible();
 });
+
+it("shows the Plan usage card with a named state and a refresh button", async () => {
+  const card = page.getByRole("region", { name: /Plan usage/ });
+  await browserExpect(card).toContainText("Usage isn't available here.");
+  await card.getByRole("button", { name: "Refresh plan usage" }).click();
+  await browserExpect(card).toContainText("Not updated yet");
+});

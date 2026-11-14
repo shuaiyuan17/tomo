@@ -56,6 +56,35 @@ export type SubagentItem =
 export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
 export interface TaskOutput { output: string; size: number }
+/** One subscription usage window for the Plan usage card. */
+export interface WebUsageWindow {
+  id: string; label: string; group: "session" | "weekly" | "other"; scoped: boolean;
+  /** 0–100, or null. */
+  percent: number | null;
+  /** ms epoch, or null. */
+  resetsAt: number | null;
+  active: boolean; elevated: boolean;
+}
+/**
+ * Claude subscription usage, as the `/usage` command reads it. `state` names
+ * what happened: ok, empty (the endpoint returned no windows), or why it
+ * failed (no_token, network, timeout, http_error, …).
+ */
+export interface WebUsage {
+  state: "ok" | "empty" | "api_key" | "no_token" | "credentials_unreadable" | "token_expired" | "refresh_pending"
+    | "unauthorized" | "network" | "timeout" | "http_error" | "bad_response" | "unavailable";
+  message?: string;
+  windows: WebUsageWindow[];
+  plan?: string;
+  /** When the daemon last asked the endpoint (ms epoch). */
+  fetchedAt: number;
+  /** When the windows shown were read (ms epoch); null if never. */
+  updatedAt: number | null;
+  /** The windows are from an earlier read; the last attempt failed. */
+  stale?: boolean;
+  /** A forced refresh before this is served from cache. */
+  nextRefreshAt: number;
+}
 export type WebEvent =
   | { type: "block"; sessionId: string; requestId: string; id: string; text: string }
   | { type: "request"; request: WebRequest }
@@ -83,6 +112,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
   z.object({ method: z.literal("request"), requestId: z.uuid() }).strict(),
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
+  z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean() }).strict(),

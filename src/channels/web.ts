@@ -9,7 +9,7 @@ import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { selectOwnerSessionKey } from "../web/data.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebEvent, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
 /** Task types whose output tail the SDK serves (`get_task_output`). */
 const OUTPUT_TASK_TYPES = new Set(["local_bash", "monitor"]);
@@ -37,6 +37,7 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  private readonly usageReader: ((refresh: boolean) => Promise<WebUsage>) | undefined;
   private readonly taskModel: ((sessionKey: string, taskId: string) => Promise<string | undefined>) | undefined;
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
@@ -55,7 +56,10 @@ export class WebChannel implements Channel {
       /** Reads a shell/Monitor task's output tail from the live session of `sessionKey`. */
       taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>;
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
-      taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined> } = {}) {
+      taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
+      /** Claude subscription usage for the Plan usage card (cached, debounced). */
+      usage?: (refresh: boolean) => Promise<WebUsage> } = {}) {
+    this.usageReader = options.usage;
     this.taskOutput = options.taskOutput;
     this.taskModel = options.taskModel;
     const now = options.now ?? Date.now;
@@ -140,6 +144,12 @@ export class WebChannel implements Channel {
     const value = await this.taskOutput?.(found.slot, taskId).catch(() => undefined);
     if (!value) throw new WebError(503, "task_output_unavailable");
     return { ...access, output: { output: value.output.slice(-16 * 1024), size: value.size } };
+  }
+
+  /** Subscription usage for the browser; never fails: an unconfigured reader reads as "unavailable". */
+  async usage(refresh: boolean): Promise<WebUsage> {
+    if (!this.usageReader) return { state: "unavailable", windows: [], fetchedAt: Date.now(), updatedAt: null, nextRefreshAt: Date.now() };
+    return this.usageReader(refresh);
   }
 
   async send(message: OutgoingMessage): Promise<void> {

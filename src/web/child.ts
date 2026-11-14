@@ -49,7 +49,9 @@ process.on("message", (value: Message) => {
       if (pending.size >= 32) return Promise.reject(new WebError(429, "rpc_limit"));
       return new Promise((resolve, reject) => {
         const id = ++sequence;
-        const timer = setTimeout(() => { pending.delete(id); reject(new WebError(503, "daemon_timeout")); }, 5_000);
+        // Usage may wait on the claude.ai endpoint (10 s) and Claude Code's
+        // delegated token refresh (30 s); everything else answers at once.
+        const timer = setTimeout(() => { pending.delete(id); reject(new WebError(503, "daemon_timeout")); }, input.method === "usage" ? 45_000 : 5_000);
         pending.set(id, { resolve, reject, timer });
         try { send({ type: "rpc", id, input }); }
         catch (err) { clearTimeout(timer); pending.delete(id); reject(err); }

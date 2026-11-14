@@ -4,6 +4,7 @@ import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
 import { Text } from "./markdown.js";
 import { TasksPanel } from "./tasks-panel.js";
+import { PlanUsage } from "./plan-usage.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, ChevronsUpDown, ListChecks, Monitor, Moon, Sun } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -240,7 +241,7 @@ export function App() {
       </div>
     </header>
     <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
-      <aside className="flex w-[272px] shrink-0 flex-col gap-1 border-r px-6 py-8 max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
+      <aside className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
         aria-label="Conversation details" inert={modal}>
         <p className="eyebrow mb-3 max-[600px]:hidden">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2 max-[600px]:mb-0">
@@ -269,6 +270,7 @@ export function App() {
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
+        <PlanUsage ready={!!web.bootstrap} />
       </aside>
       <main id="conversation" className="mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}

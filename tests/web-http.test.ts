@@ -56,6 +56,7 @@ beforeEach(async () => {
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
+      if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
   const response = await call(`/api/v1/bootstrap?t=${accessToken}`);
@@ -152,9 +153,17 @@ describe("local HTTP boundary", () => {
     expect((await call(`${base}/b1/output`)).status).toBe(503);
     expect((await call(`${base}/a1/output`)).status).toBe(400);
   });
+  it("serves plan usage through the daemon, passing a forced refresh", async () => {
+    const usage = vi.spyOn(channel, "usage");
+    const plain = await call("/api/v1/usage");
+    expect(plain.status).toBe(200);
+    expect(JSON.parse(plain.text)).toMatchObject({ state: "unavailable", windows: [] });
+    await call("/api/v1/usage?refresh=1");
+    expect(usage.mock.calls).toEqual([[false], [true]]);
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
-      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`]) {
+      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage"]) {
       const result = await call(path, { headers: { cookie: undefined } });
       expect(result.status).toBe(401); expect(result.text).toBe('{"error":"authentication_required"}');
     }

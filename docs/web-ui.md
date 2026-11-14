@@ -64,6 +64,8 @@ Use the Tailscale access link from `web-access.log` on a device in that tailnet.
 
 ## Development and validation
 
+The UI is React + Tailwind v4 (via `@tailwindcss/vite`) + shadcn/ui (new-york style, Radix primitives, lucide icons). Components live in `web/src/components/ui` (added with the shadcn CLI, imports via the `@/` alias); colours, radius and fonts are shadcn tokens defined in `web/src/styles.css` for light and `.dark`. The app sets `.dark` on `<html>` for an explicit dark theme, or for the system theme while the OS is dark. Keep Radix menus/dialogs non-modal: modal ones inject an inline `<style>` that the CSP blocks.
+
 ```sh
 npm ci
 npm run lint

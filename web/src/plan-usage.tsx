@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { isWarn, localizeUsage, nextUsageDelay, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle, type UsageSchedule } from "./usage.js";
+import { isWarn, localizeUsage, nextUsageDelay, RequestGate, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle, type UsageSchedule } from "./usage.js";
 
 /**
  * Claude subscription usage (the same numbers as `/usage`). Loads on open,
@@ -27,15 +27,28 @@ export function PlanUsage({ ready }: { ready: boolean }) {
     const delay = nextUsageDelay(latest.current, Date.now());
     timer.current = setTimeout(() => void load(false), delay);
   }, []);
+  // One request at a time; each carries a sequence number and a response
+  // that is not from the latest request is dropped.
+  const gate = useRef(new RequestGate());
   const load = useCallback(async (refresh: boolean): Promise<void> => {
+    const mine = gate.current.begin();
+    if (mine === null) return;
     clearTimeout(timer.current);
+    // Recorded when the request starts, so a slow answer cannot push the next one back.
+    latest.current = { ...latest.current, lastAttemptAt: Date.now() };
     setLoading(true);
-    const attemptAt = Date.now();
     try {
-      const value = localizeUsage(await api<WebUsage>(`/usage${refresh ? "?refresh=1" : ""}`), Date.now());
-      latest.current = { usage: value, failed: false, lastAttemptAt: attemptAt }; setUsage(value); setFailed(false);
-    } catch { latest.current = { ...latest.current, failed: true, lastAttemptAt: attemptAt }; setFailed(true); }
-    finally { setLoading(false); setNow(Date.now()); schedule(load); }
+      const raw = await api<WebUsage>(`/usage${refresh ? "?refresh=1" : ""}`);
+      if (!gate.current.current(mine)) return;
+      const value = localizeUsage(raw, Date.now());
+      latest.current = { ...latest.current, usage: value, failed: false }; setUsage(value); setFailed(false);
+    } catch {
+      if (!gate.current.current(mine)) return;
+      latest.current = { ...latest.current, failed: true }; setFailed(true);
+    } finally {
+      gate.current.end();
+      if (gate.current.current(mine)) { setLoading(false); setNow(Date.now()); schedule(load); }
+    }
   }, [schedule]);
   // Only once the page is authenticated (bootstrap sets the cookie). Next
   // reads follow the server's cache expiry; hidden tabs pause, and a tab

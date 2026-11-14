@@ -38,9 +38,15 @@ export interface UsageSchedule {
  * after the last attempt.
  */
 export function nextUsageDelay(schedule: UsageSchedule, now: number): number {
-  const due = schedule.failed || !schedule.usage ? schedule.lastAttemptAt + USAGE_RETRY_MS : schedule.usage.expiresAt + USAGE_MARGIN_MS;
+  // A failed answer (any state but ok/empty) counts as a failure: retry on
+  // the 60 s rule, not at its cache expiry.
+  const failed = schedule.failed || !schedule.usage || !usageOk(schedule.usage);
+  const due = failed ? schedule.lastAttemptAt + USAGE_RETRY_MS : schedule.usage!.expiresAt + USAGE_MARGIN_MS;
   return Math.max(0, due - now, schedule.lastAttemptAt + USAGE_MIN_GAP_MS - now);
 }
+
+/** The answer carries usage (or a definite "no windows"), not a failure. */
+export function usageOk(usage: WebUsage): boolean { return usage.state === "ok" || usage.state === "empty"; }
 
 /** At or above this utilisation a window is shown in the warning colour. */
 export const USAGE_WARN_PERCENT = 80;
@@ -100,4 +106,19 @@ const MESSAGES: Record<Exclude<WebUsage["state"], "ok">, string> = {
 /** What to say for a state other than ok; undefined for ok. */
 export function usageNotice(usage: WebUsage): string | undefined {
   return usage.state === "ok" ? undefined : MESSAGES[usage.state];
+}
+
+/**
+ * One request at a time, and only the latest one's answer counts:
+ * `begin` returns a ticket (or null while one is in flight); `current`
+ * says whether a ticket is still the latest; `end` frees the slot.
+ */
+export class RequestGate {
+  private busy = false;
+  private latest = 0;
+  begin(): number | null { if (this.busy) return null; this.busy = true; return ++this.latest; }
+  /** A newer request superseded this one (e.g. a reconnect reset). */
+  supersede(): void { this.latest++; this.busy = false; }
+  current(ticket: number): boolean { return ticket === this.latest; }
+  end(): void { this.busy = false; }
 }

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { fetchUsage, usageWindows, type UsageResult } from "../src/agent/usage.js";
-import { USAGE_DEADLINE_MS, USAGE_REFRESH_MIN_MS, USAGE_TIMEOUT_RETRY_MS, USAGE_TTL_MS, UsageCache } from "../src/web/usage.js";
+import { USAGE_DEADLINE_MS, USAGE_FAILURE_TTL_MS, USAGE_REFRESH_MIN_MS, USAGE_TIMEOUT_RETRY_MS, USAGE_TTL_MS, UsageCache } from "../src/web/usage.js";
 import { USAGE_RPC_TIMEOUT_MS } from "../src/web/protocol.js";
 import { SOCKET_TIMEOUT_MS } from "../src/web/http.js";
 import { vi } from "vitest";
-import { formatSpan, isWarn, localizeUsage, nextUsageDelay, USAGE_MARGIN_MS, USAGE_MIN_GAP_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
+import { formatSpan, isWarn, localizeUsage, nextUsageDelay, RequestGate, USAGE_MARGIN_MS, USAGE_MIN_GAP_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
 import type { WebUsage, WebUsageWindow } from "../src/web/protocol.js";
 
 const NOW = Date.parse("2026-07-27T22:36:00.000Z");
@@ -105,8 +105,35 @@ describe("usage deadlines", () => {
       expect(late.expiresAt).toBe(USAGE_DEADLINE_MS + USAGE_TIMEOUT_RETRY_MS);
       finish({ ok: true, data: { five_hour: { utilization: 33 } } });
       await vi.advanceTimersByTimeAsync(0);
-      expect(await cache.get()).toMatchObject({ state: "ok", windows: [{ percent: 33 }], expiresAt: USAGE_TTL_MS });
+      expect(await cache.get()).toMatchObject({ state: "ok", windows: [{ percent: 33 }], expiresAt: USAGE_DEADLINE_MS + USAGE_TTL_MS });
     } finally { vi.useRealTimers(); }
+  });
+});
+
+describe("failed reads and request ordering", () => {
+  it("the server caches a failed read for a minute, not thirty", async () => {
+    let now = 0, calls = 0;
+    const cache = new UsageCache(async () => { calls++; return { ok: false, reason: "network", message: "m" }; }, () => now);
+    const first = await cache.get();
+    expect(first.expiresAt).toBe(USAGE_FAILURE_TTL_MS);
+    now = USAGE_FAILURE_TTL_MS - 1; await cache.get();
+    expect(calls).toBe(1);
+    now = USAGE_FAILURE_TTL_MS; await cache.get();
+    expect(calls).toBe(2);
+  });
+  it("the card treats a failed state as a failure (60 s from the attempt), not as fresh data", () => {
+    const failedAnswer: WebUsage = { state: "http_error", windows: [], fetchedAt: 0, updatedAt: null, nextRefreshAt: 0, expiresAt: 10 * 60_000, serverNow: 0 };
+    expect(nextUsageDelay({ usage: failedAnswer, failed: false, lastAttemptAt: 0 }, 0)).toBe(USAGE_RETRY_MS);
+  });
+  it("one request at a time; only the latest answer counts", () => {
+    const gate = new RequestGate();
+    const a = gate.begin()!;
+    expect(gate.begin()).toBeNull();
+    gate.supersede();
+    const b = gate.begin()!;
+    expect([gate.current(a), gate.current(b)]).toEqual([false, true]);
+    gate.end();
+    expect(gate.begin()).not.toBeNull();
   });
 });
 

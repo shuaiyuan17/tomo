@@ -13,6 +13,8 @@ export const USAGE_REFRESH_MIN_MS = 30_000;
 export const USAGE_DEADLINE_MS = 20_000;
 /** After a deadline miss the card asks again this soon (the read has usually finished by then). */
 export const USAGE_TIMEOUT_RETRY_MS = 60_000;
+/** A failed read (no login, network, endpoint error, …) is cached only this long. */
+export const USAGE_FAILURE_TTL_MS = 60_000;
 
 /**
  * Daemon-side cache in front of the claude.ai usage endpoint (the same reader
@@ -23,6 +25,8 @@ export const USAGE_TIMEOUT_RETRY_MS = 60_000;
  */
 export class UsageCache {
   private value: WebUsage | undefined;
+  /** When `value` stops being served from cache: 30 minutes after a good read, 60 s after a failed one. */
+  private validUntil = -Infinity;
   private lastAttemptAt = -Infinity;
   private inFlight: Promise<WebUsage> | undefined;
 
@@ -31,7 +35,7 @@ export class UsageCache {
   async get(refresh = false): Promise<WebUsage> {
     const now = this.now();
     if (this.inFlight) return this.withDeadline(this.inFlight);
-    const fresh = this.value && now - this.lastAttemptAt < USAGE_TTL_MS;
+    const fresh = this.value && now < this.validUntil;
     const debounced = now - this.lastAttemptAt < USAGE_REFRESH_MIN_MS;
     if (this.value && (refresh ? debounced : fresh)) return this.decorate(this.value, now);
     this.lastAttemptAt = now;
@@ -64,16 +68,18 @@ export class UsageCache {
       const windows = usageWindows(result.data);
       this.value = { state: windows.length ? "ok" : "empty", windows, plan: subscriptionLabel(result.subscriptionType) || undefined,
         fetchedAt: now, updatedAt: now, nextRefreshAt: now + USAGE_REFRESH_MIN_MS, expiresAt: now + USAGE_TTL_MS, serverNow: now };
+      this.validUntil = now + USAGE_TTL_MS;
     } else {
       const previous = this.value?.windows.length ? this.value : undefined;
       this.value = { state: result.reason, message: result.message, windows: previous?.windows ?? [], plan: previous?.plan,
         fetchedAt: now, updatedAt: previous?.updatedAt ?? null, stale: !!previous, nextRefreshAt: now + USAGE_REFRESH_MIN_MS,
-        expiresAt: now + USAGE_TTL_MS, serverNow: now };
+        expiresAt: now + USAGE_FAILURE_TTL_MS, serverNow: now };
+      this.validUntil = now + USAGE_FAILURE_TTL_MS;
     }
     return this.decorate(this.value, now);
   }
 
-  private decorate(value: WebUsage, now: number, expiresAt = this.lastAttemptAt + USAGE_TTL_MS): WebUsage {
+  private decorate(value: WebUsage, now: number, expiresAt = this.validUntil): WebUsage {
     return { ...value, nextRefreshAt: Math.max(now, this.lastAttemptAt + USAGE_REFRESH_MIN_MS), expiresAt, serverNow: now };
   }
 }

@@ -474,7 +474,7 @@ export function renderBlock(block: ResponseBlock, showThinking: boolean): BlockR
 /**
  * Join a turn's collected content blocks into its RESPONSE STRING.
  *
- * Delivery no longer goes through here — each block was already shipped by
+ * Delivery does not go through here — each block was already shipped by
  * `renderBlock` as it completed. What is left is everything that legitimately
  * needs the whole turn: the transcript, the response log line, the value
  * `send()`/`steer()` resolve with, and the end-of-turn silence and
@@ -1048,9 +1048,8 @@ export class LiveSession {
    * opens with a thinking block the flag would hide is a warn, with the length
    * that made it worth noticing.
    *
-   * The warn stays now that a NON-EMPTY such block is routed as text
-   * (renderBlock): this is still a shape worth seeing in the log, and the
-   * message says which of the two outcomes happened. Nothing about the claim
+   * A NON-EMPTY such block is dropped by renderBlock too, so this is still a
+   * shape worth seeing in the log. Nothing about the claim
    * itself depends on the block's content — `shipBlock` decides delivery, as
    * it does for every other block.
    */
@@ -1902,7 +1901,7 @@ export class LiveSession {
     // reminder that says "reply in the group", and this note lands after it.
     // Naming the session key here would win by position and answer the group
     // privately to the owner, leaving the asker with nothing — the same
-    // silence this change exists to fix, one audience over.
+    // silence as above, one audience over.
     const targets = audience?.length ? audience : (this.sessionKey ? [this.sessionKey] : []);
     const injected = this.currentRequest?.silentDelivery === true && targets.length > 0
       ? `${text}\n${silentTurnSteerNote(targets)}`

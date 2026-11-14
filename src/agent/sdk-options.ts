@@ -176,9 +176,9 @@ export function sdkOptions(
   });
   // Thinking DISPLAY is the model-side half of config.showThinking: with
   // `display: "omitted"` the SDK strips the *reasoning* out of `thinking` blocks
-  // (they arrive with empty text and a signature). A thinking block that still
-  // carries text under "omitted" is prose the model misplaced, and LiveSession
-  // routes it as a message (see renderBlock). Resolved at session spawn — a
+  // (they arrive with empty text and a signature). With the flag off LiveSession
+  // drops every thinking block, and flags a non-empty one so the model is told
+  // its reply was not delivered (see renderBlock). Resolved at session spawn — a
   // mid-session config change only takes effect on the next session (restart).
   const thinking = adaptiveThinkingForModel(effectiveModel, config.showThinking);
 
@@ -283,8 +283,8 @@ export function sdkOptions(
  * `thinking` blocks (signature only), so it is the mechanism that hides
  * reasoning by default; `"summarized"` is what makes the SDK emit readable
  * summaries, which is what `showThinking` needs before LiveSession has
- * anything to mark with 💭. Either way a non-empty thinking block is routed
- * by LiveSession like text — see renderBlock.
+ * anything to mark with 💭. With the flag off LiveSession drops thinking
+ * blocks whatever they contain — see renderBlock.
  */
 function adaptiveThinkingForModel(
   model: string,
@@ -432,11 +432,10 @@ export function buildHooksOption(args: {
 }
 
 /** Merge one producer's hooks into the accumulator PER EVENT, concatenating
- *  the matcher arrays. The previous `Object.assign` replaced a whole event key,
+ *  the matcher arrays. A plain `Object.assign` would replace a whole event key,
  *  so two producers registering the same event (e.g. two PreToolUse guards)
- *  would silently drop the first one — the private-memory bar would vanish the
- *  day a second PreToolUse hook was added. Today's producers use different
- *  events, so this changes nothing yet; it removes the trap. Exported for tests. */
+ *  would silently drop the first one — and with it the private-memory bar.
+ *  Exported for tests. */
 export function mergeHooks(
   into: Record<string, unknown[]>,
   from: Record<string, unknown>,

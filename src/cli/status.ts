@@ -67,7 +67,7 @@ export async function gatherStatus(): Promise<StatusReport> {
   // An unreadable jobs file degrades this one section instead of taking the
   // whole report down — daemon state, config issues and channels are exactly
   // what someone runs `tomo status` for when something is broken. It is still
-  // never reported as "no scheduled tasks": that lie is what this PR is about.
+  // never reported as "no scheduled tasks".
   const { jobs, unreadablePath } = readCronJobsSafely(new CronStore());
 
   let web: StatusReport["web"];

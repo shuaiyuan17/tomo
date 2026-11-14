@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "re
 import { createRoot } from "react-dom/client";
 import { api, ApiError, sendMessage } from "./api.js";
 import { useWeb } from "./use-web.js";
+import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { runningCount } from "./tasks.js";
@@ -85,6 +86,7 @@ export function App() {
   const running = runningCount(web.tasks);
   const tasksButton = useRef<HTMLButtonElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
+  const ime = useRef(createCompositionGuard());
   // The composer grows with its text, up to a cap (then it scrolls). Text
   // changes and width changes (window, rail, rotation) both re-measure.
   useLayoutEffect(() => { fitComposer(input.current); }, [draft]);
@@ -288,7 +290,8 @@ export function App() {
             <label className="sr-only" htmlFor="message">Message Tomo</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! px-3.5 py-[7px] text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
-              onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+              onChange={(e) => setDraft(e.target.value)} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
+              onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] duration-150 hover:bg-primary/85 active:scale-[0.92] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
               disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>

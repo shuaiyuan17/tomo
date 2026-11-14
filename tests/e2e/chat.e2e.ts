@@ -286,3 +286,36 @@ it("an Enter that confirms an IME candidate (Safari order) does not send", async
   await input.press("Enter");
   await browserExpect(page.getByText("Got it.", { exact: true })).toBeVisible();
 });
+
+it("renders channel images as thumbnails (never the path), keeps line breaks, and shows reply quotes", async () => {
+  const { mkdirSync: mkdir, writeFileSync: write } = await import("node:fs");
+  const dir = resolve(mockConfig.workspaceDir, "memory", "incoming-images", "2026-11-14");
+  mkdir(dir, { recursive: true });
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const file = resolve(dir, "123533_telegram_test-owner_abcd1234.png");
+  write(file, png);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const t = Date.now();
+  store.append("dm:owner", { role: "assistant", channel: "telegram", timestamp: t, content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了" });
+  store.append("dm:owner", { role: "user", channel: "telegram", timestamp: t + 1, content: `[Sent an image, saved to: ${file}] 像这样\n• one\n• two` });
+  store.append("dm:owner", { role: "user", channel: "imessage", timestamp: t + 2, content: '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！' });
+  await page.reload();
+  const image = page.getByRole("img", { name: "Image" });
+  await image.evaluate((el) => el.scrollIntoView());
+  // Served through the authenticated media endpoint and decoded (a 1×1 PNG).
+  await browserExpect.poll(() => image.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth)).toBe(1);
+  expect(await image.evaluate(async (el: HTMLImageElement) => (await fetch(el.src)).headers.get("cache-control"))).toBe("no-store");
+  await browserExpect(page.locator("main")).not.toContainText("incoming-images");
+  await browserExpect(page.locator(".message.user .markdown").first()).toContainText("• one");
+  expect(await page.locator(".message.user .markdown br").count()).toBeGreaterThanOrEqual(2);
+  const quote = page.getByRole("button", { name: /Replying to/ });
+  await browserExpect(quote).toContainText("强哥的 #383");
+  await browserExpect(page.getByText("nicenice！！")).toBeVisible();
+  await browserExpect(page.locator("main")).not.toContainText("[replying to");
+  await quote.click();
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "第一个已经合了" })).toHaveClass(/bg-primary/);
+  await image.click();
+  await browserExpect(page.getByRole("dialog", { name: "Image" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await browserExpect(page.getByRole("dialog", { name: "Image" })).toHaveCount(0);
+});

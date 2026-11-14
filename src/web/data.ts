@@ -1,8 +1,12 @@
+import { constants } from "node:fs";
+import { open, realpath, type FileHandle } from "node:fs/promises";
+import { basename, extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
-import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
+import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
+import { isImageFiledFor } from "../channels/imageStore.js";
 import { WebError, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
@@ -62,6 +66,62 @@ export function subagentModelReader(options: WebDataOptions): (sessionKey: strin
       return entry ? await readSubagentModel(options.sdkSessionsDir, entry.sdkSessionId, taskId) : undefined;
     } catch { return undefined; }
   };
+}
+
+/** Image types the browser may be sent, by extension; the file's signature must agree. */
+const MEDIA_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic" };
+export const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+/** Messaging channels whose inbound images the store files (never "web"). */
+const INBOUND_CHANNELS = new Set(["telegram", "imessage"]);
+/** Most images taken from one message (the UI shows "+N more" past this). */
+export const MAX_MESSAGE_IMAGES = 20;
+
+/** The image type a file's leading bytes declare (PNG, JPEG, GIF, WebP, HEIC), if any. SVG is never one. */
+export function sniffImageType(head: Buffer): string | undefined {
+  if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "image/jpeg";
+  if (head.length >= 6 && /^GIF8[79]a$/.test(head.subarray(0, 6).toString("latin1"))) return "image/gif";
+  if (head.length >= 12 && head.subarray(0, 4).toString("latin1") === "RIFF" && head.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  if (head.length >= 12 && head.subarray(4, 8).toString("latin1") === "ftyp" && /^(heic|heix|hevc|mif1|msf1)$/.test(head.subarray(8, 12).toString("latin1"))) return "image/heic";
+  return undefined;
+}
+
+/**
+ * The meta.sessionKey values the channels file a session's inbound images
+ * under (telegram.ts: `telegram_<chatId>`; imsg: `imessage_<chatGuid>`).
+ * The owner's DM spans their bound chats: a Telegram id, or an iMessage
+ * handle inside a `<service>;-;<handle>` chat GUID.
+ */
+export function imageSessionKeys(key: string, owner: OwnerConfig | undefined, isOwnerSession: boolean): string[] {
+  const raw = parseRawSessionKey(key);
+  const keys = raw ? [`${raw.channelName}_${raw.chatId}`] : [];
+  if (isOwnerSession && owner) {
+    for (const id of ownerBindings(owner, "telegram")) keys.push(`telegram_${id}`);
+    // A chat GUID can carry the handle in any of its written forms; the
+    // binding is reduced with the shared normaliser (#480) and each form it
+    // stands for is tried: +E.164, bare digits, tel: URI; emails as written
+    // and lowercased.
+    for (const handle of ownerBindings(owner, "imessage")) {
+      const normal = normalizeImessageHandle(handle);
+      const forms = new Set([handle, normal, ...(normal.startsWith("+") ? [normal.slice(1), `tel:${normal}`] : [])]);
+      for (const form of forms) for (const service of ["any", "iMessage", "SMS", "RCS"]) keys.push(`imessage_${service};-;${form}`);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Paths named by the image/sticker markers at the START of a message — where
+ * the channel layer puts them (other markers may come first) — capped at
+ * MAX_MESSAGE_IMAGES. See channels/imageStore.ts.
+ */
+export function imagePaths(content: string): string[] {
+  const out: string[] = [];
+  const lead = /^(?:\s*\[[^\]]*\])*/.exec(content)?.[0] ?? "";
+  for (const match of lead.matchAll(/\[Sent (?:an image|a sticker|\d+ images|\d+ stickers), saved to:? ([^;\]]+)/g)) {
+    for (const path of match[1].split(/,\s+/)) if (path.trim().startsWith("/") && out.length < MAX_MESSAGE_IMAGES) out.push(path.trim());
+  }
+  return out;
 }
 
 /** Runs in the web process. Never imports the live Agent or starts services. */
@@ -127,10 +187,61 @@ export class WebData {
     }
   }
 
+  /**
+   * Images the browser may load, per session: only paths named by an image
+   * marker in a history page this process served for that session.
+   */
+  private media = new Map<string, Set<string>>();
+
+  /**
+   * An inbound image for display, by the absolute path its marker names.
+   * Allowed only if (1) the session is visible, (2) a served history page of
+   * that session named the path, (3) its real path (symlinks resolved) is
+   * under <workspace>/memory/incoming-images and not under memory/private,
+   * (4) it is an image type the browser renders, at most MAX_MEDIA_BYTES.
+   */
+  async mediaFile(id: string, path: string): Promise<{ type: string; bytes: Buffer }> {
+    const refuse = () => new WebError(404, "media_not_found");
+    if (!this.catalog().keys.has(id) || !this.media.get(id)?.has(path) || !this.options.workspaceDir) throw refuse();
+    const type = MEDIA_TYPES[extname(path).toLowerCase()];
+    if (!type) throw refuse();
+    let file: FileHandle | undefined;
+    try {
+      const root = await realpath(join(this.options.workspaceDir, "memory", "incoming-images"));
+      const privateRoot = join(await realpath(join(this.options.workspaceDir, "memory")), "private");
+      const real = await realpath(path);
+      if (!real.startsWith(root + sep) || real.startsWith(privateRoot + sep)) throw refuse();
+      file = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const stat = await file.stat();
+      // The store never hard-links; a second link could alias a file elsewhere.
+      if (!stat.isFile() || stat.nlink > 1 || stat.size > MAX_MEDIA_BYTES) throw refuse();
+      const bytes = await file.readFile();
+      if (sniffImageType(bytes.subarray(0, 16)) !== type) throw refuse();
+      return { type, bytes };
+    } catch (error) { throw error instanceof WebError ? error : refuse(); }
+    finally { await file?.close(); }
+  }
+
   async history(id: string, cursor?: string) {
     const key = this.catalog().keys.get(id);
     if (!key) throw new WebError(404, "session_not_found");
-    try { return await readHistoryPage(this.options, key, cursor); }
+    try {
+      const page = await readHistoryPage(this.options, key, cursor);
+      // Transcripts keep no structured attachment record, only the channel
+      // layer's text marker; a message the owner typed could contain a
+      // look-alike. So only images named at the start of an INBOUND user
+      // message from a messaging channel count, and only files filed under
+      // this session's own channel chats (the image store's own naming).
+      const allowed = this.media.get(id) ?? new Set<string>();
+      const filedAs = imageSessionKeys(key, this.options.owner, id === this.catalog().ownerId);
+      for (const message of page.messages) {
+        if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
+        for (const path of imagePaths(message.content)) if (isImageFiledFor(basename(path), filedAs)) allowed.add(path);
+      }
+      if (allowed.size > 4096) allowed.clear();
+      this.media.set(id, allowed);
+      return page;
+    }
     catch (error) {
       if (error instanceof HistoryReadError) throw new WebError(
         error.code === "invalid_cursor" ? 400 : error.code === "history_changed" ? 409 : 413, error.code);

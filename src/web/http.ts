@@ -48,7 +48,14 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const api = req.url?.startsWith("/api/") ?? false;
-    const origin = checkRequest(req, boundPort, api, externalOrigin);
+    // An <img> cannot send our x-tomo-request header, so the media endpoint
+    // (GET, read-only, cookie-authenticated like every API) instead requires
+    // a same-origin image fetch: a hostile page's <img> is cross-site.
+    const mediaRequest = req.method === "GET" && /^\/api\/v1\/sessions\/[A-Za-z0-9_-]{43}\/media(\?|$)/.test(req.url ?? "");
+    const origin = checkRequest(req, boundPort, api && !mediaRequest, externalOrigin);
+    if (mediaRequest && (req.headers["sec-fetch-site"] !== "same-origin" || !["image", "empty"].includes(String(req.headers["sec-fetch-dest"] ?? "")))) {
+      throw new WebError(403, "same_origin_required");
+    }
     const url = new URL(req.url!, origin);
     const bootstrap = url.pathname === "/api/v1/bootstrap" && req.method === "GET";
     const session = api ? (bootstrap ? access.bootstrap(req, res, url, origin) : access.require(req, origin)) : undefined;
@@ -122,6 +129,15 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
             return Number(raw);
           };
           json(res, 200, await deps.data.subagent(access.sessionKey, taskId, { before: number("before"), after: number("after") }));
+          return;
+        }
+        const media = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/media$/.exec(url.pathname);
+        if (media) {
+          const path = url.searchParams.get("path") ?? "";
+          if (!path || path.length > 1024) throw new WebError(400, "invalid_media");
+          const file = await deps.data.mediaFile(media[1], path);
+          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store" });
+          res.end(file.bytes);
           return;
         }
         const request = /^\/api\/v1\/messages\/([a-f0-9-]{36})$/.exec(url.pathname);

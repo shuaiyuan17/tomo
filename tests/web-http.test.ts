@@ -153,6 +153,16 @@ describe("local HTTP boundary", () => {
     expect((await call(`${base}/b1/output`)).status).toBe(503);
     expect((await call(`${base}/a1/output`)).status).toBe(400);
   });
+  it("lets a same-origin <img> reach the media endpoint without the API header, and nothing else", async () => {
+    const path = `/api/v1/sessions/${bootstrap.ownerId}/media?path=${encodeURIComponent("/nope.png")}`;
+    const img = { "x-tomo-request": undefined, "sec-fetch-dest": "image" };
+    expect((await call(path, { headers: img })).status).toBe(404); // authenticated; not a shown image
+    expect((await call(path, { headers: { ...img, cookie: undefined } })).status).toBe(401);
+    expect((await call(path, { headers: { ...img, "sec-fetch-site": "cross-site" } })).status).toBe(403);
+    expect((await call(path, { headers: { ...img, "sec-fetch-dest": "document" } })).status).toBe(403);
+    // Other APIs still require the header.
+    expect((await call("/api/v1/sessions", { headers: img })).status).toBe(403);
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
       `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`]) {

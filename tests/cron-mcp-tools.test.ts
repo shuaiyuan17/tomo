@@ -145,7 +145,7 @@ describe("cron MCP tools", () => {
     // And the fix sticks: the next daemon start must not settle it as
     // interrupted all over again.
     const outcome = new CronStore(TEST_PATH).recoverInterrupted();
-    expect(outcome.skipped).toHaveLength(0);
+    expect(outcome.parked).toHaveLength(0);
     expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(true);
   });
 

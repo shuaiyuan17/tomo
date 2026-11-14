@@ -44,7 +44,7 @@ import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
@@ -132,6 +132,9 @@ interface CronTurnOptions {
    *  a session turn that the handoff target may be waiting on — see
    *  processCronMessage. */
   waitForHandoff?: boolean;
+  /** Graceful shutdown ended the turn without a real outcome (see
+   *  TurnSpec.onShutdown). Carried through every handoff. */
+  onShutdown?: (kind: ShutdownTurnEnd) => void;
   /** The cron job's name, for the owner notice when its failure is kept out
    *  of a group (see agent/owner-error-notice.ts). */
   jobName?: string;
@@ -2055,6 +2058,7 @@ export class Agent {
         key,
         source: "cron",
         ...(options.restate ? { restate: true } : {}),
+        ...(options.onShutdown ? { onShutdown: options.onShutdown } : {}),
         prompt,
         stampChannelName: deliveryChannel.name,
         ...(options.showTyping === false ? {} : {

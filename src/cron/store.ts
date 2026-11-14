@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
-import type { CronJob, CronSchedule, InterruptedSkip, SkipNotice } from "./types.js";
+import type { CronJob, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { withFileLockSync } from "../file-lock.js";
@@ -16,25 +16,12 @@ export const ONE_SHOT_MAX_RETRIES = 2;
 export const ONE_SHOT_RETRY_DELAY_MS = 5 * 60_000;
 
 /**
- * A recurring job gets this many marked resume fires before the scheduler
- * gives up on it. Without a cap, a job whose turn reliably kills the daemon
- * (or a daemon in a crash loop) re-fires forever, once per restart.
- */
-export const MAX_RESUME_ATTEMPTS = 3;
-
-/**
- * A one-shot interrupted mid-run (a restart, a crash) is retried this many
- * times, and only while it is fresh (see staleWindowMs). The retry carries the
- * [resumed] marker, which tells the model to check what the interrupted run
- * already did before repeating anything with side effects.
- */
-export const ONE_SHOT_MAX_RESUMES = 1;
-
-/**
- * How long an interrupted ONE-SHOT stays worth retrying, by default. A
- * one-shot has no period to scale against; it is usually a reminder or a
- * hand-off someone is waiting on, and two hours still covers a restart, an
- * update or a short outage without delivering yesterday's reminder today.
+ * Default staleness window for a ONE-SHOT (see staleWindowMs). A one-shot has
+ * no period to scale against; it is usually a reminder or a hand-off someone
+ * is waiting on, and two hours still covers a restart, an update or a short
+ * outage without delivering yesterday's reminder today. (An INTERRUPTED
+ * one-shot is never retried automatically, however fresh — see
+ * settleInterruptedRun.)
  */
 export const ONE_SHOT_STALE_AFTER_MS = 2 * 3_600_000;
 
@@ -461,6 +448,49 @@ export class CronStore {
   }
 
   /**
+   * Undo `markStarted` for a run that never reached the model — shutdown
+   * refused its turn while it was still queued. Nothing ran, so nothing is
+   * recorded: the run token is acknowledged (recovery must not read it as an
+   * interrupted run, which would burn a one-shot's single retry and stamp a
+   * misleading [resumed] marker), and the fields markStarted overwrote are put
+   * back. `nextRunAt` was never advanced, so the job is still due and fires
+   * normally on the next start. A no-op if another dispatch has since taken
+   * the token.
+   */
+  rollbackStarted(
+    id: string,
+    runId: string,
+    prior: { lastStartedAt: number | null; interruptedAt: number | null; lastStatus: CronJob["lastStatus"] },
+  ): void {
+    this.load();
+    const job = this.get(id);
+    if (!job || job.lastRunId !== runId) return;
+    job.lastCompletedRunId = runId;
+    job.lastStartedAt = prior.lastStartedAt;
+    if (prior.interruptedAt != null) {
+      job.interruptedAt = prior.interruptedAt;
+      job.lastStatus = prior.lastStatus;
+    }
+    this.save();
+  }
+
+  /**
+   * A run that graceful shutdown cut short mid-turn (`tomo restart` / `update`
+   * / `stop`, including one the job's own turn ran). Settled exactly as
+   * restart recovery settles any interrupted run (settleInterruptedRun): never
+   * re-run automatically, owner told once after the restart. A no-op if
+   * another dispatch has since taken the token.
+   */
+  markInterruptedByShutdown(id: string, runId: string): void {
+    this.load();
+    const job = this.get(id);
+    if (!job || job.lastRunId !== runId) return;
+    const now = Date.now();
+    settleInterruptedRun(job, now, now);
+    this.save();
+  }
+
+  /**
    * Last-resort bookkeeping for a run whose turn finished but whose outcome
    * could not be written (markRun kept throwing — disk full, permissions).
    * The run is acknowledged, so recovery will not treat it as interrupted,
@@ -483,104 +513,45 @@ export class CronStore {
 
   /**
    * Settle runs that were dispatched but never acknowledged — the daemon was
-   * restarted or killed mid-turn. Called before the scheduler's first
+   * restarted, crashed or killed mid-turn, or a graceful shutdown could not
+   * write the interrupted status. Called before the scheduler's first
    * due-scan, so the normal path never sees a job in a half state.
    *
-   * Each interrupted run is closed out (the run token is acknowledged, so the
-   * job is not re-flagged on every subsequent restart) and the job is sorted:
+   * POLICY (decided 2026-11-14): an interrupted run may have done all, some or
+   * none of its work, so it is NEVER re-run automatically — no [resumed]
+   * fire. Every interrupted run is settled by settleInterruptedRun: a
+   * single-fire job is parked and the owner asked whether to run it again; a
+   * recurring job records "interrupted", moves to its next normal slot and the
+   * owner is told once.
    *
-   * - `resumed`: recurring jobs, up to MAX_RESUME_ATTEMPTS times. Still due on
-   *   disk, so they fire on the next scan — with `interruptedAt` set so the
-   *   scheduler marks that fire as a resume in the event body, telling the
-   *   model to check state before repeating anything with side effects.
-   * - single-fire jobs — `deleteAfterRun`, and every `at` schedule regardless
-   *   of that flag — are `resumed` ONCE while fresh (the interrupted run
-   *   started within the job's staleness window), with the same [resumed]
-   *   marker. Otherwise they are `skipped` with reason `"once-stale"` or
-   *   `"once-retried"`: disabled with `lastStatus: "interrupted"` so a
-   *   human/agent can inspect and re-enable, and reported to the owner by the
-   *   scheduler (see unreportedParkedOneShots) — never dropped silently.
-   * - `skipped` with reason `"resume-cap"`: a recurring job that has been
-   *   resumed MAX_RESUME_ATTEMPTS times since its last successful run. A turn
-   *   that reliably takes the daemon down (or a crash loop) would otherwise
-   *   re-fire once per restart forever.
+   * Also settles state older versions left behind for an automatic resume (a
+   * job still carrying an `interruptedAt` marker): a one-shot queued for its
+   * retry is parked instead, a recurring job's pending resume is dropped.
    */
-  recoverInterrupted(): { resumed: CronJob[]; skipped: InterruptedSkip[] } {
+  recoverInterrupted(): { parked: InterruptedSkip[]; recurring: CronJob[] } {
     this.load();
     const now = Date.now();
-    const resumed: CronJob[] = [];
-    const skipped: InterruptedSkip[] = [];
+    const parked: InterruptedSkip[] = [];
+    const recurring: CronJob[] = [];
     let changed = false;
     for (const job of this.jobs) {
-      const park = (reason: InterruptedSkip["reason"]) => {
-        job.enabled = false;
-        job.nextRunAt = null;
-        // No further fire, so no marker to carry — the state stays visible
-        // through lastStatus.
-        job.interruptedAt = null;
-        // A new incident: the owner has not been told about THIS one.
-        if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
-        skipped.push({ job: { ...job }, reason });
-        changed = true;
-      };
-      if (!isInterrupted(job)) {
-        // A one-shot an earlier start already queued for its retry, whose
-        // retry never got dispatched (the daemon went down again first).
-        // Freshness is re-judged now: after a long second outage it is too
-        // late for the retry too.
-        if (job.enabled && isSingleFire(job) && job.interruptedAt != null) {
-          const window = staleWindowMs(job);
-          if (window !== 0 && now - job.interruptedAt > window) park("once-stale");
-        }
-        continue;
-      }
-      // Acknowledge the run token: this interruption is now accounted for.
-      job.lastCompletedRunId = job.lastRunId ?? null;
-      job.interruptedAt = job.lastStartedAt ?? now;
-      job.lastRunAt = job.lastStartedAt ?? now;
-      job.lastStatus = "interrupted";
+      const legacyResume = !isInterrupted(job) && job.interruptedAt != null;
+      if (!isInterrupted(job) && !legacyResume) continue;
+      const wasEnabled = job.enabled;
+      // legacyResume: an older daemon settled the run and queued an automatic
+      // resume. Same incident, new policy: no resume. Either way the moment
+      // of the interruption is unknown here — the daemon was not alive to see
+      // it — so it is not invented.
+      settleInterruptedRun(job, now, null);
       changed = true;
-      // One-shot is a property of the SCHEDULE, not just the lifecycle flag.
-      // `deleteAfterRun: false` on an "at" job only means "keep the record
-      // after it fires" (schedule_create's `once: false`) — it is still a
-      // single-fire job, and markRun treats it as one (kind "at" never gets a
-      // recomputed nextRunAt).
-      //
-      // An interrupted one-shot is usually a reminder or a task the owner is
-      // waiting on, so parking it silently loses it. It gets ONE retry while
-      // it is fresh, carrying the [resumed] marker so the model checks what
-      // the interrupted run already did before repeating side effects. A
-      // second interruption (a turn that takes the daemon down) or a stale
-      // run is parked — and the scheduler tells the owner about it.
       if (isSingleFire(job)) {
-        const window = staleWindowMs(job);
-        const startedAt = job.lastStartedAt ?? now;
-        const fresh = window === 0 || now - startedAt <= window;
-        const attempts = (job.resumeAttempts ?? 0) + 1;
-        if (!job.enabled) {
-          // Disabled while the run was in flight: someone decided it should
-          // not run. Not retried, but not silent either.
-          park("once-disabled");
-        } else if (!fresh) {
-          park("once-stale");
-        } else if (attempts > ONE_SHOT_MAX_RESUMES) {
-          park("once-retried");
-        } else {
-          job.resumeAttempts = attempts;
-          resumed.push({ ...job });
-        }
-        continue;
+        parked.push({ job: { ...job }, reason: wasEnabled ? "once-interrupted" : "once-disabled" });
+      } else {
+        recurring.push({ ...job });
       }
-      const attempts = (job.resumeAttempts ?? 0) + 1;
-      job.resumeAttempts = attempts;
-      if (attempts > MAX_RESUME_ATTEMPTS) {
-        park("resume-cap");
-        continue;
-      }
-      resumed.push({ ...job });
     }
     if (changed) this.save();
-    return { resumed, skipped };
+    return { parked, recurring };
   }
 
   markRun(id: string, status: "ok" | "error"): void {
@@ -673,28 +644,6 @@ export class CronStore {
   }
 
   /**
-   * Park one-shot retries that recovery queued but that never got dispatched
-   * and are now past their staleness window — the same judgement recovery
-   * makes at startup, applied while the daemon keeps running.
-   */
-  expireStaleOneShotRetries(exclude: ReadonlySet<string> = new Set(), now = Date.now()): CronJob[] {
-    this.load();
-    const parked: CronJob[] = [];
-    for (const job of this.jobs) {
-      if (!job.enabled || !isSingleFire(job) || job.interruptedAt == null || exclude.has(job.id)) continue;
-      const window = staleWindowMs(job);
-      if (window === 0 || now - job.interruptedAt <= window) continue;
-      job.enabled = false;
-      job.nextRunAt = null;
-      job.interruptedAt = null;
-      if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
-      parked.push({ ...job });
-    }
-    if (parked.length > 0) this.save();
-    return parked;
-  }
-
-  /**
    * Interrupted one-shots that were parked (not retried) and that the owner
    * has not been told about yet — including ones parked by older versions,
    * which did so silently. The scheduler reports each once.
@@ -703,6 +652,42 @@ export class CronStore {
     this.load();
     return this.jobs.filter((job) =>
       !job.enabled && job.lastStatus === "interrupted" && isSingleFire(job) && job.interruptNotifiedAt == null);
+  }
+
+  /** Recurring jobs with an interrupted run the owner has not been told about. */
+  unreportedInterruptedRecurring(): CronJob[] {
+    this.load();
+    return this.jobs.filter((job) => job.interruptNotice != null);
+  }
+
+  /**
+   * Record that the owner was told about these recurring interruptions. Only
+   * the notices actually reported are cleared (by sequence number), so an
+   * interruption landing while the DM is in flight is not lost.
+   */
+  markRecurringInterruptNoticesSent(sent: ReadonlyArray<{ id: string; notice: InterruptNotice }>): void {
+    if (sent.length === 0) return;
+    this.load();
+    let changed = false;
+    for (const { id, notice } of sent) {
+      const job = this.jobs.find((j) => j.id === id);
+      const current = job?.interruptNotice;
+      if (!job || current == null) continue;
+      if (current.seq <= notice.seq) {
+        job.interruptNotice = null;
+      } else {
+        // Interrupted again while the DM was in flight: drop only what was
+        // reported, keep the newer ones (they are appended after it).
+        const newer = current.seq - notice.seq;
+        job.interruptNotice = {
+          seq: current.seq,
+          count: Math.max(1, current.count - notice.count),
+          runs: current.runs.slice(-newer),
+        };
+      }
+      changed = true;
+    }
+    if (changed) this.save();
   }
 
   /** Recurring jobs with a stale skip the owner has not been told about. */
@@ -1022,6 +1007,98 @@ export function mergeWithDisk(
   }
   return out;
 }
+
+/**
+ * Settle one interrupted run under the never-auto-re-run policy. Shared by
+ * graceful shutdown (markInterruptedByShutdown) and restart recovery, so a
+ * crash, a hard kill and a `tomo restart` all end the same way.
+ *
+ * - The run token is acknowledged: the interruption is accounted for, and is
+ *   never settled twice.
+ * - `lastStatus: "interrupted"` and `lastInterruptedAt` record it. The latter
+ *   survives later runs, so the history keeps the interruption.
+ * - `interruptedAt` is the moment of the interruption when it was seen
+ *   (graceful shutdown); null when it was not (crash / kill, settled on the
+ *   next start), in which case the run's start time stands in.
+ * - No `interruptedAt` marker: there is no automatic resume to carry it.
+ * - Single-fire (deleteAfterRun, or any "at" schedule): kept, parked —
+ *   disabled, no next run — and left unreported, so the owner report names it
+ *   and asks whether to run it again (unreportedParkedOneShots).
+ * - Recurring: moves to its next NORMAL slot from now (no catch-up), and gets
+ *   an `interruptNotice` the owner report sends once.
+ */
+export function settleInterruptedRun(job: CronJob, now: number, interruptedAt: number | null): void {
+  const startedAt = job.lastStartedAt ?? null;
+  job.lastCompletedRunId = job.lastRunId ?? null;
+  job.lastRunAt = interruptedAt ?? startedAt ?? now;
+  job.lastStatus = "interrupted";
+  job.lastInterruptedAt = interruptedAt ?? startedAt ?? now;
+  if (job.interruptedAt != null) job.interruptedAt = null;
+  if (job.resumeAttempts !== undefined) delete job.resumeAttempts;
+  if (isSingleFire(job)) {
+    job.enabled = false;
+    job.nextRunAt = null;
+    // A new incident: the owner has not been told about THIS one.
+    if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
+    return;
+  }
+  let missed: InterruptedRun["missed"];
+  if (job.enabled) {
+    const slot = job.nextRunAt;
+    const every = job.schedule.kind === "every" ? job.schedule.everyMs : null;
+    if (every !== null && everyIntervalReason(every) === null && job.nextRunAt !== null) {
+      // Keep the job's own grid: advance the interrupted run's scheduled slot
+      // by whole periods to the first one in the future — however long the
+      // downtime — rather than re-anchoring the cadence at recovery time.
+      const scheduled = job.nextRunAt;
+      job.nextRunAt = scheduled + (Math.floor(Math.max(0, now - scheduled) / every) + 1) * every;
+    } else {
+      job.nextRunAt = computeNextRun(job.schedule, now);
+    }
+    if (slot !== null) missed = missedSlots(job.schedule, slot, now);
+  }
+  // Accumulated, never overwritten: a job interrupted again before the owner
+  // heard about the first keeps both.
+  const prior = job.interruptNotice ?? null;
+  const run: InterruptedRun = { startedAt, interruptedAt, ...(missed ? { missed } : {}) };
+  const runs = [...(prior?.runs ?? []), run].slice(-MAX_INTERRUPT_NOTICE_RUNS);
+  job.interruptNotice = { seq: (prior?.seq ?? 0) + 1, count: (prior?.count ?? 0) + 1, runs };
+}
+
+/** Upper bound on slots walked when counting a cron-expression job's gap. */
+const MAX_MISSED_SLOT_WALK = 100_000;
+
+/**
+ * The recurring slots strictly AFTER the interrupted run's own `slot` and up
+ * to `now` — the runs a downtime swallowed, which the policy does not catch
+ * up. Count plus the first and last, for the owner report; undefined when
+ * there are none (the usual graceful restart).
+ */
+function missedSlots(schedule: CronSchedule, slot: number, now: number): InterruptedRun["missed"] {
+  if (schedule.kind === "every") {
+    if (everyIntervalReason(schedule.everyMs) !== null) return undefined;
+    const count = Math.floor(Math.max(0, now - slot) / schedule.everyMs);
+    if (count === 0) return undefined;
+    return { count, from: slot + schedule.everyMs, to: slot + count * schedule.everyMs };
+  }
+  if (schedule.kind !== "cron") return undefined;
+  // croner directly: computeNextRun's cron branch always answers "after now".
+  const cron = new Cron(schedule.expr, { timezone: schedule.tz });
+  let count = 0;
+  let from = 0;
+  let to = 0;
+  let t = cron.nextRun(new Date(slot))?.getTime() ?? null;
+  while (t !== null && t <= now && count < MAX_MISSED_SLOT_WALK) {
+    if (count === 0) from = t;
+    to = t;
+    count++;
+    t = cron.nextRun(new Date(t))?.getTime() ?? null;
+  }
+  return count > 0 ? { count, from, to } : undefined;
+}
+
+/** Per-job cap on the interruption details kept for the owner report. */
+export const MAX_INTERRUPT_NOTICE_RUNS = 10;
 
 /**
  * A run was dispatched (markStarted) and never acknowledged (markRun /

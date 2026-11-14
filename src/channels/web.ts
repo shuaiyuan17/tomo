@@ -405,6 +405,8 @@ export class WebChannel implements Channel {
     }
   }
   private observe(event: WatchEvent): void {
+    // Session-less: a run changes the job's next / last run. Carries nothing.
+    if (event.type === "cron.fired" || event.type === "cron.done") { this.events.publish({ type: "cron" }); return; }
     if (!("sessionKey" in event) || !event.sessionKey) return;
     const sessionId = this.sessionId(event.sessionKey);
     if (!sessionId) return;

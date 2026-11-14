@@ -1,10 +1,14 @@
+import { fileURLToPath } from "node:url";
 import { configDefaults, defineConfig } from "vitest/config";
 
 /**
- * Deliberately minimal: everything but `env` and one `exclude` entry is
- * vitest's default.
+ * Deliberately minimal: everything but `env`, one `exclude` entry and the
+ * web UI's `@` alias is vitest's default.
  */
 export default defineConfig({
+  // The web UI's shadcn imports (`@/components/...`), as in web/vite.config.ts,
+  // so tests can render its components.
+  resolve: { alias: { "@": fileURLToPath(new URL("./web/src", import.meta.url)) } },
   test: {
     // An agent's isolated worktree lives INSIDE the repo (`.claude/worktrees/
     // <agent>/`) and carries a full copy of tests/. Left behind, it makes vitest

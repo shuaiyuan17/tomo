@@ -5,11 +5,21 @@ export const STUDY_PAGES = ["todos", "memory", "context", "cron", "mcp", "config
 export type StudyPage = typeof STUDY_PAGES[number];
 export const STUDY_LABELS: Record<StudyPage, string> = { todos: "TODOs", memory: "Memory", context: "Context", cron: "Cron", mcp: "MCP servers", config: "Config" };
 
-/** `#study/<page>`: the Study is linkable and the back button leaves it. */
+/** `#study/<page>[/<item>]`: the Study is linkable and the back button leaves it. */
+const STUDY_HASH = /^#study(?:\/([a-z]+)(?:\/([A-Za-z0-9_-]{1,64}))?)?$/;
 export function viewFromHash(hash: string): StudyPage | null {
-  const match = /^#study(?:\/([a-z]+))?$/.exec(hash);
+  const match = STUDY_HASH.exec(hash);
   if (!match) return null;
   return (STUDY_PAGES as readonly string[]).includes(match[1] ?? "") ? match[1] as StudyPage : "todos";
+}
+/** The item a Study link points at (`#study/cron/<jobId>`), if any. */
+export function focusFromHash(hash: string): string | null {
+  const match = STUDY_HASH.exec(hash);
+  return match && viewFromHash(hash) === match[1] ? match[2] ?? null : null;
+}
+/** Link to one cron job in the Study's Cron tab. */
+export function cronJobHash(id: string): string {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? `#study/cron/${id}` : "#study/cron";
 }
 
 export type Resource<T> = { state: "loading" } | { state: "ready"; value: T } | { state: "error"; code: string };

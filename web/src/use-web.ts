@@ -12,6 +12,8 @@ export function useWeb() {
   const [activity, setActivity] = useState<Record<string, string>>({});
   const [tasks, setTasks] = useState<WebTask[]>([]);
   const [revision, setRevision] = useState(0);
+  /** Bumped whenever the daemon reports a cron run; Study / Scheduled re-read /cron. */
+  const [cronRevision, setCronRevision] = useState(0);
   const refreshBootstrap = useCallback(async () => {
     try { const value = await readBootstrap(); setBootstrap(value); return value; }
     catch (error) { if (error instanceof ApiError && error.status === 401) setConnection("locked"); throw error; }
@@ -51,7 +53,8 @@ export function useWeb() {
     };
     const snapshot = (value: WebSnapshot) => {
       setBlocks(value.blocks); setRequests(value.requests); setActivity({}); setTasks(value.tasks ?? []);
-      setConnection("live"); refresh();
+      // A (re)connect may have missed cron events while the stream was down.
+      setConnection("live"); refresh(); setCronRevision((r) => r + 1);
     };
     const update = (event: WebEvent) => {
       if (event.type === "block") setBlocks((old) => [...old.filter((b) => b.id !== event.id), event]);
@@ -60,6 +63,7 @@ export function useWeb() {
         if (!["queued", "running"].includes(event.request.state)) refresh();
       }
       if (event.type === "invalidate") refresh();
+      if (event.type === "cron") setCronRevision((value) => value + 1);
       if (event.type === "tool") setActivity((old) => ({ ...old,
         [event.sessionId]: `${event.tool} · ${event.state}` }));
       if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
@@ -86,5 +90,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, tasks, revision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, activity, tasks, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

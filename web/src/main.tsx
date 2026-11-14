@@ -7,10 +7,11 @@ import { Text } from "./markdown.js";
 import { MessageBody } from "./message-body.js";
 import { findQuoted, parseReply } from "./reply.js";
 import { TasksPanel } from "./tasks-panel.js";
+import { ScheduledSection } from "./scheduled-section.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun } from "lucide-react";
 import { Study } from "./study.js";
-import { STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
+import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -74,19 +75,20 @@ function Mark({ className }: { className?: string }) {
   return <svg className={cn("size-10 shrink-0 fill-none stroke-primary stroke-2 [stroke-linecap:round]", className)} viewBox="0 0 40 40" aria-hidden="true"><path d="M 32 14 C 36 20, 32 32, 20 32 C 8 32, 5 22, 10 14 C 14 7, 26 6, 30 12" /></svg>;
 }
 
-function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void] {
+function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, string | null] {
   const [page, setPage] = useState(() => viewFromHash(window.location.hash));
+  const [focus, setFocus] = useState(() => focusFromHash(window.location.hash));
   useEffect(() => {
-    const update = () => setPage(viewFromHash(window.location.hash));
+    const update = () => { setPage(viewFromHash(window.location.hash)); setFocus(focusFromHash(window.location.hash)); };
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, []);
-  return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); }];
+  return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); setFocus(null); }, focus];
 }
 
 export function App() {
   const web = useWeb();
-  const [study, setStudy] = useStudyRoute();
+  const [study, setStudy, studyFocus] = useStudyRoute();
   const [selected, setSelected] = useState("");
   const selectedId = selected || web.bootstrap?.ownerId || web.bootstrap?.sessions[0]?.id || "";
   const session = web.bootstrap?.sessions.find((s) => s.id === selectedId);
@@ -346,7 +348,7 @@ export function App() {
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
       </aside>
-      {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal}
+      {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
       <main id="conversation" hidden={!!study} className="mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
@@ -391,7 +393,8 @@ export function App() {
       </main>
       {tasksOpen && <aside ref={rail} id="tasks-rail" aria-label="Tasks" {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         className="flex min-h-0 w-[300px] shrink-0 flex-col border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:animate-[rail-in_180ms_ease-out] max-[600px]:top-16">
-        <TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} /></aside>}
+        <TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
+          footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></aside>}
     </div>
   </div>;
 }

@@ -43,6 +43,8 @@ export const MAX_CRON_STORE_BYTES = 4 * 1024 * 1024;
  * and the schedule tools.
  */
 export class WebCron {
+  /** Last parse, reused while the file is the same file with the same size and mtime. */
+  private cache: { ino: number; size: number; mtimeMs: number; ctimeMs: number; jobs: CronJob[] } | undefined;
   constructor(private readonly path: string | undefined) {}
   async list(): Promise<{ jobs: WebCronJob[] }> {
     return { jobs: (await this.read()).map(webCronJob) };
@@ -59,6 +61,11 @@ export class WebCron {
       const stat = await file.stat();
       if (!stat.isFile()) throw new WebError(503, "cron_unavailable");
       if (stat.size > MAX_CRON_STORE_BYTES) throw new WebError(413, "cron_store_too_large");
+      // Every open page re-reads /cron (the Scheduled rail polls it): skip the
+      // read and parse when the store has not been rewritten since. The store
+      // writes atomically (rename), so a rewrite is a new inode as well.
+      const cached = this.cache;
+      if (cached && cached.ino === stat.ino && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs) return cached.jobs;
       // Bounded even if the file grows after stat().
       const bytes = Buffer.alloc(MAX_CRON_STORE_BYTES + 1);
       let read = 0;
@@ -68,8 +75,11 @@ export class WebCron {
         read += bytesRead;
       }
       if (read > MAX_CRON_STORE_BYTES) throw new WebError(413, "cron_store_too_large");
-      try { return parseCronStore(this.path, bytes.toString("utf8", 0, read)).jobs; }
-      catch { throw new WebError(503, "cron_unavailable"); }
+      let jobs: CronJob[];
+      try { jobs = parseCronStore(this.path, bytes.toString("utf8", 0, read)).jobs; }
+      catch { this.cache = undefined; throw new WebError(503, "cron_unavailable"); }
+      this.cache = { ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, jobs };
+      return jobs;
     } finally { await file.close(); }
   }
   /** Enable / disable (`enabled` given) or delete a job, if it still has the reviewed `revision`. */

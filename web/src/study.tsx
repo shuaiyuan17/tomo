@@ -47,7 +47,8 @@ function Empty({ children }: { children: ReactNode }) {
 /** What a Study write needs: the page's bootstrap (CSRF token, daemon epoch) and a way to refresh it. */
 export interface Mutator { bootstrap?: WebBootstrap; refresh: () => Promise<WebBootstrap>; live: boolean }
 
-export function Study({ page, onPage, session, reload, inert, mutator }: { page: StudyPage; onPage: (page: StudyPage) => void; session?: WebSession; reload: number; inert?: boolean; mutator: Mutator }) {
+export function Study({ page, onPage, session, reload, inert, mutator, focus, cronRevision = 0 }: { page: StudyPage; onPage: (page: StudyPage) => void; session?: WebSession; reload: number; inert?: boolean; mutator: Mutator;
+  /** An item to scroll to and highlight (`#study/cron/<jobId>`). */ focus?: string | null; cronRevision?: number }) {
   const [local, setLocal] = useState(0);
   const key = reload + local;
   return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-12 pt-7 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:px-4 max-[600px]:pt-4">
@@ -66,7 +67,7 @@ export function Study({ page, onPage, session, reload, inert, mutator }: { page:
         {page === "todos" && <Todos reload={key} />}
         {page === "memory" && <Memory reload={key} />}
         {page === "context" && <Context session={session} reload={key} />}
-        {page === "cron" && <Cron reload={key} mutator={mutator} />}
+        {page === "cron" && <Cron reload={key + cronRevision} mutator={mutator} focus={focus ?? null} />}
         {page === "mcp" && <Mcp reload={key} />}
         {page === "config" && <Config reload={key} />}
       </div>
@@ -239,9 +240,11 @@ export function cronStatus(job: WebCronJob): { label: string; tone: "ok" | "warn
   return { label: "Not run yet", tone: "muted" };
 }
 
-export function CronJobRow({ job, actions }: { job: WebCronJob; actions?: ReactNode }) {
+export function CronJobRow({ job, actions, highlighted }: { job: WebCronJob; actions?: ReactNode; highlighted?: boolean }) {
   const status = cronStatus(job);
-  return <li className={cn(card, "px-5 py-4", !job.enabled && "opacity-75")}>
+  return <li id={cronRowId(job.id)} tabIndex={-1} aria-current={highlighted ? "true" : undefined}
+    className={cn(card, "scroll-mt-4 px-5 py-4 transition-[box-shadow,background-color] duration-700", !job.enabled && "opacity-75",
+      highlighted && "bg-accent/60 ring-2 ring-primary/50")}>
     <Collapsible>
       <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1">
@@ -264,10 +267,31 @@ export function CronJobRow({ job, actions }: { job: WebCronJob; actions?: ReactN
   </li>;
 }
 
-export function CronList({ jobs, actions }: { jobs: WebCronJob[]; actions?: (job: WebCronJob) => ReactNode }) {
+/** DOM id of a job's row, the target of `#study/cron/<jobId>`. */
+export function cronRowId(id: string): string { return `cron-job-${id}`; }
+
+/** How long a linked job stays highlighted. */
+const HIGHLIGHT_MS = 2500;
+
+export function CronList({ jobs, actions, focus = null }: { jobs: WebCronJob[]; actions?: (job: WebCronJob) => ReactNode; focus?: string | null }) {
   const sorted = useMemo(() => [...jobs].sort((a, b) => Number(b.enabled) - Number(a.enabled) || (a.nextRunAt ?? Infinity) - (b.nextRunAt ?? Infinity)), [jobs]);
+  const [highlighted, setHighlighted] = useState<string | null>(null);
+  const present = !!focus && jobs.some((job) => job.id === focus);
+  // Scroll to and briefly highlight the linked job once it is listed.
+  useEffect(() => {
+    if (!focus || !present) return;
+    const row = document.getElementById(cronRowId(focus));
+    row?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    row?.focus({ preventScroll: true });
+    setHighlighted(focus);
+    const timer = setTimeout(() => setHighlighted(null), HIGHLIGHT_MS);
+    return () => clearTimeout(timer);
+  }, [focus, present]);
   if (!jobs.length) return <Empty>No scheduled jobs.</Empty>;
-  return <ul className="m-0 list-none space-y-3 p-0">{sorted.map((job) => <CronJobRow key={job.id} job={job} actions={actions?.(job)} />)}</ul>;
+  return <>
+    {focus && !present && <p className={cn(meta, "mt-0 mb-3")} role="status">That job is no longer scheduled.</p>}
+    <ul className="m-0 list-none space-y-3 p-0">{sorted.map((job) => <CronJobRow key={job.id} job={job} actions={actions?.(job)} highlighted={highlighted === job.id} />)}</ul>
+  </>;
 }
 
 const CRON_ERRORS: Record<string, string> = {
@@ -337,11 +361,11 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
   </AlertDialog>;
 }
 
-function Cron({ reload, mutator }: { reload: number; mutator: Mutator }) {
+function Cron({ reload, mutator, focus }: { reload: number; mutator: Mutator; focus: string | null }) {
   const [resource, refetch] = useResource<{ jobs: WebCronJob[] }>("/cron", reload);
   return <Status resource={resource}>{resource.state === "ready" && <>
     {!mutator.live && <p className={cn(meta, "mt-0 mb-3")}>Changes are available while connected.</p>}
-    <CronList jobs={resource.value.jobs} actions={(job) => <CronActions job={job} mutator={mutator} onDone={refetch} />} />
+    <CronList jobs={resource.value.jobs} focus={focus} actions={(job) => <CronActions job={job} mutator={mutator} onDone={refetch} />} />
   </>}</Status>;
 }
 

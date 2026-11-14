@@ -99,6 +99,9 @@ export class TaskBoard {
     if (task) { this.sessions.get(slot)!.set(taskId, { ...task, model }); this.publish(); }
   }
 
+  /** Whether the board still holds this task (live or recently ended). */
+  holds(slot: string, taskId: string): boolean { return this.sessions.get(slot)?.has(taskId) ?? false; }
+
   /** Whether a task's model is already known. */
   hasModel(slot: string, taskId: string): boolean { return this.models.get(slot)?.has(taskId) ?? false; }
 

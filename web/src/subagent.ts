@@ -69,7 +69,9 @@ export function transcriptReducer(state: TranscriptState, action: TranscriptActi
     case "browse":
       return state.mode === "browse" ? state : { ...state, mode: "browse", gen: state.gen + 1 };
     case "jump":
-      return { ...INITIAL_TRANSCRIPT, gen: state.gen + 1, status: state.status === "gone" ? "gone" : "loading" };
+      // A task that left the panel cannot be reloaded: keep what was read.
+      if (state.status === "gone") return state;
+      return { ...INITIAL_TRANSCRIPT, gen: state.gen + 1 };
     case "failed": {
       if (action.gen !== state.gen) return state;
       if (action.kind === "gone") return { ...state, status: "gone" };
@@ -133,4 +135,41 @@ export function stripAnsi(text: string): string {
 /** Shell and Monitor tasks have an output tail instead of a transcript. */
 export function isOutputTask(taskType: string): boolean {
   return taskType === "local_bash" || taskType === "monitor";
+}
+
+export const POLL_MS = 2_000;
+/**
+ * One step of follow mode: load the tail (first time) or the lines after
+ * `end`, then say when to step again: at once while behind the file's end
+ * (a backlog, including after the task ended), after POLL_MS while the task
+ * runs, or never. `apply` must update the state synchronously (the caller
+ * mirrors it in a ref), so the decision sees the page just read.
+ */
+export async function followStep(io: {
+  gen: number;
+  running: boolean;
+  get: () => TranscriptState;
+  apply: (action: TranscriptAction) => void;
+  fetchPage: (query: string) => Promise<SubagentPage>;
+  classify: (error: unknown) => "gone" | "missing" | "error" | "reset";
+}): Promise<number | null> {
+  const current = io.get();
+  if (current.gen !== io.gen || current.mode !== "follow" || current.status === "gone") return null;
+  try {
+    if (current.status === "loading" || (current.end === 0 && current.size === 0)) {
+      io.apply({ type: "tail", gen: io.gen, page: await io.fetchPage("") });
+    } else {
+      io.apply({ type: "newer", gen: io.gen, page: await io.fetchPage(`?after=${current.end}`) });
+    }
+  } catch (error) {
+    const kind = io.classify(error);
+    if (kind === "reset") {
+      try { io.apply({ type: "tail", gen: io.gen, page: await io.fetchPage("") }); }
+      catch (again) { const k = io.classify(again); io.apply({ type: "failed", gen: io.gen, kind: k === "reset" ? "error" : k }); }
+    } else io.apply({ type: "failed", gen: io.gen, kind });
+  }
+  const next = io.get();
+  if (next.gen !== io.gen || next.mode !== "follow" || next.status === "gone") return null;
+  if (behind(next) && next.end > current.end) return 0;
+  return io.running ? POLL_MS : null;
 }

@@ -13,8 +13,8 @@ import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type Messa
 
 /** Task types whose output tail the SDK serves (`get_task_output`). */
 const OUTPUT_TASK_TYPES = new Set(["local_bash", "monitor"]);
-/** A subagent whose transcript has no model yet is looked up again after this. */
-export const MODEL_RETRY_MS = 5_000;
+/** A subagent whose transcript names no model yet is looked up again after these delays, then given up. */
+export const MODEL_RETRY_DELAYS_MS = [1_000, 3_000, 10_000];
 /** How often the owner-key rule is re-read while owner tasks are shown. */
 export const OWNER_KEY_CHECK_MS = 1_000;
 
@@ -38,8 +38,8 @@ export class WebChannel implements Channel {
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
   private readonly taskModel: ((sessionKey: string, taskId: string) => Promise<string | undefined>) | undefined;
-  /** Last model lookup per key/task, so a not-yet-written transcript is retried, but not on every event. */
-  private modelLookups = new Map<string, number>();
+  /** Model lookups in progress (or given up), per key and task. */
+  private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
@@ -180,6 +180,8 @@ export class WebChannel implements Channel {
     this.tornDown = true;
     this.unsubscribe?.();
     this.tasks.dispose();
+    for (const lookup of this.modelLookups.values()) clearTimeout(lookup.timer);
+    this.modelLookups.clear();
     clearInterval(this.ownerKeyTimer);
     try { await this.lifecycle?.stop(); } catch { /* Optional process cleanup cannot prevent daemon shutdown. */ }
   }
@@ -219,24 +221,38 @@ export class WebChannel implements Channel {
   }
   /**
    * Subagents (local_agent) get their model from the first assistant entry of
-   * their transcript, read once it exists: retried at most every
-   * MODEL_RETRY_MS while the task keeps sending events, then cached by the
-   * board. Other task types have no model and are never looked up.
+   * their transcript. Looked up when the task first appears; if that entry is
+   * not written yet, retried after MODEL_RETRY_DELAYS_MS (1 s, 3 s, 10 s) and
+   * then given up. A task that ended keeps being looked up while the panel
+   * still holds it; once it has left the panel, its retries are dropped.
+   * Other task types have no model and are never looked up.
    */
   private lookUpModels(key: string, tasks: WatchTask[]): void {
     if (!this.taskModel) return;
-    const now = this.now();
+    // Drop lookups for tasks the board no longer holds (left the panel).
+    for (const [id, lookup] of this.modelLookups) {
+      if (!this.tasks.holds(lookup.key, lookup.taskId)) { clearTimeout(lookup.timer); this.modelLookups.delete(id); }
+    }
     for (const task of tasks) {
       if (task.taskType !== "local_agent" || this.tasks.hasModel(key, task.taskId)) continue;
       const id = `${key}\0${task.taskId}`;
-      const last = this.modelLookups.get(id);
-      if (last !== undefined && now - last < MODEL_RETRY_MS) continue;
-      this.modelLookups.set(id, now);
-      void this.taskModel(key, task.taskId).then((model) => {
-        if (model && !this.tornDown) this.tasks.setModel(key, task.taskId, model);
-      }, () => {});
+      if (this.modelLookups.has(id)) continue;
+      const lookup = { key, taskId: task.taskId, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+      this.modelLookups.set(id, lookup);
+      const attempt = () => {
+        lookup.timer = undefined;
+        void this.taskModel!(key, task.taskId).then((model) => {
+          if (this.modelLookups.get(id) !== lookup || this.tornDown) return;
+          // A short task may have ended meanwhile; it still gets its badge
+          // while the panel keeps it. Once it left the panel, stop.
+          if (!this.tasks.holds(key, task.taskId)) { this.modelLookups.delete(id); return; }
+          if (model) { this.tasks.setModel(key, task.taskId, model); return; }
+          const delay = MODEL_RETRY_DELAYS_MS[lookup.attempt++];
+          if (delay !== undefined) { lookup.timer = setTimeout(attempt, delay); lookup.timer.unref?.(); }
+        }, () => {});
+      };
+      attempt();
     }
-    if (this.modelLookups.size > 1024) this.modelLookups.clear();
   }
 
   /** Every owner-bound or group key is recorded; the gate decides what is shown. */

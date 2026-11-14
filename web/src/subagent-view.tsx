@@ -7,7 +7,7 @@ import { ModelBadge } from "./model-badge.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
 import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
-import { behind, INITIAL_TRANSCRIPT, isOutputTask, transcriptReducer, viewRows } from "./subagent.js";
+import { followStep, INITIAL_TRANSCRIPT, isOutputTask, POLL_MS, transcriptReducer, viewRows, type TranscriptAction } from "./subagent.js";
 import { STATE_LABELS, taskKind } from "./tasks.js";
 
 /**
@@ -15,9 +15,8 @@ import { STATE_LABELS, taskKind } from "./tasks.js";
  * only the bytes appended since). Polling, not task_progress: progress events
  * are sparse (only some task types, summaries are opt-in) and a byte-offset
  * tail costs one small read, works across SSE reconnects, and stops itself
- * when the task ends.
+ * when the task ends. See followStep in subagent.ts.
  */
-export const POLL_MS = 2_000;
 
 type Status = "loading" | "ready" | "missing" | "error" | "gone";
 
@@ -73,46 +72,35 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const pinned = useRef(true);
   const restore = useRef<number | null>(null);
   const fetchPage = useCallback((query: string, signal?: AbortSignal) => api<SubagentPage>(`${base}/transcript${query}`, { signal }), [base]);
-  const fail = useCallback((gen: number, error: unknown) => {
-    // The daemon refuses a task that left the panel (expired, crowded out,
-    // hidden): say so and stop, keeping what was read.
-    const kind = error instanceof ApiError && error.code === "task_not_found" ? "gone"
-      : error instanceof ApiError && error.status === 404 ? "missing" : "error";
-    dispatch({ type: "failed", gen, kind });
+  // Every action also updates the ref at once, so a follow step decides on
+  // the page it just read (not on the last render's state).
+  const apply = useCallback((action: TranscriptAction) => {
+    stateRef.current = transcriptReducer(stateRef.current, action);
+    dispatch(action);
   }, []);
+  const classify = useCallback((error: unknown) =>
+    // The daemon refuses a task that left the panel (expired, crowded out,
+    // hidden): that is "gone" — stop, keep what was read.
+    error instanceof ApiError && error.code === "task_not_found" ? "gone" as const
+      : error instanceof ApiError && error.status === 409 ? "reset" as const
+      : error instanceof ApiError && error.status === 404 ? "missing" as const : "error" as const, []);
 
-  // Follow mode only: load the tail, then append. While behind the file's end
-  // read on at once (also after the task ended); while running, poll.
   const { mode, gen, status } = state;
+  const isGone = status === "gone";
   useEffect(() => {
-    if (mode !== "follow" || status === "gone") return;
+    if (mode !== "follow" || isGone) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controller = new AbortController();
-    const step = async () => {
-      const current = stateRef.current;
-      if (current.gen !== gen) return;
-      try {
-        if (current.status === "loading" || (current.end === 0 && current.size === 0)) {
-          dispatch({ type: "tail", gen, page: await fetchPage("", controller.signal) });
-        } else {
-          dispatch({ type: "newer", gen, page: await fetchPage(`?after=${current.end}`, controller.signal) });
-        }
-      } catch (error) {
-        if (stopped) return;
-        if (error instanceof ApiError && error.status === 409) {
-          try { dispatch({ type: "tail", gen, page: await fetchPage("", controller.signal) }); } catch (again) { if (!stopped) fail(gen, again); }
-        } else { fail(gen, error); if (error instanceof ApiError && error.code === "task_not_found") return; }
-      }
-      if (stopped) return;
-      const next = stateRef.current;
-      if (next.gen !== gen || next.status === "gone") return;
-      if (behind(next) && next.end > current.end) timer = setTimeout(() => void step(), 0);
-      else if (running) timer = setTimeout(() => void step(), POLL_MS);
+    const loop = async () => {
+      const delay = await followStep({ gen, running, get: () => stateRef.current,
+        apply: (action) => { if (!stopped) apply(action); },
+        fetchPage: (query) => fetchPage(query, controller.signal), classify });
+      if (!stopped && delay !== null) timer = setTimeout(() => void loop(), delay);
     };
-    void step();
+    void loop();
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
-  }, [fetchPage, fail, running, mode, gen, status === "gone"]);
+  }, [fetchPage, apply, classify, running, mode, gen, isGone]);
 
   useLayoutEffect(() => {
     const element = scroll.current;
@@ -124,18 +112,21 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const older = async () => {
     if (loadingOlder || !state.hasEarlier || state.status === "gone") return;
     // Leaving follow mode stops polling at once (new generation).
-    if (stateRef.current.mode === "follow") { dispatch({ type: "browse" }); stateRef.current = transcriptReducer(stateRef.current, { type: "browse" }); }
+    if (stateRef.current.mode === "follow") apply({ type: "browse" });
     const { gen: browseGen, start } = stateRef.current;
     setLoadingOlder(true);
     try {
       const page = await fetchPage(`?before=${start}`);
       const element = scroll.current;
       if (element) restore.current = element.scrollHeight - element.scrollTop;
-      dispatch({ type: "older", gen: browseGen, page });
-    } catch (error) { fail(browseGen, error); }
+      apply({ type: "older", gen: browseGen, page });
+    } catch (error) {
+      const kind = classify(error);
+      apply({ type: "failed", gen: browseGen, kind: kind === "reset" ? "error" : kind });
+    }
     finally { setLoadingOlder(false); }
   };
-  const jump = () => { pinned.current = true; dispatch({ type: "jump" }); };
+  const jump = () => { pinned.current = true; apply({ type: "jump" }); };
 
   const rows = viewRows(state.items);
   const gone = state.status === "gone";

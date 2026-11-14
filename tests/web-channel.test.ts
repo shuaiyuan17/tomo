@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { MODEL_RETRY_MS, OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
+import { MODEL_RETRY_DELAYS_MS, OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { WebEvents } from "../src/web/events.js";
 import { parseWebConfig } from "../src/web/config.js";
@@ -303,30 +303,46 @@ describe("web task panel feed", () => {
     current = undefined;
     await expect(channel.task(ownerId, "a1", false)).rejects.toMatchObject({ status: 404 });
   });
-  it("looks up a subagent's model once it is written, retries politely, caches it, and skips shell tasks", async () => {
-    let clock = 0;
-    let model: string | undefined;
-    const lookups: string[] = [];
-    const { channel, bus, events } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return model; }, () => clock);
-    const publish = () => bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1"), { ...live("b1"), taskType: "local_bash" }] });
-    publish();
-    await Promise.resolve();
-    publish();
-    expect(lookups).toEqual(["a1"]);
-    model = "claude-opus-5-5";
-    clock += MODEL_RETRY_MS;
-    publish();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(lookups).toEqual(["a1", "a1"]);
-    expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")!.model).toBe("claude-opus-5-5");
-    expect(channel.snapshot().tasks.find((t) => t.taskId === "b1")!.model).toBeUndefined();
-    const last = events.filter((e) => e.type === "tasks").at(-1);
-    expect(last && last.type === "tasks" && last.tasks.find((t) => t.taskId === "a1")!.model).toBe("claude-opus-5-5");
-    // Known now: further events do not read the transcript again, and the model survives REPLACE updates.
-    clock += MODEL_RETRY_MS * 3;
-    publish();
-    expect(lookups).toHaveLength(2);
-    expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")!.model).toBe("claude-opus-5-5");
+  it("looks up a subagent's model with bounded retries, also for a task that ended quickly, and caches it", async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let model: string | undefined;
+      const lookups: string[] = [];
+      const { channel, bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return model; }, () => Date.now());
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1"), { ...live("b1"), taskType: "local_bash" }] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookups).toEqual(["a1"]);
+      // The short task ends before its first assistant entry was found.
+      await vi.advanceTimersByTimeAsync(500);
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a1", status: "completed" }] });
+      model = "claude-opus-5-5";
+      await vi.advanceTimersByTimeAsync(600); // the 1 s retry
+      expect(lookups).toEqual(["a1", "a1"]);
+      const a1 = channel.snapshot().tasks.find((t) => t.taskId === "a1")!;
+      expect(a1).toMatchObject({ state: "completed", model: "claude-opus-5-5" });
+      expect(channel.snapshot().tasks.find((t) => t.taskId === "b1")!.model).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(lookups).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+  it("gives up after three retries, and drops retries for a task that left the panel", async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const lookups: string[] = [];
+      const { bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return undefined; }, () => Date.now());
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1")] });
+      await vi.advanceTimersByTimeAsync(MODEL_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0) + 5_000);
+      expect(lookups).toEqual(["a1", "a1", "a1", "a1"]);
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a2")] }); // a1 ended
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(TASK_RETENTION_MS + 1); // a1 leaves the panel
+      const before = lookups.filter((id) => id === "a2").length;
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [] }); // a2 ends; its pending retry stays only while held
+      await vi.advanceTimersByTimeAsync(TASK_RETENTION_MS + 15_000);
+      expect(lookups.filter((id) => id === "a2").length).toBeLessThanOrEqual(4);
+      expect(lookups.filter((id) => id === "a1")).toHaveLength(4);
+      expect(before).toBeGreaterThan(0);
+    } finally { vi.useRealTimers(); }
   });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();

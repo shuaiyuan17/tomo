@@ -184,7 +184,11 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
   } finally { await fd.close(); }
 }
 
-/** How much of a transcript's head is read to find its model. */
+/**
+ * How much of a transcript's head is read to find its model. A subagent whose
+ * first assistant entry starts beyond this (an enormous prompt) shows no
+ * badge: an accepted limit, so a lookup never reads a large file.
+ */
 export const MODEL_HEAD_BYTES = 256 * 1024;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 

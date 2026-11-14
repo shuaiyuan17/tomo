@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { behind, INITIAL_TRANSCRIPT, isOutputTask, MAX_KEPT_ITEMS, preview, PREVIEW_CHARS, stripAnsi, transcriptReducer, viewRows,
+import { behind, followStep, INITIAL_TRANSCRIPT, POLL_MS, isOutputTask, MAX_KEPT_ITEMS, preview, PREVIEW_CHARS, stripAnsi, transcriptReducer, viewRows,
   type TranscriptAction, type TranscriptState } from "../web/src/subagent.js";
 import type { SubagentItem, SubagentPage } from "../src/web/protocol.js";
 
@@ -59,12 +59,46 @@ describe("subagent transcript modes", () => {
     expect(behind(state)).toBe(false);
   });
 
+  it("after the task ends, follow mode keeps reading a backlog of several pages until it reaches the end", async () => {
+    const SIZE = 400;
+    const pages: Record<string, SubagentPage> = {
+      "": page([textItem(0)], 0, 100, false, 100),
+      "?after=100": page([textItem(100)], 100, 200, true, SIZE),
+      "?after=200": page([textItem(200)], 200, 300, true, SIZE),
+      "?after=300": page([textItem(300)], 300, 400, true, SIZE),
+    };
+    let state = T();
+    const queries: string[] = [];
+    const io = (running: boolean) => ({ gen: state.gen, running, get: () => state, apply: (a: TranscriptAction) => { state = transcriptReducer(state, a); },
+      fetchPage: async (q: string) => { queries.push(q); return pages[q]; }, classify: () => "error" as const });
+    expect(await followStep(io(true))).toBe(POLL_MS);
+    // The task ended with three pages still unread.
+    const delays: Array<number | null> = [];
+    for (let i = 0; i < 6; i++) { const d = await followStep(io(false)); delays.push(d); if (d === null) break; }
+    expect(queries).toEqual(["", "?after=100", "?after=200", "?after=300"]);
+    expect(delays).toEqual([0, 0, null]);
+    expect(state.end).toBe(SIZE);
+    expect(state.items).toHaveLength(4);
+  });
+
+  it("a late response from a superseded follow step is not applied", async () => {
+    let state = run(T(), { type: "tail", gen: 0, page: page([textItem(0)], 0, 100, false, 200) });
+    let release!: (p: SubagentPage) => void;
+    const pending = followStep({ gen: 0, running: true, get: () => state, apply: (a) => { state = transcriptReducer(state, a); },
+      fetchPage: () => new Promise<SubagentPage>((r) => { release = r; }), classify: () => "error" });
+    state = run(state, { type: "browse" });
+    release(page([textItem(100)], 100, 200, true, 200));
+    expect(await pending).toBeNull();
+    expect(state.items.map((i) => i.id)).toEqual(["0:0"]);
+  });
+
   it("when the task leaves the panel, it says so, keeps what was read, and accepts nothing more", () => {
     let state = run(T(), { type: "tail", gen: 0, page: page([textItem(100)], 100, 200) });
     state = run(state, { type: "failed", gen: 0, kind: "gone" });
     expect(state).toMatchObject({ status: "gone", items: [{ id: "100:0" }] });
     expect(run(state, { type: "newer", gen: state.gen, page: page([textItem(200)], 200, 300) })).toBe(state);
-    expect(run(state, { type: "jump" }).status).toBe("gone");
+    // Jump to latest cannot clear what was read once the task is gone.
+    expect(run(state, { type: "jump" })).toBe(state);
     // A not-yet-written transcript is "missing", not gone; with content already shown, nothing changes.
     expect(run(T(), { type: "failed", gen: 0, kind: "missing" }).status).toBe("missing");
     const shown = run(T(), { type: "tail", gen: 0, page: page([textItem(1)], 0, 10) });

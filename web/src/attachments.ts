@@ -12,9 +12,11 @@
  */
 export type MessagePart =
   | { kind: "text"; text: string }
-  | { kind: "images"; paths: string[]; sticker: boolean; missing: number }
+  | { kind: "images"; paths: string[]; sticker: boolean; missing: number; more: number }
   | { kind: "attachment"; label: string; names: string[] };
 
+/** Thumbnails shown per message; the rest are counted as "+N more". */
+export const MAX_IMAGES = 20;
 const MARKER = /\[Sent (an image|a sticker|\d+ images|\d+ stickers|a document|\d+ documents|a file|\d+ files)([^\]]*)\]/g;
 const count = (noun: string) => (/^\d+/.test(noun) ? Number.parseInt(noun, 10) : 1);
 const fileName = (path: string) => path.replace(/^.*\//, "");
@@ -29,14 +31,19 @@ function savedPaths(rest: string): string[] {
 export function splitAttachments(content: string): MessagePart[] {
   const parts: MessagePart[] = [];
   let last = 0;
+  let shown = 0;
   for (const match of content.matchAll(MARKER)) {
     const [whole, noun, rest] = match;
     const before = content.slice(last, match.index);
     if (before.trim()) parts.push({ kind: "text", text: before });
     last = match.index! + whole.length;
     if (/image|sticker/.test(noun)) {
-      const paths = savedPaths(rest);
-      parts.push({ kind: "images", paths, sticker: noun.includes("sticker"), missing: Math.max(0, count(noun) - paths.length) });
+      const all = savedPaths(rest);
+      const paths = all.slice(0, Math.max(0, MAX_IMAGES - shown));
+      shown += paths.length;
+      const missing = Math.min(Math.max(0, count(noun) - all.length), Math.max(0, MAX_IMAGES - shown));
+      shown += missing;
+      parts.push({ kind: "images", paths, sticker: noun.includes("sticker"), missing, more: Math.max(0, count(noun) - paths.length - missing) });
     } else if (/document/.test(noun)) {
       parts.push({ kind: "attachment", label: count(noun) > 1 ? `${count(noun)} documents` : "Document", names: savedPaths(rest).map(fileName) });
     } else {

@@ -20,6 +20,7 @@ export function MessageBody({ body, reply, sessionId, onQuote }:
       if (part.kind === "images") return <div key={index} className="my-1.5 flex flex-wrap gap-2">
         {part.paths.map((path) => <Thumbnail key={path} src={mediaUrl(sessionId, path)} sticker={part.sticker} onOpen={() => setViewing(mediaUrl(sessionId, path))} />)}
         {Array.from({ length: part.missing }, (_, i) => <Placeholder key={`m${i}`} />)}
+        {part.more > 0 && <span className="inline-flex h-16 items-center rounded-xl border bg-muted/50 px-3 text-[12px] text-muted-foreground">+{part.more} more</span>}
       </div>;
       return <span key={index} className="my-1 mr-1.5 inline-flex items-center gap-1.5 rounded-lg border bg-card/70 px-2 py-1 text-[12px] text-muted-foreground">
         <FileIcon className="size-3.5" aria-hidden="true" />{part.names.length ? part.names.join(", ") : part.label}</span>;

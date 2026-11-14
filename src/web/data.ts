@@ -1,10 +1,10 @@
 import { constants } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
-import { extname, join, sep } from "node:path";
+import { basename, extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
-import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
+import { isGroupSessionKey, legacySessionKeysForBinding, parseRawSessionKey } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
 import { WebError, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
@@ -67,15 +67,55 @@ export function subagentModelReader(options: WebDataOptions): (sessionKey: strin
   };
 }
 
-/** Image types the browser shows, by extension. */
-const MEDIA_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
+/** Image types the browser may be sent, by extension; the file's signature must agree. */
+const MEDIA_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic" };
 export const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+/** Messaging channels whose inbound images the store files (never "web"). */
+const INBOUND_CHANNELS = new Set(["telegram", "imessage"]);
+/** Most images taken from one message (the UI shows "+N more" past this). */
+export const MAX_MESSAGE_IMAGES = 20;
 
-/** Paths named by the image/sticker markers in a message (see channels/imageStore.ts). */
+/** The image type a file's leading bytes declare (PNG, JPEG, GIF, WebP, HEIC), if any. SVG is never one. */
+export function sniffImageType(head: Buffer): string | undefined {
+  if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "image/jpeg";
+  if (head.length >= 6 && /^GIF8[79]a$/.test(head.subarray(0, 6).toString("latin1"))) return "image/gif";
+  if (head.length >= 12 && head.subarray(0, 4).toString("latin1") === "RIFF" && head.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  if (head.length >= 12 && head.subarray(4, 8).toString("latin1") === "ftyp" && /^(heic|heix|hevc|mif1|msf1)$/.test(head.subarray(8, 12).toString("latin1"))) return "image/heic";
+  return undefined;
+}
+
+/**
+ * The channel-chat prefixes a session's inbound images are filed under
+ * (imageStore: `HHMMSS_<sanitized "<channel>_<chat>">_<guid>.<ext>`).
+ */
+export function imageChatPrefixes(key: string, owner: OwnerConfig | undefined, isOwnerSession: boolean): string[] {
+  const sanitize = (part: string) => part.replace(/[^A-Za-z0-9._-]/g, "_");
+  const raw = parseRawSessionKey(key);
+  const prefixes = raw ? [sanitize(`${raw.channelName}_${raw.chatId}`)] : [];
+  if (isOwnerSession && owner) {
+    for (const id of ownerBindings(owner, "telegram")) prefixes.push(sanitize(`telegram_${id}`));
+    // iMessage chat GUIDs embed the handle: imessage_any_-_<handle>, imessage_iMessage_-_<handle>, …
+    for (const handle of ownerBindings(owner, "imessage")) prefixes.push(`imessage_*${sanitize(handle)}`);
+  }
+  return prefixes;
+}
+const fileMatchesPrefix = (name: string, prefixes: string[]) => prefixes.some((prefix) => {
+  const [head, tail] = prefix.split("*");
+  return new RegExp(`^\\d{6}_${escapeRe(head)}${tail !== undefined ? `[A-Za-z0-9._-]*${escapeRe(tail)}` : ""}_[A-Za-z0-9]+\\.[A-Za-z0-9]+$`).test(name);
+});
+const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Paths named by the image/sticker markers at the START of a message — where
+ * the channel layer puts them (other markers may come first) — capped at
+ * MAX_MESSAGE_IMAGES. See channels/imageStore.ts.
+ */
 export function imagePaths(content: string): string[] {
   const out: string[] = [];
-  for (const match of content.matchAll(/\[Sent (?:an image|a sticker|\d+ images|\d+ stickers), saved to:? ([^;\]]+)/g)) {
-    for (const path of match[1].split(/,\s+/)) if (path.trim().startsWith("/")) out.push(path.trim());
+  const lead = /^(?:\s*\[[^\]]*\])*/.exec(content)?.[0] ?? "";
+  for (const match of lead.matchAll(/\[Sent (?:an image|a sticker|\d+ images|\d+ stickers), saved to:? ([^;\]]+)/g)) {
+    for (const path of match[1].split(/,\s+/)) if (path.trim().startsWith("/") && out.length < MAX_MESSAGE_IMAGES) out.push(path.trim());
   }
   return out;
 }
@@ -169,8 +209,11 @@ export class WebData {
       if (!real.startsWith(root + sep) || real.startsWith(privateRoot + sep)) throw refuse();
       file = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
       const stat = await file.stat();
-      if (!stat.isFile() || stat.size > MAX_MEDIA_BYTES) throw refuse();
-      return { type, bytes: await file.readFile() };
+      // The store never hard-links; a second link could alias a file elsewhere.
+      if (!stat.isFile() || stat.nlink > 1 || stat.size > MAX_MEDIA_BYTES) throw refuse();
+      const bytes = await file.readFile();
+      if (sniffImageType(bytes.subarray(0, 16)) !== type) throw refuse();
+      return { type, bytes };
     } catch (error) { throw error instanceof WebError ? error : refuse(); }
     finally { await file?.close(); }
   }
@@ -180,8 +223,17 @@ export class WebData {
     if (!key) throw new WebError(404, "session_not_found");
     try {
       const page = await readHistoryPage(this.options, key, cursor);
+      // Transcripts keep no structured attachment record, only the channel
+      // layer's text marker; a message the owner typed could contain a
+      // look-alike. So only images named at the start of an INBOUND user
+      // message from a messaging channel count, and only files filed under
+      // this session's own channel chat (the store's filename prefix).
       const allowed = this.media.get(id) ?? new Set<string>();
-      for (const message of page.messages) for (const path of imagePaths(message.content)) allowed.add(path);
+      const prefixes = imageChatPrefixes(key, this.options.owner, id === this.catalog().ownerId);
+      for (const message of page.messages) {
+        if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
+        for (const path of imagePaths(message.content)) if (fileMatchesPrefix(basename(path), prefixes)) allowed.add(path);
+      }
       if (allowed.size > 4096) allowed.clear();
       this.media.set(id, allowed);
       return page;

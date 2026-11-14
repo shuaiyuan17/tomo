@@ -17,17 +17,25 @@ describe("reply context", () => {
       reply: { verb: "replying", excerpt: "where", truncated: false }, body: "[via satellite] here" });
     expect(parseReply("just text [replying to: \"x\"]")).toEqual({ body: "just text [replying to: \"x\"]" });
   });
-  it("finds the quoted message: latest earlier match by prefix; none when it cannot", () => {
+  it("finds the quoted message: exact for a whole excerpt, prefix for a cut one, nearest earlier in time", () => {
     const messages = [
-      { id: "1", content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了" },
-      { id: "2", content: "Other\\nthing" },
-      { id: "3", content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第二版" },
-      { id: "4", content: '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！' },
+      { id: "1", timestamp: 1, content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了" },
+      { id: "2", timestamp: 2, content: "Other\nthing" },
+      { id: "3", timestamp: 3, content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第二版" },
+      { id: "4", timestamp: 4, content: '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！' },
+      { id: "5", timestamp: 5, content: "lunch?" },
+      { id: "6", timestamp: 6, content: "lunch? at noon" },
+      { id: "7", timestamp: 7, content: '[replying to: "lunch?"] sure' },
     ];
-    const { reply } = parseReply(messages[3].content);
-    expect(findQuoted(messages, 3, reply!)?.id).toBe("3");
-    expect(findQuoted(messages, 1, reply!)?.id).toBe("1");
-    expect(findQuoted(messages, 0, reply!)).toBeUndefined();
+    const cut = parseReply(messages[3].content).reply!;
+    expect(findQuoted(messages, 3, cut)?.id).toBe("3");
+    expect(findQuoted(messages, 1, cut)?.id).toBe("1");
+    expect(findQuoted(messages, 0, cut)).toBeUndefined();
+    // A whole excerpt must match exactly: "lunch? at noon" is not "lunch?".
+    expect(findQuoted(messages, 6, parseReply(messages[6].content).reply!)?.id).toBe("5");
+    // Never a message later in time than the reply, whatever the order.
+    const shuffled = [{ id: "late", timestamp: 99, content: "lunch?" }, { id: "r", timestamp: 10, content: '[replying to: "lunch?"] ok' }];
+    expect(findQuoted(shuffled, 1, parseReply(shuffled[1].content).reply!)).toBeUndefined();
     expect(findQuoted(messages, 3, { verb: "replying", excerpt: "nothing like this", truncated: false })).toBeUndefined();
     expect(findQuoted(messages, 3, { verb: "replying", excerpt: null, truncated: false })).toBeUndefined();
   });

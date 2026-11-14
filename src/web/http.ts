@@ -136,7 +136,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           const path = url.searchParams.get("path") ?? "";
           if (!path || path.length > 1024) throw new WebError(400, "invalid_media");
           const file = await deps.data.mediaFile(media[1], path);
-          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "private, max-age=86400" });
+          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store" });
           res.end(file.bytes);
           return;
         }

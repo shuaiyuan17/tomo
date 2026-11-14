@@ -40,3 +40,13 @@ describe("motion: the CSS contract", () => {
     expect(pkg).not.toMatch(/"(framer-motion|motion)"\s*:/);
   });
 });
+
+describe("motion: progress bars", () => {
+  it("ease value and colour changes (context window, plan usage)", async () => {
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { createElement } = await import("react");
+    const { Progress } = await import("../web/src/components/ui/progress.js");
+    const html = renderToStaticMarkup(createElement(Progress, { value: 40, max: 100 }));
+    expect(html).toMatch(/data-slot="progress-indicator"[^>]*transition-\[transform,background-color\]/);
+  });
+});

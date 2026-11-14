@@ -95,6 +95,22 @@ describe("TaskTracker — background_tasks_changed (REPLACE)", () => {
     expect(t.list()[0].status).toBeUndefined();
   });
 
+  it("the first end of a run is final: repeats and late conflicting ends are ignored", () => {
+    const { t } = tracker();
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "x" }));
+    t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "completed" });
+    expect(t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "completed" })).toBeUndefined();
+    expect(t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "failed" })).toBeUndefined();
+    t.apply({ subtype: "task_updated", task_id: "a", run_id: "r1", patch: { status: "killed" } });
+    expect(t.list()[0].status).toBe("completed");
+    // Out of order: updated(failed) first, then notification(completed) — failed stands.
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "x" }, { task_id: "b", run_id: "r1", task_type: "local_agent", description: "y" }));
+    t.apply({ subtype: "task_updated", task_id: "b", run_id: "r1", patch: { status: "failed" } });
+    t.apply({ subtype: "task_notification", task_id: "b", run_id: "r1", status: "completed" });
+    expect(t.list().find((x) => x.taskId === "b")!.status).toBe("failed");
+    expect(t.apply(level())!.ended).toEqual([{ taskId: "a", status: "completed" }, { taskId: "b", status: "failed" }]);
+  });
+
   it("clips text and bounds the number of tracked tasks", () => {
     const { t } = tracker();
     t.apply(level({ task_id: "a", task_type: "local_agent", description: "y".repeat(5_000) }));

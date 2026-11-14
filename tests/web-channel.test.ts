@@ -242,6 +242,25 @@ describe("web task panel feed", () => {
       expect(JSON.stringify(channel.snapshot())).not.toContain("legacy secret");
     } finally { vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); }
   });
+  it("keeps recording a hidden DM's events, so it is correct when it becomes visible again", () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let current: string | undefined = "telegram:test-owner";
+      const { channel, bus } = setup(owner, () => current);
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("a"), live("b")] });
+      current = undefined; // hidden (e.g. ambiguous)
+      expect(channel.snapshot().tasks).toEqual([]);
+      // While hidden: a ends with a report, b keeps running.
+      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("b")], ended: [{ taskId: "a", status: "failed" }] });
+      current = "telegram:test-owner";
+      expect(channel.snapshot().tasks.map((t) => [t.taskId, t.state])).toEqual([["b", "running"], ["a", "failed"]]);
+      // Hidden past the retention window: the ended task is gone when it returns.
+      current = undefined;
+      vi.advanceTimersByTime(TASK_RETENTION_MS);
+      current = "telegram:test-owner";
+      expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["b"]);
+    } finally { vi.useRealTimers(); }
+  });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();

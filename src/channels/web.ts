@@ -38,8 +38,6 @@ export class WebChannel implements Channel {
 
   /** The DM key the web catalog shows as the owner conversation (data.ts rule). */
   private readonly ownerKey: () => string | undefined;
-  /** The DM key whose tasks currently fill the owner's board entry. */
-  private ownerTaskKey: string | undefined;
   /** Re-checks the owner-key rule while the owner's board entry is filled. */
   private ownerKeyTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -50,7 +48,7 @@ export class WebChannel implements Channel {
     this.ownerKey = options.ownerKey ?? (() => selectOwnerSessionKey(owner, []));
     this.tasks = new TaskBoard((sessionId, tasks) => {
       try { this.events.publish({ type: "tasks", sessionId, tasks }); } catch { /* An oversized panel update never fails the Agent. */ }
-    }, { now, visible: (sessionId) => this.taskSessionVisible(sessionId) });
+    }, { now, route: (key) => this.taskRoute(key) });
     this.owner = owner;
     this.ownerId = this.owner ? webSessionId(ownerSessionKey(this.owner)) : null;
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
@@ -174,31 +172,25 @@ export class WebChannel implements Channel {
    * every legacy key bound to the owner, which the catalog may be hiding.
    */
   /**
-   * The board's send gate asks this, synchronously, before every send: groups
-   * are always readable in the browser; the owner's entry only while the key
-   * that filled it is still the one the catalog rule picks (read fresh).
+   * The board's send gate asks this, synchronously, before every send: where
+   * a session key's tasks show in the browser, if anywhere. Groups always
+   * (they are readable in the browser); a DM only when it is the key the
+   * catalog rule picks as the owner conversation right now (read fresh).
    */
-  private taskSessionVisible(sessionId: string): boolean {
-    if (sessionId !== this.ownerId) return true;
-    return this.ownerTaskKey !== undefined && this.ownerTaskKey === this.ownerKey();
+  private taskRoute(key: string): string | undefined {
+    if (isGroupSessionKey(key)) return webSessionId(key);
+    const ownerKey = this.ownerKey();
+    return ownerKey !== undefined && key === ownerKey && this.ownerId ? this.ownerId : undefined;
   }
-  private observeTasks(key: string, sessionId: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
-    if (!isGroupSessionKey(key)) {
-      const ownerKey = this.ownerKey();
-      if (!ownerKey || key !== ownerKey) return;
-      if (this.ownerTaskKey !== key) {
-        // Another key now feeds the owner entry: its stored tasks are not ours.
-        this.ownerTaskKey = key;
-        this.tasks.clear(sessionId);
-      }
-      // The rule can change with no task event at all; re-run the gate so a
-      // hidden owner entry is withdrawn from the browser promptly.
-      if (!this.ownerKeyTimer) {
-        this.ownerKeyTimer = setInterval(() => this.tasks.publish(), OWNER_KEY_CHECK_MS);
-        this.ownerKeyTimer.unref?.();
-      }
+  /** Every owner-bound or group key is recorded; the gate decides what is shown. */
+  private observeTasks(key: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
+    this.tasks.apply(key, event.tasks, event.ended);
+    // The owner rule can change with no task event at all; re-run the gate so
+    // a DM that stops being the owner conversation is withdrawn promptly.
+    if (!isGroupSessionKey(key) && !this.ownerKeyTimer) {
+      this.ownerKeyTimer = setInterval(() => this.tasks.publish(), OWNER_KEY_CHECK_MS);
+      this.ownerKeyTimer.unref?.();
     }
-    this.tasks.apply(sessionId, event.tasks, event.ended);
   }
   private observe(event: WatchEvent): void {
     if (!("sessionKey" in event) || !event.sessionKey) return;
@@ -216,7 +208,7 @@ export class WebChannel implements Channel {
     } else if (event.type === "transcript" || event.type === "turn.stats") {
       this.events.publish({ type: "invalidate", sessionId });
     } else if (event.type === "tasks") {
-      this.observeTasks(event.sessionKey, sessionId, event);
+      this.observeTasks(event.sessionKey, event);
     } else if (event.type === "tool.start" || event.type === "tool.end") {
       this.events.publish({ type: "tool", sessionId, tool: event.tool.slice(0, 128),
         state: event.type === "tool.start" ? "started" : event.ok ? "completed" : "failed" });

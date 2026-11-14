@@ -208,7 +208,8 @@ export class TaskTracker {
     const current = this.edge(message.task_id, message.run_id);
     if (!old || !current) return undefined;
     const patch = message.patch ?? {};
-    const status = endStatus(patch.status);
+    // As for notifications: once this run has ended, its end is not rewritten.
+    const status = current.status ? undefined : endStatus(patch.status);
     if (status && !current.background) {
       this.tasks.delete(old.taskId);
       return this.change([{ taskId: old.taskId, status }]);
@@ -227,6 +228,9 @@ export class TaskTracker {
     if (!old) return { tasks: this.list(), ended: [{ taskId: message.task_id, status }] };
     const current = this.edge(message.task_id, message.run_id);
     if (!current) return undefined;
+    // The first end of a run is final: a repeated or conflicting late report
+    // (completed, then failed) changes nothing.
+    if (current.status) return current === old ? undefined : this.change([]);
     const usage = {
       ...(typeof message.usage?.total_tokens === "number" ? { totalTokens: message.usage.total_tokens } : {}),
       ...(typeof message.usage?.tool_uses === "number" ? { toolUses: message.usage.tool_uses } : {}),

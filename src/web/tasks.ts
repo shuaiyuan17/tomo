@@ -24,11 +24,13 @@ export interface TaskBoardOptions {
   now?: () => number;
   retainMs?: number;
   /**
-   * May the browser see this session right now? Read synchronously at every
-   * send (see `publish`), never cached: the owner-key rule can change at any
-   * moment, and nothing already sent can be taken back.
+   * Where a stored session (a "slot", e.g. a session key) is shown right now:
+   * the browser session id, or undefined while the browser may not see it.
+   * Read synchronously at every send (see `publish`), never cached: the
+   * owner-key rule can change at any moment, and nothing sent can be taken
+   * back. Hidden slots keep receiving events; only sending is gated.
    */
-  visible?: (sessionId: string) => boolean;
+  route?: (slot: string) => string | undefined;
 }
 
 /**
@@ -47,12 +49,12 @@ export class TaskBoard {
   private readonly now: () => number;
   private readonly retainMs: number;
 
-  private readonly visible: (sessionId: string) => boolean;
+  private readonly route: (slot: string) => string | undefined;
 
   constructor(private readonly send: (sessionId: string, tasks: WebTask[]) => void, options: TaskBoardOptions = {}) {
     this.now = options.now ?? Date.now;
     this.retainMs = options.retainMs ?? TASK_RETENTION_MS;
-    this.visible = options.visible ?? (() => true);
+    this.route = options.route ?? ((slot) => slot);
   }
 
   /**
@@ -68,11 +70,6 @@ export class TaskBoard {
         ...(task.summary !== undefined ? { summary: clip(task.summary, SNAPSHOT_SUMMARY_LIMIT) } : {}) }));
   }
 
-  /** Forget a session's stored tasks (its source changed). */
-  clear(sessionId: string): void {
-    if (!this.sessions.delete(sessionId)) return;
-    this.publish();
-  }
 
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
     const now = this.now();
@@ -131,8 +128,8 @@ export class TaskBoard {
    * the retention timer, an owner-key re-check, or a reconnect snapshot —
    * goes through here, and nowhere else calls `send`.
    *
-   * It expires ended tasks, reads each session's visibility once, now,
-   * and shares the board's capacity among the VISIBLE sessions only: running
+   * It expires ended tasks, routes each stored slot once, now, and shares
+   * the board's capacity among the slots the browser may see only: running
    * non-ambient tasks first, round-robin across sessions so one busy session
    * cannot crowd out another; ended tasks next; watchers last. A session that
    * is not visible is sent as empty. A running task that does not fit stays
@@ -146,8 +143,12 @@ export class TaskBoard {
       }
       if (!tasks.size) this.sessions.delete(sessionId);
     }
-    const visible = new Map([...new Set([...this.sessions.keys(), ...this.shown.keys()])].map((id) => [id, this.visible(id)]));
-    const ids = [...this.sessions.keys()].filter((id) => visible.get(id)).sort();
+    const targets = new Map<string, string>();
+    for (const slot of this.sessions.keys()) {
+      const target = this.route(slot);
+      if (target !== undefined) targets.set(slot, target);
+    }
+    const ids = [...targets.keys()].sort();
     const picked = new Map<string, WebTask[]>(ids.map((id) => [id, []]));
     let room = MAX_BOARD_TASKS;
     // Activity first: running, then recently ended; watchers (ambient) only
@@ -164,8 +165,13 @@ export class TaskBoard {
         }
       }
     }
-    for (const id of new Set([...this.shown.keys(), ...picked.keys()])) {
-      const list = picked.get(id) ?? [];
+    const out = new Map<string, WebTask[]>();
+    for (const [slot, tasks] of picked) {
+      const target = targets.get(slot)!;
+      out.set(target, [...(out.get(target) ?? []), ...tasks.map((task) => ({ ...task, sessionId: target }))]);
+    }
+    for (const id of new Set([...this.shown.keys(), ...out.keys()])) {
+      const list = out.get(id) ?? [];
       const before = this.shown.get(id) ?? [];
       if (JSON.stringify(before) === JSON.stringify(list)) continue;
       if (list.length) this.shown.set(id, list); else this.shown.delete(id);

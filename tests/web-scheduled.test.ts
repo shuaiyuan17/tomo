@@ -59,6 +59,13 @@ describe("jumping to a job", () => {
     expect(html).not.toContain("no longer scheduled");
     expect(renderToStaticMarkup(createElement(CronList, { jobs: [job("abc-123", 1)], focus: "gone" }))).toContain("That job is no longer scheduled.");
   });
+  it("draws the linked job's highlight inside the card, so the scrolling panel cannot clip its sides", async () => {
+    const { CronJobRow } = await import("../web/src/study.js");
+    const html = renderToStaticMarkup(createElement(CronJobRow, { job: job("abc-123", 1), highlighted: true }));
+    const row = /<li[^>]*aria-current="true"[^>]*>/.exec(html)?.[0] ?? "";
+    expect(row).toMatch(/\bring-2\b/);
+    expect(row).toMatch(/\bring-inset\b/);
+  });
 });
 
 describe("cron change events", () => {

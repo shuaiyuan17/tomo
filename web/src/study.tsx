@@ -244,7 +244,8 @@ export function CronJobRow({ job, actions, highlighted }: { job: WebCronJob; act
   const status = cronStatus(job);
   return <li id={cronRowId(job.id)} tabIndex={-1} aria-current={highlighted ? "true" : undefined}
     className={cn(card, "scroll-mt-4 px-5 py-4 transition-[box-shadow,background-color] duration-700", !job.enabled && "opacity-75",
-      highlighted && "bg-accent/60 ring-2 ring-primary/50")}>
+      // Inset: the Study panel scrolls (overflow), which clips a ring drawn outside the card.
+      highlighted && "bg-accent/60 ring-2 ring-inset ring-primary/50")}>
     <Collapsible>
       <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1">

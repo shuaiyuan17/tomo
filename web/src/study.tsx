@@ -25,7 +25,7 @@ const INTRO: Record<StudyPage, string> = {
 };
 
 const card = "rounded-xl border bg-card shadow-xs";
-const meta = "font-mono text-[11px] text-muted-foreground";
+const meta = "text-[11px] tracking-[0.02em] text-muted-foreground";
 
 const ERRORS: Record<string, string> = {
   memory_not_found: "That file is not available.", memory_limit: "That file is too large to show here.",
@@ -185,7 +185,7 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
       <div className="flex flex-wrap items-baseline justify-between gap-2"><p className="eyebrow" id="ctx-window">Context window · {session.title}</p>
         <span className={meta}>{value.recordedAt ? `Last recorded ${formatWhen(value.recordedAt)}` : "No turn recorded yet"}</span></div>
       {value.max ? <>
-        <p className="mt-2 mb-3 font-mono text-2xl">{value.used!.toLocaleString()} <span className="text-sm text-muted-foreground">/ {value.max.toLocaleString()} · {Math.round(value.used! / value.max * 100)}%</span></p>
+        <p className="mt-2 mb-3 text-2xl tabular-nums">{value.used!.toLocaleString()} <span className="text-sm text-muted-foreground">/ {value.max.toLocaleString()} · {Math.round(value.used! / value.max * 100)}%</span></p>
         <Meter used={value.used!} max={value.max} />
         <p className="mt-3 mb-0 text-[13px] text-muted-foreground">{value.estimated ? "Estimated" : "Reported by the model"} at the end of the last turn.</p>
       </> : <p className="mt-2 mb-0 text-sm text-muted-foreground">Unavailable until a turn reports its context window.</p>}
@@ -193,7 +193,7 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
         <li key={item.name} className="grid grid-cols-[minmax(0,1fr)_80px] items-center gap-3 text-[13px]">
           <div className="min-w-0"><div className="flex justify-between gap-2"><span className="truncate">{item.name}</span></div>
             <div className="mt-1 h-1 rounded-full bg-border"><div className="h-1 rounded-full bg-primary/70" style={{ width: `${breakdownTotal ? item.tokens / breakdownTotal * 100 : 0}%` }} /></div></div>
-          <span className="text-right font-mono text-xs text-muted-foreground">{formatTokens(item.tokens)}</span></li>)}</ul>}
+          <span className="text-right text-xs tabular-nums text-muted-foreground">{formatTokens(item.tokens)}</span></li>)}</ul>}
     </section>
 
     <section className={cn(card, "px-6 py-5")} aria-labelledby="ctx-sections">
@@ -206,7 +206,7 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
             <span className={meta}>#{section.id}</span>
             <span className="min-w-0"><span className="block truncate">{section.type === "conversation" ? "Conversation" : section.type === "tool_ops" ? `Tools: ${toolList(section.toolsUsed, 4)}` : `Conversation and tools: ${toolList(section.toolsUsed, 3)}`}</span>
               <span className={meta}>{section.messageCount} messages{section.toolCallCount ? ` · ${section.toolCallCount} tool calls` : ""} · {formatWhen(Date.parse(section.earliestAt))}</span></span>
-            <span className="text-right font-mono text-xs">{formatTokens(section.tokens)}</span></li>)}</ul>}
+            <span className="text-right text-xs tabular-nums">{formatTokens(section.tokens)}</span></li>)}</ul>}
     </section>
 
     <section className={cn(card, "px-6 py-5")} aria-labelledby="ctx-rollups">
@@ -216,7 +216,7 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
           <Collapsible>
             <CollapsibleTrigger className="group flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left text-[13px] hover:bg-foreground/[0.05]">
               <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
-              <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal">{block.level}</Badge>
+              <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">{block.level}</Badge>
               <span className="min-w-0 flex-1 truncate">{block.tag === "legacy" ? "Compact summary" : block.tag}</span>
               <span className={meta}>{block.eventsSummarized ? `${block.eventsSummarized} events · ` : ""}{block.timestamp ? formatWhen(Date.parse(block.timestamp)) : ""}</span>
             </CollapsibleTrigger>
@@ -228,7 +228,7 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
         <p className="eyebrow mt-5 mb-2">Compactions since Tomo started</p>
         <ul className="m-0 list-none space-y-1 p-0">{value.recentCompactions.slice().reverse().map((c, i) => <li key={i} className="flex justify-between gap-3 text-[13px]">
           <span>{formatWhen(c.timestamp)}</span>
-          <span className="font-mono text-xs text-muted-foreground">{c.preTokens !== undefined ? formatTokens(c.preTokens) : "?"} → {c.postTokens !== undefined ? formatTokens(c.postTokens) : "?"}</span></li>)}</ul></>}
+          <span className="text-xs tabular-nums text-muted-foreground">{c.preTokens !== undefined ? formatTokens(c.preTokens) : "?"} → {c.postTokens !== undefined ? formatTokens(c.postTokens) : "?"}</span></li>)}</ul></>}
     </section>
   </div>}</Status>;
 }
@@ -249,8 +249,8 @@ export function CronJobRow({ job, actions, highlighted }: { job: WebCronJob; act
       <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2"><h2 className="m-0 text-[15px] font-medium">{job.name}</h2>
-            <Badge variant={job.enabled ? "secondary" : "outline"} className="rounded-md font-mono text-[10px] font-normal">{job.enabled ? "Enabled" : "Paused"}</Badge>
-            {job.deleteAfterRun && <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal">One-shot</Badge>}</div>
+            <Badge variant={job.enabled ? "secondary" : "outline"} className="rounded-md text-[10px] font-normal tracking-[0.02em]">{job.enabled ? "Enabled" : "Paused"}</Badge>
+            {job.deleteAfterRun && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">One-shot</Badge>}</div>
           <p className={cn(meta, "mt-1 mb-0")}>{job.scheduleLabel} · {job.sessionKey}</p>
         </div>
         {actions}
@@ -381,10 +381,10 @@ function Mcp({ reload }: { reload: number }) {
         const live = value.live.sessions.flatMap((s) => (s.connections ?? []).filter((c) => c.name === server.name).map((c) => ({ sessionId: s.sessionId, status: c.status })));
         return <li key={server.name} className={cn(card, "px-5 py-4", !server.enabled && "opacity-75")}>
           <div className="flex flex-wrap items-center gap-2"><h2 className="m-0 font-mono text-[14px] font-medium">{server.name}</h2>
-            <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal">{server.type}</Badge>
-            <Badge variant={server.enabled ? "secondary" : "outline"} className="rounded-md font-mono text-[10px] font-normal">{server.enabled ? "Enabled" : "Disabled"}</Badge>
-            {server.oauth && <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal">OAuth</Badge>}
-            {server.alwaysLoad && <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal">Always loaded</Badge>}</div>
+            <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">{server.type}</Badge>
+            <Badge variant={server.enabled ? "secondary" : "outline"} className="rounded-md text-[10px] font-normal tracking-[0.02em]">{server.enabled ? "Enabled" : "Disabled"}</Badge>
+            {server.oauth && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">OAuth</Badge>}
+            {server.alwaysLoad && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">Always loaded</Badge>}</div>
           <p className={cn(meta, "mt-1.5 mb-0 flex flex-wrap items-center gap-x-1.5")}>
             {server.configured.length ? <><Lock className="size-3" />{server.configured.join(" · ")} set</> : "No connection settings"}
             {server.timeout !== null && <> · timeout {server.timeout}s</>}</p>

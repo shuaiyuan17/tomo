@@ -38,7 +38,7 @@ export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => vo
     <div className="mb-3 px-2.5">
       <h2 id="subagent-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]">{isShellTask(task.taskType) ? <ShellPill command={task.description} className="text-[12.5px]" />
         : <>{task.description || "Untitled task"}<ModelBadge model={task.model} className="align-[2px]" /></>}</h2>
-      <p className="m-0 mt-0.5 font-mono text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
+      <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
     </div>
     {isShellTask(task.taskType) && <CommandBrief base={base} fallback={task.description} />}
     {!isOutputTask(task.taskType) && <Brief base={base} />}

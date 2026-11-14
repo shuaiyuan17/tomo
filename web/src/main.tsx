@@ -297,7 +297,7 @@ export function App() {
           <ListChecks strokeWidth={1.75} />
           {running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{running > 99 ? "99+" : running}</span>}
         </Button>
-        <span role="status" className="flex items-center gap-2 font-mono text-xs text-muted-foreground">
+        <span role="status" className="flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground">
           <i className={cn("size-1.5 rounded-full border border-muted-foreground", web.connection === "live" && "border-primary bg-primary")} />
           <span className="max-[600px]:sr-only">{connectionLabel}</span></span>
         <ToggleGroup type="single" aria-label="Color theme" value={theme} onValueChange={(value) => { if (value) setTheme(value as Theme); }}
@@ -323,7 +323,7 @@ export function App() {
         <p className="eyebrow mb-3 max-[600px]:hidden">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2 max-[600px]:mb-0">
           <span id="session-label" className="text-[13px] font-medium">Session</span>
-          <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal text-muted-foreground">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
+          <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
@@ -333,17 +333,17 @@ export function App() {
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-xl p-1">
-            <DropdownMenuLabel className="px-2 py-1.5 font-mono text-[10px] font-normal tracking-[0.12em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
+            <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
             <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); }}>
               {sessions.map((s) => <DropdownMenuRadioItem key={s.id} value={s.id} className="rounded-lg py-2 text-[13px]">
-                <span className="truncate">{s.title}</span>{s.kind === "group" && <span className="ml-auto pl-3 font-mono text-[10px] text-muted-foreground">read-only</span>}
+                <span className="truncate">{s.title}</span>{s.kind === "group" && <span className="ml-auto pl-3 tracking-[0.02em] text-[10px] text-muted-foreground">read-only</span>}
               </DropdownMenuRadioItem>)}
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
         <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : "The same conversation you share with Tomo across your messaging channels."}</p>
         <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="context-heading"><p className="eyebrow mb-3" id="context-heading">Context window</p>
-          <p className="mb-3 font-mono text-lg">{hasContext ? <>{usage!.contextUsed.toLocaleString()} <span className="text-xs text-muted-foreground">/ {usage!.contextMax.toLocaleString()}</span></> : "Unavailable"}</p>
+          <p className="mb-3 text-lg tabular-nums">{hasContext ? <>{usage!.contextUsed.toLocaleString()} <span className="text-xs text-muted-foreground">/ {usage!.contextMax.toLocaleString()}</span></> : "Unavailable"}</p>
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
@@ -360,21 +360,21 @@ export function App() {
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
           {history.messages.map((message, index) => { const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
-            <div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
-              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md font-mono text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
-            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5")}>
+            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
+              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
+            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
               <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} /></div>
             {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })}
           {pendingUsers.map((request) => <article className="message user mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
-            <div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
-              <Badge variant="outline" className="self-center rounded-md font-mono text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
+            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
+              <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
             <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text!}</Text></div>
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
-          {blocks.map((block) => <article className="message assistant mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 font-mono text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown"><Text breaks>{block.text}</Text></div></article>)}
+          {blocks.map((block) => <article className="message assistant mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown reading"><Text breaks>{block.text}</Text></div></article>)}
         </div>
-        <div className="mx-auto w-full max-w-[740px]"><div className="min-h-7 pb-2 font-mono text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
-          {resending && <div className="mb-2 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
-            <Badge variant="outline" className="rounded-md font-mono text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
+        <div className="mx-auto w-full max-w-[740px]"><div className="min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
+          {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
+            <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>
             <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] duration-150 focus-within:border-muted-foreground/50 focus-within:shadow-md">

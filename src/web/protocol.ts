@@ -113,6 +113,8 @@ export type WebEvent =
   | { type: "cron" }
   | { type: "tool"; sessionId: string; tool: string; state: "started" | "completed" | "failed" }
   | { type: "typing"; sessionId: string; active: boolean }
+  /** The latest compact request changed state. */
+  | { type: "compact"; request: WebCompactState }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
   | { type: "tasks"; sessionId: string; tasks: WebTask[] };
 export interface EventEnvelope { id: string; event: WebEvent }
@@ -126,6 +128,8 @@ export interface WebBootstrap extends WebCatalog {
   tasks: WebTask[];
   /** Optional features this daemon serves (absent on older daemons). */
   capabilities?: { screen: boolean };
+  /** The latest compact request, so a reload still shows it. */
+  compact?: WebCompactState;
 }
 /** One tick of the read-only screen view: a JPEG when live, otherwise why there is none. */
 export interface WebScreenFrame { status: "live" | "locked" | "away" | "unconfirmed" | "unavailable" | "too_large"; capturedAt: number; jpeg?: string }
@@ -183,11 +187,17 @@ export const rpcSchema = z.discriminatedUnion("method", [
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
   /** A shell task's full command, redacted and capped (see redact-command.ts). */
   command?: { text: string; truncated: boolean } }
 /** Answer to a compact request: queued, or one is already outstanding. */
-export interface WebCompactResult { status: "queued" | "already_requested" }
+export interface WebCompactResult { status: "queued" | "already_requested"; requestId: string }
+/**
+ * The latest compact request and where it stands: accepted (queued for
+ * Tomo), declined (refused: tasks were running), done (Tomo's housekeeping
+ * turn finished), failed (it did not).
+ */
+export interface WebCompactState { requestId: string; state: "accepted" | "declined" | "done" | "failed"; at: number }

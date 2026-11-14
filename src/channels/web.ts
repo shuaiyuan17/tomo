@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import type { Channel, CommandHandler, IncomingMessage, MessageHandler, OutgoingMessage } from "./types.js";
 import { markDefiniteFailure } from "./types.js";
@@ -11,7 +11,7 @@ import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
 /** A shell task's full command is served up to this many characters. */
 const COMMAND_LIMIT = 16_000;
@@ -53,7 +53,8 @@ export class WebChannel implements Channel {
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
-  private readonly compact: (() => "queued" | "already_requested" | "no_owner") | undefined;
+  private readonly compact: ((sessionKey: string, onSettled: (ok: boolean) => void) => "queued" | "already_requested" | "no_owner") | undefined;
+  private compactState: WebCompactState | undefined;
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
@@ -80,8 +81,8 @@ export class WebChannel implements Channel {
       taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>;
       /** A Bash tool call's full command from the live session, by tool_use id. */
       toolCommand?: (sessionKey: string, toolUseId: string) => string | undefined;
-      /** Queue an owner-requested compact of the owner's session (the agent runs it). */
-      compact?: () => "queued" | "already_requested" | "no_owner";
+      /** Queue an owner-requested compact of the given (owner) session; the agent runs it and reports back. */
+      compact?: (sessionKey: string, onSettled: (ok: boolean) => void) => "queued" | "already_requested" | "no_owner";
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
       /** Durable receipts; loaded here, before any request is accepted. */
@@ -199,7 +200,8 @@ export class WebChannel implements Channel {
       .sort((a, b) => (a.request.timestamp ?? 0) - (b.request.timestamp ?? 0)).map((r) => ({ ...r.request }));
     const blocks = [...this.blocks];
     const tasks = this.tasks.snapshot();
-    return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
+    return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks,
+      ...(this.compactState ? { compact: { ...this.compactState } } : {}) };
   }
 
   /**
@@ -234,17 +236,35 @@ export class WebChannel implements Channel {
   }
 
   /**
-   * The owner asks Tomo to compact their session. Refused (409
-   * tasks_running) while the owner's session has running non-ambient tasks —
-   * the browser greys the button too, but this is the check that counts.
+   * The owner asks Tomo to compact their session — the owner conversation
+   * the browser shows (the catalog's owner-key rule, as the task panel uses).
+   * First check, here: refused (409 tasks_running) while that session has
+   * running non-ambient tasks. The last check is Tomo's own, when the turn
+   * runs (the event tells it to skip if anything is running). Each request
+   * gets an id; its state (accepted → done | failed, or declined) is
+   * published and kept in the snapshot.
    */
   requestCompact(): WebCompactResult {
-    if (!this.compact || !this.ownerId) throw new WebError(409, "owner_setup_required");
+    const key = this.ownerKey();
+    if (!this.compact || !this.ownerId || !key) throw new WebError(409, "owner_setup_required");
+    const requestId = randomUUID();
     const running = this.tasks.snapshot().filter((t) => t.sessionId === this.ownerId && t.state === "running" && !t.ambient).length;
-    if (running > 0) throw new WebError(409, "tasks_running");
-    const status = this.compact();
+    if (running > 0) {
+      this.setCompactState({ requestId, state: "declined", at: Date.now() });
+      throw new WebError(409, "tasks_running");
+    }
+    const status = this.compact(key, (ok) => {
+      if (this.compactState?.requestId === requestId) this.setCompactState({ requestId, state: ok ? "done" : "failed", at: Date.now() });
+    });
     if (status === "no_owner") throw new WebError(409, "owner_setup_required");
-    return { status };
+    if (status === "already_requested") return { status, requestId: this.compactState?.requestId ?? requestId };
+    this.setCompactState({ requestId, state: "accepted", at: Date.now() });
+    return { status, requestId };
+  }
+
+  private setCompactState(state: WebCompactState): void {
+    this.compactState = state;
+    try { this.events.publish({ type: "compact", request: { ...state } }); } catch { /* best effort */ }
   }
 
   async send(message: OutgoingMessage): Promise<void> {

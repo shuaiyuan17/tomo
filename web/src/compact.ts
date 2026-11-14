@@ -1,29 +1,33 @@
-/** Pure state for the "Compact context" button. */
+import type { WebCompactState } from "../../src/web/protocol.js";
 
-/** After a request, the button shows "Requested…" until context drops or this passes. */
-export const COMPACT_PENDING_MS = 10 * 60_000;
-/** "Clearly dropped": below this fraction of the usage when it was requested. */
-export const COMPACT_DROP_FRACTION = 0.7;
+/** Pure state for the "Compact context" button, driven by the server's request state. */
 
-export interface CompactRequest { at: number; usedAtRequest: number }
+/** "Compacted" shows this long after a request is done. */
+export const COMPACT_DONE_MS = 3_000;
+/** A refusal or failure message shows this long. */
+export const COMPACT_NOTICE_MS = 6_000;
 
 export type CompactButton =
-  | { state: "ready"; label: string }
+  | { state: "ready"; label: string; note?: string }
   | { state: "busy"; label: string }
   | { state: "requested"; label: string }
+  | { state: "done"; label: string }
   | { state: "hidden" };
 
-export function compactButton(opts: { ownerSession: boolean; running: number; request?: CompactRequest; contextUsed: number; now: number }): CompactButton {
+/**
+ * `request` is the latest compact request as the server reports it;
+ * `seenAt` is when this browser saw it reach its current state.
+ */
+export function compactButton(opts: { ownerSession: boolean; running: number; request?: WebCompactState; seenAt: number; now: number }): CompactButton {
   if (!opts.ownerSession) return { state: "hidden" };
-  if (opts.request && !compactSettled(opts.request, opts.contextUsed, opts.now)) return { state: "requested", label: "Compact requested…" };
+  const { request } = opts;
+  if (request?.state === "accepted") return { state: "requested", label: "Compact requested…" };
+  if (request?.state === "done" && opts.now - opts.seenAt < COMPACT_DONE_MS) return { state: "done", label: "Compacted" };
   if (opts.running > 0) return { state: "busy", label: `${opts.running} ${opts.running === 1 ? "task" : "tasks"} running — wait for ${opts.running === 1 ? "it" : "them"} to finish` };
+  const recent = opts.now - opts.seenAt < COMPACT_NOTICE_MS;
+  if (request?.state === "failed" && recent) return { state: "ready", label: "Compact context", note: "The compact didn't finish. Try again." };
+  if (request?.state === "declined" && recent) return { state: "ready", label: "Compact context", note: "Tasks were running — try again when they finish." };
   return { state: "ready", label: "Compact context" };
-}
-
-/** The request is over: the context clearly dropped, or it has been long enough. */
-export function compactSettled(request: CompactRequest, contextUsed: number, now: number): boolean {
-  if (now - request.at >= COMPACT_PENDING_MS) return true;
-  return request.usedAtRequest > 0 && contextUsed > 0 && contextUsed < request.usedAtRequest * COMPACT_DROP_FRACTION;
 }
 
 /** A short message for a refused request. */

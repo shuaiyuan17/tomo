@@ -210,7 +210,7 @@ export class ContextNudger {
    * request per session is outstanding: a second one while the first is
    * queued or running answers "already_requested".
    */
-  requestCompact(key: string): "queued" | "already_requested" {
+  requestCompact(key: string, onSettled?: (ok: boolean) => void): "queued" | "already_requested" {
     if (this.manualCompacts.has(key)) return "already_requested";
     this.manualCompacts.add(key);
     const stats = this.sessions.getEntry(key)?.stats;
@@ -222,14 +222,14 @@ export class ContextNudger {
       : "";
     const text = formatTomoEvent(
       "context-nudge",
-      `The owner requested a compact from the web UI.${usage} Use the lcm compact skill to compact this session now.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+      `The owner requested a compact from the web UI.${usage} Before compacting, check that no subagent or background task is running; if any is, do not compact — reply NO_REPLY and the owner can retry. Otherwise use the lcm compact skill to compact this session now.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
       { name: "compact" },
     );
     log.info({ key }, "Compact requested from the web UI");
     // Same path and the same silence as the automatic nudge (see maybeNudgeCompact).
     void this.handleCronMessage(text, key, { showTyping: false, suppressDelivery: true })
-      .catch((err) => { log.warn({ err, key }, "Web compact request failed"); })
-      .finally(() => { this.manualCompacts.delete(key); });
+      .then((ok) => { this.manualCompacts.delete(key); onSettled?.(ok); },
+        (err) => { this.manualCompacts.delete(key); log.warn({ err, key }, "Web compact request failed"); onSettled?.(false); });
     return "queued";
   }
 }

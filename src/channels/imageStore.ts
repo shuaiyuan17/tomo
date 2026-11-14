@@ -62,6 +62,23 @@ function shortGuid(guid: string | undefined): string {
   return compact.slice(0, 8) || "unknown";
 }
 
+/** The `{session}` part of an inbound image's filename for a given meta.sessionKey. */
+export function imageSessionSegment(sessionKey: string): string {
+  return sanitize(sessionKey, "session");
+}
+
+/**
+ * Whether `filename` — as buildImagePath names it, including the "-N"
+ * suffix writeWithoutOverwrite adds on a collision — was filed for one of
+ * `sessionKeys` (the meta.sessionKey values the channels pass, e.g.
+ * `telegram_<chatId>` or `imessage_<chatGuid>`).
+ */
+export function isImageFiledFor(filename: string, sessionKeys: readonly string[]): boolean {
+  const match = /^\d{6}_(.+)$/.exec(filename);
+  if (!match) return false;
+  return sessionKeys.some((key) => match[1].startsWith(`${imageSessionSegment(key)}_`));
+}
+
 /**
  * Build the absolute destination path for an inbound image.
  *

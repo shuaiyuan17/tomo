@@ -6,6 +6,7 @@ import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding, parseRawSessionKey } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
+import { isImageFiledFor } from "../channels/imageStore.js";
 import { WebError, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
@@ -86,25 +87,22 @@ export function sniffImageType(head: Buffer): string | undefined {
 }
 
 /**
- * The channel-chat prefixes a session's inbound images are filed under
- * (imageStore: `HHMMSS_<sanitized "<channel>_<chat>">_<guid>.<ext>`).
+ * The meta.sessionKey values the channels file a session's inbound images
+ * under (telegram.ts: `telegram_<chatId>`; imsg: `imessage_<chatGuid>`).
+ * The owner's DM spans their bound chats: a Telegram id, or an iMessage
+ * handle inside a `<service>;-;<handle>` chat GUID.
  */
-export function imageChatPrefixes(key: string, owner: OwnerConfig | undefined, isOwnerSession: boolean): string[] {
-  const sanitize = (part: string) => part.replace(/[^A-Za-z0-9._-]/g, "_");
+export function imageSessionKeys(key: string, owner: OwnerConfig | undefined, isOwnerSession: boolean): string[] {
   const raw = parseRawSessionKey(key);
-  const prefixes = raw ? [sanitize(`${raw.channelName}_${raw.chatId}`)] : [];
+  const keys = raw ? [`${raw.channelName}_${raw.chatId}`] : [];
   if (isOwnerSession && owner) {
-    for (const id of ownerBindings(owner, "telegram")) prefixes.push(sanitize(`telegram_${id}`));
-    // iMessage chat GUIDs embed the handle: imessage_any_-_<handle>, imessage_iMessage_-_<handle>, …
-    for (const handle of ownerBindings(owner, "imessage")) prefixes.push(`imessage_*${sanitize(handle)}`);
+    for (const id of ownerBindings(owner, "telegram")) keys.push(`telegram_${id}`);
+    for (const handle of ownerBindings(owner, "imessage")) {
+      for (const service of ["any", "iMessage", "SMS", "RCS"]) keys.push(`imessage_${service};-;${handle}`);
+    }
   }
-  return prefixes;
+  return keys;
 }
-const fileMatchesPrefix = (name: string, prefixes: string[]) => prefixes.some((prefix) => {
-  const [head, tail] = prefix.split("*");
-  return new RegExp(`^\\d{6}_${escapeRe(head)}${tail !== undefined ? `[A-Za-z0-9._-]*${escapeRe(tail)}` : ""}_[A-Za-z0-9]+\\.[A-Za-z0-9]+$`).test(name);
-});
-const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
  * Paths named by the image/sticker markers at the START of a message — where
@@ -227,12 +225,12 @@ export class WebData {
       // layer's text marker; a message the owner typed could contain a
       // look-alike. So only images named at the start of an INBOUND user
       // message from a messaging channel count, and only files filed under
-      // this session's own channel chat (the store's filename prefix).
+      // this session's own channel chats (the image store's own naming).
       const allowed = this.media.get(id) ?? new Set<string>();
-      const prefixes = imageChatPrefixes(key, this.options.owner, id === this.catalog().ownerId);
+      const filedAs = imageSessionKeys(key, this.options.owner, id === this.catalog().ownerId);
       for (const message of page.messages) {
         if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
-        for (const path of imagePaths(message.content)) if (fileMatchesPrefix(basename(path), prefixes)) allowed.add(path);
+        for (const path of imagePaths(message.content)) if (isImageFiledFor(basename(path), filedAs)) allowed.add(path);
       }
       if (allowed.size > 4096) allowed.clear();
       this.media.set(id, allowed);

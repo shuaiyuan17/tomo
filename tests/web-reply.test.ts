@@ -4,7 +4,7 @@ import { findQuoted, parseReply } from "../web/src/reply.js";
 describe("reply context", () => {
   it("parses a Chinese excerpt cut with an ellipsis and keeps only the real reply as the body", () => {
     expect(parseReply('[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！')).toEqual({
-      reply: { verb: "replying", excerpt: "强哥的 #383 捡起来了，拆成了 3 个 PR，", truncated: true }, body: "nicenice！！" });
+      reply: { verb: "replying", excerpt: "强哥的 #383 捡起来了，拆成了 3 个 PR，…", truncated: true }, body: "nicenice！！" });
   });
   it("English, quotes inside, fullwidth delimiters restored", () => {
     expect(parseReply('[replying to: "he said "ok" ［see #1］"] Sounds good')).toEqual({
@@ -37,6 +37,12 @@ describe("reply context", () => {
     const shuffled = [{ id: "late", timestamp: 99, content: "lunch?" }, { id: "r", timestamp: 10, content: '[replying to: "lunch?"] ok' }];
     expect(findQuoted(shuffled, 1, parseReply(shuffled[1].content).reply!)).toBeUndefined();
     expect(findQuoted(messages, 3, { verb: "replying", excerpt: "nothing like this", truncated: false })).toBeUndefined();
+    // An original that itself ends in "…": the exact match wins over a longer message with that prefix.
+    const ellipsis = [{ id: "a", timestamp: 1, content: "wait…" }, { id: "b", timestamp: 2, content: "wait for me" }, { id: "c", timestamp: 3, content: '[replying to: "wait…"] ok' }];
+    expect(findQuoted(ellipsis, 2, parseReply(ellipsis[2].content).reply!)?.id).toBe("a");
+    // An excerpt at the marker's 60-character limit may be a cut even without "…".
+    const long = "x".repeat(60);
+    expect(parseReply(`[replying to: "${long}"] ok`).reply!.truncated).toBe(true);
     expect(findQuoted(messages, 3, { verb: "replying", excerpt: null, truncated: false })).toBeUndefined();
   });
 });

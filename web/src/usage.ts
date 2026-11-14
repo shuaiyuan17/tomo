@@ -2,8 +2,19 @@ import type { WebUsage, WebUsageWindow } from "../../src/web/protocol.js";
 
 /** Pure helpers for the Plan usage card. */
 
-/** The card refreshes itself this often while the page is visible. */
-export const USAGE_REFRESH_MS = 30 * 60_000;
+/** Asked again this long after the server's cache expires (it refreshes on that request). */
+export const USAGE_MARGIN_MS = 5_000;
+/** After a failed request to Tomo, try again this soon. */
+export const USAGE_RETRY_MS = 60_000;
+
+/**
+ * When to ask next, from what the server said: its cache expiry plus a small
+ * margin — not 30 minutes from when the request started. 0 means "now".
+ */
+export function nextUsageDelay(usage: WebUsage | undefined, failed: boolean, now: number): number {
+  if (failed || !usage) return USAGE_RETRY_MS;
+  return Math.max(0, usage.expiresAt + USAGE_MARGIN_MS - now);
+}
 /** At or above this utilisation a window is shown in the warning colour. */
 export const USAGE_WARN_PERCENT = 80;
 

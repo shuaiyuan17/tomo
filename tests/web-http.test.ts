@@ -175,6 +175,12 @@ describe("local HTTP boundary", () => {
     await call("/api/v1/usage?refresh=1");
     expect(usage.mock.calls).toEqual([[false], [true]]);
   });
+  it("turns a daemon that misses the usage deadline into a named timeout state", async () => {
+    vi.spyOn(channel, "usage").mockRejectedValueOnce(new (await import("../src/web/protocol.js")).WebError(503, "daemon_timeout"));
+    const res = await call("/api/v1/usage");
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text)).toMatchObject({ state: "timeout", windows: [] });
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
       `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage"]) {

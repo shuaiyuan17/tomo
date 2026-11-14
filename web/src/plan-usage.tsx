@@ -6,41 +6,45 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { isWarn, resetLabel, splitWindows, updatedLabel, USAGE_REFRESH_MS, usageNotice, windowTitle } from "./usage.js";
+import { isWarn, nextUsageDelay, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "./usage.js";
 
 /**
  * Claude subscription usage (the same numbers as `/usage`). Loads on open,
- * refreshes every 30 minutes while the tab is visible (catching up when it
- * becomes visible again), and on demand; the daemon caches and debounces.
+ * then again when the server's 30-minute cache expires (plus a few seconds)
+ * while the tab is visible, and on demand; the daemon caches and debounces.
  */
 export function PlanUsage({ ready }: { ready: boolean }) {
   const [usage, setUsage] = useState<WebUsage>();
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const lastLoad = useRef(0);
-  const load = useCallback(async (refresh: boolean) => {
-    setLoading(true);
-    try { setUsage(await api<WebUsage>(`/usage${refresh ? "?refresh=1" : ""}`)); setFailed(false); }
-    catch { setFailed(true); }
-    finally { lastLoad.current = Date.now(); setLoading(false); setNow(Date.now()); }
+  // The latest answer, for scheduling outside React's render cycle.
+  const latest = useRef<{ usage?: WebUsage; failed: boolean }>({ failed: false });
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const schedule = useCallback((load: (refresh: boolean) => Promise<void>) => {
+    clearTimeout(timer.current);
+    if (document.hidden) return;
+    const delay = nextUsageDelay(latest.current.usage, latest.current.failed, Date.now());
+    timer.current = setTimeout(() => void load(false), delay);
   }, []);
-  // Only once the page is authenticated (bootstrap sets the cookie).
+  const load = useCallback(async (refresh: boolean): Promise<void> => {
+    clearTimeout(timer.current);
+    setLoading(true);
+    try { const value = await api<WebUsage>(`/usage${refresh ? "?refresh=1" : ""}`); latest.current = { usage: value, failed: false }; setUsage(value); setFailed(false); }
+    catch { latest.current = { ...latest.current, failed: true }; setFailed(true); }
+    finally { setLoading(false); setNow(Date.now()); schedule(load); }
+  }, [schedule]);
+  // Only once the page is authenticated (bootstrap sets the cookie). Next
+  // reads follow the server's cache expiry; hidden tabs pause, and a tab
+  // that comes back past the expiry reads at once (else waits for it).
   useEffect(() => {
     if (!ready) return;
     void load(false);
-    let timer: ReturnType<typeof setInterval> | undefined;
-    const start = () => { clearInterval(timer); timer = setInterval(() => void load(false), USAGE_REFRESH_MS); };
-    const onVisibility = () => {
-      if (document.hidden) { clearInterval(timer); timer = undefined; return; }
-      if (Date.now() - lastLoad.current >= USAGE_REFRESH_MS) void load(false);
-      start();
-    };
-    if (!document.hidden) start();
+    const onVisibility = () => { if (document.hidden) clearTimeout(timer.current); else schedule(load); };
     document.addEventListener("visibilitychange", onVisibility);
     const tick = setInterval(() => setNow(Date.now()), 30_000);
-    return () => { clearInterval(timer); clearInterval(tick); document.removeEventListener("visibilitychange", onVisibility); };
-  }, [load, ready]);
+    return () => { clearTimeout(timer.current); clearInterval(tick); document.removeEventListener("visibilitychange", onVisibility); };
+  }, [load, schedule, ready]);
 
   const { main, scoped } = splitWindows(usage?.windows ?? []);
   const notice = failed ? "Couldn't reach Tomo for usage." : usage && usageNotice(usage);

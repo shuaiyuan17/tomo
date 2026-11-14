@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { fetchUsage, usageWindows, type UsageResult } from "../src/agent/usage.js";
-import { USAGE_REFRESH_MIN_MS, USAGE_TTL_MS, UsageCache } from "../src/web/usage.js";
-import { formatSpan, isWarn, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
+import { USAGE_DEADLINE_MS, USAGE_REFRESH_MIN_MS, USAGE_TIMEOUT_RETRY_MS, USAGE_TTL_MS, UsageCache } from "../src/web/usage.js";
+import { USAGE_RPC_TIMEOUT_MS } from "../src/web/protocol.js";
+import { SOCKET_TIMEOUT_MS } from "../src/web/http.js";
+import { vi } from "vitest";
+import { formatSpan, isWarn, nextUsageDelay, USAGE_MARGIN_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
 import type { WebUsage, WebUsageWindow } from "../src/web/protocol.js";
 
 const NOW = Date.parse("2026-07-27T22:36:00.000Z");
@@ -84,6 +87,46 @@ describe("UsageCache", () => {
   });
 });
 
+describe("usage deadlines", () => {
+  it("the daemon deadline < the RPC deadline < the HTTP socket timeout", () => {
+    expect(USAGE_DEADLINE_MS).toBeLessThan(USAGE_RPC_TIMEOUT_MS);
+    expect(USAGE_RPC_TIMEOUT_MS).toBeLessThanOrEqual(25_000);
+    expect(USAGE_RPC_TIMEOUT_MS).toBeLessThan(SOCKET_TIMEOUT_MS);
+  });
+  it("a slow read answers 'timeout' at the deadline, then lands in the cache", async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let finish!: (r: UsageResult) => void;
+      const cache = new UsageCache(() => new Promise<UsageResult>((r) => { finish = r; }), () => Date.now());
+      const pending = cache.get();
+      await vi.advanceTimersByTimeAsync(USAGE_DEADLINE_MS);
+      const late = await pending;
+      expect(late).toMatchObject({ state: "timeout", windows: [] });
+      expect(late.expiresAt).toBe(USAGE_DEADLINE_MS + USAGE_TIMEOUT_RETRY_MS);
+      finish({ ok: true, data: { five_hour: { utilization: 33 } } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await cache.get()).toMatchObject({ state: "ok", windows: [{ percent: 33 }], expiresAt: USAGE_TTL_MS });
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe("Plan usage scheduling", () => {
+  const usage = (expiresAt: number): WebUsage => ({ state: "ok", windows: [], fetchedAt: 0, updatedAt: 0, nextRefreshAt: 0, expiresAt });
+  it("asks again at the server's expiry plus a margin, not 30 minutes after the request", () => {
+    // The server's cache was filled 20 minutes before this request: it expires in 10.
+    const now = 20 * 60_000;
+    expect(nextUsageDelay(usage(USAGE_TTL_MS), false, now)).toBe(10 * 60_000 + USAGE_MARGIN_MS);
+  });
+  it("a tab back after the expiry reads at once; before it, waits only until then", () => {
+    expect(nextUsageDelay(usage(1_000), false, 50_000)).toBe(0);
+    expect(nextUsageDelay(usage(100_000), false, 50_000)).toBe(50_000 + USAGE_MARGIN_MS);
+  });
+  it("retries soon after a failed request", () => {
+    expect(nextUsageDelay(undefined, true, 0)).toBe(USAGE_RETRY_MS);
+    expect(nextUsageDelay(usage(1e12), true, 0)).toBe(USAGE_RETRY_MS);
+  });
+});
+
 describe("Plan usage card helpers", () => {
   const w = (o: Partial<WebUsageWindow>): WebUsageWindow => ({ id: "x", label: "Weekly · Opus", group: "weekly", scoped: true, percent: 10, resetsAt: null, active: false, elevated: false, ...o });
   it("warns at 80% or an elevated severity; splits and titles windows", () => {
@@ -100,7 +143,7 @@ describe("Plan usage card helpers", () => {
       .toEqual(["Not updated yet", "Updated just now", "Updated 5 min ago", "Updated 3 h ago"]);
   });
   it("has a distinct notice per failure", () => {
-    const base = { windows: [], fetchedAt: 0, updatedAt: null, nextRefreshAt: 0 };
+    const base = { windows: [], fetchedAt: 0, updatedAt: null, nextRefreshAt: 0, expiresAt: 0 };
     const states: WebUsage["state"][] = ["empty", "api_key", "no_token", "credentials_unreadable", "token_expired", "refresh_pending", "unauthorized", "network", "timeout", "http_error", "bad_response", "unavailable"];
     const notices = states.map((state) => usageNotice({ ...base, state }));
     expect(new Set(notices).size).toBe(states.length);

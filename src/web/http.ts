@@ -9,7 +9,7 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
-  type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess } from "./protocol.js";
+  type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 
 export interface HttpDependencies {
   accessToken: string;
@@ -22,6 +22,9 @@ export interface HttpDependencies {
   /** The shared desktop capture loop; absent where the screen cannot be captured. */
   screen?: ScreenLoop;
 }
+
+/** Idle socket timeout; every RPC deadline (e.g. USAGE_RPC_TIMEOUT_MS) stays under it. */
+export const SOCKET_TIMEOUT_MS = 30_000;
 
 export async function startWebHttp(port: number, deps: HttpDependencies) {
   const csrf = new CsrfTokens(deps.now);
@@ -45,7 +48,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   });
   server.maxConnections = 64;
   server.headersTimeout = 10_000;
-  server.setTimeout(30_000);
+  server.setTimeout(SOCKET_TIMEOUT_MS);
   server.on("timeout", (socket) => socket.destroy());
   // Bad header syntax is never allowed to escape as a process error.
   server.on("clientError", (_err, socket) => socket.destroy());
@@ -126,7 +129,13 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         }
         if (url.pathname === "/api/v1/usage") {
           // Cached for 30 minutes in the daemon; refresh=1 forces a read, at most every 30 s.
-          json(res, 200, await deps.rpc({ method: "usage", refresh: url.searchParams.get("refresh") === "1" }));
+          try { json(res, 200, await deps.rpc({ method: "usage", refresh: url.searchParams.get("refresh") === "1" })); }
+          catch (error) {
+            // The daemon did not answer in time: a named state, not a dropped request.
+            if (!(error instanceof WebError) || error.code !== "daemon_timeout") throw error;
+            const now = Date.now();
+            json(res, 200, { state: "timeout", windows: [], fetchedAt: now, updatedAt: null, nextRefreshAt: now, expiresAt: now } satisfies WebUsage);
+          }
           return;
         }
         const task = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(transcript|output|command|brief)$/.exec(url.pathname);

@@ -1,7 +1,7 @@
 import { WebData, type WebDataOptions } from "./data.js";
 import { startWebHttp } from "./http.js";
 import { macScreenSource, ScreenLoop } from "./screen.js";
-import { WebError, type EventEnvelope, type Rpc } from "./protocol.js";
+import { USAGE_RPC_TIMEOUT_MS, WebError, type EventEnvelope, type Rpc } from "./protocol.js";
 import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
 
 interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string } }
@@ -54,9 +54,9 @@ process.on("message", (value: Message) => {
       if (pending.size >= 32) return Promise.reject(new WebError(429, "rpc_limit"));
       return new Promise((resolve, reject) => {
         const id = ++sequence;
-        // Usage may wait on the claude.ai endpoint (10 s) and Claude Code's
-        // delegated token refresh (30 s); everything else answers at once.
-        const timer = setTimeout(() => { pending.delete(id); reject(new WebError(503, "daemon_timeout")); }, input.method === "usage" ? 45_000 : 5_000);
+        // Usage may wait on the claude.ai endpoint; the daemon answers it within
+        // its own deadline, and this stays under the HTTP socket timeout.
+        const timer = setTimeout(() => { pending.delete(id); reject(new WebError(503, "daemon_timeout")); }, input.method === "usage" ? USAGE_RPC_TIMEOUT_MS : 5_000);
         pending.set(id, { resolve, reject, timer });
         try { send({ type: "rpc", id, input }); }
         catch (err) { clearTimeout(timer); pending.delete(id); reject(err); }

@@ -94,7 +94,15 @@ export interface WebUsage {
   stale?: boolean;
   /** A forced refresh before this is served from cache. */
   nextRefreshAt: number;
+  /** When the cached value expires (ms epoch): the card schedules its next read from this. */
+  expiresAt: number;
 }
+/**
+ * RPC deadline for `usage`: under the HTTP socket timeout (30 s), above the
+ * daemon's own usage deadline, so a slow endpoint becomes a "timeout" state
+ * rather than a dropped connection.
+ */
+export const USAGE_RPC_TIMEOUT_MS = 24_000;
 export type WebEvent =
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string }
   | { type: "request"; request: WebRequest }

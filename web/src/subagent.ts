@@ -6,7 +6,7 @@ export interface ToolRow {
   kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean;
   result?: { output: string; truncated: boolean; isError: boolean };
 }
-export type ViewRow = { kind: "text"; id: string; text: string; truncated: boolean } | ToolRow;
+export type ViewRow = { kind: "text" | "message"; id: string; text: string; truncated: boolean } | ToolRow;
 
 /**
  * The transcript window has two mutually exclusive modes:
@@ -109,7 +109,7 @@ export function viewRows(items: SubagentItem[]): ViewRow[] {
   for (const item of items) if (item.kind === "result") results.set(item.toolUseId, item);
   const rows: ViewRow[] = [];
   for (const item of items) {
-    if (item.kind === "text") rows.push({ kind: "text", id: item.id, text: item.text, truncated: item.truncated });
+    if (item.kind === "text" || item.kind === "message") rows.push({ kind: item.kind, id: item.id, text: item.text, truncated: item.truncated });
     else if (item.kind === "tool") {
       const result = results.get(item.toolUseId);
       rows.push({ kind: "tool", id: item.id, toolUseId: item.toolUseId, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
@@ -175,13 +175,15 @@ export async function followStep(io: {
 }
 
 /**
- * What the transcript shows: assistant text always in full; a single tool
+ * What the transcript shows: assistant text (and messages sent to the
+ * subagent) always in full; a single tool
  * call as its own row; a run of two or more consecutive tool calls folded
  * into one group, keyed by its first tool_use id (stable while the run grows,
  * so an open/closed choice survives incremental updates).
  */
 export type ViewBlock =
-  | { kind: "text"; row: Extract<ViewRow, { kind: "text" }> }
+  | { kind: "text"; row: Extract<ViewRow, { kind: "text" | "message" }> }
+  | { kind: "message"; row: Extract<ViewRow, { kind: "text" | "message" }> }
   | { kind: "tool"; row: ToolRow }
   | { kind: "group"; key: string; tools: ToolRow[] };
 
@@ -195,7 +197,7 @@ export function groupRows(rows: ViewRow[]): ViewBlock[] {
   };
   for (const row of rows) {
     if (row.kind === "tool") run.push(row);
-    else { flush(); blocks.push({ kind: "text", row }); }
+    else { flush(); blocks.push(row.kind === "message" ? { kind: "message", row } : { kind: "text", row }); }
   }
   flush();
   return blocks;

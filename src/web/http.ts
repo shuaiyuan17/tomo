@@ -116,12 +116,13 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           json(res, 200, await deps.data.history(history[1], url.searchParams.get("cursor") ?? undefined));
           return;
         }
-        const task = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(transcript|output|command)$/.exec(url.pathname);
+        const task = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(transcript|output|command|brief)$/.exec(url.pathname);
         if (task) {
           const [, sessionId, taskId, what] = task;
           const access = await deps.rpc({ method: "task", sessionId, taskId, output: what === "output", command: what === "command" }) as WebTaskAccess;
           if (what === "output") { json(res, 200, access.output); return; }
           if (what === "command") { json(res, 200, access.command); return; }
+          if (what === "brief") { json(res, 200, await deps.data.subagentBrief(access.sessionKey, taskId)); return; }
           const number = (name: string) => {
             const raw = url.searchParams.get(name);
             if (raw === null) return undefined;

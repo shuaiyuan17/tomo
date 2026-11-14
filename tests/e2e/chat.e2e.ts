@@ -265,6 +265,8 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await page.getByRole("button", { name: /Review the release/ }).click();
   const transcript = page.getByLabel("Subagent transcript");
   await browserExpect(transcript).toContainText("Checking the release notes.");
+  // The prompt is the Brief, fixed above the transcript, and not repeated in it.
+  await browserExpect(page.getByRole("region", { name: "Brief" })).toContainText("the hidden prompt");
   await browserExpect(transcript).not.toContainText("the hidden prompt");
   // Consecutive calls fold into one group; the narration around them stays visible.
   await browserExpect(transcript).toContainText("Both look fine.");

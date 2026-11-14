@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { ArrowLeft, ChevronRight } from "lucide-react";
-import type { SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
+import type { SubagentBrief, SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
+import { cn } from "@/lib/utils";
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
@@ -40,6 +41,8 @@ export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => vo
       <p className="m-0 mt-0.5 font-mono text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
     </div>
     {isShellTask(task.taskType) && <CommandBrief base={base} fallback={task.description} />}
+    {!isOutputTask(task.taskType) && <Brief base={base} />}
+    {task.summary && running && <p className="m-0 mx-2.5 mb-2 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">Now:</span> {task.summary}</p>}
     {isOutputTask(task.taskType) ? <OutputTail base={base} running={running} /> : <Transcript base={base} running={running} />}
   </section>;
 }
@@ -148,6 +151,9 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
     {blocks.map((block, index) => {
       const last = index === blocks.length - 1;
       if (block.kind === "text") return <div key={block.row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div>;
+      if (block.kind === "message") return <div key={block.row.id} className="my-1.5 rounded-lg border-l-2 border-primary/50 bg-muted/60 px-2.5 py-1.5">
+        <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from Tomo</p>
+        <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
       if (block.kind === "tool") return <ToolCall key={block.row.id} row={block.row} running={running} />;
       const open = groupOpen(openGroups, block.key, last, running);
       const pending = running && last ? pendingTool(block.tools) : undefined;
@@ -164,6 +170,30 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
     {!gone && state.mode === "browse" && <Button variant="secondary" size="sm" onClick={jump}
       className="sticky bottom-1 mx-auto mt-2 flex h-7 rounded-full text-[11px] shadow-sm">↓ Jump to latest</Button>}
   </div>;
+}
+
+/**
+ * The prompt the subagent was given, fixed above its transcript: a few lines
+ * folded, the whole text (scrollable, up to ~40% of the screen) when opened.
+ */
+function Brief({ base }: { base: string }) {
+  const [brief, setBrief] = useState<SubagentBrief>();
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<SubagentBrief>(`${base}/brief`, { signal: controller.signal }).then(setBrief, () => {});
+    return () => controller.abort();
+  }, [base]);
+  if (!brief) return null;
+  return <section aria-label="Brief" className="mx-2.5 mb-2.5 rounded-lg border bg-card/70 px-2.5 py-2">
+    <div className="mb-1 flex items-center justify-between gap-2">
+      <p className="m-0 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Brief</p>
+      <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)}
+        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? "Show less" : "Show more"}</button>
+    </div>
+    <div className={cn("markdown text-[12.5px]! leading-relaxed", open ? "max-h-[40vh] overflow-y-auto pr-1" : "line-clamp-3")}>
+      <Text>{brief.text + (brief.truncated ? "\n\n… (truncated)" : "")}</Text></div>
+  </section>;
 }
 
 function ToolCall({ row, running }: { row: ToolRow; running: boolean }) {

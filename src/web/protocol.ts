@@ -57,7 +57,11 @@ export interface WebTask {
 export type SubagentItem =
   | { kind: "text"; id: string; text: string; truncated: boolean; ts?: number }
   | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number }
-  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean };
+  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean }
+  /** A message sent to the subagent while it ran (not its first prompt, which is the brief). */
+  | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number };
+/** The prompt the subagent was given: the first entry of its transcript. */
+export interface SubagentBrief { text: string; truncated: boolean }
 /** A byte window of complete transcript lines: page back with `before=start`, tail with `after=end`. */
 export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */

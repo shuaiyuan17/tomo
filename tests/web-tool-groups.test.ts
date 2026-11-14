@@ -8,7 +8,7 @@ const call = (name: string, id: string, done = true): SubagentItem[] => [
   { kind: "tool", id: `${++n}:0`, toolUseId: id, name, summary: `${name} x`, input: "{}", inputTruncated: false },
   ...(done ? [{ kind: "result" as const, id: `${++n}:0`, toolUseId: id, output: "ok", truncated: false, isError: false }] : []),
 ];
-const shape = (items: SubagentItem[]) => groupRows(viewRows(items)).map((b) => b.kind === "group" ? `group:${b.key}:${b.tools.length}` : b.kind === "tool" ? `tool:${b.row.toolUseId}` : "text");
+const shape = (items: SubagentItem[]) => groupRows(viewRows(items)).map((b) => b.kind === "group" ? `group:${b.key}:${b.tools.length}` : b.kind === "tool" ? `tool:${b.row.toolUseId}` : b.kind);
 
 describe("tool-call groups", () => {
   it("text splits calls into groups; a single call stays a plain row", () => {
@@ -24,6 +24,12 @@ describe("tool-call groups", () => {
     // A lone call becomes a group (keyed by itself) once a second one follows.
     expect(shape([text("x"), ...call("Read", "b1")])).toEqual(["text", "tool:b1"]);
     expect(shape([text("x"), ...call("Read", "b1"), ...call("Grep", "b2")])).toEqual(["text", "group:b1:2"]);
+  });
+
+  it("a message sent to the subagent also splits a run, and is its own block", () => {
+    const msg: SubagentItem = { kind: "message", id: `${++n}:msg`, text: "Also check the tests", truncated: false };
+    expect(shape([...call("Read", "m1"), ...call("Read", "m2"), msg, ...call("Bash", "m3"), ...call("Bash", "m4")]))
+      .toEqual(["group:m1:2", "text", "group:m3:2"].map((x) => x === "text" ? "message" : x));
   });
 
   it("summarises by tool, most used first", () => {

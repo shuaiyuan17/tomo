@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Channel, OutgoingMessage, StopTypingOptions } from "../src/channels/types.js";
 import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 import { isSilentReply } from "../src/agent/text-utils.js";
-import { STEER_MERGED, SdkResultError } from "../src/agent/live-session.js";
+import { EMPTY_REPLY, STEER_MERGED, SdkResultError } from "../src/agent/live-session.js";
 import { PartialSendError } from "../src/channels/types.js";
 import {
   TurnRunner,
@@ -298,6 +298,21 @@ describe("TurnRunner reply turns", () => {
     }));
 
     expect(h.channel.sent).toEqual([{ chatId: "123", text: "on it", replyTo: "msg-9" }]);
+  });
+
+  it("an empty reply is silent to the channel and reported via onEmpty; a literal NO_REPLY is not", async () => {
+    const empty = makeHarness(async () => EMPTY_REPLY);
+    const onEmpty = vi.fn();
+    await expect(empty.runner.runTurn(replySpec(empty, { onEmpty }))).resolves.toBe(true);
+    expect(onEmpty).toHaveBeenCalledTimes(1);
+    expect(empty.channel.sent).toHaveLength(0);
+    expect(empty.transcript.map((t) => t.content)).toEqual(["NO_REPLY"]);
+
+    const chosen = makeHarness(async () => "NO_REPLY");
+    const notEmpty = vi.fn();
+    await chosen.runner.runTurn(replySpec(chosen, { onEmpty: notEmpty }));
+    expect(notEmpty).not.toHaveBeenCalled();
+    expect(chosen.channel.sent).toHaveLength(0);
   });
 
   it("still appends a silent reply to the transcript but sends nothing", async () => {

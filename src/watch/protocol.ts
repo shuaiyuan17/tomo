@@ -117,7 +117,7 @@ export interface WatchCronJobInfo {
   nextRunAt: number | null;
   lastRunAt: number | null;
   /** `interrupted`: dispatched, then the daemon restarted before it finished. */
-  lastStatus: "ok" | "error" | "interrupted" | null;
+  lastStatus: "ok" | "empty" | "error" | "interrupted" | null;
 }
 
 export interface WatchSnapshot {

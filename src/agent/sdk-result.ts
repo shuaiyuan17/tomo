@@ -7,10 +7,17 @@ import type { UsageBaseline } from "../sessions/types.js";
  * turn: that turn's owner request receives (and delivers) the combined
  * response, so the steered caller gets this empty marker instead. The empty
  * string is safe as a sentinel only because send()/steer() can never
- * legitimately resolve with "" — empty turns fall back to "I'm not sure how
- * to respond to that." in the result handler.
+ * legitimately resolve with "" — a turn with no text resolves EMPTY_REPLY.
  */
 export const STEER_MERGED = "";
+/**
+ * Resolution of a turn that ended with no reply text anywhere (no text block,
+ * no result text) and that the model did not answer with a literal NO_REPLY.
+ * Silent to the channel like NO_REPLY, but NOT a successful outcome: the
+ * runner reports it (TurnSpec.onEmpty) so cron records "empty", not "ok".
+ * Never delivered or recorded as text: the runner swaps it for NO_REPLY.
+ */
+export const EMPTY_REPLY = "[empty reply]";
 export const QUERY_TIMEOUT_ERROR_PREFIX = "Query timed out after";
 
 /** Fabricated reply for a turn the CLI cut short at the max-turns limit. */

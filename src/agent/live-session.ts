@@ -23,6 +23,7 @@ import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
 import {
   STEER_MERGED,
+  EMPTY_REPLY,
   SteerDeclinedError,
   cumulativeModelTokens,
   describeResultFailure,
@@ -46,6 +47,7 @@ export {
   MAX_TURNS_RESPONSE,
   QUERY_TIMEOUT_ERROR_PREFIX,
   STEER_MERGED,
+  EMPTY_REPLY,
   SdkResultError,
   SteerDeclinedError,
   TurnInterruptedError,
@@ -990,6 +992,19 @@ export class LiveSession {
       // The turn is over. Its blocks have ALREADY shipped, one by one, as they
       // completed; what is assembled here is only the response string — the
       // transcript, the log line, and the value send()/steer() resolve with.
+      // TEXT ONLY IN THE RESULT. When no assistant frame carried text but the
+      // result has some (it is the turn's final text), it becomes the turn's
+      // closing text block and goes through the same path as any other:
+      // rendered (scaffold filter, fabricated-marker advisory), shipped to the
+      // sink, and joined into the response below. Never when frames did carry
+      // text: the result repeats it.
+      if (!failure && !this.parts.some((part) => part.type === "text")) {
+        const finalText = result.result?.trim();
+        if (finalText) {
+          this.parts.push({ type: "text", text: finalText });
+          await this.shipBlock({ type: "text", text: finalText });
+        }
+      }
       const rendered = renderResponseBlocks(this.parts, this.showThinking);
       if (rendered.scaffoldFiltered) {
         log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
@@ -1000,23 +1015,17 @@ export class LiveSession {
       // A turn that ended with NO text at all used to resolve as "I'm not
       // sure how to respond to that.", which the runner delivered. Every time
       // that line reached a channel it was a symptom (a result that belonged
-      // to another turn, 2026-11-14), never an answer, so a turn with no text
-      // anywhere is silent now and the log says so.
-      // The result's own text stands in when no assistant frame carried any
-      // text (it is the turn's final text); only a turn with neither is
-      // silent. Not when frames did carry text that rendering removed (a
-      // filtered scaffold leak): the raw result would put it back.
-      const hadTextFrame = this.parts.some((part) => part.type === "text");
-      const resultText = !failure && !hadTextFrame && result.subtype === "success" && !result.is_error
-        ? result.result?.trim() ?? ""
-        : "";
-      if (!rendered.text && !resultText && !this.droppedThinkingThisTurn && !failure) {
+      // to another turn, 2026-11-14), never an answer. Now it resolves
+      // EMPTY_REPLY: silent to the channel, reported as not-a-success.
+      // A turn the model ended on purpose (literal NO_REPLY, or a dropped
+      // thinking block) stays an ordinary silent NO_REPLY.
+      if (!rendered.text && !failure && !this.droppedThinkingThisTurn) {
         log.warn(
           { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
-          "Turn ended with no reply text; resolving as NO_REPLY",
+          "Turn ended with no reply text; resolving as an empty reply",
         );
       }
-      const response = rendered.text || (this.droppedThinkingThisTurn ? "NO_REPLY" : resultText) || "NO_REPLY";
+      const response = rendered.text || (this.droppedThinkingThisTurn ? "NO_REPLY" : EMPTY_REPLY);
       this.droppedThinkingThisTurn = false;
       this.parts = [];
       this.unownedTurnDropLogged = false;

@@ -196,6 +196,29 @@ describe("CronScheduler", () => {
     expect(jobs.find((j) => j.name === "job-fail")?.nextRunAt).toBeGreaterThan(Date.now());
   });
 
+  it("a run whose turn ended with no reply text is recorded as empty, not ok; a deliberate NO_REPLY run is ok", async () => {
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "job-empty", schedule: { kind: "every", everyMs: 60_000 }, message: "empty", sessionKey: "dm:bob" });
+    store.add({ name: "job-silent", schedule: { kind: "every", everyMs: 60_000 }, message: "silent", sessionKey: "dm:bob" });
+    makeJobsDue();
+    // handleCronMessage reports an empty turn through onEmpty and still
+    // resolves true (the turn ran); a deliberate NO_REPLY just resolves true.
+    const fakeAgent = {
+      handleCronMessage: vi.fn((msg: string, _key: string, options: { onEmpty?: () => void }) => {
+        if (msg.includes("empty")) options.onEmpty?.();
+        return Promise.resolve(true);
+      }),
+    } as unknown as Agent;
+
+    await tick(new CronScheduler(fakeAgent, store));
+
+    const jobs = store.list();
+    const empty = jobs.find((j) => j.name === "job-empty");
+    expect(empty?.lastStatus).toBe("empty");
+    expect(empty?.nextRunAt).toBeGreaterThan(Date.now());
+    expect(jobs.find((j) => j.name === "job-silent")?.lastStatus).toBe("ok");
+  });
+
   // --- restart / interrupted-run recovery -------------------------------
   //
   // A cron run can outlive the daemon: `tomo restart` during a run, a crash,

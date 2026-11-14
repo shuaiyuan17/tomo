@@ -66,6 +66,9 @@ export interface CronTurnOptions {
   /** Graceful shutdown ended the turn without a real outcome (see
    *  TurnSpec.onShutdown). Carried through every handoff. */
   onShutdown?: (kind: ShutdownTurnEnd) => void;
+  /** The turn ended with no reply text and not by the model's choice (see
+   *  TurnSpec.onEmpty). Carried through every handoff. */
+  onEmpty?: () => void;
   /** The cron job's name, for the owner notice when its failure is kept out
    *  of a group (see agent/owner-error-notice.ts). */
   jobName?: string;

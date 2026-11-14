@@ -97,6 +97,7 @@ const {
   LiveSession,
   MAX_MCP_AUTH_REFRESHES_PER_WINDOW,
   MCP_AUTH_REFRESH_WINDOW_MS,
+  EMPTY_REPLY,
   STEER_MERGED,
   SdkResultError,
 } = await import("../src/agent/live-session.js");
@@ -1504,25 +1505,57 @@ describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)
     expect(vi.mocked(log.error)).not.toHaveBeenCalled();
   });
 
-  it("a turn whose text came only in the result resolves with that text", async () => {
+  it("a turn whose text came only in the result ships it as a block and resolves with it", async () => {
     const { session, harness } = makeSession();
-    const p1 = session.send("hello");
+    const shipped: string[] = [];
+    const p1 = session.send("hello", undefined, undefined, (b) => { shipped.push(b); });
     await flushMicrotasks();
     harness.pushEvent(assistantToolEvent("Bash", "t1"));
     harness.pushEvent(toolResultEvent("t1"));
     harness.pushEvent({ ...answering(harness.uuids[0]), result: "done, all green" });
     await expect(p1).resolves.toBe("done, all green");
-    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as NO_REPLY");
+    expect(shipped).toEqual(["done, all green"]);
   });
 
-  it("a turn of ours that ends with no text resolves silent (NO_REPLY) and warns, instead of a fallback line", async () => {
+  it("result-only text goes through the same render: a scaffold leak in it is filtered", async () => {
+    const { session, harness } = makeSession();
+    const shipped: string[] = [];
+    const p1 = session.send("hello", undefined, undefined, (b) => { shipped.push(b); });
+    await flushMicrotasks();
+    harness.pushEvent(assistantToolEvent("Bash", "t1"));
+    harness.pushEvent({ ...answering(harness.uuids[0]), result: "leaked\n_end_of_dialog_\nUser: hi" });
+    await expect(p1).resolves.toBe("leaked");
+    expect(shipped).toEqual(["leaked"]);
+    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => msg === "model scaffold leak filtered")).toBe(true);
+  });
+
+  it("result text is not used when the turn's frames already carried text", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("the reply"));
+    harness.pushEvent({ ...answering(harness.uuids[0]), result: "the reply" });
+    await expect(p1).resolves.toBe("the reply");
+  });
+
+  it("a turn with no text anywhere resolves EMPTY_REPLY (silent, not a success) and warns", async () => {
     const { session, harness } = makeSession();
     const p1 = session.send("hello");
     await flushMicrotasks();
     harness.pushEvent(assistantToolEvent("Bash", "t1"));
     harness.pushEvent(toolResultEvent("t1"));
     harness.pushEvent(answering(harness.uuids[0]));
+    await expect(p1).resolves.toBe(EMPTY_REPLY);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as an empty reply");
+  });
+
+  it("a literal NO_REPLY from the model is an ordinary silent reply, not an empty one", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hello", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("NO_REPLY"));
+    harness.pushEvent(answering(harness.uuids[0]));
     await expect(p1).resolves.toBe("NO_REPLY");
-    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as NO_REPLY");
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as an empty reply");
   });
 });

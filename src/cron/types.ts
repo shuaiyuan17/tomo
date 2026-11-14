@@ -8,7 +8,14 @@ export type CronSchedule =
  * and completion (a restart, a crash) — the turn may have done all, some, or
  * none of its work, so it is never silently equated with success or failure.
  */
-export type CronRunStatus = "ok" | "error" | "interrupted";
+export type CronRunStatus = "ok" | "empty" | "error" | "interrupted";
+/**
+ * How a finished run is recorded. "empty": the turn ran but ended with no
+ * reply text and not by the model's choice (EMPTY_REPLY) — scheduled like
+ * "ok" (the turn may have done its work; re-running could repeat it), but
+ * not reported as one.
+ */
+export type CronOutcome = "ok" | "empty" | "error";
 
 export interface CronJob {
   id: string;

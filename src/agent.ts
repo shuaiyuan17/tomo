@@ -1731,6 +1731,7 @@ export class Agent {
         source: "cron",
         ...(options.restate ? { restate: true } : {}),
         ...(options.onShutdown ? { onShutdown: options.onShutdown } : {}),
+        ...(options.onEmpty ? { onEmpty: options.onEmpty } : {}),
         prompt,
         stampChannelName: deliveryChannel.name,
         ...(options.showTyping === false ? {} : {

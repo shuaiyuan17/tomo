@@ -268,3 +268,21 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await page.getByRole("button", { name: "Back to tasks" }).click();
   await browserExpect(page.getByRole("button", { name: /Review the release/ })).toBeVisible();
 });
+
+it("an Enter that confirms an IME candidate (Safari order) does not send", async () => {
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("ni hao");
+  // Safari fires compositionend before the confirming Enter's keydown, which then has isComposing=false.
+  await input.evaluate((el) => {
+    el.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    el.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "你好" }));
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  });
+  await page.waitForTimeout(300);
+  expect(mockSdk.promptsBySession).toHaveLength(0);
+  await browserExpect(input).toHaveValue("ni hao");
+  // A later, ordinary Enter sends.
+  mockSdk.responseFn = () => "Got it.";
+  await input.press("Enter");
+  await browserExpect(page.getByText("Got it.", { exact: true })).toBeVisible();
+});

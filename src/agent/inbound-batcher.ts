@@ -8,6 +8,9 @@ export interface InboundItem {
   message: IncomingMessage;
   /** Resolution captured at receipt time so delayed batches cannot re-route. */
   resolution: SessionResolution;
+  /** Durable-inbox record backing this item (see DurableInbox); absent when the
+   *  inbox is off or the write failed and the item lives in memory only. */
+  inboxId?: string;
 }
 
 /**
@@ -97,6 +100,7 @@ export class InboundBatcher {
     message: IncomingMessage,
     canCoalesce: boolean,
     resolution: SessionResolution,
+    inboxId?: string,
   ): boolean {
     // Past drainForShutdown nothing here will ever run again, so accepting an
     // item would be the same silent drop this class just closed. Ingestion is
@@ -111,7 +115,7 @@ export class InboundBatcher {
     }
 
     const receivedAt = Date.now();
-    const item: InboundItem = { channel, message, resolution };
+    const item: InboundItem = { channel, message, resolution, ...(inboxId ? { inboxId } : {}) };
 
     if (!canCoalesce) {
       this.host.enqueueForSession(sessionKey, () => this.host.processInboundItems([item]))

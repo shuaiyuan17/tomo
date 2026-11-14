@@ -28,13 +28,13 @@ export function TasksPanel({ tasks, sessions, onClose }: { tasks: WebTask[]; ses
   }, [ticking]);
   const ambient = tasks.some((task) => task.ambient);
   const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label="Close tasks" title="Close" onClick={onClose}
-    className="size-9 rounded-xl hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
+    className="size-8 rounded-lg hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   if (openTask) return <div className="relative flex min-h-0 flex-1 flex-col">
-    <div className="absolute top-0 right-2.5">{close}</div>
+    <div className="absolute top-0 right-1">{close}</div>
     <SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} onBack={() => setOpened(undefined)} />
   </div>;
   return <section className="flex min-h-0 flex-1 flex-col" aria-labelledby="tasks-heading">
-    <div className="mb-2 flex items-center justify-between gap-3 px-2.5">
+    <div className="mb-1.5 flex items-center justify-between gap-3 pr-1 pl-2.5">
       <h2 id="tasks-heading" className="m-0 text-base font-semibold tracking-[-0.1px]">Tasks</h2>
       {close}
     </div>

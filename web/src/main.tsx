@@ -277,7 +277,7 @@ export function App() {
         <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : "The same conversation you share with Tomo across your messaging channels."}</p>
         <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="context-heading"><p className="eyebrow mb-3" id="context-heading">Context window</p>
           <p className="mb-3 font-mono text-lg">{hasContext ? <>{usage!.contextUsed.toLocaleString()} <span className="text-xs text-muted-foreground">/ {usage!.contextMax.toLocaleString()}</span></> : "Unavailable"}</p>
-          {hasContext && <Progress value={Math.min(100, (usage!.contextUsed / usage!.contextMax) * 100)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
+          {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
       </aside>

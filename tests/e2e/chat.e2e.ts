@@ -128,6 +128,9 @@ it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibili
   await browserExpect(page.getByRole("checkbox", { name: "Completed task" })).toBeChecked();
   await browserExpect(page.getByRole("checkbox", { name: "Completed task" })).toBeDisabled();
   await browserExpect(page.getByText("5,000", { exact: false })).toBeVisible();
+  const meter = page.getByRole("progressbar", { name: "Context tokens used" });
+  await browserExpect(meter).toHaveAttribute("aria-valuenow", "5000");
+  await browserExpect(meter).toHaveAttribute("aria-valuemax", "200000");
   expect(provider.delivered).toHaveLength(0);
   expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner"]);
   expect(requests.some((request) => new URL(request).hostname === "example.invalid")).toBe(false);

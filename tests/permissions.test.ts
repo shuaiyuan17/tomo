@@ -708,8 +708,31 @@ describe("isPrivateMemoryAccess - send_message MEDIA paths", () => {
     expect(call(42)).toBe(false);
   });
 
-  it("leaves STICKER ids alone - they name no file", () => {
-    expect(call("STICKER:memory/private/x")).toBe(false);
+  it("denies a STICKER value inside private/ — on iMessage a sticker IS a file path", () => {
+    // Was "leaves STICKER ids alone - they name no file", true only of
+    // Telegram: iMessage's sendSticker opens the path and, without the native
+    // sticker RPC, sends it as a plain attachment (audit P0-2).
+    expect(call("STICKER:memory/private/x")).toBe(true);
+    expect(call('STICKER:"/ws/memory/private/note.md"')).toBe(true);
+  });
+
+  it("still allows a Telegram sticker file_id and a public sticker path", () => {
+    expect(call("STICKER:CAACAgIAAxkBAAEBmRVlYr4")).toBe(false);
+    expect(call('STICKER:"/ws/stickers/wave.png"')).toBe(false);
+  });
+
+  it("expands a leading ~ before judging a MEDIA or STICKER path", () => {
+    // path.resolve does not expand `~`, so `~/…/private/x` resolved under the
+    // cwd and passed — while the iMessage sticker sender expands it itself.
+    const home = {
+      cwd: "/ws",
+      memoryDir: join(homedir(), "tomo-ws", "memory"),
+      privateDir: join(homedir(), "tomo-ws", "memory", "private"),
+    };
+    const send = (message: string) => isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message }, home);
+    expect(send("STICKER:~/tomo-ws/memory/private/note.md")).toBe(true);
+    expect(send('MEDIA:"~/tomo-ws/memory/private/diary.png"')).toBe(true);
+    expect(send("STICKER:~/tomo-ws/stickers/wave.png")).toBe(false);
   });
 
   it("is enforced by the hook, so a barred turn's direct send is refused", async () => {
@@ -720,6 +743,211 @@ describe("isPrivateMemoryAccess - send_message MEDIA paths", () => {
     });
     expect(decision(await hook(send('MEDIA:"memory/private/diary.png"')))).toBe("deny");
     expect(await hook(send('MEDIA:"memory/cat.png"'))).toEqual({});
+    expect(decision(await hook(send("STICKER:memory/private/note.md")))).toBe("deny");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit P0-1: spellings the filesystem folds and JS lower-casing does not.
+// `ſ` (U+017F, long s) is already lower case, so `toLowerCase()` keeps it,
+// while APFS opens `/wſ/` as `/ws/`. NFD input, compatibility forms (full-width
+// letters), and a ſ-spelled ancestor are the same class.
+// ---------------------------------------------------------------------------
+
+describe("isPrivateMemoryAccess — Unicode-folded spellings", () => {
+  const spellings = [
+    "/wſ/memory/private/secret.md",
+    "/Wſ/Memory/Private/secret.md",
+    "memory/ＰＲＩＶＡＴＥ/secret.md",
+  ];
+  for (const p of spellings) {
+    it(`denies Read of ${JSON.stringify(p)}`, () => {
+      expect(isPrivateMemoryAccess("Read", { file_path: p }, ctx)).toBe(true);
+    });
+  }
+
+  it("denies Write, Glob roots, Glob patterns and Grep filters spelled with ſ", () => {
+    expect(isPrivateMemoryAccess("Write", { file_path: "/wſ/memory/private/new.md", content: "x" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Glob", { path: "/wſ/memory/private", pattern: "*.md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Glob", { path: "/wſ", pattern: "memory/pri*/*.md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Glob", { path: "/tmp", pattern: "/wſ/memory/private/*.md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "/tmp", pattern: "x", glob: "/wſ/memory/pri*/*.md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "/wſ", pattern: "x" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: 'MEDIA:"/wſ/memory/private/a.png"' }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: "STICKER:/wſ/memory/private/a.png" }, ctx)).toBe(true);
+  });
+
+  it("denies an NFD spelling of a non-ASCII private dir", () => {
+    const nfc = "/ws/mémoire".normalize("NFC");
+    const accented = { cwd: "/ws", memoryDir: nfc, privateDir: `${nfc}/privé`.normalize("NFC") };
+    const nfd = `${nfc}/privé/x.md`.normalize("NFD");
+    expect(nfd).not.toBe(`${nfc}/privé/x.md`.normalize("NFC"));
+    expect(isPrivateMemoryAccess("Read", { file_path: nfd }, accented)).toBe(true);
+  });
+
+  it("does not fold unrelated paths into private/", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "memory/publiſh.md" }, ctx)).toBe(false);
+    expect(isPrivateMemoryAccess("Read", { file_path: "/tmp/priſate/x.md" }, ctx)).toBe(false);
+  });
+});
+
+describe("isPrivateMemoryAccess — Unicode spellings on a real filesystem", () => {
+  // The fixture directory name carries an `s` so it can be respelled with `ſ`
+  // — the audit's shape: `/Uſers/<user>/.tomo/workſpace/memory/private/x.md`,
+  // where the CANONICAL private dir is never spelled at all.
+  const root = mkdtempSync(join(tmpdir(), "tomo-ws-sec-"));
+  const realCtx = { cwd: root, memoryDir: join(root, "memory"), privateDir: join(root, "memory", "private") };
+  const longS = (p: string) => p.replace("tomo-ws-sec-", "tomo-wſ-ſec-");
+
+  beforeAll(() => {
+    mkdirSync(realCtx.privateDir, { recursive: true });
+    writeFileSync(join(realCtx.privateDir, "secret.md"), "owner-only", "utf-8");
+    symlinkSync(realCtx.privateDir, join(realCtx.memoryDir, "notes"));
+    symlinkSync(realCtx.memoryDir, join(root, "shortcut"));
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("denies a Read through a ſ-spelled ancestor that the filesystem opens", ({ skip }) => {
+    const p = longS(join(realCtx.privateDir, "secret.md"));
+    // Only a filesystem that folds ſ (APFS) opens this; elsewhere it is ENOENT
+    // and there is nothing to read.
+    if (!existsSync(p)) skip();
+    expect(isPrivateMemoryAccess("Read", { file_path: p }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: `MEDIA:"${p}"` }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: `STICKER:"${p}"` }, realCtx)).toBe(true);
+  });
+
+  it("denies ſ-spelled symlink hops into private/ and the memory tree", ({ skip }) => {
+    if (!existsSync(join(realCtx.memoryDir, "noteſ"))) skip();
+    expect(isPrivateMemoryAccess("Read", { file_path: "memory/noteſ/secret.md" }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "ſhortcut", pattern: "owner-only" }, realCtx)).toBe(true);
+    expect(isPrivateMemoryAccess("Glob", { path: longS(join(root, "ſhortcut")), pattern: "private/*.md" }, realCtx)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Names that START with two dots are children, not `..` (codex on #464).
+// `path.relative` gives `..notes.md` for a hidden file inside private/, and
+// `rel.startsWith("..")` read that as "outside".
+// ---------------------------------------------------------------------------
+
+describe("isPrivateMemoryAccess — dot-dot-prefixed names", () => {
+  it("denies Read/Write of a `..`-prefixed hidden file inside private/", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "memory/private/..notes.md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Read", { file_path: "/ws/memory/private/...md" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Write", { file_path: "memory/private/..hidden/x.md", content: "x" }, ctx)).toBe(true);
+  });
+
+  it("denies Glob/Grep rooted at a `..`-prefixed dir inside private/ or memory/", () => {
+    expect(isPrivateMemoryAccess("Glob", { path: "memory/private/..dir", pattern: "*" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "memory/..cache", pattern: "x" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: 'MEDIA:"memory/private/..x.png"' }, ctx)).toBe(true);
+  });
+
+  it("treats `\\` as a filename character, never a separator (POSIX)", () => {
+    // `..\\secret.png` is ONE name inside private/ on macOS, not a step out.
+    expect(isPrivateMemoryAccess("Read", { file_path: "memory/private/..\\secret.png" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess("Read", { file_path: "/ws/memory/private/..\\" }, ctx)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: 'MEDIA:"memory/private/..\\x.png"' }, ctx)).toBe(true);
+  });
+
+  it("still treats a real `..` segment as leaving the dir", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "/ws/memory/private/../../x.md" }, ctx)).toBe(false);
+  });
+
+  it("denies a hidden `..` file on a real filesystem, through the real-path arm too", () => {
+    const root = mkdtempSync(join(tmpdir(), "tomo-perm-dotdot-"));
+    try {
+      const real = { cwd: root, memoryDir: join(root, "memory"), privateDir: join(root, "memory", "private") };
+      mkdirSync(real.privateDir, { recursive: true });
+      writeFileSync(join(real.privateDir, "..notes.md"), "owner-only");
+      symlinkSync(join(real.privateDir, "..notes.md"), join(root, "innocent.md"));
+      expect(isPrivateMemoryAccess("Read", { file_path: "memory/private/..notes.md" }, real)).toBe(true);
+      expect(isPrivateMemoryAccess("Read", { file_path: "innocent.md" }, real)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `link/../x` — the kernel follows the link BEFORE applying `..`; path.resolve
+// collapses `..` first (codex on #464). With `hop -> memory/private/sub`,
+// `hop/../secret.md` opens `memory/private/secret.md`, while the lexical form
+// is `<root>/secret.md`, outside memory/ entirely, so no `..` rule fired.
+// ---------------------------------------------------------------------------
+
+describe("isPrivateMemoryAccess — `..` after a symlink resolves in kernel order", () => {
+  const root = mkdtempSync(join(tmpdir(), "tomo-perm-hop-"));
+  const real = { cwd: root, memoryDir: join(root, "memory"), privateDir: join(root, "memory", "private") };
+
+  beforeAll(() => {
+    mkdirSync(join(real.privateDir, "sub"), { recursive: true });
+    writeFileSync(join(real.privateDir, "secret.png"), "owner-only");
+    symlinkSync(join(real.privateDir, "sub"), join(root, "hop"));
+    mkdirSync(join(root, "elsewhere", "inner"), { recursive: true });
+    symlinkSync(join(root, "elsewhere", "inner"), join(root, "fine"));
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("denies Read and MEDIA of `hop/../secret.png`", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "hop/../secret.png" }, real)).toBe(true);
+    expect(isPrivateMemoryAccess("Read", { file_path: `${root}/hop/../secret.png` }, real)).toBe(true);
+    expect(isPrivateMemoryAccess(SEND_MESSAGE_TOOL, { target: "g", message: 'MEDIA:"hop/../secret.png"' }, real)).toBe(true);
+  });
+
+  it("denies a Write to a not-yet-existing file reached the same way", () => {
+    expect(isPrivateMemoryAccess("Write", { file_path: "hop/../new.md", content: "x" }, real)).toBe(true);
+    expect(isPrivateMemoryAccess("Write", { file_path: "hop/../newdir/deeper/x.md", content: "x" }, real)).toBe(true);
+  });
+
+  it("denies a Glob/Grep rooted at `hop/..`", () => {
+    expect(isPrivateMemoryAccess("Glob", { path: "hop/..", pattern: "*.png" }, real)).toBe(true);
+    expect(isPrivateMemoryAccess("Grep", { path: "hop/..", pattern: "x" }, real)).toBe(true);
+  });
+
+  it("still allows `..` through a link that lands outside memory/", () => {
+    expect(isPrivateMemoryAccess("Read", { file_path: "fine/../x.md" }, real)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit P0-3: the SDK's `Monitor` tool runs `command` in a shell and streams
+// stdout back. On a barred turn it was the one shell the hook did not see.
+// ---------------------------------------------------------------------------
+
+describe("privateMemoryGuardHooks - Monitor, Workflow and schedulers on a barred turn (P0-3)", () => {
+  const MONITOR_CAT = { tool_name: "Monitor", tool_input: { command: "cat memory/private/x", description: "d", timeout_ms: 1000 } };
+  const MONITOR_WS = { tool_name: "Monitor", tool_input: { ws: { url: "wss://example.com" }, description: "d", timeout_ms: 1000 } };
+  const calls = [MONITOR_CAT, MONITOR_WS, { tool_name: "Workflow", tool_input: { script: "x" } },
+    ...["CronCreate", "ScheduleWakeup", "RemoteTrigger"].map((tool_name) => ({ tool_name, tool_input: { prompt: "p" } }))];
+
+  for (const bar of ["group-session", "summoned-turn"] as const) {
+    it(`refuses Monitor, Workflow and the schedulers on a ${bar} turn`, async () => {
+      const hook = hookFor(() => bar);
+      for (const call of calls) {
+        const result = await hook(call);
+        expect(decision(result), call.tool_name).toBe("deny");
+        expect(result.hookSpecificOutput?.permissionDecisionReason, call.tool_name).toContain("schedule_create");
+      }
+    });
+  }
+
+  it("refuses Monitor even for an allowlisted group — the exemption is for Bash only", async () => {
+    const key = "imessage:any;+;allowlisted-group-test";
+    const hook = hookFor(() => "group-session", { sessionKey: key, groupShellAllowlist: () => [key] });
+    expect(decision(await hook(MONITOR_CAT))).toBe("deny");
+  });
+
+  it("leaves them alone on the owner's own turn", async () => {
+    const hook = hookFor(() => null);
+    for (const call of calls) expect(await hook(call), call.tool_name).toEqual({});
   });
 });
 
@@ -1422,6 +1650,14 @@ describe("agentProfileDenial — write tools", () => {
 describe("agentProfileDenial — Bash by mode", () => {
   const bash = (cmd: string, profile: Profile) =>
     agentProfileDenial(profile, "Bash", { command: cmd }, "/ws");
+
+  it("holds a Monitor command to the same Bash rules (audit P0-3)", () => {
+    const monitor = (cmd: string, profile: Profile) =>
+      agentProfileDenial(profile, "Monitor", { command: cmd, description: "d", timeout_ms: 1000 }, "/ws");
+    expect(monitor("rm -rf x", REVIEWER)).toContain("`rm` writes");
+    expect(monitor("ls", { ...REVIEWER, bash: "none" })).toContain("not available");
+    expect(monitor("git log", REVIEWER)).toBeNull();
+  });
 
   it("bash: none denies every command", () => {
     const none: Profile = { ...REVIEWER, bash: "none" };

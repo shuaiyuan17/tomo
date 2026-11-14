@@ -82,6 +82,7 @@ function makeHarness(overrides: Partial<Deps> = {}, channel = new FakeChannel())
 
   const service = new ProactiveSendService({
     getChannel: (name) => (name === channel.name ? channel : undefined),
+    isPrivateMemoryBarred: () => false,
     getSummonedIdentity: () => undefined,
     getReplyTarget: () => undefined,
     deriveReplyTargetFromConfig: () => undefined,

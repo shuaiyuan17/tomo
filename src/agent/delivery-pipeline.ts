@@ -49,6 +49,8 @@ export class PartialDeliveryError extends Error {
     /** The first failure, verbatim. */
     readonly failure: unknown,
     readonly segments: readonly DeliverySegment[],
+    /** Some piece was ALSO withheld by policy (not merely failed). */
+    readonly withheld = false,
   ) {
     const failed = segments.filter((s) => !s.delivered).length;
     // The message is the short form (it can be shown); the full diagnostic
@@ -64,6 +66,35 @@ export class PartialDeliveryError extends Error {
  * failure marks only the pieces that are not known to have shipped; anything
  * else marks the whole block, as before.
  */
+/**
+ * What a block's send reports when it RESOLVED but did not ship every piece —
+ * an attachment withheld by policy (a private-memory path on a barred turn).
+ * Not an error: nothing failed, the harness refused on purpose, and the rest
+ * of the block went out. But the transcript must not record the withheld piece
+ * as something the reader received, so the per-piece outcome comes back here.
+ */
+export interface DeliveryReceipt {
+  segments: readonly DeliverySegment[];
+}
+
+/** The transcript entry for a block whose send resolved: the block verbatim,
+ *  or — when the send withheld pieces — each piece with the not-delivered
+ *  marker on the ones that did not ship. */
+export function deliveredEntry(block: string, receipt: DeliveryReceipt | void): string {
+  if (!receipt) return block;
+  // The receipt describes the WIRE copy, which the outlet guard may have
+  // prefixed with an advisory (inbound-markers.ts). The transcript records the
+  // model's own words, so each piece's outcome is mapped back onto the
+  // ORIGINAL block's pieces — same tags, same order, only the caption text
+  // can differ. Should they ever not line up, the whole block is marked
+  // rather than guessing which piece is which.
+  const original = planSegments(block, extractAttachments(block).cleanText.trim()).segments;
+  if (original.length !== receipt.segments.length) return `${DELIVERY_FAILED_MARKER}${block}`;
+  return original
+    .map((s, i) => (receipt.segments[i]!.delivered ? s.text : `${DELIVERY_FAILED_MARKER}${s.text}`))
+    .join("\n");
+}
+
 export function failedDeliveryEntry(block: string, err: unknown): string {
   if (!(err instanceof PartialDeliveryError)) return `${DELIVERY_FAILED_MARKER}${block}`;
   return err.segments
@@ -160,7 +191,8 @@ export interface DeliverOptions {
    * entitlement changes turn to turn while a group is summoned into it, and a
    * sender outlives the moment it was opened.
    *
-   * When it answers true, a `MEDIA:` path that lands in private/ is DROPPED
+   * When it answers true, a `MEDIA:` path (or an iMessage `STICKER:` path)
+   * that lands in private/ is DROPPED
    * before the send. THE ATTACHMENT IS THE READ: the channel opens the file and
    * puts its contents in the chat, so a turn that the hook stopped from
    * `Read`ing `memory/private/x` could still write `MEDIA:"memory/private/x"`
@@ -180,8 +212,10 @@ export interface DeliverOptions {
  * cannot be expressed by independent per-block calls.
  */
 export interface BlockSender {
-  /** Ship one completed block. Resolves when it has reached the channel. */
-  deliver(block: string): Promise<void>;
+  /** Ship one completed block. Resolves when it has reached the channel —
+   *  with a receipt when some piece was withheld rather than sent (see
+   *  {@link DeliveryReceipt}). */
+  deliver(block: string): Promise<DeliveryReceipt | void>;
 }
 
 export function isAgentErrorResponse(response: string): boolean {
@@ -231,7 +265,7 @@ export class DeliveryPipeline {
     response: string,
     isSilent: (response: string) => boolean = isSilentReply,
     options: DeliverOptions = {},
-  ): Promise<void> {
+  ): Promise<DeliveryReceipt | void> {
     if (isAgentErrorResponse(response)) {
       const visibleError = `[error] ${withRecoveryHint(response)}`;
       if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(sessionKey, visibleError);
@@ -250,7 +284,7 @@ export class DeliveryPipeline {
       return;
     }
 
-    await this.createBlockSender(replyChannel, replyChatId, options).deliver(visible);
+    return this.createBlockSender(replyChannel, replyChatId, options).deliver(visible);
   }
 
   /**
@@ -292,7 +326,7 @@ export class DeliveryPipeline {
     };
 
     return {
-      deliver: async (block: string): Promise<void> => {
+      deliver: async (block: string): Promise<DeliveryReceipt | void> => {
         // Defence in depth: the bare-NO_REPLY drop already happened per block
         // in renderBlock, but callers that hand us raw text get it here too.
         if (endsWithTrailingNoReply(block)) return;
@@ -331,7 +365,9 @@ export class DeliveryPipeline {
         // part-way through one block's delivery, and this keeps the getter off
         // the hot path for the overwhelming majority of blocks that carry no
         // media at all.
-        const barred = media.length > 0 && (options.blockPrivateMedia?.() ?? false);
+        const barred = (media.length > 0 || stickers.length > 0) && (options.blockPrivateMedia?.() ?? false);
+        /** Some piece was refused by policy: reported in the receipt. */
+        let withheld = false;
         for (const { path, segment } of media) {
           // Handled exactly like a file that is not there: never attempted, so
           // the segment stays not-known-delivered and the transcript records
@@ -339,6 +375,7 @@ export class DeliveryPipeline {
           // `deliverText` below and the reader still gets the words.
           if (barred && isPrivateAttachmentPath(path)) {
             log.warn({ chatId, path }, "Dropped a private-memory attachment: this turn's audience may not read memory/private/");
+            withheld = true;
             continue;
           }
           if (!existsSync(path)) continue;
@@ -396,6 +433,15 @@ export class DeliveryPipeline {
           }
         }
         for (const { id, segment } of stickers) {
+          // A sticker value is a local FILE PATH on iMessage (sendSticker falls
+          // back to a plain attachment send), so it is the same read a MEDIA:
+          // path is and gets the same check. Dropped like a private picture:
+          // never attempted, recorded as not delivered.
+          if (barred && isPrivateAttachmentPath(id)) {
+            log.warn({ chatId, sticker: id }, "Dropped a private-memory sticker: this turn's audience may not read memory/private/");
+            withheld = true;
+            continue;
+          }
           try {
             await send({ chatId, text: "", sticker: id, ...offerReplyTo() });
             segment.delivered = true;
@@ -412,8 +458,11 @@ export class DeliveryPipeline {
         // (a refused picture whose caption then went out as text, and no
         // other pieces) is a warn line, not a failed block.
         if (failure && segments.some((s) => !s.delivered)) {
-          throw new PartialDeliveryError(failure.err, segments);
+          throw new PartialDeliveryError(failure.err, segments, withheld);
         }
+        // A policy refusal is not a failure (nothing to retry, no error to
+        // surface) but it IS a piece the reader did not get.
+        if (withheld) return { segments };
       },
     };
   }

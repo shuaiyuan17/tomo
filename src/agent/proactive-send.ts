@@ -11,6 +11,7 @@ import {
   replyTargetFromRawSessionKey,
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
+import { isPrivateAttachmentPath } from "./permissions.js";
 import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
 import type { DeliverySegment } from "./delivery-pipeline.js";
 import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
@@ -35,6 +36,10 @@ export interface SessionCatalog {
  */
 export interface ProactiveSendDeps {
   getChannel(name: string): Channel | undefined;
+  /** Is `memory/private/` closed to the turn in flight on this (CALLER)
+   *  session right now? `Agent.isPrivateMemoryBarred` — the same answer the
+   *  PreToolUse guard and the reply pipeline use. */
+  isPrivateMemoryBarred(sessionKey: string): boolean;
   getSummonedIdentity(channelName: string, chatId: string): string | undefined;
   getReplyTarget(sessionKey: string): ReplyTarget | undefined;
   deriveReplyTargetFromConfig(identityName: string): ReplyTarget | undefined;
@@ -141,6 +146,33 @@ export class ProactiveSendService {
     /** Per-piece outcome in model order, set only when something failed. */
     let segments: DeliverySegment[] | undefined;
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
+
+    // PRIVATE ATTACHMENTS FOLLOW THE CALLER'S AUDIENCE. The PreToolUse guard
+    // stops a barred turn's send_message; this is the same rule at the outlet,
+    // so it holds whatever route reached it. Judged by the turn that is ASKING,
+    // not by the target: the owner in his own DM may explicitly share a
+    // private file into a group, while a group turn or a summoned turn may
+    // not. A caller that cannot be identified is refused when the target is a
+    // group (fail closed). NOT covered here: background work a summoned turn
+    // started that is still running after the turn ends is judged as the
+    // owner (no turn is registered then) — keeping summoned turns from
+    // starting such work is audit P0-4, draft PR #466. Checked
+    // before anything is sent, so nothing is half-delivered. Sticker values
+    // count: on iMessage they are file paths.
+    const callerBarred = callerSessionKey === undefined
+      ? isGroupSessionKey(sessionKey)
+      : this.deps.isPrivateMemoryBarred(callerSessionKey);
+    if (callerBarred) {
+      const privatePaths = [...mediaPaths, ...stickerIds].filter((p) => isPrivateAttachmentPath(p));
+      if (privatePaths.length > 0) {
+        log.warn({ sessionKey, callerSessionKey, count: privatePaths.length }, "Direct send refused: attachment lands in memory/private/ and the calling turn may not read it");
+        return {
+          ok: false,
+          error: `Not sent: ${privatePaths.length === 1 ? "an attachment names" : `${privatePaths.length} attachments name`} a file under \`memory/private/\`, which this turn's audience may not read. Nothing was delivered.`,
+        };
+      }
+    }
+
     if (mediaPaths.length > 0 || stickerIds.length > 0) {
       // Send text first (matches assistant response ordering). The effect
       // rides the text send — it modifies delivery of text, not attachments.

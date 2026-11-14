@@ -29,7 +29,7 @@ beforeEach(async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
-  agent = new Agent(); channel = new WebChannel(mockConfig.owner); provider = new MockChannel("telegram");
+  agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: () => agent.requestOwnerCompact() }); provider = new MockChannel("telegram");
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
@@ -334,4 +334,20 @@ it("shows the Plan usage card with a named state and a refresh button", async ()
   await browserExpect(card).toContainText("Usage isn't available here.");
   await card.getByRole("button", { name: "Refresh plan usage" }).click();
   await browserExpect(card).toContainText("Not updated yet");
+});
+
+it("asks Tomo to compact from the context card, after a confirm; greyed out while tasks run", async () => {
+  mockSdk.responseFn = () => "NO_REPLY";
+  const button = page.getByRole("button", { name: "Compact context" });
+  await browserExpect(button).toBeEnabled();
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [{ taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: true, startedAt: Date.now() }] });
+  await browserExpect(page.getByRole("button", { name: "1 task running — wait for it to finish" })).toBeDisabled();
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [] });
+  await page.getByRole("button", { name: "Compact context" }).click();
+  await page.getByRole("button", { name: "Compact", exact: true }).click();
+  await browserExpect(page.getByText("Requested…")).toBeVisible();
+  await browserExpect.poll(() => mockSdk.promptsBySession.length).toBe(1);
+  expect(mockSdk.promptsBySession[0].sessionKey).toBe("dm:owner");
+  expect(JSON.stringify(mockSdk.promptsBySession[0])).toContain("The owner requested a compact from the web UI.");
+  expect(provider.delivered).toHaveLength(0);
 });

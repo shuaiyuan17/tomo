@@ -31,6 +31,8 @@ export class ContextNudger {
   // current over-threshold episode. Cleared when usage drops back below
   // config.lcm.nudgeResetPct.
   private contextNudged = new Map<string, ContextNudgeLatch>();
+  /** Sessions with an owner-requested compact still queued or running. */
+  private manualCompacts = new Set<string>();
 
   constructor(
     private readonly sessions: SessionStore,
@@ -198,5 +200,36 @@ export class ContextNudger {
       log.warn({ err, key }, "Compact nudge failed");
       rollBackLatch("Context nudge turn threw; latch cleared for a retry");
     });
+  }
+
+  /**
+   * The owner asked for a compact from the web UI. Queues the same
+   * housekeeping turn as the automatic compact nudge (a "context-nudge"
+   * event named "compact", delivery suppressed) — the web never compacts
+   * anything itself; the agent runs the lcm compact skill. At most one
+   * request per session is outstanding: a second one while the first is
+   * queued or running answers "already_requested".
+   */
+  requestCompact(key: string): "queued" | "already_requested" {
+    if (this.manualCompacts.has(key)) return "already_requested";
+    this.manualCompacts.add(key);
+    const stats = this.sessions.getEntry(key)?.stats;
+    const usage = stats?.contextMax
+      ? ` Context usage is at ${Math.round((stats.contextUsed / stats.contextMax) * 100)}% (${stats.contextUsed}/${stats.contextMax} tokens).`
+      : "";
+    const groupNote = isGroupSessionKey(key)
+      ? " This is a group session — scope the rollup to this group's conversation; don't mix in personal/DM context from elsewhere."
+      : "";
+    const text = formatTomoEvent(
+      "context-nudge",
+      `The owner requested a compact from the web UI.${usage} Use the lcm compact skill to compact this session now.${groupNote} After the compact finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.`,
+      { name: "compact" },
+    );
+    log.info({ key }, "Compact requested from the web UI");
+    // Same path and the same silence as the automatic nudge (see maybeNudgeCompact).
+    void this.handleCronMessage(text, key, { showTyping: false, suppressDelivery: true })
+      .catch((err) => { log.warn({ err, key }, "Web compact request failed"); })
+      .finally(() => { this.manualCompacts.delete(key); });
+    return "queued";
   }
 }

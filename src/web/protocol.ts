@@ -177,6 +177,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
   /** Compactions of one browser session seen on the watch bus. */
   z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),
+  z.object({ method: z.literal("compact"), epoch: z.uuid() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
@@ -188,3 +189,5 @@ export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
   /** A shell task's full command, redacted and capped (see redact-command.ts). */
   command?: { text: string; truncated: boolean } }
+/** Answer to a compact request: queued, or one is already outstanding. */
+export interface WebCompactResult { status: "queued" | "already_requested" }

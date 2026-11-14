@@ -58,6 +58,7 @@ import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
 import type { CronTurnOptions, QueuedInboundWork, RewindOutcome, UserTurnRequest } from "./agent/agent-turn-types.js";
 import { OwnerAdoption } from "./agent/owner-adoption.js";
 import { ContextNudger } from "./agent/context-nudger.js";
+import { ownerSessionKey } from "./owner.js";
 import { RestartCoordinator } from "./agent/restart-coordinator.js";
 import { OwnerNotices } from "./agent/owner-notices.js";
 import { McpAuthPrompts } from "./agent/mcp-auth-prompts.js";
@@ -1077,6 +1078,12 @@ export class Agent {
     const key = this.router.ownerSessionKey();
     if (!owner || !key) return undefined;
     return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(owner.name);
+  }
+
+  /** The owner asked for a compact of their own session from the web UI (see ContextNudger.requestCompact). */
+  requestOwnerCompact(): "queued" | "already_requested" | "no_owner" {
+    if (!config.owner) return "no_owner";
+    return this.contextNudger.requestCompact(ownerSessionKey(config.owner));
   }
 
   /** Context-pressure nudge after a completed turn — see ContextNudger. */

@@ -244,6 +244,10 @@ export class WebSupervisor implements WebLifecycle {
           }
           if (input.method === "epoch") return this.channel.events.epoch;
           if (input.method === "request") return this.channel.request(input.requestId);
+          if (input.method === "compact") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.requestCompact();
+          }
           if (input.method === "task") return this.channel.task(input.sessionId, input.taskId, input.output, input.command ?? false);
           if (input.method === "context-events") return this.channel.contextEvents(input.sessionId);
           if (input.method === "mcp-status") {

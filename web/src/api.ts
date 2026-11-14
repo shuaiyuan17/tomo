@@ -1,4 +1,4 @@
-import type { EventEnvelope, MessageInput, WebBootstrap, WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
+import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
@@ -49,6 +49,20 @@ export function sendMessage(input: MessageInput, bootstrap: WebBootstrap, refres
 /** The owner dealt with an interrupted request: its bubble goes, the record stays. */
 export function dismissRequest(requestId: string, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
   return mutate<WebRequest>(`/messages/${requestId}/dismiss`, "POST", {}, bootstrap, refresh);
+}
+
+/** Ask Tomo to compact the owner's session. Same CSRF/epoch rules as sending a message. */
+export async function requestCompact(bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebCompactResult> {
+  const send = (csrfToken: string) => api<WebCompactResult>("/compact-request", { method: "POST", headers: {
+    "content-type": "application/json", "x-tomo-csrf": csrfToken, "x-tomo-epoch": bootstrap.epoch,
+  }, body: "{}" });
+  try { return await send(bootstrap.csrfToken); }
+  catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 403 || error.code !== "invalid_csrf") throw error;
+    const fresh = await refresh();
+    if (fresh.epoch !== bootstrap.epoch) throw new ApiError(409, "epoch_changed");
+    return send(fresh.csrfToken);
+  }
 }
 
 export interface StreamHandlers {

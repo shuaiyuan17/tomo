@@ -11,7 +11,7 @@ import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
 /** A shell task's full command is served up to this many characters. */
 const COMMAND_LIMIT = 16_000;
@@ -53,6 +53,7 @@ export class WebChannel implements Channel {
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
+  private readonly compact: (() => "queued" | "already_requested" | "no_owner") | undefined;
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
@@ -79,6 +80,8 @@ export class WebChannel implements Channel {
       taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>;
       /** A Bash tool call's full command from the live session, by tool_use id. */
       toolCommand?: (sessionKey: string, toolUseId: string) => string | undefined;
+      /** Queue an owner-requested compact of the owner's session (the agent runs it). */
+      compact?: () => "queued" | "already_requested" | "no_owner";
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
       /** Durable receipts; loaded here, before any request is accepted. */
@@ -88,6 +91,7 @@ export class WebChannel implements Channel {
     this.usageReader = options.usage;
     this.taskOutput = options.taskOutput;
     this.toolCommand = options.toolCommand;
+    this.compact = options.compact;
     this.taskModel = options.taskModel;
     const now = options.now ?? Date.now;
     this.now = now;
@@ -227,6 +231,20 @@ export class WebChannel implements Channel {
   async usage(refresh: boolean): Promise<WebUsage> {
     if (!this.usageReader) return { state: "unavailable", windows: [], fetchedAt: Date.now(), updatedAt: null, nextRefreshAt: Date.now(), expiresAt: Date.now() + 30 * 60_000, serverNow: Date.now() };
     return this.usageReader(refresh);
+  }
+
+  /**
+   * The owner asks Tomo to compact their session. Refused (409
+   * tasks_running) while the owner's session has running non-ambient tasks —
+   * the browser greys the button too, but this is the check that counts.
+   */
+  requestCompact(): WebCompactResult {
+    if (!this.compact || !this.ownerId) throw new WebError(409, "owner_setup_required");
+    const running = this.tasks.snapshot().filter((t) => t.sessionId === this.ownerId && t.state === "running" && !t.ambient).length;
+    if (running > 0) throw new WebError(409, "tasks_running");
+    const status = this.compact();
+    if (status === "no_owner") throw new WebError(409, "owner_setup_required");
+    return { status };
   }
 
   async send(message: OutgoingMessage): Promise<void> {

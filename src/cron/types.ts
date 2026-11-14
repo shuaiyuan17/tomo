@@ -123,12 +123,6 @@ export interface SkipNotice {
   windowMs: number;
 }
 
-export type CronJobCreate = Pick<CronJob, "name" | "message" | "sessionKey"> & {
-  schedule: string; // Parsed by the CLI: "in 20m", "every 1h", "0 9 * * *"
-  deleteAfterRun?: boolean;
-  staleAfterMs?: number;
-};
-
 /** A single-fire job recovery parked, and why. */
 export interface InterruptedSkip {
   job: CronJob;

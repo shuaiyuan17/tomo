@@ -530,14 +530,6 @@ export class TelegramChannel implements Channel {
     });
   }
 
-  /** Drop a previously recorded own message from the recent ring (retraction). */
-  private forgetOwnMessage(chatId: string, messageId: number): void {
-    const ring = this.recentByChat.get(chatId);
-    if (!ring) return;
-    const idx = ring.findIndex((m) => m.id === String(messageId));
-    if (idx !== -1) ring.splice(idx, 1);
-  }
-
   recentMessages(chatId: string): RecentChatMessage[] {
     return [...(this.recentByChat.get(chatId) ?? [])];
   }

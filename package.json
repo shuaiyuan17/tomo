@@ -3,7 +3,6 @@
   "version": "0.12.0",
   "description": "Personal assistant powered by Claude Agent SDK",
   "type": "module",
-  "main": "dist/index.js",
   "bin": {
     "tomo": "dist/cli.js"
   },

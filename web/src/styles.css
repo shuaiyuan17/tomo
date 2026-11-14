@@ -27,6 +27,8 @@
   --border: #dbd1bd;
   --input: #dbd1bd;
   --ring: #526346;
+  --shimmer-base: #70665d;
+  --shimmer-glint: #c3cfaf;
   --radius: 0.75rem;
   --font-serif: Georgia, "Times New Roman", serif;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -52,6 +54,8 @@
   --border: #4e463c;
   --input: #4e463c;
   --ring: #c9a97a;
+  --shimmer-base: #6f675c;
+  --shimmer-glint: #fbf6ec;
 }
 
 @theme inline {
@@ -80,7 +84,7 @@
   --font-serif: var(--font-serif);
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
-  --animate-shimmer: shimmer 2.2s linear infinite;
+  --animate-shimmer: shimmer 2s linear infinite;
   @keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0% 0; } }
   @keyframes rail-in { from { transform: translateX(100%); } }
 }
@@ -99,13 +103,15 @@
   .eyebrow { @apply m-0 font-mono text-[11px] uppercase leading-relaxed tracking-[0.12em] text-muted-foreground; }
 
   /* "Working" sweeps a soft highlight, like the old slide-to-unlock. */
+  /* A bright glint sweeping across dim text, like the old slide-to-unlock:
+     the band is about a third of the word wide, with soft edges. */
   .shimmer {
     @apply animate-shimmer bg-clip-text text-transparent;
-    background-image: linear-gradient(100deg, var(--muted-foreground) 0%, var(--muted-foreground) 40%, var(--foreground) 50%, var(--muted-foreground) 60%, var(--muted-foreground) 100%);
-    background-size: 250% 100%;
+    background-image: linear-gradient(100deg, var(--shimmer-base) 0%, var(--shimmer-base) 43%, var(--shimmer-glint) 50%, var(--shimmer-base) 57%, var(--shimmer-base) 100%);
+    background-size: 300% 100%;
     background-repeat: no-repeat;
   }
-  @media (prefers-reduced-motion: reduce) { .shimmer { @apply text-muted-foreground; background: none; } }
+  @media (prefers-reduced-motion: reduce) { .shimmer { color: var(--shimmer-base); background: none; } }
 
   /* Rendered markdown (model output): typography only, no executable HTML. */
   .markdown { @apply text-[15px] leading-[1.75]; overflow-wrap: anywhere; }

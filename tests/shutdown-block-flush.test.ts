@@ -106,7 +106,7 @@ const { LiveSessionManager, SHUTDOWN_NOT_PROCESSED } = await import("../src/agen
 const { TurnRunner } = await import("../src/agent/turn-runner.js");
 const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 const { isSilentReply } = await import("../src/agent/text-utils.js");
-const { DELIVERY_FAILED_MARKER } = await import("../src/agent/block-transcript.js");
+const { DELIVERY_UNKNOWN_MARKER } = await import("../src/agent/block-transcript.js");
 
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
@@ -270,7 +270,7 @@ describe("shutdown flushes the block transcript before converting a turn to NO_R
     expect(r.transcript).not.toContain("NO_REPLY");
   });
 
-  it("closes a slot whose send is still OPEN with the failure marker, in slot order, without hanging", async () => {
+  it("closes a slot whose send is still OPEN with the status-unknown marker, in slot order, without hanging", async () => {
     const r = rig();
     r.channel.hang("A");
     const turn = r.start();
@@ -284,13 +284,13 @@ describe("shutdown flushes the block transcript before converting a turn to NO_R
     await r.manager.stop();
     await turn;
 
-    expect(r.transcript).toEqual([`${DELIVERY_FAILED_MARKER}A`]);
+    expect(r.transcript).toEqual([`${DELIVERY_UNKNOWN_MARKER}A`]);
 
     // The parked send has no cancellation to be handed; it completes late.
     // Its slot is already closed, so it cannot rewrite history.
     r.channel.releaseHangs();
     await new Promise((res) => setTimeout(res, 10));
-    expect(r.transcript).toEqual([`${DELIVERY_FAILED_MARKER}A`]);
+    expect(r.transcript).toEqual([`${DELIVERY_UNKNOWN_MARKER}A`]);
   });
 
   it("is unchanged when no block was ever in flight: NO_REPLY, recorded once, quickly", async () => {

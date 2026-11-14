@@ -2,7 +2,7 @@ import { Bot, GrammyError, type Context } from "grammy";
 import { existsSync } from "node:fs";
 import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
-import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure } from "./types.js";
+import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure, markNothingSent, markPartsSent } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
 import {
@@ -613,9 +613,19 @@ export class TelegramChannel implements Channel {
   }
 
   async send(message: OutgoingMessage): Promise<void> {
+    // How many provider calls of THIS send landed, so a failure can say
+    // whether anything is already on the phone (see markNothingSent).
+    const progress = { sent: 0, total: 1 };
     try {
-      await this.sendUnmarked(message);
+      await this.sendUnmarked(message, progress);
     } catch (err) {
+      if (!(err instanceof PartialSendError)) {
+        if (progress.sent === 0 && (err instanceof GrammyError || err instanceof AttachmentUnreadableError)) {
+          markNothingSent(err);
+        } else if (progress.sent > 0) {
+          markPartsSent(err, progress.sent, progress.total);
+        }
+      }
       // A GrammyError is the Bot API answering `ok: false` — the server saw
       // the request and refused it, so nothing was sent: DEFINITE, and the
       // delivery pipeline may re-send a caption by another route. Marked
@@ -627,7 +637,7 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  private async sendUnmarked(message: OutgoingMessage): Promise<void> {
+  private async sendUnmarked(message: OutgoingMessage, progress: { sent: number; total: number }): Promise<void> {
     // `allow_sending_without_reply` makes the thread a PREFERENCE, not a
     // precondition. Without it the Bot API answers 400
     // "message to be replied not found" when the target is gone — the user
@@ -658,6 +668,7 @@ export class TelegramChannel implements Channel {
         ...replyParams,
         caption: fitsCaption ? caption : undefined,
       });
+      progress.sent++;
       if (fitsCaption && caption) {
         // A captioned photo is the visible form of a text reply (the delivery
         // pipeline ships assistant text as the first photo's caption) — it
@@ -677,6 +688,7 @@ export class TelegramChannel implements Channel {
 
     if (message.sticker) {
       await this.bot.api.sendSticker(message.chatId, message.sticker, replyParams);
+      progress.sent++;
       return;
     }
 
@@ -684,6 +696,7 @@ export class TelegramChannel implements Channel {
     // outright, so chunk like the iMessage channel does. Only the first
     // chunk carries the reply reference.
     const chunks = splitText(message.text, TELEGRAM_TEXT_LIMIT);
+    progress.total = chunks.length;
     for (const [i, chunk] of chunks.entries()) {
       const params = i === 0 ? replyParams : {};
       let sent;
@@ -703,6 +716,7 @@ export class TelegramChannel implements Channel {
         log.debug({ chatId: message.chatId, err: this.redactToken(err) }, "Telegram rejected Markdown; resending as plain text");
         sent = await this.bot.api.sendMessage(message.chatId, chunk, params);
       }
+      progress.sent++;
       this.recordOwnMessage(message.chatId, sent.message_id, chunk);
     }
   }

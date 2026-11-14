@@ -4,7 +4,7 @@ import { readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, ImageAttachment, DocumentAttachment, StopTyping } from "./types.js";
-import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure } from "./types.js";
+import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure, markNothingSent, markPartsSent } from "./types.js";
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
@@ -744,75 +744,88 @@ export class ImsgChannel implements Channel {
     // reply_to param at all. Track the one success rather than assume it.
     let threaded = false;
     const chunks = splitText(text, TEXT_CHUNK_LIMIT);
-    for (const [i, chunk] of chunks.entries()) {
-      // Threaded replies and expressive-send effects need the IMCore bridge
-      // (send.rich); plain sends stay on the AppleScript transport. Only the
-      // first chunk carries either: continuation chunks read as one message,
-      // not repeated replies — and one effect per message, not one per chunk
-      // (three confetti bursts for one long message is noise, not emphasis).
-      const richParams = i === 0 && (message.replyTo || message.effect)
-        ? {
-          ...(message.replyTo ? { reply_to: message.replyTo } : {}),
-          ...(message.effect ? { effect: message.effect } : {}),
+    // Parts of THIS text already on the phone, so a failure can say whether
+    // anything went out (markNothingSent) or how much (markPartsSent).
+    let sentParts = 0;
+    try {
+      for (const [i, chunk] of chunks.entries()) {
+        // Threaded replies and expressive-send effects need the IMCore bridge
+        // (send.rich); plain sends stay on the AppleScript transport. Only the
+        // first chunk carries either: continuation chunks read as one message,
+        // not repeated replies — and one effect per message, not one per chunk
+        // (three confetti bursts for one long message is noise, not emphasis).
+        const richParams = i === 0 && (message.replyTo || message.effect)
+          ? {
+            ...(message.replyTo ? { reply_to: message.replyTo } : {}),
+            ...(message.effect ? { effect: message.effect } : {}),
+          }
+          : null;
+        if (richParams && this.capabilities.advancedFeatures && bridgeAddressable) {
+          try {
+            const result = await this.request("send.rich", {
+              chat_guid: chatId,
+              text: chunk,
+              ...richParams,
+              part_index: 0,
+            });
+            sentParts++;
+            this.recordOwnSend(chatId, result, chunk);
+            if (message.replyTo) threaded = true;
+            continue;
+          } catch (err) {
+            // Fall back to a plain send only on a definite refusal (an RPC
+            // error response proves nothing was sent). An ambiguous failure —
+            // timeout, child death — may have dispatched the message before
+            // dying; resending the text plain would double-deliver, so
+            // propagate instead: prefer a missing message over a duplicate.
+            if (!(err instanceof ImsgRpcResponseError)) throw err;
+            log.warn({ err, chatId }, "imsg rich send refused; falling back to plain send");
+          }
+        } else if (richParams && bridgeAddressable) {
+          // Bridge down per the cached snapshot → this goes out plain, as
+          // before (the effect is silently dropped — a structured field, so
+          // nothing can leak into the visible text). Kick a rate-limited
+          // background re-probe so a bridge that has since come up (#258)
+          // restores rich sends for the next send.
+          this.maybeReprobeCapabilities();
+        } else if (isBareHttpUrl(chunk) && bridgeAddressable) {
+          // A part that is exactly one URL: send it as an Apple rich link
+          // preview when the injected bridge supports it (the balloon iMessage
+          // renders when a human shares a link), else leave it a plain text
+          // send as before. send.rich's url mode accepts NO other params
+          // (no text/reply_to/effect), which is why this branch is mutually
+          // exclusive with the rich-text branch above.
+          if (this.richLinksSupported()) {
+            if (await this.trySendRichLink(chatId, chunk.trim())) { sentParts++; continue; }
+          } else {
+            // Snapshot lacks the rich-link selectors. Unlike a missing edit
+            // selector (an OS limit), this state heals: a Messages relaunch
+            // with the 0.13+ bridge adds the selectors while advanced_features
+            // stays true throughout — hence evenIfBridged, or the reprobe
+            // would early-return forever and rich links would need a daemon
+            // restart to ever light up. (Mind the operational trap the
+            // diagnosis names: `imsg launch` alone no-ops while the old bridge
+            // still answers ping — Messages must actually quit first.)
+            this.maybeReprobeCapabilities({ evenIfBridged: true });
+            log.info(
+              { chatId, ...this.capabilityGateDiagnosis(null, ["urlPreviewMessage", "sendRichLinkAction"]) },
+              "imsg rich link preview unavailable; sending the URL as plain text",
+            );
+          }
         }
-        : null;
-      if (richParams && this.capabilities.advancedFeatures && bridgeAddressable) {
-        try {
-          const result = await this.request("send.rich", {
-            chat_guid: chatId,
-            text: chunk,
-            ...richParams,
-            part_index: 0,
-          });
-          this.recordOwnSend(chatId, result, chunk);
-          if (message.replyTo) threaded = true;
-          continue;
-        } catch (err) {
-          // Fall back to a plain send only on a definite refusal (an RPC
-          // error response proves nothing was sent). An ambiguous failure —
-          // timeout, child death — may have dispatched the message before
-          // dying; resending the text plain would double-deliver, so
-          // propagate instead: prefer a missing message over a duplicate.
-          if (!(err instanceof ImsgRpcResponseError)) throw err;
-          log.warn({ err, chatId }, "imsg rich send refused; falling back to plain send");
-        }
-      } else if (richParams && bridgeAddressable) {
-        // Bridge down per the cached snapshot → this goes out plain, as
-        // before (the effect is silently dropped — a structured field, so
-        // nothing can leak into the visible text). Kick a rate-limited
-        // background re-probe so a bridge that has since come up (#258)
-        // restores rich sends for the next send.
-        this.maybeReprobeCapabilities();
-      } else if (isBareHttpUrl(chunk) && bridgeAddressable) {
-        // A part that is exactly one URL: send it as an Apple rich link
-        // preview when the injected bridge supports it (the balloon iMessage
-        // renders when a human shares a link), else leave it a plain text
-        // send as before. send.rich's url mode accepts NO other params
-        // (no text/reply_to/effect), which is why this branch is mutually
-        // exclusive with the rich-text branch above.
-        if (this.richLinksSupported()) {
-          if (await this.trySendRichLink(chatId, chunk.trim())) continue;
-        } else {
-          // Snapshot lacks the rich-link selectors. Unlike a missing edit
-          // selector (an OS limit), this state heals: a Messages relaunch
-          // with the 0.13+ bridge adds the selectors while advanced_features
-          // stays true throughout — hence evenIfBridged, or the reprobe
-          // would early-return forever and rich links would need a daemon
-          // restart to ever light up. (Mind the operational trap the
-          // diagnosis names: `imsg launch` alone no-ops while the old bridge
-          // still answers ping — Messages must actually quit first.)
-          this.maybeReprobeCapabilities({ evenIfBridged: true });
-          log.info(
-            { chatId, ...this.capabilityGateDiagnosis(null, ["urlPreviewMessage", "sendRichLinkAction"]) },
-            "imsg rich link preview unavailable; sending the URL as plain text",
-          );
-        }
+        const result = await this.request("send", {
+          ...this.imsgTarget(chatId),
+          text: chunk,
+        });
+        sentParts++;
+        this.recordOwnSend(chatId, result, chunk);
       }
-      const result = await this.request("send", {
-        ...this.imsgTarget(chatId),
-        text: chunk,
-      });
-      this.recordOwnSend(chatId, result, chunk);
+    } catch (err) {
+      // Only an RPC error RESPONSE proves the failing call sent nothing; with
+      // no earlier part out either, the whole send put nothing on the wire.
+      if (sentParts === 0 && err instanceof ImsgRpcResponseError) markNothingSent(err);
+      else if (sentParts > 0) markPartsSent(err, sentParts, chunks.length);
+      throw err;
     }
     // The text shipped, but if it shipped PLAIN the reply target did not go
     // with it: the AppleScript `send` has no reply_to. Returning nothing here

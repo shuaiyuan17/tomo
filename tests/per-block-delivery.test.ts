@@ -119,9 +119,12 @@ const { TurnRunner } = await import("../src/agent/turn-runner.js");
 const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 const { isSilentReply } = await import("../src/agent/text-utils.js");
 const { log } = await import("../src/logger.js");
-const { DELIVERY_FAILED_MARKER } = await import("../src/agent/block-transcript.js");
+const { DELIVERY_FAILED_MARKER, DELIVERY_UNKNOWN_MARKER } = await import("../src/agent/block-transcript.js");
 const { FABRICATED_MARKER_NOTICE, formatGroupTag, formatInboundStamp } = await import("../src/agent/inbound-markers.js");
 const { watchBus } = await import("../src/watch/bus.js");
+const { markDefiniteFailure, markNothingSent, markPartsSent } = await import("../src/channels/types.js");
+const { undeliveredBlockNote } = await import("../src/agent/turn-runner.js");
+const { PartialDeliveryError } = await import("../src/agent/delivery-pipeline.js");
 
 // --- event builders -------------------------------------------------------
 
@@ -156,6 +159,14 @@ class OrderedChannel implements Channel {
   sent: OutgoingMessage[] = [];
   /** Texts whose send must throw, for the partial-delivery tests. */
   failTexts = new Set<string>();
+  /** Texts whose NEXT send is refused with NOTHING on the wire — once each. */
+  refuseOnce = new Set<string>();
+  /** Texts whose every send is refused with nothing on the wire. */
+  refuseAlways = new Set<string>();
+  /** Texts whose NEXT send fails definitely AFTER part 1 of 2 went out. */
+  partialOnce = new Set<string>();
+  /** Texts whose send parks, then — on release — is refused with nothing sent. */
+  hangThenRefuse = new Set<string>();
   /**
    * Texts whose send PARKS until the test releases it — a wedged channel, the
    * shape the delivery budget exists for. The send is not cancelled when the
@@ -182,6 +193,23 @@ class OrderedChannel implements Channel {
   onMessage(): void {}
   onCommand(): void {}
   async send(message: OutgoingMessage): Promise<void> {
+    if (message.text !== undefined && this.hangThenRefuse.has(message.text)) {
+      this.hangThenRefuse.delete(message.text);
+      this.order.push(`send-parked:${message.text}`);
+      await new Promise<void>((resolve) => { this.gates.push(resolve); });
+      this.order.push(`send-refused:${message.text}`);
+      throw markNothingSent(new Error(`provider refused ${message.text}`));
+    }
+    if (message.text !== undefined && (this.refuseOnce.has(message.text) || this.refuseAlways.has(message.text))) {
+      this.refuseOnce.delete(message.text);
+      this.order.push(`send-refused:${message.text}`);
+      throw markNothingSent(new Error(`provider refused ${message.text}`));
+    }
+    if (message.text !== undefined && this.partialOnce.has(message.text)) {
+      this.partialOnce.delete(message.text);
+      this.order.push(`send-partial:${message.text}`);
+      throw markPartsSent(markDefiniteFailure(new Error(`provider refused part 2 of ${message.text}`)), 1, 2);
+    }
     if (message.text !== undefined && this.failTexts.has(message.text)) {
       this.order.push(`send-failed:${message.text}`);
       throw new Error(`channel refused ${message.text}`);
@@ -206,6 +234,8 @@ interface Rig {
   order: string[];
   channel: OrderedChannel;
   transcript: string[];
+  /** DURABLE notes queued for the next turn (queueDeliveryFailureNote). */
+  errorNotes: string[];
   /** The session under test — for state the hooks read (undelivered reply). */
   session: InstanceType<typeof LiveSession>;
   run: (events: AnyEvent[], overrides?: Partial<TurnSpec>) => Promise<boolean>;
@@ -221,6 +251,7 @@ function makeRig(settings: {
   const order: string[] = [];
   const channel = new OrderedChannel(order);
   const transcript: string[] = [];
+  const errorNotes: string[] = [];
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
 
@@ -230,6 +261,8 @@ function makeRig(settings: {
       ?? ((req) => session.send(req.prompt, undefined, undefined, req.onBlock, req.onBlockAbandoned)),
     appendAssistantTranscript: (_key, content) => { transcript.push(content); },
     queuePendingErrorNote: () => {},
+    queueDeliveryFailureNote: (_key, note) => { errorNotes.push(note); },
+    blockRetryDelayMs: 0,
     startTurnTyping: (): StopTyping => async () => {},
     isPrivateMemoryBarred: () => false,
     delivery: new DeliveryPipeline({ queuePendingErrorNote: () => {} }),
@@ -269,7 +302,7 @@ function makeRig(settings: {
     return done;
   };
 
-  return { order, channel, transcript, session, run, close: () => session.close() };
+  return { order, channel, transcript, errorNotes, session, run, close: () => session.close() };
 }
 
 let rigs: Rig[] = [];
@@ -992,6 +1025,109 @@ describe("the transcript records what was DELIVERED, not what was composed", () 
 });
 
 /**
+ * P0-5 (audit 2026-11-13): an ordinary user turn records `transcript: "always"`
+ * — the CLEAN joined response, once, after the turn. A block whose send threw
+ * was marked in its deferred slot, but that slot was only ever flushed when the
+ * turn itself died, so a turn that carried on normally recorded the clean text
+ * of a block the owner never received, queued nothing for the next turn, and
+ * never retried. The owner got nothing; the model and recall believed he had.
+ */
+describe("an `always` turn whose block failed to send does not claim it was delivered", () => {
+  it("records per-block entries with the marker instead of the clean joined response", async () => {
+    const r = rig();
+    r.channel.failTexts.add("B");
+
+    expect(await r.run([
+      assistant([textBlock("A")]),
+      assistant([textBlock("B")]),
+      assistant([textBlock("C")]),
+      result(),
+    ])).toBe(true);
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["A", "C"]);
+    expect(r.transcript).toEqual(["A", `${DELIVERY_FAILED_MARKER}B`, "C"]);
+    expect(r.transcript.some((t) => /(^|\n)B(\n|$)/.test(t) && !t.startsWith(DELIVERY_FAILED_MARKER))).toBe(false);
+  });
+
+  it("queues a pending error note so the next turn knows the block never arrived", async () => {
+    const r = rig();
+    r.channel.failTexts.add("the only reply");
+
+    await r.run([assistant([textBlock("the only reply")]), result()]);
+
+    expect(r.channel.sent).toEqual([]);
+    expect(r.errorNotes).toHaveLength(1);
+    expect(r.errorNotes[0]).toContain("delivery failed");
+    expect(r.errorNotes[0]).toContain("the only reply");
+    expect(r.transcript).toEqual([`${DELIVERY_FAILED_MARKER}the only reply`]);
+  });
+
+  it("re-sends a block the channel says put NOTHING on the wire, once, and records it clean when the re-send lands", async () => {
+    const r = rig();
+    r.channel.refuseOnce.add("hello there");
+
+    await r.run([assistant([textBlock("hello there")]), result()]);
+
+    expect(r.order).toEqual(["send-refused:hello there", "send:hello there", "TURN-RETURNED"]);
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["hello there"]);
+    expect(r.transcript).toEqual(["hello there"]);
+    expect(r.errorNotes).toEqual([]);
+  });
+
+  it("never re-sends a block that PARTLY went out (definite refusal of a later part)", async () => {
+    const r = rig();
+    r.channel.partialOnce.add("long reply");
+
+    await r.run([assistant([textBlock("long reply")]), result()]);
+
+    expect(r.order.filter((e) => e.endsWith("long reply"))).toEqual(["send-partial:long reply"]);
+    expect(r.errorNotes).toHaveLength(1);
+    expect(r.errorNotes[0]).toContain("PARTIALLY delivered");
+    expect(r.errorNotes[0]).toContain("first 1");
+  });
+
+  it("says NOT delivered when the re-send is refused with nothing sent too", async () => {
+    const r = rig();
+    r.channel.refuseAlways.add("nope");
+
+    await r.run([assistant([textBlock("nope")]), result()]);
+
+    expect(r.order.filter((e) => e.endsWith("nope"))).toEqual(["send-refused:nope", "send-refused:nope"]);
+    expect(r.errorNotes).toHaveLength(1);
+    expect(r.errorNotes[0]).toContain("NOT delivered");
+    expect(r.errorNotes[0]).not.toContain("UNKNOWN");
+  });
+
+  it("never re-sends an AMBIGUOUS failure — it may already be on the owner's phone", async () => {
+    const r = rig();
+    r.channel.failTexts.add("maybe sent");
+
+    await r.run([assistant([textBlock("maybe sent")]), result()]);
+
+    expect(r.order.filter((e) => e.endsWith("maybe sent"))).toEqual(["send-failed:maybe sent"]);
+    expect(r.errorNotes).toHaveLength(1);
+    expect(r.errorNotes[0]).toContain("UNKNOWN whether delivered");
+  });
+});
+
+describe("undeliveredBlockNote: three different facts, three wordings", () => {
+  it("names the pieces that arrived for a partial media block", () => {
+    const err = new PartialDeliveryError(new Error("caption refused"), [
+      { text: "MEDIA:/tmp/a.png", delivered: true },
+      { text: "the caption", delivered: false },
+    ]);
+    const note = undeliveredBlockNote("telegram", "MEDIA:/tmp/a.png the caption", err);
+    expect(note).toContain("PARTIALLY delivered");
+    expect(note).toMatch(/Arrived: "MEDIA:\/tmp\/a\.png"/);
+    expect(note).toMatch(/Not known to have arrived: "the caption"/);
+  });
+
+  it("an abandoned (timed-out) block is UNKNOWN, not NOT delivered", () => {
+    expect(undeliveredBlockNote("imessage", "slow", undefined)).toContain("UNKNOWN whether delivered");
+  });
+});
+
+/**
  * THE TRANSCRIPT IS ORDERED BY DISPATCH, NOT BY SETTLEMENT.
  *
  * A block's transcript entry can only be written once its send has settled —
@@ -1010,6 +1146,55 @@ describe("the transcript records what was DELIVERED, not what was composed", () 
 describe("a wedged block keeps its place in the transcript", () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
+
+  it("an `always` turn records the abandoned block MARKED, not inside a clean joined response", async () => {
+    const r = rig();
+    r.channel.hang("A");
+
+    const turn = r.run([assistant([textBlock("A")]), assistant([textBlock("B")]), result()]);
+    await vi.advanceTimersByTimeAsync(60_200);
+    await turn;
+
+    expect(r.transcript).toEqual([`${DELIVERY_UNKNOWN_MARKER}A`, "B"]);
+    expect(r.errorNotes.some((n) => n.includes("timed out"))).toBe(true);
+    r.channel.releaseHangs();
+    await vi.advanceTimersByTimeAsync(20);
+  });
+
+  it("block 1 delivered, block 2 timed out: block 2 is recorded as status UNKNOWN, not as not-delivered", async () => {
+    const r = rig();
+    r.channel.hang("B");
+
+    const turn = r.run([assistant([textBlock("A")]), assistant([textBlock("B")]), result()]);
+    await vi.advanceTimersByTimeAsync(60_200);
+    await turn;
+
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["A"]);
+    expect(r.transcript).toEqual(["A", `${DELIVERY_UNKNOWN_MARKER}B`]);
+    expect(r.transcript.some((t) => t.startsWith(DELIVERY_FAILED_MARKER))).toBe(false);
+    expect(r.errorNotes).toHaveLength(1);
+    expect(r.errorNotes[0]).toContain("UNKNOWN whether delivered");
+    expect(r.errorNotes[0]).not.toContain("NOT delivered");
+    r.channel.releaseHangs();
+    await vi.advanceTimersByTimeAsync(20);
+  });
+
+  it("never re-sends an abandoned block whose late failure says nothing went out", async () => {
+    const r = rig();
+    r.channel.hangThenRefuse.add("stale");
+
+    const turn = r.run([assistant([textBlock("stale")]), assistant([textBlock("next")]), result()]);
+    await vi.advanceTimersByTimeAsync(60_200);
+    await turn;
+    // The turn gave up on "stale" and moved on; now its send finally fails.
+    r.channel.releaseHangs();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(r.order.filter((e) => e.endsWith(":stale"))).toEqual(["send-parked:stale", "send-refused:stale"]);
+    expect(r.channel.sent.map((m) => m.text)).toEqual(["next"]);
+    // One note (the abandon), not a second one for the late failure.
+    expect(r.errorNotes.filter((n) => n.includes("stale"))).toHaveLength(1);
+  });
 
   it("records the abandoned block IN ORDER, and ignores its late completion", async () => {
     const r = rig();
@@ -1030,10 +1215,10 @@ describe("a wedged block keeps its place in the transcript", () => {
     // place, before B is ever handed over — so A's entry is FIRST even though
     // B's send is the one that settled first.
     await vi.advanceTimersByTimeAsync(60_100);
-    expect(r.transcript[0]).toBe("[delivery failed] A");
+    expect(r.transcript[0]).toBe("[delivery status unknown] A");
 
     await turn;
-    expect(r.transcript).toEqual(["[delivery failed] A", "B"]);
+    expect(r.transcript).toEqual(["[delivery status unknown] A", "B"]);
     // B is on the owner's phone; A is not known to be.
     expect(r.channel.sent.map((m) => m.text)).toEqual(["B"]);
 
@@ -1042,7 +1227,7 @@ describe("a wedged block keeps its place in the transcript", () => {
     // marker's ambiguity means — but it must not rewrite history.
     r.channel.releaseHangs();
     await vi.advanceTimersByTimeAsync(20);
-    expect(r.transcript).toEqual(["[delivery failed] A", "B"]);
+    expect(r.transcript).toEqual(["[delivery status unknown] A", "B"]);
   });
 });
 

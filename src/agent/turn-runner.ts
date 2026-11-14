@@ -7,6 +7,7 @@ import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { endsWithTrailingNoReply, isSilentReply, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
+import { isNothingSent, partsSent } from "../channels/types.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { formatInboundStamp } from "./inbound-markers.js";
 import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
@@ -123,6 +124,71 @@ export interface DeferredSendTurnDelivery {
 
 export type TurnDelivery = ReplyTurnDelivery | SendTurnDelivery | DeferredSendTurnDelivery;
 
+/** Default pause before re-sending a block the channel says never went out. */
+const DEFAULT_BLOCK_RETRY_DELAY_MS = 1_000;
+/** Ceiling on a provider-requested back-off (Telegram 429 `retry_after`). The
+ *  re-send runs inside the block's 60s delivery budget. */
+const MAX_BLOCK_RETRY_DELAY_MS = 10_000;
+
+/**
+ * Is a failed block safe to send again, once? Only when the channel reports
+ * that the failed send put NOTHING on the wire (`isNothingSent`). "Definite"
+ * is not enough: a long text goes out as several chunks, and a refusal on
+ * chunk 2 is definite while chunk 1 is already on the phone — re-sending the
+ * block would repeat it. Ambiguous failures (timeout, dead bridge) and partial
+ * deliveries are never re-sent; they are recorded as they are.
+ */
+function retryableBlockFailure(err: unknown): boolean {
+  return !(err instanceof PartialDeliveryError) && isNothingSent(err);
+}
+
+/** The provider's own back-off when it gave one (grammY `parameters.retry_after`, seconds). */
+function blockRetryDelay(err: unknown, base: number): number {
+  const retryAfter = (err as { parameters?: { retry_after?: unknown } } | null)?.parameters?.retry_after;
+  if (typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(Math.max(base, retryAfter * 1000), MAX_BLOCK_RETRY_DELAY_MS);
+  }
+  return base;
+}
+
+function excerptOf(text: string, max = 160): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > max ? `"${line.slice(0, max)}…"` : `"${line}"`;
+}
+
+/**
+ * The note the NEXT turn sees for a block that did not (fully) arrive. Three
+ * different facts, three different wordings — the model must not be told
+ * "not delivered" about text that may be on the phone, nor "unknown" about
+ * pieces known to have landed:
+ *
+ * - NOT DELIVERED: the channel vouched nothing went out (`isNothingSent`);
+ * - PARTIALLY DELIVERED: some pieces are known to have arrived — named;
+ * - UNKNOWN: a timeout, a dead bridge, an abandoned send — it may or may not
+ *   have arrived.
+ */
+export function undeliveredBlockNote(channelName: string | undefined, block: string, err: unknown): string {
+  const where = channelName ? ` to ${channelName}` : "";
+  const why = err === undefined ? "the send timed out and was abandoned" : shortErrorMessage(err);
+  if (err instanceof PartialDeliveryError && err.segments.some((seg) => seg.delivered)) {
+    const arrived = err.segments.filter((seg) => seg.delivered).map((seg) => excerptOf(seg.text, 80));
+    const missing = err.segments.filter((seg) => !seg.delivered).map((seg) => excerptOf(seg.text, 80));
+    return `[delivery failed — PARTIALLY delivered] A reply block${where} only partly reached the chat (${why}). `
+      + `Arrived: ${arrived.join(", ")}. Not known to have arrived: ${missing.join(", ")}.`;
+  }
+  const parts = partsSent(err);
+  if (parts && parts.sent > 0) {
+    return `[delivery failed — PARTIALLY delivered] A reply block${where} was sent in ${parts.total} parts and only the first ${parts.sent} arrived (${why}). `
+      + `The rest of ${excerptOf(block)} did NOT arrive.`;
+  }
+  if (err !== undefined && isNothingSent(err)) {
+    return `[delivery failed — NOT delivered] A reply block${where} definitely did not reach the chat (${why}). `
+      + `The recipient did NOT receive ${excerptOf(block)}. Do not assume it was seen.`;
+  }
+  return `[delivery failed — UNKNOWN whether delivered] A reply block${where} may or may not have reached the chat (${why}). `
+    + `Not confirmed: ${excerptOf(block)}. Do not assume it was seen, and do not blindly resend it.`;
+}
+
 /**
  * Does this turn's own model output reach the chat at all?
  *
@@ -231,6 +297,18 @@ export interface TurnRunnerDeps {
    *  in agent/permissions.ts. */
   isPrivateMemoryBarred(sessionKey: string): boolean;
   delivery: DeliveryPipeline;
+  /**
+   * Pause before the one re-send of a block whose send put nothing on the
+   * wire (see `retryableBlockFailure`). Undefined ⇒ the default; tests pass 0.
+   */
+  blockRetryDelayMs?: number;
+  /**
+   * Queue a DURABLE note for the session's next turn — one that survives a
+   * restart. Used for blocks that did not (fully) reach the chat: the next
+   * turn must know, even if the daemon restarts first. Falls back to the
+   * in-memory error note when unwired.
+   */
+  queueDeliveryFailureNote?(sessionKey: string, note: string): void;
   /**
    * Read-and-clear: did this session drop a non-empty thinking block that no
    * text block followed? True at the end of a turn means the model's last
@@ -377,6 +455,11 @@ export class TurnRunner {
       // settled; this only closes out anything still in flight.)
       sink.flushBlockTranscript();
       throw err;
+    } finally {
+      // The turn is over (finished, died, /rewind-interrupted, shut down).
+      // A send still in flight past this point belongs to a turn that has
+      // moved on, and must never be re-sent.
+      sink.end();
     }
 
     if (reply?.steer && rawResponse === STEER_MERGED) {
@@ -422,11 +505,17 @@ export class TurnRunner {
     // "NO_REPLY". Appending it on top would assert silence for a turn that
     // spoke. Nothing else can flush and then arrive here (the turn-died path
     // rethrows), so this guard only ever bites on shutdown.
+    //
+    // NOR WHEN A BLOCK FAILED TO SEND. The joined response is the CLEAN text of
+    // every block — recording it would claim the failed one was delivered, and
+    // recall would later read back something the owner never received. The
+    // per-block entries say exactly what landed and mark what did not, so they
+    // are recorded instead (the same entries the turn-died path flushes).
     if (spec.transcript === "always" && reply && !sink.recordedAny()) {
-      // The joined response would record a withheld attachment's tag as said
-      // and shipped. When a block withheld one, record the per-block entries
-      // (which mark it) instead.
-      if (sink.withheldAny()) sink.flushBlockTranscript();
+      // A block that withheld a private attachment, or failed to send, makes
+      // the joined response a false record: record the per-block entries
+      // (which mark those pieces) instead.
+      if (sink.withheldAny() || sink.deliveryFailed()) sink.flushBlockTranscript();
       else this.deps.appendAssistantTranscript(spec.key, response, reply.channel.name);
     }
 
@@ -556,6 +645,8 @@ export class TurnRunner {
     flushBlockTranscript: () => boolean;
     recordedAny: () => boolean;
     withheldAny: () => boolean;
+    deliveryFailed: () => boolean;
+    end: () => void;
   } {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
@@ -575,6 +666,11 @@ export class TurnRunner {
     // unresolvable target must not be reported for a turn that stays silent.
     let sender: BlockSender | undefined;
     let channelName: string | undefined;
+    // Set once runWithRetry has settled — see runDelivery.
+    let ended = false;
+    // The block whose send is in flight. Delivery is serialized, so there is
+    // at most one; named in the note if it is abandoned.
+    let inFlightBlock: string | undefined;
 
     // Entries are appended in DISPATCH order, not settle order: a block takes
     // its slot before its send is attempted and fills it when the send settles,
@@ -589,6 +685,10 @@ export class TurnRunner {
     let recordedAny = false;
     /** Some block resolved with a piece withheld by policy. */
     let withheldAny = false;
+    // A block's send failed for good (after its one permitted re-send). Read by
+    // the post-turn `always` append, which must then record the per-block
+    // entries instead of the clean joined response.
+    let deliveryFailed = false;
     const transcript = createOrderedBlockTranscript(
       (entry) => {
         if (!channelName) return;
@@ -637,6 +737,7 @@ export class TurnRunner {
       // happens to settle, is what let a fast block B overtake a wedged block A
       // in the transcript.
       const slot = transcript.reserve(block);
+      inFlightBlock = block;
       try {
         const receipt = await sender.deliver(outgoing);
         if (receipt) withheldAny = true;
@@ -665,7 +766,47 @@ export class TurnRunner {
         // out of model order. Only the channel can fix this properly (an
         // idempotent send with a dispatch receipt); until then we prefer a
         // possibly-reordered pair over a turn that dies on one bad send.
-        log.error({ err, sessionKey: spec.key }, "Block delivery failed");
+        //
+        // ONE RE-SEND, AND ONLY WHEN THE CHANNEL SAYS NOTHING WENT OUT. The
+        // first provider call was refused (Telegram 429, chat briefly
+        // unavailable) with nothing before it, so trying again cannot
+        // duplicate. Ambiguous and partial failures are never re-sent.
+        //
+        // AND NEVER FOR A BLOCK THE TURN HAS GIVEN UP ON. A send that outlived
+        // its delivery budget was abandoned (its slot closed out, its note
+        // queued) and the turn moved on — or the turn has since ended, been
+        // /rewind-ed or shut down. Re-sending then would deliver a stale reply
+        // after the conversation has continued. Checked before AND after the
+        // back-off, since either can happen while we wait.
+        const givenUp = (): boolean => ended || !slot.isOpen();
+        let failure: unknown = err;
+        if (givenUp()) {
+          log.warn({ err, sessionKey: spec.key }, "Late failure for a block already given up on; not re-sending");
+        } else if (retryableBlockFailure(err)) {
+          const delay = blockRetryDelay(err, this.deps.blockRetryDelayMs ?? DEFAULT_BLOCK_RETRY_DELAY_MS);
+          log.warn({ err, sessionKey: spec.key, delayMs: delay }, "Block delivery refused before anything went out; re-sending once");
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+          if (givenUp()) {
+            log.warn({ sessionKey: spec.key }, "Block given up on during the re-send back-off; not re-sending");
+          } else {
+            try {
+              const retryReceipt = await sender.deliver(outgoing);
+              if (retryReceipt) withheldAny = true;
+              slot.settle(deliveredEntry(block, retryReceipt));
+              return;
+            } catch (retryErr) {
+              failure = retryErr;
+            }
+          }
+        }
+        // An abandoned block already has its entry and its note.
+        if (!slot.isOpen()) return;
+        log.error({ err: failure, sessionKey: spec.key }, "Block delivery failed");
+        deliveryFailed = true;
+        // The next turn must know: without this the model carries on as if the
+        // owner had read the block, and nothing else tells it otherwise.
+        // Durable — it must survive a restart before that next turn.
+        this.queueDeliveryNote(spec.key, undeliveredBlockNote(channelName, block, failure));
         // Still recorded, but MARKED. Dropping it would lose the fact that the
         // turn composed this text at all; recording it clean would assert a
         // delivery that did not happen. The marker is also the honest answer
@@ -674,14 +815,20 @@ export class TurnRunner {
         // that outcome was recorded, in order, when we gave up on it.
         // A block that withheld a private piece AND failed another still
         // withheld it: the joined response must not be recorded either way.
-        if (err instanceof PartialDeliveryError && err.withheld) withheldAny = true;
-        slot.settle(failedDeliveryEntry(block, err));
+        if (failure instanceof PartialDeliveryError && failure.withheld) withheldAny = true;
+        slot.settle(failedDeliveryEntry(block, failure));
       }
     };
 
     return {
       onBlock,
-      onBlockAbandoned: () => transcript.abandonOldest(),
+      // An abandoned block (blew its delivery budget) is not known to have
+      // landed either: same honesty rule as a send that threw.
+      onBlockAbandoned: () => {
+        deliveryFailed = true;
+        this.queueDeliveryNote(spec.key, undeliveredBlockNote(channelName, inFlightBlock ?? "", undefined));
+        transcript.abandonOldest();
+      },
       handledAny: () => handledAny,
       hasShipped: () => shipped,
       // Shared by BOTH paths on which the post-turn recording never runs: the
@@ -691,7 +838,15 @@ export class TurnRunner {
       flushBlockTranscript: () => { transcript.flushAll(); return recordedAny; },
       recordedAny: () => recordedAny,
       withheldAny: () => withheldAny,
+      deliveryFailed: () => deliveryFailed,
+      end: () => { ended = true; },
     };
+  }
+
+  /** Durable when the host wires it (survives a restart), else in-memory. */
+  private queueDeliveryNote(sessionKey: string, note: string): void {
+    if (this.deps.queueDeliveryFailureNote) this.deps.queueDeliveryFailureNote(sessionKey, note);
+    else this.deps.queuePendingErrorNote(sessionKey, note);
   }
 
   private async handleThrownError(spec: TurnSpec, err: unknown, stopTyping: StopTyping): Promise<boolean> {

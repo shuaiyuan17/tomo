@@ -110,7 +110,7 @@ describe("web routing through the real Agent", () => {
     // filters silence. Web must not rewrite the session's existing policy.
     expect(store().get("dm:owner").messages.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual(["Visible block\nNO_REPLY", "NO_REPLY"]);
   });
-  it("does not retry a failed web delivery and preserves the existing raw transcript policy", async () => {
+  it("does not retry a failed web delivery and records it MARKED undelivered, not as a clean reply", async () => {
     vi.spyOn(web, "send");
     const reply = "x".repeat(260 * 1024);
     mockSdk.responseFn = () => reply;
@@ -118,7 +118,9 @@ describe("web routing through the real Agent", () => {
     await web.receive({ requestId, text: "question" }); await drainQueue(agent);
     expect(web.send).toHaveBeenCalledOnce();
     const messages = store().get("dm:owner").messages.filter((m) => m.role === "assistant");
-    expect(messages).toHaveLength(1); expect(messages[0].content).toBe(reply);
+    // P0-5: the reply never reached the browser, so the transcript must not
+    // claim it did — the block is recorded with the delivery-failed marker.
+    expect(messages).toHaveLength(1); expect(messages[0].content).toBe(`[delivery failed] ${reply}`);
     expect(web.request(requestId).state).toBe("failed");
     expect(webBlocks()).toEqual([]);
   });

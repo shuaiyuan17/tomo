@@ -31,7 +31,7 @@ export function selectOwnerSessionKey(owner: OwnerConfig | undefined, keys: read
 }
 
 /** Reads the owner key from the session registry, cached briefly; fails closed. */
-export function ownerSessionKeyReader(options: WebDataOptions, ttlMs = 2_000, now: () => number = Date.now): () => string | undefined {
+export function ownerSessionKeyReader(options: WebDataOptions, ttlMs = 1_000, now: () => number = Date.now): () => string | undefined {
   let cached: { at: number; key: string | undefined } | undefined;
   return () => {
     if (cached && now() - cached.at < ttlMs) return cached.key;

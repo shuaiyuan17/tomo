@@ -7,15 +7,16 @@ export const TASK_RETENTION_MS = 60_000;
 export const MAX_SESSION_TASKS = 64;
 /** Across all sessions, so the snapshot below has a fixed worst-case size. */
 export const MAX_BOARD_TASKS = 128;
-/** Description length in the snapshot (live updates carry up to 200). */
+/** Text length in the snapshot (live updates carry up to 200). */
 export const SNAPSHOT_DESCRIPTION_LIMIT = 80;
+export const SNAPSHOT_SUMMARY_LIMIT = 120;
 /**
  * Worst-case JSON size of `snapshot()`: MAX_BOARD_TASKS compact entries, each
- * well under 2 KiB even when every string is escaped. channels/web.ts reserves
+ * well under 3 KiB even when every string is escaped. channels/web.ts reserves
  * this much of the snapshot IPC frame, so the snapshot is never truncated and
  * the browser can treat it as the complete list.
  */
-export const MAX_SNAPSHOT_TASK_BYTES = MAX_BOARD_TASKS * 2 * 1024;
+export const MAX_SNAPSHOT_TASK_BYTES = MAX_BOARD_TASKS * 3 * 1024;
 const TASK_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
 const LABEL_LIMIT = 40;
 
@@ -32,7 +33,10 @@ export interface TaskBoardOptions {
  * list whenever it changes.
  */
 export class TaskBoard {
+  /** Everything known, per session (bounded by MAX_SESSION_TASKS). */
   private sessions = new Map<string, Map<string, WebTask>>();
+  /** What the browser was last sent, per session (bounded by MAX_BOARD_TASKS). */
+  private shown = new Map<string, WebTask[]>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly now: () => number;
   private readonly retainMs: number;
@@ -43,21 +47,21 @@ export class TaskBoard {
   }
 
   /**
-   * Every task on the board (complete: the board itself is capped), in a
-   * compact form — short description, no progress summary — whose size is
-   * bounded by MAX_SNAPSHOT_TASK_BYTES. Summaries return with the next
-   * per-session update. `visible` drops sessions the browser may not read.
+   * Exactly what the browser has been sent (the visible board), in a compact
+   * form — short description and summary — whose size is bounded by
+   * MAX_SNAPSHOT_TASK_BYTES, so it is never truncated. `visible` drops
+   * sessions the browser may not read.
    */
   snapshot(visible: (sessionId: string) => boolean = () => true): WebTask[] {
-    return [...this.sessions].filter(([sessionId]) => visible(sessionId)).flatMap(([, tasks]) => [...tasks.values()])
-      .map(({ summary: _summary, ...task }) => ({ ...task, description: clip(task.description, SNAPSHOT_DESCRIPTION_LIMIT) }));
+    return [...this.shown].filter(([sessionId]) => visible(sessionId)).flatMap(([, tasks]) => tasks)
+      .map((task) => ({ ...task, description: clip(task.description, SNAPSHOT_DESCRIPTION_LIMIT),
+        ...(task.summary !== undefined ? { summary: clip(task.summary, SNAPSHOT_SUMMARY_LIMIT) } : {}) }));
   }
 
-  /** Forget a session's tasks (its source changed); the browser is told. */
+  /** Forget a session's tasks (its source changed); the browser is told at once. */
   clear(sessionId: string): void {
     if (!this.sessions.delete(sessionId)) return;
-    this.publish(sessionId, []);
-    this.schedule();
+    this.refresh();
   }
 
   apply(sessionId: string, live: WatchTask[], ended: { taskId: string; status: TaskEndStatus }[] = []): void {
@@ -96,33 +100,61 @@ export class TaskBoard {
       const task = next.get(report.taskId);
       if (task && task.state === "ended") next.set(task.taskId, { ...task, state: report.status });
     }
-    this.store(sessionId, old, next);
+    this.store(sessionId, next);
   }
 
   /** Drop expired ended tasks now. Exposed for the timer and for tests. */
-  prune(): void {
-    for (const [sessionId, tasks] of [...this.sessions]) this.store(sessionId, tasks, new Map(tasks));
-  }
+  prune(): void { this.refresh(); }
 
   dispose(): void { clearTimeout(this.timer); this.timer = undefined; }
 
-  private store(sessionId: string, old: Map<string, WebTask>, next: Map<string, WebTask>): void {
+  private store(sessionId: string, next: Map<string, WebTask>): void {
+    // Per session, live tasks first, then the most recently ended.
+    const list = [...next.values()];
+    const live = list.filter((task) => task.endedAt === undefined);
+    const done = list.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
+    const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
+    if (kept.length) this.sessions.set(sessionId, new Map(kept.map((task) => [task.taskId, task])));
+    else this.sessions.delete(sessionId);
+    this.refresh();
+  }
+
+  /**
+   * Expire ended tasks, share the board's capacity fairly, and publish every
+   * session whose visible list changed. Capacity goes to running tasks first,
+   * round-robin across sessions so one busy session cannot crowd out another;
+   * ended tasks fill what is left. A running task that does not fit stays
+   * stored here and appears as soon as there is room.
+   */
+  private refresh(): void {
     const now = this.now();
-    for (const [id, task] of next) {
-      if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) next.delete(id);
+    for (const [sessionId, tasks] of [...this.sessions]) {
+      for (const [id, task] of tasks) {
+        if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) tasks.delete(id);
+      }
+      if (!tasks.size) this.sessions.delete(sessionId);
     }
-    let others = 0;
-    for (const [id, tasks] of this.sessions) if (id !== sessionId) others += tasks.size;
-    const allowed = Math.max(0, Math.min(MAX_SESSION_TASKS, MAX_BOARD_TASKS - others));
-    let list = [...next.values()];
-    if (list.length > allowed) {
-      const live = list.filter((task) => task.endedAt === undefined);
-      const done = list.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
-      list = [...live, ...done].slice(0, allowed);
+    const ids = [...this.sessions.keys()].sort();
+    const picked = new Map<string, WebTask[]>(ids.map((id) => [id, []]));
+    let room = MAX_BOARD_TASKS;
+    for (const ended of [false, true]) {
+      const queues = ids.map((id) => {
+        const tasks = [...this.sessions.get(id)!.values()].filter((task) => (task.endedAt !== undefined) === ended);
+        return { id, tasks: ended ? tasks.sort((a, b) => b.endedAt! - a.endedAt!) : tasks.sort((a, b) => a.startedAt - b.startedAt) };
+      });
+      for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {
+        for (const queue of queues) {
+          if (room > 0 && queue.tasks[round]) { picked.get(queue.id)!.push(queue.tasks[round]); room--; }
+        }
+      }
     }
-    const kept = new Map(list.map((task) => [task.taskId, task]));
-    if (kept.size) this.sessions.set(sessionId, kept); else this.sessions.delete(sessionId);
-    if (JSON.stringify([...old.values()]) !== JSON.stringify(list)) this.publish(sessionId, list.map((task) => ({ ...task })));
+    for (const id of new Set([...this.shown.keys(), ...picked.keys()])) {
+      const list = picked.get(id) ?? [];
+      const before = this.shown.get(id) ?? [];
+      if (JSON.stringify(before) === JSON.stringify(list)) continue;
+      if (list.length) this.shown.set(id, list); else this.shown.delete(id);
+      this.publish(id, list.map((task) => ({ ...task })));
+    }
     this.schedule();
   }
 

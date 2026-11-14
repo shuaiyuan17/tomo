@@ -40,10 +40,10 @@ export function elapsed(task: WebTask, now: number): number {
   return (task.endedAt ?? now) - task.startedAt;
 }
 
-/** The most recent step, when progress reported one. */
+/** What a running task is doing now, when progress reported anything. */
 export function lastStep(task: WebTask): string | undefined {
   if (task.summary) return task.summary;
-  if (task.lastTool) return `Last tool: ${task.lastTool}${task.toolUses ? ` · ${task.toolUses} tool uses` : ""}`;
+  if (task.lastTool) return `${task.lastTool}${task.toolUses ? ` · ${task.toolUses} tool uses` : ""}`;
   return undefined;
 }
 

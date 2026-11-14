@@ -88,6 +88,19 @@ export class TaskTracker {
 
   private change(ended: TaskChange["ended"]): TaskChange { return { tasks: this.list(), ended }; }
 
+  /**
+   * Any frame naming a newer run moves the task to it — not only the level —
+   * so that an end report of the older run, arriving after, is seen as late.
+   * A new run starts clean: its clock, progress and end status are its own.
+   */
+  private advance(task: WatchTask, runId: string | undefined): WatchTask {
+    if (!runId || task.runId === runId) return task;
+    if (!task.runId) return { ...task, runId };
+    const fresh: WatchTask = { ...task, runId, startedAt: this.now() };
+    for (const key of ["status", "lastTool", "summary", "totalTokens", "toolUses"] as const) delete fresh[key];
+    return fresh;
+  }
+
   private late(task: WatchTask, runId: string | undefined): boolean {
     // sdk.d.ts (run_id): "The run ids of one task sort, by plain string
     // comparison, in the order the runs opened; a frame that names a run
@@ -134,11 +147,12 @@ export class TaskTracker {
     const old = this.tasks.get(message.task_id);
     if (old) {
       if (this.late(old, message.run_id)) return undefined;
-      this.tasks.set(old.taskId, { ...old,
-        ...(message.subagent_type && !old.subagentType ? { subagentType: message.subagent_type } : {}),
-        ...(message.parent_task_id && !old.parentTaskId ? { parentTaskId: message.parent_task_id } : {}),
-        taskType: old.taskType || message.task_type || "",
-        description: old.description || text(message.description) });
+      const current = this.advance(old, message.run_id);
+      this.tasks.set(old.taskId, { ...current,
+        ...(message.subagent_type && !current.subagentType ? { subagentType: message.subagent_type } : {}),
+        ...(message.parent_task_id && !current.parentTaskId ? { parentTaskId: message.parent_task_id } : {}),
+        taskType: current.taskType || message.task_type || "",
+        description: current.description || text(message.description) });
       return this.change([]);
     }
     // A background task joins the level before its task_started. One that is
@@ -162,13 +176,14 @@ export class TaskTracker {
   private applyProgress(message: Extract<TaskSystemMessage, { subtype: "task_progress" }>): TaskChange | undefined {
     const old = this.tasks.get(message.task_id);
     if (!old || this.late(old, message.run_id)) return undefined;
-    const next: WatchTask = { ...old,
+    const current = this.advance(old, message.run_id);
+    const next: WatchTask = { ...current,
       ...(message.last_tool_name ? { lastTool: clip(message.last_tool_name, 128) } : {}),
       ...(message.summary ? { summary: text(message.summary) } : {}),
       ...(typeof message.usage?.total_tokens === "number" ? { totalTokens: message.usage.total_tokens } : {}),
       ...(typeof message.usage?.tool_uses === "number" ? { toolUses: message.usage.tool_uses } : {}),
     };
-    if (old.lastTool === next.lastTool && old.summary === next.summary && old.toolUses === next.toolUses) {
+    if (current === old && old.lastTool === next.lastTool && old.summary === next.summary && old.toolUses === next.toolUses) {
       // Token counts alone tick on every frame; carry them without an event.
       this.tasks.set(old.taskId, next);
       return undefined;

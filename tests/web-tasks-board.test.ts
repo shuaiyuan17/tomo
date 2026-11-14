@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_BOARD_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, TASK_RETENTION_MS, TaskBoard } from "../src/web/tasks.js";
+import { MAX_BOARD_TASKS, MAX_SESSION_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS, TaskBoard } from "../src/web/tasks.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 import type { WebTask } from "../src/web/protocol.js";
 
@@ -67,11 +67,45 @@ describe("TaskBoard", () => {
     b.apply("s", [task("w", { ambient: true, summary: "progress text" }), task("x", { description: "d".repeat(200) })]);
     const snap = b.snapshot();
     expect(snap.find((t) => t.taskId === "w")).toMatchObject({ ambient: true });
-    expect(snap.find((t) => t.taskId === "w")!.summary).toBeUndefined();
+    expect(snap.find((t) => t.taskId === "w")!.summary).toBe("progress text");
     expect(snap.find((t) => t.taskId === "x")!.description.length).toBe(SNAPSHOT_DESCRIPTION_LIMIT + 1);
     for (let i = 0; i < 5; i++) b.apply(`g${i}`, Array.from({ length: 60 }, (_, n) => task(`t${i}-${n}`)));
     expect(b.snapshot()).toHaveLength(MAX_BOARD_TASKS);
     expect(b.snapshot((id) => id === "s")).toHaveLength(2);
+    b.dispose();
+  });
+
+  it("keeps a clipped summary in the snapshot, so a reconnect still shows it", () => {
+    const { b } = board();
+    b.apply("s", [task("a", { summary: "s".repeat(200) })]);
+    expect(b.snapshot()[0].summary).toBe(`${"s".repeat(SNAPSHOT_SUMMARY_LIMIT)}…`);
+    b.dispose();
+  });
+
+  it("shares capacity fairly, running tasks before ended ones, and restores a crowded-out running task", () => {
+    vi.useFakeTimers({ now: 0 });
+    const { b, published } = board();
+    // Session "a" fills the board with ended tasks, then many running ones.
+    b.apply("a", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`old${i}`)));
+    b.apply("a", []);
+    b.apply("b", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`b${i}`, { startedAt: i })));
+    b.apply("c", Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`c${i}`, { startedAt: i })));
+    const late = Array.from({ length: 10 }, (_, i) => task(`z${i}`, { startedAt: 100 + i }));
+    b.apply("z", late);
+    const shown = b.snapshot();
+    expect(shown).toHaveLength(MAX_BOARD_TASKS);
+    // Running tasks win over ended ones, and the last session still gets all of its running tasks.
+    expect(shown.filter((t) => t.state === "running")).toHaveLength(MAX_BOARD_TASKS);
+    expect(shown.filter((t) => t.sessionId === "z")).toHaveLength(10);
+    const counts = ["b", "c"].map((id) => shown.filter((t) => t.sessionId === id).length);
+    expect(Math.abs(counts[0] - counts[1])).toBeLessThanOrEqual(1);
+    const hidden = Array.from({ length: MAX_SESSION_TASKS }, (_, i) => `b${i}`).find((id) => !shown.some((t) => t.taskId === id))!;
+    expect(hidden).toBeDefined();
+    // Room frees up: the crowded-out running task is published without any event of its own session.
+    b.apply("c", []);
+    vi.advanceTimersByTime(TASK_RETENTION_MS);
+    expect(b.snapshot().some((t) => t.taskId === hidden)).toBe(true);
+    expect(published.filter(([id]) => id === "b").at(-1)![1].some((t) => t.taskId === hidden)).toBe(true);
     b.dispose();
   });
 

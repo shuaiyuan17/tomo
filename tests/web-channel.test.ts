@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { WebChannel } from "../src/channels/web.js";
+import { OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { WebEvents } from "../src/web/events.js";
 import { parseWebConfig } from "../src/web/config.js";
 import { webSessionId } from "../src/web/owner.js";
-import { MAX_BOARD_TASKS, MAX_SNAPSHOT_TASK_BYTES } from "../src/web/tasks.js";
+import { MAX_BOARD_TASKS, MAX_SNAPSHOT_TASK_BYTES, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS } from "../src/web/tasks.js";
 import type { OwnerConfig } from "../src/owner.js";
 import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
 
@@ -176,6 +176,23 @@ describe("web task panel feed", () => {
     single.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("c")] });
     expect(single.channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["c"]);
   });
+  it("clears the owner's tasks as soon as the owner-key rule changes, with no new event, and never re-sends them", () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let current: string | undefined = "dm:owner";
+      const { channel, bus, events } = setup(owner, () => current);
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a", "owner work")] });
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("b", "owner work")] }); // a ends, retained
+      const ownerUpdates = () => events.filter((e) => e.type === "tasks" && e.sessionId === channel.ownerId);
+      current = undefined; // e.g. a second legacy key appeared: the catalog hides the owner session
+      vi.advanceTimersByTime(OWNER_KEY_CHECK_MS);
+      expect(ownerUpdates().at(-1)).toMatchObject({ tasks: [] });
+      expect(channel.snapshot().tasks).toEqual([]);
+      const count = ownerUpdates().length;
+      vi.advanceTimersByTime(TASK_RETENTION_MS * 2);
+      expect(ownerUpdates()).toHaveLength(count);
+    } finally { vi.useRealTimers(); }
+  });
   it("a full mailbox plus a full board still yields the complete task list on reconnect", async () => {
     const { channel, bus } = setup();
     const requestId = randomUUID();
@@ -189,7 +206,8 @@ describe("web task panel feed", () => {
     }
     const snapshot = channel.snapshot();
     expect(snapshot.tasks).toHaveLength(MAX_BOARD_TASKS);
-    expect(snapshot.tasks.every((t) => t.summary === undefined)).toBe(true);
+    // The reconnect snapshot keeps (a short) summary.
+    expect(snapshot.tasks.every((t) => t.summary !== undefined && t.summary.length <= SNAPSHOT_SUMMARY_LIMIT + 1)).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(snapshot.tasks))).toBeLessThanOrEqual(MAX_SNAPSHOT_TASK_BYTES);
     // The frame the supervisor sends (with replay) still fits the IPC limit.
     expect(Buffer.byteLength(JSON.stringify({ snapshot, replay: null }))).toBeLessThan(MAX_BUFFER_BYTES - 1024);

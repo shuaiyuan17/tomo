@@ -13,6 +13,28 @@ const labels: Record<WebRequest["state"], string> = { queued: "Queued", running:
   failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted", unknown: "Outcome unknown — check the conversation before sending again" };
 type Theme = "system" | "light" | "dark";
 
+const OVERLAY_QUERY = "(max-width: 800px)";
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const list = window.matchMedia(query);
+    const update = () => setMatches(list.matches);
+    update();
+    list.addEventListener("change", update);
+    return () => list.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
+/** Keeps Tab / Shift+Tab inside `container`. */
+function trapTab(container: HTMLElement, event: KeyboardEvent) {
+  const items = [...container.querySelectorAll<HTMLElement>("button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])")]
+    .filter((element) => !element.hasAttribute("disabled"));
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  const inside = container.contains(document.activeElement);
+  if (event.shiftKey && (document.activeElement === first || !inside)) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && (document.activeElement === last || !inside)) { event.preventDefault(); first.focus(); }
+}
 function storedTasksOpen(): boolean {
   try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
 }
@@ -61,6 +83,24 @@ export function App() {
     try { localStorage.setItem("tomo-tasks-open", tasksOpen ? "1" : "0"); } catch { /* Storage can be unavailable. */ }
   }, [tasksOpen]);
   const running = runningCount(web.tasks);
+  const tasksButton = useRef<HTMLButtonElement>(null);
+  const rail = useRef<HTMLElement>(null);
+  const overlay = useMediaQuery(OVERLAY_QUERY);
+  const modal = tasksOpen && overlay;
+  const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
+  // On narrow screens the rail is a modal layer: focus moves into it, stays
+  // there (the content under it is inert), and Escape anywhere closes it,
+  // returning focus to the topbar button. A pinned desktop rail is not modal.
+  useEffect(() => {
+    if (!modal) return;
+    rail.current?.querySelector<HTMLElement>(".tasks-close")?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); closeTasks(); return; }
+      if (event.key === "Tab" && rail.current) trapTab(rail.current, event);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [modal]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem("tomo-theme", theme); } catch { /* Storage can be unavailable. */ }
@@ -157,7 +197,7 @@ export function App() {
     <a className="skip" href="#conversation">Skip to conversation</a>
     <header className="topbar"><a className="brand" href="/" aria-label="Tomo home"><Mark /><span>tomo<span className="brand-dot">.</span></span></a>
       <span className="section-name">Conversation</span>
-      <div className="header-actions"><button type="button" className="tasks-button" aria-pressed={tasksOpen} aria-controls="tasks-rail"
+      <div className="header-actions"><button ref={tasksButton} type="button" className="tasks-button" aria-pressed={tasksOpen} aria-controls="tasks-rail"
           aria-label={`Working now panel${running ? `, ${running} running` : ""}`} onClick={() => setTasksOpen((open) => !open)}>
           <TasksIcon /><span className="tasks-button-label">Working now</span>{running > 0 && <span className="tasks-count" aria-hidden="true">{running}</span>}</button>
         <span className={`connection ${web.connection}`} role="status"><i />{web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…"}</span>
@@ -165,7 +205,7 @@ export function App() {
       </div>
     </header>
     <div className="workspace">
-      <aside className="sidebar" aria-label="Conversation details">
+      <aside className="sidebar" aria-label="Conversation details" inert={modal}>
         <p className="eyebrow">Your conversations</p>
         <label htmlFor="session">Session</label>
         <select id="session" value={selectedId} disabled={!web.bootstrap?.sessions.length} onChange={(e) => { setSelected(e.target.value); setFeedback(""); }}>
@@ -180,7 +220,7 @@ export function App() {
         </section>
         <div className="local-note"><Mark /><p>A quiet place<br />to think together.</p><span>Your private workspace</span></div>
       </aside>
-      <main id="conversation" className="conversation" tabIndex={-1}>
+      <main id="conversation" className="conversation" tabIndex={-1} inert={modal}>
         <div className="conversation-heading"><div><p className="eyebrow">{session?.kind === "group" ? "Group history" : "A conversation with Tomo"}</p><h1>{session?.kind === "group" ? session.title : "Room to think."}</h1></div><span className="scope">{session?.kind === "group" ? "Read-only" : "Owner DM"}</span></div>
         {web.bootstrap?.setupRequired && <div className="notice" role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className="notice" role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
@@ -200,9 +240,8 @@ export function App() {
           {uncertain && !sending && <div className="recovery"><button onClick={() => void checkOutcome()}>Check message status</button><button onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</button></div>}
         </div>
       </main>
-      {tasksOpen && <aside id="tasks-rail" className="tasks-rail" aria-label="Working now"
-        onKeyDown={(e) => { if (e.key === "Escape" && window.matchMedia("(max-width: 800px)").matches) setTasksOpen(false); }}>
-        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} /></aside>}
+      {tasksOpen && <aside ref={rail} id="tasks-rail" className="tasks-rail" aria-label="Working now" {...(modal ? { role: "dialog", "aria-modal": true } : {})}>
+        <TasksPanel tasks={web.tasks} sessions={web.bootstrap?.sessions ?? []} onClose={modal ? closeTasks : undefined} /></aside>}
     </div>
   </div>;
 }

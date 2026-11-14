@@ -57,6 +57,20 @@ describe("TaskTracker — background_tasks_changed (REPLACE)", () => {
     expect(t.list()[0].status).toBeUndefined();
   });
 
+  it("progress or a start naming a newer run advances the run, so the older run's late end report is dropped", () => {
+    const { t, tick } = tracker();
+    t.apply(level({ task_id: "a", run_id: "r1", task_type: "local_agent", description: "x" }));
+    tick(1_000);
+    t.apply({ subtype: "task_progress", task_id: "a", run_id: "r2", description: "x", last_tool_name: "Grep" });
+    expect(t.list()[0]).toMatchObject({ runId: "r2", lastTool: "Grep", startedAt: 2_000 });
+    expect(t.apply({ subtype: "task_notification", task_id: "a", run_id: "r1", status: "failed" })).toBeUndefined();
+    expect(t.list()[0].status).toBeUndefined();
+    t.apply({ subtype: "task_started", task_id: "a", run_id: "r3", description: "x" });
+    expect(t.list()[0]).toMatchObject({ runId: "r3" });
+    expect(t.list()[0].lastTool).toBeUndefined();
+    expect(t.apply({ subtype: "task_progress", task_id: "a", run_id: "r2", description: "x", last_tool_name: "Old" })).toBeUndefined();
+  });
+
   it("clips text and bounds the number of tracked tasks", () => {
     const { t } = tracker();
     t.apply(level({ task_id: "a", task_type: "local_agent", description: "y".repeat(5_000) }));

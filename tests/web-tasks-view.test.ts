@@ -53,7 +53,7 @@ describe("task panel view", () => {
     expect(taskKind(task("a", { taskType: "local_bash" }))).toBe("shell");
     expect(taskKind(task("a", { taskType: "something_new" }))).toBe("something_new");
     expect(lastStep(task("a"))).toBeUndefined();
-    expect(lastStep(task("a", { lastTool: "Grep", toolUses: 3 }))).toBe("Last tool: Grep · 3 tool uses");
+    expect(lastStep(task("a", { lastTool: "Grep", toolUses: 3 }))).toBe("Grep · 3 tool uses");
     expect(lastStep(task("a", { lastTool: "Grep", summary: "Reading the config" }))).toBe("Reading the config");
   });
 

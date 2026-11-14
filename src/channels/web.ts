@@ -11,6 +11,9 @@ import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { selectOwnerSessionKey } from "../web/data.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type WebEvent, type WebRequest } from "../web/protocol.js";
 
+/** How often the owner-key rule is re-read while owner tasks are shown. */
+export const OWNER_KEY_CHECK_MS = 1_000;
+
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
 interface Receipt { digest: string; request: WebRequest; settled: boolean }
 
@@ -37,6 +40,8 @@ export class WebChannel implements Channel {
   private readonly ownerKey: () => string | undefined;
   /** The DM key whose tasks currently fill the owner's board entry. */
   private ownerTaskKey: string | undefined;
+  /** Re-checks the owner-key rule while the owner's board entry is filled. */
+  private ownerKeyTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(owner: OwnerConfig | undefined, private readonly bus: WatchBus = watchBus,
     options: { now?: () => number; ownerKey?: () => string | undefined } = {}) {
@@ -103,7 +108,8 @@ export class WebChannel implements Channel {
   snapshot() {
     const requests = [...this.receipts.values()].slice(-128).map((r) => ({ ...r.request }));
     const blocks = [...this.blocks];
-    const tasks = this.tasks.snapshot((sessionId) => sessionId !== this.ownerId || this.ownerTaskKey === this.ownerKey());
+    this.checkOwnerTaskKey();
+    const tasks = this.tasks.snapshot();
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks };
   }
 
@@ -145,6 +151,7 @@ export class WebChannel implements Channel {
     this.tornDown = true;
     this.unsubscribe?.();
     this.tasks.dispose();
+    clearInterval(this.ownerKeyTimer);
     try { await this.lifecycle?.stop(); } catch { /* Optional process cleanup cannot prevent daemon shutdown. */ }
   }
   async stop(): Promise<void> { this.closeIngestion(); await this.quiesce(); await this.teardown(); }
@@ -167,11 +174,30 @@ export class WebChannel implements Channel {
    * group, and for DMs exactly the key `selectOwnerSessionKey` picks — not
    * every legacy key bound to the owner, which the catalog may be hiding.
    */
+  /**
+   * The owner-key rule can change without any task event (the registry
+   * gained the canonical key, or a second legacy key appeared). The moment it
+   * no longer names the key the owner's board entry came from, that entry is
+   * cleared and the browser told — it is not left until the next event.
+   */
+  private checkOwnerTaskKey(): void {
+    if (this.ownerTaskKey === undefined || this.ownerTaskKey === this.ownerKey()) return;
+    this.ownerTaskKey = undefined;
+    clearInterval(this.ownerKeyTimer);
+    this.ownerKeyTimer = undefined;
+    if (this.ownerId) this.tasks.clear(this.ownerId);
+  }
   private observeTasks(key: string, sessionId: string, event: Extract<WatchEvent, { type: "tasks" }>): void {
     if (!isGroupSessionKey(key)) {
       const ownerKey = this.ownerKey();
       if (!ownerKey || key !== ownerKey) return;
-      if (this.ownerTaskKey !== key) { this.tasks.clear(sessionId); this.ownerTaskKey = key; }
+      if (this.ownerTaskKey !== key) {
+        this.tasks.clear(sessionId);
+        this.ownerTaskKey = key;
+        clearInterval(this.ownerKeyTimer);
+        this.ownerKeyTimer = setInterval(() => this.checkOwnerTaskKey(), OWNER_KEY_CHECK_MS);
+        this.ownerKeyTimer.unref?.();
+      }
     }
     this.tasks.apply(sessionId, event.tasks, event.ended);
   }

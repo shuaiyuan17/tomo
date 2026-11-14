@@ -7,6 +7,7 @@ import {
   type SDKMessage,
   type SDKMessageOrigin,
 } from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "node:crypto";
 import { log } from "../logger.js";
 import { McpLiveStatus, type McpConnection } from "../mcp/live-status.js";
 import { shortErrorMessage } from "../error-text.js";
@@ -138,6 +139,9 @@ export interface TurnRequest {
   silentDelivery?: boolean;
 }
 
+/** Rejection for a request whose result was overtaken by a later one's (see attributeResult). */
+export const RESULT_OUT_OF_STEP = "Lost track of this reply: the SDK answered a later message first";
+
 export interface MessageRequest extends TurnRequest {
   message: SDKUserMessage;
 }
@@ -202,6 +206,8 @@ export class LiveSession {
   // The request that owns the in-flight turn: its callbacks receive the
   // turn's collected blocks and it resolves with the turn's full response.
   private currentRequest: TurnRequest | null = null;
+  /** Whether the turn now in flight has produced any top-level assistant frame. */
+  private turnSawAssistant = false;
   // Steered requests confirmed merged into the in-flight turn (we saw the CLI
   // echo their message back mid-turn). Resolved with STEER_MERGED at result.
   private mergedRequests: MessageRequest[] = [];
@@ -359,6 +365,11 @@ export class LiveSession {
   }
 
   private pushInput(msg: SDKUserMessage): void {
+    // A client uuid on every send: the CLI stamps it back on the assistant
+    // frames and the result of the turn that consumed it
+    // (`user_message_uuids`), which is how attributeResult tells this
+    // request's result from one the CLI produced for something else.
+    msg.uuid ??= randomUUID();
     this.inputQueue.push(msg);
     this.inputWaiter?.();
   }
@@ -585,6 +596,77 @@ export class LiveSession {
    * itself depends on the block's content — `shipBlock` decides delivery, as
    * it does for every other block.
    */
+  /**
+   * WHOSE RESULT IS THIS. A result ends the current request's turn only if it
+   * is that turn's result. Results are otherwise matched by position, so one
+   * extra result shifts every later reply onto the next request: on
+   * 2026-11-14 a web message got "I'm not sure how to respond to that." and
+   * its real reply went to a context nudge that arrived next, whose output is
+   * suppressed, so the reply reached nobody.
+   *
+   * The extra result came from the CLI itself. On resume it re-delivers the
+   * notification of a background task the previous process left running
+   * (`task_notification`, status "stopped") and closes it with a result of
+   * its own: success, `num_turns: 0`, empty text, no `user_message_uuids`,
+   * `origin: { kind: "task-notification" }` (reproduced against the real CLI).
+   *
+   * Three checks, from the source outward:
+   * 1. a result the CLI started for a task notification never ends a request
+   *    we sent (one with a client uuid);
+   * 2. a result that names the user messages it consumed must name the
+   *    current request (or one merged into it); naming a later steered
+   *    request means we are already one behind, so log an error, fail the
+   *    skipped requests (their outcome is unknown) and line back up on the
+   *    named one, so the shift cannot carry on to every later turn;
+   * 3. backstop for anything unstamped: a success with zero turns, no text
+   *    and no assistant frame this turn is nobody's answer.
+   *
+   * "foreign" = not ours: the caller drops it and the current turn goes on.
+   */
+  private async attributeResult(result: SdkResultLike): Promise<"ours" | "foreign"> {
+    const current = this.currentRequest;
+    const mine = (current as Partial<MessageRequest> | null)?.message?.uuid;
+    if (!current || !mine) return "ours"; // idle, or a turn the CLI started (claimed unowned)
+    const ignore = (why: string): "foreign" => {
+      log.warn(
+        { session: this.sessionKey, why, turns: result.num_turns, origin: result.origin?.kind, uuids: result.user_message_uuids },
+        "SDK result does not belong to the current request; ignoring it",
+      );
+      return "foreign";
+    };
+
+    const stamped = result.user_message_uuids ?? (result.user_message_uuid ? [result.user_message_uuid] : []);
+    const names = (req: TurnRequest) => {
+      const id = (req as Partial<MessageRequest>).message?.uuid;
+      return !!id && stamped.includes(id);
+    };
+    if (stamped.length > 0) {
+      if (names(current) || this.mergedRequests.some(names)) return "ours";
+      const ahead = this.pendingSteers.findIndex((s) => names(s.req));
+      if (ahead < 0) return ignore("names none of this session's requests");
+      log.error(
+        { session: this.sessionKey, skipped: ahead + 1 },
+        "SDK result answers a later request than the current one; failing the skipped ones and re-aligning",
+      );
+      // Their replies (if any) went out under the wrong turn; what reached
+      // the owner is unknown, so they fail visibly instead of resolving as
+      // if answered.
+      for (const req of [current, ...this.pendingSteers.slice(0, ahead).map((s) => s.req)]) {
+        await req.reject(new Error(RESULT_OUT_OF_STEP));
+      }
+      const [next] = this.pendingSteers.splice(0, ahead + 1).slice(-1);
+      this.currentRequest = next.req;
+      this.onTurnClaimed();
+      this.promotedSteerText = next.text;
+      return "ours";
+    }
+
+    if (result.origin?.kind === "task-notification") return ignore("task-notification turn");
+    const empty = result.subtype === "success" && !result.is_error && result.num_turns === 0 && !result.result;
+    if (empty && !this.turnSawAssistant) return ignore("empty zero-turn result");
+    return "ours";
+  }
+
   private claimFirstUnownedEvent(content: unknown[]): void {
     let reason = "assistant_event";
     let openedWithHiddenThinking = false;
@@ -658,7 +740,7 @@ export class LiveSession {
       // of these warns is the signal that the model is still composing
       // replies in thinking blocks. Remembered for the end of the turn: a
       // turn whose only content was a dropped thinking block must resolve
-      // silent, not to the "I'm not sure" fallback the runner would deliver.
+      // silent, without the "no reply text" warn an empty turn gets.
       const chars = block.text.trim().length;
       if (chars > 0) {
         this.droppedThinkingThisTurn = true;
@@ -805,6 +887,7 @@ export class LiveSession {
     // while the turn is still running", which is exactly what awaiting here
     // delivers.
     if (event.type === "assistant" && event.message?.content) {
+      this.turnSawAssistant = true;
       // CLAIM ON THE FIRST EVENT OF THE TURN, WHATEVER IT CARRIES.
       //
       // An assistant event with no owner is an SDK-initiated (autonomous /
@@ -880,6 +963,8 @@ export class LiveSession {
 
     if (event.type === "result") {
       const result = event as unknown as SdkResultLike;
+      if (await this.attributeResult(result) === "foreign") return;
+      this.turnSawAssistant = false;
       this.publishTasks(this.taskTracker.endTurn());
 
       if (result.session_id) {
@@ -934,8 +1019,18 @@ export class LiveSession {
       // A turn whose only content was a dropped thinking block resolves as a
       // bare NO_REPLY — silent to the channel, honest in the transcript —
       // rather than the generic fallback, which the runner WOULD deliver.
-      const response = rendered.text
-        || (this.droppedThinkingThisTurn ? "NO_REPLY" : "I'm not sure how to respond to that.");
+      // A turn that ended with NO text at all used to resolve as "I'm not
+      // sure how to respond to that.", which the runner delivered. Every time
+      // that line reached a channel it was a symptom (a result that belonged
+      // to another turn, 2026-11-14), never an answer, so an empty turn is
+      // silent now and the log says so.
+      if (!rendered.text && !this.droppedThinkingThisTurn && !failure) {
+        log.warn(
+          { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
+          "Turn ended with no reply text; resolving as NO_REPLY",
+        );
+      }
+      const response = rendered.text || "NO_REPLY";
       this.droppedThinkingThisTurn = false;
       this.parts = [];
       this.unownedTurnDropLogged = false;
@@ -1329,6 +1424,7 @@ export class LiveSession {
           this.currentRequest = req;
           this.onTurnClaimed();
           this.parts = [];
+          this.turnSawAssistant = false;
           this.refreshActivityTimeout();
           this.pushInput(req.message);
           return;

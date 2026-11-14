@@ -34,6 +34,15 @@ export interface SdkResultLike {
   /** `success` subtype: the final assistant text — or, with `is_error`, the API error text. */
   result?: string;
   num_turns?: number;
+  /**
+   * Client uuids of the user messages this result's turn consumed (the
+   * `uuid` stamped on each pushed SDKUserMessage). Absent on turns the CLI
+   * started itself and from older CLIs; `user_message_uuid` is the last one.
+   */
+  user_message_uuid?: string;
+  user_message_uuids?: string[];
+  /** Set when the CLI started the turn itself, e.g. `{ kind: "task-notification" }`. */
+  origin?: { kind?: string };
   duration_ms?: number;
   total_cost_usd?: number;
   usage?: Record<string, unknown>;

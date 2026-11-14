@@ -69,7 +69,7 @@ export interface SessionContext {
    * (tests, callers with no audience notion), every turn counts as the
    * session's own.
    */
-  isOwnAudienceTurn?: () => boolean;
+  isOwnAudienceTurn?: (agentId?: string) => boolean;
   /**
    * The key the turn in flight is scoped to (`Agent.scopedCallerKey`): the
    * session key for its own turns, the steering group's key on a summoned
@@ -78,7 +78,7 @@ export interface SessionContext {
    * inherits its group's `groupShellAllowlist` entry; undefined means it never
    * does.
    */
-  scopedCallerKey?: () => string;
+  scopedCallerKey?: (agentId?: string) => string;
   /**
    * Read-and-clear: did the model's last message land in a thinking block and
    * get dropped (see LiveSession.takeUndeliveredReply)? Consulted after every
@@ -112,7 +112,8 @@ export function sdkOptions(
   // (delivery-pipeline.ts, which drops private MEDIA: attachments on a barred
   // turn) decides it from the same function rather than a second copy.
   const ownAudienceTurn = sessionContext?.isOwnAudienceTurn;
-  const privateMemoryBar = (): PrivateMemoryBar | null => privateMemoryBarFor(isGroup, ownAudienceTurn);
+  const privateMemoryBar = (agentId?: string): PrivateMemoryBar | null =>
+    privateMemoryBarFor(isGroup, ownAudienceTurn ? () => ownAudienceTurn(agentId) : undefined);
 
   // Per-subagent-type permission scoping. Read from config PER TOOL CALL, not
   // snapshotted here, for the same reason `privateMemoryBar` is a getter: these
@@ -396,7 +397,7 @@ export function buildHooksOption(args: {
   groupShellAllowlist?: () => readonly string[] | undefined;
   /** The key the turn in flight is scoped to (see SessionContext). Lets a
    *  summoned turn inherit its steering group's allowlist entry. */
-  scopedCallerKey?: () => string;
+  scopedCallerKey?: (agentId?: string) => string;
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;

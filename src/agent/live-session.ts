@@ -24,6 +24,7 @@ import {
 import { silentTurnSteerNote } from "../continuity-defaults.js";
 import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
+import { BackgroundAudienceLedger } from "./audience.js";
 
 export interface TurnRequest {
   resolve: (response: string) => void | Promise<void>;
@@ -313,6 +314,12 @@ export interface LiveSessionSettings {
    * deltas start from `baseline` instead of 0. See `turnUsage`.
    */
   resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
+  /**
+   * The audiences of the turns registered on this session right now
+   * (`TurnAudienceRegistry.liveAudiences`). Read when a background task
+   * appears, to record whose task it is — see BackgroundAudienceLedger.
+   */
+  turnAudiences?: () => readonly string[] | undefined;
 }
 
 /** What the host's refresh attempt did. Mirrors McpOAuthManager's outcomes. */
@@ -777,6 +784,13 @@ export class LiveSession {
    */
   private outstandingDelivery: OutstandingDelivery | null = null;
 
+  /** Per-task audience of this session's background work. See audience.ts. */
+  private readonly backgroundLedger = new BackgroundAudienceLedger();
+  private readonly turnAudiences: (() => readonly string[] | undefined) | undefined;
+  /** The SDK-initiated turn in flight holds a ledger claim. */
+  private reportTurnActive = false;
+  private reportTurnRequest: TurnRequest | null = null;
+
   constructor(
     options: ReturnType<typeof sdkOptions>,
     sessionKey?: string,
@@ -792,6 +806,7 @@ export class LiveSession {
     this.onMcpAuthError = settings.onMcpAuthError;
     this.now = settings.now ?? Date.now;
     this.onToolResult = settings.onToolResult;
+    this.turnAudiences = settings.turnAudiences;
     const resumeFrom = settings.resumeFrom;
     if (resumeFrom) {
       const baseline = resumeFrom.baseline;
@@ -864,7 +879,29 @@ export class LiveSession {
    * Reject the in-flight turn's owner plus any merged/pending steered
    * requests, clear turn state, and wake idle waiters. No-op when idle.
    */
+  private endReportTurn(): void {
+    this.reportTurnActive = false;
+    this.reportTurnRequest = null;
+    this.backgroundLedger.endReportTurn();
+  }
+
+  /** The origin audience of a live background task (a subagent's `agent_id`). */
+  backgroundTaskAudience(taskId: string): string[] | undefined {
+    return this.backgroundLedger.originOf(taskId);
+  }
+
+  /** Union of the origins of every live background task. */
+  liveBackgroundAudiences(): string[] {
+    return this.backgroundLedger.liveOrigins();
+  }
+
+  /** The audience of the SDK-initiated turn in flight, or null. */
+  reportTurnAudience(): string[] | null {
+    return this.backgroundLedger.reportTurnAudience();
+  }
+
   private failTurn(err: Error): void {
+    if (this.reportTurnActive) this.endReportTurn();
     const requests: TurnRequest[] = [];
     if (this.currentRequest) requests.push(this.currentRequest);
     requests.push(...this.mergedRequests, ...this.pendingSteers.map((e) => e.req));
@@ -904,41 +941,6 @@ export class LiveSession {
   /** True between a background drain and the next SDK-initiated turn. */
   isAwaitingTaskReport(): boolean {
     return this.awaitingTaskReport;
-  }
-
-  /** Background work is live, or has drained and its report turn is due. */
-  hasPendingBackgroundWork(): boolean {
-    return this.backgroundTaskIds.size > 0 || this.awaitingTaskReport;
-  }
-
-  /**
-   * Resolves once the session's background work has fully played out: no live
-   * background task, no report turn still due, and no turn in flight (the
-   * report turn itself, or any follow-up it chained) — or once the session
-   * dies. Never rejects.
-   *
-   * NOT CAPPED while tasks are live, unlike `retireWhenIdle`'s wait: the caller
-   * holds a summoned turn's narrower audience open on this, and a cap would
-   * hand a still-running subagent the owner's scope the moment it expired. A
-   * hung task keeps the narrower scope, which is the safe direction. Only the
-   * wait for the REPORT turn is bounded (`reportWaitMs`), since a drained
-   * task's result may instead have been folded into a turn already running,
-   * in which case no SDK-initiated report turn ever comes.
-   */
-  async waitForBackgroundSettled(reportWaitMs: number): Promise<void> {
-    // Chunked: setTimeout clamps anything over 2^31-1 ms to 1 ms.
-    const CHUNK_MS = 60 * 60 * 1000;
-    while (this.alive) {
-      if (this.isBusy()) {
-        await this.waitForIdle();
-      } else if (this.backgroundTaskIds.size > 0) {
-        await this.waitForBackgroundIdle(CHUNK_MS);
-      } else if (this.awaitingTaskReport) {
-        if (!(await this.waitForTurnStart(reportWaitMs)) && !this.isBusy()) return;
-      } else {
-        return;
-      }
-    }
   }
 
   /**
@@ -1059,9 +1061,18 @@ export class LiveSession {
    */
   private claimUnownedTurn(reason: string): TurnRequest | null {
     if (this.currentRequest) return this.currentRequest;
+    // The turn runs whether or not it gets a delivery request, so its
+    // audience is claimed first: an SDK-initiated turn is a background task's
+    // report (or unattributable), never implicitly the owner's.
+    if (!this.reportTurnActive) {
+      const audience = this.backgroundLedger.claimReportTurn();
+      this.reportTurnActive = true;
+      log.info({ session: this.sessionKey, audience }, "SDK-initiated turn claimed with its background task's audience");
+    }
     const req = this.unownedTurnFactory?.();
     if (!req) return null;
     this.currentRequest = req;
+    this.reportTurnRequest = req;
     this.onTurnClaimed(true);
     this.unownedTurnDropLogged = false;
     this.refreshActivityTimeout();
@@ -1338,13 +1349,21 @@ export class LiveSession {
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
-      const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
+      const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean; parent_task_id?: string }> }).tasks ?? [];
+      // EVERY task, ambient ones included: whose a task is matters for what
+      // its tool calls may touch, not for whether it counts as activity.
+      this.backgroundLedger.setLiveTasks(tasks, () => this.turnAudiences?.());
       const hadTasks = this.backgroundTaskIds.size > 0;
       this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
       if (this.backgroundTaskIds.size === 0) {
         if (hadTasks) this.awaitingTaskReport = true;
         this.notifyBackgroundIdle();
       }
+    }
+
+    if (event.type === "system" && (event as { subtype?: string }).subtype === "task_notification") {
+      const taskId = (event as { task_id?: unknown }).task_id;
+      if (typeof taskId === "string") this.backgroundLedger.taskFinished(taskId);
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
@@ -1432,6 +1451,7 @@ export class LiveSession {
       // than resolving with a note the block sink would deliver as if the
       // model had said it — bypassing the turn's error policy and reporting
       // a clean run to cron.
+      if (this.reportTurnActive && (req === null || req === this.reportTurnRequest)) this.endReportTurn();
       if (failure) await req?.reject(failure);
       else await req?.resolve(response);
       for (const m of this.mergedRequests) await m.resolve(STEER_MERGED);
@@ -2029,6 +2049,8 @@ export class LiveSession {
    */
   close(): void {
     this.alive = false;
+    this.backgroundLedger.clear();
+    this.reportTurnActive = false;
     this.disposeMcpConfig();
     this.notifyBackgroundIdle();
     this.onTurnClaimed();

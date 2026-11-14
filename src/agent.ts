@@ -37,7 +37,8 @@ import { TurnInterruptedError, type QueryResult, type TurnRequest } from "./agen
 import { usesLcmCompact } from "./agent/sdk-options.js";
 import { decideContextNudge, type ContextNudgeLatch } from "./agent/context-nudge.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote, isOwnAudienceTurn as isOwnAudienceTurnFor, MIXED_AUDIENCE_KEY, TurnAudienceRegistry } from "./agent/audience.js";
+import type { ToolCaller } from "./agent/live-session-manager.js";
+import { audienceOf, audienceSwitchNote, MIXED_AUDIENCE_KEY, originAudienceFor, scopedCallerKeyFor, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
@@ -374,8 +375,9 @@ export class Agent {
         { authorizationWaitMs: 0 },
       ),
       buildGroupContext: (key) => this.buildGroupContext(key),
-      isOwnAudienceTurn: (key) => this.isOwnAudienceTurn(key),
-      scopedCallerKey: (key) => this.scopedCallerKey(key),
+      isOwnAudienceTurn: (key, caller) => this.isOwnAudienceTurn(key, caller),
+      scopedCallerKey: (key, caller) => this.scopedCallerKey(key, caller),
+      turnAudiences: (key) => this.turnAudiences.liveAudiences(key),
       handleMcpElicitation: (key, request) => this.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       handleToolResult: (key, toolName, content, isError) => {
@@ -1440,52 +1442,16 @@ export class Agent {
     try {
       await this.runUserTurnInner(req);
     } finally {
-      this.endTurnAudience(req.key, turnId, req.audiences);
+      this.turnAudiences.end(req.key, turnId);
       if (req.webRequestId) this.webRequestIds.delete(req.key);
     }
-  }
-
-  /**
-   * Unregister a turn's audience — or, when the turn was NOT the session's own
-   * (a summoned group steering the owner's `dm:` session, a mixed batch) and it
-   * left background work running, keep it registered until that work has
-   * played out.
-   *
-   * The turn ending is not the work ending. A summoned turn can launch
-   * `Agent { run_in_background: true }` (or a background shell, or a Monitor)
-   * and return at once; the subagent's tool calls still reach this session's
-   * PreToolUse hook afterwards, and so does the SDK-initiated turn that reports
-   * its result. Unregistering at turn end left nothing on the session, so the
-   * bar resolved as the owner's own turn and the group's background agent read
-   * `memory/private/` unbarred, with `recall_conversation`, `list_people` and
-   * the cron tools at owner scope too. Held, the session stays narrowed —
-   * concurrent owner turns see a mixed audience and fail closed — until
-   * `LiveSessionManager.backgroundSettled` resolves.
-   *
-   * An owner's own turn is released at once, as before: its background work is
-   * the owner's.
-   */
-  private endTurnAudience(key: string, turnId: number, audiences: readonly string[] | undefined): void {
-    // The registry records a turn with no audiences as unattributable (MIXED);
-    // judge it the same way here.
-    const recorded = audiences?.length ? audiences : [MIXED_AUDIENCE_KEY];
-    const settled = isOwnAudienceTurnFor(key, recorded) ? null : this.liveSessionManager.backgroundSettled(key);
-    if (!settled) {
-      this.turnAudiences.end(key, turnId);
-      return;
-    }
-    log.info({ key }, "Turn left background work running; keeping its audience registered until it settles");
-    void settled.finally(() => {
-      this.turnAudiences.end(key, turnId);
-      log.info({ key }, "Background work settled; released the turn's audience");
-    });
   }
 
   /** The session key a session-scoped MCP tool should be judged against for
    *  the turn in flight. See TurnAudienceRegistry for why this is not simply
    *  `sessionKey`. */
-  scopedCallerKey(sessionKey: string): string {
-    const scoped = this.turnAudiences.scopedCallerKey(sessionKey);
+  scopedCallerKey(sessionKey: string, caller?: ToolCaller): string {
+    const scoped = scopedCallerKeyFor(sessionKey, this.audiencesInScope(sessionKey, caller));
     if (scoped !== sessionKey) {
       // Also fires for a background turn (cron, continuity, watch chat) that
       // happens to overlap a live summoned-group turn on this session: those
@@ -1510,8 +1476,45 @@ export class Agent {
    * `agent/permissions.ts`, whose PreToolUse hook gates the private memory
    * FILES on it.
    */
-  isOwnAudienceTurn(sessionKey: string): boolean {
-    return this.turnAudiences.isOwnAudienceTurn(sessionKey);
+  isOwnAudienceTurn(sessionKey: string, caller?: ToolCaller): boolean {
+    return this.scopedCallerKey(sessionKey, caller) === sessionKey;
+  }
+
+  /**
+   * Every audience a tool call on this session could be acting for right now,
+   * or undefined when nothing is registered (a harness-owned turn — the
+   * owner's).
+   *
+   * Turns are only half of it. Background work — a subagent, a background
+   * shell, a Monitor, and the SDK-initiated turn that reports one — outlives
+   * the turn that started it, and carries the audience recorded for its TASK
+   * (BackgroundAudienceLedger, audience.ts), not the session's.
+   *
+   * - `caller` given (the PreToolUse hook, which knows who is calling): a
+   *   subagent's call (`agentId`) is judged by its task's origin; a subagent
+   *   that is not a background task by the turn running it, and with no turn
+   *   running it is unattributable (fail closed). A main-thread call is judged
+   *   by the live turns and the report turn in flight — so the owner's own
+   *   turn is not narrowed by a group's background agent running beside it.
+   * - `caller` absent (MCP tools, the reply and direct-send outlets — which
+   *   cannot tell a subagent's call from the main thread's): the union of
+   *   everything that could be calling, live background tasks included.
+   *   Disagreement fails closed via `scopedCallerKeyFor`.
+   */
+  private audiencesInScope(key: string, caller?: ToolCaller): string[] | undefined {
+    const live = this.turnAudiences.liveAudiences(key) ?? [];
+    const report = this.liveSessionManager.reportTurnAudience(key) ?? [];
+    const now = [...live, ...report];
+    if (caller) {
+      if (caller.agentId !== undefined) {
+        const origin = this.liveSessionManager.backgroundTaskAudience(key, caller.agentId);
+        if (origin) return origin;
+        return now.length > 0 ? now : [MIXED_AUDIENCE_KEY];
+      }
+      return now.length > 0 ? now : undefined;
+    }
+    const all = [...now, ...this.liveSessionManager.liveBackgroundAudiences(key)];
+    return all.length > 0 ? [...new Set(all)] : undefined;
   }
 
   /**
@@ -2128,7 +2131,7 @@ export class Agent {
         },
       });
     } finally {
-      if (turnId !== undefined) this.endTurnAudience(key, turnId, options.audiences);
+      if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
@@ -2199,7 +2202,7 @@ export class Agent {
       const groupKey = audiences?.find((a) => isGroupSessionKey(a));
       await this.runContinuityTurn(prompt, key, turnKind, groupKey);
     } finally {
-      if (turnId !== undefined) this.endTurnAudience(key, turnId, audiences);
+      if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
@@ -2296,7 +2299,10 @@ export class Agent {
   async delegateToSession(target: string, request: string, callerSessionKey?: string): Promise<SendResult> {
     let callerAudiences: string[] | undefined;
     if (callerSessionKey !== undefined) {
-      callerAudiences = this.turnAudiences.originAudience(callerSessionKey);
+      // Over everything that could be calling — a background subagent's
+      // delegate carries its task's audience, not "nobody registered, so the
+      // owner".
+      callerAudiences = originAudienceFor(callerSessionKey, this.audiencesInScope(callerSessionKey));
       if (!callerAudiences) {
         return {
           ok: false,

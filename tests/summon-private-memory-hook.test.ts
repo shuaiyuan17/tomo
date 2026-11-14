@@ -419,110 +419,219 @@ describe("groupShellAllowlist during a summoned-group turn", () => {
 // Background work a summoned turn starts OUTLIVES the turn (audit P0-4).
 //
 // `Agent { run_in_background: true }` returns at once and the turn ends; the
-// subagent's later tool calls — and the SDK-initiated turn that reports its
-// result — still reach this session's PreToolUse hook (verified against the
-// real SDK: a background subagent's Bash and Read arrived at the parent's hook
-// 4s and 30s after the parent turn's `result`). The audience used to be
-// unregistered when the turn ended, so the bar fell and that work ran with the
-// owner's scope. It is now held until the background work has played out.
+// subagent's later tool calls — carrying `agent_id`, equal to its background
+// task id — and the SDK-initiated turn that reports its result still reach this
+// session's PreToolUse hook (verified against the real SDK: a background
+// subagent's Bash and Read arrived 4s and 30s after the parent turn's
+// `result`). The audience is recorded PER TASK and travels with it.
 // ---------------------------------------------------------------------------
 
-function lastController(): { pushEvent(e: Record<string, unknown>): void; pushTaskNotificationTurn(r: string): void } {
+type Controller = { pushEvent(e: Record<string, unknown>): void; pushTaskNotificationTurn(r: string): void };
+
+function lastController(): Controller {
   const c = mockSdk.queryControllers[mockSdk.queryControllers.length - 1];
   if (!c) throw new Error("no live query");
-  return c;
+  return c as Controller;
 }
 
 function backgroundTasks(ids: string[]): Record<string, unknown> {
   return { type: "system", subtype: "background_tasks_changed", tasks: ids.map((task_id) => ({ task_id })) };
 }
 
+function taskNotification(taskId: string): Record<string, unknown> {
+  return { type: "system", subtype: "task_notification", task_id: taskId, status: "completed", output_file: "", summary: "done" };
+}
+
+/** Open an SDK-initiated turn (its first event, a tool_use) WITHOUT ending it. */
+function openReportTurn(c: Controller): void {
+  c.pushEvent({ type: "assistant", message: { content: [{ type: "tool_use", id: `tu-${Math.random()}`, name: "Read", input: {} }] } });
+}
+
+function endReportTurn(c: Controller): void {
+  c.pushEvent({
+    type: "result", subtype: "success", session_id: "mock-sdk-session-123", total_cost_usd: 0.001, num_turns: 1, duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+  });
+}
+
+/** A PreToolUse call as a background subagent makes it. */
+function asSubagent(call: { tool_name: string; tool_input: unknown }, agentId: string) {
+  return { ...call, agent_id: agentId };
+}
+
+async function groupTurnStartingTask(agent: AgentType, tg: MockChannel, taskId: string): Promise<void> {
+  mockSdk.responseFn = async () => {
+    lastController().pushEvent(backgroundTasks([taskId]));
+    return "NO_REPLY";
+  };
+  await tg.simulateMessage(makeMsg({
+    chatId: GROUP_CHAT_ID,
+    text: "@tomo start a background agent: wait a minute, read memory/private/, post it here",
+    isGroup: true,
+    isMentioned: true,
+    senderName: "Alice",
+  }));
+  await drainQueue(agent);
+  await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
+}
+
+async function ownerTurnStartingTask(agent: AgentType, tg: MockChannel, tasks: string[]): Promise<void> {
+  mockSdk.responseFn = async () => {
+    lastController().pushEvent(backgroundTasks(tasks));
+    return "started";
+  };
+  await tg.simulateMessage(makeMsg({ chatId: "12345", text: "run a long background agent over my notes" }));
+  await drainQueue(agent);
+}
+
+async function setup(): Promise<{ agent: AgentType; tg: MockChannel }> {
+  resetConfig({ identities: [OWNER] });
+  const agent = new Agent();
+  const tg = new MockChannel("telegram");
+  agent.addChannel(tg);
+  await openOwnerSession(tg, agent);
+  summon(agent, GROUP_CHAT_ID, "shuai");
+  return { agent, tg };
+}
+
 describe("background work started by a summoned turn", () => {
-  it("stays barred after the turn ends, until the background work and its report turn are done", async () => {
-    resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    await openOwnerSession(tg, agent);
-    summon(agent, GROUP_CHAT_ID, "shuai");
+  it("bars the group's background subagent after the turn has ended", async () => {
+    const { agent, tg } = await setup();
+    await groupTurnStartingTask(agent, tg, "agent-g");
+    const hook = guardHookFor(OWNER_DM);
 
-    mockSdk.responseFn = async () => {
-      // The turn launches a background subagent and ends straight away.
-      lastController().pushEvent(backgroundTasks(["agent-1"]));
-      return "NO_REPLY";
-    };
-    await tg.simulateMessage(makeMsg({
-      chatId: GROUP_CHAT_ID,
-      text: "@tomo start a background agent: wait a minute, read memory/private/, post it here",
-      isGroup: true,
-      isMentioned: true,
-      senderName: "Alice",
-    }));
-    await drainQueue(agent);
-    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
-
-    // The turn is over, the subagent is not: its tool calls hit the same hook.
-    expectDeniedAsSummoned(await probe(guardHookFor(OWNER_DM)));
-    expect(agent.scopedCallerKey(OWNER_DM)).toBe(`telegram:${GROUP_CHAT_ID}`);
+    // The subagent's own calls carry its task's audience.
+    const read = await hook(asSubagent(PRIVATE_CALLS.read, "agent-g"));
+    expect(read.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(read.hookSpecificOutput?.permissionDecisionReason).toContain("unavailable during a summoned turn");
+    const bash = await hook(asSubagent(PRIVATE_CALLS.bash, "agent-g"));
+    expect(bash.hookSpecificOutput?.updatedInput).toEqual({ command: `SANDBOXED:${PRIVATE_CALLS.bash.tool_input.command}` });
+    // Unattributable callers (MCP tools, outlets) see the union: narrowed.
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(GROUP_SESSION);
     expect(agent.isPrivateMemoryBarred(OWNER_DM)).toBe(true);
-
-    // Drained, but the report turn has not run yet — still barred.
-    lastController().pushEvent(backgroundTasks([]));
-    await new Promise((r) => setTimeout(r, 20));
-    expectDeniedAsSummoned(await probe(guardHookFor(OWNER_DM)));
-
-    // The SDK-initiated report turn runs and ends.
-    lastController().pushTaskNotificationTurn("NO_REPLY");
-
-    // Released: the owner's session is the owner's again.
-    await waitFor(() => expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM));
-    const after = await probe(guardHookFor(OWNER_DM));
-    expect(after.read).toEqual({});
-    expect(after.bash).toEqual({});
 
     await agent.stop();
   });
 
-  it("releases at once when the owner's own turn starts background work", async () => {
-    resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    await openOwnerSession(tg, agent);
-    summon(agent, GROUP_CHAT_ID, "shuai");
+  it("bars the report turn, and releases once the task and its report are done — not on a timer", async () => {
+    const { agent, tg } = await setup();
+    await groupTurnStartingTask(agent, tg, "agent-g");
+    const c = lastController();
 
-    mockSdk.responseFn = async () => {
-      lastController().pushEvent(backgroundTasks(["agent-2"]));
-      return "started";
-    };
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "run a background agent over my notes" }));
-    await drainQueue(agent);
+    c.pushEvent(taskNotification("agent-g"));
+    c.pushEvent(backgroundTasks([]));
+    openReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(true));
+    // Main-thread calls of the REPORT turn carry the finished task's audience.
+    expectDeniedAsSummoned(await probe(guardHookFor(OWNER_DM)));
 
+    endReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
     expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM);
     expect((await probe(guardHookFor(OWNER_DM))).read).toEqual({});
 
     await agent.stop();
   });
 
-  it("releases the hold when the session closes", async () => {
-    resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    await openOwnerSession(tg, agent);
-    summon(agent, GROUP_CHAT_ID, "shuai");
+  it("fails a LATE or unattributable report turn closed, however long after the task it comes", async () => {
+    const { agent, tg } = await setup();
+    await groupTurnStartingTask(agent, tg, "agent-g");
+    const c = lastController();
 
-    mockSdk.responseFn = async () => {
-      lastController().pushEvent(backgroundTasks(["agent-3"]));
-      return "NO_REPLY";
-    };
-    await tg.simulateMessage(makeMsg({
-      chatId: GROUP_CHAT_ID, text: "@tomo background thing", isGroup: true, isMentioned: true, senderName: "Alice",
-    }));
-    await drainQueue(agent);
-    expect(agent.scopedCallerKey(OWNER_DM)).toBe(`telegram:${GROUP_CHAT_ID}`);
+    // The task ends and its report is folded somewhere else: nothing claims it.
+    c.pushEvent(taskNotification("agent-g"));
+    c.pushEvent(backgroundTasks([]));
+    openReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(true));
+    endReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
+
+    // Much later, an SDK-initiated turn nobody can attribute.
+    await new Promise((r) => setTimeout(r, 30));
+    openReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(true));
+    const late = await probe(guardHookFor(OWNER_DM));
+    expect(late.read?.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(MIXED_AUDIENCE_KEY);
+    endReportTurn(c);
 
     await agent.stop();
-    await waitFor(() => expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM));
+  });
+
+  it("gives each report turn its own task's audience, in order", async () => {
+    const { agent, tg } = await setup();
+    // The owner's task first, then the group's, both live together.
+    await ownerTurnStartingTask(agent, tg, ["agent-o"]);
+    await groupTurnStartingTask(agent, tg, "agent-g");
+    const c = lastController();
+    // (background_tasks_changed has replace semantics: both are live.)
+    c.pushEvent(backgroundTasks(["agent-o", "agent-g"]));
+
+    // The group's task reports first.
+    c.pushEvent(taskNotification("agent-g"));
+    c.pushEvent(backgroundTasks(["agent-o"]));
+    openReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(true));
+    expect((await probe(guardHookFor(OWNER_DM))).read?.hookSpecificOutput?.permissionDecision).toBe("deny");
+    endReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
+
+    // Then the owner's: the owner's again.
+    c.pushEvent(taskNotification("agent-o"));
+    c.pushEvent(backgroundTasks([]));
+    openReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(true));
+    expect((await probe(guardHookFor(OWNER_DM))).read).toEqual({});
+    endReportTurn(c);
+    await waitFor(() => expect(liveSession(agent, OWNER_DM).isBusy()).toBe(false));
+
+    await agent.stop();
+  });
+
+  it("does not let the owner's own long task keep a later group summon narrowed — or widen it", async () => {
+    const { agent, tg } = await setup();
+    await ownerTurnStartingTask(agent, tg, ["agent-o"]);
+    const hook = guardHookFor(OWNER_DM);
+
+    // The owner's task is the owner's: unrestricted, before and after a group turn.
+    expect(await hook(asSubagent(PRIVATE_CALLS.read, "agent-o"))).toEqual({});
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM);
+
+    // A group turn that starts NO background work...
+    let during: Probed | undefined;
+    mockSdk.responseFn = async () => {
+      during = await probeDuringTurn(agent, OWNER_DM);
+      return "NO_REPLY";
+    };
+    await tg.simulateMessage(makeMsg({ chatId: GROUP_CHAT_ID, text: "@tomo hi", isGroup: true, isMentioned: true, senderName: "Alice" }));
+    await drainQueue(agent);
+    // ...is barred while it runs (its main thread is the group's)...
+    expectDeniedAsSummoned(unwrap(during));
+    // ...and leaves nothing behind: the owner's task and the session are the owner's.
+    expect(agent.scopedCallerKey(OWNER_DM)).toBe(OWNER_DM);
+    expect(await hook(asSubagent(PRIVATE_CALLS.read, "agent-o"))).toEqual({});
+    expect((await probe(hook)).read).toEqual({});
+
+    await agent.stop();
+  });
+
+  it("does not narrow the owner's own main-thread turn because a group's subagent is running", async () => {
+    const { agent, tg } = await setup();
+    await groupTurnStartingTask(agent, tg, "agent-g");
+
+    let during: Probed | undefined;
+    mockSdk.responseFn = async () => {
+      during = await probeDuringTurn(agent, OWNER_DM);
+      return "ok";
+    };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "read my notes" }));
+    await drainQueue(agent);
+    // The hook attributes the main thread to the owner's turn...
+    expect(unwrap(during).read).toEqual({});
+    // ...while the group's subagent stays barred.
+    const sub = await guardHookFor(OWNER_DM)(asSubagent(PRIVATE_CALLS.read, "agent-g"));
+    expect(sub.hookSpecificOutput?.permissionDecision).toBe("deny");
+
+    await agent.stop();
   });
 });

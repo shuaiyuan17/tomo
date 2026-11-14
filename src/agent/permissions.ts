@@ -304,10 +304,13 @@ export function privateMemoryBashDenial(bar: PrivateMemoryBar): string {
  *  not scoped to the main thread. */
 export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
-  bar: () => PrivateMemoryBar | null,
+  // Both getters take the calling subagent's `agent_id` (undefined on the main
+  // thread), so background work is judged by its own task's audience — see
+  // `Agent.audiencesInScope`.
+  bar: (agentId?: string) => PrivateMemoryBar | null,
   pluginDirs: () => readonly string[] = () => [],
   groupShellAllowlist: () => readonly string[] | undefined = () => [],
-  scopedCallerKey: () => string | undefined = () => undefined,
+  scopedCallerKey: (agentId?: string) => string | undefined = () => undefined,
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   // The settings files the query actually loads, so the Bash arm can refuse when
@@ -317,10 +320,10 @@ export function privateMemoryGuardHooks(
   const settingsFiles = loadedSettingsFiles(config.workspaceDir);
   return {
     PreToolUse: [{
-      hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
+      hooks: [async (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => {
         // Cheap check first: `bar()` is a map lookup, `isPrivateMemoryAccess`
         // can hit the filesystem. Order does not affect the outcome.
-        const reason = bar();
+        const reason = bar(input.agent_id);
         if (!reason) return {};
         const isBash = input.tool_name === "Bash";
         if (isBash) {
@@ -329,7 +332,7 @@ export function privateMemoryGuardHooks(
           // MEDIA denials below still fire, but an unsandboxed shell can read
           // the same paths, so allowlisting a group hands its participants the
           // owner's private memory through Bash.
-          const allowlistedKey = shellAllowlistedKey(reason, sessionKey, groupShellAllowlist, scopedCallerKey);
+          const allowlistedKey = shellAllowlistedKey(reason, sessionKey, groupShellAllowlist, () => scopedCallerKey(input.agent_id));
           if (allowlistedKey) {
             log.info(
               { key: sessionKey, allowlistedKey, bar: reason },

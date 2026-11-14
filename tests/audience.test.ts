@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { audienceOf, audienceSwitchNote, isOwnAudienceTurn } from "../src/agent/audience.js";
+import { audienceOf, audienceSwitchNote, isOwnAudienceTurn, MIXED_AUDIENCE_KEY } from "../src/agent/audience.js";
 
 const label = (a: string) => (a === "dm" ? "the private DM" : `the group ${a}`);
 
@@ -92,5 +92,98 @@ describe("isOwnAudienceTurn", () => {
   it("fails closed for a batch spanning several audiences", () => {
     expect(isOwnAudienceTurn(DM, ["dm", GROUP])).toBe(false);
     expect(isOwnAudienceTurn(DM, [GROUP, OTHER_GROUP])).toBe(false);
+  });
+});
+
+describe("BackgroundAudienceLedger", () => {
+  const GROUP = "telegram:-100270";
+  const OTHER = "telegram:-100999";
+
+  it("records a task's origin from the turn running when it appeared", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "a" }], () => [GROUP]);
+    l.setLiveTasks([{ task_id: "a" }, { task_id: "b" }], () => ["dm"]);
+    expect(l.originOf("a")).toEqual([GROUP]);
+    expect(l.originOf("b")).toEqual(["dm"]);
+    expect(l.liveOrigins().sort()).toEqual([GROUP, "dm"].sort());
+  });
+
+  it("is the owner's for a task started with nothing registered (a harness turn)", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "c" }], () => undefined);
+    expect(l.originOf("c")).toEqual(["dm"]);
+  });
+
+  it("gives a subagent-launched task its parent's origin, not the current turn's", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "p" }], () => [GROUP]);
+    l.setLiveTasks([{ task_id: "p" }, { task_id: "child", parent_task_id: "p" }], () => ["dm"]);
+    expect(l.originOf("child")).toEqual([GROUP]);
+  });
+
+  it("attributes report turns in order, one task's report each", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "g" }], () => [GROUP]);
+    l.setLiveTasks([{ task_id: "g" }, { task_id: "o" }], () => ["dm"]);
+    l.taskFinished("g");
+    l.setLiveTasks([{ task_id: "o" }], () => undefined);
+    expect(l.claimReportTurn()).toEqual([GROUP]);
+    l.endReportTurn();
+    l.taskFinished("o");
+    l.setLiveTasks([], () => undefined);
+    expect(l.claimReportTurn()).toEqual(["dm"]);
+  });
+
+  it("unions reports that arrive together, so disagreement fails closed", async () => {
+    const { BackgroundAudienceLedger, scopedCallerKeyFor } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "g" }], () => [GROUP]);
+    l.setLiveTasks([{ task_id: "g" }, { task_id: "h" }], () => [OTHER]);
+    l.taskFinished("g");
+    l.taskFinished("h");
+    expect(scopedCallerKeyFor("dm:shuai", l.claimReportTurn())).toBe(MIXED_AUDIENCE_KEY);
+  });
+
+  it("does not queue a task's report twice (notification, then leaving the set)", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "g" }], () => [GROUP]);
+    l.taskFinished("g");
+    expect(l.claimReportTurn()).toEqual([GROUP]);
+    l.endReportTurn();
+    l.setLiveTasks([], () => undefined);
+    // Nothing left to attribute the next one to.
+    expect(l.claimReportTurn()).toEqual([MIXED_AUDIENCE_KEY]);
+  });
+
+  it("fails an unattributable report turn closed, with no timeout to release it", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    expect(l.claimReportTurn()).toEqual([MIXED_AUDIENCE_KEY]);
+    expect(l.reportTurnAudience()).toEqual([MIXED_AUDIENCE_KEY]);
+    l.endReportTurn();
+    expect(l.reportTurnAudience()).toBeNull();
+  });
+
+  it("falls back to the live tasks' origins when no report is queued", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "m" }], () => ["dm"]);
+    expect(l.claimReportTurn()).toEqual(["dm"]);
+  });
+
+  it("a task started inside a report turn inherits that turn's audience", async () => {
+    const { BackgroundAudienceLedger } = await import("../src/agent/audience.js");
+    const l = new BackgroundAudienceLedger();
+    l.setLiveTasks([{ task_id: "g" }], () => [GROUP]);
+    l.taskFinished("g");
+    l.setLiveTasks([], () => undefined);
+    l.claimReportTurn();
+    l.setLiveTasks([{ task_id: "g2" }], () => undefined);
+    expect(l.originOf("g2")).toEqual([GROUP]);
   });
 });

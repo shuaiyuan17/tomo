@@ -225,3 +225,123 @@ export class TurnAudienceRegistry {
 export function isOwnAudienceTurn(sessionKey: string, audiences: readonly string[] | undefined): boolean {
   return scopedCallerKeyFor(sessionKey, audiences) === sessionKey;
 }
+
+/**
+ * Who each piece of BACKGROUND work on a session belongs to — per task id.
+ *
+ * A turn ending is not its work ending. `Agent { run_in_background: true }`, a
+ * background shell or a Monitor returns at once and the turn resolves; the
+ * subagent's later tool calls still reach the session's PreToolUse hook
+ * (carrying `agent_id` = the task id), and the CLI then runs an SDK-initiated
+ * REPORT turn for it. None of that runs inside the turn that started it, so the
+ * per-turn {@link TurnAudienceRegistry} has nothing registered for it — and on
+ * a `dm:` session "nothing registered" resolves to the owner. A summoned
+ * group's background agent therefore read `memory/private/` unbarred.
+ *
+ * So the audience is recorded PER TASK, at the moment the task appears, and
+ * travels with it:
+ *
+ * - a task's ORIGIN is the audience of the turn running when it appeared (or
+ *   its parent task's origin, for a task a subagent launched). A harness-owned
+ *   turn (cron, LCM) with no registered audience is the owner's: `["dm"]`.
+ * - a subagent's tool calls are judged by its task's origin (`originOf`).
+ * - when a task finishes (its `task_notification`, or leaving the live set) its
+ *   origin is queued for the report turn; the next SDK-initiated turn takes
+ *   everything queued (`claimReportTurn`). Several queued reports → their
+ *   union, which fails closed if they disagree.
+ * - a report turn that cannot be attributed — nothing queued — takes the
+ *   union of the still-live tasks' origins, and with none of those it is
+ *   UNATTRIBUTABLE and fails closed as {@link MIXED_AUDIENCE_KEY}. No timeout
+ *   ever turns an unattributed turn back into the owner's.
+ *
+ * Pure bookkeeping: LiveSession feeds it the SDK's task events.
+ */
+export class BackgroundAudienceLedger {
+  /** Live background task id → origin audiences. */
+  private origins = new Map<string, string[]>();
+  /** Tasks whose origin was already queued for a report (notification seen). */
+  private reported = new Set<string>();
+  /** Origins of finished tasks whose report turn has not been claimed yet. */
+  private pending: string[] = [];
+  /** The audience of the SDK-initiated turn in flight, if any. */
+  private reportTurn: string[] | null = null;
+
+  /**
+   * Replace the live set (`background_tasks_changed` has REPLACE semantics).
+   * `now` is the audience of whatever turn is running at this instant.
+   */
+  setLiveTasks(
+    tasks: ReadonlyArray<{ task_id: string; parent_task_id?: string }>,
+    now: () => readonly string[] | undefined,
+  ): void {
+    const live = new Set(tasks.map((t) => t.task_id));
+    for (const [id, origin] of this.origins) {
+      if (live.has(id)) continue;
+      if (!this.reported.has(id)) this.pending.push(...origin);
+      this.origins.delete(id);
+      this.reported.delete(id);
+    }
+    for (const t of tasks) {
+      if (this.origins.has(t.task_id)) continue;
+      const parent = t.parent_task_id ? this.origins.get(t.parent_task_id) : undefined;
+      this.origins.set(t.task_id, parent ? [...parent] : this.currentAudience(now));
+    }
+  }
+
+  /** A task's `task_notification`: queue its origin for the report turn now. */
+  taskFinished(taskId: string): void {
+    const origin = this.origins.get(taskId);
+    if (!origin || this.reported.has(taskId)) return;
+    this.reported.add(taskId);
+    this.pending.push(...origin);
+  }
+
+  /** An SDK-initiated turn has started. Returns the audience it runs under. */
+  claimReportTurn(): string[] {
+    if (this.reportTurn) return this.reportTurn;
+    let audience: string[];
+    if (this.pending.length > 0) audience = [...new Set(this.pending)];
+    else if (this.origins.size > 0) audience = [...new Set([...this.origins.values()].flat())];
+    else audience = [MIXED_AUDIENCE_KEY];
+    this.pending = [];
+    this.reportTurn = audience;
+    return audience;
+  }
+
+  /** The SDK-initiated turn in flight has ended. */
+  endReportTurn(): void {
+    this.reportTurn = null;
+  }
+
+  /** The audience of the SDK-initiated turn in flight, or null. */
+  reportTurnAudience(): string[] | null {
+    return this.reportTurn ? [...this.reportTurn] : null;
+  }
+
+  /** The origin of a live background task, by its id (= a subagent's `agent_id`). */
+  originOf(taskId: string): string[] | undefined {
+    const o = this.origins.get(taskId);
+    return o ? [...o] : undefined;
+  }
+
+  /** Union of every live background task's origin. Empty when none is live. */
+  liveOrigins(): string[] {
+    return [...new Set([...this.origins.values()].flat())];
+  }
+
+  /** The session is gone: nothing it tracked can run any more. */
+  clear(): void {
+    this.origins.clear();
+    this.reported.clear();
+    this.pending = [];
+    this.reportTurn = null;
+  }
+
+  private currentAudience(now: () => readonly string[] | undefined): string[] {
+    const registered = now() ?? [];
+    const all = [...registered, ...(this.reportTurn ?? [])];
+    // Nothing registered and no report turn: a harness-owned turn (cron, LCM),
+    // which is the owner's.
+    return all.length > 0 ? [...new Set(all)] : ["dm"];
+  }
+}

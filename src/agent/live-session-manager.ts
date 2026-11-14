@@ -22,6 +22,16 @@ import type { RunWithRetryRequest } from "./turn-runner.js";
  * is retired anyway. Long enough for a typical subagent run, short enough that
  * a hung task cannot pin a stale system prompt for the rest of the day.
  */
+/**
+ * Who a PreToolUse call comes from, as the hook sees it: `agentId` is the
+ * subagent's id (equal to its background task id), absent on the main thread.
+ * Passing a caller at all means "attribute this call" — see
+ * `Agent.audiencesInScope`.
+ */
+export interface ToolCaller {
+  agentId?: string;
+}
+
 export const PROMPT_RETIRE_BACKGROUND_WAIT_MS = 2 * 60 * 60 * 1000;
 
 /**
@@ -131,14 +141,16 @@ export interface LiveSessionManagerDeps {
    * call by the private-memory PreToolUse guard, so it must be a live query
    * and not a value snapshotted at session creation.
    */
-  isOwnAudienceTurn(key: string): boolean;
+  isOwnAudienceTurn(key: string, caller?: ToolCaller): boolean;
   /**
    * The key the turn in flight on `key` is scoped to (`Agent.scopedCallerKey`),
    * which is the steering group's key on a summoned turn. Read per tool call by
    * the private-memory guard so a summoned turn inherits its group's
    * `groupShellAllowlist` entry; a live query for the same reason as above.
    */
-  scopedCallerKey(key: string): string;
+  scopedCallerKey(key: string, caller?: ToolCaller): string;
+  /** The audiences of the turns registered on `key` right now. */
+  turnAudiences(key: string): readonly string[] | undefined;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
@@ -221,16 +233,19 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.isAlive() ?? false;
   }
 
-  /**
-   * A promise that settles once the session's background work (subagents,
-   * background shells, monitors, and the turn that reports them) has played
-   * out — or null when there is none to wait for. See
-   * LiveSession.waitForBackgroundSettled.
-   */
-  backgroundSettled(key: string): Promise<void> | null {
-    const live = this.liveSessions.get(key);
-    if (!live?.isAlive() || !live.hasPendingBackgroundWork()) return null;
-    return live.waitForBackgroundSettled(PROMPT_RETIRE_REPORT_WAIT_MS);
+  /** Origin audience of a live background task on `key`. See LiveSession. */
+  backgroundTaskAudience(key: string, taskId: string): string[] | undefined {
+    return this.liveSessions.get(key)?.backgroundTaskAudience(taskId);
+  }
+
+  /** Union of the origins of `key`'s live background tasks. */
+  liveBackgroundAudiences(key: string): string[] {
+    return this.liveSessions.get(key)?.liveBackgroundAudiences() ?? [];
+  }
+
+  /** The audience of the SDK-initiated turn in flight on `key`, or null. */
+  reportTurnAudience(key: string): string[] | null {
+    return this.liveSessions.get(key)?.reportTurnAudience() ?? null;
   }
 
   /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */
@@ -491,8 +506,11 @@ export class LiveSessionManager {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
       group: this.deps.buildGroupContext(key),
-      isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
-      scopedCallerKey: () => this.deps.scopedCallerKey(key),
+      // The hook knows WHO is calling (a subagent's `agent_id`, or the main
+      // thread), and hands it on so background work is judged by its own
+      // task's audience.
+      isOwnAudienceTurn: (agentId) => this.deps.isOwnAudienceTurn(key, { agentId }),
+      scopedCallerKey: (agentId) => this.deps.scopedCallerKey(key, { agentId }),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
       // Late-bound on purpose: the options are built before the session that
       // owns the flag exists. Until it does, nothing was dropped.
@@ -506,6 +524,7 @@ export class LiveSessionManager {
       onToolResult: (toolName, content, isError) => {
         this.deps.handleToolResult?.(key, toolName, content, isError);
       },
+      turnAudiences: () => this.deps.turnAudiences(key),
       ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: this.deps.getUsageBaseline(key) } } : {}),
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`

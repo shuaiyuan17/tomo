@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   CronStore,
   CronStoreReadError,
@@ -17,14 +17,16 @@ import {
   unschedulableReason,
 } from "../src/cron/store.js";
 import { POLL_INTERVAL_MS } from "../src/cron/scheduler.js";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { cronAddRefusal, readCronJobsSafely } from "../src/cli/cron-errors.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 type CronJobLike = Record<string, unknown> & { id: string };
 
-const TEST_DIR = join(tmpdir(), "tomo-test-cron");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 describe("CronStore", () => {

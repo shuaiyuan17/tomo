@@ -1,12 +1,12 @@
 import { describe, it, expect, afterAll } from "vitest";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 // HOME is patched BEFORE the dynamic import below, because the cron store's
 // default path is resolved from homedir() at module load. Everything this
 // file touches lives under the temp home.
-const HOME = join(tmpdir(), "tomo-test-status-cron-home");
+const HOME = mkdtempSync(join(tmpdir(), "tomo-test-status-cron-home-"));
 const CRON_DIR = join(HOME, ".tomo", "data", "cron");
 const JOBS = join(CRON_DIR, "jobs.json");
 rmSync(HOME, { recursive: true, force: true });

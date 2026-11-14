@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   annotateSenderName,
   autoBindHandle,
@@ -18,11 +18,13 @@ import {
   type PeopleDirs,
   type PersonRecord,
 } from "../src/people.js";
-import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-people");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-people-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const dirs: PeopleDirs = {
   publicDir: join(TEST_DIR, "people"),
   privateDir: join(TEST_DIR, "private", "people"),

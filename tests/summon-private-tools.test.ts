@@ -1,7 +1,15 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+
+// One unique directory per run, created before the hoisted vi.mock factories
+// below read it (a fixed name would collide with a concurrent vitest run).
+const TMP = await vi.hoisted(async () => {
+  const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  return { home: fs.mkdtempSync(path.join(os.tmpdir(), "tomo-test-summon-private-tools-")) };
+});
 
 // The people registry resolves its directories from `defaultRuntimePaths`
 // (src/people.ts `defaultPeopleDirs`), which the internal MCP server does not
@@ -10,8 +18,7 @@ import { tmpdir } from "node:os";
 vi.mock("../src/runtime-paths.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/runtime-paths.js")>();
   const path = await import("node:path");
-  const os = await import("node:os");
-  const home = path.join(os.tmpdir(), "tomo-test-summon-private-tools");
+  const home = TMP.home;
   return {
     ...actual,
     defaultRuntimePaths: actual.createRuntimePaths({
@@ -50,7 +57,9 @@ installAgentTestHooks();
 // observable.
 // ---------------------------------------------------------------------------
 
-const HOME = join(tmpdir(), "tomo-test-summon-private-tools");
+const HOME = TMP.home;
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(HOME, { recursive: true, force: true }));
 const MEMORY = join(HOME, "workspace", "memory");
 const OWNER_DM = "dm:shuai";
 const GROUP_CHAT_ID = "-100270";

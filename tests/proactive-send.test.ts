@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, RecentChatMessage } from "../src/channels/types.js";
@@ -171,8 +171,7 @@ describe("ProactiveSendService.sendToSession", () => {
     });
 
     it("marks the caption of an attachment send and leaves the attachment alone", async () => {
-      const dir = join(tmpdir(), `tomo-proactive-guard-${process.pid}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), "tomo-proactive-guard-"));
       const photo = join(dir, "pic.png");
       writeFileSync(photo, "fake");
       try {

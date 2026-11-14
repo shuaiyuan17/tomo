@@ -1,7 +1,6 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // ONE REGISTRY READ PER INBOUND MESSAGE.
@@ -18,7 +17,18 @@ import { tmpdir } from "node:os";
 // module boundaries.
 // ---------------------------------------------------------------------------
 
-const HOME = join(tmpdir(), "tomo-test-people-registry-loads");
+// One unique directory per run, created before the hoisted vi.mock factories
+// below read it (a fixed name would collide with a concurrent vitest run).
+const TMP = await vi.hoisted(async () => {
+  const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  return { home: fs.mkdtempSync(path.join(os.tmpdir(), "tomo-test-people-registry-loads-")) };
+});
+
+const HOME = TMP.home;
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(HOME, { recursive: true, force: true }));
 const MEMORY = join(HOME, "workspace", "memory");
 const PUBLIC_PEOPLE_DIR = join(MEMORY, "people");
 
@@ -27,8 +37,7 @@ const counter = vi.hoisted(() => ({ registryLoads: 0 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const path = await import("node:path");
-  const os = await import("node:os");
-  const publicPeopleDir = path.join(os.tmpdir(), "tomo-test-people-registry-loads", "workspace", "memory", "people");
+  const publicPeopleDir = path.join(TMP.home, "workspace", "memory", "people");
   return {
     ...actual,
     // Delegates everything; the only change is the tally.
@@ -42,8 +51,7 @@ vi.mock("node:fs", async (importOriginal) => {
 vi.mock("../src/runtime-paths.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/runtime-paths.js")>();
   const path = await import("node:path");
-  const os = await import("node:os");
-  const home = path.join(os.tmpdir(), "tomo-test-people-registry-loads");
+  const home = TMP.home;
   return {
     ...actual,
     defaultRuntimePaths: actual.createRuntimePaths({

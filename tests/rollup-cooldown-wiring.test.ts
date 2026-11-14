@@ -12,8 +12,8 @@
  * the new store module, so on unchanged main it fails at the assertion rather
  * than at module resolution.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -25,7 +25,9 @@ vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
   findDuePromotions: () => [{ level: "daily", period: "2026-08-28", childCount: 46 }],
 }));
 
-const TOMO_HOME = join(tmpdir(), "tomo-test-rollup-cooldown-wiring");
+const TOMO_HOME = mkdtempSync(join(tmpdir(), "tomo-test-rollup-cooldown-wiring-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TOMO_HOME, { recursive: true, force: true }));
 const EXPECTED_FILE = join(TOMO_HOME, "data", "lcm", "nudge-cooldown.json");
 const SESSION = "dm:owner";
 

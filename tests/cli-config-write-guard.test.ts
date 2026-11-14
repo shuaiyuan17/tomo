@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import {
   mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync,
@@ -27,6 +27,8 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // ---------------------------------------------------------------------------
 const TEST_HOME = mkdtempSync(join(tmpdir(), "tomo-config-guard-home-"));
 vi.stubEnv("HOME", TEST_HOME);
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 vi.resetModules();
 
 const shared = await import("../src/cli/config/shared.js");

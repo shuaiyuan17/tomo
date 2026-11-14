@@ -1,10 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { iterateJsonlBackwardsSync, readJsonlTailSync, readFirstJsonlRecordSync } from "../src/jsonl.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-jsonl");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-jsonl-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 
 describe("jsonl backward reading", () => {
   beforeEach(() => {

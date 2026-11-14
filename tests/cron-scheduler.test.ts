@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { CronScheduler } from "../src/cron/scheduler.js";
 import { CronStore, ONE_SHOT_STALE_AFTER_MS, isInterrupted } from "../src/cron/store.js";
 import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -17,7 +17,9 @@ vi.mock("../src/logger.js", () => ({
   },
 }));
 
-const TEST_DIR = join(tmpdir(), "tomo-test-cron-scheduler");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-scheduler-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const TEST_PATH = join(TEST_DIR, "jobs.json");
 
 /** Make the interrupted run on disk look like it started `agoMs` ago. */

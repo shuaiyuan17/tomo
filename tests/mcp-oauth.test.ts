@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { connect } from "node:net";
@@ -7,7 +7,9 @@ import { McpOAuthManager, startCallbackServer } from "../src/mcp/oauth.js";
 import { log } from "../src/logger.js";
 import type { ExternalMcpServerConfig } from "../src/mcp/external-config.js";
 
-const TEST_DIR = join(tmpdir(), "tomo-test-mcp-oauth");
+const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-mcp-oauth-"));
+// The root is unique to this run, so nothing else will clean it up.
+afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 
 async function flushMicrotasks(times = 5): Promise<void> {
   for (let i = 0; i < times; i++) await Promise.resolve();

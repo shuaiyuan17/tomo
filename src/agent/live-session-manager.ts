@@ -8,6 +8,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import type { McpConnection } from "../mcp/live-status.js";
 import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
@@ -230,6 +231,12 @@ export class LiveSessionManager {
 
   isAlive(key: string): boolean {
     return this.liveSessions.get(key)?.isAlive() ?? false;
+  }
+
+  /** SDK-reported MCP connection state of up to 32 live sessions (web Study). Never creates a session or probes a server. */
+  async readMcpStatuses(): Promise<Array<{ key: string; connections: McpConnection[] | null }>> {
+    const sessions = [...this.liveSessions].filter(([, session]) => session.isAlive()).slice(0, 32);
+    return Promise.all(sessions.map(async ([key, session]) => ({ key, connections: await session.readMcpStatus() })));
   }
 
   /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */

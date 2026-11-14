@@ -24,7 +24,20 @@ The web chat is always the owner's DM session (`dm:<owner.name>`). With no owner
 - Click a task to read it, read-only. A subagent shows its transcript in order: assistant text, then each tool call folded to one line (`Read src/web/http.ts`, `Bash: npm test`) that expands to its input and output (capped server-side at 4,000 characters each; "Show more" expands within that cap). The subagent's own prompt is not shown. Long transcripts load the newest page first; "Load earlier" pages back. While the task runs, the view polls every 2 s for the lines appended since the last read, and reads once more after it ends. Shell and Monitor tasks show the end of their output (the SDK's `get_task_output`, at most the last 8 KiB, escape sequences stripped). Only a task the panel currently shows can be opened (the exact set the panel's send gate last published, after expiry, the owner rule and the capacity share), and tool input/output is secret-scrubbed like the logs. Pages never split a transcript entry; an entry with more than 400 blocks shows the first 400 and says how many it left out. At most 2,000 items stay in memory; whatever is dropped can be loaded again ("Load earlier" / "Load newer"). The Tool and Terminal views are adapted from AI Elements (Apache-2.0); the license ships as `dist/web-assets/THIRD_PARTY_LICENSES.txt`.
 - Context uses the same persisted `contextUsed` / `contextMax` values as the CLI. Estimated values are labeled. A missing window is unavailable.
 
-The first implementation includes chat, history, and the recorded context meter. TODOs, cron, memory, detailed context history, MCP, and config editing follow in separate PRs.
+## The Study
+
+**The Study** (left sidebar, or `#study/<page>`) is a read-only view of the workspace. Every read uses the same authentication as chat and runs in the web process, never on the daemon thread.
+
+- **TODOs:** root-level `memory/TODO*.md` files with their checkbox state (nested TODO files stay browsable in Memory).
+- **Memory:** browse `MEMORY.md`, topic files and subdirectories; search literal text and open results.
+- **Context:** for the conversation selected in the sidebar (owner DM or a group): persisted window usage and breakdown, the same estimated sections as `tomo lcm stats`, retained rollup blocks as in `tomo lcm blocks`, and compactions seen since the daemon started (not a complete audit log). A missing window is unavailable, not zero.
+- **Cron:** names, schedules, target sessions, messages, next/last runs and status, read fresh from the scheduler's store.
+- **MCP servers:** saved definitions, including disabled ones, with the state live SDK sessions report (connected, failed, needs sign-in…). Health is never probed and no connection or OAuth flow is started; no report means unknown.
+- **Config:** the saved `config.json`. Values the daemon is running with may differ until it restarts.
+
+`memory/private/` is never listed, read or searched by the Study, not even for the owner. It uses the agent's own private-memory fence (`landsInPrivate`: lexical, real-path and case-folded), a private path reads as not found, and `MEMORY.md` lines that link into `private/` are withheld, as in group prompts. Secrets in config appear only as set / not set: a secret-named key anywhere on the path (the shared `isSecretFieldName` rule), any MCP server value other than `type`, `enabled`, `disabled`, `timeout` and `alwaysLoad`, and any value the log scrubber would alter or a URL with credentials or a query.
+
+Study reads are bounded: Markdown files to 256 KiB; the tree to 1,000 entries, eight levels and a time budget; search to 100 hits, 4 MiB and a time budget. Symlinks, hard links and special files are rejected. Context analysis reads at most 16 MiB of SDK transcript one JSON line at a time (256 KiB per line, 20,000 lines) and returns at most 100 sections and 100 rollups (8,000-character previews); a larger transcript keeps its persisted window reading. One workspace/context inspection runs at a time across browser clients (`429 inspection_busy`, retried by the page); chat stays available. MCP status covers at most 32 live sessions and times out after one second.
 
 ## Reconnection and limits
 

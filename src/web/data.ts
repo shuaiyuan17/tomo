@@ -3,7 +3,10 @@ import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
-import { WebError, type SubagentPage, type WebCatalog } from "./protocol.js";
+import { WebError, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
+import { readSessionContext, WebCron } from "./inspection.js";
+import { WebConfigReader } from "./config-view.js";
+import { MemoryReader } from "../workspace/memory-reader.js";
 import { readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 
 export interface WebDataOptions {
@@ -11,6 +14,12 @@ export interface WebDataOptions {
   sdkSessionsDir: string;
   /** The owner (the web UI always means the owner); undefined = setup required. */
   owner?: OwnerConfig;
+  /** The workspace whose public memory the Study browses (never memory/private/). */
+  workspaceDir?: string;
+  /** Runtime home holding config.json (Study config / MCP view). */
+  tomoHome?: string;
+  /** Cron store file; defaults to the daemon scheduler's own default path. */
+  cronStorePath?: string;
 }
 
 /**
@@ -57,7 +66,22 @@ export function subagentModelReader(options: WebDataOptions): (sessionKey: strin
 
 /** Runs in the web process. Never imports the live Agent or starts services. */
 export class WebData {
-  constructor(private readonly options: WebDataOptions) {}
+  readonly memory?: MemoryReader;
+  readonly cron: WebCron;
+  readonly config?: WebConfigReader;
+  constructor(private readonly options: WebDataOptions) {
+    if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
+    if (options.tomoHome) this.config = new WebConfigReader(options.tomoHome);
+    this.cron = new WebCron(options.cronStorePath);
+  }
+
+  /** Context usage, estimated breakdown and rollups of a session the catalog shows. */
+  async context(id: string): Promise<WebContext> {
+    const key = this.catalog().keys.get(id);
+    if (!key) throw new WebError(404, "session_not_found");
+    const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).find((item) => item.channelKey === key);
+    return readSessionContext(entry, this.options.sdkSessionsDir);
+  }
 
   catalog(): WebCatalog & { keys: Map<string, string> } {
     const entries = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir);

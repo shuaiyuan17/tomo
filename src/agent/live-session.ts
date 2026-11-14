@@ -8,6 +8,7 @@ import {
   type SDKMessageOrigin,
 } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
+import { McpLiveStatus, type McpConnection } from "../mcp/live-status.js";
 import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
@@ -1449,6 +1450,12 @@ export class LiveSession {
 
   isAlive(): boolean {
     return this.alive;
+  }
+
+  private mcpLiveStatus?: McpLiveStatus;
+  /** SDK-reported MCP connection state (bounded, one request in flight); null when unknown. */
+  readMcpStatus(): Promise<McpConnection[] | null> {
+    return (this.mcpLiveStatus ??= new McpLiveStatus(this.q as unknown as { mcpServerStatus?: () => Promise<unknown> })).read();
   }
 
   /** Replace the live query's complete dynamic MCP set when the SDK supports it. */

@@ -10,7 +10,7 @@ import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebEvent, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebEvent, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
 /** A shell task's full command is served up to this many characters. */
 const COMMAND_LIMIT = 16_000;
@@ -40,6 +40,8 @@ export class WebChannel implements Channel {
   private receipts = new Map<string, Receipt>();
   private blocks: Extract<WebEvent, { type: "block" }>[] = [];
   private blockBytes = 0;
+  /** Recent compactions per browser session, for the Study's context view. */
+  private compactions = new Map<string, WebCompaction[]>();
   private readonly taskModel: ((sessionKey: string, taskId: string) => Promise<string | undefined>) | undefined;
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
@@ -209,6 +211,10 @@ export class WebChannel implements Channel {
     receipt.request.state = state;
     this.events.publish({ type: "request", request: { ...receipt.request } });
   }
+  /** Compactions of `sessionId` seen since this daemon started, oldest first. */
+  contextEvents(sessionId: string): WebCompaction[] { return [...(this.compactions.get(sessionId) ?? [])]; }
+  /** The browser session id for a daemon session key, or undefined when the browser may not see it. */
+  sessionIdFor(key: string): string | undefined { return this.sessionId(key); }
   private sessionId(key: string): string | undefined {
     if (isGroupSessionKey(key)) return webSessionId(key);
     if (!this.owner || !this.ownerId) return;
@@ -294,6 +300,14 @@ export class WebChannel implements Channel {
       if (receipt) receipt.settled = true;
       this.blocks = this.blocks.filter((block) => block.requestId !== event.requestId);
       this.blockBytes = this.blocks.reduce((sum, block) => sum + Buffer.byteLength(block.text), 0);
+      this.events.publish({ type: "invalidate", sessionId });
+    } else if (event.type === "compact") {
+      const list = this.compactions.get(sessionId) ?? [];
+      list.push({ timestamp: event.ts, ...(event.preTokens !== undefined ? { preTokens: event.preTokens } : {}),
+        ...(event.postTokens !== undefined ? { postTokens: event.postTokens } : {}) });
+      if (list.length > 50) list.shift();
+      if (!this.compactions.has(sessionId) && this.compactions.size >= 256) this.compactions.delete(this.compactions.keys().next().value!);
+      this.compactions.set(sessionId, list);
       this.events.publish({ type: "invalidate", sessionId });
     } else if (event.type === "transcript" || event.type === "turn.stats") {
       this.events.publish({ type: "invalidate", sessionId });

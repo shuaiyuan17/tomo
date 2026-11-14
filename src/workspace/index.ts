@@ -3,6 +3,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { defaultPeopleDirs, loadPeople, renderPeopleRoster } from "../people.js";
+import { PRIVATE_MEMORY_SUBDIR, isPrivateIndexLine } from "./private-memory.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -13,15 +14,10 @@ const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
 export const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
 const MEMORY_ENTRYPOINT = join(MEMORY_DIR, "MEMORY.md");
 const MAX_MEMORY_LINES = 200;
-/** Subdir for DM-only memories. Files here are filtered out of MEMORY.md for
- *  group sessions and blocked by a PreToolUse hook (see sdk-options.ts). */
-export const PRIVATE_MEMORY_SUBDIR = "private";
+export { PRIVATE_MEMORY_SUBDIR };
 /** Absolute path to the private memory dir. Used by the group-session guard
  *  hook to deny tool calls referencing this location. */
 export const PRIVATE_MEMORY_DIR = join(MEMORY_DIR, PRIVATE_MEMORY_SUBDIR);
-/** Matches markdown links pointing into the private subdir, with or without a
- *  leading `./`. Used to strip private entries from MEMORY.md in groups. */
-const PRIVATE_LINK_RE = /\]\(\s*\.?\/?private\//i;
 
 /** Load a .md file from workspace, falling back to bundled defaults */
 function load(name: string): string {
@@ -98,7 +94,7 @@ Don't wait to be told "remember this." Save durable personal details, preference
     const raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8").trim();
     let lines = raw.split("\n");
     if (isGroup) {
-      lines = lines.filter(line => !PRIVATE_LINK_RE.test(line));
+      lines = lines.filter(line => !isPrivateIndexLine(line));
     }
     if (lines.length > MAX_MEMORY_LINES) {
       memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;

@@ -6,7 +6,9 @@ import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, ChevronsUpDown, ListChecks, Monitor, Moon, Sun } from "lucide-react";
+import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun } from "lucide-react";
+import { Study } from "./study.js";
+import { STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -60,8 +62,19 @@ function Mark({ className }: { className?: string }) {
   return <svg className={cn("size-10 shrink-0 fill-none stroke-primary stroke-2 [stroke-linecap:round]", className)} viewBox="0 0 40 40" aria-hidden="true"><path d="M 32 14 C 36 20, 32 32, 20 32 C 8 32, 5 22, 10 14 C 14 7, 26 6, 30 12" /></svg>;
 }
 
+function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void] {
+  const [page, setPage] = useState(() => viewFromHash(window.location.hash));
+  useEffect(() => {
+    const update = () => setPage(viewFromHash(window.location.hash));
+    window.addEventListener("hashchange", update);
+    return () => window.removeEventListener("hashchange", update);
+  }, []);
+  return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); }];
+}
+
 export function App() {
   const web = useWeb();
+  const [study, setStudy] = useStudyRoute();
   const [selected, setSelected] = useState("");
   const selectedId = selected || web.bootstrap?.ownerId || web.bootstrap?.sessions[0]?.id || "";
   const session = web.bootstrap?.sessions.find((s) => s.id === selectedId);
@@ -217,11 +230,11 @@ export function App() {
   const connectionLabel = web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…";
   const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px]";
   return <div className="flex h-dvh flex-col">
-    <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href="#conversation">Skip to conversation</a>
+    <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : "Skip to conversation"}</a>
     <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-16 max-[600px]:gap-3 max-[600px]:px-4">
       <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:text-[26px]" href="/" aria-label="Tomo home">
         <Mark className="size-9" /><span>tomo<span className="text-primary">.</span></span></a>
-      <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">Conversation</span>
+      <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : "Conversation"}</span>
       <div className="ml-auto flex items-center gap-4 max-[600px]:gap-2">
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
           aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => setTasksOpen((open) => !open)}
@@ -244,6 +257,14 @@ export function App() {
     <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
       <aside className="flex w-[272px] shrink-0 flex-col gap-1 border-r px-6 py-8 max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
         aria-label="Conversation details" inert={modal}>
+        <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5 max-[600px]:mb-0 max-[600px]:flex-row max-[600px]:gap-1">
+          {([[null, "Conversation", MessageCircle], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
+            const current = target === null ? !study : !!study;
+            return <Button key={label} variant="ghost" aria-current={current ? "page" : undefined} onClick={() => setStudy(target === null ? null : study ?? target)}
+              className="h-9 justify-start gap-2.5 rounded-xl px-3 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-9 max-[600px]:px-2.5">
+              <Icon strokeWidth={1.75} /><span className="max-[600px]:sr-only">{label}</span></Button>;
+          })}
+        </nav>
         <p className="eyebrow mb-3 max-[600px]:hidden">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2 max-[600px]:mb-0">
           <span id="session-label" className="text-[13px] font-medium">Session</span>
@@ -272,7 +293,8 @@ export function App() {
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
       </aside>
-      <main id="conversation" className="mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
+      {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} />}
+      <main id="conversation" hidden={!!study} className="mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
         <div className="min-h-0 w-full flex-1 overflow-y-auto pt-2 pr-4 pb-6 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[600px]:pr-2" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={() => { const e = scroll.current!; atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 80; }}>

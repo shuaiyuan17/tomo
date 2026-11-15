@@ -67,6 +67,8 @@ export type SubagentItem =
   /** `sources`: the page a WebFetch call reads. */
   | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number;
     sources?: WebSource[];
+    /** `summary` is words the model wrote (a Bash description), not a command: shown in the text face. */
+    prose?: true;
     /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
     privateOutput?: boolean }
   /** `images`: image blocks in the output, counted and never served (the view shows a chip). `sources`: a WebSearch result's links. */

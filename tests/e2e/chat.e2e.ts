@@ -480,4 +480,19 @@ it("a picture the agent sends (MEDIA:<path>) shows as a thumbnail by id, never a
   await browserExpect(page.locator("main")).not.toContainText("MEDIA:");
   expect(await page.content()).not.toContain("gap.png");
   expect(await page.content()).not.toContain("long-gone");
+it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps its own name", async () => {
+  mkdirSync(mockConfig.workspaceDir, { recursive: true });
+  writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "# IDENTITY.md - Who Am I?\n\n- **Name:** Claw\n- **Vibe:** direct\n");
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).append("dm:owner", { role: "assistant", channel: "web", content: "Hello there.", timestamp: Date.now() });
+  await page.reload();
+  await browserExpect(page.getByRole("textbox", { name: "Message Claw" })).toBeVisible();
+  await browserExpect(page.locator("article.message.assistant").first()).toContainText("Claw");
+  await browserExpect(page.locator("article.message.assistant").first()).not.toContainText("Tomo");
+  await browserExpect(page.getByRole("link", { name: "Tomo home" })).toBeVisible();
+  expect(await page.title()).toMatch(/Tomo/i);
+  writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "- **名字：** 小爪\n");
+  const { utimesSync } = await import("node:fs");
+  utimesSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), new Date(), new Date(Date.now() + 5_000));
+  await page.reload();
+  await browserExpect(page.getByRole("textbox", { name: "Message 小爪" })).toBeVisible();
 });

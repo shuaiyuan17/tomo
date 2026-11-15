@@ -56,7 +56,7 @@ const {
   PRIVATE_MEMORY_SUMMONED_DENIAL,
 } = await import("../src/agent/permissions.js");
 const { MIXED_AUDIENCE_KEY } = await import("../src/agent/audience.js");
-const { harnessDataDenialReason, isPrivateAttachmentPath } = await import("../src/agent/private-memory-guard.js");
+const { barredSearchDenialReason, harnessDataDenialReason, isPrivateAttachmentPath } = await import("../src/agent/private-memory-guard.js");
 const { config } = await import("../src/config.js");
 
 const ctx = {
@@ -389,7 +389,7 @@ describe("privateMemoryGuardHooks — Tomo's data/ on a barred turn", () => {
       for (const call of DATA_CALLS) {
         const result = await hook({ ...call, tool_input: { ...call.tool_input } });
         expect(decision(result), JSON.stringify(call)).toBe("deny");
-        expect(result.hookSpecificOutput?.permissionDecisionReason).toBe(harnessDataDenialReason(bar));
+        expect([harnessDataDenialReason(bar), barredSearchDenialReason(bar)]).toContain(result.hookSpecificOutput?.permissionDecisionReason);
       }
     });
   }
@@ -403,7 +403,7 @@ describe("privateMemoryGuardHooks — Tomo's data/ on a barred turn", () => {
   it("leaves the workspace and the owner's own turn alone", async () => {
     expect(await hookFor(() => "group-session")(PUBLIC_READ)).toEqual({});
     expect(await hookFor(() => "group-session")({ tool_name: "Grep", tool_input: { pattern: "x", path: "/ws/notes" } })).toEqual({});
-    expect(await hookFor(() => "group-session")({ tool_name: "Glob", tool_input: { pattern: "/ws/notes/**/*.md" } })).toEqual({});
+    expect(await hookFor(() => "group-session")({ tool_name: "Glob", tool_input: { path: "/ws/notes", pattern: "*.md" } })).toEqual({});
     for (const call of DATA_CALLS) expect(await hookFor(() => null)(call)).toEqual({});
   });
 

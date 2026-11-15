@@ -5,8 +5,8 @@ import { HOME_SCENE_DIR, MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR }
 import { sandboxedBashCommand } from "./bash-sandbox.js";
 import { MIXED_AUDIENCE_KEY } from "./audience.js";
 import { loadedSettingsFiles } from "./setting-sources.js";
-import { isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
-export { isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL };
+import { barredSearch, isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEARCH_TOOLS, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
+export { barredSearch, isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEARCH_TOOLS, SEND_MESSAGE_TOOL };
 import { join } from "node:path";
 import { landsInPrivate } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
@@ -71,6 +71,11 @@ export function harnessDataDirs(): string[] {
   if (config.tomoHome) dirs.add(join(config.tomoHome, "data"));
   if (config.sessionsDir) dirs.add(config.sessionsDir);
   return [...dirs];
+}
+
+/** Denial text for a search rooted at, inside or above a barred directory. */
+export function barredSearchDenialReason(bar: PrivateMemoryBar): string {
+  return `On this turn a search may not start at, inside or above \`memory/${PRIVATE_MEMORY_SUBDIR}/\` or Tomo's \`~/.tomo/data/\` (${bar === "group-session" ? "a group session" : "a group is steering this session"}). Point \`path\` at the specific subdirectory you mean, below them and not containing them — for example a folder in the workspace other than \`memory/\`.`;
 }
 
 /** Denial text for a file-tool call into Tomo's `data/` on a barred turn. */
@@ -206,6 +211,7 @@ export function privateMemoryGuardHooks(
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   const homeCtx = { cwd: config.workspaceDir, homeDir: HOME_SCENE_DIR };
   const dataCtx = { cwd: config.workspaceDir, dataDirs: harnessDataDirs() };
+  const searchCtx = { cwd: config.workspaceDir, barredDirs: [PRIVATE_MEMORY_DIR, ...dataCtx.dataDirs] };
   // The settings files the query actually loads, so the Bash arm can refuse when
   // one of them carries a PreToolUse hook that could undo the sandbox rewrite.
   // Derived from the same constant the query option uses (setting-sources.ts) —
@@ -268,6 +274,19 @@ export function privateMemoryGuardHooks(
             };
           }
         } else if (!isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) {
+          // Searches, structurally: rooted at, inside or above any barred dir
+          // is refused, whatever the pattern says (the predicates above judge
+          // the pattern, which is the arm that kept leaking).
+          if (SEARCH_TOOLS.has(input.tool_name) && barredSearch(input.tool_name, input.tool_input, searchCtx)) {
+            log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a search over a barred directory");
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                permissionDecision: "deny" as const,
+                permissionDecisionReason: barredSearchDenialReason(reason),
+              },
+            };
+          }
           // The third barred directory, reads and writes: Tomo's own data/.
           if (isHarnessDataAccess(input.tool_name, input.tool_input, dataCtx)) {
             log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked access to Tomo's data directory on a private-memory-barred turn");

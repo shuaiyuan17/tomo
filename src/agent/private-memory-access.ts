@@ -2,7 +2,7 @@ import { extractAttachments } from "./text-utils.js";
 import { landsInPrivate, globReachesPrivate, grepReachesPrivate, bashTouchesMemory } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
 import { isAbsolute } from "node:path";
-import { foldPath, isInside } from "./permission-paths.js";
+import { abs, foldPath, hasTraversalSegment, isInside, realResolve } from "./permission-paths.js";
 
 /*
  * The #464 private-memory predicate for one tool call, in a module free of
@@ -76,25 +76,54 @@ export function isHarnessDataAccess(
   ctx: { cwd: string; dataDirs: readonly string[] },
 ): boolean {
   if (toolName === "Bash") return false;
-  if (ctx.dataDirs.some((dir) => isPrivateMemoryAccess(toolName, toolInput, { cwd: ctx.cwd, memoryDir: dir, privateDir: dir }))) {
-    return true;
-  }
-  // An ABSOLUTE Glob pattern / Grep filter anchors itself wherever the root
-  // is, and the probe paths above cannot model every suffix it might ask for
-  // (`/…/data/**/*.ndjson` matches no `probe.md`). For data/ the rule is
-  // blunter: refuse when the pattern's literal prefix is inside a data dir,
-  // or is a string prefix of one (it can still widen into it).
-  if (toolName !== "Glob" && toolName !== "Grep") return false;
-  const ti = toolInput as Record<string, unknown>;
-  const pattern = toolName === "Glob" ? ti.pattern : ti.glob;
-  if (typeof pattern !== "string") return false;
+  return ctx.dataDirs.some((dir) => isPrivateMemoryAccess(toolName, toolInput, { cwd: ctx.cwd, memoryDir: dir, privateDir: dir }));
+}
+
+/** Tools that search a tree from a root. */
+export const SEARCH_TOOLS: ReadonlySet<string> = new Set(["Glob", "Grep", "LS"]);
+
+/** `p` as spelled (made absolute) and as the kernel resolves it, folded. */
+function spellings(p: string, cwd: string): string[] {
+  const out = new Set([foldPath(abs(p, cwd))]);
+  const real = realResolve(p, cwd, true);
+  if (real !== null) out.add(foldPath(real));
+  return [...out];
+}
+
+/**
+ * Would this search be rooted at, inside, or ABOVE a barred directory? On a
+ * barred turn that is the whole test: the search is refused without asking
+ * whether its pattern could reach the barred tree. Deciding that from a
+ * pattern is the arm that kept leaking — `Grep({ path: "~/.tomo", glob:
+ * "data/usage/*.ndjson" })` matched none of the probe paths, and `~` was never
+ * expanded at all — so a barred turn searches a specific subdirectory or not
+ * at all.
+ *
+ * The root is `~`-expanded and compared both as spelled and as it really
+ * resolves (a symlink to an ancestor of a barred dir is that ancestor), as is
+ * each barred dir. A pattern or filter that is absolute, or that steers
+ * upward with `..`, anchors itself wherever the root is: refused when its
+ * literal prefix is inside a barred dir or could still widen into one, and
+ * always when it climbs.
+ */
+export function barredSearch(
+  toolName: string,
+  toolInput: unknown,
+  ctx: { cwd: string; barredDirs: readonly string[] },
+): boolean {
+  if (!SEARCH_TOOLS.has(toolName)) return false;
+  const ti = toolInput && typeof toolInput === "object" ? toolInput as Record<string, unknown> : {};
+  const rootRaw = typeof ti.path === "string" && ti.path ? expandTilde(ti.path) : ctx.cwd;
+  const roots = spellings(rootRaw, ctx.cwd);
+  const dirs = ctx.barredDirs.flatMap((dir) => spellings(dir, ctx.cwd));
+  if (roots.some((root) => dirs.some((dir) => isInside(root, dir) || isInside(dir, root)))) return true;
+  const pattern = toolName === "Glob" ? ti.pattern : toolName === "Grep" ? ti.glob : undefined;
+  if (typeof pattern !== "string" || !pattern) return false;
   const spelled = expandTilde(pattern);
+  if (hasTraversalSegment(spelled)) return true;
   if (!isAbsolute(spelled)) return false;
   const literal = foldPath(spelled.split(/[*?[{]/, 1)[0]);
-  return ctx.dataDirs.some((dir) => {
-    const folded = foldPath(dir);
-    return isInside(literal, folded) || folded.startsWith(literal);
-  });
+  return dirs.some((dir) => isInside(literal, dir) || dir.startsWith(literal));
 }
 
 export function isPrivateMemoryAccess(

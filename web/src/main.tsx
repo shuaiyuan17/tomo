@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn, taskAction } from "./api.js";
 import { useWeb } from "./use-web.js";
@@ -14,9 +14,7 @@ import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
 import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
-import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
-import { ScreenWindow } from "./screen.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
 import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { ReadReceiptMark } from "./read-receipt.js";
@@ -35,11 +33,28 @@ import { AgentNameContext, agentNameOf } from "./agent-name.js";
 import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
 import { useSessionTools } from "./use-session-tools.js";
 import { ChatRow, ChatScroller, type ChatScrollerHandle } from "./chat-scroller.js";
-import { chatRows, rowId } from "./chat-rows.js";
+import { chatRows, rowId, type ChatRow as ChatRowData } from "./chat-rows.js";
 import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
 import { useAttachments } from "./use-attachments.js";
 import { channelLabel, dayDividers, messageDateTime, messageTime } from "./message-meta.js";
 import { attachmentLabel, canSendWith, captureSend, dragHasFiles, imageFiles } from "./uploads.js";
+
+// The Study and the screen window are off the chat's first paint: their own chunks, fetched when opened.
+const Study = lazy(() => import("./study.js").then((m) => ({ default: m.Study })));
+const ScreenWindow = lazy(() => import("./screen.js").then((m) => ({ default: m.ScreenWindow })));
+
+/**
+ * Each message's send marker, reply quote, body and quoted original, once
+ * per history (findQuoted scans the messages before it). Indexed like
+ * `history.messages`.
+ */
+function parsedMessages(messages: HistoryPage["messages"]) {
+  return messages.map((message, index) => {
+    const { sent, body: content } = parseSendMarker(message.role, message.content);
+    const { reply, body } = parseReply(content);
+    return { sent, reply, body, quoted: reply && findQuoted(messages, index, reply) };
+  });
+}
 
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
@@ -367,12 +382,15 @@ export function App() {
     if (request.images?.length) void reattach(request.images);
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
+  // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
+  const latestActions = useRef({ resend, dismiss });
+  latestActions.current = { resend, dismiss };
   /** Resend / Dismiss for an interrupted request awaiting the owner, on its bubble (history or pending). */
   const interruptedActions = (request: WebRequest | undefined) => request && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
     <span>Not answered. {agent} may have started on it — check before resending.</span>
-    <Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => resend(request)} disabled={!session?.writable}>Resend…</Button>
+    <Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => latestActions.current.resend(request)} disabled={!session?.writable}>Resend…</Button>
     {confirmDismiss === request.requestId
-      ? <><Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => void dismiss(request.requestId)}>Dismiss it</Button>
+      ? <><Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => void latestActions.current.dismiss(request.requestId)}>Dismiss it</Button>
         <Button variant="ghost" size="sm" className="h-7 rounded-lg text-xs" onClick={() => setConfirmDismiss(null)}>Keep</Button></>
       : <Button variant="ghost" size="sm" className="h-7 rounded-lg text-xs" onClick={() => setConfirmDismiss(request.requestId)}>Dismiss</Button>}
   </div>;
@@ -417,14 +435,29 @@ export function App() {
     ? (history.nextCursor ? history.messages[0]?.timestamp ?? 0 : 0) : null;
   const turnActive = latest?.state === "running" || latest?.state === "queued" || !!web.activity[selectedId];
   const tools = useSessionTools(selectedId, toolsSince, (web.toolTicks[selectedId] ?? 0) * 1_000_003 + web.revision, turnActive);
-  const timeline = interleave(history.messages, tools.items, history.nextCursor ? toolsSince ?? 0 : 0);
-  const messageIndex = new Map(history.messages.map((m, i) => [m.id, i]));
+  // Derived from the history and tool list only, not recomputed per keystroke or SSE event.
+  const toolsCutoff = history.nextCursor ? toolsSince ?? 0 : 0;
+  const timeline = useMemo(() => interleave(history.messages, tools.items, toolsCutoff), [history.messages, tools.items, toolsCutoff]);
+  const messageIndex = useMemo(() => new Map(history.messages.map((m, i) => [m.id, i])), [history.messages]);
+  const parsed = useMemo(() => parsedMessages(history.messages), [history.messages]);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   // A turn's step rows (calls, its todo list, its sources) sit close together; the last one keeps the gap before the next message.
   const toolBlock = (block: ToolBlock, running: boolean) => <div key={block.key} data-slot="turn-block" className="mx-auto mb-4 max-w-[740px] has-[+[data-slot=turn-block]]:mb-0.5">
     <TurnBlock block={block} running={running} choices={openGroups} onChoice={(key, value) => setOpenGroups((old) => ({ ...old, [key]: value }))} /></div>;
   // Rows of the scroller (see chat-rows.ts); the running turn's calls and reply ride in the last one.
   const rows = chatRows(timeline.entries, pendingUsers, timeline.trailing.length > 0 || blocks.length > 0);
+  // A recorded message's row content, built once and reused until something it reads changes: typing or
+  // a streamed block re-renders the page, not every recorded row. The handlers inside only call setters
+  // or read latestActions; `appeared` is keyed by its content. The day dividers are not part of it (the
+  // one at a row's end depends on the next row and on today's date), nor is the live content of the last row.
+  const appearedKey = [...appeared].join("\n");
+  const messageViews = useMemo(() => new Map<string, React.JSX.Element>(),
+    [timeline, parsed, appearedKey, web.requests, flashId, confirmDismiss, agent, session?.kind, session?.writable, ownerConversation, selectedId, openGroups]);
+  const messageView = (row: Extract<ChatRowData, { kind: "message" }>, build: () => React.JSX.Element) => {
+    let view = messageViews.get(row.id);
+    if (!view) { view = build(); messageViews.set(row.id, view); }
+    return view;
+  };
   // A day divider rides at the top of the row it introduces (rows only grow at their ends; see chat-rows.ts).
   const dividers = dayDividers(rows.map((row) => row.kind === "message" ? { at: row.message.timestamp } : { at: row.kind === "pending" ? row.request.timestamp : undefined, late: true }));
   useEffect(() => { stamp.current = requestStamp(latest); });
@@ -551,8 +584,8 @@ export function App() {
           </ToggleGroup>
         </div>
       </aside>
-      {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
-        mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
+      {study && <Suspense fallback={null}><Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
+        mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} /></Suspense>}
       {home && <HomePage events={web.home} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} inert={modal} />}
       <main id="conversation" hidden={!!study || home} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]" tabIndex={-1} inert={modal}>
         {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
@@ -571,10 +604,9 @@ export function App() {
           {/* The first shown row's day, outside the rows: on "Load earlier" only its text changes. */}
           {dividers.first && <DayDivider label={dividers.first} />}
           </>}>
-          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
+          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && messageView(row, () => <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
-            const { sent, body: content } = parseSendMarker(message.role, message.content);
-            const { reply, body } = parseReply(content); const quoted = reply && findQuoted(history.messages, index, reply);
+            const { sent, reply, body, quoted } = parsed[index];
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span>
               {sent && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{sendMarkerLabel(sent)}</Badge>}
@@ -584,7 +616,7 @@ export function App() {
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
                 : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>)}
-            {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })()}</>}
+            {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })()}</>)}
           {row.kind === "pending" && ((request: WebRequest) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
@@ -667,7 +699,7 @@ export function App() {
       {/* While dragging only this guide moves (a transform); the rail and the chat resize once, on release. */}
       {railSize.separator && <div ref={railSize.guide} hidden aria-hidden="true" className="pointer-events-none fixed inset-y-0 left-0 z-40 w-0.5 bg-primary/70" />}
     </div>
-    {screen && <ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} />}
+    {screen && <Suspense fallback={null}><ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} /></Suspense>}
   </div></AgentNameContext.Provider>;
 }
 

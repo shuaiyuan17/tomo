@@ -28,7 +28,9 @@ export default defineConfig({
     // The Study, the screen window and the task view are lazy chunks. React
     // is its own chunk: its name (hash) survives app releases, so a browser
     // keeps it in cache (hashed assets are served immutable) across upgrades.
-    chunkSizeWarningLimit: 500,
+    // The largest chunk is the home room's three.js (~530 kB, lazy, only on
+    // #home); every chunk the chat loads is under 400 kB.
+    chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: { advancedChunks: { groups: [{ name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ }] } },
       // Radix ships "use client" for React Server Components; meaningless in a client-only bundle.

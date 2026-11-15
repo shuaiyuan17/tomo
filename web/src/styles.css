@@ -188,3 +188,6 @@
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
+
+/* Dragging the Tasks rail's edge: one cursor everywhere, no text selection. */
+body.rail-resizing { cursor: col-resize; user-select: none; }

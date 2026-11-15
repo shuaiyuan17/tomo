@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 import { composerStatus, REQUEST_LABELS, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { useRailWidth } from "./rail-width.js";
 
 const labels = REQUEST_LABELS;
 type Theme = "system" | "light" | "dark";
@@ -150,8 +151,11 @@ export function App() {
     return () => observer.disconnect();
   }, []);
   const rail = useRef<HTMLElement>(null);
+  const sidebar = useRef<HTMLElement>(null);
   const overlay = useMediaQuery(OVERLAY_QUERY);
   const phone = useMediaQuery("(max-width: 600px)");
+  // Drag-to-resize for the Tasks rail; wide screens only (the narrow overlay keeps its width).
+  const railSize = useRailWidth({ enabled: !overlay, sidebar: () => sidebar.current?.offsetWidth ?? 272 });
   // The rail stays mounted through its closing transition (see motion.ts).
   const railMotion = useMountedFor(tasksOpen);
   const modal = tasksOpen && overlay && railMotion.mounted;
@@ -332,7 +336,7 @@ export function App() {
       </div>
     </header>
     <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
-      <aside className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
+      <aside ref={sidebar} className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
         aria-label="Conversation details" inert={modal}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5 max-[600px]:mb-0 max-[600px]:flex-row max-[600px]:gap-1">
           {([[null, "Conversation", MessageCircle], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
@@ -438,9 +442,15 @@ export function App() {
       {railMotion.mounted && overlay && <div aria-hidden="true" onClick={closeTasks} data-state={railMotion.shown ? "open" : "closed"}
         className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-16" />}
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
-        className="group/rail flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:transition-transform max-[800px]:duration-[220ms] max-[800px]:data-[state=closed]:translate-x-full max-[600px]:top-16">
+        style={railSize.width !== null ? { width: railSize.width } : undefined}
+        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[260px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:transition-transform max-[800px]:duration-[220ms] max-[800px]:data-[state=closed]:translate-x-full max-[600px]:top-16">
         <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[801px]:group-data-[state=closed]/rail:translate-x-4 min-[801px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
-          footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div></aside>}
+          footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
+        {railSize.separator && <div {...railSize.separator}
+          className="group/handle absolute inset-y-0 left-0 z-10 w-2 cursor-col-resize touch-none outline-none">
+          <span className="absolute inset-y-0 left-0 w-px transition-colors group-hover/handle:bg-primary/60 group-focus-visible/handle:bg-primary" /></div>}</aside>}
+      {/* While dragging only this guide moves (a transform); the rail and the chat resize once, on release. */}
+      {railSize.separator && <div ref={railSize.guide} hidden aria-hidden="true" className="pointer-events-none fixed inset-y-0 left-0 z-40 w-0.5 bg-primary/70" />}
     </div>
     {screen && <ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} />}
   </div>;

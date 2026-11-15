@@ -124,6 +124,16 @@
   p, h1, h2 { text-wrap: pretty; }
 }
 
+/* iOS Safari zooms the whole page in when a focused field's text is under
+   16px, and stays zoomed. Unlayered and !important so no utility class on a
+   field (the composer's 15px, a search box's 13px) can bring the zoom back.
+   Touch devices only: desktop keeps its denser type. */
+@media (hover: none) and (pointer: coarse) {
+  input, textarea, select { font-size: 16px !important; }
+}
+/* Rotating a phone must not inflate the text. */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+
 @layer components {
   /* Eyebrow: the small mono caps used for section labels. */
   .eyebrow { @apply m-0 text-[10.5px] font-medium uppercase leading-relaxed tracking-[0.08em] text-muted-foreground; }

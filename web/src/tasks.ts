@@ -132,7 +132,9 @@ export function runningCount(tasks: WebTask[]): number {
  * `claude-fable-5-2` → "Fable 5.2", `claude-sonnet-4-5-20250929` → "Sonnet 4.5".
  * Anything else is shown as is, minus a `claude-` prefix.
  */
-export function modelLabel(id: string): string {
+export function modelLabel(raw: string): string {
+  // A context-window tag (`[1m]`) is not part of the name.
+  const id = raw.replace(/\[[^\]]*\]$/, "");
   const match = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/.exec(id);
   if (match) {
     const [, family, major, minor] = match;

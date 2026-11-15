@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronRight, RefreshCw } from "lucide-react";
-import type { WebUsage } from "../../src/web/protocol.js";
+import type { WebRateLimit, WebUsage } from "../../src/web/protocol.js";
+import { rateLimitNotice } from "./composer-status.js";
 import { api } from "./api.js";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -13,7 +14,9 @@ import { isWarn, localizeUsage, nextUsageDelay, RequestGate, resetLabel, splitWi
  * then again when the server's 30-minute cache expires (plus a few seconds)
  * while the tab is visible, and on demand; the daemon caches and debounces.
  */
-export function PlanUsage({ ready }: { ready: boolean }) {
+export function PlanUsage({ ready, live }: { ready: boolean;
+  /** The rate-limit state the SDK last pushed (`rate_limit_event`): shown at once, and the bars are re-read when it changes. */
+  live?: WebRateLimit }) {
   const [usage, setUsage] = useState<WebUsage>();
   const [loading, setLoading] = useState(false);
   // The refresh icon spins while loading and finishes its turn instead of
@@ -69,6 +72,15 @@ export function PlanUsage({ ready }: { ready: boolean }) {
     return () => { clearTimeout(timer.current); clearInterval(tick); document.removeEventListener("visibilitychange", onVisibility); };
   }, [load, schedule, ready]);
 
+  // A pushed change of state (a warning, a rejection, a reset) is newer than the cached bars.
+  const liveKey = live ? `${live.status}:${live.limit ?? ""}` : "";
+  const seenLive = useRef(liveKey);
+  useEffect(() => {
+    if (!ready || seenLive.current === liveKey) return;
+    seenLive.current = liveKey;
+    void load(true);
+  }, [liveKey, ready, load]);
+  const liveNotice = rateLimitNotice(live, now);
   const { main, scoped } = splitWindows(usage?.windows ?? []);
   const notice = failed ? "Couldn't reach Tomo for usage." : usage && usageNotice(usage);
   return <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="usage-heading">
@@ -78,6 +90,7 @@ export function PlanUsage({ ready }: { ready: boolean }) {
         className="-my-1 size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-3.5">
         <RefreshCw className={cn(spinning && "animate-spin")} onAnimationIteration={() => { if (!loading) setSpinning(false); }} strokeWidth={1.75} /></Button>
     </div>
+    {liveNotice && <p className="m-0 mb-3 text-[12px] leading-relaxed font-medium text-warn" role="status">{liveNotice}</p>}
     {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">Loading…</p>}
     {main.length > 0 && <div className="space-y-3.5">{main.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} />)}</div>}
     {scoped.length > 0 && <Collapsible className="group/models mt-3">

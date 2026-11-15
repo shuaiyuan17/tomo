@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError, dismissRequest, sendMessage } from "./api.js";
+import { api, ApiError, dismissRequest, sendMessage, stopTurn } from "./api.js";
 import { useWeb } from "./use-web.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
@@ -12,7 +12,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowDown, ArrowUp, ImagePlus, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
+import { ArrowDown, ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { ModelBadge } from "./model-badge.js";
 import { useRailWidth } from "./rail-width.js";
 import { AgentNameContext, agentNameOf } from "./agent-name.js";
 import { blockKey, interleave, jumpLabel, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
@@ -376,6 +377,32 @@ export function App() {
   const jumper = useJumpToLatest(scroll, atBottom,
     [...history.messages.map(messageKey), ...pendingUsers.map(pendingKey), ...blocks.map(blockKey)], selectedId, restoreScroll);
   useEffect(() => { stamp.current = requestStamp(latest); });
+  // The status line counts a running tool's seconds itself between the daemon's reports.
+  const turn = web.turns[selectedId];
+  const [now, setNow] = useState(() => Date.now());
+  const ticking = turnActive && turn?.status.kind === "tool";
+  useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [ticking]);
+  // Stop: offered in place of Send while a turn runs and there is nothing to send.
+  const [stopping, setStopping] = useState(false);
+  const canStop = !!session?.writable && turnActive && web.connection === "live";
+  const showStop = canStop && !canSendWith(draft, attachments.items) && !sending && !uncertain;
+  useEffect(() => { if (!turnActive) setStopping(false); }, [turnActive]);
+  const stop = async () => {
+    if (!web.bootstrap || stopping) return;
+    setStopping(true); setFeedback("Stopping…");
+    try {
+      const { stopped } = await stopTurn(web.bootstrap, web.refreshBootstrap);
+      if (!stopped) { setStopping(false); setFeedback("Nothing was running to stop."); }
+    } catch { setStopping(false); setFeedback("Could not stop it. Try again."); }
+  };
+  // The SDK's predicted next message: offered only while the composer is empty and idle.
+  const suggestion = session?.writable && !turnActive && !draft && !attachments.items.length && !resending && !uncertain ? web.suggestions[selectedId] : undefined;
+  const model = web.models[selectedId];
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -383,20 +410,20 @@ export function App() {
   const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px]";
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : "Skip to conversation"}</a>
-    <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-16 max-[600px]:gap-3 max-[600px]:px-4">
-      <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:text-[26px]" href="/" aria-label="Tomo home">
-        <Mark className="size-9" /><span>tomo<span className="text-primary">.</span></span></a>
+    <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content">
+      <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px]" href="/" aria-label="Tomo home">
+        <Mark className="size-9 max-[600px]:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
       <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : "Conversation"}</span>
-      <div className="ml-auto flex items-center gap-4 max-[600px]:gap-2">
+      <div className="ml-auto flex items-center gap-4 max-[600px]:gap-1">
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
           aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => setTasksOpen((open) => !open)}
-          className="relative size-10 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
+          className="relative size-10 rounded-xl text-foreground max-[600px]:size-9 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
           <ListChecks strokeWidth={1.75} />
           {running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{running > 99 ? "99+" : running}</span>}
         </Button>
         {screenAllowed && <Button ref={screenButton} variant="ghost" size="icon" aria-pressed={screen} aria-controls="screen-window" title="Screen"
           aria-label="Screen (read-only live view)" onClick={() => screen ? closeScreen() : setScreenOpen(true)}
-          className="size-10 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
+          className="size-10 rounded-xl text-foreground max-[600px]:size-9 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
           <Monitor strokeWidth={1.75} /></Button>}
         <span role="status" className="flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground">
           <i className={cn("size-1.5 rounded-full border border-muted-foreground", web.connection === "live" && "border-primary bg-primary")} />
@@ -404,7 +431,7 @@ export function App() {
       </div>
     </header>
     <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
-      <aside ref={sidebar} className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:py-2.5"
+      <aside ref={sidebar} className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-3.5 max-[600px]:py-1.5 max-[600px]:gap-2"
         aria-label="Conversation details" inert={modal}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5 max-[600px]:mb-0 max-[600px]:flex-row max-[600px]:gap-1">
           {([[null, "Conversation", MessageCircle], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
@@ -416,13 +443,13 @@ export function App() {
         </nav>
         <p className="eyebrow mb-3 max-[600px]:hidden">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2 max-[600px]:mb-0">
-          <span id="session-label" className="text-[13px] font-medium">Session</span>
+          <span id="session-label" className="text-[13px] font-medium max-[600px]:sr-only">Session</span>
           <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
             <Button variant="outline" aria-labelledby="session-label session-value"
-              className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent max-[600px]:flex-1">
+              className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent max-[600px]:h-9 max-[600px]:flex-1 max-[600px]:px-3">
               <span id="session-value" className="truncate">{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
@@ -445,7 +472,7 @@ export function App() {
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
-        <PlanUsage ready={!!web.bootstrap} />
+        <PlanUsage ready={!!web.bootstrap} live={web.rateLimit} />
         {/* Theme: pinned to the bottom of the sidebar; in the phone-width top bar, one button at its end that cycles. */}
         <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:hidden">
           <span className="eyebrow">Theme</span>
@@ -463,7 +490,7 @@ export function App() {
       </aside>
       {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
-      <main id="conversation" hidden={!!study} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
+      <main id="conversation" hidden={!!study} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]" tabIndex={-1} inert={modal}>
         {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
           <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />Drop to attach</span></div>}
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
@@ -498,7 +525,12 @@ export function App() {
         </div>
         <JumpToLatest visible={jumper.visible} unseen={jumper.unseen} onJump={jumper.jump} />
         </div>
-        <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent })}</div>
+        <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-start gap-3 pb-2">
+          <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now })}</div>
+          {model && <a href="#study/model" title={`Model: ${model}`} aria-label={`Model: ${model}. Open model settings`} className="shrink-0 rounded-md no-underline opacity-80 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"><ModelBadge model={model} className="ml-0 h-[18px] px-1.5 text-[10.5px]" /></a>}</div>
+          {suggestion && <button type="button" onClick={() => { setDraft(suggestion); input.current?.focus(); }} title="Use this as your message"
+            className="motion-enter mb-2 flex max-w-full items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 text-left text-[12.5px] text-muted-foreground shadow-xs transition-colors hover:border-muted-foreground/50 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
+            <Sparkles className="size-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span className="truncate">{suggestion}</span></button>}
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>
@@ -515,14 +547,14 @@ export function App() {
                 className="absolute top-1 right-1 grid size-5 place-items-center rounded-full bg-foreground/70 text-background hover:bg-foreground"><X className="size-3" strokeWidth={2.5} /></button>
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
-          <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
+          <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-1 rounded-[20px] border bg-card p-2.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
             <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden
               onChange={(e) => { attachments.add(Array.from(e.target.files ?? [])); e.target.value = ""; input.current?.focus(); }} />
             <Button type="button" variant="ghost" size="icon" aria-label="Attach images" title={uploadsOn ? "Attach images (or drop / paste them)" : "Image uploads are off (saveInboundImages is false in config)"} disabled={!canAttach}
-              onClick={() => fileInput.current?.click()} className="ml-1 size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground"><ImagePlus strokeWidth={1.75} /></Button>
+              onClick={() => fileInput.current?.click()} className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg:not([class*='size-'])]:size-[18px]"><ImagePlus strokeWidth={1.75} /></Button>
             <label className="sr-only" htmlFor="message">Message {agent}</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
-              className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! px-3.5 py-[7px] text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
+              className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! py-[7px] pr-3 pl-1.5 text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
               onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onPaste={(e) => {
                 const files = imageFiles(e.clipboardData?.items);
                 if (!files.length || !canAttach) return;
@@ -531,9 +563,12 @@ export function App() {
                 if (!Array.from(e.clipboardData.types).includes("text/plain")) e.preventDefault();
               }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
               onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+            {showStop ? <Button type="button" size="icon" aria-label={`Stop ${agent}`} title="Stop" aria-busy={stopping} disabled={stopping} onClick={() => void stop()}
+              className="size-9 shrink-0 rounded-full bg-foreground text-background transition-[background-color,transform] hover:bg-foreground/85 active:scale-[0.94] disabled:opacity-60 [&_svg:not([class*='size-'])]:size-3.5">
+              <Square fill="currentColor" strokeWidth={0} /></Button> :
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
-              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>
+              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>}
           </form>
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>
@@ -543,10 +578,10 @@ export function App() {
           ones: it slides over the chat, with a dimmed backdrop. It stays
           mounted for the closing transition. */}
       {railMotion.mounted && overlay && <div aria-hidden="true" onClick={closeTasks} data-state={railMotion.shown ? "open" : "closed"}
-        className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-16" />}
+        className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-[calc(3rem+env(safe-area-inset-top))]" />}
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         style={railSize.width !== null ? { width: railSize.width } : undefined}
-        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[280px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:transition-transform max-[800px]:duration-[220ms] max-[800px]:data-[state=closed]:translate-x-full max-[600px]:top-16">
+        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[280px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:transition-transform max-[800px]:duration-[220ms] max-[800px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))]">
         <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[801px]:group-data-[state=closed]/rail:translate-x-4 min-[801px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
         {railSize.separator && <div {...railSize.separator}

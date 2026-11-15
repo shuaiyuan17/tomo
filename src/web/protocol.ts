@@ -116,6 +116,31 @@ export interface WebUsage {
  * rather than a dropped connection.
  */
 export const USAGE_RPC_TIMEOUT_MS = 24_000;
+/**
+ * What the SDK reports about a session's running turn besides its content.
+ * `retry` and `tool` describe the moment and lapse as the turn moves on;
+ * `refusal`, `error` and `stopped` say how it went and stay until the next
+ * message.
+ */
+export type WebTurnStatus =
+  | { kind: "retry"; attempt: number; max: number; delayMs: number; error: string }
+  | { kind: "tool"; tool: string; elapsed: number }
+  | { kind: "refusal"; model: string; fallbackModel?: string; category?: string }
+  | { kind: "error"; error: string }
+  | { kind: "stopped" };
+/** The subscription's rate-limit state as the SDK last reported it (`rate_limit_event`). */
+export interface WebRateLimit {
+  status: "allowed" | "allowed_warning" | "rejected";
+  /** five_hour, seven_day, seven_day_opus, … */
+  limit?: string;
+  /** ms epoch. */
+  resetsAt?: number;
+  /** 0–100. */
+  utilization?: number;
+  overage?: boolean;
+  /** Daemon clock when it was reported (ms epoch). */
+  at: number;
+}
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
@@ -127,6 +152,13 @@ export type WebEvent =
   | { type: "typing"; sessionId: string; active: boolean }
   /** The latest compact request changed state. */
   | { type: "compact"; request: WebCompactState }
+  /** null: a new turn started, whatever the last one reported no longer applies. */
+  | { type: "turn"; sessionId: string; status: WebTurnStatus | null }
+  | { type: "rate-limit"; limit: WebRateLimit }
+  /** The model a session runs on (the SDK's own report once it has one, else the configured one). */
+  | { type: "model"; sessionId: string; model: string }
+  /** The SDK's predicted next message for the composer; null withdraws it. */
+  | { type: "suggestion"; sessionId: string; text: string | null }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
   | { type: "tasks"; sessionId: string; tasks: WebTask[] };
 export interface EventEnvelope { id: string; event: WebEvent }
@@ -142,6 +174,11 @@ export interface WebBootstrap extends WebCatalog {
   capabilities?: { screen: boolean; uploads?: boolean };
   /** The latest compact request, so a reload still shows it. */
   compact?: WebCompactState;
+  /** Model id per session, where known. */
+  models?: Record<string, string>;
+  rateLimit?: WebRateLimit;
+  /** The standing prompt suggestion per session. */
+  suggestions?: Record<string, string>;
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
   agentName?: string;
 }
@@ -196,17 +233,21 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),
   z.object({ method: z.literal("compact"), epoch: z.uuid() }).strict(),
+  /** Stop the owner conversation's running turn. */
+  z.object({ method: z.literal("stop"), epoch: z.uuid() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "models" | "rateLimit" | "suggestions">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
   /** A shell task's full command, redacted and capped (see redact-command.ts). */
   command?: { text: string; truncated: boolean } }
+/** Answer to a stop request: whether a turn was running to stop. */
+export interface WebStopResult { stopped: boolean }
 /** Answer to a compact request: queued, or one is already outstanding. */
 export interface WebCompactResult { status: "queued" | "already_requested"; requestId: string }
 /**

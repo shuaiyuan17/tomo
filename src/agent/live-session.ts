@@ -39,6 +39,7 @@ import { renderBlock, renderResponseBlocks, type ResponseBlock } from "./block-r
 import { summarizeToolInput, summarizeToolResult } from "./tool-summary.js";
 import { buildContentBlocks, isTextBlock, isThinkingBlock, isToolUseBlock } from "./content-blocks.js";
 import { isTaskSystemMessage, TaskTracker, type TaskChange, type TaskSystemMessage } from "./task-tracker.js";
+import { sdkSignalOf, type SdkSignal } from "./sdk-signals.js";
 
 // Re-exported so existing `./live-session.js` imports keep working.
 export {
@@ -836,6 +837,12 @@ export class LiveSession {
     if (!this.alive) return;
     this.refreshActivityTimeout();
 
+    // Everything the SDK says ABOUT the turn (retry, rate limit, refusal, tool
+    // progress, typed error, model, suggestion) goes to the watch bus for the
+    // web UI. Observability only: it never touches turn state.
+    const signal = sdkSignalOf(event);
+    if (signal) this.publishSignal(signal);
+
     // Events originating inside a subagent (Agent tool) carry
     // parent_tool_use_id. They must never reach the channel-facing callbacks:
     // the subagent's interim narration would ship to the user as Tomo's own
@@ -966,7 +973,12 @@ export class LiveSession {
       // without this branch they resolved as ordinary turns — the owner got
       // partial text or the generic "I'm not sure how to respond to that.",
       // cron recorded a clean run, and nothing was logged.
-      const failure = describeResultFailure(result);
+      // A turn the owner stopped ends on an error-shaped result (the CLI was
+      // interrupted). That is what he asked for: no failure, no error notice.
+      const stopped = this.stopRequestedFor !== null && this.stopRequestedFor === this.currentRequest;
+      this.stopRequestedFor = null;
+      if (stopped) this.publishSignal({ kind: "stopped" });
+      const failure = stopped ? null : describeResultFailure(result);
       if (failure) {
         log.warn(
           { session: this.sessionKey, subtype: result.subtype, errors: result.errors, turns: result.num_turns },
@@ -998,7 +1010,7 @@ export class LiveSession {
       // rendered (scaffold filter, fabricated-marker advisory), shipped to the
       // sink, and joined into the response below. Never when frames did carry
       // text: the result repeats it.
-      if (!failure && !this.parts.some((part) => part.type === "text")) {
+      if (!failure && !stopped && !this.parts.some((part) => part.type === "text")) {
         const finalText = result.result?.trim();
         if (finalText) {
           this.parts.push({ type: "text", text: finalText });
@@ -1019,13 +1031,13 @@ export class LiveSession {
       // EMPTY_REPLY: silent to the channel, reported as not-a-success.
       // A turn the model ended on purpose (literal NO_REPLY, or a dropped
       // thinking block) stays an ordinary silent NO_REPLY.
-      if (!rendered.text && !failure && !this.droppedThinkingThisTurn) {
+      if (!rendered.text && !failure && !stopped && !this.droppedThinkingThisTurn) {
         log.warn(
           { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
           "Turn ended with no reply text; resolving as an empty reply",
         );
       }
-      const response = rendered.text || (this.droppedThinkingThisTurn ? "NO_REPLY" : EMPTY_REPLY);
+      const response = rendered.text || (this.droppedThinkingThisTurn || stopped ? "NO_REPLY" : EMPTY_REPLY);
       this.droppedThinkingThisTurn = false;
       this.parts = [];
       this.unownedTurnDropLogged = false;
@@ -1089,6 +1101,41 @@ export class LiveSession {
     if (event.type === "user" && event.message?.content && Array.isArray(event.message.content)) {
       this.logToolResults(event.message.content, agentName);
     }
+  }
+
+  private publishSignal(signal: SdkSignal): void {
+    if (signal.kind === "retry") {
+      log.warn({ session: this.sessionKey, attempt: signal.attempt, max: signal.maxRetries, error: signal.error, status: signal.status },
+        "SDK is retrying the API call");
+    } else if (signal.kind === "refusal") {
+      log.warn({ session: this.sessionKey, model: signal.model, fallback: signal.fallbackModel, category: signal.category }, "Model refused the request");
+    } else if (signal.kind === "error") {
+      log.warn({ session: this.sessionKey, error: signal.error }, "Assistant message ended on an API error");
+    }
+    watchBus.publish({ type: "sdk", ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}), signal });
+  }
+
+  /** The request whose turn the owner asked to stop; its result is a clean end, not a failure. */
+  private stopRequestedFor: TurnRequest | null = null;
+  /**
+   * SOFT STOP (the SDK's `interrupt()`): the CLI ends the running turn at its
+   * next checkpoint and still yields a `result`, so the session, its SDK
+   * child and its background tasks all stay. Unlike `interrupt(err)` below,
+   * which fails the turn and closes the session. False when nothing is running.
+   */
+  async stop(): Promise<boolean> {
+    const request = this.currentRequest;
+    if (!this.alive || !request) return false;
+    this.stopRequestedFor = request;
+    try {
+      await this.q.interrupt();
+    } catch (err) {
+      if (this.stopRequestedFor === request) this.stopRequestedFor = null;
+      log.warn({ err, session: this.sessionKey }, "Could not stop the running turn");
+      return false;
+    }
+    log.info({ session: this.sessionKey }, "Running turn stopped at the owner's request");
+    return true;
   }
 
   /** Recent Bash commands by tool_use id (bounded), for the web task view's full command. */

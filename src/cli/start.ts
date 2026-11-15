@@ -242,6 +242,8 @@ async function startForeground(): Promise<void> {
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),
         toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
         compact: (key, onSettled) => agent.requestOwnerCompact(key, onSettled),
+        stop: (key) => agent.stopTurn(key),
+        model: (key) => agent.modelFor(key),
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         usage: (refresh) => usageCache.get(refresh) });
       web.attach(new WebSupervisor(web, {

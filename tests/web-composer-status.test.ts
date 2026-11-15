@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WebRequest } from "../src/web/protocol.js";
-import { composerStatus, requestStamp, type ComposerNote } from "../web/src/composer-status.js";
+import { composerStatus, elapsedLabel, rateLimitNotice, requestStamp, toolName, turnDetail, turnOutcome, TYPING_ACTIVITY, type ComposerNote, type TurnStatus } from "../web/src/composer-status.js";
+import { modelLabel } from "../web/src/tasks.js";
 
 const req = (state: WebRequest["state"], requestId = "r1"): WebRequest => ({ requestId, state, sessionId: "s" });
 
@@ -41,5 +42,55 @@ describe("composer status: one line, one source", () => {
     expect(line(req("completed"), "r1")).toBe("");
     // A note written before the request was accepted lapses once it is.
     expect(composerStatus({ activity: undefined, note: { text: "Sending…", at: "" }, latest: queued, settled: null })).toBe("Queued");
+  });
+});
+
+describe("composer status: what the SDK says about the turn", () => {
+  const none: ComposerNote = { text: "", at: "" };
+  const line = (latest: WebRequest | undefined, turn: TurnStatus | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
+    composerStatus({ activity: undefined, note: none, latest, settled: null, turn, now: 10_000, ...extra });
+
+  it("a retry is named while the turn runs, and never once it is over", () => {
+    const retry: TurnStatus = { status: { kind: "retry", attempt: 2, max: 10, delayMs: 4000, error: "overloaded" }, at: 9_000 };
+    expect(line(req("running"), retry)).toBe("Tomo is working… Retrying 2/10 · claude is overloaded");
+    expect(line(undefined, retry, { activity: TYPING_ACTIVITY })).toBe("Tomo is working… Retrying 2/10 · claude is overloaded");
+    expect(line(req("completed"), retry)).toBe("Completed");
+  });
+
+  it("a tool's progress is shown only once it has run a while, counting on between reports", () => {
+    const tool = (elapsed: number): TurnStatus => ({ status: { kind: "tool", tool: "mcp__tomo-internal__recall", elapsed }, at: 4_000 });
+    expect(turnDetail(tool(1), 5_000)).toBe("");
+    expect(turnDetail(tool(31), 4_000)).toBe("recall · 31s");
+    expect(line(req("running"), tool(31))).toBe("Tomo is working… recall · 37s");
+    expect(toolName("Bash")).toBe("Bash");
+    expect([elapsedLabel(59.9), elapsedLabel(125), elapsedLabel(3725)]).toEqual(["59s", "2m 05s", "1h 02m"]);
+  });
+
+  it("how the turn went outranks the bare request state, and still clears with a completed request", () => {
+    const stopped: TurnStatus = { status: { kind: "stopped" }, at: 0 };
+    expect(line(req("completed"), stopped)).toBe("Stopped");
+    expect(line(req("completed"), stopped, { settled: "r1" })).toBe("");
+    expect(line(req("running"), stopped)).toBe("Tomo is working…");
+    expect(line(req("failed"), { status: { kind: "error", error: "authentication_failed" }, at: 0 }))
+      .toBe("Claude login expired. Send /login to sign in again — not answered");
+    expect(turnOutcome({ status: { kind: "error", error: "brand_new" }, at: 0 })).toBe("The model returned an error — not answered");
+  });
+
+  it("a refusal names the models", () => {
+    const fallback: TurnStatus = { status: { kind: "refusal", model: "claude-fable-5-1[1m]", fallbackModel: "claude-opus-5-5" }, at: 0 };
+    expect(line(req("running"), fallback)).toBe("Tomo is working… Fable 5.1 declined · continuing on Opus 5.5");
+    expect(line(req("completed"), fallback)).toBe("Fable 5.1 declined this; answered by Opus 5.5");
+    expect(turnOutcome({ status: { kind: "refusal", model: "claude-fable-5-1" }, at: 0 })).toBe("Fable 5.1 declined this request");
+    expect(modelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5");
+  });
+
+  it("the live rate-limit line is silent while allowed and names the window and reset otherwise", () => {
+    const now = 1_000_000;
+    expect(rateLimitNotice(undefined, now)).toBe("");
+    expect(rateLimitNotice({ status: "allowed", at: now }, now)).toBe("");
+    expect(rateLimitNotice({ status: "allowed_warning", limit: "five_hour", utilization: 91, resetsAt: now + 125 * 60_000, at: now }, now))
+      .toBe("5-hour limit almost reached · 91% · resets in 2h 05m");
+    expect(rateLimitNotice({ status: "rejected", limit: "seven_day_opus", resetsAt: now + 30 * 60_000, at: now }, now)).toBe("Weekly Opus limit reached · resets in 30 min");
+    expect(rateLimitNotice({ status: "rejected", at: now }, now)).toBe("Usage limit reached");
   });
 });

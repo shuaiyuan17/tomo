@@ -1,4 +1,4 @@
-import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebEvent, WebRequest, WebSnapshot } from "../../src/web/protocol.js";
+import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebEvent, WebRequest, WebSnapshot, WebStopResult } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
@@ -49,6 +49,11 @@ export function sendMessage(input: MessageInput, bootstrap: WebBootstrap, refres
 /** The owner dealt with an interrupted request: its bubble goes, the record stays. */
 export function dismissRequest(requestId: string, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebRequest> {
   return mutate<WebRequest>(`/messages/${requestId}/dismiss`, "POST", {}, bootstrap, refresh);
+}
+
+/** Stop the owner conversation's running turn. Same CSRF/epoch rules as sending a message. */
+export function stopTurn(bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebStopResult> {
+  return mutate<WebStopResult>("/stop", "POST", {}, bootstrap, refresh);
 }
 
 /** Ask Tomo to compact the owner's session. Same CSRF/epoch rules as sending a message. */

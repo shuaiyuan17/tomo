@@ -260,6 +260,10 @@ export class WebSupervisor implements WebLifecycle {
             });
           }
           if (input.method === "usage") return this.channel.usage(input.refresh);
+          if (input.method === "stop") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.stopOwnerTurn();
+          }
           if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
           if (input.method === "dismiss") return this.channel.resolveInterrupted(input.requestId, "dismissed");
           return this.channel.receive(input.input);

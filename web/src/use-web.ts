@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
-import type { WebCompactState, WebEvent, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
+import type { WebCompactState, WebEvent, WebRateLimit, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
-import { TYPING_ACTIVITY } from "./composer-status.js";
+import { isTransient, TYPING_ACTIVITY, type TurnStatus } from "./composer-status.js";
 
+function without<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
 export function useWeb() {
   const [bootstrap, setBootstrap] = useState<WebBootstrap>();
   const [connection, setConnection] = useState<"connecting" | "live" | "reconnecting" | "locked">("connecting");
@@ -15,6 +20,14 @@ export function useWeb() {
   const [toolTicks, setToolTicks] = useState<Record<string, number>>({});
   const [tasks, setTasks] = useState<WebTask[]>([]);
   const [compact, setCompact] = useState<WebCompactState>();
+  /** What the SDK last reported about each conversation's turn (retry, tool progress, refusal, error, stopped). */
+  const [turns, setTurns] = useState<Record<string, TurnStatus>>({});
+  /** Model id per conversation. */
+  const [models, setModels] = useState<Record<string, string>>({});
+  /** The subscription's live rate-limit state, on the local clock. */
+  const [rateLimit, setRateLimit] = useState<WebRateLimit>();
+  /** The SDK's predicted next message per conversation. */
+  const [suggestions, setSuggestions] = useState<Record<string, string>>({});
   const [revision, setRevision] = useState(0);
   /** Bumped whenever the daemon reports a cron run; Study / Scheduled re-read /cron. */
   const [cronRevision, setCronRevision] = useState(0);
@@ -57,11 +70,28 @@ export function useWeb() {
     };
     const snapshot = (value: WebSnapshot) => {
       setBlocks(value.blocks); setRequests(value.requests); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact);
+      // Turn statuses are of the moment: a (re)connect starts without them.
+      setTurns({}); setModels(value.models ?? {}); setSuggestions(value.suggestions ?? {});
+      setRateLimit(value.rateLimit);
       // A (re)connect may have missed cron events while the stream was down.
       setConnection("live"); refresh(); setCronRevision((r) => r + 1);
     };
     const update = (event: WebEvent) => {
       if (event.type === "block") setBlocks((old) => [...old.filter((b) => b.id !== event.id), event]);
+      // Content or a tool boundary means the turn moved on: a retry or a tool's progress no longer describes it.
+      if (event.type === "block" || event.type === "tool") {
+        setTurns((old) => old[event.sessionId] && isTransient(old[event.sessionId].status) ? without(old, event.sessionId) : old);
+      }
+      if (event.type === "turn") {
+        const { sessionId, status } = event;
+        setTurns((old) => status ? { ...old, [sessionId]: { status, at: Date.now() } } : old[sessionId] ? without(old, sessionId) : old);
+      }
+      if (event.type === "model") setModels((old) => ({ ...old, [event.sessionId]: event.model }));
+      if (event.type === "rate-limit") setRateLimit(event.limit);
+      if (event.type === "suggestion") {
+        const { sessionId, text } = event;
+        setSuggestions((old) => text ? { ...old, [sessionId]: text } : old[sessionId] ? without(old, sessionId) : old);
+      }
       if (event.type === "request") {
         setRequests((old) => trimRequests([...old.filter((r) => r.requestId !== event.request.requestId), event.request]));
         if (!["queued", "running"].includes(event.request.state)) refresh();
@@ -96,5 +126,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, models, rateLimit, suggestions, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

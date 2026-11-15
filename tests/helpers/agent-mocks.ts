@@ -42,10 +42,14 @@ export type MockResponse = string | MockResponseBlock[];
 
 export interface MockQueryController {
   pushTaskNotificationTurn(response: MockResponse, notification?: string): void;
+  /** Hand the session a raw SDK event (a retry, a rate-limit change, tool progress, …). */
+  pushEvent(event: Record<string, unknown>): void;
 }
 
 /** Mutable per-file mock-SDK state. Tests write these fields directly. */
 export const mockSdk = {
+  /** How many times a query was asked to interrupt its turn. */
+  interrupts: 0,
   /** Controls what the mock SDK returns for each user message. Returning a
    *  string emits a single text block; returning an array emits one assistant
    *  event per element (each becomes its own block, stitched into the same turn
@@ -97,6 +101,7 @@ export function resetMockSdk(): void {
   mockSdk.failNextQuery = null;
   mockSdk.nextResult = null;
   mockSdk.queryControllers = [];
+  mockSdk.interrupts = 0;
   mockSdk.mcpServerSets = [];
   mockSdk.promptsBySession = [];
   mockSdk.optionsBySession = [];
@@ -204,7 +209,10 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
     }
   };
 
+  let turnRunning = false;
+  let interruptedTurn = false;
   mockSdk.queryControllers.push({
+    pushEvent(event) { eventQueue.push(event); wakeConsumer(); },
     pushTaskNotificationTurn(response, notification = "<task-notification>background task complete</task-notification>") {
       eventQueue.push({
         type: "user",
@@ -236,7 +244,11 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
           mockSdk.promptsBySession.push({ sessionKey, text });
         }
 
+        turnRunning = true;
         const responseValue = await mockSdk.responseFn(text);
+        turnRunning = false;
+        // interrupt() already ended this turn with its own result.
+        if (interruptedTurn) { interruptedTurn = false; continue; }
         let blocks = responseBlocks(responseValue);
 
         for (let echo = 0; mockSdk.steerEcho && echo < mockSdk.steerEchoCount; echo++) {
@@ -289,6 +301,15 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
     },
     close() {
       closed = true;
+      wakeConsumer();
+    },
+    /** Like the CLI: the running turn ends at once on an error-shaped result. */
+    async interrupt() {
+      mockSdk.interrupts++;
+      if (!turnRunning) return;
+      interruptedTurn = true;
+      eventQueue.push({ type: "result", subtype: "error_during_execution", is_error: true, session_id: "mock-sdk-session-123",
+        total_cost_usd: 0.001, num_turns: 1, duration_ms: 100, usage: { input_tokens: 1, output_tokens: 1 } });
       wakeConsumer();
     },
     async getContextUsage() {

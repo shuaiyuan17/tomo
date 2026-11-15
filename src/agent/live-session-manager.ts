@@ -219,6 +219,12 @@ export class LiveSessionManager {
     return !!live?.isAlive() && live.isBusy();
   }
 
+  /** Soft-stop the key's running turn (SDK interrupt); the session stays. False when nothing runs. */
+  async stopTurn(key: string): Promise<boolean> {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() && live.isBusy() ? live.stop() : false;
+  }
+
   /** A shell/Monitor task's output tail from the key's live session; never creates one. */
   async taskOutput(key: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     const live = this.liveSessions.get(key);

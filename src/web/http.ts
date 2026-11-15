@@ -220,6 +220,16 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 202, await deps.rpc({ method: "compact", epoch }));
         return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/stop") {
+        // Stops the owner conversation's running turn. Same gate as a message.
+        csrf.verify(req, session!);
+        await body(req);
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
+        json(res, 200, await deps.rpc({ method: "stop", epoch }));
+        return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/uploads") {
         // An image for the owner's next message: the same gate as sending one
         // (CSRF, the owner, the daemon epoch), a raw body of at most

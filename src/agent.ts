@@ -2023,6 +2023,16 @@ export class Agent {
     return this.liveSessionManager.toolCommand(sessionKey, toolUseId);
   }
 
+  /** Stop the session's running turn at the owner's request (web Stop). False when nothing runs. */
+  stopTurn(sessionKey: string): Promise<boolean> {
+    return this.liveSessionManager.stopTurn(sessionKey);
+  }
+
+  /** The model a session runs on: its /model override, else the configured default. */
+  modelFor(sessionKey: string): string {
+    return this.modelOverrides.get(sessionKey) ?? config.model;
+  }
+
   /** Read-only: a shell/Monitor task's output tail (web task view). */
   readTaskOutput(sessionKey: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);

@@ -119,6 +119,28 @@ describe("interrupted subagents across a restart", () => {
     await third.agent.stop();
   });
 
+  it("a notice turn that ends on an API error (429) keeps the list for the next start", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "706");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:706", tasks: [task("ratelimited706")] });
+    crash(first.agent);
+
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "API Error: 429 rate limited";
+    const second = await boot();
+    await waitFor(() => expect(notices("imessage:706").length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 50));
+    const store = (second.agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions;
+    expect(store.getPendingNotes("imessage:706").join("\n")).toContain("ratelimited706");
+    await second.agent.stop();
+
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const third = await boot();
+    await waitFor(() => expect(notices("imessage:706").some((p) => p.text.includes("ratelimited706"))).toBe(true));
+    await third.agent.stop();
+  });
+
   it("only the session that owned the agent is told", async () => {
     const first = await boot();
     await haveSession(first.channel, "702");

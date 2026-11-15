@@ -222,6 +222,7 @@ export class Agent {
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       delivery: this.delivery,
       undeliveredReplyAtTurnEnd: (sessionKey) => this.liveSessionManager.takeUndeliveredReply(sessionKey),
+      turnStoppedByOwner: (sessionKey) => this.liveSessionManager.takeTurnStopped(sessionKey),
       requestRestate: (sessionKey, target) => this.restateUndeliveredReply(sessionKey, target),
       reportSuppressedError: (sessionKey, target, detail) => this.reportSuppressedError(sessionKey, target, detail),
       recordTurnOutcome: (sessionKey, ok) => { if (ok) this.lastGoodTurnAt.set(sessionKey, Date.now()); },
@@ -1756,6 +1757,7 @@ export class Agent {
         ...(options.restate ? { restate: true } : {}),
         ...(options.onShutdown ? { onShutdown: options.onShutdown } : {}),
         ...(options.onEmpty ? { onEmpty: options.onEmpty } : {}),
+        ...(options.onStopped ? { onStopped: options.onStopped } : {}),
         prompt,
         stampChannelName: deliveryChannel.name,
         ...(options.showTyping === false ? {} : {

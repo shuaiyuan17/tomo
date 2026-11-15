@@ -6,7 +6,7 @@ import { formatSchedule, formatRelative } from "../../cron/format.js";
 
 function statusHint(job: CronJob): string {
   if (!job.enabled) {
-    if (job.lastStatus === "interrupted") return "disabled — last run interrupted by a restart";
+    if (job.lastStatus === "interrupted") return "disabled — last run interrupted (restart or Stop)";
     return job.lastStatus === "error" ? "disabled — last run failed" : "disabled";
   }
   const next = job.nextRunAt ? formatRelative(job.nextRunAt) : "never";

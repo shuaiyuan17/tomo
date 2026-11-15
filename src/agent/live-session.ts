@@ -977,7 +977,7 @@ export class LiveSession {
       // interrupted). That is what he asked for: no failure, no error notice.
       const stopped = this.stopRequestedFor !== null && this.stopRequestedFor === this.currentRequest;
       this.stopRequestedFor = null;
-      if (stopped) this.publishSignal({ kind: "stopped" });
+      if (stopped) { this.publishSignal({ kind: "stopped" }); this.turnStopped = true; }
       const failure = stopped ? null : describeResultFailure(result);
       if (failure) {
         log.warn(
@@ -1115,6 +1115,19 @@ export class LiveSession {
     watchBus.publish({ type: "sdk", ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}), signal });
   }
 
+  /** The turn that just settled was stopped by the owner (read-and-clear, see takeTurnStopped). */
+  private turnStopped = false;
+  /**
+   * Read-and-clear: did the turn that just resolved end because the owner
+   * pressed Stop? The turn resolves like a finished one (what it had said, or
+   * NO_REPLY) so nothing is reported to the owner as an error, but it is NOT
+   * a finished run: a caller that records outcomes (cron) must be told.
+   */
+  takeTurnStopped(): boolean {
+    const stopped = this.turnStopped;
+    this.turnStopped = false;
+    return stopped;
+  }
   /** The request whose turn the owner asked to stop; its result is a clean end, not a failure. */
   private stopRequestedFor: TurnRequest | null = null;
   /**

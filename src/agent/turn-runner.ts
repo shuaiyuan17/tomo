@@ -5,6 +5,8 @@ import { log } from "../logger.js";
 import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
+import { triggerSnippet, type UsageAttribution, type UsageSource } from "../metrics/usage-ledger.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { EMPTY_REPLY, STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
@@ -266,6 +268,11 @@ export interface TurnSpec {
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
   source: TurnSource;
+  /**
+   * Usage-ledger attribution. Fields left out are derived: `source` from the
+   * ingress path (see defaultUsageSource), `trigger` from `prompt`.
+   */
+  usage?: Partial<UsageAttribution>;
   /** Prompt body; pending notes are always drained in front of it. */
   prompt: string;
   /** Channel label for the timestamp stamp. When undefined the prompt is sent
@@ -397,6 +404,25 @@ export function originForSource(source: TurnSource): SDKMessageOrigin {
   return source === "user" ? { kind: "human" } : { kind: "unclassified" };
 }
 
+/** The ledger source a turn gets when its builder does not name one. */
+export function defaultUsageSource(source: TurnSource, key: string): UsageSource {
+  switch (source) {
+    case "user": return isGroupSessionKey(key) ? "group" : "owner";
+    case "cron": return "system";
+    default: return "heartbeat";
+  }
+}
+
+export function usageAttributionFor(spec: Pick<TurnSpec, "source" | "key" | "prompt" | "usage">): UsageAttribution {
+  const trigger = spec.usage?.trigger ?? triggerSnippet(spec.prompt);
+  return {
+    source: spec.usage?.source ?? defaultUsageSource(spec.source, spec.key),
+    ...(spec.usage?.jobId ? { jobId: spec.usage.jobId } : {}),
+    ...(spec.usage?.jobName ? { jobName: spec.usage.jobName } : {}),
+    ...(trigger ? { trigger } : {}),
+  };
+}
+
 /**
  * Prefix `[<channel> · <weekday> <mm/dd> <hh:mm> <tz>]` onto a prompt, plus a
  * `· sender <mm/dd> <hh:mm> <tz>` segment when the sender keeps a different
@@ -517,7 +543,7 @@ export class TurnRunner {
 
     const channel = delivery.kind === "deferred-send" ? "" : delivery.channel.name;
     spec.replyContext = { turnId: spec.requestId ?? randomUUID(), channel, requestId: spec.requestId,
-      interactive: spec.source === "user" && delivery.kind === "reply" };
+      interactive: spec.source === "user" && delivery.kind === "reply", usage: usageAttributionFor(spec) };
     const sink = this.makeBlockSink(spec);
     let rawResponse: string;
     try {

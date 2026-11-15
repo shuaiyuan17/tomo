@@ -77,6 +77,31 @@ export interface UsageBaseline {
     cacheRead: number;
     cacheCreated: number;
   };
+  /**
+   * Last cumulative `modelUsage`, per model — what the first result after a
+   * resume differences against to split its turn by model. Absent on
+   * baselines written before per-model usage was recorded; that resume's
+   * first turn then has no per-model split (its totals are still exact).
+   */
+  models?: Record<string, ModelCounters>;
+}
+
+/**
+ * One model's cumulative `modelUsage` counters (or one turn's delta of them).
+ * The optional fields are absent when the CLI did not report them.
+ */
+export interface ModelCounters {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreated: number;
+  /** 5-minute / 1-hour cache writes, already inside `cacheCreated`. */
+  cacheCreated5m?: number;
+  cacheCreated1h?: number;
+  /** Thinking tokens, already inside `output`. */
+  thinking?: number;
+  webSearch: number;
+  costUsd: number;
 }
 
 export interface ReplyTarget {

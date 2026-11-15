@@ -20,15 +20,20 @@ import {
 } from "./inbound-markers.js";
 import { silentTurnSteerNote } from "../continuity-defaults.js";
 import { stageExternalMcpServers } from "./mcp-config-file.js";
-import type { UsageBaseline } from "../sessions/types.js";
+import type { ModelCounters, UsageBaseline } from "../sessions/types.js";
+import { USAGE_LEDGER_VERSION, type UsageAttribution, type UsageRecorder } from "../metrics/usage-ledger.js";
 import {
   STEER_MERGED,
   EMPTY_REPLY,
   SteerDeclinedError,
+  cumulativeModelCounters,
   cumulativeModelTokens,
   describeResultFailure,
   mainLoopUsage,
+  modelUsageDelta,
+  roundUsd,
   tokenSum,
+  type ModelTurnUsage,
   type QueryResult,
   type SdkResultLike,
   type TokenTotals,
@@ -75,6 +80,8 @@ export {
 export { summarizeToolInput } from "./tool-summary.js";
 
 export interface ReplyContext { turnId: string; channel: string; requestId?: string; webJoined?: boolean; interactive?: boolean;
+  /** Who started this turn, for the usage ledger. Absent: an SDK-initiated turn. */
+  usage?: UsageAttribution;
   /**
    * Set when THIS request's turn ended because the owner pressed Stop. The
    * turn resolves like a finished one (what it had said, or NO_REPLY) so
@@ -208,6 +215,8 @@ export interface LiveSessionSettings {
    * deltas start from `baseline` instead of 0. See `turnUsage`.
    */
   resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
+  /** One row per SDK result for the usage ledger. Must not throw (it is caught anyway). */
+  recordUsage?: UsageRecorder;
 }
 
 export class LiveSession {
@@ -275,6 +284,14 @@ export class LiveSession {
   private prevTotalCost = 0;
   /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
   private prevModelTokens: TokenTotals | null = null;
+  /** Cumulative `modelUsage` per model as of the previous result. */
+  private prevModelCounters: Record<string, ModelCounters> | null = null;
+  /**
+   * The resume baseline has totals but no per-model counters (written before
+   * they were recorded), so the first result cannot be split by model.
+   */
+  private modelBaselineMissing = false;
+  private recordUsage: UsageRecorder | undefined;
   /**
    * The next result is the first since this session resumed an SDK session.
    * `"baseline"`: prev* were seeded from the persisted baseline. `"unknown"`:
@@ -345,12 +362,15 @@ export class LiveSession {
     this.showThinking = settings.showThinking ?? false;
     this.mcpAuthRefresher = new McpAuthRefresher(settings.onMcpAuthError, settings.now ?? Date.now);
     this.onToolResult = settings.onToolResult;
+    this.recordUsage = settings.recordUsage;
     const resumeFrom = settings.resumeFrom;
     if (resumeFrom) {
       const baseline = resumeFrom.baseline;
       if (baseline && baseline.sdkSessionId === resumeFrom.sdkSessionId) {
         this.prevTotalCost = baseline.totalCostUsd;
         this.prevModelTokens = { ...baseline.tokens };
+        if (baseline.models) this.prevModelCounters = structuredClone(baseline.models);
+        else this.modelBaselineMissing = true;
         this.resumeState = "baseline";
       } else {
         this.resumeState = "unknown";
@@ -1003,7 +1023,10 @@ export class LiveSession {
         totalCost,
         tokens: { input, output, cacheRead, cacheCreated },
         baseline,
+        models,
+        noBaseline,
       } = this.turnUsage(result);
+      this.appendUsageRow(result, turnCost, { input, output, cacheRead, cacheCreated }, models, noBaseline);
 
       // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
       // successful one. `subtype` names why the CLI stopped early (max turns,
@@ -1351,15 +1374,23 @@ export class LiveSession {
     totalCost: number;
     tokens: TokenTotals;
     baseline: UsageBaseline | null;
+    /** This turn per model; undefined when it cannot be split. */
+    models: Record<string, ModelTurnUsage> | undefined;
+    /** First result after a resume with no usable baseline (cost recorded as 0). */
+    noBaseline: boolean;
   } {
     const totalCost = result.total_cost_usd ?? 0;
     const cumulative = cumulativeModelTokens(result);
+    const cumulativeModels = cumulativeModelCounters(result);
     const perTurnUsage = mainLoopUsage(result);
 
     const resumeState = this.resumeState;
     this.resumeState = null;
     const prevCost = this.prevTotalCost;
     const prevTokens = this.prevModelTokens;
+    const prevModels = this.prevModelCounters;
+    const modelBaselineMissing = this.modelBaselineMissing;
+    this.modelBaselineMissing = false;
 
     const tokensWentBackwards = !!(cumulative && prevTokens) && (
       cumulative.input < prevTokens.input
@@ -1371,10 +1402,16 @@ export class LiveSession {
 
     this.prevTotalCost = totalCost;
     if (cumulative) this.prevModelTokens = cumulative;
+    if (cumulativeModels) this.prevModelCounters = cumulativeModels;
 
     const baselineFor = (trusted: boolean): UsageBaseline | null =>
       trusted && cumulative && this.sessionId
-        ? { sdkSessionId: this.sessionId, totalCostUsd: totalCost, tokens: { ...cumulative } }
+        ? {
+          sdkSessionId: this.sessionId,
+          totalCostUsd: totalCost,
+          tokens: { ...cumulative },
+          ...(cumulativeModels ? { models: structuredClone(cumulativeModels) } : {}),
+        }
         : null;
 
     if (resumeState === "unknown" || (resumeState === "baseline" && (costWentBackwards || tokensWentBackwards))) {
@@ -1386,7 +1423,7 @@ export class LiveSession {
       // "zeroed" by cost AND tokens: a zero-cost route (e.g. a gateway that
       // reports no price) with real cumulative tokens is a valid baseline.
       const zeroed = totalCost <= 0 && !(cumulative && tokenSum(cumulative) > 0);
-      return { costUsd: 0, totalCost, tokens: perTurnUsage, baseline: baselineFor(!zeroed) };
+      return { costUsd: 0, totalCost, tokens: perTurnUsage, baseline: baselineFor(!zeroed), models: undefined, noBaseline: true };
     }
 
     // A reset is decided ONCE for the whole result: after one (crash or
@@ -1405,10 +1442,54 @@ export class LiveSession {
         }
         : cumulative
       : perTurnUsage;
+    // Per model the same way. A resume from a baseline with totals but no
+    // per-model counters has nothing to subtract per model: no split.
+    const models = !cumulativeModels || (modelBaselineMissing && !reset)
+      ? undefined
+      : modelUsageDelta(result, cumulativeModels, reset ? null : prevModels);
     // After a reset it is unknown what total the SDK transcript saved (a
     // crash leaves the old one, a /clear the new one): drop the baseline so
     // the next resume takes the conservative path instead of guessing.
-    return { costUsd, totalCost, tokens, baseline: baselineFor(!reset) };
+    return { costUsd, totalCost, tokens, baseline: baselineFor(!reset), models, noBaseline: false };
+  }
+
+  /**
+   * One usage-ledger row for this result. Attribution comes from the request
+   * that owns the turn; a turn the CLI started itself has none ("background").
+   * Bookkeeping: whatever goes wrong here, the turn goes on.
+   */
+  private appendUsageRow(
+    result: SdkResultLike,
+    costUsd: number,
+    tokens: TokenTotals,
+    models: Record<string, ModelTurnUsage> | undefined,
+    noBaseline: boolean,
+  ): void {
+    if (!this.recordUsage || !this.sessionKey) return;
+    try {
+      const ctx = this.currentRequest?.replyContext;
+      const usage = ctx?.usage ?? { source: "background" as const };
+      this.recordUsage({
+        v: USAGE_LEDGER_VERSION,
+        ts: Date.now(),
+        sessionKey: this.sessionKey,
+        source: usage.source,
+        ...(usage.jobId ? { jobId: usage.jobId } : {}),
+        ...(usage.jobName ? { jobName: usage.jobName } : {}),
+        ...(ctx?.requestId ? { requestId: ctx.requestId } : {}),
+        ...(usage.trigger ? { trigger: usage.trigger } : {}),
+        ...(result.subtype !== "success" ? { subtype: result.subtype } : {}),
+        costUsd: roundUsd(costUsd),
+        tokens: { ...tokens },
+        ...(result.duration_ms !== undefined ? { durationMs: result.duration_ms } : {}),
+        ...(result.duration_api_ms !== undefined ? { durationApiMs: result.duration_api_ms } : {}),
+        ...(result.num_turns !== undefined ? { numTurns: result.num_turns } : {}),
+        ...(noBaseline ? { noBaseline: true as const } : {}),
+        ...(models ? { models } : {}),
+      });
+    } catch (err) {
+      log.warn({ err, session: this.sessionKey }, "Usage ledger row failed; turn unaffected");
+    }
   }
 
   private async logContextUsage(

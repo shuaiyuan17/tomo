@@ -1,6 +1,6 @@
 /** SDK result classification for one LiveSession turn: fabricated replies, result errors, token totals. */
 
-import type { UsageBaseline } from "../sessions/types.js";
+import type { ModelCounters, UsageBaseline } from "../sessions/types.js";
 
 /**
  * Sentinel resolution for a steered message that merged into the in-flight
@@ -51,6 +51,7 @@ export interface SdkResultLike {
   /** Set when the CLI started the turn itself, e.g. `{ kind: "task-notification" }`. */
   origin?: { kind?: string };
   duration_ms?: number;
+  duration_api_ms?: number;
   total_cost_usd?: number;
   usage?: Record<string, unknown>;
   modelUsage?: Record<string, {
@@ -58,6 +59,12 @@ export interface SdkResultLike {
     outputTokens?: number;
     cacheReadInputTokens?: number;
     cacheCreationInputTokens?: number;
+    cacheCreationEphemeral5mInputTokens?: number;
+    cacheCreationEphemeral1hInputTokens?: number;
+    thinkingTokens?: number;
+    webSearchRequests?: number;
+    costUSD?: number;
+    costBasis?: string;
   }>;
   session_id?: string;
 }
@@ -79,6 +86,67 @@ export function cumulativeModelTokens(result: SdkResultLike): TokenTotals | null
     cacheRead: acc.cacheRead + (m.cacheReadInputTokens ?? 0),
     cacheCreated: acc.cacheCreated + (m.cacheCreationInputTokens ?? 0),
   }), { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 });
+}
+
+/** Cumulative `modelUsage` per model; null when the result has none. */
+export function cumulativeModelCounters(result: SdkResultLike): Record<string, ModelCounters> | null {
+  const entries = result.modelUsage ? Object.entries(result.modelUsage) : [];
+  if (entries.length === 0) return null;
+  const out: Record<string, ModelCounters> = {};
+  for (const [model, m] of entries) {
+    out[model] = {
+      input: m.inputTokens ?? 0,
+      output: m.outputTokens ?? 0,
+      cacheRead: m.cacheReadInputTokens ?? 0,
+      cacheCreated: m.cacheCreationInputTokens ?? 0,
+      ...(m.cacheCreationEphemeral5mInputTokens !== undefined ? { cacheCreated5m: m.cacheCreationEphemeral5mInputTokens } : {}),
+      ...(m.cacheCreationEphemeral1hInputTokens !== undefined ? { cacheCreated1h: m.cacheCreationEphemeral1hInputTokens } : {}),
+      ...(m.thinkingTokens !== undefined ? { thinking: m.thinkingTokens } : {}),
+      webSearch: m.webSearchRequests ?? 0,
+      costUsd: m.costUSD ?? 0,
+    };
+  }
+  return out;
+}
+
+/** One model's share of one turn: its counter deltas plus the price table used. */
+export type ModelTurnUsage = ModelCounters & { costBasis?: string };
+
+const COUNTER_KEYS = ["input", "output", "cacheRead", "cacheCreated", "cacheCreated5m", "cacheCreated1h", "thinking", "webSearch", "costUsd"] as const;
+
+/**
+ * This turn's usage per model: `current` minus `previous` (null = this turn
+ * owns the whole cumulative, as on a fresh session or after a reset). Models
+ * that did nothing this turn are left out. A counter the CLI did not report
+ * stays absent rather than reading as 0.
+ */
+export function modelUsageDelta(
+  result: SdkResultLike,
+  current: Record<string, ModelCounters>,
+  previous: Record<string, ModelCounters> | null,
+): Record<string, ModelTurnUsage> {
+  const out: Record<string, ModelTurnUsage> = {};
+  for (const [model, cur] of Object.entries(current)) {
+    const prev = previous?.[model];
+    const delta: Record<string, number> = {};
+    let active = false;
+    for (const key of COUNTER_KEYS) {
+      const now = cur[key];
+      if (now === undefined) continue;
+      const value = key === "costUsd" ? roundUsd(now - (prev?.[key] ?? 0)) : now - (prev?.[key] ?? 0);
+      delta[key] = value;
+      if (value !== 0) active = true;
+    }
+    if (!active) continue;
+    const basis = result.modelUsage?.[model]?.costBasis;
+    out[model] = { ...(delta as unknown as ModelCounters), ...(basis ? { costBasis: basis } : {}) };
+  }
+  return out;
+}
+
+/** Strip float noise from a differenced dollar figure (micro-dollar precision). */
+export function roundUsd(usd: number): number {
+  return Math.round(usd * 1e6) / 1e6;
 }
 
 /** `usage`: main agent loop only, but already per-turn. */

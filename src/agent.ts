@@ -50,6 +50,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
+import { UsageLedger, triggerSnippet, type UsageSource } from "./metrics/usage-ledger.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
@@ -136,6 +137,7 @@ export class Agent {
   private commands: ChatCommandHandler;
   // /pause state: raw group keys whose inbound messages are dropped at receipt.
   private pauses: PauseStore;
+  private usageLedger: UsageLedger;
   private modelOverrides = new Map<string, string>();
   private readonly ownerAdoption: OwnerAdoption;
   private readonly contextNudger: ContextNudger;
@@ -280,6 +282,7 @@ export class Agent {
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
+    this.usageLedger = new UsageLedger(join(config.tomoHome, "data", "usage"));
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
@@ -325,6 +328,7 @@ export class Agent {
           ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
+      recordUsage: (row) => this.usageLedger.append(row),
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
@@ -374,6 +378,7 @@ export class Agent {
       queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
       runDelegateTurn: (systemMsg, sessionKey, deliveryTarget, audiences) =>
         this.handleCronMessage(systemMsg, sessionKey, {
+          usageSource: "delegate",
           ...(deliveryTarget ? { deliveryTarget } : {}),
           ...(audiences ? { audiences } : {}),
         }),
@@ -1365,6 +1370,8 @@ export class Agent {
       requestId: req.webRequestId,
       key: req.key,
       source: "user",
+      // A summoned group's messages run on the owner's dm: session.
+      ...(req.audiences?.some((a) => isGroupSessionKey(a)) ? { usage: { source: "group" as const } } : {}),
       prompt: req.promptText,
       stampChannelName: req.sourceChannelName,
       stampSenderTimeZone: req.senderTimeZone,
@@ -1934,6 +1941,14 @@ export class Agent {
       return await this.turnRunner.runTurn({
         key,
         source: "cron",
+        // The trigger is the message as the caller wrote it, before the
+        // delivery note above was appended to it.
+        usage: {
+          ...(options.jobId
+            ? { source: "cron" as const, jobId: options.jobId, ...(options.jobName ? { jobName: options.jobName } : {}) }
+            : { source: options.usageSource ?? "system" }),
+          ...(triggerSnippet(message) ? { trigger: triggerSnippet(message) } : {}),
+        },
         ...(options.restate ? { restate: true } : {}),
         ...(options.onShutdown ? { onShutdown: options.onShutdown } : {}),
         ...(options.onEmpty ? { onEmpty: options.onEmpty } : {}),
@@ -2002,7 +2017,7 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
-    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn"))
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn", "heartbeat"))
       .catch((err) => {
         log.error({ err, sessionKey: key }, "Continuity failed in queue");
       });
@@ -2039,28 +2054,41 @@ export class Agent {
     // group is summoned, is the group's turn wherever it runs — same rule as
     // the cron handoff in processCronMessage.
     const audiences = summonedKey ? [sessionKey] : undefined;
-    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn"))
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn", "restart"))
       .catch((err) => {
         log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
   }
 
-  private async processContinuity(prompt: string, key: string, audiences: string[] | undefined, turnKind: string): Promise<void> {
+  private async processContinuity(
+    prompt: string,
+    key: string,
+    audiences: string[] | undefined,
+    turnKind: string,
+    usageSource: UsageSource,
+  ): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
     try {
       // A summoned group's restart notice runs on the owner's dm: session;
       // its failure still belongs to (and is reported as) the group's.
       const groupKey = audiences?.find((a) => isGroupSessionKey(a));
-      await this.runContinuityTurn(prompt, key, turnKind, groupKey);
+      await this.runContinuityTurn(prompt, key, turnKind, usageSource, groupKey);
     } finally {
       if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
-  private async runContinuityTurn(prompt: string, key: string, turnKind: string, noticeGroupKey?: string): Promise<void> {
+  private async runContinuityTurn(
+    prompt: string,
+    key: string,
+    turnKind: string,
+    usageSource: UsageSource,
+    noticeGroupKey?: string,
+  ): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
+      usage: { source: usageSource },
       prompt,
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`

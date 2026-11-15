@@ -156,6 +156,11 @@ describe("CronScheduler", () => {
     await tick1;
 
     expect(fakeAgent.handleCronMessage).toHaveBeenCalledTimes(2);
+    // The job's id and name ride along for the usage ledger.
+    const slow = store.list().find((j) => j.name === "slow")!;
+    expect(fakeAgent.handleCronMessage).toHaveBeenCalledWith(
+      expect.any(String), "dm:alice", expect.objectContaining({ jobId: slow.id, jobName: "slow" }),
+    );
     for (const job of store.list()) {
       expect(job.lastStatus).toBe("ok");
       expect(job.nextRunAt).toBeGreaterThan(Date.now());

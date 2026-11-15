@@ -221,9 +221,9 @@ describe("golden: upgrading a single-identity install to `owner`", () => {
     // The registry only changed in lastActiveAt / replyTarget / stats: same
     // entries, same keys, same SDK session ids, nothing migrated or added.
     expect(stableRegistryView(registry())).toEqual(stableRegistryView(registryBefore));
-    // New files are only advisory lock files.
+    // New files are only advisory lock files and the append-only usage ledger.
     const added = [...after.keys()].filter((path) => !before.has(path));
-    expect(added.filter((path) => !path.endsWith(".lock"))).toEqual([]);
+    expect(added.filter((path) => !path.endsWith(".lock") && !/^data\/usage\/\d{4}-\d{2}\.ndjson$/.test(path))).toEqual([]);
     // The cron store, summons, LCM latch and config are byte-identical.
     for (const path of ["data/cron/jobs.json", "data/summons.json", "data/lcm/nudge-cooldown.json", "config.json"]) {
       expect(after.get(path), path).toBe(before.get(path));

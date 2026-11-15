@@ -70,7 +70,9 @@ src/
                       #   client.ts, tui/ (Ink app — feed, vitals sidebar, chat line, log tail)
   metrics/            # Prometheus exporter (exporter.ts, /metrics on 127.0.0.1:9464) + NDJSON
                       #   activity log (activity-log.ts) — both WatchBus subscribers, gated by
-                      #   config.metrics; Grafana stack in contrib/observability/
+                      #   config.metrics; Grafana stack in contrib/observability/. usage-ledger.ts:
+                      #   always-on, append-only data/usage/YYYY-MM.ndjson, one row per SDK
+                      #   result (LiveSession), per model; the Study Cost page's history
   costs.ts, models.ts, litellm.ts        # /cost reports; model aliases; LiteLLM gateway modes
   jsonl.ts, fs-utils.ts, runtime-paths.ts # JSONL readers; atomic writes; SDK session file paths
   file-lock.ts        # withFileLockSync — advisory cross-process lock for the JSON stores

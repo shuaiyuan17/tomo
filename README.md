@@ -291,6 +291,7 @@ Structured logs via [pino](https://github.com/pinojs/pino):
     sessions/                 # Transcript logs and session registry
     pet.json                  # Virtual pet state
     summons.json              # Active group summons
+    usage/YYYY-MM.ndjson      # Usage ledger: estimated cost and tokens per turn, per model
   logs/
     tomo.log                  # Daemon logs
 ```

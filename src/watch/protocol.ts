@@ -70,6 +70,11 @@ export type WatchEvent =
   | { type: "turn.handoff"; ts: number; sessionKey: string; requestId: string }
   /** A steer declined before injection went back to the session queue. */
   | { type: "turn.requeue"; ts: number; sessionKey: string; requestId: string }
+  /**
+   * The SDK consumed these user messages (client uuids, first sighting each):
+   * read receipts. `requestIds`: the web requests among them.
+   */
+  | { type: "read"; ts: number; sessionKey: string; uuids: string[]; requestIds: string[] }
   | { type: "turn.start"; ts: number; sessionKey: string; source: TurnSource; requestId?: string }
   | { type: "turn.end"; ts: number; sessionKey: string; source: TurnSource; ok: boolean; durationMs: number; requestId?: string; uncertain?: boolean }
   /** Per-query stats from the SDK result (cost, context) — follows turn.end. */

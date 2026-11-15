@@ -13,6 +13,8 @@ import { checkRequest, CsrfTokens } from "../src/web/security.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
 import { sendMessage } from "../web/src/api.js";
 import type { IncomingMessage } from "node:http";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
+import { pickEncoding } from "../src/web/static-assets.js";
 
 let root: string;
 let service: Awaited<ReturnType<typeof startWebHttp>>;
@@ -379,6 +381,51 @@ describe("local HTTP boundary", () => {
       const response = await call(path); expect(response.status).toBe(404); expect(response.text).not.toContain("private data");
     }
     expect((await call("/api/v1/messages", { method: "OPTIONS", headers: { origin: "https://evil.example" } })).status).toBe(403);
+  });
+  it("caches hashed assets for a year and compresses text once per version; index.html and icons stay no-store", async () => {
+    const raw = (path: string, encoding?: string) => new Promise<{ headers: IncomingMessage["headers"]; body: Buffer }>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: service.port, path, headers: { ...(encoding ? { "accept-encoding": encoding } : {}) } }, (res) => {
+        const parts: Buffer[] = []; res.on("data", (part: Buffer) => parts.push(part));
+        res.on("end", () => resolve({ headers: res.headers, body: Buffer.concat(parts) }));
+      });
+      req.on("error", reject); req.end();
+    });
+    const source = `export const text = ${JSON.stringify("tomo ".repeat(2_000))};`;
+    writeFileSync(join(root, "assets", "assets", "big-abc123.js"), source);
+    const br = await raw("/assets/big-abc123.js", "gzip, deflate, br");
+    expect(br.headers["content-encoding"]).toBe("br");
+    expect(br.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+    expect(br.headers.vary).toBe("accept-encoding");
+    expect(Number(br.headers["content-length"])).toBe(br.body.length);
+    expect(br.body.length).toBeLessThan(source.length / 10);
+    expect(brotliDecompressSync(br.body).toString()).toBe(source);
+    const gz = await raw("/assets/big-abc123.js", "gzip");
+    expect(gz.headers["content-encoding"]).toBe("gzip");
+    expect(gunzipSync(gz.body).toString()).toBe(source);
+    const plain = await raw("/assets/big-abc123.js");
+    expect(plain.headers["content-encoding"]).toBeUndefined();
+    expect(plain.body.toString()).toBe(source);
+    // The security headers still go out with a cached asset.
+    expect(plain.headers["content-security-policy"]).toContain("script-src 'self'");
+    // A rebuilt file under the same name is not served from the stale compressed copy.
+    writeFileSync(join(root, "assets", "assets", "big-abc123.js"), source + "\n// rebuilt");
+    expect(brotliDecompressSync((await raw("/assets/big-abc123.js", "br")).body).toString()).toBe(source + "\n// rebuilt");
+    // Tiny files and already-compressed formats go out as they are.
+    expect((await raw("/assets/app-test.js", "br")).headers["content-encoding"]).toBeUndefined();
+    for (const path of ["/", "/favicon.svg", "/manifest.webmanifest"]) {
+      expect((await raw(path, "br")).headers["cache-control"]).toBe("no-store");
+    }
+  });
+  it("negotiates brotli, then gzip, honouring q=0", () => {
+    expect(pickEncoding("gzip, deflate, br, zstd")).toBe("br");
+    expect(pickEncoding("gzip;q=1.0, br;q=0")).toBe("gzip");
+    expect(pickEncoding("GZIP")).toBe("gzip");
+    expect(pickEncoding("*")).toBe("br");
+    expect(pickEncoding("*;q=0, gzip")).toBe("gzip");
+    expect(pickEncoding("identity")).toBeUndefined();
+    expect(pickEncoding("br;q=0, gzip;q=0")).toBeUndefined();
+    expect(pickEncoding(undefined)).toBeUndefined();
+    expect(pickEncoding("")).toBeUndefined();
   });
   it("sends an SSE snapshot and live completed blocks without a browser read acknowledgment", async () => {
     const requestId = randomUUID();

@@ -7,6 +7,7 @@ import type { WebData } from "./data.js";
 import { SCREEN_RATES, type ScreenLoop, type ScreenRate } from "./screen.js";
 import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
+import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
@@ -54,6 +55,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   let active = 0;
   let inspecting = false;
   let boundPort = port;
+  const compressed = new CompressedAssets();
   const server = createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 10_000 }, (req, res) => {
     for (const [key, value] of Object.entries(securityHeaders)) res.setHeader(key, value);
     void handle(req, res).catch((error: unknown) => {
@@ -108,7 +110,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     try {
       if (!api) {
         if (req.method !== "GET") throw new WebError(405, "method_not_allowed");
-        await asset(url.pathname, res);
+        await asset(url.pathname, req, res);
         return;
       }
       if (req.method === "GET") {
@@ -437,7 +439,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     res.once("close", () => { unsubscribe(); clearInterval(heartbeat); screenStreams.delete(res); });
   }
 
-  async function asset(path: string, res: ServerResponse): Promise<void> {
+  async function asset(path: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const relative = path === "/" ? "index.html" : /^\/assets\/[A-Za-z0-9_-]+\.(js|css|woff2)$/.test(path) || ICON_FILES.has(path) ? path.slice(1) : null;
     if (!relative) throw new WebError(404, "not_found");
     const root = await realpath(deps.assetsDir);
@@ -450,10 +452,17 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       if (!stat.isFile() || stat.size > MAX_BUFFER_BYTES) throw new WebError(404, "not_found");
       const bytes = await file.readFile();
       const ext = relative.split(".").pop()!;
+      // Hashed bundle files never change under their name; everything else keeps no-store.
+      const hashed = relative.startsWith("assets/");
+      const compressible = CompressedAssets.compressible(ext, bytes.length);
+      const encoding = compressible ? pickEncoding(req.headers["accept-encoding"]) : undefined;
+      const body = encoding ? await compressed.get(relative, `${stat.size}:${stat.mtimeMs}`, encoding, bytes) : bytes;
       res.writeHead(200, { "content-type": ({ html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8",
         css: "text/css; charset=utf-8", woff2: "font/woff2", svg: "image/svg+xml", ico: "image/x-icon", png: "image/png",
-        webmanifest: "application/manifest+json" } as Record<string, string>)[ext] });
-      res.end(bytes);
+        webmanifest: "application/manifest+json" } as Record<string, string>)[ext], "content-length": body.length,
+        ...(hashed ? { "cache-control": IMMUTABLE_CACHE } : {}),
+        ...(compressible ? { vary: "accept-encoding" } : {}), ...(encoding ? { "content-encoding": encoding } : {}) });
+      res.end(body);
     } finally { await file.close(); }
   }
 

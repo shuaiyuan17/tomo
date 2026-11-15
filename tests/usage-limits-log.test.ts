@@ -7,6 +7,7 @@ const warn = vi.hoisted(() => vi.fn());
 vi.mock("../src/logger.js", () => ({ log: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 import { fetchUsage } from "../src/agent/usage.js";
+import { sdkSignalOf } from "../src/agent/sdk-signals.js";
 import { LIMITS_REPEAT_MS, LimitsLog, type LimitSample } from "../src/usage/limits-log.js";
 import { usageDataDir } from "../src/usage/dir.js";
 
@@ -56,6 +57,16 @@ describe("LimitsLog", () => {
     await log.recordSignal({ ...RATE, overage: true });
     expect(lines(log)).toEqual([{ v: 1, ts: "2026-11-15T20:00:00.000Z", source: "rate-limit-event",
       windows: [{ window: "five_hour", percent: 90, resetsAt: "2026-11-15T22:00:00.000Z", status: "allowed_warning", overage: true }] }]);
+  });
+
+  it("keeps the SDK's own precision: 0.901 and 0.904 are two samples", async () => {
+    const log = new LimitsLog(home, () => clock);
+    const event = (utilization: number) => sdkSignalOf({ type: "rate_limit_event",
+      rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", resetsAt: 1_763_244_000, utilization } })!;
+    await log.recordSignal(event(0.901));
+    await log.recordSignal(event(0.904));
+    await log.recordSignal(event(0.904));
+    expect(lines(log).map((l) => [l.windows[0].percent, l.windows[0].utilization])).toEqual([[90.1, 0.901], [90.4, 0.904]]);
   });
 
   it("dedups an unchanged sample for 10 minutes, per stream", async () => {

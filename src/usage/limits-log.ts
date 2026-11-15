@@ -1,8 +1,8 @@
-import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { SdkSignal } from "../agent/sdk-signals.js";
 import { usageWindows, type UsageResponse } from "../agent/usage.js";
 import { log } from "../logger.js";
+import { appendLineSerial } from "./append.js";
 import { usageDataDir } from "./dir.js";
 
 /** Bump when a line's shape changes incompatibly. */
@@ -21,8 +21,10 @@ export interface LimitWindowSample {
   group?: "session" | "weekly" | "other";
   /** Per-model / per-surface cap. */
   scoped?: boolean;
-  /** 0–100. */
+  /** 0–100, unrounded. */
   percent?: number;
+  /** rate-limit-event only: the SDK's `utilization` exactly as sent (usually a 0–1 fraction). */
+  utilization?: number;
   /** ISO time. */
   resetsAt?: string;
   /** oauth-usage: `elevated` / `normal`; rate-limit-event: `allowed` / `allowed_warning` / `rejected`. */
@@ -62,7 +64,10 @@ export function oauthWindows(data: UsageResponse | null | undefined): LimitWindo
 export function rateLimitWindow(signal: Extract<SdkSignal, { kind: "rate_limit" }>): LimitWindowSample {
   return defined({
     window: signal.limit ?? "unknown",
-    percent: signal.utilization,
+    // Unrounded: the display rounding in sdk-signals.ts would merge 0.901 and 0.904.
+    percent: signal.rawUtilization === undefined ? signal.utilization
+      : signal.rawUtilization <= 1 ? Math.round(signal.rawUtilization * 1e6) / 1e4 : signal.rawUtilization,
+    utilization: signal.rawUtilization,
     resetsAt: iso(signal.resetsAt),
     status: signal.status,
     overage: signal.overage,
@@ -78,13 +83,11 @@ export function rateLimitWindow(signal: Extract<SdkSignal, { kind: "rate_limit" 
  * throws: a failed write is a warn in the log and the caller carries on.
  */
 export class LimitsLog {
-  readonly dir: string;
   readonly path: string;
   private last = new Map<string, { key: string; at: number }>();
 
   constructor(tomoHome: string, private readonly now: () => number = Date.now) {
-    this.dir = usageDataDir(tomoHome);
-    this.path = join(this.dir, "limits.ndjson");
+    this.path = join(usageDataDir(tomoHome), "limits.ndjson");
   }
 
   recordOAuthUsage(data: UsageResponse | null | undefined): Promise<void> {
@@ -110,16 +113,17 @@ export class LimitsLog {
   private async record(source: LimitSource, stream: string, windows: LimitWindowSample[]): Promise<void> {
     const now = this.now();
     const key = JSON.stringify(windows);
-    const previous = this.last.get(stream);
-    if (previous && previous.key === key && now - previous.at < LIMITS_REPEAT_MS) return;
-    this.last.set(stream, { key, at: now });
-    const sample: LimitSample = { v: LIMITS_LOG_VERSION, ts: new Date(now).toISOString(), source, windows };
     try {
-      await mkdir(this.dir, { recursive: true });
-      await appendFile(this.path, `${JSON.stringify(sample)}\n`, "utf8");
+      // Serialized per file, and the dedup decision is made at write time against
+      // what actually landed: so the last line and `last` always agree, and a
+      // failed write leaves `last` alone (the next sample is not skipped).
+      await appendLineSerial(this.path, () => {
+        const previous = this.last.get(stream);
+        if (previous && previous.key === key && now - previous.at < LIMITS_REPEAT_MS) return undefined;
+        const sample: LimitSample = { v: LIMITS_LOG_VERSION, ts: new Date(now).toISOString(), source, windows };
+        return JSON.stringify(sample);
+      }, () => this.last.set(stream, { key, at: now }));
     } catch (err) {
-      // Forget it, so the next sample is not deduplicated against a line that never landed.
-      if (this.last.get(stream)?.at === now) this.last.delete(stream);
       await this.warn(err);
     }
   }

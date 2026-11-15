@@ -32,9 +32,9 @@ describe("sdkSignalOf", () => {
 
   it("normalises rate-limit times to ms and utilisation to a percentage", () => {
     expect(sdkSignalOf({ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "seven_day", resetsAt: 1_800_000_000, utilization: 1, isUsingOverage: true } }))
-      .toEqual({ kind: "rate_limit", status: "rejected", limit: "seven_day", resetsAt: 1_800_000_000_000, utilization: 100, overage: true });
+      .toEqual({ kind: "rate_limit", status: "rejected", limit: "seven_day", resetsAt: 1_800_000_000_000, utilization: 100, rawUtilization: 1, overage: true });
     expect(sdkSignalOf({ type: "rate_limit_event", rate_limit_info: { status: "allowed", resetsAt: 1_800_000_000_000, utilization: 42 } }))
-      .toEqual({ kind: "rate_limit", status: "allowed", resetsAt: 1_800_000_000_000, utilization: 42 });
+      .toEqual({ kind: "rate_limit", status: "allowed", resetsAt: 1_800_000_000_000, utilization: 42, rawUtilization: 42 });
   });
 });
 

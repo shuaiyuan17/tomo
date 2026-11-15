@@ -269,7 +269,7 @@ export function App() {
     const { keys: sentKeys, ids: images } = captureSend(attachments.items);
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
-    // Sending is the reader's own move: their message anchors its turn wherever they were reading.
+    // Sending is the reader's own move: it takes them to the end, wherever they were reading.
     // Claimed before the request goes out: the live stream can show its bubble before the POST returns.
     scroller.current?.claim(pendingKey({ requestId }));
     try {

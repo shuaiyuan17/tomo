@@ -716,7 +716,9 @@ export class WebChannel implements Channel {
       const receipt = this.receipts.get(event.requestId);
       if (receipt && !receipt.settled) this.state(event.requestId, "queued");
     } else if (event.type === "read") {
-      // A read receipt changes no state and is not journaled.
+      // A read receipt changes no state and is not journaled. Owner only:
+      // web requests only ever run there.
+      if (sessionId !== this.ownerId) return;
       for (const requestId of event.requestIds) {
         const receipt = this.receipts.get(requestId);
         if (!receipt || receipt.request.read) continue;

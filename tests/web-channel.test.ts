@@ -471,3 +471,28 @@ it("releases accepted text after failed handoff and terminal settlement", async 
   bus.publish({ type: "turn.end", sessionKey: "dm:owner", requestId: completed, source: "user", ok: true, durationMs: 1 });
   expect(channel.request(completed).text).toBeUndefined();
 });
+
+describe("WebChannel read receipts", () => {
+  it("a read event marks each named web request read once, without changing its state", async () => {
+    const { channel, bus, events } = setup();
+    const first = randomUUID(); const second = randomUUID();
+    await channel.receive({ requestId: first, text: "one" });
+    await channel.receive({ requestId: second, text: "two" });
+    events.length = 0;
+    bus.publish({ type: "read", sessionKey: "dm:owner", uuids: ["u1", "u2"], requestIds: [first, second] });
+    bus.publish({ type: "read", sessionKey: "dm:owner", uuids: ["u1"], requestIds: [first] });
+    const published = events.flatMap((e) => e.type === "request" ? [e.request] : []);
+    expect(published.map((r) => [r.requestId, r.read, r.state])).toEqual([[first, true, "queued"], [second, true, "queued"]]);
+    expect(channel.request(first)).toMatchObject({ read: true, state: "queued" });
+  });
+  it("ignores read events for unknown requests and other sessions", async () => {
+    const { channel, bus, events } = setup();
+    const id = randomUUID();
+    await channel.receive({ requestId: id, text: "one" });
+    events.length = 0;
+    bus.publish({ type: "read", sessionKey: "telegram:-100123", uuids: ["u"], requestIds: [id] });
+    bus.publish({ type: "read", sessionKey: "dm:owner", uuids: ["u"], requestIds: [randomUUID()] });
+    expect(events).toEqual([]);
+    expect(channel.request(id).read).toBeUndefined();
+  });
+});

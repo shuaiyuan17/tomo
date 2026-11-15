@@ -1639,3 +1639,97 @@ describe("LiveSession.stop (owner Stop) and SDK signals", () => {
     off();
   });
 });
+
+describe("LiveSession: read receipts (user_message_uuids)", () => {
+  type ReadEvent = { uuids: string[]; requestIds: string[] };
+  const ctx = (requestId: string) => ({ turnId: requestId, channel: "web", requestId, interactive: true });
+  const stamped = (text: string, ...uuids: Array<string | undefined>) => ({ ...assistantEvent(text), user_message_uuids: uuids, user_message_uuid: uuids.at(-1) });
+  let reads: ReadEvent[] = [];
+  let unsubscribe: () => void = () => {};
+  beforeEach(async () => {
+    const { watchBus } = await import("../src/watch/bus.js");
+    reads = [];
+    unsubscribe = watchBus.subscribe((e) => { if (e.type === "read" && e.sessionKey === "test:session") reads.push({ uuids: e.uuids, requestIds: e.requestIds }); });
+  });
+  afterEach(() => unsubscribe());
+
+  it("marks a message read the first frame that names it, and only once", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("hi", undefined, undefined, undefined, undefined, undefined, false, ctx("req-1"));
+    await flushMicrotasks();
+    const uuid = harness.uuids[0]!;
+    expect(uuid).toMatch(/^[0-9a-f-]{36}$/);
+    expect(reads).toEqual([]);
+    harness.pushEvent(stamped("one", uuid));
+    harness.pushEvent(stamped("two", uuid));
+    harness.pushEvent({ ...resultEvent(), user_message_uuids: [uuid], user_message_uuid: uuid });
+    await p;
+    expect(reads).toEqual([{ uuids: [uuid], requestIds: ["req-1"] }]);
+  });
+
+  it("a message folded in mid-turn is marked read when the turn reports it, the first not again", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("first", undefined, undefined, undefined, undefined, undefined, false, ctx("req-1"));
+    await flushMicrotasks();
+    harness.pushEvent(stamped("working", harness.uuids[0]));
+    await flushMicrotasks(10);
+    const p2 = session.steer("second", undefined, undefined, undefined, undefined, undefined, undefined, { replyContext: ctx("req-2"), canJoin: () => true });
+    await flushMicrotasks();
+    expect(reads).toEqual([{ uuids: [harness.uuids[0]], requestIds: ["req-1"] }]);
+    harness.pushEvent(userEcho("second"));
+    harness.pushEvent(stamped("saw it", harness.uuids[0], harness.uuids[1]));
+    harness.pushEvent(resultEvent());
+    await p1; await p2;
+    expect(reads).toEqual([{ uuids: [harness.uuids[0]], requestIds: ["req-1"] }, { uuids: [harness.uuids[1]], requestIds: ["req-2"] }]);
+  });
+
+  it("every member of a batch the CLI merged into the next turn is marked read, queued ones only when that turn reads them", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("first", undefined, undefined, undefined, undefined, undefined, false, ctx("req-1"));
+    await flushMicrotasks();
+    const p2 = session.steer("second", undefined, undefined, undefined, undefined, undefined, undefined, { replyContext: ctx("req-2"), canJoin: () => true });
+    const p3 = session.steer("third", undefined, undefined, undefined, undefined, undefined, undefined, { replyContext: ctx("req-3"), canJoin: () => true });
+    await flushMicrotasks();
+    harness.pushEvent(stamped("one", harness.uuids[0]));
+    harness.pushEvent(resultEvent());
+    await p1;
+    // Queued behind the turn: not read yet.
+    expect(reads.flatMap((r) => r.requestIds)).toEqual(["req-1"]);
+    harness.pushEvent(stamped("both", harness.uuids[1], harness.uuids[2]));
+    harness.pushEvent(resultEvent());
+    await flushMicrotasks(10);
+    expect(reads.at(-1)).toEqual({ uuids: [harness.uuids[1], harness.uuids[2]], requestIds: ["req-2", "req-3"] });
+    session.close();
+    await Promise.allSettled([p2, p3]);
+  });
+
+  it("an older producer that stamps nothing: no receipt and no error; one that stamps only user_message_uuid still works", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("old", undefined, undefined, undefined, undefined, undefined, false, ctx("req-1"));
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("reply"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("reply");
+    expect(reads).toEqual([]);
+    const p2 = session.send("newer", undefined, undefined, undefined, undefined, undefined, false, ctx("req-2"));
+    await flushMicrotasks();
+    harness.pushEvent({ ...assistantEvent("ok"), user_message_uuid: harness.uuids[1] });
+    harness.pushEvent(resultEvent());
+    await p2;
+    expect(reads).toEqual([{ uuids: [harness.uuids[1]], requestIds: ["req-2"] }]);
+  });
+
+  it("ignores uuids it did not send, and subagent frames", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("hi");
+    await flushMicrotasks();
+    harness.pushEvent({ ...stamped("sub", harness.uuids[0]), parent_tool_use_id: "tool-1" });
+    harness.pushEvent(stamped("x", "00000000-0000-0000-0000-000000000000"));
+    await flushMicrotasks(10);
+    expect(reads).toEqual([]);
+    harness.pushEvent(stamped("main", harness.uuids[0]));
+    harness.pushEvent(resultEvent());
+    await p;
+    expect(reads).toEqual([{ uuids: [harness.uuids[0]], requestIds: [] }]);
+  });
+});

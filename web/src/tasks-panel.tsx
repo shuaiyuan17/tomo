@@ -1,15 +1,18 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronRight, TerminalIcon, X } from "lucide-react";
 import type { WebSession, WebTask } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { measureExit, useAppeared, useExiting } from "./motion.js";
-import { SubagentView, type TaskControl } from "./subagent-view.js";
+import type { TaskControl } from "./subagent-view.js";
 import { isShellTask, shellShortName } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
 import { ModelBadge } from "./model-badge.js";
 import { type TaskRow, buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
+
+/** A task's transcript view: its own chunk, fetched when a task is opened. */
+const SubagentView = lazy(() => import("./subagent-view.js").then((m) => ({ default: m.SubagentView })));
 
 /**
  * Shows what is running. The list itself offers nothing to act on; an opened task of the owner
@@ -42,7 +45,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control }: { task
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>
-    <SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} />
+    <Suspense fallback={null}><SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} /></Suspense>
   </div>;
   return <section className={cn("flex min-h-0 flex-1 flex-col", cameBack && "motion-from-left")} aria-labelledby="tasks-heading">
     <div className="mb-1.5 flex items-center justify-between gap-3 pr-1 pl-2.5">

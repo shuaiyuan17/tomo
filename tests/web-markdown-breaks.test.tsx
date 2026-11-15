@@ -20,4 +20,17 @@ describe("chat message line breaks", () => {
   it("without breaks, markdown joins single newlines as before", () => {
     expect(render("a\nb", false)).not.toContain("<br/>");
   });
+  it("parses GFM (tables, strikethrough, task lists, autolinks, footnotes) with and without breaks", () => {
+    for (const breaks of [true, false]) {
+      const html = render("| a | b |\n|---|---|\n| 1 | 2 |\n\n~~gone~~ www.example.com\n\n- [x] done\n- [ ] todo\n\nNote[^1]\n\n[^1]: The footnote.", breaks);
+      expect(html).toContain("<table>");
+      expect(html).toContain("<td>2</td>");
+      expect(html).toContain("<del>gone</del>");
+      expect(html).toContain('<a href="http://www.example.com" target="_blank" rel="noopener noreferrer">www.example.com</a>');
+      expect(html).toContain('aria-label="Completed task"');
+      expect(html).toContain('aria-label="Incomplete task"');
+      expect(html).toContain("The footnote.");
+      expect(html).toContain("<sup><span>1</span></sup>");
+    }
+  });
 });

@@ -52,7 +52,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer }: { tasks: WebTas
     <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-0" tabIndex={0} aria-label="Task list">
       {view.groups.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">Nothing running in the background.</p>
         : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
-          <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span className="opacity-80"> · group</span> : null}</p>
+          <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span> · group</span> : null}</p>
           <GroupRows sessionId={group.sessionId} rows={group.rows} now={now} openFolds={openFolds} setOpenFolds={setOpenFolds}
             onOpen={(task) => setOpened({ sessionId: task.sessionId, taskId: task.taskId })} />
         </div>)}
@@ -70,11 +70,11 @@ function TaskCard({ task, depth, now, onOpen, motion }: { task: WebTask; depth: 
   const shell = isShellTask(task.taskType);
   return <li ref={motion?.includes("motion-exit") ? measureExit : undefined} style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch, motion)}>
     <button type="button" title={shell ? `${shellShortName(task.description)}\n\n${task.description}\n\nOpen to see the full command` : taskKind(task)} onClick={onOpen}
-      className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.06] focus-visible:outline-offset-0", "transition-[background-color,opacity] duration-200", !running && "opacity-60")}>
+      className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.06] focus-visible:outline-offset-0", "transition-[background-color,opacity] duration-200")}>
       <div className="flex min-w-0 items-baseline justify-between gap-2.5">
         {shell ? <span className="min-w-0"><ShellPill command={task.description} /></span>
-          : <span className="text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>}
-        {running && <span className="shrink-0 tracking-[0.02em] text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
+          : <span className={cn("text-[13px] leading-normal font-medium [overflow-wrap:anywhere]", !running && "text-muted-foreground")}>{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>}
+        {running && <span className="shrink-0 tracking-[0.02em] text-[10px] text-muted-foreground tabular-nums">{time}</span>}
       </div>
       <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
         {running ? <><span className="shimmer">Working</span>{step && <> · {step}</>}</> : <>{STATE_LABELS[task.state]} · {time}</>}
@@ -89,7 +89,7 @@ function FoldedShells({ tasks, depth, now, open, onToggle, onOpen, motion }:
   return <>
     <li ref={motion?.includes("motion-exit") ? measureExit : undefined} style={{ marginLeft: depth * 16 }} className={cn("relative", depth > 0 && branch, motion)}>
       <button type="button" aria-expanded={open} onClick={onToggle}
-        className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground opacity-80 transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
+        className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
         <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-90")} />
         <TerminalIcon className="size-3 shrink-0" aria-hidden="true" />{tasks.length} shell commands done</button>
     </li>

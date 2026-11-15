@@ -208,6 +208,9 @@ export function App() {
   // only one of the two is open at a time.
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButton = useRef<HTMLButtonElement>(null);
+  // A conversation picked with the pointer: the menu closes without handing focus back to
+  // its trigger, which Chromium would then draw with a keyboard focus ring. Keys keep it.
+  const pickedByPointer = useRef(false);
   const drawer = phone && menuOpen;
   const drawerMotion = useMountedFor(drawer);
   const closeMenu = (refocus = true) => { setMenuOpen(false); if (refocus) menuButton.current?.focus(); };
@@ -469,7 +472,7 @@ export function App() {
       {phone && drawerMotion.mounted && <div aria-hidden="true" onClick={() => closeMenu()} data-state={drawerMotion.shown ? "open" : "closed"}
         className="fixed inset-0 top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 transition-opacity dark:bg-black/45 duration-[220ms] data-[state=closed]:opacity-0" />}
       <aside ref={sidebar} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
-        className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
+        className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
         aria-label="Conversation details" inert={tasksModal || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5">
           {([[null, "Conversation", MessageCircle], ["home", "Home", House], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
@@ -491,7 +494,9 @@ export function App() {
               <span id="session-value" className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-auto max-w-[min(22rem,calc(100vw-2rem))] min-w-(--radix-dropdown-menu-trigger-width) rounded-xl p-1">
+          <DropdownMenuContent align="start" className="w-auto max-w-[min(22rem,calc(100vw-2rem))] min-w-(--radix-dropdown-menu-trigger-width) rounded-xl p-1"
+            onPointerDown={() => { pickedByPointer.current = true; }} onKeyDown={() => { pickedByPointer.current = false; }}
+            onCloseAutoFocus={(event) => { if (pickedByPointer.current) event.preventDefault(); pickedByPointer.current = false; }}>
             <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
             <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) closeMenu(false); }}>
               {sessions.map((s) => <DropdownMenuRadioItem key={s.id} value={s.id} className="rounded-lg py-2 text-[13px]">

@@ -34,7 +34,7 @@
   --secondary: #ece5d4;
   --secondary-foreground: #2a2622;
   --muted: #ece5d4;
-  --muted-foreground: #70665d;
+  --muted-foreground: #6a6057; /* ≥ 4.5:1 on background, card, secondary and accent */
   --accent: #e7dfcc;
   --accent-foreground: #2a2622;
   --destructive: #a4483a;
@@ -43,7 +43,7 @@
   --ring: #526346;
   --shimmer-base: #70665d;
   --shimmer-glint: #c3cfaf;
-  --warn: #a8661f;
+  --warn: #93591a; /* ≥ 4.5:1 for the small usage percentages */
   --radius: 0.75rem;
   /* Serif for the brand and Tomo's replies; Chinese always in PingFang (sans). */
   --font-serif: "Source Serif 4", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif;
@@ -124,6 +124,8 @@
   body { @apply bg-background text-foreground font-sans antialiased; font-size: 16px; line-height: 1.6; }
   :focus-visible { @apply outline-2 outline-offset-2 outline-ring; }
   a { @apply text-primary underline-offset-4; }
+  /* Selected text in the palette's green (light) / sand (dark), not the browser's blue. */
+  ::selection { background-color: color-mix(in srgb, var(--primary) 24%, transparent); }
   p, h1, h2 { text-wrap: pretty; }
 }
 
@@ -195,7 +197,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 }
 @keyframes motion-enter { from { opacity: 0; transform: translateY(6px); } }
 @keyframes motion-drop { from { opacity: 0; transform: translateY(-4px); } }
-@keyframes motion-exit { from { opacity: 0.6; height: var(--motion-exit-from, auto); } to { opacity: 0; height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; } }
+@keyframes motion-exit { from { opacity: 1; height: var(--motion-exit-from, auto); } to { opacity: 0; height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; } }
 @keyframes motion-from-right { from { opacity: 0; transform: translateX(16px); } }
 @keyframes motion-from-left { from { opacity: 0; transform: translateX(-16px); } }
 @keyframes collapsible-open { from { height: 0; opacity: 0; } to { height: var(--radix-collapsible-content-height); opacity: 1; } }

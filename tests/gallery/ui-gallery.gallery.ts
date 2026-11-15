@@ -519,13 +519,16 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
     await s("study", tab, async (snap) => {
       await page.goto(`${url}/#study/${tab}`);
       await page.waitForTimeout(900);
+      if (tab === "cron") await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
       await snap();
     });
   }
   await s("study", "cron-confirm", async (snap) => {
     await page.goto(`${url}/#study/cron`);
-    await page.waitForTimeout(900);
-    await page.getByRole("button", { name: /^(Pause|Delete)/ }).first().click({ timeout: 5000 });
+    // The jobs arrive after the page; wait for them rather than for a fixed time.
+    await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
+    await page.waitForTimeout(300);
+    await page.getByRole("button", { name: /^(Pause|Delete)/ }).filter({ visible: true }).first().click();
     await snap();
     await page.keyboard.press("Escape");
   });

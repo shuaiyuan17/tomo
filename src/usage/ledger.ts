@@ -1,3 +1,4 @@
+import { readdirSync, readFileSync } from "node:fs";
 import { chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "../logger.js";
@@ -91,6 +92,16 @@ export interface UsageLedgerRow {
    * per-model usage existed.
    */
   models?: Record<string, ModelTurnUsage>;
+  /** The SDK session the result belongs to. */
+  sdkSessionId?: string;
+  /**
+   * The SDK's cumulative counters at the end of this turn (totals and per
+   * model): THE baseline a resume of `sdkSessionId` starts from (see
+   * UsageLedger.lastSnapshot). Absent when they cannot be trusted as one (the
+   * totals just reset, or the result carried none), which sends that resume
+   * down the no-baseline path.
+   */
+  snapshot?: UsageBaseline;
 }
 
 export const TRIGGER_MAX_CHARS = 80;
@@ -122,13 +133,15 @@ export const LEDGER_FILE_MODE = 0o600;
 export const LEDGER_DIR_MODE = 0o700;
 
 /**
- * Called once per SDK result with its ledger row and the cumulative baseline
- * the next resume must start from (`null`: drop it; see QueryResult). The two
- * travel together so the baseline is persisted with every row written: a
- * result whose row was written but whose baseline was not would be charged
- * again by the first turn after a resume.
+ * Called once per SDK result. `build` makes the row when its turn in the
+ * session's write queue comes (so it can measure against the last row that
+ * landed); `onWritten` runs once that row is on disk, before the session's
+ * next `build`. A row that fails never calls it.
  */
-export type UsageRecorder = (row: UsageLedgerRow, baseline: UsageBaseline | null) => void;
+export type UsageRecorder = (build: () => UsageLedgerRow | undefined, onWritten: () => void) => void;
+
+/** How many month files a baseline lookup reads back before giving up. */
+const SNAPSHOT_LOOKBACK_FILES = 3;
 
 export class UsageLedger {
   /** After a failure, warn once until a write succeeds again. */
@@ -141,28 +154,103 @@ export class UsageLedger {
   /** `dir`: the usage data directory (`usageDataDir`). */
   constructor(private readonly dir: string) {}
 
+  /** Each session's rows, written one after another. */
+  private readonly sessionChains = new Map<string, Promise<void>>();
+  /** sessionKey + sdkSessionId → the snapshot of the last row that landed this process. */
+  private readonly landed = new Map<string, UsageBaseline | null>();
+
+  /** Queue a ready row. See appendFor. */
+  append(row: UsageLedgerRow, onWritten?: () => void): Promise<void> {
+    return this.appendFor(row.sessionKey, () => row, onWritten);
+  }
+
   /**
-   * Queue one row. Never throws and never rejects: callers fire and forget.
-   * Resolves once the row is written (or the write failed and was logged).
+   * Queue one row for `sessionKey`. Rows of one session are written strictly
+   * one after another, whatever month file they go to: `build` runs only once
+   * the previous row has landed or failed, and `onWritten` right after this
+   * one lands. Never throws and never rejects: callers fire and forget.
    */
-  append(row: UsageLedgerRow): Promise<void> {
+  appendFor(sessionKey: string, build: () => UsageLedgerRow | undefined, onWritten?: () => void): Promise<void> {
+    const previous = this.sessionChains.get(sessionKey) ?? Promise.resolve();
+    const write = previous.then(() => this.writeOne(build, onWritten));
+    this.sessionChains.set(sessionKey, write);
+    this.pending.add(write);
+    void write.finally(() => {
+      this.pending.delete(write);
+      if (this.sessionChains.get(sessionKey) === write) this.sessionChains.delete(sessionKey);
+    });
+    return write;
+  }
+
+  private async writeOne(build: () => UsageLedgerRow | undefined, onWritten?: () => void): Promise<void> {
+    let row: UsageLedgerRow | undefined;
     let line: string;
     try {
+      row = build();
+      if (!row) return;
       line = JSON.stringify(row);
     } catch (err) {
-      this.warn(err, row);
-      return Promise.resolve();
+      this.warn(err, row?.sessionKey);
+      return;
     }
+    const landedRow = row;
     const path = join(this.dir, ledgerFileName(row.ts));
-    const write = appendLineSerial(path, () => line, () => { this.failing = false; }, {
-      fileMode: LEDGER_FILE_MODE,
-      dirMode: LEDGER_DIR_MODE,
-    })
-      .then(() => this.secure(path))
-      .then(() => undefined, (err: unknown) => this.warn(err, row));
-    this.pending.add(write);
-    void write.finally(() => this.pending.delete(write));
-    return write;
+    try {
+      await appendLineSerial(path, () => line, () => {
+        this.failing = false;
+        if (landedRow.sdkSessionId) this.landed.set(snapshotKey(landedRow.sessionKey, landedRow.sdkSessionId), landedRow.snapshot ?? null);
+        onWritten?.();
+      }, { fileMode: LEDGER_FILE_MODE, dirMode: LEDGER_DIR_MODE });
+      await this.secure(path);
+    } catch (err) {
+      this.warn(err, row.sessionKey);
+    }
+  }
+
+  /**
+   * The baseline a resume of `sdkSessionId` on `sessionKey` starts from,
+   * read from the ledger: the snapshot of that session's last row that
+   * parses. `null`: that row says the counters cannot be trusted (resume on
+   * the no-baseline path). `undefined`: the ledger has no row for it within
+   * the look-back (the caller may fall back to the registry's copy).
+   *
+   * A torn or corrupt line — a crash mid-append — is skipped, so the lookup
+   * falls back to the row before it. Rows that never landed are not here, so
+   * a failed append leaves the baseline where it was and the next row
+   * carries that turn. Call after `idle()` so rows still queued count.
+   */
+  lastSnapshot(sessionKey: string, sdkSessionId: string): UsageBaseline | null | undefined {
+    const key = snapshotKey(sessionKey, sdkSessionId);
+    if (this.landed.has(key)) return this.landed.get(key) ?? null;
+    let files: string[];
+    try {
+      files = readdirSync(this.dir).filter((f) => LEDGER_FILE_RE.test(f)).sort().reverse().slice(0, SNAPSHOT_LOOKBACK_FILES);
+    } catch {
+      return undefined;
+    }
+    for (const file of files) {
+      let text: string;
+      try {
+        text = readFileSync(join(this.dir, file), "utf8");
+      } catch {
+        continue;
+      }
+      const lines = text.split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line.includes(sdkSessionId)) continue;
+        let row: Partial<UsageLedgerRow>;
+        try {
+          row = JSON.parse(line) as Partial<UsageLedgerRow>;
+        } catch {
+          continue;
+        }
+        if (row.sessionKey !== sessionKey || row.sdkSessionId !== sdkSessionId) continue;
+        const snap = row.snapshot;
+        return snap && snap.sdkSessionId === sdkSessionId && typeof snap.totalCostUsd === "number" && snap.tokens ? snap : null;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -187,12 +275,18 @@ export class UsageLedger {
     while (this.pending.size > 0) await Promise.all([...this.pending]);
   }
 
-  private warn(err: unknown, row: UsageLedgerRow): void {
+  private warn(err: unknown, sessionKey: string | undefined): void {
     if (this.failing) return;
     this.failing = true;
     log.warn(
-      { err: err instanceof Error ? err.message : String(err), dir: this.dir, sessionKey: row.sessionKey },
+      { err: err instanceof Error ? err.message : String(err), dir: this.dir, sessionKey },
       "Could not write the usage ledger; this turn's usage is not recorded",
     );
   }
+}
+
+const LEDGER_FILE_RE = /^\d{4}-\d{2}\.ndjson$/;
+
+function snapshotKey(sessionKey: string, sdkSessionId: string): string {
+  return `${sessionKey}\u0000${sdkSessionId}`;
 }

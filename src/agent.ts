@@ -50,7 +50,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
-import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
+import { UsageLedger, triggerSnippet, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
@@ -316,7 +316,7 @@ export class Agent {
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
       retireSdkSessionId: (key) => { this.sessions.retireSdkSessionId(key); },
-      getUsageBaseline: (key) => this.sessions.getUsageBaseline(key),
+      getUsageBaseline: (key, sdkSessionId) => this.resumeUsageBaseline(key, sdkSessionId),
       updateStats: (key, result) => {
         this.sessions.updateStats(key, result);
         watchBus.publish({
@@ -331,7 +331,7 @@ export class Agent {
           ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
-      recordUsage: (key, row, baseline) => this.recordResultUsage(key, row, baseline),
+      recordUsage: (key, build, onWritten) => { void this.usageLedger.appendFor(key, build, onWritten); },
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
@@ -1137,14 +1137,18 @@ export class Agent {
   }
 
   /**
-   * One SDK result's bookkeeping that must not be split: the ledger row, and
-   * the usage baseline the result advanced to. A row written without its
-   * baseline (a background turn, which never reaches recordTurnCompletion)
-   * is charged again by the first turn after the session is rebuilt.
+   * The usage baseline a resume of `sdkSessionId` on `key` starts from. The
+   * LEDGER is the source: its last row for that SDK session carries the
+   * cumulative snapshot, written in the same append as the turn's delta, so
+   * the two cannot disagree. Rows still queued land first. The registry's
+   * copy is only the fallback for a session the ledger has no row for
+   * (sessions older than the ledger, or a ledger that could not be written).
    */
-  private recordResultUsage(key: string, row: UsageLedgerRow, baseline: UsageBaseline | null): void {
-    void this.usageLedger.append(row);
-    this.sessions.setUsageBaseline(key, baseline);
+  private async resumeUsageBaseline(key: string, sdkSessionId: string): Promise<UsageBaseline | undefined> {
+    await this.usageLedger.idle();
+    const fromLedger = this.usageLedger.lastSnapshot(key, sdkSessionId);
+    if (fromLedger !== undefined) return fromLedger ?? undefined;
+    return this.sessions.getUsageBaseline(key);
   }
 
   private createUnownedTurnRequest(key: string): TurnRequest | undefined {

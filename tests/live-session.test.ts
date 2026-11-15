@@ -123,7 +123,7 @@ function makeSession(settings?: {
       models?: Record<string, ModelCounters>;
     };
   };
-  recordUsage?: (row: UsageLedgerRow) => void;
+  recordUsage?: (build: () => UsageLedgerRow | undefined, onWritten: () => void) => void;
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
@@ -1738,6 +1738,12 @@ describe("LiveSession: read receipts (user_message_uuids)", () => {
   });
 });
 
+/** A recorder that lands every row at once, like a ledger whose writes all succeed. */
+const into = (rows: UsageLedgerRow[]) => (build: () => UsageLedgerRow | undefined, onWritten: () => void) => {
+  const row = build();
+  if (row) { rows.push(row); onWritten(); }
+};
+
 describe("LiveSession usage ledger rows", () => {
   // Cumulative modelUsage after n turns: an opus main loop plus a haiku subagent.
   const sdkModels = (n: number, haiku = n) => ({
@@ -1776,7 +1782,7 @@ describe("LiveSession usage ledger rows", () => {
 
   it("writes one versioned row per result with the turn's own cost, tokens, timings and attribution", async () => {
     const rows: UsageLedgerRow[] = [];
-    const { session, harness } = makeSession({ recordUsage: (r) => rows.push(r) });
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
     const owner = { turnId: "t1", channel: "web", requestId: "req-1", usage: { source: "owner", trigger: "what did I spend" } };
 
     await turn(session, harness, 1, { total_cost_usd: 0.51, modelUsage: sdkModels(1), duration_ms: 900, duration_api_ms: 700, num_turns: 3 }, owner);
@@ -1799,13 +1805,19 @@ describe("LiveSession usage ledger rows", () => {
         "claude-opus": { ...opusAt(1), costBasis: "list" },
         "claude-haiku": haikuAt(1),
       },
+      // The cumulative counters this turn ends on: the next resume's baseline.
+      sdkSessionId: "sid-1",
+      snapshot: {
+        sdkSessionId: "sid-1", totalCostUsd: 1.02, tokens: totalsAt(2),
+        models: { "claude-opus": opusAt(2), "claude-haiku": haikuAt(2) },
+      },
     });
     expect(JSON.stringify(rows[1])).not.toContain("noBaseline");
   });
 
   it("leaves a model that did nothing this turn out, and the costs per model add up to the turn's", async () => {
     const rows: UsageLedgerRow[] = [];
-    const { session, harness } = makeSession({ recordUsage: (r) => rows.push(r) });
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
     await turn(session, harness, 1, { total_cost_usd: 0.51, modelUsage: sdkModels(1, 1) });
     // The haiku subagent did not run on turn 2.
     await turn(session, harness, 2, { total_cost_usd: 1.01, modelUsage: sdkModels(2, 1) });
@@ -1819,7 +1831,7 @@ describe("LiveSession usage ledger rows", () => {
   it("splits the first turn after a resume by model against the per-model baseline", async () => {
     const rows: UsageLedgerRow[] = [];
     const { session, harness } = makeSession({
-      recordUsage: (r) => rows.push(r),
+      recordUsage: into(rows),
       resumeFrom: {
         sdkSessionId: "sid-1",
         baseline: {
@@ -1843,7 +1855,7 @@ describe("LiveSession usage ledger rows", () => {
   it("does not guess a per-model split when the resume baseline predates per-model counters", async () => {
     const rows: UsageLedgerRow[] = [];
     const { session, harness } = makeSession({
-      recordUsage: (r) => rows.push(r),
+      recordUsage: into(rows),
       resumeFrom: { sdkSessionId: "sid-1", baseline: { sdkSessionId: "sid-1", totalCostUsd: 25.5, tokens: totalsAt(50) } },
     });
     await turn(session, harness, 1, { total_cost_usd: 26.01, modelUsage: sdkModels(51) });
@@ -1860,7 +1872,7 @@ describe("LiveSession usage ledger rows", () => {
 
   it("flags the first turn after a resume with no baseline, with no per-model split", async () => {
     const rows: UsageLedgerRow[] = [];
-    const { session, harness } = makeSession({ recordUsage: (r) => rows.push(r), resumeFrom: { sdkSessionId: "sid-1" } });
+    const { session, harness } = makeSession({ recordUsage: into(rows), resumeFrom: { sdkSessionId: "sid-1" } });
     await turn(session, harness, 1, { total_cost_usd: 26.01, modelUsage: sdkModels(51), usage: { input_tokens: 7, output_tokens: 3 } });
     await turn(session, harness, 2, { total_cost_usd: 26.52, modelUsage: sdkModels(52) });
 
@@ -1873,7 +1885,7 @@ describe("LiveSession usage ledger rows", () => {
   it("attributes cron turns to their job and SDK-initiated turns to background", async () => {
     const rows: UsageLedgerRow[] = [];
     const factory = vi.fn(() => ({ resolve: () => {}, reject: () => {}, onBlock: () => {} }));
-    const session = new LiveSession({} as never, "dm:owner", undefined, factory, { recordUsage: (r) => rows.push(r) });
+    const session = new LiveSession({} as never, "dm:owner", undefined, factory, { recordUsage: into(rows) });
     const harness = harnessRef.current!;
     await turn(session, harness, 1, { total_cost_usd: 0.2 }, {
       turnId: "t", channel: "telegram",
@@ -1893,7 +1905,7 @@ describe("LiveSession usage ledger rows", () => {
 
   it("records costs exactly as differenced from the SDK's totals, never rounded", async () => {
     const rows: UsageLedgerRow[] = [];
-    const { session, harness } = makeSession({ recordUsage: (r) => rows.push(r) });
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
     const models = (usd: number) => ({ "claude-opus": { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: usd } });
     await turn(session, harness, 1, { total_cost_usd: 0.0000001234, modelUsage: models(0.0000001234) });
     await turn(session, harness, 2, { total_cost_usd: 0.1234567891, modelUsage: models(0.1234567891) });
@@ -1902,6 +1914,28 @@ describe("LiveSession usage ledger rows", () => {
     expect(rows[0].models!["claude-opus"].costUsd).toBe(0.0000001234);
     expect(rows[1].costUsd).toBe(0.1234567891 - 0.0000001234);
     expect(rows[1].models!["claude-opus"].costUsd).toBe(0.1234567891 - 0.0000001234);
+  });
+
+  it("a row that fails to land does not advance the ledger's counters: the next row carries both turns", async () => {
+    const rows: UsageLedgerRow[] = [];
+    let fail = true;
+    const { session, harness } = makeSession({
+      recordUsage: (build, onWritten) => {
+        const row = build();
+        if (!row) return;
+        if (fail) { fail = false; return; } // the append failed: never on disk, onWritten not called
+        rows.push(row);
+        onWritten();
+      },
+    });
+    await turn(session, harness, 1, { total_cost_usd: 0.51, modelUsage: sdkModels(1) });
+    await turn(session, harness, 2, { total_cost_usd: 1.02, modelUsage: sdkModels(2) });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ costUsd: 1.02, tokens: totalsAt(2), snapshot: { totalCostUsd: 1.02 } });
+    expect(rows[0].models).toEqual({ "claude-opus": { ...opusAt(2), costBasis: "list" }, "claude-haiku": haikuAt(2) });
+    // Session stats are a separate counter and still saw each turn once.
+    expect(session.lastResult?.costUsd).toBeCloseTo(0.51);
   });
 
   it("a recorder that throws costs a warn, never the turn", async () => {

@@ -113,6 +113,74 @@ describe("UsageLedger", () => {
   });
 });
 
+describe("UsageLedger.lastSnapshot — the ledger is where a resume finds its baseline", () => {
+  let dir: string;
+  beforeEach(() => { vi.clearAllMocks(); dir = mkdtempSync(join(tmpdir(), "tomo-usage-snap-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const snap = (usd: number, sid = "sid-1") => ({ sdkSessionId: sid, totalCostUsd: usd, tokens: { input: 1, output: 1, cacheRead: 0, cacheCreated: 0 } });
+  const ts = new Date(2026, 10, 15).getTime();
+
+  it("reads the last row's snapshot for that session and SDK session, from disk", async () => {
+    const writer = new UsageLedger(dir);
+    await writer.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(1) }));
+    await writer.append(row(ts, { sessionKey: "telegram:9", sdkSessionId: "sid-9", snapshot: snap(9, "sid-9") }));
+    await writer.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(2) }));
+    // A fresh process: nothing cached, the file is the only source.
+    const reader = new UsageLedger(dir);
+    expect(reader.lastSnapshot("dm:owner", "sid-1")).toEqual(snap(2));
+    expect(reader.lastSnapshot("telegram:9", "sid-9")).toEqual(snap(9, "sid-9"));
+    expect(reader.lastSnapshot("dm:owner", "sid-other")).toBeUndefined();
+    expect(writer.lastSnapshot("dm:owner", "sid-1")).toEqual(snap(2));
+  });
+
+  it("steps back over a torn or corrupt last line to the row before it", async () => {
+    const writer = new UsageLedger(dir);
+    await writer.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(1) }));
+    const file = join(dir, ledgerFileName(ts));
+    // A crash mid-append: half a row, naming the same session, then garbage.
+    writeFileSync(file, `${readFileSync(file, "utf8")}{"v":1,"sessionKey":"dm:owner","sdkSessionId":"sid-1","snapshot":{"sdkSess\nnot json sid-1\n`);
+    expect(new UsageLedger(dir).lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1));
+  });
+
+  it("a row whose counters cannot be trusted says so (null), rather than falling back further", async () => {
+    const writer = new UsageLedger(dir);
+    await writer.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(1) }));
+    await writer.append(row(ts, { sdkSessionId: "sid-1" })); // a reset: no snapshot
+    expect(new UsageLedger(dir).lastSnapshot("dm:owner", "sid-1")).toBeNull();
+    expect(writer.lastSnapshot("dm:owner", "sid-1")).toBeNull();
+  });
+
+  it("a failed append leaves the baseline where it was, and never calls onWritten", async () => {
+    const ledger = new UsageLedger(dir);
+    const landed: number[] = [];
+    await ledger.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(1) }), () => landed.push(1));
+    const file = join(dir, ledgerFileName(ts));
+    chmodSync(file, 0o400);
+    try {
+      await ledger.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(2) }), () => landed.push(2));
+    } finally {
+      chmodSync(file, 0o600);
+    }
+    expect(landed).toEqual([1]);
+    expect(ledger.lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1));
+    expect(new UsageLedger(dir).lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1));
+  });
+
+  it("builds a session's rows strictly one after another, even across month files", async () => {
+    const ledger = new UsageLedger(dir);
+    const order: string[] = [];
+    const oct = new Date(2026, 9, 31, 23, 59).getTime();
+    const nov = new Date(2026, 10, 1, 0, 1).getTime();
+    let committed = 0;
+    // "slow-first" makes the October write slow (see the fs mock above).
+    void ledger.appendFor("slow-first", () => { order.push(`build1@${committed}`); return row(oct, { sessionKey: "slow-first" }); }, () => { committed = 1; });
+    void ledger.appendFor("slow-first", () => { order.push(`build2@${committed}`); return row(nov, { sessionKey: "slow-first" }); }, () => { committed = 2; });
+    await ledger.idle();
+    expect(order).toEqual(["build1@0", "build2@1"]);
+    expect(committed).toBe(2);
+  });
+});
+
 describe("usage attribution", () => {
   it("names the month file YYYY-MM", () => {
     expect(ledgerFileName(new Date(2026, 0, 5).getTime())).toBe("2026-01.ndjson");

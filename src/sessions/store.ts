@@ -868,21 +868,6 @@ export class SessionStore {
     });
   }
 
-  /**
-   * Persist the usage baseline an SDK result advanced to, without touching
-   * stats — for every result, as its usage-ledger row is written (see
-   * Agent.recordResultUsage). `null` drops the stored baseline. Bookkeeping:
-   * a skipped write leaves the older baseline, which undercharges nothing.
-   */
-  setUsageBaseline(key: string, baseline: UsageBaseline | null): void {
-    this.mutateRegistry("setUsageBaseline", "bookkeeping", () => {
-      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-      if (!entry) return;
-      applyUsageBaseline(entry, baseline);
-      this.saveRegistryBestEffort("setUsageBaseline");
-    });
-  }
-
   /** Touch the active session (update lastActiveAt) */
   touchSession(key: string): void {
     this.mutateRegistry("touchSession", "bookkeeping", () => {

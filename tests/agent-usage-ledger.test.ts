@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { formatTomoEvent } from "../src/tomo-event.js";
 
@@ -104,6 +104,47 @@ describe("usage ledger and the resume baseline", () => {
     expect(rows.map((r) => r.costUsd)).toEqual([1.0, 0.5, 0.25]);
     expect(rows[2].models).toEqual({ "claude-opus": { input: 10, output: 5, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.25 } });
     // Together they add up to the SDK's own total: nothing charged twice.
+    expect(rows.reduce((sum, r) => sum + (r.costUsd as number), 0)).toBe(1.75);
+  });
+
+  it("a row that failed to land is counted by the first turn after the resume, from the ledger's last snapshot", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const key = "telegram:12345";
+    const models = (n: number) => ({
+      "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
+    });
+
+    mockSdk.responseFn = () => "one";
+    mockSdk.nextResult = { total_cost_usd: 1.0, modelUsage: models(4) };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "one" }));
+    await drainQueue(agent);
+    await waitFor(() => expect(ledgerRows()).toHaveLength(1));
+
+    // The ledger cannot be appended to for the second turn.
+    const file = join(agentEnv.tmpDir, "data", "usage", readdirSync(join(agentEnv.tmpDir, "data", "usage")).find((f) => f.endsWith(".ndjson"))!);
+    chmodSync(file, 0o400);
+    mockSdk.responseFn = () => "two";
+    mockSdk.nextResult = { total_cost_usd: 1.5, modelUsage: models(6) };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "two" }));
+    await drainQueue(agent);
+    await (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger.idle();
+    chmodSync(file, 0o600);
+    expect(ledgerRows()).toHaveLength(1);
+
+    // Rebuild and resume. The registry's copy saw turn two ($1.50); the
+    // ledger's last row did not ($1.00), and the ledger wins.
+    (agent as unknown as { liveSessionManager: { closeLiveSession(k: string): void } }).liveSessionManager.closeLiveSession(key);
+    mockSdk.responseFn = () => "three";
+    mockSdk.nextResult = { total_cost_usd: 1.75, modelUsage: models(7) };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "three" }));
+    await drainQueue(agent);
+    await agent.stop();
+
+    const rows = ledgerRows();
+    expect(rows.map((r) => r.costUsd)).toEqual([1.0, 0.75]);
+    expect(rows[1].models).toEqual({ "claude-opus": { input: 30, output: 15, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.75 } });
     expect(rows.reduce((sum, r) => sum + (r.costUsd as number), 0)).toBe(1.75);
   });
 });

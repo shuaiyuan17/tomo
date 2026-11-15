@@ -4,9 +4,9 @@ import { rmSync } from "node:fs";
 // A real tree on disk: a home with ~/.tomo/{data,workspace}, a real usage
 // ledger file and a real private note, and symlinks pointing into both.
 const tree = vi.hoisted(() => {
-  const { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
-  const { tmpdir } = require("node:os") as typeof import("node:os");
-  const { join } = require("node:path") as typeof import("node:path");
+  const { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } = process.getBuiltinModule("node:fs");
+  const { tmpdir } = process.getBuiltinModule("node:os");
+  const { join } = process.getBuiltinModule("node:path");
   const home = realpathSync(mkdtempSync(join(tmpdir(), "tomo-search-roots-")));
   const tomoHome = join(home, ".tomo");
   const ws = join(tomoHome, "workspace");

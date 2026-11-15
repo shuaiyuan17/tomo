@@ -115,14 +115,14 @@ export interface LiveSessionManagerDeps {
    * The persisted SDK usage baseline for the session `key` links to — what a
    * resumed session's cumulative cost/token totals are differenced against.
    */
-  getUsageBaseline(key: string): UsageBaseline | undefined;
+  getUsageBaseline(key: string, sdkSessionId: string): UsageBaseline | undefined | Promise<UsageBaseline | undefined>;
   updateStats(key: string, result: QueryResult): void;
   /**
-   * One SDK result: append its row to the usage ledger (`usage/ledger.ts`)
-   * AND persist the usage baseline it advanced to, in one step (see
-   * UsageRecorder). Called for every result, background turns included.
+   * One SDK result's usage-ledger row (see UsageRecorder), for every result,
+   * background turns included. The row also carries the cumulative snapshot
+   * that `getUsageBaseline` reads back first on the next resume.
    */
-  recordUsage?(key: string, row: UsageLedgerRow, baseline: UsageBaseline | null): void;
+  recordUsage?(key: string, build: () => UsageLedgerRow | undefined, onWritten: () => void): void;
   /** Transcript messages for pre-resume repair. */
   getSessionMessages(key: string): SessionMessage[];
   /** Per-session model override, if any. */
@@ -531,6 +531,7 @@ export class LiveSessionManager {
     const model = this.deps.getModelOverride(key);
     const turnBudget = makeTurnBudget();
     const externalMcpServers = await this.deps.buildExternalMcpServers(key);
+    const resumeBaseline = resumeId ? await this.deps.getUsageBaseline(key, resumeId) : undefined;
     // Per-session server instance: binds the caller's session key so tool
     // handlers (e.g. send_message) can attribute cross-session sends.
     const internalMcpServer = this.deps.createInternalMcpServer(key);
@@ -553,8 +554,10 @@ export class LiveSessionManager {
       onToolResult: (toolName, content, isError) => {
         this.deps.handleToolResult?.(key, toolName, content, isError);
       },
-      ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: this.deps.getUsageBaseline(key) } } : {}),
-      ...(this.deps.recordUsage ? { recordUsage: (row: UsageLedgerRow, baseline: UsageBaseline | null) => this.deps.recordUsage?.(key, row, baseline) } : {}),
+      ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: resumeBaseline } } : {}),
+      ...(this.deps.recordUsage
+        ? { recordUsage: (build: () => UsageLedgerRow | undefined, onWritten: () => void) => this.deps.recordUsage?.(key, build, onWritten) }
+        : {}),
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
     // yields — it can spend real time on OAuth — and stop() may have run its

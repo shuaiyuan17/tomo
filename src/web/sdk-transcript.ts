@@ -56,7 +56,18 @@ export function subagentMetaFile(transcriptFile: string): string {
 /** The model a subagent's meta.json names: `pickedEffortModel` (the resolved id), else `model`. */
 export function metaModels(raw: string): unknown[] {
   const meta = JSON.parse(raw) as { pickedEffortModel?: unknown; model?: unknown } | null;
-  return [meta?.pickedEffortModel, meta?.model];
+  const model = meta?.model;
+  const picked = meta?.pickedEffortModel;
+  // A spawn-time override is an alias ("fable", "opus"). `pickedEffortModel` is
+  // not always the id that alias resolved to: a "fable" subagent spawned from an
+  // Opus session wrote `pickedEffortModel: "claude-opus-5-5"` and ran on
+  // claude-fable-5-2. Trust it only when it is of the alias's family; otherwise
+  // say nothing, so the transcript's own model is read.
+  if (typeof model === "string" && !model.startsWith("claude-") && model !== "inherit") {
+    if (typeof picked === "string") return picked.includes(model) ? [picked] : [];
+    return [model];
+  }
+  return [picked, model];
 }
 
 /** One part of a tool result's content. Images are counted, never carried. `link`: a `search_result` block's page. */

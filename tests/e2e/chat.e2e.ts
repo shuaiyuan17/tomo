@@ -1110,13 +1110,12 @@ it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read 
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A tick is a receipt." })).toBeVisible();
   await receipt.click();
   await browserExpect(receipt).toContainText("Read by Tomo");
-  const column = (await own.boundingBox())!.width;
-  const short = (await own.locator(".own-bubble").boundingBox())!.width;
-  expect(short).toBeLessThan(column * 0.4);
-  // Receipt sits under the bubble's right edge.
-  const bubbleBox = (await own.locator(".own-bubble .markdown").boundingBox())!;
-  const tick = (await receipt.boundingBox())!;
-  expect(Math.abs(tick.x + tick.width - (bubbleBox.x + bubbleBox.width))).toBeLessThan(2);
+  // A row can be re-rendered (pending → history) between reads: measure in one evaluate, retried.
+  const measure = (row: typeof own) => row.evaluate((el) => {
+    const r = (sel: string) => el.querySelector(sel)!.getBoundingClientRect();
+    return { column: el.getBoundingClientRect().width, bubble: r(".own-bubble").width, text: r(".own-bubble .markdown").right, tick: r(".read-receipt").right };
+  });
+  await browserExpect.poll(async () => { const m = await measure(own); return m.bubble < m.column * 0.4 && Math.abs(m.tick - m.text) < 2; }).toBe(true);
 
   mockSdk.responseFn = () => "ok";
   const long = "long words ".repeat(120).trim();
@@ -1124,8 +1123,5 @@ it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read 
   await page.getByRole("button", { name: "Send", exact: true }).click();
   const longOwn = page.locator("article.message.user").filter({ hasText: "long words long words" }).last();
   await browserExpect(longOwn.locator(".read-receipt")).toHaveAttribute("data-receipt", "read");
-  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "ok" }).last()).toBeVisible();
-  const longWidth = (await longOwn.locator(".own-bubble").boundingBox())!.width;
-  expect(longWidth).toBeLessThanOrEqual(column * 0.85 + 1);
-  expect(longWidth).toBeGreaterThan(column * 0.8);
+  await browserExpect.poll(async () => { const m = await measure(longOwn); return m.bubble <= m.column * 0.85 + 1 && m.bubble > m.column * 0.8; }).toBe(true);
 });

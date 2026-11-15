@@ -66,9 +66,10 @@ function OutputTail({ base, running }: { base: string; running: boolean }) {
     void load();
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
   }, [base, running]);
-  return <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 pl-1">
+  // Inset like the Command card above it (mx-2.5), edge for edge and with its corners.
+  return <div className="min-h-0 flex-1 overflow-y-auto px-2.5">
     {status === "gone" && <Note status="gone" />}
-    {value ? <Terminal output={value.output} size={value.size} /> : status !== "gone" && <Note status={status} />}
+    {value ? <Terminal output={value.output} size={value.size} className="rounded-lg" /> : status !== "gone" && <Note status={status} />}
   </div>;
 }
 
@@ -147,7 +148,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const gone = state.status === "gone";
   return <div ref={scroll} tabIndex={0} aria-label="Subagent transcript" onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
     className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
-    {gone && <p role="status" className="m-0 mb-2 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">This task has left the panel, so nothing more can be loaded. What was read stays here.</p>}
+    {gone && <p role="status" className="m-0 mb-2 ml-1.5 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">This task has left the panel, so nothing more can be loaded. What was read stays here.</p>}
     {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? "Loading…" : "Load earlier"}</Button>}
     {state.unreadable && <UnreadableNote className="mb-2 px-1.5" />}
     {(state.status === "loading" || state.status === "missing" || state.status === "error") && !state.items.length && <Note status={state.status} />}
@@ -155,7 +156,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
     {blocks.map((block, index) => {
       const last = index === blocks.length - 1;
       if (block.kind === "text") return <div key={block.row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div>;
-      if (block.kind === "message") return <div key={block.row.id} className="my-1.5 rounded-xl bg-muted px-3 py-2">
+      if (block.kind === "message") return <div key={block.row.id} className="my-1.5 ml-1.5 rounded-xl bg-muted px-3 py-2">
         <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from {agent}</p>
         <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
       // A group is running only while it is the last block; a todo list for as long as its turn is the last one.

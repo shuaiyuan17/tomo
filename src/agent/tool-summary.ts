@@ -51,6 +51,16 @@ export function toolTitle(name: string, input?: Record<string, unknown>): string
   return summarizeToolInput(name, input);
 }
 
+/**
+ * Whether `toolTitle` is words the model wrote (a Bash call's description, a
+ * subagent's) rather than a command, path or pattern: a reader sets it in
+ * the text face, not monospace.
+ */
+export function toolTitleIsProse(name: string, input?: Record<string, unknown>): boolean {
+  const description = typeof input?.description === "string" ? input.description.trim() : "";
+  return !!description && (name === "Bash" || name === "Agent" || name === "Task");
+}
+
 function describeToolInput(name: string, input?: Record<string, unknown>): string {
   if (!input) return name;
   switch (name) {

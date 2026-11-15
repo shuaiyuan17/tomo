@@ -6,6 +6,7 @@ import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
 import { MessageBody } from "./message-body.js";
 import { findQuoted, parseReply } from "./reply.js";
+import { parseSendMarker, sendMarkerLabel } from "./send-marker.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { PlanUsage } from "./plan-usage.js";
 import { CompactButton } from "./compact-button.js";
@@ -517,9 +518,11 @@ export function App() {
           </>}>
           {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
-            const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
+            const { sent, body: content } = parseSendMarker(message.role, message.content);
+            const { reply, body } = parseReply(content); const quoted = reply && findQuoted(history.messages, index, reply);
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
+              {sent && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{sendMarkerLabel(sent)}</Badge>}
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
             <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
               {message.role === "assistant" && body.trim() === "NO_REPLY"

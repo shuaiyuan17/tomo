@@ -28,8 +28,13 @@ const TOOL_ICONS: Record<string, ComponentType> = {
   Agent: BotIcon, Task: BotIcon, TodoWrite: ListTodoIcon,
   SubagentMessage: MessageSquareTextIcon, BackgroundTask: TerminalIcon,
 };
-/** Rows whose title is a sentence, not a command: a subagent's run, and a background task reporting back. */
-const PROSE_TITLES = new Set(["Agent", "Task", "SubagentMessage", "BackgroundTask"]);
+/**
+ * Rows whose title is a sentence, not a command: a subagent's run, a
+ * background task reporting back, and a web search (its query is words, often
+ * not English). A Bash call the model described says so (`prose`); a command,
+ * path, pattern or URL stays monospace.
+ */
+const PROSE_TITLES = new Set(["Agent", "Task", "SubagentMessage", "BackgroundTask", "WebSearch"]);
 /** What a row's result is called: a subagent hands back a report, a tool returns output. */
 const resultLabel = (name: string, isError: boolean) => isError ? "Error" : name === "SubagentMessage" || name === "Agent" || name === "Task" ? "Report" : "Output";
 const toolIcon = (name: string) => TOOL_ICONS[name] ?? WrenchIcon;
@@ -73,7 +78,7 @@ export function ToolCall({ row, running }: { row: ToolRow; running: boolean }) {
     <TraceCollapsibleTrigger>
       <TraceLine status={status}>
         <TraceIcon><Icon /></TraceIcon>
-        <TraceTitle className={PROSE_TITLES.has(row.name) ? undefined : "font-mono text-[11.5px]"}>{row.summary || row.name}</TraceTitle>
+        <TraceTitle className={row.prose || PROSE_TITLES.has(row.name) ? undefined : "font-mono text-[11.5px]"}>{row.summary || row.name}</TraceTitle>
         {duration && <TraceDescription>{duration}</TraceDescription>}
         <StateText status={status} />
       </TraceLine>

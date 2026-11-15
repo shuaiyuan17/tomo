@@ -5,6 +5,8 @@ import { safeHref } from "./links.js";
 
 export interface ToolRow {
   kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean;
+  /** `summary` is words the model wrote (a Bash description), not a command: set in the text face. */
+  prose?: true;
   /** When the call was made (ms epoch); with the result's, its duration. */
   ts?: number;
   /** The page a WebFetch reads. */
@@ -127,7 +129,7 @@ export function viewRows(items: SubagentItem[]): ViewRow[] {
     } else if (item.kind === "tool") {
       const result = results.get(item.toolUseId);
       rows.push({ kind: "tool", id: item.id, toolUseId: item.toolUseId, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
-        ...(item.ts !== undefined ? { ts: item.ts } : {}), ...(item.sources ? { sources: item.sources } : {}),
+        ...(item.prose ? { prose: true as const } : {}), ...(item.ts !== undefined ? { ts: item.ts } : {}), ...(item.sources ? { sources: item.sources } : {}),
         ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError, ...(result.images ? { images: result.images } : {}),
           ...(result.ts !== undefined ? { ts: result.ts } : {}), ...(result.sources ? { sources: result.sources } : {}) } } : {}) });
     }

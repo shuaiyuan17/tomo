@@ -343,12 +343,49 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   // A message sent while it was busy (queued_command) shows once, as a message.
   await browserExpect(transcript.getByText("Also check the README.")).toHaveCount(1);
   await browserExpect(transcript).toContainText("Message from Tomo");
+  // Its card lines up with the Brief card above, left and right.
+  await browserExpect.poll(() => offset(transcript.getByText("Message from Tomo").locator(".."), page.getByRole("region", { name: "Brief" }))).toEqual([0, 0]);
   await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
   await transcript.getByRole("button", { name: /Read a file, ran a search/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
   await browserExpect(transcript).toContainText("## 0.12.0 entries");
   await page.getByRole("button", { name: "Back to tasks" }).click();
   await browserExpect(page.getByRole("button", { name: /Review the release/ })).toBeVisible();
+});
+
+/** A box's left and right edges, in whole pixels. */
+const edges = (box: ReturnType<Page["locator"]>) => box.evaluate((el) => { const r = el.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.right)]; });
+/** How far `box`'s left and right edges sit from `ref`'s, once the rail has finished sliding in. */
+const offset = async (box: ReturnType<Page["locator"]>, ref: ReturnType<Page["locator"]>) => {
+  const [a, b] = [await edges(box), await edges(ref)];
+  return [a[0] - b[0], a[1] - b[1]];
+};
+
+it("a shell task: its Output card lines up with the Command card above it", async () => {
+  await page.route("**/tasks/b1/command", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ text: "/tmp/merge-seq.sh 2>&1", truncated: false }) }));
+  await page.route("**/tasks/b1/output", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ output: "351 already merged\n352 already merged\n", size: 38 }) }));
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+    { taskId: "b1", taskType: "local_bash", description: "重启后拉起", ambient: false, background: true, startedAt: Date.now() },
+  ] });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await page.getByRole("button", { name: /重启后拉起/ }).click();
+  const command = page.getByRole("region", { name: "Command" });
+  await browserExpect(command).toContainText("/tmp/merge-seq.sh");
+  const output = page.getByText("352 already merged").locator("xpath=ancestor::div[contains(@class,'border')][1]");
+  await browserExpect(output).toBeVisible();
+  await browserExpect.poll(() => offset(output, command)).toEqual([0, 0]);
+  await page.screenshot({ path: "test-results/shell-task.png" });
+});
+
+it("a message Tomo sent on its own carries a label, and no [proactive] marker in its text", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  store.append("dm:owner", { role: "assistant", channel: "imessage", content: "[proactive] 重启好了，可以继续用了。", timestamp: Date.now() - 1_000 });
+  await page.reload();
+  const sent = page.locator("article.message.assistant").filter({ hasText: "重启好了" });
+  await browserExpect(sent).toBeVisible();
+  await browserExpect(sent.locator(".markdown")).toHaveText("重启好了，可以继续用了。");
+  await browserExpect(sent).toContainText("Sent proactively");
+  await browserExpect(page.locator("main")).not.toContainText("[proactive]");
 });
 
 it("an Enter that confirms an IME candidate (Safari order) does not send", async () => {
@@ -549,6 +586,11 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
   expect(await page.content()).not.toContain("supersecret");
   // A command the model described is titled by that description; the command itself is inside.
   await browserExpect(history.getByText("git status")).toHaveCount(0);
+  // Its title is the model's words, in the text face; a command (no description), a path, stay monospace.
+  const titleFont = (name: string | RegExp) => history.getByRole("button", { name }).locator("[data-slot=trace-title]").evaluate((el) => getComputedStyle(el).fontFamily);
+  expect(await titleFont("Check the working tree")).not.toMatch(/mono/i);
+  expect(await titleFont(/gh pr list/)).toMatch(/mono/i);
+  expect(await titleFont(/Read \/repo\/CHANGELOG\.md/)).toMatch(/mono/i);
   await history.getByRole("button", { name: "Check the working tree" }).click();
   await browserExpect(history).toContainText("git status");
   await page.screenshot({ path: "test-results/inline-tools-desktop.png" });

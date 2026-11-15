@@ -122,6 +122,27 @@ function tree(list: WebTask[]): TaskRow[] {
   return rows;
 }
 
+/**
+ * The tree lines of a list of rows drawn top to bottom, given each row's depth. For each row:
+ * `last` — no later sibling, so its own line stops at its elbow; `through` — the shallower
+ * levels (1 … depth-1) whose line passes this row on its way to a later sibling.
+ */
+export interface TreeGuide { last: boolean; through: number[] }
+export function treeGuides(depths: readonly number[]): TreeGuide[] {
+  /** Whether a later row sits at `level` before the list climbs above it. */
+  const continues = (from: number, level: number) => {
+    for (let j = from + 1; j < depths.length; j++) {
+      if (depths[j] < level) return false;
+      if (depths[j] === level) return true;
+    }
+    return false;
+  };
+  return depths.map((depth, i) => ({
+    last: !continues(i, depth),
+    through: Array.from({ length: Math.max(0, depth - 1) }, (_, k) => k + 1).filter((level) => continues(i, level)),
+  }));
+}
+
 /** The topbar badge: running tasks that count as activity (not watchers). */
 export function runningCount(tasks: WebTask[]): number {
   return tasks.filter((task) => task.state === "running" && !task.ambient).length;

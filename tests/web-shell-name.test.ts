@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { shellShortName, shortenPaths, SHORT_NAME_MAX } from "../web/src/shell.js";
+import { isProseDescription, PROSE_LABEL_MAX, shellLabel, shellShortName, shortenPaths, SHORT_NAME_MAX } from "../web/src/shell.js";
 
 describe("shell task short names", () => {
   it.each([
@@ -29,5 +29,36 @@ describe("shell task short names", () => {
     expect(shortenPaths("cat /Users/alex/notes.txt")).toBe("cat ~/notes.txt");
     expect(shortenPaths("cd /Volumes/Claw/worktrees/tomo-shadcn")).toBe("cd …/tomo-shadcn");
     expect(shortenPaths("echo hi")).toBe("echo hi");
+  });
+});
+
+describe("shell task labels", () => {
+  it.each([
+    // A description in words is shown whole: not cut at its first space.
+    ["用 stdin 重跑 codex 审 #539", "用 stdin 重跑 codex 审 #539"],
+    ["重启后拉起", "重启后拉起"],
+    ["Run the e2e suite --watch", "Run the e2e suite --watch"],
+    ["Stream-extract tool calls", "Stream-extract tool calls"],
+    // A command line keeps its short name.
+    ["npm test", "npm test"],
+    ["codex", "codex"],
+    ["cd /tmp && 跑测试.sh", "跑测试.sh"],
+    ["FOO=1 npm test", "npm test"],
+    ["~/.tomo/workspace/scripts/wait-ci.sh ~/Developer/tomo 490", "wait-ci.sh 490"],
+  ])("%s → %s", (description, label) => expect(shellLabel(description)).toBe(label));
+
+  it("tells words from a command", () => {
+    expect(isProseDescription("用 stdin 重跑 codex 审 #539")).toBe(true);
+    expect(isProseDescription("Check CI")).toBe(true);
+    expect(isProseDescription("git status")).toBe(false);
+    expect(isProseDescription("Build | tee log")).toBe(false);
+    expect(isProseDescription("")).toBe(false);
+  });
+
+  it("cuts a long sentence with an ellipsis, on one line", () => {
+    const label = shellLabel(`用   stdin\t${"重跑".repeat(60)}`);
+    expect(label.length).toBe(PROSE_LABEL_MAX);
+    expect(label.endsWith("…")).toBe(true);
+    expect(label.startsWith("用 stdin 重跑")).toBe(true);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTaskView, modelLabel, runningCount, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind } from "../web/src/tasks.js";
+import { buildTaskView, modelLabel, runningCount, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind, treeGuides } from "../web/src/tasks.js";
 import type { WebSession, WebTask } from "../src/web/protocol.js";
 
 const session = (id: string, title: string, kind: "dm" | "group"): WebSession =>
@@ -97,5 +97,27 @@ describe("task panel view", () => {
     const nested = buildTaskView([task("p"), sh("c1", "p", 1), sh("c2", "p", 2)], sessions, false).groups[0].rows;
     const orphaned = buildTaskView([sh("c1", "p", 1), sh("c2", "p", 2)], sessions, false).groups[0].rows;
     expect([nested.at(-1)!.foldKey, orphaned.at(-1)!.foldKey]).toEqual(["p", "p"]);
+  });
+});
+
+describe("treeGuides", () => {
+  it("a last child's line stops at it; a parent's line passes its earlier children's subtrees", () => {
+    // p
+    //   a        (more siblings below: line goes on)
+    //     a1     (a's last child; p's line passes it on the way to b)
+    //   b        (p's last child)
+    // q
+    expect(treeGuides([0, 1, 2, 1, 0])).toEqual([
+      { last: false, through: [] },
+      { last: false, through: [] },
+      { last: true, through: [1] },
+      { last: true, through: [] },
+      { last: true, through: [] },
+    ]);
+  });
+
+  it("a line does not run past a shallower row to a later cousin", () => {
+    expect(treeGuides([0, 1, 0, 1]).map((g) => g.last)).toEqual([false, true, true, true]);
+    expect(treeGuides([])).toEqual([]);
   });
 });

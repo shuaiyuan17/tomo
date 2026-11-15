@@ -2,14 +2,19 @@ import { useEffect, useState } from "react";
 import { api } from "./api.js";
 import { TerminalIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { shellShortName, shortenPaths } from "./shell.js";
+import { isProseDescription, shellLabel, shortenPaths } from "./shell.js";
 
-/** A shell command as a compact pill: terminal icon + short name; the full command in the tooltip. */
+/**
+ * A shell task as a compact pill: terminal icon + its label (shellLabel). A command line is set in
+ * mono by its short name, on one line; a description in words is shown whole, in the text face, as
+ * the trace does, wrapping when the row is narrow.
+ */
 export function ShellPill({ command, className }: { command: string; className?: string }) {
-  return <span className={cn("inline-flex max-w-full min-w-0 items-center gap-1 rounded-md border border-border/80 bg-muted/60 px-1.5 py-px align-middle font-mono text-[11.5px] leading-[18px] font-normal", className)}>
-    <TerminalIcon className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" /><span className="truncate">{shellShortName(command)}</span></span>;
+  const prose = isProseDescription(command);
+  return <span data-shell-label className={cn("inline-flex max-w-full min-w-0 items-center gap-1 rounded-md border border-border/80 bg-muted/60 px-1.5 py-px align-middle leading-[18px] font-normal",
+    prose ? "items-start text-[12px]" : "font-mono text-[11.5px]", className)}>
+    <TerminalIcon data-task-icon="shell" className={cn("size-3 shrink-0 text-muted-foreground", prose && "mt-[3px]")} aria-hidden="true" /><span className={prose ? "min-w-0 [overflow-wrap:anywhere]" : "truncate"}>{shellLabel(command)}</span></span>;
 }
-
 
 /**
  * The full command of a shell task, pinned above its output: fetched on

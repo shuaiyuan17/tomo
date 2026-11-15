@@ -2744,7 +2744,7 @@ export class Agent {
       { name: "check" },
     );
     for (const key of owed) {
-      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn"))
+      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn", "restart"))
         .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }
   }

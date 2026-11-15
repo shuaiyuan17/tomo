@@ -86,7 +86,7 @@ export function PlanUsage({ ready, live }: { ready: boolean;
   return <section className="mt-8 border-t pt-7" aria-labelledby="usage-heading">
     <div className="mb-3 flex items-center justify-between gap-2">
       <p className="eyebrow m-0" id="usage-heading">Plan usage{usage?.plan ? <span className="normal-case tracking-normal"> · {usage.plan}</span> : null}</p>
-      <Button variant="ghost" size="icon" aria-label="Refresh plan usage" title="Refresh" disabled={loading} onClick={() => void load(true)}
+      <Button variant="ghost" size="icon" aria-label="Refresh plan usage" title={usage ? `Refresh · ${updatedLabel(usage.updatedAt, now)}` : "Refresh"} disabled={loading} onClick={() => void load(true)}
         className="-my-1 size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-3.5">
         <RefreshCw className={cn(spinning && "animate-spin")} onAnimationIteration={() => { if (!loading) setSpinning(false); }} strokeWidth={1.75} /></Button>
     </div>
@@ -99,20 +99,18 @@ export function PlanUsage({ ready, live }: { ready: boolean;
       <CollapsibleContent className="mt-2.5 space-y-3">{scoped.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} compact />)}</CollapsibleContent>
     </Collapsible>}
     {notice && <p className={cn("m-0 text-[12px] leading-relaxed text-muted-foreground", main.length && "mt-3")} role="status">{usage?.stale ? `${notice} Showing the last reading.` : notice}</p>}
-    {usage && <p className="m-0 mt-3 text-[12px] text-muted-foreground">{updatedLabel(usage.updatedAt, now)}</p>}
   </section>;
 }
 
 function UsageRow({ title, window, now, compact }: { title: string; window: WebUsage["windows"][number]; now: number; compact?: boolean }) {
   const warn = isWarn(window);
-  const reset = resetLabel(window, now);
+  const reset = resetLabel(window, now)?.replace(/^R/, "r");
   return <div>
     <div className="mb-1.5 flex items-baseline justify-between gap-2">
-      <span className={cn("text-[13px]", compact && "text-[12px]")}>{title}</span>
+      <span className={cn("min-w-0 truncate text-[13px]", compact && "text-[12px]")}>{title}{reset && <span className="ml-2 text-[11px] text-muted-foreground">{reset}</span>}</span>
       <span className={cn("text-[13px] tabular-nums", warn ? "font-medium text-warn" : "text-muted-foreground")}>{window.percent === null ? "—" : `${Math.round(window.percent)}%`}</span>
     </div>
     {window.percent !== null && <Progress max={100} value={Math.min(100, Math.max(0, window.percent))} aria-label={`${title} usage`}
       className={cn("h-1.5 bg-border", warn && "[&>[data-slot=progress-indicator]]:bg-warn")} />}
-    {reset && <p className="m-0 mt-1 text-[11px] text-muted-foreground">{reset}</p>}
   </div>;
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { rewindCount, rewindRefusal, rewoundBy, startsRewind } from "../web/src/rewind.js";
 import type { WebRewindMark } from "../src/web/protocol.js";
 
-const roles = (...list: Array<"user" | "assistant">) => list.map((role) => ({ role }));
+const roles = (...list: Array<"user" | "assistant">) => list.map((role, i) => ({ role, timestamp: (i + 1) * 100 }));
 
 describe("rewind to here: counting and marking", () => {
   it("counts the clicked message and every user message after it; only the owner's own messages can be rewound to", () => {
@@ -12,6 +12,19 @@ describe("rewind to here: counting and marking", () => {
     expect(rewindCount(messages, 3)).toBe(1);
     expect(rewindCount(messages, 1)).toBeNull();
     expect(rewindCount(messages, 9)).toBeNull();
+  });
+
+  it("does not count messages an earlier rewind already removed: they are in the history, not on the model's branch", () => {
+    // user(100) reply(200) user(300, rewound) user(400, rewound) user(500, sent after the rewind)
+    const messages = roles("user", "assistant", "user", "user", "user");
+    const marks: WebRewindMark[] = [{ sessionId: "a", from: 300, at: 450, count: 2 }];
+    const rewound = (timestamp: number) => !!rewoundBy(marks, "a", timestamp);
+    // Without the marks the first message would count 4 and the fork would cut too far back.
+    expect(rewindCount(messages, 0)).toBe(4);
+    expect(rewindCount(messages, 0, rewound)).toBe(2);
+    expect(rewindCount(messages, 4, rewound)).toBe(1);
+    // A message that is itself rewound cannot be rewound to.
+    expect(rewindCount(messages, 2, rewound)).toBeNull();
   });
 
   it("marks the messages a rewind removed, per conversation, and puts one marker line at the first of them", () => {

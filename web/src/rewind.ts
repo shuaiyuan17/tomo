@@ -4,12 +4,18 @@ import type { HistoryMessage, WebRewindMark } from "../../src/web/protocol.js";
 
 /**
  * How many of the conversation's latest user messages a rewind to `index`
- * goes back: that message and every user message after it. Null when the
- * message is not the owner's own.
+ * goes back: that message and every user message after it THAT THE MODEL
+ * STILL HAS. Messages an earlier rewind already removed stay in the history
+ * (the transcript is never rewritten) but are no longer on the SDK's branch,
+ * so counting them would send the fork further back than the message
+ * pointed at. Null when the message is not the owner's own, or is itself
+ * already rewound.
  */
-export function rewindCount(messages: readonly Pick<HistoryMessage, "role">[], index: number): number | null {
-  if (messages[index]?.role !== "user") return null;
-  return messages.slice(index).filter((message) => message.role === "user").length;
+export function rewindCount(messages: readonly Pick<HistoryMessage, "role" | "timestamp">[], index: number,
+  rewound: (timestamp: number) => boolean = () => false): number | null {
+  const target = messages[index];
+  if (target?.role !== "user" || rewound(target.timestamp)) return null;
+  return messages.slice(index).filter((message) => message.role === "user" && !rewound(message.timestamp)).length;
 }
 
 /** The rewind that removed this message from the model's context, if any. */

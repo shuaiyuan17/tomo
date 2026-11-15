@@ -57,6 +57,18 @@ describe("task notifications: a background task reporting back", () => {
     expect(items[1]).toMatchObject({ truncated: true });
   });
 
+  it("in the main chat a report that names memory/private is withheld whole, like the output of a call that reached it", async () => {
+    const { pairOutputs, PRIVATE_HIDDEN } = await import("../src/web/session-tools.js");
+    const scope = { workspaceDir: "/home/owner/.tomo/workspace" };
+    const leaky = toolItemsFromLine(line(NOTICE.replace("Nine tests pass.", "Read memory/private/people/alex.md: Alex prefers email.")), 11, scope);
+    const shown = pairOutputs(leaky);
+    expect(shown[1]).toMatchObject({ kind: "result", output: PRIVATE_HIDDEN });
+    expect(JSON.stringify(shown)).not.toContain("prefers email");
+    expect(JSON.stringify(shown)).not.toContain("privateOutput");
+    // An ordinary report is shown.
+    expect(pairOutputs(toolItemsFromLine(line(NOTICE), 12, scope))[1]).toMatchObject({ output: "The picker is in. Nine tests pass." });
+  });
+
   it("counts in a group as hearing from a subagent, and a subagent's own call is titled by what it was sent to do", () => {
     const rows = viewRows(toolItemsFromLine(line([{ type: "text", text: NOTICE }]), 500)) as ToolRow[];
     expect(groupSummary([rows[0], rows[0]])).toBe("Heard from 2 subagents");

@@ -516,7 +516,7 @@ export function App() {
           {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
             const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
-            const rewound = rewoundBy(web.rewinds, selectedId, message.timestamp); const back = canRewind && !rewound ? rewindCount(history.messages, index) : null;
+            const rewound = rewoundBy(web.rewinds, selectedId, message.timestamp); const back = canRewind && !rewound ? rewindCount(history.messages, index, (timestamp) => !!rewoundBy(web.rewinds, selectedId, timestamp)) : null;
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", "group/message", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
             {startsRewind(web.rewinds, selectedId, history.messages, index) && <div role="separator" className="mb-5 flex items-center gap-3 tracking-[0.02em] text-[11px] text-muted-foreground">
               <span className="h-px flex-1 bg-border" /><Undo2 className="size-3" strokeWidth={1.75} aria-hidden="true" /><span>Rewound from here · no longer in {agent}'s context</span><span className="h-px flex-1 bg-border" /></div>}

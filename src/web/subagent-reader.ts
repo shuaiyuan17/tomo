@@ -115,7 +115,13 @@ function noticeItems(notice: TaskNotice, offset: number, ts: number | undefined,
   const report = clip(notice.text || (notice.status ? `(${notice.status}; no report text)` : "(no report text)"), IO_LIMIT);
   const failed = notice.status === "failed" || notice.status === "killed";
   return [
-    { kind: "tool", id: `${offset}:notice`, toolUseId, name, summary: title, input: "", inputTruncated: false, ...(ts ? { ts } : {}) },
+    // A report is model-written prose with no input to judge by, so the
+    // main chat's private-memory rule looks at the report itself: one that
+    // names memory/private is withheld whole, like the output of a call that
+    // reached it. Best effort, as for Bash: a report can quote private
+    // content without naming where it came from.
+    { kind: "tool", id: `${offset}:notice`, toolUseId, name, summary: title, input: "", inputTruncated: false, ...(ts ? { ts } : {}),
+      ...(redact?.reachesPrivate?.(name, { report: `${notice.name}\n${notice.text}` }) ? { privateOutput: true } : {}) },
     { kind: "result", id: `${offset}:notice-result`, toolUseId, output: redact ? redact.output(report.text) : report.text, truncated: report.truncated, isError: failed, ...(ts ? { ts } : {}) },
   ];
 }

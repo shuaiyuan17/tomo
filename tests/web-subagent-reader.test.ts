@@ -116,7 +116,7 @@ describe("readSubagentPage", () => {
     expect(await readSubagentModel(dir, SDK, "../a1")).toBeUndefined();
   });
 
-  it("prefers the meta.json written at spawn: pickedEffortModel, else model; the transcript is the fallback", async () => {
+  it("prefers the meta.json written at spawn: pickedEffortModel (when of the override's family), else model; the transcript is the fallback", async () => {
     const meta = (id: string, body: unknown) => writeFileSync(join(dir, SDK, "subagents", `agent-${id}.meta.json`), JSON.stringify(body));
     const withModel = (model: string) => JSON.stringify({ type: "assistant", message: { model, content: [] } }) + "\n";
     // Spawned, no assistant entry yet: the meta already knows.
@@ -133,6 +133,14 @@ describe("readSubagentPage", () => {
     expect(await readSubagentModel(dir, SDK, "m3")).toBe("claude-fable-5-2");
     meta("m3", { pickedEffortModel: "x".repeat(70) });
     expect(await readSubagentModel(dir, SDK, "m3")).toBe("claude-fable-5-2");
+    // A "fable" override spawned from an Opus session: the meta's picked id is the
+    // parent's, not the run's. The transcript says what it ran on; until it has an
+    // assistant entry, nothing (the board retries) rather than the wrong model.
+    meta("m4", { agentType: "general-purpose", model: "fable", pickedEffortModel: "claude-opus-5-5" });
+    writeFileSync(file("m4"), line("user", [{ type: "text", text: "prompt" }]));
+    expect(await readSubagentModel(dir, SDK, "m4")).toBeUndefined();
+    writeFileSync(file("m4"), withModel("claude-fable-5-2"));
+    expect(await readSubagentModel(dir, SDK, "m4")).toBe("claude-fable-5-2");
   });
 
   it("the brief is the first entry only (string or text blocks), clipped; later user text is a message", async () => {

@@ -438,6 +438,16 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toBeVisible();
   // The overlay covers the window: no row or scroller contains it (paint/layout containment would).
   expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => { const r = el.getBoundingClientRect(); return [r.width === innerWidth, r.height === innerHeight]; })).toEqual([true, true]);
+  // Nor is it clipped by an ancestor's mask or clip-path (a mask on the scroller once hid its backdrop and Close button).
+  expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => {
+    const clipped: string[] = [];
+    for (let a = el.parentElement; a; a = a.parentElement) {
+      const cs = getComputedStyle(a) as CSSStyleDeclaration & { webkitMaskImage?: string };
+      if ((cs.maskImage && cs.maskImage !== "none") || (cs.webkitMaskImage && cs.webkitMaskImage !== "none") || cs.clipPath !== "none") clipped.push(a.tagName);
+    }
+    return clipped;
+  })).toEqual([]);
+  await browserExpect(page.getByRole("button", { name: "Close image" })).toBeInViewport();
   await page.keyboard.press("Escape");
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toHaveCount(0);
 });
@@ -766,6 +776,28 @@ it("opens at the last turn; a sent message (a tall picture too) is just fully sh
   // The scroller sets its spacer through the DOM: no <style> element, nothing the CSP refused.
   expect(await page.evaluate(() => [document.querySelectorAll("style").length, (window as unknown as { cspViolations: string[] }).cspViolations])).toEqual([0, []]);
 });
+
+for (const [label, olderDay] of [["the same day", 0], ["an earlier day", 86_400_000]] as const) {
+  it(`Load earlier does not move the first shown message when the earlier page ends on ${label} (day dividers never sit at a row's top)`, async () => {
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const t = Date.now() - 600_000;
+    // The first page shows messages 30..129; "Load earlier" brings 0..29.
+    for (let i = 0; i < 130; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Message ${i}\n\nwith a second paragraph`, timestamp: t + i * 1_000 - (i < 30 ? olderDay : 0) });
+    await page.reload();
+    const history = page.getByLabel("Conversation history");
+    const earlier = page.getByRole("button", { name: "Load earlier messages" });
+    await browserExpect(earlier).toBeVisible();
+    await history.hover();
+    await browserExpect.poll(async () => { await page.mouse.wheel(0, -20_000); return history.evaluate((el) => el.scrollTop); }).toBe(0);
+    const article = history.locator("article.message").filter({ hasText: /^.*Message 30\b/ }).first();
+    const top = () => article.evaluate((el) => Math.round(el.getBoundingClientRect().top));
+    const before = await top();
+    await earlier.click();
+    await browserExpect(history).toContainText("Message 0");
+    await page.waitForTimeout(300);
+    expect(Math.abs(await top() - before)).toBeLessThanOrEqual(1);
+  });
+}
 
 it("Load earlier keeps the reader's place, and a row growing above the view does not move it", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);

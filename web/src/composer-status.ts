@@ -23,7 +23,7 @@ export function requestStamp(latest: WebRequest | undefined): string {
 }
 
 /** A one-off note from the page (sending, a refusal, a failed check), and the request stamp it was written at. */
-/** `warn`: the note says something went wrong (shown in the warning colour). */
+/** `warn`: the note says something failed (shown in the destructive colour, `text-destructive`). */
 export interface ComposerNote { text: string; at: string; warn?: boolean }
 
 /** A turn status as the page holds it: `at` is when it arrived (local clock). */
@@ -151,7 +151,7 @@ const PROBLEM_STATES = new Set<WebRequest["state"]>(["failed", "refused", "unkno
 
 /**
  * Whether the line composerStatus shows for the same input reports a
- * problem (in the warning colour): a note written as a warning, a typed
+ * problem (shown in the destructive colour): a note marked `warn`, a typed
  * error or an unanswered refusal, or a failed / refused / unknown /
  * interrupted request. Progress, "Stopped" and "Completed" never are.
  */

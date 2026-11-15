@@ -225,11 +225,9 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
 
-/* The conversation softens into the composer instead of a hard cut (the viewport's bottom padding keeps the last line clear of it). */
-.chat-fade { mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent); }
-
 /* Everything clickable in the conversation and composer says so (Tailwind v4 buttons default to the arrow). */
-#conversation button:not(:disabled) { cursor: pointer; }
+/* Not while the Tasks rail is being dragged: its col-resize cursor must win over a button under the pointer. */
+body:not(.rail-resizing) #conversation button:not(:disabled) { cursor: pointer; }
 
 /* Dragging the Tasks rail's edge: one cursor everywhere, no text selection. */
 body.rail-resizing { cursor: col-resize; user-select: none; }

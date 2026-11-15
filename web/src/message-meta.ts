@@ -50,15 +50,25 @@ export function dividerBefore(previous: number | undefined, current: number, now
   return dayLabel(current, now, locale);
 }
 
+/** A scroller row's time: `late` rows (pending / live, always rendered after the history) never date earlier than the row before them. */
+export interface DayStamp { at?: number; late?: boolean }
+
 /**
- * Dividers for a timeline whose entries are messages (a timestamp) or tool
- * runs (undefined). A tool run belongs to the day of the message it leads
- * into, so a divider never lands between a run and its reply; trailing runs
- * take `now`.
+ * Day labels for the chat's rows, placed so no row ever changes at its top
+ * (rows may only grow at their ends; see chat-rows.ts):
+ * `first` names the first row's day and sits above the rows (outside them);
+ * `after[i]` is the divider at the END of row i, naming the day row i+1 starts.
+ * A row without a time takes the next timed row's day (else `now`). A late
+ * row (an old interrupted request is kept, and shown, after newer history)
+ * is moved up to the previous row's day instead of announcing an earlier one.
  */
-export function dayDividers(stamps: readonly (number | undefined)[], now = Date.now(), locale?: string): (string | null)[] {
+export function dayDividers(stamps: readonly DayStamp[], now = Date.now(), locale?: string): { first: string | null; after: (string | null)[] } {
   const days = new Array<number>(stamps.length);
   let upcoming = now;
-  for (let i = stamps.length - 1; i >= 0; i--) { upcoming = stamps[i] ?? upcoming; days[i] = upcoming; }
-  return days.map((day, i) => dividerBefore(i ? days[i - 1] : undefined, day, now, locale));
+  for (let i = stamps.length - 1; i >= 0; i--) { upcoming = stamps[i].at ?? upcoming; days[i] = upcoming; }
+  for (let i = 1; i < days.length; i++) if (stamps[i].late && days[i] < days[i - 1]) days[i] = days[i - 1];
+  return {
+    first: days.length ? dayLabel(days[0], now, locale) : null,
+    after: days.map((day, i) => i + 1 < days.length && differentDay(day, days[i + 1]) ? dayLabel(days[i + 1], now, locale) : null),
+  };
 }

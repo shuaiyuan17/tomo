@@ -325,7 +325,7 @@ export function App() {
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
           : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
           : err.code === "owner_dm_only" ? "Group conversations are read-only."
-          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.", true);
+          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.", err.code !== "owner_dm_only");
       } else setFeedback(labels.unknown, true);
     } finally { setSending(false); }
   };
@@ -418,7 +418,7 @@ export function App() {
   // Rows of the scroller (see chat-rows.ts); the running turn's calls and reply ride in the last one.
   const rows = chatRows(timeline.entries, pendingUsers, timeline.trailing.length > 0 || blocks.length > 0);
   // A day divider rides at the top of the row it introduces (rows only grow at their ends; see chat-rows.ts).
-  const dividers = dayDividers(rows.map((row) => row.kind === "message" ? row.message.timestamp : row.kind === "pending" ? row.request.timestamp : undefined));
+  const dividers = dayDividers(rows.map((row) => row.kind === "message" ? { at: row.message.timestamp } : { at: row.kind === "pending" ? row.request.timestamp : undefined, late: true }));
   useEffect(() => { stamp.current = requestStamp(latest); });
   // The status line counts a running tool's seconds itself between the daemon's reports.
   const turn = web.turns[selectedId];
@@ -555,8 +555,10 @@ export function App() {
           {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">History is unavailable. <Button variant="outline" size="sm" className="rounded-lg" onClick={() => setReload((r) => r + 1)}>Try again</Button></div>}
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
+          {/* The first shown row's day, outside the rows: on "Load earlier" only its text changes. */}
+          {dividers.first && <DayDivider label={dividers.first} />}
           </>}>
-          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{dividers[rowIndex] && <DayDivider label={dividers[rowIndex]!} />}{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
+          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
             const { sent, body: content } = parseSendMarker(message.role, message.content);
             const { reply, body } = parseReply(content); const quoted = reply && findQuoted(history.messages, index, reply);
@@ -583,7 +585,9 @@ export function App() {
           {rowIndex === rows.length - 1 && <>
           {timeline.trailing.map((block) => toolBlock(block, turnActive))}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} thinking="block" /></div></article>)}
-          </>}</ChatRow>)}
+          </>}
+          {/* A change of day: at the END of the earlier row, so no row ever changes at its top. */}
+          {dividers.after[rowIndex] && <DayDivider label={dividers.after[rowIndex]!} />}</ChatRow>)}
         </ChatScroller>
         <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-baseline gap-3 pb-2">
           <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0", composerStatusIsProblem(statusInput) && "text-destructive")} role="status" aria-live="polite">{composerStatus(statusInput)}</div>

@@ -87,7 +87,7 @@ function Frame({ keys, lastRowId, busy, top, handle, children }: Parameters<type
   const touchY = useRef<number | null>(null);
   const count = unseen.size;
   return <MessageScroller className="-mr-4 min-h-0 w-auto flex-1 self-stretch max-[600px]:-mr-2">
-    <MessageScrollerViewport ref={viewport} aria-label="Conversation history" className="chat-fade pt-2 pr-4 pb-6 max-[600px]:pr-2"
+    <MessageScrollerViewport ref={viewport} aria-label="Conversation history" className="pt-2 pr-4 pb-6 max-[600px]:pr-2"
       onPointerDown={(e) => { dragging.current = e.target === e.currentTarget; }} onPointerUp={() => { dragging.current = false; }}
       onWheel={(e) => { if (e.deltaY > 0) refollow(e.currentTarget); }}
       onKeyDown={(e) => { if (DOWN_KEYS.has(e.key) && !(e.key === " " && e.shiftKey)) refollow(e.currentTarget); }}
@@ -97,6 +97,9 @@ function Frame({ keys, lastRowId, busy, top, handle, children }: Parameters<type
       {top}
       <MessageScrollerContent aria-busy={busy} className="min-h-0 gap-0"><Anchors.Provider value={opening.current ?? NONE}>{children}</Anchors.Provider></MessageScrollerContent>
     </MessageScrollerViewport>
+    {/* The history softens into the composer: an overlay beside the viewport, never a mask on it (an
+        ancestor's mask clips fixed descendants such as the image Lightbox). It leaves the scrollbar gutter alone. */}
+    <div aria-hidden="true" data-slot="chat-fade" className="pointer-events-none absolute right-4 bottom-0 left-0 h-5 bg-linear-to-b from-transparent to-background max-[600px]:right-2" />
     <JumpToLatest visible={jumpVisible({ canScrollEnd: end, lastRowVisible: !lastRowId || visibleMessageIds.includes(lastRowId), unseen: count })} unseen={count} onJump={jump} />
   </MessageScroller>;
 }

@@ -83,3 +83,21 @@ export function dismissAfterAcceptedSend(resend: Resend | null, sent: string, se
   if (!resend.original.trim() && resend.imageKeys?.some((key) => sentKeys.includes(key))) return resend.requestId;
   return null;
 }
+
+/**
+ * The read receipt under one of the owner's own messages, by requestId:
+ * "queued" while it waits behind the running turn, "sent" once handed over,
+ * "read" when the agent's turn has consumed it. A message with no request
+ * this page knows (history, a reload after the daemon restarted) counts as
+ * read. A request that did not end cleanly shows no receipt (its own badge
+ * says what happened). An SDK too old to report reads leaves a sent message
+ * at "sent".
+ */
+export type ReadReceipt = "queued" | "sent" | "read";
+export function readReceipt(requestId: string | undefined, requests: WebRequest[]): ReadReceipt | undefined {
+  if (!requestId) return undefined;
+  const request = requests.find((r) => r.requestId === requestId);
+  if (!request || request.read) return "read";
+  if (request.state === "queued") return request.joined ? "sent" : "queued";
+  return request.state === "running" || request.state === "completed" ? "sent" : undefined;
+}

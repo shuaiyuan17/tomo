@@ -70,8 +70,15 @@ export function isResendOf(original: string, sent: string): boolean {
  * `imageKeys` / `fileKeys`: the tray items its images / files were re-attached
  * as (a message without text is a resend by these). `restoring`: its images
  * are still being read back — not sendable yet, and never counted as the resend.
+ * `expected`: how many attachments the ORIGINAL had (images + files) — the
+ * resend counts only if every one of them came back and was sent.
  */
-export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[]; restoring?: boolean }
+export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[]; restoring?: boolean; expected?: number }
+/** Attachments of the original that did not make it back into the tray (a failed read, a full tray). */
+export function missingAttachments(resend: Resend | null): number {
+  if (!resend || resend.restoring) return 0;
+  return Math.max(0, (resend.expected ?? 0) - attachedKeys(resend).length);
+}
 const attachedKeys = (resend: Resend) => [...(resend.imageKeys ?? []), ...(resend.fileKeys ?? [])];
 /** Clearing the composer cancels a resend; editing it does not (nor does an image-only one's empty draft). */
 export function resendAfterDraftChange(resend: Resend | null, draft: string): Resend | null {
@@ -86,6 +93,8 @@ export function resendAfterDraftChange(resend: Resend | null, draft: string): Re
  */
 export function dismissAfterAcceptedSend(resend: Resend | null, sent: string, sentKeys: readonly string[] = []): string | null {
   if (!resend || resend.restoring) return null;
+  // Judged against the original's attachments, not what happened to come back.
+  if (missingAttachments(resend) > 0) return null;
   if (!attachedKeys(resend).every((key) => sentKeys.includes(key))) return null;
   if (isResendOf(resend.original, sent)) return resend.requestId;
   if (!resend.original.trim() && attachedKeys(resend).some((key) => sentKeys.includes(key))) return resend.requestId;

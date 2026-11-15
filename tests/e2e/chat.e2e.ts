@@ -1108,6 +1108,31 @@ it("Resend of an image + file message: Send stays off until its image is back, t
   for (const finish of finishes) finish("done");
 });
 
+it("Resend where an image cannot be read back: says so, and sending keeps the original queued", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const finishes: Array<(value: string) => void> = [];
+  mockSdk.responseFn = () => new Promise<string>((resolve) => { finishes.push(resolve); });
+  const bodies: Array<{ requestId: string }> = [];
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) bodies.push(JSON.parse(request.postData() ?? "{}")); });
+  const tray = page.getByRole("list", { name: "Attachments" });
+  await page.locator("input[type=file]").setInputFiles([{ name: "pic.png", mimeType: "image/png", buffer: png }, { name: "notes.md", mimeType: "text/markdown", buffer: Buffer.from("# n\n") }]);
+  await browserExpect(tray.getByRole("listitem", { name: /attached$/ })).toHaveCount(2);
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("both again");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => bodies.length && channel.request(bodies[0].requestId).state).toBe("running");
+  (channel as unknown as { state(id: string, state: string): void }).state(bodies[0].requestId, "interrupted");
+  await page.route("**/api/v1/sessions/*/media**", (route) => route.fulfill({ status: 404, body: "{}" }));
+  await page.getByRole("button", { name: "Resend…" }).click();
+  await browserExpect(page.getByText("1 attachment could not be restored", { exact: false })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(1);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => bodies.length).toBe(2);
+  await browserExpect.poll(() => channel.request(bodies[1].requestId).state).not.toBe("unknown");
+  // Not dismissed: the original is still awaiting the owner.
+  expect(channel.request(bodies[0].requestId)).toMatchObject({ state: "interrupted", text: "both again" });
+  for (const finish of finishes) finish("done");
+});
+
 it("a thinking block in history reads as a folded, quiet Thinking row; the reply stays the reply", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   const t = Date.now() - 60_000;

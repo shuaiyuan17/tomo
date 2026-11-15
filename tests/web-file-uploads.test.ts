@@ -16,7 +16,7 @@ import { webSessionId } from "../src/web/owner.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import { splitAttachments } from "../web/src/attachments.js";
 import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, type Attachment } from "../web/src/uploads.js";
-import { dismissAfterAcceptedSend, resendAfterDraftChange } from "../web/src/pending.js";
+import { dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange } from "../web/src/pending.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 const MD = Buffer.from("# Notes\n\n- one\n- two\n");
@@ -186,6 +186,26 @@ describe("a message with a file (web channel)", () => {
     const restored = { ...restoring, imageKeys: ["i1"], restoring: false };
     expect(dismissAfterAcceptedSend(restored, "see both", ["f1"])).toBeNull();
     expect(dismissAfterAcceptedSend(restored, "see both", ["f1", "i1"])).toBe("orig");
+  });
+  it("judged against the ORIGINAL's attachments: an image that failed to read back keeps the original queued", () => {
+    // Original: one image + one file. The file came back; the image read failed (no key for it).
+    const resend = { requestId: "orig", original: "both", fileKeys: ["f1"], imageKeys: [], restoring: false, expected: 2 };
+    expect(missingAttachments(resend)).toBe(1);
+    expect(dismissAfterAcceptedSend(resend, "both", ["f1"])).toBeNull();
+    expect(dismissAfterAcceptedSend({ ...resend, original: "" }, "", ["f1"])).toBeNull();
+  });
+  it("a full tray that took only some of the original's images keeps the original queued", () => {
+    let n = 0;
+    const make = (f: File): Attachment => ({ key: `k${n++}`, file: f, preview: "", status: "uploading", progress: 0 });
+    const full: Attachment[] = Array.from({ length: 5 }, (_, i) => make({ name: `x${i}.png`, type: "image/png", size: 1 } as File));
+    const back = [1, 2, 3].map((i) => ({ name: `p${i}.png`, type: "image/png", size: 1 }) as File);
+    const { added } = addFiles(full, back, make);
+    expect(added).toHaveLength(1);
+    const resend = { requestId: "orig", original: "three pictures", imageKeys: added.map((item) => item.key), restoring: false, expected: 3 };
+    expect(missingAttachments(resend)).toBe(2);
+    expect(dismissAfterAcceptedSend(resend, "three pictures", [...full.map((item) => item.key), ...resend.imageKeys])).toBeNull();
+    // All back and all sent: then, and only then, it counts.
+    expect(dismissAfterAcceptedSend({ ...resend, imageKeys: ["a", "b", "c"] }, "three pictures", ["a", "b", "c"])).toBe("orig");
   });
   it("refiled never names an arbitrary path: only files an interrupted request filed, still present", async () => {
     const { channel, handled, request } = await interrupted("x", "n.md");

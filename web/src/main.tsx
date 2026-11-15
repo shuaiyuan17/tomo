@@ -17,7 +17,7 @@ import { runningCount } from "./tasks.js";
 import { ArrowUp, FileIcon, ImagePlus, Plus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
-import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
+import { awaitingOwner, dismissAfterAcceptedSend, missingAttachments, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { ReadReceiptMark } from "./read-receipt.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -61,6 +61,10 @@ function parsedMessages(messages: HistoryPage["messages"]) {
 
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
+/** A resend that could not bring all of the original's attachments back (a failed read, a full tray). */
+const missingNote = (missing: number) =>
+  `${missing} attachment${missing === 1 ? "" : "s"} could not be restored. The interrupted message stays queued; attach ${missing === 1 ? "it" : "them"} again or dismiss it yourself.`;
+
 const refusalReasons: Record<string, string> = {
   interrupted_backlog: "Not sent: messages interrupted by restarts are waiting for you above. Resend or dismiss them first; your draft is kept.",
   journal_unavailable: "Not sent: Tomo cannot read its record of browser messages, so it is not taking new ones. Check the daemon log; your draft is kept.",
@@ -418,7 +422,7 @@ export function App() {
       } else setFeedback(labels.unknown, true);
     } finally { setSending(false); }
   };
-  const reattach = async (paths: string[]) => {
+  const reattach = async (paths: string[], restored: { fileKeys: string[]; expected: number }) => {
     // Every read settles (allSettled-style: each one catches) before the tray or the resend changes.
     const files = await Promise.all(paths.map(async (path, i) => {
       try {
@@ -432,7 +436,9 @@ export function App() {
     const keys = attachments.add(found);
     // Restored: only now may it be sent (and only now can it count as the resend).
     setResending((old) => old && { ...old, imageKeys: keys, restoring: false });
-    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.", true);
+    // A failed read or a full tray: the original stays queued (missingAttachments), and the owner is told.
+    const missing = missingAttachments({ requestId: "", original: "", imageKeys: keys, fileKeys: restored.fileKeys, expected: restored.expected });
+    if (missing) setFeedback(missingNote(missing), true);
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
@@ -449,11 +455,12 @@ export function App() {
     // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
     const fileKeys = request.files?.length ? attachments.addFiled(request.files) : [];
     const restoringImages = !!request.images?.length;
-    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}) });
+    const expected = (request.images?.length ?? 0) + (request.files?.length ?? 0);
+    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}) });
     setDraft(request.text ?? ""); input.current?.focus();
     // Its images come back too: read from where they were filed, attached (uploaded) again.
     // Until every one is back, Send stays off — a send now would leave them behind.
-    if (restoringImages) void reattach(request.images!);
+    if (restoringImages) void reattach(request.images!, { fileKeys, expected });
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
@@ -737,7 +744,8 @@ export function App() {
             <Sparkles className="size-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span className="truncate">{suggestion}</span></button>}
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
-            <span role="status">{restoring ? "Restoring attachments…" : "The original is dismissed once this one is accepted."}</span>
+            <span role="status" className={cn(missingAttachments(resending) > 0 && "text-destructive")}>{restoring ? "Restoring attachments…"
+              : missingAttachments(resending) > 0 ? missingNote(missingAttachments(resending)) : "The original is dismissed once this one is accepted."}</span>
             <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
           {attachments.items.length > 0 && <ul aria-label={filesOn ? "Attachments" : "Attached images"} className="m-0 mb-2 flex list-none flex-wrap gap-2 p-0">
             {attachments.items.map((item, index) => item.kind === "file" ? <li key={item.key} aria-label={attachmentLabel(item, index)} data-kind="file"

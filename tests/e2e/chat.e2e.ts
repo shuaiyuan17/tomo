@@ -124,8 +124,9 @@ it("the Tasks rail resizes from its edge: keyboard, drag (one resize on release)
   await browserExpect(handle).toHaveAttribute("aria-valuenow", "500");
   expect(await width()).toBe(500);
 
+  // The rail's open state is remembered too: after a reload it is already open (a click here would close it).
   await page.reload();
-  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(rail).toHaveAttribute("data-state", "open");
   await browserExpect(page.getByRole("separator", { name: "Resize the Tasks panel" })).toHaveAttribute("aria-valuenow", "500");
   expect(await width()).toBe(500);
 

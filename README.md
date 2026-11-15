@@ -295,6 +295,7 @@ Structured logs via [pino](https://github.com/pinojs/pino):
     pet.json                  # Virtual pet state
     summons.json              # Active group summons
     usage/YYYY-MM.ndjson      # Usage ledger: estimated cost and tokens per turn, per model
+    usage/backfill.ndjson     # History from before the ledger started (`tomo usage backfill`)
   logs/
     tomo.log                  # Daemon logs
 ```

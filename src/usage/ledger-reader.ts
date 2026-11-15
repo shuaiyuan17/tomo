@@ -1,6 +1,6 @@
 import { closeSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { LEDGER_FILE_RE, usageCategory, type UsageCategory, type UsageLedgerRow, type UsageSource } from "./ledger.js";
+import { BACKFILL_FILE, LEDGER_FILE_RE, readLedgerStarted, usageCategory, type UsageCategory, type UsageLedgerRow, type UsageSource } from "./ledger.js";
 
 /**
  * What the Cost page needs of a ledger row: the row minus its snapshot (the
@@ -87,13 +87,28 @@ export class LedgerReader {
   /** Rows of the month files named (see `files`); unreadable files read as empty. */
   rows(files: readonly string[]): CostRow[][] {
     const present = new Set(this.files());
-    for (const key of this.cache.keys()) if (!present.has(key)) this.cache.delete(key);
+    for (const key of this.cache.keys()) if (!present.has(key) && key !== BACKFILL_FILE) this.cache.delete(key);
     const out = files.map((file) => (present.has(file) ? this.read(file) : []));
     for (const key of this.cache.keys()) {
       if (this.cache.size <= Math.max(this.maxFiles, files.length)) break;
       this.cache.delete(key);
     }
     return out;
+  }
+
+  /**
+   * The rows of `backfill.ndjson` that are history: before the ledger's
+   * start marker. Anything at or after it is the live ledger's (a turn whose
+   * row failed to land has its cost on the next live row), so it is dropped
+   * here even if a backfill wrote it; without a marker there is no history to
+   * add. The file is replaced whole on each backfill, so the cache reads it
+   * again then.
+   */
+  backfillRows(): CostRow[] {
+    const startedAt = readLedgerStarted(this.dir);
+    if (startedAt === undefined) return [];
+    const rows = this.read(BACKFILL_FILE);
+    return rows.every((row) => row.ts < startedAt) ? rows : rows.filter((row) => row.ts < startedAt);
   }
 
   private read(file: string): CostRow[] {

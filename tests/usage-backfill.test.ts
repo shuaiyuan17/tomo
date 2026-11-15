@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityFiles, backfillUsage, rowsFromActivity } from "../src/usage/backfill.js";
-import { ledgerFileName } from "../src/usage/ledger.js";
+import { promisify } from "node:util";
+import { acquireBackfillLock, activityFiles, BackfillError, backfillUsage, BACKFILL_LOCK_FILE, rowsFromActivity } from "../src/usage/backfill.js";
+import { BACKFILL_FILE, LEDGER_STARTED_FILE, ledgerFileName, writeLedgerStarted, type UsageLedgerRow } from "../src/usage/ledger.js";
+import { LedgerReader } from "../src/usage/ledger-reader.js";
+import { buildCostReport } from "../src/usage/cost-report.js";
 
 const LA = "America/Los_Angeles";
 const at = (iso: string) => Date.parse(iso);
@@ -85,40 +89,111 @@ describe("backfillUsage", () => {
   });
   afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
-  const snapshotDir = () => Object.fromEntries(readdirSync(usage).sort().map((f) => [f, readFileSync(join(usage, f), "utf8")]));
+  const run = (dryRun = false) => backfillUsage({ logsDir: logs, usageDir: usage, timeZone: LA, dryRun });
+  /** The ledger started after everything in the activity log. */
+  const startedLate = () => writeLedgerStarted(usage, at("2026-11-15T00:00:00-08:00"));
+  const listing = () => readdirSync(usage).sort();
 
   it("reads rotated files oldest first", () => {
     expect(activityFiles(logs).map((f) => f.slice(logs.length + 1))).toEqual(["activity.ndjson.1", "activity.ndjson"]);
   });
 
-  it("dry run reports and writes nothing", async () => {
-    const report = await backfillUsage({ logsDir: logs, usageDir: usage, timeZone: LA, dryRun: true });
-    expect(report).toMatchObject({ found: 5, written: 5, days: 2, firstDay: "2026-09-22", lastDay: "2026-09-23", overcountedDays: 1, costUsd: 307.75 });
+  it("refuses when the ledger never started (no marker), dry run included", () => {
+    expect(() => run(true)).toThrow(BackfillError);
+    expect(() => run()).toThrow(/never started/);
     expect(existsSync(usage)).toBe(false);
   });
 
-  it("is idempotent: a second run writes nothing and leaves the files byte for byte", async () => {
-    const first = await backfillUsage({ logsDir: logs, usageDir: usage, timeZone: LA, dryRun: false });
-    expect(first.written).toBe(5);
-    const files = snapshotDir();
-    expect(Object.keys(files)).toEqual([...new Set([ledgerFileName(at("2026-09-22T10:00:00-07:00")), ledgerFileName(at("2026-09-23T12:00:00-07:00"))])]);
-    expect(statSync(join(usage, Object.keys(files)[0])).mode & 0o777).toBe(0o600);
-
-    const second = await backfillUsage({ logsDir: logs, usageDir: usage, timeZone: LA, dryRun: false });
-    expect(second).toMatchObject({ found: 5, alreadyThere: 5, written: 0 });
-    expect(snapshotDir()).toEqual(files);
-    const third = await backfillUsage({ logsDir: logs, usageDir: usage, timeZone: LA, dryRun: true });
-    expect(third.written).toBe(0);
+  it("dry run reports and writes nothing", () => {
+    startedLate();
+    const report = run(true);
+    expect(report).toMatchObject({ found: 5, afterStart: 0, written: 5, days: 2, firstDay: "2026-09-22", lastDay: "2026-09-23", overcountedDays: 1, costUsd: 307.75, replaced: false });
+    expect(listing()).toEqual([LEDGER_STARTED_FILE]);
   });
 
-  it("writes nothing at or after the ledger's first live row", async () => {
-    const live = { v: 1, ts: at("2026-09-23T12:00:00-07:00"), sessionKey: "dm:owner", source: "owner", costUsd: 9, tokens: { input: 1, output: 1, cacheRead: 1, cacheCreated: 1 } };
-    mkdirSync(usage, { recursive: true });
-    writeFileSync(join(usage, ledgerFileName(live.ts)), JSON.stringify(live) + "\n");
-    const report = await backfillUsage({ logsDir: logs, usageDir: usage, timeZone: LA, dryRun: false });
-    expect(report).toMatchObject({ found: 5, afterLedger: 2, written: 3, ledgerStartsAt: live.ts });
-    const lines = Object.values(snapshotDir()).join("").trim().split("\n").map((l) => JSON.parse(l) as { ts: number; backfilled?: boolean });
-    expect(lines.filter((l) => l.backfilled).every((l) => l.ts < live.ts)).toBe(true);
-    expect(lines.filter((l) => !l.backfilled)).toHaveLength(1);
+  it("writes its own file, whole, owner-only; a second run replaces it with the same bytes", () => {
+    startedLate();
+    expect(run()).toMatchObject({ written: 5, replaced: false });
+    const path = join(usage, BACKFILL_FILE);
+    const first = readFileSync(path, "utf8");
+    expect(first.trim().split("\n")).toHaveLength(5);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(statSync(usage).mode & 0o777).toBe(0o700);
+    const inode = statSync(path).ino;
+
+    expect(run()).toMatchObject({ written: 5, replaced: true });
+    expect(readFileSync(path, "utf8")).toBe(first);
+    // Replaced by rename, not rewritten in place; no month file, temp or lock left.
+    expect(statSync(path).ino).not.toBe(inode);
+    expect(listing()).toEqual([BACKFILL_FILE, LEDGER_STARTED_FILE]);
+  });
+
+  it("one backfill at a time: a second one refuses while the lock is held, a dead holder's lock is cleared", async () => {
+    startedLate();
+    const release = acquireBackfillLock(usage);
+    expect(() => acquireBackfillLock(usage)).toThrow(new RegExp(`Another backfill is running \\(pid ${process.pid}\\)`));
+    expect(() => run()).toThrow(BackfillError);
+    expect(existsSync(join(usage, BACKFILL_FILE))).toBe(false);
+    release();
+    expect(run().written).toBe(5);
+
+    // A lock left by a run that died.
+    const child = spawn(process.execPath, ["-e", ""]);
+    await new Promise((resolve) => child.on("exit", resolve));
+    writeFileSync(join(usage, BACKFILL_LOCK_FILE), `${child.pid}\n`);
+    expect(run().written).toBe(5);
+    expect(existsSync(join(usage, BACKFILL_LOCK_FILE))).toBe(false);
+  });
+
+  it("the CLI exits 1 with the reason while another backfill holds the lock", async () => {
+    startedLate();
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"]);
+    try {
+      writeFileSync(join(usage, BACKFILL_LOCK_FILE), `${holder.pid}\n`);
+      const cli = promisify(execFile)(process.execPath, ["--import", "tsx", "src/cli.ts", "usage", "backfill", "--logs-dir", logs, "--usage-dir", usage, "--timezone", LA]);
+      await expect(cli).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining(`Another backfill is running (pid ${holder.pid})`) });
+      expect(existsSync(join(usage, BACKFILL_FILE))).toBe(false);
+    } finally {
+      holder.kill();
+    }
+  }, 30_000);
+
+  it("stops at the ledger's start marker, so a live row carrying a failed row's cost is not counted twice", () => {
+    // The ledger started between the cron turn and the system turn. The
+    // system turn's row failed to land; the next live row of that session
+    // carries its cost (0.25 + 22.5). The group turn landed on its own.
+    writeLedgerStarted(usage, at("2026-09-23T06:00:30-07:00"));
+    const live: UsageLedgerRow[] = [
+      { v: 1, ts: at("2026-09-23T12:00:01-07:00"), sessionKey: "imessage:any;+;g1", source: "group", costUsd: 1.5, tokens: { input: 1, output: 1, cacheRead: 1, cacheCreated: 1 } },
+      { v: 1, ts: at("2026-09-23T12:00:05-07:00"), sessionKey: "dm:owner", source: "background", costUsd: 22.75, tokens: { input: 1, output: 1, cacheRead: 1, cacheCreated: 1 } },
+    ];
+    writeFileSync(join(usage, ledgerFileName(live[0].ts)), live.map((r) => JSON.stringify(r) + "\n").join(""));
+    const report = run();
+    expect(report).toMatchObject({ found: 5, afterStart: 3, written: 2, costUsd: 283.5 });
+    const cost = buildCostReport(new LedgerReader(usage), { from: "2026-09-22", to: "2026-09-23", timeZone: LA, now: at("2026-09-30T12:00:00-07:00"),
+      describeSession: (k) => ({ label: k, kind: "dm" }) });
+    // Exactly what the activity log says was spent: nothing twice, nothing lost.
+    expect(cost.totals.costUsd).toBeCloseTo(283 + 0.5 + 0.25 + 1.5 + 22.5, 9);
+    expect(cost.totals.turns).toBe(4);
+    expect(cost.days.map((d) => [d.date, d.overcounted, d.backfilled])).toEqual([["2026-09-22", true, true], ["2026-09-23", false, true]]);
+  });
+
+  it("the report reads both files and never a backfilled row from after the marker", () => {
+    writeLedgerStarted(usage, at("2026-09-23T00:00:00-07:00"));
+    writeFileSync(join(usage, BACKFILL_FILE), [
+      { v: 1, ts: at("2026-09-22T10:00:00-07:00"), sessionKey: "dm:owner", source: "owner", costUsd: 3, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 }, backfilled: true },
+      // Hand-made or stale: after the start, so the live ledger's to tell.
+      { v: 1, ts: at("2026-09-23T10:00:00-07:00"), sessionKey: "dm:owner", source: "owner", costUsd: 100, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 }, backfilled: true },
+    ].map((r) => JSON.stringify(r) + "\n").join(""));
+    const ts = at("2026-09-23T10:00:00-07:00");
+    writeFileSync(join(usage, ledgerFileName(ts)), JSON.stringify({ v: 1, ts, sessionKey: "dm:owner", source: "owner", costUsd: 4, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 } }) + "\n");
+    const reader = new LedgerReader(usage);
+    const cost = () => buildCostReport(reader, { from: "2026-09-22", to: "2026-09-23", timeZone: LA, now: at("2026-09-30T12:00:00-07:00"),
+      describeSession: (k) => ({ label: k, kind: "dm" }) });
+    expect(cost().days.map((d) => d.costUsd)).toEqual([3, 4]);
+    expect(cost().recordedSince).toBe(at("2026-09-22T10:00:00-07:00"));
+    // No marker: no history is added.
+    rmSync(join(usage, LEDGER_STARTED_FILE));
+    expect(cost().days.map((d) => d.costUsd)).toEqual([0, 4]);
   });
 });

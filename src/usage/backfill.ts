@@ -1,15 +1,13 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { isGroupSessionKey } from "../sessions/keys.js";
-import { appendLineSerial } from "./append.js";
-import { LedgerReader } from "./ledger-reader.js";
-import { ledgerFileName, LEDGER_DIR_MODE, LEDGER_FILE_MODE, triggerSnippet, USAGE_LEDGER_VERSION, type UsageLedgerRow, type UsageSource } from "./ledger.js";
+import { BACKFILL_FILE, LEDGER_DIR_MODE, LEDGER_FILE_MODE, readLedgerStarted, triggerSnippet, USAGE_LEDGER_VERSION, type UsageLedgerRow, type UsageSource } from "./ledger.js";
 import { localParts } from "./local-time.js";
 
 /**
  * One-off: rebuild the usage ledger's history from the activity log
  * (`~/.tomo/logs/activity.ndjson*`, the watch-bus feed) for the time before
- * the ledger existed. Run by hand (`tomo usage backfill`), never by the daemon.
+ * the ledger started. Run by hand (`tomo usage backfill`), never by the daemon.
  *
  * What the activity log has per turn: who started it (`turn.start.source`),
  * its cost (`turn.stats.costUsd`, already per turn), its duration
@@ -17,10 +15,14 @@ import { localParts } from "./local-time.js";
  * the owner's message before it (`transcript`), and for a cron turn the job
  * that fired within 5 s before it (`cron.fired`). No tokens, no model split.
  *
- * Idempotent: a row is identified by session key + timestamp, and one the
- * ledger already holds is not written again. Nothing at or after the
- * ledger's first live row is written either — from there the ledger has the
- * real record.
+ * The rows go to a file of their own, `<usage dir>/backfill.ndjson`, never
+ * into the live month files: the whole file is computed again and replaced
+ * atomically on every run (so running twice gives the same file, and the
+ * daemon's appends are never touched). Only turns before the ledger's start
+ * marker (`ledger-started.json`) are kept: from then on the ledger owns every
+ * turn — one whose row failed to land included, its cost carried by the next
+ * row — so the activity log must not add any of them. No marker (the ledger
+ * never ran): refused. Two runs at once: the second is refused (lock file).
  */
 
 /** The fix of #389: before this local date a resume's first turn was charged the whole session. */
@@ -189,101 +191,132 @@ export interface BackfillReport {
   activityFiles: string[];
   /** Rows the activity log yields. */
   found: number;
-  /** Of those, already in the ledger (an earlier backfill). */
-  alreadyThere: number;
-  /** Of those, at or after the ledger's first live row. */
-  afterLedger: number;
-  /** Rows written (dry run: would be written). */
+  /** Of those, at or after the ledger's start (left to the ledger). */
+  afterStart: number;
+  /** Rows in backfill.ndjson (dry run: would be). */
   written: number;
-  /** Local dates the written rows cover. */
+  /** Local dates the rows cover. */
   days: number;
   firstDay: string | null;
   lastDay: string | null;
   overcountedDays: number;
   costUsd: number;
-  /** Rows per month file. */
-  byFile: Record<string, number>;
-  /** First live (not backfilled) ledger row, ms epoch. */
-  ledgerStartsAt: number | null;
+  /** The ledger's start marker, ms epoch. */
+  ledgerStartedAt: number;
+  /** An earlier backfill.ndjson was (dry run: would be) replaced. */
+  replaced: boolean;
   dryRun: boolean;
 }
 
-const rowKey = (sessionKey: string, ts: number) => `${sessionKey}\u0000${ts}`;
+export class BackfillError extends Error {}
 
-export async function backfillUsage(options: BackfillOptions): Promise<BackfillReport> {
-  const files = activityFiles(options.logsDir);
-  const lines = (function* () {
-    for (const file of files) {
-      let text: string;
-      try { text = readFileSync(file, "utf8"); } catch { continue; }
-      yield* text.split("\n");
+export const BACKFILL_LOCK_FILE = "backfill.lock";
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return (err as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/**
+ * Take the backfill lock: `backfill.lock` created with O_EXCL, holding our
+ * pid. A lock whose pid is not running (a run that crashed) is stale: it is
+ * removed and taken once more. Returns the release function.
+ */
+export function acquireBackfillLock(usageDir: string): () => void {
+  const path = join(usageDir, BACKFILL_LOCK_FILE);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const fd = openSync(path, "wx", LEDGER_FILE_MODE);
+      try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
+      return () => {
+        try { if (readFileSync(path, "utf8").trim() === String(process.pid)) rmSync(path, { force: true }); } catch { /* gone */ }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
-  })();
-  const rows = rowsFromActivity(lines, options.timeZone);
-
-  const reader = new LedgerReader(options.usageDir);
-  const existing = new Set<string>();
-  let ledgerStartsAt: number | null = null;
-  for (const fileRows of reader.rows(reader.files())) {
-    for (const row of fileRows) {
-      existing.add(rowKey(row.sessionKey, row.ts));
-      if (!row.backfilled && (ledgerStartsAt === null || row.ts < ledgerStartsAt)) ledgerStartsAt = row.ts;
+    let holder: number | undefined;
+    try { holder = Number.parseInt(readFileSync(path, "utf8").trim(), 10); } catch { /* removed meanwhile: retry */ }
+    // An unreadable or empty lock is treated as held: its writer may be mid-write.
+    if (holder !== undefined && Number.isInteger(holder) && holder > 0 && !alive(holder) && attempt === 0) {
+      rmSync(path, { force: true });
+      continue;
     }
+    if (holder === undefined && attempt === 0) continue;
+    throw new BackfillError(`Another backfill is running${holder && Number.isInteger(holder) ? ` (pid ${holder})` : ""}; ${path} is its lock`);
   }
+}
 
-  let alreadyThere = 0;
-  let afterLedger = 0;
-  const todo: UsageLedgerRow[] = [];
-  for (const row of rows) {
-    if (ledgerStartsAt !== null && row.ts >= ledgerStartsAt) { afterLedger++; continue; }
-    const key = rowKey(row.sessionKey, row.ts);
-    if (existing.has(key)) { alreadyThere++; continue; }
-    existing.add(key);
-    todo.push(row);
+/** Replace `path` with `text` whole: temp file, fsync, rename, fsync the directory. */
+function replaceFile(path: string, text: string): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  const fd = openSync(tmp, "w", LEDGER_FILE_MODE);
+  try {
+    writeSync(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
-
-  const days = new Set<string>();
-  const overcounted = new Set<string>();
-  const byFile: Record<string, number> = {};
-  let costUsd = 0;
-  for (const row of todo) {
-    const date = localParts(row.ts, options.timeZone).date;
-    days.add(date);
-    if (row.overcounted) overcounted.add(date);
-    const file = ledgerFileName(row.ts);
-    byFile[file] = (byFile[file] ?? 0) + 1;
-    costUsd += row.costUsd;
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
   }
+  const dirFd = openSync(join(path, ".."), "r");
+  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+}
 
+export function backfillUsage(options: BackfillOptions): BackfillReport {
+  const ledgerStartedAt = readLedgerStarted(options.usageDir);
+  if (ledgerStartedAt === undefined) {
+    throw new BackfillError(`The usage ledger has never started (no ${join(options.usageDir, "ledger-started.json")}): nothing to backfill up to. Start tomo once first.`);
+  }
+  let release: (() => void) | undefined;
   if (!options.dryRun) {
-    // One append per month file, through the same serial writer the daemon
-    // uses (torn-tail repair, owner-only modes).
-    const perFile = new Map<string, string[]>();
-    for (const row of todo) {
-      const file = ledgerFileName(row.ts);
-      let list = perFile.get(file);
-      if (!list) perFile.set(file, list = []);
-      list.push(JSON.stringify(row));
-    }
-    for (const [file, list] of perFile) {
-      await appendLineSerial(join(options.usageDir, file), () => list.join("\n"), undefined, { fileMode: LEDGER_FILE_MODE, dirMode: LEDGER_DIR_MODE });
-    }
+    mkdirSync(options.usageDir, { recursive: true, mode: LEDGER_DIR_MODE });
+    release = acquireBackfillLock(options.usageDir);
   }
+  try {
+    const files = activityFiles(options.logsDir);
+    const lines = (function* () {
+      for (const file of files) {
+        let text: string;
+        try { text = readFileSync(file, "utf8"); } catch { continue; }
+        yield* text.split("\n");
+      }
+    })();
+    const rows = rowsFromActivity(lines, options.timeZone);
+    const kept = rows.filter((row) => row.ts < ledgerStartedAt);
 
-  const sorted = [...days].sort();
-  return {
-    activityFiles: files,
-    found: rows.length,
-    alreadyThere,
-    afterLedger,
-    written: todo.length,
-    days: days.size,
-    firstDay: sorted[0] ?? null,
-    lastDay: sorted.at(-1) ?? null,
-    overcountedDays: overcounted.size,
-    costUsd,
-    byFile,
-    ledgerStartsAt,
-    dryRun: options.dryRun,
-  };
+    const days = new Set<string>();
+    const overcounted = new Set<string>();
+    let costUsd = 0;
+    for (const row of kept) {
+      const date = localParts(row.ts, options.timeZone).date;
+      days.add(date);
+      if (row.overcounted) overcounted.add(date);
+      costUsd += row.costUsd;
+    }
+    const target = join(options.usageDir, BACKFILL_FILE);
+    const replaced = existsSync(target);
+    if (!options.dryRun) replaceFile(target, kept.map((row) => `${JSON.stringify(row)}\n`).join(""));
+
+    const sorted = [...days].sort();
+    return {
+      activityFiles: files,
+      found: rows.length,
+      afterStart: rows.length - kept.length,
+      written: kept.length,
+      days: days.size,
+      firstDay: sorted[0] ?? null,
+      lastDay: sorted.at(-1) ?? null,
+      overcountedDays: overcounted.size,
+      costUsd,
+      ledgerStartedAt,
+      replaced,
+      dryRun: options.dryRun,
+    };
+  } finally {
+    release?.();
+  }
 }

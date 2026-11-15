@@ -2400,6 +2400,8 @@ export class Agent {
 
   async start(): Promise<void> {
     log.info({ channels: this.channels.length }, "Starting Tomo");
+    // Before any turn: from here on the ledger owns every turn (backfill stops here).
+    this.usageLedger.markStarted();
     // Snapshot what the PREVIOUS run left BEFORE any channel starts ingesting:
     // a message accepted while another channel is still starting is already
     // dispatched by live ingress, and replaying it too would run it twice (or

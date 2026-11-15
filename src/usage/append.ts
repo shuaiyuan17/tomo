@@ -1,23 +1,26 @@
-import { appendFile, mkdir, open } from "node:fs/promises";
+import { appendFile, chmod, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const chains = new Map<string, Promise<unknown>>();
 
-/** Does the file exist, non-empty, without a final newline? */
-async function endsTorn(path: string): Promise<boolean> {
+/**
+ * The existing file's state: does it end without a final newline (torn), and
+ * its permission bits. undefined: no file yet.
+ */
+async function inspect(path: string): Promise<{ torn: boolean; mode: number } | undefined> {
   let handle;
   try {
     handle = await open(path, "r");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw err;
   }
   try {
-    const { size } = await handle.stat();
-    if (size === 0) return false;
+    const { size, mode } = await handle.stat();
+    if (size === 0) return { torn: false, mode: mode & 0o777 };
     const last = Buffer.alloc(1);
     await handle.read(last, 0, 1, size - 1);
-    return last[0] !== 0x0a;
+    return { torn: last[0] !== 0x0a, mode: mode & 0o777 };
   } finally {
     await handle.close();
   }
@@ -44,7 +47,8 @@ export interface AppendModes {
  * A file that does not end in a newline — the torn tail of a crash mid-append,
  * by this process or another — gets one first, so the torn fragment stays a
  * line of its own (skipped by readers) instead of swallowing the new line
- * into one unparseable mess. Checked before every append: one byte read, and
+ * into one unparseable mess. With `modes.fileMode`, an existing file whose
+ * permissions are wider is chmod-ed to it first. Checked before every append: one byte read, and
  * a tail torn by another writer since the last check is caught too.
  */
 export function appendLineSerial(
@@ -57,7 +61,11 @@ export function appendLineSerial(
     const text = line();
     if (text === undefined) return false;
     await mkdir(dirname(path), { recursive: true, ...(modes.dirMode !== undefined ? { mode: modes.dirMode } : {}) });
-    const lead = (await endsTorn(path)) ? "\n" : "";
+    const existing = await inspect(path);
+    // An existing file wider than `fileMode` (made by an older build, or by
+    // hand) is tightened before anything more is written into it.
+    if (existing && modes.fileMode !== undefined && (existing.mode & ~modes.fileMode) !== 0) await chmod(path, modes.fileMode);
+    const lead = existing?.torn ? "\n" : "";
     await appendFile(path, `${lead}${text}\n`, { encoding: "utf8", ...(modes.fileMode !== undefined ? { mode: modes.fileMode } : {}) });
     onWritten?.();
     return true;

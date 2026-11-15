@@ -63,10 +63,15 @@ export function buildCostReport(reader: LedgerReader, options: CostReportOptions
   // The earliest file says since when anything is recorded.
   if (files.length > 0) wanted.add(files[0]);
   const chosen = files.filter((f) => wanted.has(f));
-  const perFile = reader.rows(chosen);
+  const months = reader.rows(chosen);
+  // History rebuilt by `tomo usage backfill`: all before the ledger started, so it never overlaps the month files.
+  const backfill = reader.backfillRows();
+  const perFile = [...months, backfill];
 
   let recordedSince: number | null = null;
-  if (files.length > 0) for (const row of perFile[0]) if (recordedSince === null || row.ts < recordedSince) recordedSince = row.ts;
+  for (const rows of files.length > 0 ? [months[0], backfill] : [backfill]) {
+    for (const row of rows) if (recordedSince === null || row.ts < recordedSince) recordedSince = row.ts;
+  }
   const firstRecorded = recordedSince === null ? null : localParts(recordedSince, timeZone).date;
 
   const days = new Map<string, DayAcc>();

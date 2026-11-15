@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  LEDGER_STARTED_FILE,
+  readLedgerStarted,
+  writeLedgerStarted,
   TRIGGER_MAX_CHARS,
   UsageLedger,
   ledgerFileName,
@@ -248,5 +251,32 @@ describe("usage attribution", () => {
     expect(usageAttributionFor({
       source: "cron", key: "dm:owner", prompt: "x", usage: { source: "cron", jobId: "j1", jobName: "Digest" },
     })).toEqual({ source: "cron", jobId: "j1", jobName: "Digest", trigger: "x" });
+  });
+});
+
+describe("ledger start marker", () => {
+  it("is written once: a later start keeps the first time; owner-only", () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "tomo-ledger-start-")), "usage");
+    new UsageLedger(dir).markStarted(1_000);
+    new UsageLedger(dir).markStarted(9_000);
+    expect(readLedgerStarted(dir)).toBe(1_000);
+    expect(statSync(join(dir, LEDGER_STARTED_FILE)).mode & 0o777).toBe(0o600);
+    expect(readdirSync(dir)).toEqual([LEDGER_STARTED_FILE]);
+  });
+
+  it("never replaces a marker that is there, even one it cannot read", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-ledger-start-"));
+    writeFileSync(join(dir, LEDGER_STARTED_FILE), "garbage");
+    writeLedgerStarted(dir, 9_000);
+    expect(readFileSync(join(dir, LEDGER_STARTED_FILE), "utf8")).toBe("garbage");
+    expect(readdirSync(dir)).toEqual([LEDGER_STARTED_FILE]);
+  });
+
+  it("a ledger that ran before the marker existed is dated by its earliest row", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-ledger-start-"));
+    writeFileSync(join(dir, "2026-11.ndjson"), [JSON.stringify({ ts: 5_000 }), JSON.stringify({ ts: 3_000 }), "{\"ts\":1"].join("\n"));
+    writeFileSync(join(dir, "2026-12.ndjson"), JSON.stringify({ ts: 2_000 }) + "\n");
+    expect(writeLedgerStarted(dir, 9_000)).toBe(3_000);
+    expect(readLedgerStarted(dir)).toBe(3_000);
   });
 });

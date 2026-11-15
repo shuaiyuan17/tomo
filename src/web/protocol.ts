@@ -106,7 +106,8 @@ export interface WebUsage {
  */
 export const USAGE_RPC_TIMEOUT_MS = 24_000;
 export type WebEvent =
-  | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string }
+  /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
+  | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
   | { type: "request"; request: WebRequest }
   | { type: "invalidate"; sessionId?: string }
   /** The cron schedule may have changed (a job fired or finished). No payload: the page re-reads /cron. */

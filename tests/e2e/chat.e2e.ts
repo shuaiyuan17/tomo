@@ -14,6 +14,7 @@ import { WebSupervisor } from "../../src/web/supervisor.js";
 import { webSessionId } from "../../src/web/owner.js";
 import { watchBus } from "../../src/watch/bus.js";
 import { transcriptFileStem } from "../../src/sessions/store.js";
+import { OutgoingMediaStore, outgoingImagesDir } from "../../src/web/outgoing-media.js";
 
 installAgentTestHooks();
 let agent: Agent;
@@ -29,7 +30,8 @@ beforeEach(async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
-  agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled) }); provider = new MockChannel("telegram");
+  agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled),
+    outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }) }); provider = new MockChannel("telegram");
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
@@ -451,4 +453,31 @@ it("motion: new messages rise in, the rail transitions open and closed, and redu
     const cs = getComputedStyle(el); const out = [cs.animationName, cs.transitionDuration]; el.remove(); return out;
   });
   expect(style).toEqual(["none", "0s"]);
+});
+
+it("a picture the agent sends (MEDIA:<path>) shows as a thumbnail by id, never as its path; an unfiled one is a placeholder", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(resolve(tmpdir(), "tomo-e2e-out-"));
+  const file = resolve(dir, "gap.png");
+  writeFileSync(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).append("dm:owner",
+    { role: "assistant", channel: "imessage", timestamp: Date.now() - 1_000, content: "From before:\nMEDIA:/tmp/long-gone.jpg" });
+  mockSdk.responseFn = () => `Here is the gap.\nMEDIA:${file}`;
+  await page.reload();
+  await browserExpect(page.getByText("Image (no longer available)")).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Show me the gap");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const image = page.locator("article.message.assistant").filter({ hasText: "Here is the gap." }).getByRole("img", { name: "Image" });
+  await browserExpect.poll(() => image.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth).catch(() => 0)).toBe(1);
+  expect(await image.evaluate((el: HTMLImageElement) => new URL(el.src).pathname)).toMatch(/\/outgoing\/[a-f0-9]{32}$/);
+  // Recorded and reloaded: the same picture, from the store (the source can go).
+  const { rmSync } = await import("node:fs");
+  rmSync(dir, { recursive: true, force: true });
+  await page.reload();
+  const recorded = page.locator("article.message.assistant").filter({ hasText: "Here is the gap." }).getByRole("img", { name: "Image" });
+  await browserExpect.poll(() => recorded.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth).catch(() => 0)).toBe(1);
+  await browserExpect(page.locator("main")).not.toContainText("MEDIA:");
+  expect(await page.content()).not.toContain("gap.png");
+  expect(await page.content()).not.toContain("long-gone");
 });

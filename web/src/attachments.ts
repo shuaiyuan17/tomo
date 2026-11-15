@@ -13,7 +13,9 @@
 export type MessagePart =
   | { kind: "text"; text: string }
   | { kind: "images"; paths: string[]; sticker: boolean; missing: number; more: number }
-  | { kind: "attachment"; label: string; names: string[] };
+  | { kind: "attachment"; label: string; names: string[] }
+  /** Pictures the agent sent, by outgoing-store id; null: no longer available. */
+  | { kind: "sent"; ids: (string | null)[] };
 
 /** Thumbnails shown per message; the rest are counted as "+N more". */
 export const MAX_IMAGES = 20;
@@ -53,5 +55,33 @@ export function splitAttachments(content: string): MessagePart[] {
   }
   const after = content.slice(last);
   if (after.trim() || !parts.length) parts.push({ kind: "text", text: parts.length ? after.replace(/^\s+/, "") : after });
+  return parts;
+}
+
+/**
+ * The server rewrites each picture the agent sent (`MEDIA:<path>`,
+ * `STICKER:<path>`) to `MEDIA:web:<id>` — or `MEDIA:web:gone` when it was
+ * never filed (an older message, another channel's turn). Consecutive ones
+ * form one row of thumbnails; the text between is parsed as usual.
+ */
+export const SENT_TOKEN = /MEDIA:web:([a-f0-9]{32}|gone)\b/g;
+export function splitMessage(content: string): MessagePart[] {
+  const parts: MessagePart[] = [];
+  let run: (string | null)[] | null = null;
+  let last = 0;
+  const flush = () => { if (run) parts.push({ kind: "sent", ids: run }); run = null; };
+  const text = (chunk: string) => {
+    if (!chunk.trim()) return;
+    flush();
+    parts.push(...splitAttachments(chunk.replace(/^[ \t]*\n/, "").replace(/\n[ \t]*$/, "")));
+  };
+  for (const match of content.matchAll(SENT_TOKEN)) {
+    text(content.slice(last, match.index));
+    (run ??= []).push(match[1] === "gone" ? null : match[1]);
+    last = match.index! + match[0].length;
+  }
+  if (!parts.length && !run) return splitAttachments(content);
+  text(content.slice(last));
+  flush();
   return parts;
 }

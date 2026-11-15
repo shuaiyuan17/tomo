@@ -228,7 +228,12 @@ async function startForeground(): Promise<void> {
       const { CRON_STORE_PATH } = await import("../cron/store.js");
       const { WebRequestJournal } = await import("../web/request-journal.js");
       const { WEB_CHAT_ID } = await import("../web/protocol.js");
+      const { OutgoingMediaStore, outgoingImagesDir } = await import("../web/outgoing-media.js");
+      // No private-memory guard, no copying (fail closed: pictures are then refused, not filed).
+      const guard = await import("../agent/private-memory-guard.js").catch(() => undefined);
       const web = new WebChannel(config.owner, undefined, {
+        outgoingMedia: config.workspaceDir && guard
+          ? new OutgoingMediaStore(outgoingImagesDir(config.workspaceDir), { isPrivate: guard.isPrivateAttachmentPath }) : undefined,
         journal: new WebRequestJournal(join(config.tomoHome, "data", "web", "requests.jsonl")),
         ownerKey: ownerSessionKeyReader({
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),

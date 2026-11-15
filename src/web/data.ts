@@ -8,6 +8,7 @@ import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle
 import { webSessionId } from "./owner.js";
 import { isImageFiledFor } from "../channels/imageStore.js";
 import { sniffImageType } from "./image-type.js";
+import { OutgoingMediaStore, outgoingImagesDir } from "./outgoing-media.js";
 export { sniffImageType };
 import { WebError, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
@@ -121,7 +122,9 @@ export class WebData {
   readonly memory?: MemoryReader;
   readonly cron: WebCron;
   readonly config?: WebConfigReader;
+  private readonly outgoing: OutgoingMediaStore;
   constructor(private readonly options: WebDataOptions) {
+    this.outgoing = new OutgoingMediaStore(options.workspaceDir ? outgoingImagesDir(options.workspaceDir) : undefined);
     if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
     if (options.tomoHome) this.config = new WebConfigReader(options.tomoHome);
     this.cron = new WebCron(options.cronStorePath);
@@ -214,6 +217,14 @@ export class WebData {
     finally { await file?.close(); }
   }
 
+  /** A picture the agent sent in a session the catalog shows, by its store id. */
+  outgoingFile(id: string, mediaId: string): { type: string; bytes: Buffer } {
+    const key = this.catalog().keys.get(id);
+    const file = key && this.outgoing.read(key, mediaId);
+    if (!file) throw new WebError(404, "media_not_found");
+    return file;
+  }
+
   /** The brief of a shown subagent (sessionKey from the daemon's task gate). */
   async subagentBrief(sessionKey: string, taskId: string): Promise<SubagentBrief> {
     const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir)
@@ -235,6 +246,10 @@ export class WebData {
       // this session's own channel chats (the image store's own naming).
       const allowed = this.media.get(id) ?? new Set<string>();
       const filedAs = imageSessionKeys(key, this.options.owner, id === this.catalog().ownerId);
+      // A picture the agent sent: its MEDIA:/STICKER: tag becomes the id it
+      // was filed under at delivery, or "gone" — the path never goes out.
+      page.messages = page.messages.map((message) => message.role !== "assistant" ? message
+        : { ...message, content: this.outgoing.rewrite(key, [message.requestId, message.turnId], message.content).content });
       for (const message of page.messages) {
         if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
         for (const path of imagePaths(message.content)) if (isImageFiledFor(basename(path), filedAs)) allowed.add(path);

@@ -36,13 +36,14 @@ export class OutgoingMediaError extends Error {
 
 export class OutgoingMediaStore {
   private cache?: { stamp: string; entries: Entry[] };
-  constructor(private readonly dir: string, private readonly options: { isPrivate?: (path: string) => boolean } = {}) {}
+  constructor(private readonly dir: string | undefined, private readonly options: { isPrivate?: (path: string) => boolean } = {}) {}
 
   /**
    * Daemon side: copy `path` into the store for this turn. `turns`: the ids
    * the recorded message may carry (its requestId, the shared turnId).
    */
   file(sessionKey: string, turns: readonly string[], path: string): { id: string; type: string } {
+    if (!this.dir) throw new OutgoingMediaError("missing");
     const wanted = expand(path.trim());
     if (!wanted.startsWith("/")) throw new OutgoingMediaError("missing");
     // Asked twice: as written and with symlinks resolved, like the delivery guard.
@@ -74,6 +75,7 @@ export class OutgoingMediaStore {
 
   /** The index, re-read when it changes (the web process reads what the daemon writes). */
   private entries(): Entry[] {
+    if (!this.dir) return [];
     const path = join(this.dir, "index.jsonl");
     let stamp: string;
     try { const stat = statSync(path); stamp = `${stat.mtimeMs}:${stat.size}`; } catch { return []; }
@@ -119,7 +121,7 @@ export class OutgoingMediaStore {
 
   /** Web side: a filed image of `sessionKey`, by id. Anything else is not found. */
   read(sessionKey: string, id: string): { type: string; bytes: Buffer } | undefined {
-    if (!ID.test(id)) return undefined;
+    if (!this.dir || !ID.test(id)) return undefined;
     const entry = this.entries().find((e) => e.id === id && e.sessionKey === sessionKey);
     if (!entry) return undefined;
     const name = `${id}.${EXT[entry.type]}`;

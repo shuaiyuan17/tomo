@@ -269,10 +269,13 @@ export class WebData {
    * read from that session's current SDK transcript.
    */
   async tools(id: string, query: { from?: number; after?: number; transcript?: string }): Promise<SessionTools> {
-    const key = this.catalog().keys.get(id);
+    const catalog = this.catalog();
+    const key = catalog.keys.get(id);
     if (!key) throw new WebError(404, "session_not_found");
     const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).find((e) => e.channelKey === key);
-    try { return await readSessionTools(this.options.sdkSessionsDir, entry?.sdkSessionId, query, { workspaceDir: this.options.workspaceDir }); }
+    // The owner's DM shows its calls whole; a group's keep #464's withholding.
+    const owner = id === catalog.ownerId && !isGroupSessionKey(key);
+    try { return await readSessionTools(this.options.sdkSessionsDir, entry?.sdkSessionId, query, { workspaceDir: this.options.workspaceDir, owner }); }
     catch (error) {
       if (error instanceof SessionToolsError) throw new WebError(error.code === "invalid_cursor" ? 400 : 409, error.code);
       throw error;

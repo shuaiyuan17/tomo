@@ -30,9 +30,16 @@ export const PAIR_LOOKBACK_BYTES = 2 * 1024 * 1024;
 export const PRIVATE_HIDDEN = "[private memory content hidden]";
 export const UNPAIRED_HIDDEN = "(output hidden — call not in view)";
 
-/** Where memory/private is, for the #464 predicate (isPrivateMemoryAccess). */
-export interface PrivateScope { workspaceDir?: string }
+/**
+ * Where memory/private is, for the #464 predicate (isPrivateMemoryAccess),
+ * and whose conversation this is. `owner`: the owner's own DM — its private
+ * memory is the reader's own, so nothing is withheld from its calls (#492's
+ * secret redaction still applies). Every other conversation (a group) keeps
+ * the withholding.
+ */
+export interface PrivateScope { workspaceDir?: string; owner?: boolean }
 function redaction(scope: PrivateScope): ToolRedaction {
+  if (scope.owner) return { input: (input) => redactToolInput(input), output: redactText };
   const ctx = scope.workspaceDir
     ? { cwd: scope.workspaceDir, memoryDir: join(scope.workspaceDir, "memory"), privateDir: join(scope.workspaceDir, "memory", "private") }
     : undefined;
@@ -92,9 +99,11 @@ export function isCallItem(item: SubagentItem): item is CallItem { return item.k
  * Pair every result with its call, ON THE SERVER, before anything is sent:
  * the output of a call that reached memory/private is replaced whole (its
  * input stays, redacted); a result whose call is not known is hidden too.
+ * `owner` (the owner's DM): nothing is withheld, every output is kept.
  * `known`: calls from outside this page (an `after` read's look-back).
  */
-export function pairOutputs(items: SubagentItem[], known: ReadonlyMap<string, boolean> = new Map()): SubagentItem[] {
+export function pairOutputs(items: SubagentItem[], known: ReadonlyMap<string, boolean> = new Map(), owner = false): SubagentItem[] {
+  if (owner) return items.map((item) => { if (item.kind !== "tool") return item; const rest = { ...item }; delete rest.privateOutput; return rest; });
   const calls = new Map(known);
   for (const item of items) if (isCallItem(item)) calls.set(item.toolUseId, item.kind === "tool" && item.privateOutput === true);
   return items.map((item) => {
@@ -176,7 +185,7 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
         if (page.start >= hi) break;
         hi = page.start;
       }
-      return { items: pairOutputs(items, known), end: cursor, transcript: token, complete: true, ...flagged() };
+      return { items: pairOutputs(items, known, scope.owner), end: cursor, transcript: token, complete: true, ...flagged() };
     }
     const from = query.from ?? 0;
     const pages: SubagentItem[][] = [];
@@ -199,6 +208,6 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
     const kept = new Set(tools.slice(-MAX_TOOL_ITEMS / 2).map((item) => item.toolUseId));
     const items = all.filter((item) => (isCallItem(item) || item.kind === "result") && kept.has(item.toolUseId));
     // Incomplete: the scan stopped at a cap before reaching `from`, or found more calls than it keeps.
-    return { items: pairOutputs(items), end: end ?? 0, transcript: token, complete: (reached || hi === 0) && tools.length <= MAX_TOOL_ITEMS / 2, ...flagged() };
+    return { items: pairOutputs(items, undefined, scope.owner), end: end ?? 0, transcript: token, complete: (reached || hi === 0) && tools.length <= MAX_TOOL_ITEMS / 2, ...flagged() };
   } finally { await fd.close(); }
 }

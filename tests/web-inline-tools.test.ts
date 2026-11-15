@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { HistoryMessage, SessionTools, SubagentItem, WebRequest } from "../src/web/protocol.js";
 import { blockKey, interleave, jumpLabel, jumpVisible, mergeTools, messageKey, NO_TOOLS, pendingKey, unseenKeys } from "../web/src/inline-tools.js";
-import { chatRows, rowId } from "../web/src/chat-rows.js";
+import { chatRows, openingAnchors, rowId } from "../web/src/chat-rows.js";
 import { groupLabel, pendingTool } from "../web/src/subagent.js";
 
 const msg = (id: string, role: "user" | "assistant", timestamp: number, extra: Partial<HistoryMessage> = {}): HistoryMessage =>
@@ -111,6 +111,13 @@ describe("chatRows: the Message Scroller's rows", () => {
     expect(rowId(msg("a9", "assistant", 300, { requestId: "q2" }))).toBe("a9");
     const queued = chatRows(interleave(history, []).entries, [request("q2"), request("q3", { state: "queued" })], false);
     expect(shapeOf(queued)).toEqual(["u1", "a1", "sent:q2", "sent:q3*"]);
+  });
+  it("only the rows a conversation opened with may anchor; what this tab sends never does", () => {
+    const opened = openingAnchors(["u1", "a1", "u2"], new Set());
+    expect([...opened]).toEqual(["u1", "a1", "u2"]);
+    expect(opened.has("sent:q9")).toBe(false);
+    // A first message into an empty conversation, claimed by this tab before its row shows.
+    expect([...openingAnchors(["sent:q1"], new Set(["sent:q1"]))]).toEqual([]);
   });
   it("history paged in above only prepends; live content with no row to ride in gets one", () => {
     const newer = chatRows(interleave([msg("u2", "user", 600), msg("a2", "assistant", 700)], []).entries, [], false).map((row) => row.id);

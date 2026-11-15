@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, isResendOf, MAX_KEPT_REQUESTS, pendingLabel, pendingUserMessages, recordedReplyIds, resendAfterDraftChange, trimRequests } from "../web/src/pending.js";
+import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, isResendOf, MAX_KEPT_REQUESTS, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, trimRequests } from "../web/src/pending.js";
+import { readReceiptLabel } from "../web/src/read-receipt.js";
 import type { HistoryMessage, HistoryPage, WebRequest } from "../src/web/protocol.js";
 
 const message = (id: string, extra: Partial<HistoryMessage>): HistoryMessage =>
@@ -74,5 +75,32 @@ describe("resending an interrupted message", () => {
   it("compares characters for short or unspaced text (e.g. Chinese)", () => {
     expect(isResendOf("帮我订周五晚上七点的餐厅", "帮我订周六晚上七点的餐厅")).toBe(true);
     expect(isResendOf("帮我订周五晚上七点的餐厅", "明天天气怎么样")).toBe(false);
+  });
+});
+
+describe("read receipts", () => {
+  it("queued → sent → read, in the order a message lives through them", () => {
+    let r = request("a");
+    expect(readReceipt("a", [r])).toBe("queued");
+    r = { ...r, state: "running", handedOff: true };
+    expect(readReceipt("a", [r])).toBe("sent");
+    r = { ...r, read: true };
+    expect(readReceipt("a", [r])).toBe("read");
+    expect(readReceipt("a", [{ ...r, state: "completed" }])).toBe("read");
+  });
+  it("a joined message is sent, not queued; an old SDK leaves a completed message at sent", () => {
+    expect(readReceipt("a", [request("a", { joined: true })])).toBe("sent");
+    expect(readReceipt("a", [request("a", { state: "completed" })])).toBe("sent");
+  });
+  it("history this page has no request for counts as read; no request id, no receipt", () => {
+    expect(readReceipt("gone", [request("a")])).toBe("read");
+    expect(readReceipt(undefined, [])).toBeUndefined();
+  });
+  it("a request that did not end cleanly shows no receipt (its badge speaks)", () => {
+    for (const state of ["failed", "refused", "unknown", "interrupted"] as const) expect(readReceipt("a", [request("a", { state })])).toBeUndefined();
+  });
+  it("labels name the agent", () => {
+    expect(readReceiptLabel("read", "Claw")).toBe("Read by Claw");
+    expect(readReceiptLabel("sent", "Claw")).toBe("Sent");
   });
 });

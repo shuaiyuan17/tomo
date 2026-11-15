@@ -176,7 +176,9 @@ export class WebChannel implements Channel {
     for (const entry of loaded.entries) {
       const request: WebRequest = { requestId: entry.requestId, state: entry.state, timestamp: entry.timestamp,
         ...(this.ownerId ? { sessionId: this.ownerId } : {}), ...(entry.text !== undefined ? { text: entry.text } : {}),
-        ...(entry.images?.length ? { images: entry.images } : {}) };
+        ...(entry.images?.length ? { images: entry.images } : {}),
+        // History: a request whose turn completed was read, whatever the last run saw.
+        ...(entry.state === "completed" ? { read: true } : {}) };
       if (entry.text !== undefined) this.pendingTextBytes += Buffer.byteLength(JSON.stringify(entry.text));
       this.receipts.set(entry.requestId, { digest: entry.digest, request, settled: true });
     }
@@ -713,6 +715,16 @@ export class WebChannel implements Channel {
     } else if (event.type === "turn.requeue") {
       const receipt = this.receipts.get(event.requestId);
       if (receipt && !receipt.settled) this.state(event.requestId, "queued");
+    } else if (event.type === "read") {
+      // A read receipt changes no state and is not journaled. Owner only:
+      // web requests only ever run there.
+      if (sessionId !== this.ownerId) return;
+      for (const requestId of event.requestIds) {
+        const receipt = this.receipts.get(requestId);
+        if (!receipt || receipt.request.read) continue;
+        receipt.request.read = true;
+        this.events.publish({ type: "request", request: { ...receipt.request } });
+      }
     } else if (event.type === "turn.start") {
       // A new turn makes the last one's suggestion stale.
       this.publishQuietly({ type: "turn", sessionId, status: null });

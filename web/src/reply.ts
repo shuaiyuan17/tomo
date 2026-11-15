@@ -1,3 +1,5 @@
+import { parseSendMarker } from "./send-marker.js";
+
 /**
  * Threaded-reply prefixes tomo writes for iMessage replies and reactions
  * (src/channels/text-utils.ts formatReplyContextMarker):
@@ -32,7 +34,8 @@ export function parseReply(content: string): { reply?: ReplyContext; body: strin
     body: before + content.slice(whole.length) };
 }
 
-const normalize = (text: string) => parseReply(text).body.replace(/\s+/g, " ").trim();
+// A quoted message Tomo sent on its own is recorded with a send marker in front; the quote never has it.
+const normalize = (text: string) => parseReply(parseSendMarker("assistant", text).body).body.replace(/\s+/g, " ").trim();
 
 /**
  * The message a reply quotes, among messages earlier in time than the reply:

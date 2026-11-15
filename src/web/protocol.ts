@@ -32,7 +32,9 @@ export interface WebCatalog { sessions: WebSession[]; ownerId: string | null; se
  *  settled; never re-run automatically. Neither is retried. */
 export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown" | "interrupted";
 /** `images`: where an owner's attached images were filed (incoming-images), while the request's text is kept. */
-export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean; text?: string; timestamp?: number; images?: string[] }
+export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean;
+  /** The agent has read (the SDK consumed) this message. In memory only; restored completed requests count as read. */
+  read?: boolean; text?: string; timestamp?: number; images?: string[] }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
@@ -67,6 +69,8 @@ export type SubagentItem =
   /** `sources`: the page a WebFetch call reads. */
   | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number;
     sources?: WebSource[];
+    /** `summary` is words the model wrote (a Bash description), not a command: shown in the text face. */
+    prose?: true;
     /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
     privateOutput?: boolean }
   /** `images`: image blocks in the output, counted and never served (the view shows a chip). `sources`: a WebSearch result's links. */

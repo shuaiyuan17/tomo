@@ -40,6 +40,7 @@ import { summarizeToolInput, summarizeToolResult } from "./tool-summary.js";
 import { buildContentBlocks, isTextBlock, isThinkingBlock, isToolUseBlock } from "./content-blocks.js";
 import { isTaskSystemMessage, TaskTracker, type TaskChange, type TaskSystemMessage } from "./task-tracker.js";
 import { sdkSignalOf, type SdkSignal } from "./sdk-signals.js";
+import { ReadReceiptTracker } from "./read-receipts.js";
 
 // Re-exported so existing `./live-session.js` imports keep working.
 export {
@@ -231,6 +232,8 @@ export class LiveSession {
   // send() callers waiting for the session to go idle (steered messages can
   // keep the session busy past the turn the agent-level queue saw finish).
   private idleWaiters: Array<() => void> = [];
+  /** Messages pushed to the SDK not yet seen consumed (see read-receipts.ts). */
+  private readReceipts = new ReadReceiptTracker();
   /**
    * Live, non-ambient background tasks (subagents, background shells,
    * workflows) as last reported by the SDK's `background_tasks_changed`
@@ -373,12 +376,14 @@ export class LiveSession {
     }
   }
 
-  private pushInput(msg: SDKUserMessage): void {
+  private pushInput(msg: SDKUserMessage, requestId?: string): void {
     // A client uuid on every send: the CLI stamps it back on the assistant
     // frames and the result of the turn that consumed it
     // (`user_message_uuids`), which is how attributeResult tells this
-    // request's result from one the CLI produced for something else.
+    // request's result from one the CLI produced for something else, and how
+    // the web UI learns the message was read.
     msg.uuid ??= randomUUID();
+    this.readReceipts.track(msg.uuid, requestId);
     this.inputQueue.push(msg);
     this.inputWaiter?.();
   }
@@ -657,6 +662,12 @@ export class LiveSession {
     return "ours";
   }
 
+  private publishRead(event: SDKMessage): void {
+    const read = this.readReceipts.consume(event);
+    if (!read || !this.sessionKey) return;
+    watchBus.publish({ type: "read", sessionKey: this.sessionKey, uuids: read.uuids, requestIds: read.requestIds });
+  }
+
   private claimFirstUnownedEvent(content: unknown[]): void {
     let reason = "assistant_event";
     let openedWithHiddenThinking = false;
@@ -865,6 +876,10 @@ export class LiveSession {
       this.logSubagentEvent(event, this.subagentTypeById.get(parentToolUseId) ?? "subagent");
       return;
     }
+
+    // Which of our messages this turn has consumed so far: each is reported
+    // once, the first frame that names it. Observability only.
+    if (event.type === "assistant") this.publishRead(event);
 
     // An `assistant` event carries COMPLETE content blocks. There are no
     // deltas to reassemble (#292 removed streaming), so this is the earliest
@@ -1480,7 +1495,7 @@ export class LiveSession {
           this.parts = [];
           this.turnSawAssistant = false;
           this.refreshActivityTimeout();
-          this.pushInput(req.message);
+          this.pushInput(req.message, req.replyContext?.requestId);
           return;
         }
         // Steered messages can keep the session busy past the turn that the
@@ -1620,7 +1635,7 @@ export class LiveSession {
       // Keyed on the text the CLI actually received (note included) — that is
       // what it echoes back, and matchSteerEchoes compares verbatim.
       this.pendingSteers.push({ req, text: injected });
-      this.pushInput(req.message);
+      this.pushInput(req.message, replyContext?.requestId);
       onHandedOff?.();
     });
   }

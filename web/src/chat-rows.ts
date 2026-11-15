@@ -8,8 +8,9 @@ import { messageKey, pendingKey, type TimelineEntry, type ToolBlock } from "./in
  * The scroller (@shadcn/react) reads the transcript's direct children and
  * infers what happened from how their list changed: a new first row is a
  * prepend (keep the reader's place), rows past the old count are appended
- * (anchor a new turn), a same-length list that changed is treated as a fresh
- * transcript (it scrolls to the first anchor it has not scrolled to yet).
+ * (it anchors a new turn near the top, under a spacer of nearly a screen),
+ * a same-length list that changed is treated as a fresh transcript (it
+ * scrolls to the first anchor it has not scrolled to yet).
  * So the list must only ever grow at its ends:
  *
  * - Tool calls are not rows of their own: the calls before a message ride in
@@ -20,9 +21,11 @@ import { messageKey, pendingKey, type TimelineEntry, type ToolBlock } from "./in
  *   swapping rows out.
  * - A web message has one id from pending bubble to recorded message
  *   (`sent:<requestId>`), so recording it keeps the row, and its element.
- * - Only the latest user message is a scroll anchor: it is what a new turn
- *   anchors to and where a reopened conversation lands, and with no older
- *   anchors there is nothing earlier for the scroller to jump back to.
+ * - Only the latest user message is a scroll anchor: it is where a reopened
+ *   conversation lands, and with no older anchors there is nothing earlier
+ *   for the scroller to jump back to. And only while it is one the
+ *   conversation opened with (`openingAnchors`): a turn that comes later goes
+ *   in at the end and is followed there, with no spacer under it.
  */
 export type ChatRow =
   | { kind: "message"; id: string; key: string; anchor: boolean; tools: ToolBlock[]; message: HistoryMessage }
@@ -51,4 +54,13 @@ export function chatRows(entries: readonly TimelineEntry[], pending: readonly We
     if (row.kind === "pending" || (row.kind === "message" && row.message.role === "user")) { rows[i] = { ...row, anchor: true }; break; }
   }
   return rows;
+}
+
+/**
+ * The keys that may be scroll anchors: the rows the conversation opened with
+ * (its first non-empty `keys`), less any this tab sent (`claimed`): a first
+ * message into an empty conversation is followed like any other.
+ */
+export function openingAnchors(keys: readonly string[], claimed: ReadonlySet<string>): ReadonlySet<string> {
+  return new Set(keys.filter((key) => !claimed.has(key)));
 }

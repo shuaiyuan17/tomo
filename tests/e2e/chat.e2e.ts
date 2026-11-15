@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { chromium, expect as browserExpect, type Browser, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { crc32, deflateSync } from "node:zlib";
 
 vi.mock("../../src/config.js", async () => (await import("../helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../../src/workspace/index.js", async () => (await import("../helpers/agent-mocks.js")).workspaceModuleMock());
@@ -342,12 +343,49 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   // A message sent while it was busy (queued_command) shows once, as a message.
   await browserExpect(transcript.getByText("Also check the README.")).toHaveCount(1);
   await browserExpect(transcript).toContainText("Message from Tomo");
+  // Its card lines up with the Brief card above, left and right.
+  await browserExpect.poll(() => offset(transcript.getByText("Message from Tomo").locator(".."), page.getByRole("region", { name: "Brief" }))).toEqual([0, 0]);
   await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
   await transcript.getByRole("button", { name: /Read a file, ran a search/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
   await browserExpect(transcript).toContainText("## 0.12.0 entries");
   await page.getByRole("button", { name: "Back to tasks" }).click();
   await browserExpect(page.getByRole("button", { name: /Review the release/ })).toBeVisible();
+});
+
+/** A box's left and right edges, in whole pixels. */
+const edges = (box: ReturnType<Page["locator"]>) => box.evaluate((el) => { const r = el.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.right)]; });
+/** How far `box`'s left and right edges sit from `ref`'s, once the rail has finished sliding in. */
+const offset = async (box: ReturnType<Page["locator"]>, ref: ReturnType<Page["locator"]>) => {
+  const [a, b] = [await edges(box), await edges(ref)];
+  return [a[0] - b[0], a[1] - b[1]];
+};
+
+it("a shell task: its Output card lines up with the Command card above it", async () => {
+  await page.route("**/tasks/b1/command", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ text: "/tmp/merge-seq.sh 2>&1", truncated: false }) }));
+  await page.route("**/tasks/b1/output", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ output: "351 already merged\n352 already merged\n", size: 38 }) }));
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+    { taskId: "b1", taskType: "local_bash", description: "重启后拉起", ambient: false, background: true, startedAt: Date.now() },
+  ] });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await page.getByRole("button", { name: /重启后拉起/ }).click();
+  const command = page.getByRole("region", { name: "Command" });
+  await browserExpect(command).toContainText("/tmp/merge-seq.sh");
+  const output = page.getByText("352 already merged").locator("xpath=ancestor::div[contains(@class,'border')][1]");
+  await browserExpect(output).toBeVisible();
+  await browserExpect.poll(() => offset(output, command)).toEqual([0, 0]);
+  await page.screenshot({ path: "test-results/shell-task.png" });
+});
+
+it("a message Tomo sent on its own carries a label, and no [proactive] marker in its text", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  store.append("dm:owner", { role: "assistant", channel: "imessage", content: "[proactive] 重启好了，可以继续用了。", timestamp: Date.now() - 1_000 });
+  await page.reload();
+  const sent = page.locator("article.message.assistant").filter({ hasText: "重启好了" });
+  await browserExpect(sent).toBeVisible();
+  await browserExpect(sent.locator(".markdown")).toHaveText("重启好了，可以继续用了。");
+  await browserExpect(sent).toContainText("Sent proactively");
+  await browserExpect(page.locator("main")).not.toContainText("[proactive]");
 });
 
 it("an Enter that confirms an IME candidate (Safari order) does not send", async () => {
@@ -548,6 +586,11 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
   expect(await page.content()).not.toContain("supersecret");
   // A command the model described is titled by that description; the command itself is inside.
   await browserExpect(history.getByText("git status")).toHaveCount(0);
+  // Its title is the model's words, in the text face; a command (no description), a path, stay monospace.
+  const titleFont = (name: string | RegExp) => history.getByRole("button", { name }).locator("[data-slot=trace-title]").evaluate((el) => getComputedStyle(el).fontFamily);
+  expect(await titleFont("Check the working tree")).not.toMatch(/mono/i);
+  expect(await titleFont(/gh pr list/)).toMatch(/mono/i);
+  expect(await titleFont(/Read \/repo\/CHANGELOG\.md/)).toMatch(/mono/i);
   await history.getByRole("button", { name: "Check the working tree" }).click();
   await browserExpect(history).toContainText("git status");
   await page.screenshot({ path: "test-results/inline-tools-desktop.png" });
@@ -601,7 +644,22 @@ const topOf = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
 });
 const tall = (i: number) => `Reply ${i}.\n\n${"A paragraph of the reply, long enough to give the conversation some height on any screen.\n\n".repeat(16)}`;
 
-it("opens at the last turn; a sent message anchors near the top under a peek of the previous row, and the reply grows below it", async () => {
+/** A solid PNG of the given size (a real one: the upload sniffs it). */
+function solidPng(width: number, height: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(crc32(body), body.length + 4);
+    return out;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header.set([8, 2, 0, 0, 0], 8);
+  const row = Buffer.alloc(1 + width * 3, 0x88); row[0] = 0;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header),
+    chunk("IDAT", deflateSync(Buffer.concat(Array.from({ length: height }, () => row)))), chunk("IEND", Buffer.alloc(0))]);
+}
+
+it("opens at the last turn; a sent message (a tall picture too) is just fully shown, no screen of blank under it, and the reply is followed while the reader stays at the end", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   const t = Date.now() - 600_000;
   for (let i = 0; i < 30; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: i % 2 ? tall(i) : `Question ${i}?`, timestamp: t + i * 1_000 });
@@ -634,42 +692,73 @@ it("opens at the last turn; a sent message anchors near the top under a peek of 
   await page.waitForTimeout(300);
   expect(await history.evaluate((el) => el.scrollTop)).toBe(dragged);
 
+  const gap = () => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+  /** How far a row's bottom sits above the viewport's (negative: cut off), and whether its top is in view. */
+  const fit = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
+    const view = el.closest("[aria-label='Conversation history']")!.getBoundingClientRect(), box = el.getBoundingClientRect();
+    return { below: Math.round(view.bottom - box.bottom), topIn: box.top >= view.top - 1 };
+  });
+  const spacer = () => history.evaluate((el) => { const s = el.querySelector<HTMLElement>("[data-message-scroller-spacer]"); return s && !s.hidden ? s.offsetHeight : 0; });
+
+  // Sent from a screen up, with a tall picture and no reply yet: the view goes
+  // to the end, just far enough to show the whole message; nothing reserved under it.
   let release!: (text: string) => void;
   mockSdk.responseFn = () => new Promise<string>((r) => { release = r; });
+  await page.locator("input[type=file]").setInputFiles([{ name: "tall.png", mimeType: "image/png", buffer: solidPng(200, 900) }]);
+  await browserExpect(page.getByRole("listitem", { name: "tall.png, attached" })).toBeVisible();
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("The next question");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   const sent = page.locator("article.message.user").filter({ hasText: "The next question" });
-  await browserExpect(sent).toBeVisible();
-  await browserExpect.poll(() => topOf(sent)).toBeLessThan(100);
-  const anchored = await topOf(sent);
-  expect(anchored).toBeGreaterThan(40);
+  await browserExpect(sent.getByRole("img")).toBeVisible();
+  await browserExpect.poll(gap).toBeLessThan(2);
+  await browserExpect.poll(async () => (await fit(sent)).below).toBeGreaterThanOrEqual(0);
+  expect((await fit(sent)).below).toBeLessThan(60);
+  expect((await fit(sent)).topIn).toBe(true);
+  expect(await spacer()).toBe(0);
   await page.screenshot({ path: "test-results/chat-just-sent.png" });
+  // A picture that loads late (0px, then its height) in the last row: the end stays in view, not cut off.
+  await page.route("**/late-picture.png", async (route) => { await new Promise((r) => setTimeout(r, 400)); await route.fulfill({ contentType: "image/png", body: solidPng(200, 600) }); });
+  await sent.evaluate((el) => { const img = document.createElement("img"); img.src = "/late-picture.png"; img.style.display = "block"; img.style.maxHeight = "200px"; el.append(img); });
+  await browserExpect.poll(() => sent.evaluate((el) => el.querySelector<HTMLImageElement>("img[src='/late-picture.png']")!.offsetHeight)).toBe(200);
+  await browserExpect.poll(gap).toBeLessThan(2);
+  expect((await fit(sent)).below).toBeGreaterThanOrEqual(0);
+  // A short answer: right under the question, and the view ends at it.
   release("A short answer.\n\nIn two paragraphs.");
   const reply = page.locator("article.message.assistant").filter({ hasText: "In two paragraphs." });
   await browserExpect(reply).toBeVisible();
-  await page.waitForTimeout(300);
-  // Recorded (the bubble becomes the history message) and answered: the turn stays where it was anchored.
-  expect(Math.abs(await topOf(sent) - anchored)).toBeLessThanOrEqual(1);
-  expect(await topOf(reply)).toBeGreaterThan(anchored);
+  await browserExpect.poll(gap).toBeLessThan(2);
+  expect((await fit(reply)).below).toBeGreaterThanOrEqual(0);
+  expect((await fit(reply)).below).toBeLessThan(60);
+  expect(await spacer()).toBe(0);
 
-  // A reply that streams past the screen: once it fills the room under the
-  // anchored question, the view follows its end, block by block.
+  // A reply that streams past the screen: the view follows its end, block by block.
   mockSdk.responseFn = () => new Promise<string>((r) => { release = r; });
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Now a long one");
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  const second = page.locator("article.message.user").filter({ hasText: "Now a long one" });
-  await browserExpect.poll(() => topOf(second)).toBeLessThan(100);
+  await browserExpect(page.locator("article.message.user").filter({ hasText: "Now a long one" })).toBeVisible();
+  await browserExpect.poll(gap).toBeLessThan(2);
   const sdk = mockSdk.queryControllers.at(-1)!;
-  const gap = () => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
   for (const i of [100, 101, 102]) {
     sdk.pushEvent({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: tall(i) }] } });
     await browserExpect(history).toContainText(`Reply ${i}.`);
     await browserExpect.poll(gap).toBeLessThan(2);
   }
+  // The reader scrolls up (past the start of the reply): what streams in next leaves them there, and the pill offers the way back.
+  await history.hover();
+  await page.mouse.wheel(0, -8_000);
+  await page.waitForTimeout(300);
+  const reading = await history.evaluate((el) => el.scrollTop);
+  sdk.pushEvent({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: tall(103) }] } });
+  await browserExpect(history).toContainText("Reply 103.");
+  await page.waitForTimeout(300);
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(reading);
+  expect(await gap()).toBeGreaterThan(400);
+  await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toBeVisible();
   release("The end of it.");
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "The end of it." })).toBeVisible();
-  await browserExpect.poll(gap).toBeLessThan(2);
-  await browserExpect(page.getByText("Reply in progress")).toHaveCount(0);
+  await page.waitForTimeout(300);
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(reading);
+  await page.getByRole("button", { name: /jump to latest/i }).click();
   await browserExpect.poll(gap).toBeLessThan(2);
   // The scroller sets its spacer through the DOM: no <style> element, nothing the CSP refused.
   expect(await page.evaluate(() => [document.querySelectorAll("style").length, (window as unknown as { cspViolations: string[] }).cspViolations])).toEqual([0, []]);
@@ -1002,4 +1091,46 @@ it("a turn's trace: the todo list open while it runs and folded after, its Sourc
   await settledShot("trace-todos-done-phone-light");
   await page.emulateMedia({ colorScheme: "light" });
   await page.setViewportSize({ width: 1440, height: 900 });
+});
+
+it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read by the agent", async () => {
+  mockSdk.stampUserUuids = true;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  mockSdk.responseFn = async () => { await gate; return "A tick is a receipt."; };
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("第一个对号是啥意思");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const own = page.locator("article.message.user").filter({ hasText: "第一个对号是啥意思" }).last();
+  const receipt = own.locator(".read-receipt");
+  await browserExpect(receipt).toHaveAttribute("data-receipt", "sent");
+  release();
+  await browserExpect(receipt).toHaveAttribute("data-receipt", "read");
+  await browserExpect(receipt).toHaveAttribute("title", "Read by Tomo");
+  // Measured once the turn is over and the bubble is the settled history row.
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A tick is a receipt." })).toBeVisible();
+  // Hidden until the bubble is hovered.
+  const opacity = () => receipt.evaluate((el) => Number(getComputedStyle(el).opacity));
+  await page.mouse.move(0, 0);
+  await browserExpect.poll(opacity).toBe(0);
+  await own.locator(".own-bubble").hover();
+  await browserExpect.poll(opacity).toBeGreaterThan(0.5);
+  await receipt.click();
+  await browserExpect(receipt).toContainText("Read by Tomo");
+  // A row can be re-rendered (pending → history) between reads: measure in one evaluate, retried.
+  const measure = (row: typeof own) => row.evaluate((el) => {
+    const r = (sel: string) => el.querySelector(sel)!.getBoundingClientRect();
+    const b = r(".own-bubble"); const t = r(".read-receipt");
+    return { column: el.getBoundingClientRect().width, bubble: b.width,
+      // The tick sits inside the bubble, in its bottom-right corner.
+      inCorner: t.right <= b.right && t.right > b.right - 24 && t.bottom <= b.bottom && t.bottom > b.bottom - 16 };
+  });
+  await browserExpect.poll(async () => { const m = await measure(own); return m.bubble < m.column * 0.4 && m.inCorner; }).toBe(true);
+
+  mockSdk.responseFn = () => "ok";
+  const long = "long words ".repeat(120).trim();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill(long);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const longOwn = page.locator("article.message.user").filter({ hasText: "long words long words" }).last();
+  await browserExpect(longOwn.locator(".read-receipt")).toHaveAttribute("data-receipt", "read");
+  await browserExpect.poll(async () => { const m = await measure(longOwn); return m.bubble <= m.column * 0.85 + 1 && m.bubble > m.column * 0.8; }).toBe(true);
 });

@@ -25,6 +25,7 @@ function usePageVisible(): boolean {
   return visible;
 }
 
+const UNAVAILABLE = "Screen viewing is not available on this machine.";
 const NOTICE: Record<Exclude<WebScreenFrame["status"], "live">, string> = {
   locked: "The Mac is locked. This is not a live picture.",
   away: "No one is signed in at the Mac's screen. This is not a live picture.",
@@ -76,7 +77,7 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
       }).catch((err: unknown) => {
         if (controller.signal.aborted) return;
         if (err instanceof ApiError && err.code === "epoch_changed") { void refresh().catch(() => {}); return; }
-        if (err instanceof ApiError && err.code === "screen_unavailable") { setError("Screen viewing is not available on this machine."); return; }
+        if (err instanceof ApiError && err.code === "screen_unavailable") { setError(UNAVAILABLE); return; }
         setError("Reconnecting…");
         retry = setTimeout(open, 3000);
       });
@@ -109,13 +110,13 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
 
   const stale = frame && frame.status !== "live";
   const status = !live ? "Disconnected" : paused ? "Paused" : !visible ? "Paused (tab hidden)"
-    : error || (frame?.status === "live" ? updatedAgo(frame.capturedAt, now) : frame ? "Not live" : "Connecting…");
+    : error === UNAVAILABLE ? "Unavailable" : error || (frame?.status === "live" ? updatedAgo(frame.capturedAt, now) : frame ? "Not live" : "Connecting…");
   const iconButton = "size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-4";
   return <div ref={root} id="screen-window" role="dialog" aria-label="Screen, read-only" tabIndex={-1}
     onKeyDown={(event) => { if (event.key === "Escape" && !document.fullscreenElement) { event.stopPropagation(); onClose(); } }}
     style={compact ? undefined : { left: geometry.x, top: geometry.y, width: geometry.width, height: windowHeight(geometry.width) }}
     className={cn("fixed z-40 flex flex-col overflow-hidden border bg-card shadow-2xl outline-none",
-      compact ? "inset-x-0 bottom-0 max-h-[70dvh] rounded-t-2xl border-b-0 animate-in slide-in-from-bottom-4" : "rounded-2xl")}>
+      compact ? "inset-x-0 bottom-0 max-h-[70dvh] rounded-t-2xl border-b-0 pb-[env(safe-area-inset-bottom)] animate-in slide-in-from-bottom-4" : "rounded-2xl")}>
     <div onPointerDown={track("move")} style={compact ? undefined : { height: TITLE_BAR }}
       className={cn("flex shrink-0 items-center gap-2 border-b px-3 select-none", compact ? "h-12" : "cursor-grab active:cursor-grabbing")}>
       <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", streaming && frame?.status === "live" && "border-primary bg-primary")} />
@@ -140,7 +141,7 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
       {image && (stale || paused) && <span className="absolute top-2 left-2 max-w-[calc(100%-1rem)] rounded-lg bg-card/90 px-2 py-1 text-[11px] text-foreground shadow-sm">
         {stale ? NOTICE[frame!.status as Exclude<WebScreenFrame["status"], "live">] : "Paused"} · last picture {updatedAgo(image.capturedAt, now).replace("Updated ", "")}</span>}
       {!compact && <span onPointerDown={track("resize")} aria-hidden="true" title="Resize"
-        className="absolute right-0 bottom-0 size-4 cursor-nwse-resize bg-[linear-gradient(135deg,transparent_50%,var(--border)_50%)]" />}
+        className="absolute right-0.5 bottom-0.5 size-4 cursor-nwse-resize bg-[linear-gradient(135deg,transparent_42%,var(--muted-foreground)_42%,var(--muted-foreground)_50%,transparent_50%,transparent_67%,var(--muted-foreground)_67%,var(--muted-foreground)_75%,transparent_75%)] opacity-50 transition-opacity hover:opacity-90" />}
     </div>
   </div>;
 }

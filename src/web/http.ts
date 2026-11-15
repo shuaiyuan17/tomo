@@ -7,10 +7,11 @@ import type { WebData } from "./data.js";
 import { SCREEN_RATES, type ScreenLoop, type ScreenRate } from "./screen.js";
 import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
+import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
-  type EventEnvelope, type Rpc, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
+  type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
 
@@ -43,6 +44,8 @@ export interface HttpDependencies {
 /** Idle socket timeout; every RPC deadline (e.g. USAGE_RPC_TIMEOUT_MS) stays under it. */
 export const SOCKET_TIMEOUT_MS = 30_000;
 
+const TASK_ACTION_PATH = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(stop|background)$/;
+
 export async function startWebHttp(port: number, deps: HttpDependencies) {
   const csrf = new CsrfTokens(deps.now);
   const access = new WebAccess(deps.accessToken, deps.now);
@@ -52,6 +55,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   let active = 0;
   let inspecting = false;
   let boundPort = port;
+  const compressed = new CompressedAssets();
   const server = createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 10_000 }, (req, res) => {
     for (const [key, value] of Object.entries(securityHeaders)) res.setHeader(key, value);
     void handle(req, res).catch((error: unknown) => {
@@ -106,7 +110,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     try {
       if (!api) {
         if (req.method !== "GET") throw new WebError(405, "method_not_allowed");
-        await asset(url.pathname, res);
+        await asset(url.pathname, req, res);
         return;
       }
       if (req.method === "GET") {
@@ -288,6 +292,18 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 200, await deps.rpc({ method: "stop", epoch }));
         return;
+      } else if (req.method === "POST" && TASK_ACTION_PATH.test(url.pathname)) {
+        // Stop one running task of the owner conversation, or move it to the background. Same gate as a message.
+        csrf.verify(req, session!);
+        await body(req);
+        const [, sessionId, taskId, action] = TASK_ACTION_PATH.exec(url.pathname)!;
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        if (sessionId !== ownerId) throw new WebError(403, "owner_dm_only");
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
+        json(res, 200, await deps.rpc({ method: "task-action", epoch, sessionId, taskId, action: action as TaskAction }));
+        return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/uploads") {
         // An image for the owner's next message: the same gate as sending one
         // (CSRF, the owner, the daemon epoch), a raw body of at most
@@ -423,7 +439,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     res.once("close", () => { unsubscribe(); clearInterval(heartbeat); screenStreams.delete(res); });
   }
 
-  async function asset(path: string, res: ServerResponse): Promise<void> {
+  async function asset(path: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const relative = path === "/" ? "index.html" : /^\/assets\/[A-Za-z0-9_-]+\.(js|css|woff2)$/.test(path) || ICON_FILES.has(path) ? path.slice(1) : null;
     if (!relative) throw new WebError(404, "not_found");
     const root = await realpath(deps.assetsDir);
@@ -436,10 +452,17 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       if (!stat.isFile() || stat.size > MAX_BUFFER_BYTES) throw new WebError(404, "not_found");
       const bytes = await file.readFile();
       const ext = relative.split(".").pop()!;
+      // Hashed bundle files never change under their name; everything else keeps no-store.
+      const hashed = relative.startsWith("assets/");
+      const compressible = CompressedAssets.compressible(ext, bytes.length);
+      const encoding = compressible ? pickEncoding(req.headers["accept-encoding"]) : undefined;
+      const body = encoding ? await compressed.get(relative, `${stat.size}:${stat.mtimeMs}`, encoding, bytes) : bytes;
       res.writeHead(200, { "content-type": ({ html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8",
         css: "text/css; charset=utf-8", woff2: "font/woff2", svg: "image/svg+xml", ico: "image/x-icon", png: "image/png",
-        webmanifest: "application/manifest+json" } as Record<string, string>)[ext] });
-      res.end(bytes);
+        webmanifest: "application/manifest+json" } as Record<string, string>)[ext], "content-length": body.length,
+        ...(hashed ? { "cache-control": IMMUTABLE_CACHE } : {}),
+        ...(compressible ? { vary: "accept-encoding" } : {}), ...(encoding ? { "content-encoding": encoding } : {}) });
+      res.end(body);
     } finally { await file.close(); }
   }
 
@@ -450,6 +473,8 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   // Keep runtime listener errors local even after the startup promise settles.
   server.on("error", () => { for (const stream of [...streams, ...screenStreams]) stream.destroy(); });
   boundPort = (server.address() as { port: number }).port;
+  // The bundle's brotli copies, made now rather than on the first page load.
+  void realpath(deps.assetsDir).then((root) => compressed.warm(root), () => undefined);
   return { port: boundPort, async close() {
     for (const stream of [...streams, ...screenStreams]) stream.destroy();
     server.closeAllConnections();

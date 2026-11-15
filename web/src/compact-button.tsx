@@ -36,7 +36,7 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button variant="ghost" size="icon" aria-label={button.label} title={button.label} disabled={button.state === "busy" || button.state === "requested"}
-          className={cn("-my-1 size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-40 [&_svg:not([class*='size-'])]:size-3.5",
+          className={cn("-my-1 size-7 rounded-lg text-muted-foreground max-[600px]:-my-2 max-[600px]:size-9 hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-40 [&_svg:not([class*='size-'])]:size-3.5",
             button.state === "requested" && "disabled:opacity-100")}>
           <FoldVertical strokeWidth={1.75} className={cn(button.state === "requested" && "animate-pulse")} /></Button>
       </PopoverTrigger>
@@ -48,8 +48,8 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
         </div>
       </PopoverContent>
     </Popover>
-    {button.state === "requested" && <span className="absolute top-1/2 right-8 -translate-y-1/2 text-[11px] whitespace-nowrap"><span className="shimmer">Requested…</span></span>}
-    {button.state === "done" && <span role="status" className="absolute top-1/2 right-8 -translate-y-1/2 text-[11px] whitespace-nowrap text-muted-foreground">Compacted</span>}
+    {button.state === "requested" && <span className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap"><span className="shimmer">Requested…</span></span>}
+    {button.state === "done" && <span role="status" className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap text-muted-foreground">Compacted</span>}
     {button.state === "ready" && button.note && !error && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{button.note}</span>}
     {error && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{error}</span>}
   </span>;

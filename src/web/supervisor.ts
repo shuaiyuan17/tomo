@@ -266,6 +266,10 @@ export class WebSupervisor implements WebLifecycle {
             if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
             return this.channel.stopOwnerTurn();
           }
+          if (input.method === "task-action") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.taskAction(input.sessionId, input.taskId, input.action);
+          }
           if (input.method === "model") return this.channel.model(input.sessionId);
           if (input.method === "home") return this.channel.home();
           if (input.method === "home-snapshot") {

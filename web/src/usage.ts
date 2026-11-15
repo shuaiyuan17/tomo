@@ -122,3 +122,6 @@ export class RequestGate {
   current(ticket: number): boolean { return ticket === this.latest; }
   end(): void { this.busy = false; }
 }
+
+/** The plan as a name beside the card's heading: "max" → "Max" (whatever else it says is kept). */
+export function planName(plan: string): string { return plan.charAt(0).toUpperCase() + plan.slice(1); }

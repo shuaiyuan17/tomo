@@ -2053,6 +2053,16 @@ export class Agent {
     return this.liveSessionManager.stopTurn(sessionKey);
   }
 
+  /** Stop one running task at the owner's request (web task view). False when it could not be asked. */
+  stopTask(sessionKey: string, taskId: string): Promise<boolean> {
+    return this.liveSessionManager.stopTask(sessionKey, taskId);
+  }
+
+  /** Move a foreground task to the background at the owner's request (web task view). */
+  backgroundTask(sessionKey: string, toolUseId: string): Promise<boolean> {
+    return this.liveSessionManager.backgroundTask(sessionKey, toolUseId);
+  }
+
   /** Read-only: a shell/Monitor task's output tail (web task view). */
   readTaskOutput(sessionKey: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);

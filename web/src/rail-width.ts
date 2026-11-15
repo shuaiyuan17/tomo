@@ -11,7 +11,7 @@ export const RAIL_KEY_STEP_LARGE = 64;
 
 export interface RailBounds { min: number; max: number }
 
-/** The stylesheet's width for the rail (main.tsx: w-[300px], max-[1024px]:w-[280px]); never below RAIL_MIN. */
+/** The stylesheet's width for the pinned rail (main.tsx: w-[300px]; at 1024 and below the rail is an overlay and is not resized, so 280 there is only a floor); never below RAIL_MIN. */
 export function railDefaultWidth(viewport: number): number {
   return viewport <= 1024 ? 280 : 300;
 }

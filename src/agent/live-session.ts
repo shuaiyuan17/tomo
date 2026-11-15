@@ -1165,6 +1165,32 @@ export class LiveSession {
     return true;
   }
 
+  /**
+   * Stop ONE task (a subagent, a shell command) at the owner's request; the turn and the
+   * session carry on, and the SDK reports the task as `stopped`. False when it could not be asked.
+   */
+  async stopTask(taskId: string): Promise<boolean> {
+    if (!this.alive) return false;
+    try { await this.q.stopTask(taskId); }
+    catch (err) { log.warn({ err, session: this.sessionKey, taskId }, "Could not stop the task"); return false; }
+    log.info({ session: this.sessionKey, taskId }, "Task stopped at the owner's request");
+    return true;
+  }
+
+  /**
+   * Move the foreground task a tool call started to the background: the blocking call returns
+   * at once ("running in the background"), the turn continues, and the task reports back when
+   * it settles. False when no foreground task matched, or the SDK refused.
+   */
+  async backgroundTask(toolUseId: string): Promise<boolean> {
+    if (!this.alive) return false;
+    try {
+      const moved = await this.q.backgroundTasks(toolUseId);
+      if (moved) log.info({ session: this.sessionKey, toolUseId }, "Task moved to the background at the owner's request");
+      return moved;
+    } catch (err) { log.warn({ err, session: this.sessionKey, toolUseId }, "Could not move the task to the background"); return false; }
+  }
+
   /** Recent Bash commands by tool_use id (bounded), for the web task view's full command. */
   private toolCommands = new Map<string, string>();
   private rememberCommand(block: { id?: string; name: string; input?: Record<string, unknown> }): void {

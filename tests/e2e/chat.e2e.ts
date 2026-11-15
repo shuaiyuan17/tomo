@@ -185,6 +185,45 @@ it("silently reloads the first history page after rotation invalidates a cursor"
   expect(staleStatus).toBe(409);
 });
 
+it("loads the Study as a lazy chunk under the CSP, cached immutable and compressed", async () => {
+  const chunks: Record<string, string | undefined>[] = [];
+  page.on("response", (response) => {
+    if (/^\/assets\/study-[\w-]+\.js$/.test(new URL(response.url()).pathname)) chunks.push(response.headers());
+  });
+  await page.evaluate(() => {
+    const w = window as unknown as { __csp: string[] }; w.__csp = [];
+    document.addEventListener("securitypolicyviolation", (event) => w.__csp.push(event.violatedDirective));
+  });
+  // Not on the chat's critical path: nothing of the Study is fetched until it is opened.
+  expect(chunks).toHaveLength(0);
+  await page.getByRole("button", { name: "The Study" }).click();
+  await browserExpect(page.locator("#study")).toBeVisible();
+  expect(chunks).toHaveLength(1);
+  expect(chunks[0]["cache-control"]).toBe("public, max-age=31536000, immutable");
+  expect(chunks[0]["content-encoding"]).toBe("br");
+  expect(await page.evaluate(() => (window as unknown as { __csp: string[] }).__csp)).toEqual([]);
+});
+
+it("a Study chunk that fails to load shows Reload in its place; the rest of the app stays", async () => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.route(/\/assets\/study-[\w-]+\.js$/, (route) => route.abort());
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("a draft that must survive");
+  await page.getByRole("button", { name: "The Study" }).first().click();
+  await browserExpect(page.getByText("The Study didn't load. Reload the page to try again.")).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Reload", exact: true })).toBeVisible();
+  // Header, sidebar and the (hidden) chat are still mounted, the stream still live.
+  await browserExpect(page.locator("header")).toBeVisible();
+  await browserExpect(page.locator("#sidebar")).toHaveCount(1);
+  await browserExpect(page.locator("#conversation")).toHaveCount(1);
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Conversation" }).first().click();
+  await browserExpect(page.locator("#conversation")).toBeVisible();
+  await browserExpect(input).toHaveValue("a draft that must survive");
+  expect(errors).toEqual([]);
+});
+
 it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibility and group read-only state", async () => {
   const errors: string[] = []; const requests: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -270,12 +309,17 @@ it("keeps messaging operational when the optional web process dies", async () =>
 it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe overlay", async () => {
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Map the repo", ambient: false, background: true, startedAt: Date.now(), summary: "Reading src/web" },
+    { taskId: "f1", taskType: "local_agent", description: "Check the tests", ambient: false, background: false, startedAt: Date.now() },
   ] });
-  const toggle = page.getByRole("button", { name: /^Tasks, 1 running$/ });
+  const toggle = page.getByRole("button", { name: /^Tasks, 2 running$/ });
   await browserExpect(toggle).toHaveAttribute("aria-pressed", "false");
   // Desktop: pinned rail, not modal, persisted across reloads.
   await toggle.click();
   await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toContainText("Reading src/web");
+  // Only the task that outlives the reply is tagged; the one the turn is waiting on is not.
+  await browserExpect(page.getByTestId("task-background")).toHaveCount(1);
+  await browserExpect(page.getByRole("button", { name: /Map the repo/ })).toContainText(/background · \d/);
+  await browserExpect(page.getByRole("button", { name: /Check the tests/ })).not.toContainText("background");
   await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
   await page.reload();
   await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toBeVisible();
@@ -362,6 +406,43 @@ const offset = async (box: ReturnType<Page["locator"]>, ref: ReturnType<Page["lo
   return [a[0] - b[0], a[1] - b[1]];
 };
 
+it("an opened owner task can be moved to the background and stopped; a group's task offers neither", async () => {
+  const calls: string[] = [];
+  let answer = true;
+  (channel as unknown as { taskControl: unknown }).taskControl = {
+    stop: async (key: string, taskId: string) => { calls.push(`stop ${key} ${taskId}`); return answer; },
+    background: async (key: string, toolUseId: string) => { calls.push(`background ${key} ${toolUseId}`); return answer; } };
+  const task = (background: boolean) => ({ taskId: "f1", taskType: "local_agent", description: "Check the tests", ambient: false, background, toolUseId: "toolu_f1", startedAt: Date.now() });
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task(false)] });
+  watchBus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [{ ...task(false), taskId: "g1", description: "Group work" }] });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await page.getByRole("button", { name: /Check the tests/ }).click();
+  const move = page.getByRole("button", { name: "Move to background" });
+  const stop = page.getByRole("button", { name: "Stop task" });
+  // Refused by the SDK (it had just finished): said quietly, nothing else changes.
+  answer = false;
+  await move.click();
+  await browserExpect(page.getByRole("status").filter({ hasText: "Couldn't move it" })).toBeVisible();
+  answer = true;
+  await move.click();
+  await browserExpect.poll(() => calls).toEqual(["background dm:owner toolu_f1", "background dm:owner toolu_f1"]);
+  // The daemon reports it in the background: the offer goes, the tag shows, Stop stays.
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task(true)] });
+  await browserExpect(move).toHaveCount(0);
+  await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toContainText("Working · background");
+  await page.screenshot({ path: "test-results/task-controls.png" });
+  await stop.click();
+  await browserExpect.poll(() => calls.at(-1)).toBe("stop dm:owner f1");
+  // Ended: nothing left to act on.
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [{ ...task(true), status: "stopped" }] });
+  await browserExpect(stop).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to tasks" }).click();
+  await page.getByRole("button", { name: /Group work/ }).click();
+  await browserExpect(page.getByRole("heading", { name: "Group work" })).toBeVisible();
+  await browserExpect(stop).toHaveCount(0);
+  await browserExpect(move).toHaveCount(0);
+});
+
 it("a shell task: its Output card lines up with the Command card above it", async () => {
   await page.route("**/tasks/b1/command", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ text: "/tmp/merge-seq.sh 2>&1", truncated: false }) }));
   await page.route("**/tasks/b1/output", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ output: "351 already merged\n352 already merged\n", size: 38 }) }));
@@ -438,6 +519,16 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toBeVisible();
   // The overlay covers the window: no row or scroller contains it (paint/layout containment would).
   expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => { const r = el.getBoundingClientRect(); return [r.width === innerWidth, r.height === innerHeight]; })).toEqual([true, true]);
+  // Nor is it clipped by an ancestor's mask or clip-path (a mask on the scroller once hid its backdrop and Close button).
+  expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => {
+    const clipped: string[] = [];
+    for (let a = el.parentElement; a; a = a.parentElement) {
+      const cs = getComputedStyle(a) as CSSStyleDeclaration & { webkitMaskImage?: string };
+      if ((cs.maskImage && cs.maskImage !== "none") || (cs.webkitMaskImage && cs.webkitMaskImage !== "none") || cs.clipPath !== "none") clipped.push(a.tagName);
+    }
+    return clipped;
+  })).toEqual([]);
+  await browserExpect(page.getByRole("button", { name: "Close image" })).toBeInViewport();
   await page.keyboard.press("Escape");
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toHaveCount(0);
 });
@@ -751,6 +842,28 @@ it("opens at the last turn; a sent message (a tall picture too) is just fully sh
   // The scroller sets its spacer through the DOM: no <style> element, nothing the CSP refused.
   expect(await page.evaluate(() => [document.querySelectorAll("style").length, (window as unknown as { cspViolations: string[] }).cspViolations])).toEqual([0, []]);
 });
+
+for (const [label, olderDay] of [["the same day", 0], ["an earlier day", 86_400_000]] as const) {
+  it(`Load earlier does not move the first shown message when the earlier page ends on ${label} (day dividers never sit at a row's top)`, async () => {
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const t = Date.now() - 600_000;
+    // The first page shows messages 30..129; "Load earlier" brings 0..29.
+    for (let i = 0; i < 130; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Message ${i}\n\nwith a second paragraph`, timestamp: t + i * 1_000 - (i < 30 ? olderDay : 0) });
+    await page.reload();
+    const history = page.getByLabel("Conversation history");
+    const earlier = page.getByRole("button", { name: "Load earlier messages" });
+    await browserExpect(earlier).toBeVisible();
+    await history.hover();
+    await browserExpect.poll(async () => { await page.mouse.wheel(0, -20_000); return history.evaluate((el) => el.scrollTop); }).toBe(0);
+    const article = history.locator("article.message").filter({ hasText: /^.*Message 30\b/ }).first();
+    const top = () => article.evaluate((el) => Math.round(el.getBoundingClientRect().top));
+    const before = await top();
+    await earlier.click();
+    await browserExpect(history).toContainText("Message 0");
+    await page.waitForTimeout(300);
+    expect(Math.abs(await top() - before)).toBeLessThanOrEqual(1);
+  });
+}
 
 it("Load earlier keeps the reader's place, and a row growing above the view does not move it", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { FileIcon, ImageIcon, X } from "lucide-react";
 import { Text } from "./markdown.js";
 import { splitMessage } from "./attachments.js";
@@ -15,8 +15,11 @@ import { cn } from "@/lib/utils";
  * `thinking` (Tomo's replies only): text marked as a thinking block shows as
  * a folded "Thinking" row, never as the reply. `block`: one live content
  * block; `joined`: a recorded turn (see splitThinking).
+ *
+ * Memoized: the chat re-renders on every keystroke and SSE event; an
+ * unchanged body (streamed blocks, the pending bubbles) is skipped.
  */
-export function MessageBody({ body, reply, sessionId, onQuote, thinking }:
+export const MessageBody = memo(function MessageBody({ body, reply, sessionId, onQuote, thinking }:
   { body: string; reply?: ReplyContext; sessionId: string; onQuote?: () => void; thinking?: "block" | "joined" }) {
   const [viewing, setViewing] = useState<string>();
   const segments = thinking ? splitThinking(body, thinking) : [{ kind: "reply" as const, text: body }];
@@ -27,7 +30,7 @@ export function MessageBody({ body, reply, sessionId, onQuote, thinking }:
       : <ReplyParts key={`r${at}`} body={segment.text} sessionId={sessionId} onView={setViewing} />)}
     {viewing && <Lightbox src={viewing} onClose={() => setViewing(undefined)} />}
   </>;
-}
+});
 
 function ReplyParts({ body, sessionId, onView }: { body: string; sessionId: string; onView: (src: string) => void }) {
   const setViewing = onView;
@@ -94,7 +97,7 @@ function ReplyQuote({ reply, onClick }: { reply: ReplyContext; onClick?: () => v
     <span className="block text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">{label}</span>
     <span className="line-clamp-2 text-[12.5px] leading-snug whitespace-pre-line text-muted-foreground">{reply.excerpt ?? "an earlier message"}</span>
   </>;
-  const className = "mb-2 block w-full rounded-md border-l-2 border-muted-foreground/40 bg-foreground/[0.04] py-1 pr-2 pl-2.5 text-left";
+  const className = "mb-2 block w-full rounded-r-md border-l-2 border-muted-foreground/40 bg-foreground/[0.04] py-1 pr-2 pl-2.5 text-left";
   return onClick
     ? <button type="button" onClick={onClick} title="Show the original message" className={cn(className, "cursor-pointer transition-colors hover:bg-foreground/[0.07]")}>{content}</button>
     : <div className={className}>{content}</div>;

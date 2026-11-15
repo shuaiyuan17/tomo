@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { request } from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -13,6 +13,8 @@ import { checkRequest, CsrfTokens } from "../src/web/security.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
 import { sendMessage } from "../web/src/api.js";
 import type { IncomingMessage } from "node:http";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
+import { CompressedAssets, pickEncoding } from "../src/web/static-assets.js";
 
 let root: string;
 let service: Awaited<ReturnType<typeof startWebHttp>>;
@@ -59,6 +61,7 @@ beforeEach(async () => {
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "compact") return channel.requestCompact();
       if (input.method === "stop") return channel.stopOwnerTurn();
+      if (input.method === "task-action") return channel.taskAction(input.sessionId, input.taskId, input.action);
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
@@ -215,6 +218,30 @@ describe("local HTTP boundary", () => {
     stop.mockResolvedValueOnce(false);
     expect(JSON.parse((await post(mutationHeaders())).text)).toEqual({ stopped: false });
   });
+  it("a task action needs CSRF, the epoch and the owner conversation, and reaches the task by its id", async () => {
+    const stop = vi.fn(async (_key: string, _taskId: string) => true);
+    const background = vi.fn(async (_key: string, _toolUseId: string) => true);
+    const { watchBus } = await import("../src/watch/bus.js");
+    (channel as unknown as { taskControl: unknown }).taskControl = { stop, background };
+    watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+      { taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: false, toolUseId: "toolu_1", startedAt: 1 }] });
+    const post = (path: string, headers: Record<string, string | undefined> = mutationHeaders()) =>
+      call(`/api/v1/sessions/${path}`, { method: "POST", headers, body: "{}" });
+    const own = `${bootstrap.ownerId}/tasks/a1`;
+    expect((await post(`${own}/stop`, { ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
+    expect((await post(`${own}/stop`, { ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
+    const group = bootstrap.sessions.find((s) => s.id !== bootstrap.ownerId)!;
+    const refused = await post(`${group.id}/tasks/a1/stop`);
+    expect(refused.status).toBe(403); expect(JSON.parse(refused.text)).toEqual({ error: "owner_dm_only" });
+    expect((await post(`${own}/kill`)).status).toBe(404);
+    expect((await post(`${bootstrap.ownerId}/tasks/zz/stop`)).status).toBe(404);
+    expect(stop).not.toHaveBeenCalled();
+    const moved = await post(`${own}/background`);
+    expect(moved.status).toBe(200); expect(JSON.parse(moved.text)).toEqual({ done: true });
+    expect(background).toHaveBeenCalledWith("dm:owner", "toolu_1");
+    expect(JSON.parse((await post(`${own}/stop`)).text)).toEqual({ done: true });
+    expect(stop).toHaveBeenCalledWith("dm:owner", "a1");
+  });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
       `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage"]) {
@@ -354,6 +381,69 @@ describe("local HTTP boundary", () => {
       const response = await call(path); expect(response.status).toBe(404); expect(response.text).not.toContain("private data");
     }
     expect((await call("/api/v1/messages", { method: "OPTIONS", headers: { origin: "https://evil.example" } })).status).toBe(403);
+  });
+  it("caches hashed assets for a year and compresses text once per version; index.html and icons stay no-store", async () => {
+    const raw = (path: string, encoding?: string) => new Promise<{ headers: IncomingMessage["headers"]; body: Buffer }>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: service.port, path, headers: { ...(encoding ? { "accept-encoding": encoding } : {}) } }, (res) => {
+        const parts: Buffer[] = []; res.on("data", (part: Buffer) => parts.push(part));
+        res.on("end", () => resolve({ headers: res.headers, body: Buffer.concat(parts) }));
+      });
+      req.on("error", reject); req.end();
+    });
+    const source = `export const text = ${JSON.stringify("tomo ".repeat(2_000))};`;
+    writeFileSync(join(root, "assets", "assets", "big-abc123.js"), source);
+    const br = await raw("/assets/big-abc123.js", "gzip, deflate, br");
+    expect(br.headers["content-encoding"]).toBe("br");
+    expect(br.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+    expect(br.headers.vary).toBe("accept-encoding");
+    expect(Number(br.headers["content-length"])).toBe(br.body.length);
+    expect(br.body.length).toBeLessThan(source.length / 10);
+    expect(brotliDecompressSync(br.body).toString()).toBe(source);
+    const gz = await raw("/assets/big-abc123.js", "gzip");
+    expect(gz.headers["content-encoding"]).toBe("gzip");
+    expect(gunzipSync(gz.body).toString()).toBe(source);
+    const plain = await raw("/assets/big-abc123.js");
+    expect(plain.headers["content-encoding"]).toBeUndefined();
+    expect(plain.body.toString()).toBe(source);
+    // The security headers still go out with a cached asset.
+    expect(plain.headers["content-security-policy"]).toContain("script-src 'self'");
+    // A rebuilt file under the same name is not served from the stale compressed copy.
+    writeFileSync(join(root, "assets", "assets", "big-abc123.js"), source + "\n// rebuilt");
+    expect(brotliDecompressSync((await raw("/assets/big-abc123.js", "br")).body).toString()).toBe(source + "\n// rebuilt");
+    // Tiny files and already-compressed formats go out as they are.
+    expect((await raw("/assets/app-test.js", "br")).headers["content-encoding"]).toBeUndefined();
+    for (const path of ["/", "/favicon.svg", "/manifest.webmanifest"]) {
+      expect((await raw(path, "br")).headers["cache-control"]).toBe("no-store");
+    }
+  });
+  it("warms the bundle's brotli copies at startup, regular files only", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-web-warm-")); mkdirSync(join(dir, "assets"));
+    const source = "x".repeat(4_000);
+    writeFileSync(join(dir, "assets", "app-1.js"), source); writeFileSync(join(dir, "index.html"), source);
+    writeFileSync(join(dir, "elsewhere.js"), source); symlinkSync(join(dir, "elsewhere.js"), join(dir, "assets", "link-1.js"));
+    const cache = new CompressedAssets();
+    await cache.warm(dir);
+    const version = (path: string) => { const stat = statSync(join(dir, path)); return `${stat.size}:${stat.mtimeMs}`; };
+    // Already compressed: the bytes passed now are not what is returned.
+    for (const path of ["assets/app-1.js", "index.html"]) {
+      expect(brotliDecompressSync(await cache.get(path, version(path), "br", Buffer.from("other"))).toString()).toBe(source);
+    }
+    expect(brotliDecompressSync(await cache.get("assets/link-1.js", version("assets/link-1.js"), "br", Buffer.from("other"))).toString()).toBe("other");
+    await cache.warm(join(dir, "missing"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  it("negotiates brotli, then gzip, honouring q=0", () => {
+    expect(pickEncoding("gzip, deflate, br, zstd")).toBe("br");
+    expect(pickEncoding("gzip;q=1.0, br;q=0")).toBe("gzip");
+    expect(pickEncoding("GZIP")).toBe("gzip");
+    expect(pickEncoding("br ;q=1")).toBe("br");
+    expect(pickEncoding("gzip, br ;q=0")).toBe("gzip");
+    expect(pickEncoding("*")).toBe("br");
+    expect(pickEncoding("*;q=0, gzip")).toBe("gzip");
+    expect(pickEncoding("identity")).toBeUndefined();
+    expect(pickEncoding("br;q=0, gzip;q=0")).toBeUndefined();
+    expect(pickEncoding(undefined)).toBeUndefined();
+    expect(pickEncoding("")).toBeUndefined();
   });
   it("sends an SSE snapshot and live completed blocks without a browser read acknowledgment", async () => {
     const requestId = randomUUID();

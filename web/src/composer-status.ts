@@ -23,7 +23,8 @@ export function requestStamp(latest: WebRequest | undefined): string {
 }
 
 /** A one-off note from the page (sending, a refusal, a failed check), and the request stamp it was written at. */
-export interface ComposerNote { text: string; at: string }
+/** `warn`: the note says something failed (shown in the destructive colour, `text-destructive`). */
+export interface ComposerNote { text: string; at: string; warn?: boolean }
 
 /** A turn status as the page holds it: `at` is when it arrived (local clock). */
 export interface TurnStatus { status: WebTurnStatus; at: number }
@@ -143,6 +144,25 @@ export function composerStatus(input: {
   if (!latest) return "";
   if (latest.state === "running" && detail) return `${labels.running} ${detail}`;
   return labels[latest.state];
+}
+
+/** Request states the status line shows as a problem. */
+const PROBLEM_STATES = new Set<WebRequest["state"]>(["failed", "refused", "unknown", "interrupted"]);
+
+/**
+ * Whether the line composerStatus shows for the same input reports a
+ * problem (shown in the destructive colour): a note marked `warn`, a typed
+ * error or an unanswered refusal, or a failed / refused / unknown /
+ * interrupted request. Progress, "Stopped" and "Completed" never are.
+ */
+export function composerStatusIsProblem(input: Parameters<typeof composerStatus>[0]): boolean {
+  const { latest } = input;
+  if (input.activity) return false;
+  if (input.note.text && input.note.at === requestStamp(latest)) return !!input.note.warn;
+  if (latest?.state === "completed" && input.settled === latest.requestId) return false;
+  const status = latest?.state === "queued" || latest?.state === "running" ? undefined : input.turn?.status;
+  if (status && turnOutcome(input.turn)) return status.kind === "error" || (status.kind === "refusal" && !status.fallbackModel);
+  return !!latest && PROBLEM_STATES.has(latest.state);
 }
 
 /**

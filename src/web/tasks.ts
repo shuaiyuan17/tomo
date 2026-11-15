@@ -131,6 +131,7 @@ export class TaskBoard {
         description: clip(task.taskType === "local_bash" ? redactCommand(task.description) : task.description, 200),
         ...(task.parentTaskId && TASK_ID.test(task.parentTaskId) ? { parentTaskId: task.parentTaskId } : {}),
         ambient: task.ambient,
+        ...(task.background ? { background: true as const } : {}),
         startedAt: task.startedAt,
         // The end report can arrive while the task is still in the SDK's set.
         state: reported ?? "running",

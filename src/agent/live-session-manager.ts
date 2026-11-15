@@ -236,6 +236,18 @@ export class LiveSessionManager {
       || this.liveSessionCreates.has(key) || this.sessionHolds.has(key);
   }
 
+  /** Stop one task of the key's live session (never creates one). */
+  async stopTask(key: string, taskId: string): Promise<boolean> {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() ? live.stopTask(taskId) : false;
+  }
+
+  /** Move the foreground task a tool call started to the background (never creates a session). */
+  async backgroundTask(key: string, toolUseId: string): Promise<boolean> {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() ? live.backgroundTask(toolUseId) : false;
+  }
+
   /** A shell/Monitor task's output tail from the key's live session; never creates one. */
   async taskOutput(key: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     const live = this.liveSessions.get(key);

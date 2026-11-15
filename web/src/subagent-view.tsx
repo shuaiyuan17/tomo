@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
-import type { SubagentBrief, SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
+import { ArrowLeft, ArrowDownToLine, Square } from "lucide-react";
+import type { SubagentBrief, SubagentPage, TaskAction, TaskOutput, WebTask } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
@@ -25,8 +25,41 @@ import { useAgentName } from "./agent-name.js";
 
 type Status = "loading" | "ready" | "missing" | "error" | "gone";
 
-/** Read-only view of one task: a subagent's transcript, or a shell's output tail. */
-export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => void }) {
+/** How the task view acts on a task: the owner conversation's id, and the call that does it. */
+export interface TaskControl { ownerId: string | undefined; act: (task: WebTask, action: TaskAction) => Promise<boolean> }
+
+const ACTION_FAILED: Record<TaskAction, string> = {
+  stop: "Couldn't stop it. It may have just finished.",
+  background: "Couldn't move it. It may have finished, or is no longer in the foreground.",
+};
+
+/**
+ * Stop, and (for a task the turn is waiting on) Move to background. Shown only for a running task
+ * of the owner conversation; the row itself changes when the daemon reports the new state, so a
+ * success needs no message here.
+ */
+function TaskControls({ task, control }: { task: WebTask; control: TaskControl }) {
+  const [busy, setBusy] = useState<TaskAction>();
+  const [failed, setFailed] = useState<TaskAction>();
+  const run = (action: TaskAction) => {
+    setBusy(action); setFailed(undefined);
+    void control.act(task, action).then((done) => { if (!done) setFailed(action); }, () => setFailed(action)).finally(() => setBusy(undefined));
+  };
+  const button = "h-7 gap-1.5 rounded-lg px-2 text-[12px] text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground";
+  return <div className="mb-2 px-1">
+    <div className="flex flex-wrap items-center gap-1">
+      {!task.background && <Button variant="ghost" size="sm" disabled={!!busy} onClick={() => run("background")} className={button}
+        title="Tomo stops waiting for it; it keeps running and reports back when it is done">
+        <ArrowDownToLine className="size-3.5" strokeWidth={1.75} />Move to background</Button>}
+      <Button variant="ghost" size="sm" disabled={!!busy} onClick={() => run("stop")} className={button}>
+        <Square className="size-3 fill-current" strokeWidth={1.75} />Stop task</Button>
+    </div>
+    {failed && <p role="status" className="m-0 mt-1 px-1.5 text-[11px] leading-snug text-muted-foreground">{ACTION_FAILED[failed]}</p>}
+  </div>;
+}
+
+/** One task: a subagent's transcript, or a shell's output tail; a running owner task can be stopped or moved to the background. */
+export function SubagentView({ task, onBack, control }: { task: WebTask; onBack: () => void; control?: TaskControl }) {
   const base = `/sessions/${task.sessionId}/tasks/${encodeURIComponent(task.taskId)}`;
   const running = task.state === "running";
   return <section className="flex min-h-0 flex-1 flex-col" aria-labelledby="subagent-heading">
@@ -38,8 +71,9 @@ export function SubagentView({ task, onBack }: { task: WebTask; onBack: () => vo
     <div className="mb-3 px-2.5">
       <h2 id="subagent-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]">{isShellTask(task.taskType) ? <ShellPill command={task.description} className="text-[12.5px]" />
         : <>{task.description || "Untitled task"}<ModelBadge model={task.model} className="align-[2px]" /></>}</h2>
-      <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <span className="shimmer">Working</span> : STATE_LABELS[task.state]}</p>
+      <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <><span className="shimmer">Working</span>{task.background && " · background"}</> : STATE_LABELS[task.state]}</p>
     </div>
+    {running && control && task.sessionId === control.ownerId && <TaskControls task={task} control={control} />}
     {isShellTask(task.taskType) && <CommandBrief base={base} fallback={task.description} />}
     {!isOutputTask(task.taskType) && <Brief base={base} />}
     {task.summary && running && <p className="m-0 mx-2.5 mb-2 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">Now:</span> {task.summary}</p>}

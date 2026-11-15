@@ -21,7 +21,7 @@ import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
 import type { WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type WebStopResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
 /** A running tool's progress reaches the browser at most this often; the page counts in between. */
 export const TOOL_PROGRESS_EVERY_MS = 10_000;
@@ -103,6 +103,7 @@ export class WebChannel implements Channel {
   /** When a tool's progress was last sent to the browser, by tool_use id. */
   private toolProgressAt = new Map<string, number>();
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
+  private readonly taskControl: { stop: (sessionKey: string, taskId: string) => Promise<boolean>; background: (sessionKey: string, toolUseId: string) => Promise<boolean> } | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   private readonly models: WebModelAccess | undefined;
   private readonly sessionKeys: (() => readonly string[]) | undefined;
@@ -131,6 +132,8 @@ export class WebChannel implements Channel {
       taskOutput?: (sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>;
       /** A Bash tool call's full command from the live session, by tool_use id. */
       toolCommand?: (sessionKey: string, toolUseId: string) => string | undefined;
+      /** Stop one task, or move the foreground task a tool call started to the background. */
+      taskControl?: { stop: (sessionKey: string, taskId: string) => Promise<boolean>; background: (sessionKey: string, toolUseId: string) => Promise<boolean> };
       /** Queue an owner-requested compact of the given (owner) session; the agent runs it and reports back. */
       compact?: (sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner";
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
@@ -158,6 +161,7 @@ export class WebChannel implements Channel {
     this.stopTurn = options.stop;
     this.taskOutput = options.taskOutput;
     this.toolCommand = options.toolCommand;
+    this.taskControl = options.taskControl;
     this.compact = options.compact;
     this.taskModel = options.taskModel;
     this.outgoing = options.outgoingMedia;
@@ -356,6 +360,26 @@ export class WebChannel implements Channel {
     const value = await this.taskOutput?.(found.slot, taskId).catch(() => undefined);
     if (!value) throw new WebError(503, "task_output_unavailable");
     return { ...access, output: { output: value.output.slice(-16 * 1024), size: value.size } };
+  }
+
+  /**
+   * The owner acts on ONE running task from the task view: stop it, or move a foreground one to
+   * the background. Only a task the panel shows right now, and only in the owner conversation
+   * (groups stay read-only in the browser). `done: false` means the SDK did not take it — the
+   * task had just ended, or was no longer in the foreground; the next `tasks` event says which.
+   */
+  async taskAction(sessionId: string, taskId: string, action: TaskAction): Promise<WebTaskActionResult> {
+    const key = this.ownerKey();
+    if (!this.taskControl || !this.ownerId || !key) throw new WebError(409, "owner_setup_required");
+    const found = this.tasks.locate(sessionId, taskId);
+    if (!found) throw new WebError(404, "task_not_found");
+    if (sessionId !== this.ownerId || found.slot !== key) throw new WebError(403, "owner_dm_only");
+    if (found.task.state !== "running") throw new WebError(409, "task_not_running");
+    if (action === "stop") return { done: await this.taskControl.stop(found.slot, taskId).catch(() => false) };
+    if (found.task.background) throw new WebError(409, "task_already_background");
+    const toolUseId = this.tasks.toolUseOf(found.slot, taskId);
+    if (!toolUseId) throw new WebError(409, "task_not_backgroundable");
+    return { done: await this.taskControl.background(found.slot, toolUseId).catch(() => false) };
   }
 
   /**

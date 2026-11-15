@@ -5,14 +5,17 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { measureExit, useAppeared, useExiting } from "./motion.js";
-import { SubagentView } from "./subagent-view.js";
+import { SubagentView, type TaskControl } from "./subagent-view.js";
 import { isShellTask, shellShortName } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
 import { ModelBadge } from "./model-badge.js";
 import { type TaskRow, buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
 
-/** Read-only: shows what is running, never offers to stop it. */
-export function TasksPanel({ tasks, sessions, onClose, footer }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode }) {
+/**
+ * Shows what is running. The list itself offers nothing to act on; an opened task of the owner
+ * conversation can be stopped or moved to the background (`control`, see TaskControls).
+ */
+export function TasksPanel({ tasks, sessions, onClose, footer, control }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl }) {
   const [showAmbient, setShowAmbient] = useState(false);
   /** Open "N shell commands done" rows, per session and parent. */
   const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
@@ -39,7 +42,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer }: { tasks: WebTas
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>
-    <SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} onBack={() => { setCameBack(true); setOpened(undefined); }} />
+    <SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} />
   </div>;
   return <section className={cn("flex min-h-0 flex-1 flex-col", cameBack && "motion-from-left")} aria-labelledby="tasks-heading">
     <div className="mb-1.5 flex items-center justify-between gap-3 pr-1 pl-2.5">
@@ -74,7 +77,8 @@ function TaskCard({ task, depth, now, onOpen, motion }: { task: WebTask; depth: 
       <div className="flex min-w-0 items-baseline justify-between gap-2.5">
         {shell ? <span className="min-w-0"><ShellPill command={task.description} /></span>
           : <span className="text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{task.description || "Untitled task"}<ModelBadge model={task.model} /></span>}
-        {running && <span className="shrink-0 tracking-[0.02em] text-[10px] text-muted-foreground tabular-nums opacity-75">{time}</span>}
+        {running && <span className="shrink-0 tracking-[0.02em] text-[10px] text-muted-foreground tabular-nums opacity-75">
+          {task.background && <span data-testid="task-background" title="Keeps running after Tomo has replied">background · </span>}{time}</span>}
       </div>
       <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
         {running ? <><span className="shimmer">Working</span>{step && <> · {step}</>}</> : <>{STATE_LABELS[task.state]} · {time}</>}

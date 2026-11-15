@@ -62,6 +62,16 @@ describe("TaskBoard", () => {
     b.dispose();
   });
 
+  it("says which tasks are in the background, and follows a foreground one that is moved there", () => {
+    const { b } = board();
+    b.apply("s", [task("bg"), task("fg", { background: false })]);
+    expect(b.snapshot().find((t) => t.taskId === "bg")).toMatchObject({ background: true });
+    expect(b.snapshot().find((t) => t.taskId === "fg")).not.toHaveProperty("background");
+    b.apply("s", [task("bg"), task("fg", { background: true })]);
+    expect(b.snapshot().find((t) => t.taskId === "fg")).toMatchObject({ background: true });
+    b.dispose();
+  });
+
   it("keeps the ambient flag; the snapshot is compact and complete; the board is capped across sessions", () => {
     const { b } = board();
     b.apply("s", [task("w", { ambient: true, summary: "progress text" }), task("x", { description: "d".repeat(200) })]);

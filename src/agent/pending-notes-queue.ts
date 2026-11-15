@@ -26,7 +26,8 @@ function pendingErrorChars(notes: string[]): number {
  * losing it to the cap would lose the message.
  */
 function isPinnedNote(note: string): boolean {
-  return note.startsWith('<tomo-event type="inbox"');
+  // `includes`, not `startsWith`: a restored prefix bundles several notes.
+  return note.includes('<tomo-event type="inbox"');
 }
 
 /** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */

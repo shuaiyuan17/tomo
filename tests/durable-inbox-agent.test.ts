@@ -470,9 +470,10 @@ describe("durable inbox: the interrupted-turn note takes custody", () => {
     await third.agent.stop();
   });
 
-  it("quotes every message in full up to 8000 characters, with saved attachment paths", async () => {
+  it("quotes every message in full, however long, with saved attachment paths", async () => {
     const first = await boot(60_000);
-    const long = `${"y".repeat(7_990)}TAIL`;
+    // Far past one note part: split across parts, never shortened.
+    const long = `HEAD${"y".repeat(39_990)}TAIL`;
     await first.channel.simulateMessage(makeMsg({ id: "q0", chatId: "582", text: long }));
     for (let i = 1; i <= 11; i++) await first.channel.simulateMessage(makeMsg({ id: `q${i}`, chatId: "582", text: `msg number ${i}` }));
     await first.channel.simulateMessage(makeMsg({
@@ -486,7 +487,9 @@ describe("durable inbox: the interrupted-turn note takes custody", () => {
 
     const second = await boot();
     const notes = peekPendingNotes(second.agent, "imessage:582").join("\n");
+    expect(notes).toContain("HEAD");
     expect(notes).toContain("TAIL");
+    expect(notes.match(/y/g)?.length ?? 0).toBeGreaterThanOrEqual(39_990);
     expect(notes).toContain("msg number 11");
     expect(notes).toContain("/tmp/tomo-test-photo.png");
     await second.agent.stop();
@@ -510,6 +513,67 @@ describe("durable inbox: start means the SDK took it", () => {
     const second = await boot();
     mockSdk.responseFn = async () => "replayed";
     await waitFor(() => expect(second.channel.delivered.map((d) => d.text)).toEqual(["replayed"]));
+    await second.agent.stop();
+  });
+});
+
+describe("durable inbox: a turn that ends before the model sees it", () => {
+  it("leaves the message for replay and keeps the interrupted note", async () => {
+    const first = await boot();
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: "nb1", chatId: "590", text: "first ask" }));
+    await waitFor(() => expect(turns).toBe(1));
+    crash(first.agent);
+
+    // Second run: the next turn cannot even build its session.
+    const second = await boot();
+    const internals = second.agent as unknown as { mcpOAuthManager: { buildServersWithAuth: (...a: unknown[]) => Promise<unknown> } };
+    internals.mcpOAuthManager.buildServersWithAuth = async () => { throw new Error("session build failed"); };
+    await second.channel.simulateMessage(makeMsg({ id: "nb2", chatId: "590", text: "second ask" }));
+    await waitFor(() => expect(second.channel.delivered.length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 30));
+    // Never reached the model: neither the message nor the note is consumed.
+    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["nb2", "received"]]);
+    expect(peekPendingNotes(second.agent, "imessage:590").join("\n")).toContain("first ask");
+    crash(second.agent);
+
+    const third = await boot();
+    mockSdk.responseFn = async () => "both answered";
+    await waitFor(() => expect(third.channel.delivered.map((d) => d.text)).toContain("both answered"));
+    const prompt = mockSdk.promptsBySession.filter((p) => p.sessionKey === "imessage:590").map((p) => p.text).join("\n");
+    expect(prompt).toContain("first ask");
+    expect(prompt).toContain("second ask");
+    await third.agent.stop();
+  });
+});
+
+describe("durable inbox: deliberate pauses do not consume", () => {
+  it("a message dropped during /restore is answered after the restart", async () => {
+    const first = await boot();
+    (first.agent as unknown as { commands: { restoringConfig: boolean } }).commands.restoringConfig = true;
+    await first.channel.simulateMessage(makeMsg({ id: "rs1", chatId: "591", text: "during restore" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["rs1", "received"]]);
+    crash(first.agent);
+
+    const second = await boot();
+    mockSdk.responseFn = async () => "after restore";
+    await waitFor(() => expect(second.channel.delivered.map((d) => d.text)).toEqual(["after restore"]));
+    await second.agent.stop();
+  });
+
+  it("a turn graceful shutdown cuts short is surfaced on the next start, like a crash", async () => {
+    const first = await boot();
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: "gs1", chatId: "592", text: "halfway there" }));
+    await waitFor(() => expect(turns).toBe(1));
+    await first.agent.stop();
+    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["gs1", "started"]]);
+
+    const second = await boot();
+    expect(peekPendingNotes(second.agent, "imessage:592").join("\n")).toContain("halfway there");
     await second.agent.stop();
   });
 });

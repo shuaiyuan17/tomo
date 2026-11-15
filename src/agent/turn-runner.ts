@@ -258,6 +258,8 @@ export interface TurnSpec {
   shutdownInterrupted?: boolean;
   /** The prompt reached the SDK's input queue (see MessageRequest.onPromptHandedOff). */
   onPromptHandedOff?: () => void;
+  /** Set once the SDK has taken this turn's prompt (notes included). */
+  promptTaken?: boolean;
   requestId?: string;
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
@@ -453,7 +455,13 @@ export class TurnRunner {
       return ok;
     } finally {
       if (!declined) {
-        if (notes) this.deps.settlePendingNotes?.(spec.key, notes);
+        // Notes are consumed only if the prompt carrying them reached the
+        // model. A turn that ended before that (session build failed, refused
+        // for shutdown) puts them back for the next turn instead.
+        if (notes) {
+          if (spec.promptTaken) this.deps.settlePendingNotes?.(spec.key, notes);
+          else this.deps.restorePendingNotes?.(spec.key, notes);
+        }
         this.deps.recordTurnOutcome?.(spec.key, ok);
         watchBus.publish({
           type: "turn.end",
@@ -518,7 +526,7 @@ export class TurnRunner {
           spec.handedOff = true;
           watchBus.publish({ type: "turn.handoff", sessionKey: spec.key, requestId: spec.requestId! });
         } } : {}),
-        ...(spec.onPromptHandedOff ? { onPromptHandedOff: spec.onPromptHandedOff } : {}),
+        onPromptHandedOff: () => { spec.promptTaken = true; spec.onPromptHandedOff?.(); },
         flushOnShutdown: sink.flushBlockTranscript,
         onShutdownInterrupted: () => { spec.shutdownInterrupted = true; spec.onShutdown?.("interrupted"); },
         ...(reply

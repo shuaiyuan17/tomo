@@ -42,7 +42,7 @@ import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
@@ -57,7 +57,7 @@ import { readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
-import type { CronTurnOptions, QueuedInboundWork, RewindOutcome, UserTurnRequest } from "./agent/agent-turn-types.js";
+import type { CronTurnOptions, InboxTurnHooks, QueuedInboundWork, RewindOutcome, UserTurnRequest } from "./agent/agent-turn-types.js";
 import { OwnerAdoption } from "./agent/owner-adoption.js";
 import { ContextNudger } from "./agent/context-nudger.js";
 import { RestartCoordinator } from "./agent/restart-coordinator.js";
@@ -867,16 +867,36 @@ export class Agent {
     // have acted — and the next start tells the session instead, quoting the
     // messages (see replayInbox).
     const inboxIds = inboxIdsOf(routed);
-    const onPromptHandedOff = inboxIds.length > 0 ? () => this.markInboxStarted(routedKey, inboxIds) : undefined;
+    const progress = { unconsumed: false, handedOff: false, cutShort: false };
+    const hooks: InboxTurnHooks | undefined = inboxIds.length > 0
+      ? {
+        notConsumed: () => { progress.unconsumed = true; },
+        cutShort: () => { progress.cutShort = true; },
+        onPromptHandedOff: () => { progress.handedOff = true; this.markInboxStarted(routedKey, inboxIds); },
+      }
+      : undefined;
     try {
       if (routed.length === 1) {
-        await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded, onPromptHandedOff);
+        await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded, hooks);
         return;
       }
-      await this.handleBatchedMessages(routed, steer, onPromptHandedOff);
+      await this.handleBatchedMessages(routed, steer, hooks);
     } finally {
       if (inboxIds.length > 0) {
-        if (steer) {
+        if (progress.unconsumed && !progress.handedOff) {
+          // A turn was set up for these but the prompt never reached the model
+          // (session build failed, refused for shutdown, a steer whose session
+          // died before the CLI pulled it). Not consumed, so not done: the
+          // record stays `received` and the next start answers it. Marking it
+          // done here would drop a message nobody ever saw.
+          log.warn({ sessionKey: routedKey, count: inboxIds.length }, "Durable inbox: turn ended before its prompt reached the model; left for replay on next start");
+        } else if (progress.cutShort) {
+          // Graceful shutdown stopped this turn mid-flight: the reply may be
+          // missing or partial, exactly as after a crash. Left `started`, so
+          // the next start tells the session (quoting the messages) instead of
+          // the shutdown silently writing them off.
+          log.info({ sessionKey: routedKey, count: inboxIds.length }, "Durable inbox: turn cut short by shutdown; the next start tells the session");
+        } else if (steer) {
           // A steered message may have MERGED into another turn: its answer is
           // that turn's reply, which is delivered and recorded only when that
           // turn's own queue task finishes — after our STEER_MERGED resolves.
@@ -1258,6 +1278,8 @@ export class Agent {
     // cron or background turn on the same session is the owner's again and
     // does not inherit a summoned group's narrower scope.
     const turnId = this.turnAudiences.begin(req.key, req.audiences);
+    // Until the SDK takes the prompt, this turn has not consumed its messages.
+    req.inboxHooks?.notConsumed();
     try {
       await this.runUserTurnInner(req);
     } finally {
@@ -1339,7 +1361,10 @@ export class Agent {
       },
       silentMatcher: isSilentReply,
       transcript: "always",
-      ...(req.onPromptHandedOff ? { onPromptHandedOff: req.onPromptHandedOff } : {}),
+      ...(req.inboxHooks ? {
+        onPromptHandedOff: req.inboxHooks.onPromptHandedOff,
+        onShutdown: (kind: ShutdownTurnEnd) => { if (kind === "interrupted") req.inboxHooks?.cutShort(); },
+      } : {}),
       errors: {
         visiblePrefix: "[error] ",
         // Agent-error responses stream back like any text and are handled by
@@ -1358,10 +1383,13 @@ export class Agent {
     steer = false,
     receiptResolution?: SessionResolution,
     userRecorded = false,
-    onPromptHandedOff?: () => void,
+    inboxHooks?: InboxTurnHooks,
   ): Promise<void> {
     if (this.commands.isRestoring) {
       channel.settleMessage?.(message.id, "refused");
+      // /restore drops input until the restart it leads to. A durably held
+      // message is not dropped: it stays `received` and that restart answers it.
+      inboxHooks?.notConsumed();
       return;
     }
 
@@ -1475,7 +1503,7 @@ export class Agent {
         steer,
         steerAudience: audience,
         passiveListen: isPassiveGroup,
-        ...(onPromptHandedOff ? { onPromptHandedOff } : {}),
+        ...(inboxHooks ? { inboxHooks } : {}),
         ...(channel.name === "web" ? { webRequestId: message.id } : {}),
       });
     } catch (err) {
@@ -1534,7 +1562,7 @@ export class Agent {
   private async handleBatchedMessages(
     items: InboundItem[],
     steer = false,
-    onPromptHandedOff?: () => void,
+    inboxHooks?: InboxTurnHooks,
   ): Promise<void> {
     const last = items[items.length - 1];
     const lastChannel = last.channel;
@@ -1647,7 +1675,7 @@ export class Agent {
         ? `${it.channel.name}:${it.message.chatId}`
         : key)),
       passiveListen: isPassiveGroup,
-      ...(onPromptHandedOff ? { onPromptHandedOff } : {}),
+      ...(inboxHooks ? { inboxHooks } : {}),
     });
   }
 
@@ -2667,7 +2695,9 @@ export class Agent {
       const chunks = interruptedNoteChunks(recs);
       let persisted = true;
       chunks.forEach((chunk, i) => {
-        const part = chunks.length > 1 ? ` (part ${i + 1} of ${chunks.length})` : "";
+        const part = chunks.length > 1
+          ? ` (part ${i + 1} of ${chunks.length}; the quoted text continues across parts exactly where each one ends)`
+          : "";
         const ok = this.queuePendingNote(key, formatTomoEvent(
           "inbox",
           `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
@@ -2704,15 +2734,15 @@ export class Agent {
   }
 }
 
-/** Per-message cap on the text quoted in an `interrupted` note. */
-const INTERRUPTED_TEXT_MAX = 8_000;
-/** Above this many characters of quoted messages, the note is split into parts. */
+/**
+ * Size of one `interrupted` note part. Larger quoted text is split across
+ * parts — never truncated: the note is the message's only remaining copy.
+ */
 const INTERRUPTED_NOTE_CHUNK = 16_000;
 
-/** One interrupted message as quoted in the note: sender, text, saved attachments. */
+/** One interrupted message as quoted in the note, in full: sender, text, saved attachments. */
 function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): string {
-  const raw = rec.message.text ?? "";
-  const text = raw.length > INTERRUPTED_TEXT_MAX ? `${raw.slice(0, INTERRUPTED_TEXT_MAX)}… [truncated]` : raw;
+  const text = rec.message.text ?? "";
   const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
   const attachments = [...(rec.message.images ?? []), ...(rec.message.documents ?? [])]
     .map((a) => `\n  [attachment ${a.mediaType}: ${a.savedPath ?? "not saved"}]`).join("");
@@ -2720,22 +2750,16 @@ function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): s
 }
 
 /**
- * Every interrupted message, quoted, grouped into note-sized chunks. None is
- * left out: a message not quoted here is a message lost.
+ * Every interrupted message, quoted in full, cut into note-sized parts in
+ * order. A message longer than one part continues in the next. Nothing is
+ * left out or shortened: a character not quoted here is a character lost.
  */
-function interruptedNoteChunks(recs: readonly InboxRecord[]): string[] {
+export function interruptedNoteChunks(recs: readonly InboxRecord[], chunkSize = INTERRUPTED_NOTE_CHUNK): string[] {
+  // By code point, so a cut never splits a surrogate pair.
+  const all = Array.from(recs.map((rec, i) => formatInterruptedMessage(rec, i, recs.length)).join("\n"));
   const chunks: string[] = [];
-  let current = "";
-  recs.forEach((rec, i) => {
-    const entry = formatInterruptedMessage(rec, i, recs.length);
-    if (current && current.length + entry.length + 1 > INTERRUPTED_NOTE_CHUNK) {
-      chunks.push(current);
-      current = "";
-    }
-    current = current ? `${current}\n${entry}` : entry;
-  });
-  if (current) chunks.push(current);
-  return chunks;
+  for (let at = 0; at < all.length; at += chunkSize) chunks.push(all.slice(at, at + chunkSize).join(""));
+  return chunks.length > 0 ? chunks : [""];
 }
 
 /** Owner DMs about inbox faults: at most one per this window. */

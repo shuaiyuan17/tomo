@@ -10,6 +10,7 @@ import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
+import { OutgoingMediaError, type OutgoingMediaStore } from "../web/outgoing-media.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
@@ -53,6 +54,7 @@ export class WebChannel implements Channel {
   /** Model lookups in progress (or given up), per key and task. */
   private modelLookups = new Map<string, { key: string; taskId: string; runId: string | undefined; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
+  private readonly outgoing: OutgoingMediaStore | undefined;
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
@@ -85,6 +87,8 @@ export class WebChannel implements Channel {
       compact?: (sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner";
       /** Reads a subagent's model from its transcript (the SDK's task events carry none). */
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
+      /** Where pictures the agent sends are copied, so the browser can show them by id. */
+      outgoingMedia?: OutgoingMediaStore;
       /** Durable receipts; loaded here, before any request is accepted. */
       journal?: WebRequestJournal;
       /** Claude subscription usage for the Plan usage card (cached, debounced). */
@@ -94,6 +98,7 @@ export class WebChannel implements Channel {
     this.toolCommand = options.toolCommand;
     this.compact = options.compact;
     this.taskModel = options.taskModel;
+    this.outgoing = options.outgoingMedia;
     const now = options.now ?? Date.now;
     this.now = now;
     // Without registry access the catalog would pick the canonical key.
@@ -273,12 +278,25 @@ export class WebChannel implements Channel {
     if (this.tornDown || !this.ownerId || !receipt || receipt.settled || !["queued", "running", "failed"].includes(receipt.request.state)) {
       throw markDefiniteFailure(new Error("Web outlet unavailable"));
     }
-    if (message.photo || message.sticker) {
-      this.state(requestId, "failed");
-      throw markDefiniteFailure(new Error("Web attachments are not supported"));
+    // A picture (MEDIA:<path>, or a path STICKER:) is copied into the
+    // outgoing store and shown by id; the path never reaches the browser.
+    // A Telegram sticker file_id has nothing to show here: only its caption goes.
+    const picture = message.photo ?? (message.sticker && /^[/~]/.test(message.sticker) ? message.sticker : undefined);
+    let images: string[] | undefined;
+    if (picture) {
+      const sessionKey = this.ownerKey();
+      if (!this.outgoing || !sessionKey) throw markDefiniteFailure(new Error("Web attachments are not supported"));
+      try {
+        images = [this.outgoing.file(sessionKey, [requestId, receipt.request.responseTurnId ?? ""], picture).id];
+      } catch (err) {
+        // Not shown (private, not an image, too large, gone): the picture is
+        // definitely undelivered; the pipeline still sends its caption as text.
+        throw markDefiniteFailure(err instanceof OutgoingMediaError ? new Error(`Web attachment refused: ${err.code}`) : err);
+      }
     }
+    if (!message.text && !images) return;
     const block: Extract<WebEvent, { type: "block" }> = { type: "block", sessionId: this.ownerId,
-      requestId, turnId: receipt.request.responseTurnId, id: `${requestId}:${this.blocks.length}`, text: message.text };
+      requestId, turnId: receipt.request.responseTurnId, id: `${requestId}:${this.blocks.length}`, text: message.text, ...(images ? { images } : {}) };
     const bytes = Buffer.byteLength(JSON.stringify(block));
     // The rest of the snapshot frame is reserved for receipts and the task
     // panel, whose worst case is fixed, so the snapshot never truncates it.

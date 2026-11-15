@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FileIcon, ImageIcon, X } from "lucide-react";
 import { Text } from "./markdown.js";
-import { splitAttachments } from "./attachments.js";
+import { splitMessage } from "./attachments.js";
 import type { ReplyContext } from "./reply.js";
 import { cn } from "@/lib/utils";
 
@@ -15,8 +15,12 @@ export function MessageBody({ body, reply, sessionId, onQuote }:
   const [viewing, setViewing] = useState<string>();
   return <>
     {reply && <ReplyQuote reply={reply} onClick={onQuote} />}
-    {splitAttachments(body).map((part, index) => {
+    {splitMessage(body).map((part, index) => {
       if (part.kind === "text") return <Text key={index} breaks>{part.text}</Text>;
+      if (part.kind === "sent") return <div key={index} className="my-1.5 flex flex-wrap gap-2">
+        {part.ids.map((id, i) => id ? <Thumbnail key={`${id}:${i}`} src={sentUrl(sessionId, id)} sticker={false} onOpen={() => setViewing(sentUrl(sessionId, id))} />
+          : <Placeholder key={`gone${i}`} label="Image (no longer available)" />)}
+      </div>;
       if (part.kind === "images") return <div key={index} className="my-1.5 flex flex-wrap gap-2">
         {part.paths.map((path) => <Thumbnail key={path} src={mediaUrl(sessionId, path)} sticker={part.sticker} onOpen={() => setViewing(mediaUrl(sessionId, path))} />)}
         {Array.from({ length: part.missing }, (_, i) => <Placeholder key={`m${i}`} />)}
@@ -29,6 +33,7 @@ export function MessageBody({ body, reply, sessionId, onQuote }:
   </>;
 }
 
+const sentUrl = (sessionId: string, id: string) => `/api/v1/sessions/${sessionId}/outgoing/${id}`;
 const mediaUrl = (sessionId: string, path: string) => `/api/v1/sessions/${sessionId}/media?path=${encodeURIComponent(path)}`;
 
 function Thumbnail({ src, sticker, onOpen }: { src: string; sticker: boolean; onOpen: () => void }) {
@@ -40,9 +45,9 @@ function Thumbnail({ src, sticker, onOpen }: { src: string; sticker: boolean; on
       className={cn("block max-h-[280px] max-w-[280px] object-contain", sticker && "max-h-[140px] max-w-[140px]")} /></button>;
 }
 
-function Placeholder() {
-  return <span className="inline-flex h-16 w-24 flex-col items-center justify-center gap-1 rounded-xl border bg-muted/50 text-[11px] text-muted-foreground">
-    <ImageIcon className="size-4" aria-hidden="true" />Image</span>;
+function Placeholder({ label = "Image" }: { label?: string }) {
+  return <span className={cn("inline-flex h-16 flex-col items-center justify-center gap-1 rounded-xl border bg-muted/50 px-3 text-[11px] text-muted-foreground", label === "Image" && "w-24")}>
+    <ImageIcon className="size-4" aria-hidden="true" />{label}</span>;
 }
 
 /**

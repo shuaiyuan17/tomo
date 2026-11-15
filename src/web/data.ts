@@ -7,6 +7,9 @@ import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js
 import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey } from "../sessions/keys.js";
 import { webSessionId } from "./owner.js";
 import { isImageFiledFor } from "../channels/imageStore.js";
+import { sniffImageType } from "./image-type.js";
+import { OutgoingMediaStore, outgoingImagesDir } from "./outgoing-media.js";
+export { sniffImageType };
 import { WebError, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
@@ -76,16 +79,6 @@ const INBOUND_CHANNELS = new Set(["telegram", "imessage"]);
 /** Most images taken from one message (the UI shows "+N more" past this). */
 export const MAX_MESSAGE_IMAGES = 20;
 
-/** The image type a file's leading bytes declare (PNG, JPEG, GIF, WebP, HEIC), if any. SVG is never one. */
-export function sniffImageType(head: Buffer): string | undefined {
-  if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
-  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "image/jpeg";
-  if (head.length >= 6 && /^GIF8[79]a$/.test(head.subarray(0, 6).toString("latin1"))) return "image/gif";
-  if (head.length >= 12 && head.subarray(0, 4).toString("latin1") === "RIFF" && head.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
-  if (head.length >= 12 && head.subarray(4, 8).toString("latin1") === "ftyp" && /^(heic|heix|hevc|mif1|msf1)$/.test(head.subarray(8, 12).toString("latin1"))) return "image/heic";
-  return undefined;
-}
-
 /**
  * The meta.sessionKey values the channels file a session's inbound images
  * under (telegram.ts: `telegram_<chatId>`; imsg: `imessage_<chatGuid>`).
@@ -129,7 +122,9 @@ export class WebData {
   readonly memory?: MemoryReader;
   readonly cron: WebCron;
   readonly config?: WebConfigReader;
+  private readonly outgoing: OutgoingMediaStore;
   constructor(private readonly options: WebDataOptions) {
+    this.outgoing = new OutgoingMediaStore(options.workspaceDir ? outgoingImagesDir(options.workspaceDir) : undefined);
     if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
     if (options.tomoHome) this.config = new WebConfigReader(options.tomoHome);
     this.cron = new WebCron(options.cronStorePath);
@@ -222,6 +217,14 @@ export class WebData {
     finally { await file?.close(); }
   }
 
+  /** A picture the agent sent in a session the catalog shows, by its store id. */
+  outgoingFile(id: string, mediaId: string): { type: string; bytes: Buffer } {
+    const key = this.catalog().keys.get(id);
+    const file = key && this.outgoing.read(key, mediaId);
+    if (!file) throw new WebError(404, "media_not_found");
+    return file;
+  }
+
   /** The brief of a shown subagent (sessionKey from the daemon's task gate). */
   async subagentBrief(sessionKey: string, taskId: string): Promise<SubagentBrief> {
     const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir)
@@ -243,6 +246,10 @@ export class WebData {
       // this session's own channel chats (the image store's own naming).
       const allowed = this.media.get(id) ?? new Set<string>();
       const filedAs = imageSessionKeys(key, this.options.owner, id === this.catalog().ownerId);
+      // A picture the agent sent: its MEDIA:/STICKER: tag becomes the id it
+      // was filed under at delivery, or "gone" — the path never goes out.
+      page.messages = page.messages.map((message) => message.role !== "assistant" ? message
+        : { ...message, content: this.outgoing.rewrite(key, [message.requestId, message.turnId], message.content).content });
       for (const message of page.messages) {
         if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
         for (const path of imagePaths(message.content)) if (isImageFiledFor(basename(path), filedAs)) allowed.add(path);

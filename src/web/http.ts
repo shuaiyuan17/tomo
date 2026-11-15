@@ -65,7 +65,8 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     // An <img> cannot send our x-tomo-request header, so the media endpoint
     // (GET, read-only, cookie-authenticated like every API) instead requires
     // a same-origin image fetch: a hostile page's <img> is cross-site.
-    const mediaRequest = req.method === "GET" && /^\/api\/v1\/sessions\/[A-Za-z0-9_-]{43}\/media(\?|$)/.test(req.url ?? "");
+    // The same holds for a picture the agent sent (`/outgoing/<id>`).
+    const mediaRequest = req.method === "GET" && /^\/api\/v1\/sessions\/[A-Za-z0-9_-]{43}\/(?:media(?:\?|$)|outgoing\/[a-f0-9]{32}$)/.test(req.url ?? "");
     const origin = checkRequest(req, boundPort, api && !mediaRequest, externalOrigin);
     if (mediaRequest && (req.headers["sec-fetch-site"] !== "same-origin" || !["image", "empty"].includes(String(req.headers["sec-fetch-dest"] ?? "")))) {
       throw new WebError(403, "same_origin_required");
@@ -167,6 +168,13 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           if (!path || path.length > 1024) throw new WebError(400, "invalid_media");
           const file = await deps.data.mediaFile(media[1], path);
           res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store" });
+          res.end(file.bytes);
+          return;
+        }
+        const sent = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/outgoing\/([a-f0-9]{32})$/.exec(url.pathname);
+        if (sent) {
+          const file = deps.data.outgoingFile(sent[1], sent[2]);
+          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store", "x-content-type-options": "nosniff" });
           res.end(file.bytes);
           return;
         }

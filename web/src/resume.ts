@@ -30,3 +30,31 @@ export function repaint(element: HTMLElement | null | undefined): void {
   element.style.transform = "translateZ(0)";
   requestAnimationFrame(() => { element.style.transform = ""; });
 }
+
+type NudgeDoc = Pick<Document, "createElement" | "querySelectorAll"> & { body: Pick<HTMLElement, "appendChild"> };
+type NudgeView = Pick<Window, "scrollTo" | "scrollY" | "requestAnimationFrame">;
+
+/**
+ * Has Safari re-lay its own top-edge glass. On an iPhone Duo's cover screen,
+ * after switching back from another app, Safari draws that glass over the
+ * page header (apple.com too); a real scroll of the document clears it,
+ * scrolling an inner pane does not. The app's document never scrolls, so
+ * give it one extra pixel, scroll it by that pixel and back, then take the
+ * pixel away; and touch theme-color, which Safari also re-reads for its bars.
+ */
+export function nudgeBrowserChrome(doc: NudgeDoc = document, view: NudgeView = window): void {
+  const spacer = doc.createElement("div");
+  spacer.setAttribute("aria-hidden", "true");
+  spacer.style.cssText = "height:2px;width:1px;pointer-events:none";
+  doc.body.appendChild(spacer);
+  const top = view.scrollY;
+  view.scrollTo(0, top + 1);
+  const metas = [...doc.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')];
+  const colours = metas.map((meta) => meta.content);
+  for (const meta of metas) meta.content = meta.content.toUpperCase() === meta.content ? meta.content.toLowerCase() : meta.content.toUpperCase();
+  view.requestAnimationFrame(() => {
+    view.scrollTo(0, top);
+    metas.forEach((meta, i) => { meta.content = colours[i]!; });
+    view.requestAnimationFrame(() => spacer.remove());
+  });
+}

@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { stream } from "../web/src/api.js";
-import { onResume } from "../web/src/resume.js";
+import { nudgeBrowserChrome, onResume } from "../web/src/resume.js";
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
@@ -35,4 +35,27 @@ it("stream: gives up a connection that goes quiet (no heartbeat) instead of wait
   const outcome = expect(done).rejects.toThrow("Stream went quiet");
   await vi.advanceTimersByTimeAsync(1_500);
   await outcome;
+});
+
+it("nudgeBrowserChrome: scrolls the document by a pixel and back, touches theme-color, and leaves nothing behind", () => {
+  const frames: (() => void)[] = [];
+  const scrolls: number[] = [];
+  const children: { remove(): void }[] = [];
+  const metas = [{ content: "#f4efe6" }, { content: "#1e1c1b" }];
+  const seenColours: string[] = [];
+  const doc = {
+    createElement: () => { const el = { style: {} as Record<string, string>, setAttribute() {}, remove() { children.splice(children.indexOf(el), 1); } }; return el; },
+    querySelectorAll: () => metas,
+    body: { appendChild: (el: { remove(): void }) => { children.push(el); return el; } },
+  };
+  const view = { scrollY: 0, scrollTo: (_x: number, y: number) => { scrolls.push(y); seenColours.push(...metas.map((m) => m.content)); }, requestAnimationFrame: (cb: () => void) => { frames.push(cb); return frames.length; } };
+  nudgeBrowserChrome(doc as never, view as never);
+  expect(scrolls).toEqual([1]);
+  expect(children).toHaveLength(1);
+  expect(metas.map((m) => m.content)).not.toEqual(["#f4efe6", "#1e1c1b"]);
+  frames.shift()!();
+  expect(scrolls).toEqual([1, 0]);
+  expect(metas.map((m) => m.content)).toEqual(["#f4efe6", "#1e1c1b"]);
+  frames.shift()!();
+  expect(children).toHaveLength(0);
 });

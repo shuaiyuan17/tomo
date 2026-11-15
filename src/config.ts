@@ -252,6 +252,10 @@ export interface TomoConfig {
    *  minutes. Older ones are recorded in the transcript as not processed
    *  instead of being answered late. Default 360 (6 hours). */
   inboxReplayMaxAgeMinutes: number;
+  /** Keep a running list of each session's subagents and background commands
+   *  on disk (~/.tomo/data/running-agents.json), and on the next start tell
+   *  each session which ones a restart or crash cut off. Default true. */
+  interruptedAgents: boolean;
   /** Deliver the model's `thinking` content blocks to the chat alongside its
    *  `text` blocks. Default false.
    *
@@ -976,6 +980,10 @@ function buildConfig(): TomoConfig {
       nonNegativeInt,
       envVar("TOMO_INBOX_REPLAY_MAX_AGE_MINUTES") ?? file.inboxReplayMaxAgeMinutes,
       360,
+    ),
+    interruptedAgents: validated(
+      "interruptedAgents (TOMO_INTERRUPTED_AGENTS)", boolLike,
+      envVar("TOMO_INTERRUPTED_AGENTS") ?? file.interruptedAgents, true,
     ),
     showThinking: validated("showThinking (TOMO_SHOW_THINKING)", boolLike, envVar("TOMO_SHOW_THINKING") ?? file.showThinking, false),
     notifyOwnerOnSuppressedErrors: validated(

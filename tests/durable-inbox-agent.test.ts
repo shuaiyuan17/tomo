@@ -580,6 +580,31 @@ describe("durable inbox: deliberate pauses do not consume", () => {
   });
 });
 
+describe("durable inbox: an interrupted note whose turn ends on an API error", () => {
+  it("is not consumed by an error response (429) and rides the next turn", async () => {
+    const first = await boot();
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: "ae1", chatId: "594", text: "lost request" }));
+    await waitFor(() => expect(turns).toBe(1));
+    crash(first.agent);
+
+    const second = await boot();
+    mockSdk.responseFn = async () => "API Error: 429 rate limited";
+    await second.channel.simulateMessage(makeMsg({ id: "ae2", chatId: "594", text: "anyone?" }));
+    await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.text.includes("lost request") && p.text.includes("anyone?"))).toBe(true));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(peekPendingNotes(second.agent, "imessage:594").join("\n")).toContain("lost request");
+
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "answered now";
+    await second.channel.simulateMessage(makeMsg({ id: "ae3", chatId: "594", text: "retry" }));
+    await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.text.includes("lost request") && p.text.includes("retry"))).toBe(true));
+    await waitFor(() => expect(peekPendingNotes(second.agent, "imessage:594").join("\n")).not.toContain("lost request"));
+    await second.agent.stop();
+  });
+});
+
 describe("durable inbox: an interrupted note whose own turn is cut short", () => {
   it("is kept for the next start, marked as possibly partly answered", async () => {
     const first = await boot();

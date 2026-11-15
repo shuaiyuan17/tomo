@@ -46,6 +46,7 @@ export type TomoEventType =
   | "undelivered-reply" // the last turn ended on a reply written in a thinking block; say it as text
   | "web"              // browser-channel notice (name = interrupted)
   | "inbox"            // durable-inbox replay after a restart (name = replay|interrupted)
+  | "interrupted-agents" // subagents/background commands a restart or crash cut off
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

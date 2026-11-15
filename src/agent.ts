@@ -35,6 +35,7 @@ import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type TurnRe
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
+import { formatInterruptedAgentsNotice, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { describeSessionModel, switchSessionModel, type ModelSwitchOutcome } from "./agent/model-switch.js";
@@ -148,6 +149,9 @@ export class Agent {
    * could not be opened — the in-memory path then runs exactly as before.
    */
   private inbox: DurableInbox | undefined;
+  /** Subagents/background commands running per session, mirrored to disk (see running-agents-ledger.ts). */
+  private runningAgents: RunningAgentsLedger | undefined;
+  private detachRunningAgents: (() => void) | undefined;
   /** Throttle for reportInboxFault's owner DM. */
   private lastInboxFaultNoticeAt = 0;
   private delivery: DeliveryPipeline;
@@ -207,6 +211,21 @@ export class Agent {
         this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
       } catch (err) {
         log.error({ err }, "Durable inbox unavailable; inbound messages are held in memory only");
+      }
+    }
+    if (config.interruptedAgents) {
+      try {
+        this.runningAgents = new RunningAgentsLedger({
+          path: join(config.tomoHome, "data", "running-agents.json"),
+          resolveTranscriptPath: (sessionKey, taskId) => {
+            const sdkSessionId = this.sessions.getSdkSessionId(sessionKey);
+            return sdkSessionId ? join(config.sdkSessionsDir, sdkSessionId, "subagents", `agent-${taskId}.jsonl`) : undefined;
+          },
+          warn: (obj, msg) => log.warn(obj, msg),
+        });
+        this.detachRunningAgents = this.runningAgents.attach(watchBus);
+      } catch (err) {
+        log.warn({ err }, "Running-agents ledger unavailable; interrupted subagents will not be reported after a restart");
       }
     }
     this.delivery = new DeliveryPipeline({
@@ -2327,6 +2346,11 @@ export class Agent {
       // Replay is recovery, never a startup prerequisite.
       log.error({ err }, "Durable inbox replay failed");
     }
+    try {
+      this.notifyInterruptedAgents();
+    } catch (err) {
+      log.warn({ err }, "Could not report interrupted subagents");
+    }
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
@@ -2433,6 +2457,11 @@ export class Agent {
     // ends runs the deferred-restart check. From here on a restart request is
     // dropped rather than honoured, so `tomo stop` cannot be reversed by one.
     this.stopping = true;
+    // Before any session is closed: closing empties its task set, and what is
+    // still running now was interrupted, not finished.
+    this.runningAgents?.freeze();
+    this.detachRunningAgents?.();
+    this.detachRunningAgents = undefined;
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
@@ -2641,6 +2670,54 @@ export class Agent {
         { sessionKey: key, count: items.length },
         "Recorded inbound messages shutdown will not process",
       );
+    }
+  }
+
+  /**
+   * Tell each session which of its subagents and background commands the last
+   * restart or crash cut off — that session ONLY (never rerouted: an agent id
+   * is only addressable from the SDK session that started it). Nothing is
+   * resumed; the model decides.
+   *
+   * CUSTODY HAND-OFF, as for the durable inbox's `interrupted` note: the list
+   * goes into the durable pending-notes store, which keeps a note until a turn
+   * that TOOK it ran to its normal result (a turn that failed, was refused, or
+   * was cut short puts it back). Only once it is persisted there is the ledger
+   * entry dropped; a note that could not be persisted leaves the entry, so the
+   * next start tells the session again. A background turn is then queued so
+   * the note reaches the model now rather than at the next message.
+   */
+  private notifyInterruptedAgents(): void {
+    const ledger = this.runningAgents;
+    if (!ledger) return;
+    const known = new Set(this.sessions.listActiveEntries().map((e) => e.channelKey));
+    // A note an earlier start handed off but no turn finished with is still
+    // owed: give it its turn again now, not only at the next message.
+    const owed = new Set([...known].filter((key) =>
+      this.pendingNotesQueue.peekNotes(key).some((n) => n.includes('<tomo-event type="interrupted-agents"'))));
+    for (const [key, records] of ledger.pendingBySession()) {
+      if (!known.has(key)) {
+        log.warn({ sessionKey: key, count: records.length }, "Interrupted subagents belong to an unknown session; dropping the notice");
+        ledger.acknowledge(key);
+        continue;
+      }
+      if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records)))) {
+        log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
+        continue;
+      }
+      ledger.acknowledge(key);
+      owed.add(key);
+      log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
+    }
+    const prompt = formatTomoEvent(
+      "interrupted-agents",
+      "Startup check after a restart: if a note above lists interrupted subagents or commands, decide whether each is "
+        + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
+      { name: "check" },
+    );
+    for (const key of owed) {
+      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn"))
+        .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }
   }
 

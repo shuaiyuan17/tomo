@@ -574,8 +574,12 @@ export class TurnRunner {
     }
 
     // The turn reached its result (a shutdown cut is told apart by
-    // spec.shutdownInterrupted, set during the run).
-    spec.completed = true;
+    // spec.shutdownInterrupted, set during the run). An error-shaped response
+    // (`API Error: 429`, overloaded, a usage limit) returns normally too, but
+    // the model never handled the turn: its pending notes — a durable-inbox
+    // `interrupted` note, an `interrupted-agents` list — must go back, not be
+    // settled as consumed.
+    spec.completed = !isAgentErrorResponse(rawResponse);
 
     if (reply?.steer && rawResponse === STEER_MERGED) {
       // Steered message merged into the in-flight turn — that turn's owner

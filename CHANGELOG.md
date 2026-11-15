@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.13.0 (2026-11-14)
+
+### Behaviour changes
+
+- Group and summoned turns can no longer use `Monitor`, `Workflow`, `CronCreate`, `ScheduleWakeup` or `RemoteTrigger`; use sandboxed Bash, a foreground subagent or `schedule_create` instead (#464).
+- A cron run cut off by a restart, crash or kill is **never re-run automatically**. One-shots are parked (disabled), recurring jobs are recorded as `interrupted`, and the owner gets one DM listing them and any slots missed during downtime. This replaces the one-shot retry from 0.12.0 (#463).
+- A cron run that produces no text is recorded as `empty`, not `ok` (#502).
+- A turn that ends with no text is silent (logged as a warning) instead of sending "I'm not sure how to respond to that." (#502).
+- A failed reply block is no longer recorded as delivered. It is re-sent once only when the channel shows nothing went out; otherwise it is marked not delivered, unknown or partially delivered (#462).
+- Contact records match iMessage handles with the same strict normalizer as config and allowlists (E.164 numbers, `tel:`/`sms:`/`mailto:` dropped). Stored values are not rewritten and still match when unambiguous (#480).
+- The web UI calls the agent by its own name: `agent.name` in config, else the Name line in `IDENTITY.md`, else "Tomo" (#512).
+
+### Features
+
+- **Web UI redesign** (#483, #498, #500, #509): Tailwind v4 and shadcn/ui, a serif face for replies, subtle motion, and an app icon.
+- **Tasks rail** (#482, #485, #492, #495, #497, #505): running subagents and background shells; open one to read its transcript or output, with tool runs folded and the Brief pinned; upcoming cron jobs below. Resizable.
+- **The Study** (#489, #491): TODOs, memory, context, cron, MCP and config in one read-only panel (`memory/private/` is never shown). Cron jobs can be paused, resumed or deleted, with confirmation.
+- **Plan usage card** (#487) shows the Claude subscription's usage windows; a **Compact button** (#494) asks the agent to compact, disabled while tasks run.
+- **Screen** (#496): a read-only live view of the Mac's display in a floating window, captured only while the session is unlocked and never written to disk. **On by default on macOS** for the owner; it goes away with `web.enabled: false`.
+- **Images** (#493, #511, #513): channel and agent images show as thumbnails and iMessage reply quotes as cards; attach images by button, drag and drop or paste (unavailable when `saveInboundImages` is off).
+- **Inline tool calls** (#510): folded in the chat, with a jump-to-latest pill.
+- **Queued messages and steering** (#488): a sent message shows at once as Queued, Sent or Joined; in the owner DM it joins a running turn. Requests interrupted by a restart are marked and can be resent, never re-run.
+
+### Bug fixes
+
+- A leftover background-task result after a resume no longer ends the owner's request and loses the real reply (#502).
+- An Enter that confirms an IME candidate no longer sends the message (#490).
+- iMessage images still being written are waited for instead of read as a small preview (#460).
+- Web: one composer status line, resumed subagents keep their model badge, rendering fixes (#484, #501, #504).
+
+### Security
+
+- Private-memory guard bypasses closed: Unicode and case-folded path spellings, `..`-prefixed names, symlink-then-`..` paths, and private files sent as `STICKER:` (#464).
+
+### Other
+
+- Internal refactors with no behaviour change (#470, #471, #476, #477, #478, #479); test and docs cleanup (#469, #472, #473, #474, #475).
+
+### Dependencies
+
+- `@anthropic-ai/claude-agent-sdk` 0.3.319 → 0.3.325 (#458, #459, #461); additive type changes.
+- `minimatch` 11.0.5 → 11.0.8 (GHSA-cf2h-pxjq-68xw). `zod` stays pinned at 4.4.3 (#359); `croner` stays on 10.x.
+- Minor bumps: `eslint` 10.15.0; new web build deps (Tailwind, Radix, lucide); transitive refresh.
+
 ## 0.12.0 (2026-11-09)
 
 ### Features

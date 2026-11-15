@@ -233,6 +233,13 @@ export function sdkOptions(
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
     settingSources: [...SDK_SETTING_SOURCES],
     settings: {
+      // Tomo keeps its own memory (workspace/memory, written into the system
+      // prompt with private/ lines stripped for groups). The SDK's auto memory
+      // is a second, separate store under ~/.claude/projects/<cwd>/memory: it
+      // was injecting stale notes every turn (one of them wrong), would inject
+      // an unstripped index into group sessions if pointed at ours, and its
+      // extract/dream passes are gated by server flags we cannot see.
+      autoMemoryEnabled: false,
       attribution: {
         commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",

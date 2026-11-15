@@ -36,6 +36,18 @@ export function summarizeToolInput(name: string, input?: Record<string, unknown>
   return scrubSecretValues(describeToolInput(name, input));
 }
 
+/**
+ * A tool call's one-line title for a READER (the web UI's folded rows), where
+ * `summarizeToolInput` is for logs. The model writes a short description with
+ * every Bash command ("Run the test suite"); that says what the call was for
+ * better than the command does, and the command is one click away in the row.
+ * Everything else, and a Bash call without a description, keeps its summary.
+ */
+export function toolTitle(name: string, input?: Record<string, unknown>): string {
+  const description = name === "Bash" && typeof input?.description === "string" ? input.description.replace(/\s+/g, " ").trim() : "";
+  return description ? scrubSecretValues(description) : summarizeToolInput(name, input);
+}
+
 function describeToolInput(name: string, input?: Record<string, unknown>): string {
   if (!input) return name;
   switch (name) {

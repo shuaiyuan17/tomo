@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
 import { sep } from "node:path";
 import { scrubSecretValues } from "../redact.js";
-import { summarizeToolInput } from "../agent/tool-summary.js";
+import { toolTitle } from "../agent/tool-summary.js";
 import type { SubagentBrief, SubagentItem, SubagentPage } from "./protocol.js";
 import { mayBeAssistant, metaModels, parseEntry, reportUnreadable, subagentMetaFile, subagentTranscriptFile,
   type Block, type Entry, type Problem, type ResultPart } from "./sdk-transcript.js";
@@ -122,7 +122,7 @@ function itemsFromBlocks(entry: Extract<Entry, { kind: "message" }>, content: Bl
       const input = redact ? redact.input(raw, b.name) : raw;
       const inputText = clip(JSON.stringify(input, null, 2), IO_LIMIT);
       items.push({ kind: "tool", id, toolUseId: b.id ?? id, name: b.name.slice(0, 128),
-        summary: clip(summarizeToolInput(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
+        summary: clip(toolTitle(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
         ...(ts ? { ts } : {}), ...(redact?.reachesPrivate?.(b.name, raw) ? { privateOutput: true } : {}) });
     } else if (entry.role === "user" && b.type === "tool_result") {
       const result = resultText(b.parts);

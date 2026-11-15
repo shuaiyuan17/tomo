@@ -343,7 +343,7 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await browserExpect(transcript.getByText("Also check the README.")).toHaveCount(1);
   await browserExpect(transcript).toContainText("Message from Tomo");
   await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
-  await transcript.getByRole("button", { name: /2 tool calls · Read, Grep/ }).click();
+  await transcript.getByRole("button", { name: /Read a file, ran a search/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
   await browserExpect(transcript).toContainText("## 0.12.0 entries");
   await page.getByRole("button", { name: "Back to tasks" }).click();
@@ -522,11 +522,11 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
     line("user", t + 1_100, [{ type: "tool_result", tool_use_id: "c1", content: "## 0.12.0 entries" }]) +
     line("assistant", t + 2_000, [{ type: "tool_use", id: "c2", name: "Bash", input: { command: "GH_TOKEN=supersecret gh pr list" } }]) +
     line("user", t + 2_100, [{ type: "tool_result", tool_use_id: "c2", content: "#1 open" }]) +
-    line("assistant", t + 3_000, [{ type: "tool_use", id: "c3", name: "Bash", input: { command: "git status" } }]) +
+    line("assistant", t + 3_000, [{ type: "tool_use", id: "c3", name: "Bash", input: { command: "git status", description: "Check the working tree" } }]) +
     line("user", t + 3_100, [{ type: "tool_result", tool_use_id: "c3", content: "clean" }]));
   await page.reload();
   const history = page.getByLabel("Conversation history");
-  const summary = history.getByRole("button", { name: "3 tool calls · Bash ×2, Read" });
+  const summary = history.getByRole("button", { name: "Read a file, ran 2 commands" });
   await browserExpect(summary).toBeVisible();
   // Collapsed by default, between the request and the reply; the reply text is never folded.
   expect(await summary.evaluate((el) => {
@@ -544,6 +544,11 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
   await history.getByRole("button", { name: /gh pr list/ }).click();
   await browserExpect(history).toContainText("GH_TOKEN=•••");
   expect(await page.content()).not.toContain("supersecret");
+  // A command the model described is titled by that description; the command itself is inside.
+  await browserExpect(history.getByText("git status")).toHaveCount(0);
+  await history.getByRole("button", { name: "Check the working tree" }).click();
+  await browserExpect(history).toContainText("git status");
+  await page.screenshot({ path: "test-results/inline-tools-desktop.png" });
   // No separate "Bash · completed" line above the composer.
   watchBus.publish({ type: "tool.end", ts: Date.now(), sessionKey: "dm:owner", tool: "Bash", ok: true } as never);
   await page.waitForTimeout(300);

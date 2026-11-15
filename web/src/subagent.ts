@@ -213,12 +213,30 @@ export function groupRows(rows: ViewRow[]): ViewBlock[] {
   return blocks;
 }
 
-/** "7 tool calls · Read ×3, Bash ×2, Grep, Edit" (most used first, ties in order of first use). */
+/** What a tool call was, for counting: [verb, singular, plural]. Anything unlisted is "used N tools". */
+const TOOL_KINDS: Record<string, readonly [string, string, string]> = {
+  Bash: ["ran", "command", "commands"],
+  Read: ["read", "file", "files"],
+  Edit: ["edited", "file", "files"], Write: ["edited", "file", "files"], MultiEdit: ["edited", "file", "files"], NotebookEdit: ["edited", "file", "files"],
+  Grep: ["ran", "search", "searches"], Glob: ["ran", "search", "searches"],
+  WebSearch: ["looked up", "page", "pages"], WebFetch: ["looked up", "page", "pages"],
+  Agent: ["started", "subagent", "subagents"], Task: ["started", "subagent", "subagents"],
+};
+const OTHER_KIND = ["used", "tool", "tools"] as const;
+
+/** "Ran 5 commands, read 3 files, edited a file" — by what the calls did, in order of first use. */
 export function groupSummary(tools: ToolRow[]): string {
-  const counts = new Map<string, number>();
-  for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
-  const names = [...counts].sort((a, b) => b[1] - a[1]).map(([name, n]) => (n > 1 ? `${name} ×${n}` : name));
-  return `${tools.length} tool calls · ${names.join(", ")}`;
+  const counts = new Map<string, { kind: readonly [string, string, string]; n: number }>();
+  for (const tool of tools) {
+    const kind = TOOL_KINDS[tool.name] ?? OTHER_KIND;
+    const key = `${kind[0]} ${kind[1]}`;
+    const entry = counts.get(key) ?? { kind, n: 0 };
+    entry.n++;
+    counts.set(key, entry);
+  }
+  const parts = [...counts.values()].map(({ kind, n }) => `${kind[0]} ${n === 1 ? `${/^[aeiou]/.test(kind[1]) ? "an" : "a"} ${kind[1]}` : `${n} ${kind[2]}`}`);
+  const text = parts.join(", ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /**
@@ -231,12 +249,14 @@ export function groupOpen(choices: Readonly<Record<string, boolean>>, key: strin
 
 /**
  * A group's summary line, split so the running part can shimmer:
- * "5 tool calls · Read ×3, Bash" or, while a call is still running,
- * "5 tool calls · " + "Running Bash…".
+ * "Ran 5 commands, read 3 files" or, while a call is still running, what is
+ * done so far and then the running call by its title: "Ran 2 commands · " +
+ * "Run the test suite…".
  */
 export function groupLabel(tools: ToolRow[], pending?: ToolRow): { lead: string; running?: string } {
   if (!pending) return { lead: groupSummary(tools) };
-  return { lead: `${tools.length} tool calls · `, running: `Running ${pending.name}…` };
+  const done = tools.filter((tool) => tool !== pending);
+  return { lead: done.length ? `${groupSummary(done)} · ` : "", running: `${pending.summary || pending.name}…` };
 }
 
 /** The call still waiting for its result in a running group, if any. */

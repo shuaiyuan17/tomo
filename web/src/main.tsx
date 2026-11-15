@@ -96,6 +96,10 @@ function fitComposer(element: HTMLTextAreaElement | null) {
   element.style.height = "auto";
   element.style.height = `${Math.min(element.scrollHeight, COMPOSER_MAX_HEIGHT)}px`;
 }
+/** Home only: the conversation opened beside the room (#home-chat). */
+function storedHomeChatOpen(): boolean {
+  try { return localStorage.getItem("tomo-home-chat-open") === "1"; } catch { return false; }
+}
 function storedTasksOpen(): boolean {
   try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
 }
@@ -246,7 +250,24 @@ export function App() {
   const drawer = phone && menuOpen;
   const drawerMotion = useMountedFor(drawer);
   const closeMenu = (refocus = true) => { setMenuOpen(false); if (refocus) menuButton.current?.focus(); };
-  const modal = tasksModal || drawer;
+  // On Home the conversation (this same <main>, its stream and state) can open beside the room:
+  // a pinned column on wide screens, a modal layer over the room on narrow ones.
+  const [homeChatOpen, setHomeChatOpen] = useState(storedHomeChatOpen);
+  useEffect(() => {
+    try { localStorage.setItem("tomo-home-chat-open", homeChatOpen ? "1" : "0"); } catch { /* Storage can be unavailable. */ }
+  }, [homeChatOpen]);
+  const chatButton = useRef<HTMLButtonElement>(null);
+  const conversation = useRef<HTMLElement>(null);
+  const chatPanel = home && homeChatOpen;
+  const chatModal = chatPanel && overlay;
+  const closeChat = () => { setHomeChatOpen(false); chatButton.current?.focus(); };
+  const modal = tasksModal || drawer || chatModal;
+  // A dot on the button while the conversation is out of sight on Home and a reply has come since it was last on screen.
+  const lastMessage = history.messages.at(-1);
+  const [seenMessage, setSeenMessage] = useState<string>();
+  const chatInSight = (!study && !home) || chatPanel;
+  useEffect(() => { if (chatInSight || seenMessage === undefined) setSeenMessage(lastMessage?.id ?? ""); }, [chatInSight, lastMessage?.id]);
+  const chatUnread = home && !chatPanel && !!lastMessage && seenMessage !== undefined && lastMessage.id !== seenMessage && lastMessage.role === "assistant";
   useEffect(() => {
     if (!drawer) return;
     sidebar.current?.querySelector<HTMLElement>("button, a[href]")?.focus();
@@ -270,6 +291,24 @@ export function App() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [tasksModal]);
+  // The conversation beside the room: Escape closes it. Narrow, it is modal like the Tasks overlay
+  // (focus moves in and stays); wide, it is pinned and only takes the composer's focus on opening.
+  useEffect(() => {
+    if (!chatPanel) return;
+    // Narrow: the close button, so a phone's keyboard does not jump up over the room.
+    if (chatModal) conversation.current?.querySelector<HTMLElement>("[data-chat-close]")?.focus();
+    else if (!conversation.current?.contains(document.activeElement)) input.current?.focus({ preventScroll: true });
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || tasksModal || drawer) return;
+      if (event.key === "Escape") {
+        if (!chatModal && (event.target as Element | null)?.closest?.("[role=menu], [role=listbox], [role=dialog]")) return;
+        event.preventDefault(); closeChat(); return;
+      }
+      if (chatModal && event.key === "Tab" && conversation.current) trapTab(conversation.current, event);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [chatPanel, chatModal, tasksModal, drawer]);
   // Back from another app (or the back/forward cache): iOS Safari can hand
   // back a stale frame, the document nudged under its status bar (where
   // Safari blurs and dims whatever sits there) and a dimmed backdrop left
@@ -279,7 +318,7 @@ export function App() {
   const overlayNow = useRef(overlay); overlayNow.current = overlay;
   useEffect(() => onResume(() => {
     setMenuOpen(false);
-    if (overlayNow.current) setTasksOpen(false);
+    if (overlayNow.current) { setTasksOpen(false); setHomeChatOpen(false); }
     if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
     repaint(header.current);
   }), []);
@@ -511,7 +550,7 @@ export function App() {
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : home ? "#home" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : home ? "home" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : home ? "Skip to Home" : "Skip to conversation"}</a>
     <header ref={header} className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content compact:h-12 compact:gap-4 compact:px-5 compact:pt-[env(safe-area-inset-top)] compact:box-content">
       <Button ref={menuButton} variant="ghost" size="icon" aria-expanded={drawer} aria-controls="sidebar" title="Menu" aria-label="Menu: conversations, the Study, usage and theme"
-        onClick={() => { setTasksOpen(false); setMenuOpen((open) => !open); }}
+        onClick={() => { setTasksOpen(false); setHomeChatOpen(false); setMenuOpen((open) => !open); }}
         className="-ml-2.5 hidden size-11 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>
       <a className="flex shrink-0 items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px] compact:gap-1.5 compact:text-[22px] compact:tracking-[-1px]" href="/" aria-label="Tomo home">
         <Mark className="size-9 max-[600px]:size-7 compact:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
@@ -519,8 +558,14 @@ export function App() {
       {/* Phones have no sidebar on screen: Home, or a group being read, is named here. */}
       {(home || (!study && session?.kind === "group")) && <span className="hidden min-w-0 truncate border-l pl-3 text-[13px] text-muted-foreground max-[600px]:block" title={home ? undefined : session?.title}>{home ? "Home" : session?.title}</span>}
       <div className="ml-auto flex items-center gap-4 max-[600px]:gap-0.5">
+        {home && <Button ref={chatButton} variant="ghost" size="icon" aria-pressed={chatPanel} aria-controls="conversation" title="Conversation"
+          aria-label={`Conversation beside the room${chatUnread ? ", new message" : ""}`} onClick={() => { setMenuOpen(false); if (overlay) setTasksOpen(false); setHomeChatOpen((open) => !open); }}
+          className="relative size-10 rounded-xl text-foreground max-[600px]:size-11 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
+          <MessageCircle strokeWidth={1.75} />
+          {chatUnread && <span aria-hidden="true" data-testid="chat-unread" className="absolute top-1.5 right-1.5 size-2 rounded-full bg-primary ring-2 ring-background" />}
+        </Button>}
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
-          aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => { setMenuOpen(false); setTasksOpen((open) => !open); }}
+          aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => { setMenuOpen(false); if (overlay) setHomeChatOpen(false); setTasksOpen((open) => !open); }}
           className="relative size-10 rounded-xl text-foreground max-[600px]:size-11 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
           <ListChecks strokeWidth={1.75} />
           {running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{running > 99 ? "99+" : running}</span>}
@@ -539,7 +584,7 @@ export function App() {
         className="fixed inset-0 top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 transition-opacity dark:bg-black/45 duration-[220ms] data-[state=closed]:opacity-0" />}
       <aside ref={sidebar} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
         className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
-        aria-label="Conversation details" inert={tasksModal || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
+        aria-label="Conversation details" inert={tasksModal || chatModal || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5">
           {([[null, "Conversation", MessageCircle], ["home", "Home", House], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
             const current = target === null ? !study && !home : target === "home" ? home : !!study;
@@ -602,7 +647,19 @@ export function App() {
       {study && <ChunkBoundary what="The Study" className="min-h-0 min-w-0 flex-1"><Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} /></ChunkBoundary>}
       {home && <HomePage events={web.home} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} inert={modal} />}
-      <main id="conversation" hidden={!!study || home} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]" tabIndex={-1} inert={modal}>
+      {chatModal && <div aria-hidden="true" data-testid="chat-scrim" onClick={closeChat}
+        className="fixed inset-0 top-[72px] compact:top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 motion-enter dark:bg-black/45 max-[600px]:top-[calc(3rem+env(safe-area-inset-top))]" />}
+      <main ref={conversation} id="conversation" hidden={!!study || (home && !chatPanel)} {...dragProps} tabIndex={-1} inert={tasksModal || drawer}
+        {...(chatPanel ? { "aria-label": "Conversation", ...(chatModal ? { role: "dialog", "aria-modal": true } : {}) } : {})}
+        // Beside the room: a column on the right (the canvas re-fits to what is left, by its own ResizeObserver);
+        // narrow, a sheet over the room from the right, and on a phone a drawer up from the bottom.
+        className={chatPanel
+          ? "relative flex min-h-0 w-[400px] shrink-0 flex-col overscroll-contain border-l px-4 pt-2 pb-4 max-[1024px]:fixed max-[1024px]:top-[72px] compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(440px,92vw)] max-[1024px]:bg-background max-[1024px]:shadow-2xl motion-enter max-[600px]:top-auto max-[600px]:left-0 max-[600px]:h-[min(85dvh,calc(100dvh-3rem-env(safe-area-inset-top)-1rem))] max-[600px]:w-full max-[600px]:rounded-t-2xl max-[600px]:border-t max-[600px]:border-l-0 max-[600px]:px-3.5 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]"
+          : "relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]"}>
+        {chatPanel && <div className="flex shrink-0 items-center justify-between pb-2">
+          <h2 className="m-0 text-[13px] font-medium text-muted-foreground">{session?.kind === "group" ? session.title : "Conversation"}</h2>
+          <Button variant="ghost" size="icon" data-chat-close aria-label="Close conversation" title="Close (Esc)" onClick={closeChat}
+            className="size-8 rounded-lg text-muted-foreground hover:text-foreground"><X strokeWidth={1.75} /></Button></div>}
         {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
           <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />Drop to attach</span></div>}
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}

@@ -8,7 +8,7 @@ vi.mock("../../src/workspace/index.js", async () => (await import("../helpers/ag
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("../helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../../src/logger.js", async () => (await import("../helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, installAgentTestHooks, mockConfig } from "../helpers/agent-harness.js";
+import { Agent, MockChannel, installAgentTestHooks, mockConfig, mockSdk } from "../helpers/agent-harness.js";
 import { WebChannel } from "../../src/channels/web.js";
 import { WebSupervisor } from "../../src/web/supervisor.js";
 import { watchBus } from "../../src/watch/bus.js";
@@ -416,4 +416,53 @@ it("with reduced motion the view stops where the owner lets go (no glide)", asyn
   const released = await viewOf(page);
   await page.waitForTimeout(600);
   expect(await viewOf(page)).toEqual(released);
+}, ROOM_TEST_TIMEOUT_MS);
+
+it("the conversation opens beside the room: same stream as the Conversation page, the canvas re-fits; narrow, it is an overlay", async () => {
+  const { page } = await open({ viewport: { width: 1440, height: 900 } }, homeOf());
+  mockSdk.responseFn = () => "Seen from the room.";
+  await page.evaluate(() => { window.location.hash = "home"; });
+  await drawn(page);
+  const canvas = page.locator('[data-testid="home-view"] canvas');
+  const before = (await canvas.boundingBox())!.width;
+  const toggle = page.getByRole("button", { name: /^Conversation beside the room/ });
+  await browserExpect(toggle).toHaveAttribute("aria-pressed", "false");
+  await toggle.click();
+  const panel = page.getByRole("main", { name: "Conversation" });
+  await browserExpect(panel).toBeVisible();
+  const input = panel.getByRole("textbox", { name: "Message Tomo" });
+  await browserExpect(input).toBeFocused();
+  await input.fill("Hello from Home"); await input.press("Enter");
+  await browserExpect(panel.getByText("Seen from the room.", { exact: true })).toBeVisible();
+  // The room gives up the panel's width and re-fits its drawing buffer (no stretching).
+  await browserExpect.poll(async () => (await canvas.boundingBox())!.width).toBeLessThan(before - 300);
+  const box = (await panel.boundingBox())!;
+  expect(box.width).toBeGreaterThanOrEqual(380); expect(box.width).toBeLessThanOrEqual(440);
+  await browserExpect.poll(() => canvas.evaluate((c: HTMLCanvasElement) => Math.abs(c.width / c.clientWidth - c.height / c.clientHeight))).toBeLessThan(0.02);
+  expect(await page.evaluate(() => localStorage.getItem("tomo-home-chat-open"))).toBe("1");
+  await page.keyboard.press("Escape");
+  await browserExpect(panel).toBeHidden();
+  await browserExpect(toggle).toBeFocused();
+  // The Conversation page is the same conversation: the message once, the reply once.
+  await page.getByRole("button", { name: "Conversation", exact: true }).click();
+  await browserExpect(page.getByText("Seen from the room.", { exact: true })).toHaveCount(1);
+  await browserExpect(page.getByText("Hello from Home", { exact: true })).toHaveCount(1);
+  await page.close();
+
+  // Narrow: a modal sheet over the room with a scrim; a click on the scrim closes it, and so does a resume.
+  const narrow = await open({ viewport: { width: 820, height: 900 } }, homeOf());
+  await narrow.page.evaluate(() => { window.location.hash = "home"; });
+  await narrow.page.getByRole("button", { name: /^Conversation beside the room/ }).click();
+  const sheet = narrow.page.getByRole("dialog", { name: "Conversation" });
+  await browserExpect(sheet).toBeVisible();
+  await browserExpect(sheet.getByRole("textbox", { name: "Message Tomo" })).toBeEnabled();
+  await browserExpect(sheet.getByText("Seen from the room.", { exact: true })).toBeVisible();
+  await browserExpect(narrow.page.locator("#home")).toHaveAttribute("inert", "");
+  await narrow.page.getByTestId("chat-scrim").click({ position: { x: 20, y: 300 } });
+  await browserExpect(sheet).toBeHidden();
+  await browserExpect(narrow.page.locator("#home")).not.toHaveAttribute("inert", "");
+  await narrow.page.getByRole("button", { name: /^Conversation beside the room/ }).click();
+  await browserExpect(sheet).toBeVisible();
+  await narrow.page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+  await browserExpect(sheet).toBeHidden();
 }, ROOM_TEST_TIMEOUT_MS);

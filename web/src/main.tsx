@@ -2,6 +2,7 @@ import { lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormE
 import { createRoot } from "react-dom/client";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn, taskAction } from "./api.js";
 import { useWeb } from "./use-web.js";
+import { onResume, repaint } from "./resume.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
 import { MessageBody } from "./message-body.js";
@@ -269,6 +270,19 @@ export function App() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [tasksModal]);
+  // Back from another app (or the back/forward cache): iOS Safari can hand
+  // back a stale frame, the document nudged under its status bar (where
+  // Safari blurs and dims whatever sits there) and a dimmed backdrop left
+  // over the page. Drop the modal layers, put the document back at the top
+  // and have the header repainted.
+  const header = useRef<HTMLElement>(null);
+  const overlayNow = useRef(overlay); overlayNow.current = overlay;
+  useEffect(() => onResume(() => {
+    setMenuOpen(false);
+    if (overlayNow.current) setTasksOpen(false);
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+    repaint(header.current);
+  }), []);
   const systemDark = useMediaQuery("(prefers-color-scheme: dark)");
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -495,7 +509,7 @@ export function App() {
   const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px] [&_code]:whitespace-nowrap";
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : home ? "#home" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : home ? "home" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : home ? "Skip to Home" : "Skip to conversation"}</a>
-    <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content">
+    <header ref={header} className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content">
       <Button ref={menuButton} variant="ghost" size="icon" aria-expanded={drawer} aria-controls="sidebar" title="Menu" aria-label="Menu: conversations, the Study, usage and theme"
         onClick={() => { setTasksOpen(false); setMenuOpen((open) => !open); }}
         className="-ml-2.5 hidden size-11 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>

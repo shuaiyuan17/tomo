@@ -293,3 +293,40 @@ it("the pet sits near Tomo while awake and goes into its nest to sleep", async (
   await page.screenshot({ path: "test-results/home-pet-sleeping.png" });
   await browserExpect(caption(page)).toHaveText(/^Idle for 20 min/);
 }, ROOM_TEST_TIMEOUT_MS);
+
+it("back from another app on a phone: the scrim is gone, nothing stays inert, and the status is read again", async () => {
+  const { page, served } = await open({ ...devices["iPhone 14"], defaultBrowserType: undefined }, homeOf());
+  let reads = 0;
+  page.on("request", (request) => { if (new URL(request.url()).pathname === "/api/v1/home") reads++; });
+  await page.getByRole("button", { name: /^Menu/ }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Home" }).click();
+  await browserExpect(caption(page)).toHaveText(/^Idle for 20 min/);
+  // While the page is away a background subagent starts; the stream never says so.
+  served.home = homeOf({ status: status({ subagents: [{ id: "bg", type: "general-purpose" }] }) });
+  const before = reads;
+  // The drawer is open when the owner switches apps.
+  await page.getByRole("button", { name: /^Menu/ }).click();
+  await browserExpect(page.getByRole("dialog")).toBeVisible();
+  await page.evaluate(() => {
+    let hidden = true;
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => hidden ? "hidden" : "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+  });
+  await browserExpect(page.getByRole("button", { name: /^Menu/ })).toHaveAttribute("aria-expanded", "false");
+  await browserExpect(page.getByRole("dialog")).toHaveCount(0);
+  // No backdrop left over the page, the header is on top at its own spot, nothing is inert.
+  await browserExpect(page.locator(".fixed.inset-0.bg-black\\/20")).toHaveCount(0);
+  expect(await page.evaluate(() => {
+    const header = document.querySelector("header")!;
+    const box = header.getBoundingClientRect();
+    return { top: box.top, hit: header.contains(document.elementFromPoint(box.left + box.width / 2, box.bottom - 4)), scrolled: scrollY,
+      inert: [...document.querySelectorAll("main, header")].some((el) => (el as HTMLElement).inert) };
+  })).toEqual({ top: 0, hit: true, scrolled: 0, inert: false });
+  // The page reconnected and read /home again: the visitor shows.
+  await browserExpect(caption(page)).toHaveText(/1 subagent/);
+  expect(reads).toBeGreaterThan(before);
+});

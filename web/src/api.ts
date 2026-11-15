@@ -86,16 +86,27 @@ export interface StreamHandlers {
   cursor(value: string): void;
 }
 /** Fetch SSE supports our same-origin header; EventSource cannot set one. */
-export async function stream(cursor: string, signal: AbortSignal, handlers: StreamHandlers): Promise<void> {
+/**
+ * The daemon writes a heartbeat every 15 s. A stream silent for longer than
+ * this is dead even if no error says so (iOS drops a suspended page's
+ * sockets without telling the reader), and is given up for a reconnect.
+ */
+export const STREAM_IDLE_MS = 45_000;
+export async function stream(cursor: string, signal: AbortSignal, handlers: StreamHandlers, idleMs = STREAM_IDLE_MS): Promise<void> {
   const response = await fetch(`/api/v1/events?cursor=${encodeURIComponent(cursor)}`, {
     signal, credentials: "same-origin", headers: { "x-tomo-request": "1" },
   });
   if (!response.ok || !response.body) throw new Error("Stream unavailable");
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  let stale = false;
+  const watch = () => { clearTimeout(idle); idle = setTimeout(() => { stale = true; void reader.cancel().catch(() => {}); }, idleMs); };
   try {
     for (;;) {
+      watch();
       const { value, done } = await reader.read();
+      if (stale) throw new Error("Stream went quiet");
       if (done) throw new Error("Stream disconnected");
       buffer += value;
       if (buffer.length > 2 * 1024 * 1024) throw new Error("Stream limit exceeded");
@@ -111,7 +122,7 @@ export async function stream(cursor: string, signal: AbortSignal, handlers: Stre
         if (fields.id) handlers.cursor(fields.id);
       }
     }
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally { clearTimeout(idle); await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 export type { WebBootstrap };
 

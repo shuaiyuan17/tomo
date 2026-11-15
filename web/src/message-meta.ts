@@ -11,14 +11,29 @@ export function channelLabel(channel: string | undefined): string {
   return CHANNEL_NAMES[channel.toLowerCase()] ?? channel.charAt(0).toUpperCase() + channel.slice(1);
 }
 
+const TIME: Intl.DateTimeFormatOptions = { hour: "numeric", minute: "2-digit" };
+const DATE_TIME: Intl.DateTimeFormatOptions = { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit" };
+const formatters = new Map<string, Intl.DateTimeFormat>();
+/**
+ * One Intl formatter per shape and locale. `toLocaleTimeString` /
+ * `toLocaleString` with these options format exactly the same, but build a
+ * new formatter on every call: a long history's meta lines paid for that.
+ */
+function formatter(shape: "time" | "dateTime", locale: string | undefined): Intl.DateTimeFormat {
+  const key = `${shape}\n${locale ?? ""}`;
+  let found = formatters.get(key);
+  if (!found) { found = new Intl.DateTimeFormat(locale, shape === "time" ? TIME : DATE_TIME); formatters.set(key, found); }
+  return found;
+}
+
 /** "6:32 AM" (no leading zero; 24-hour locales keep their own form). */
 export function messageTime(timestamp: number, locale?: string): string {
-  return new Date(timestamp).toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+  return formatter("time", locale).format(timestamp);
 }
 
 /** The full date and time, for the timestamp's tooltip. */
 export function messageDateTime(timestamp: number, locale?: string): string {
-  return new Date(timestamp).toLocaleString(locale, { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit" });
+  return formatter("dateTime", locale).format(timestamp);
 }
 
 function dayStart(timestamp: number): number {

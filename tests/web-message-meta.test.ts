@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { channelLabel, dayDividers, dayLabel, dividerBefore, messageTime } from "../web/src/message-meta.js";
+import { channelLabel, dayDividers, dayLabel, dividerBefore, messageDateTime, messageTime } from "../web/src/message-meta.js";
 
 const at = (y: number, m: number, d: number, h = 12, min = 0) => new Date(y, m - 1, d, h, min).getTime();
 const now = at(2026, 11, 15, 10);
@@ -14,6 +14,15 @@ describe("message meta line", () => {
   });
   it("shows the hour without a leading zero", () => {
     expect(messageTime(at(2026, 11, 15, 6, 5), "en-US")).toBe("6:05 AM");
+  });
+  it("formats exactly as toLocaleTimeString / toLocaleString do (cached formatters)", () => {
+    for (const locale of [undefined, "en-US", "en-GB", "de-DE", "ja-JP", "zh-CN"]) {
+      for (const stamp of [at(2026, 1, 1, 0, 0), at(2026, 11, 15, 6, 5), at(2025, 7, 4, 23, 59)]) {
+        expect(messageTime(stamp, locale)).toBe(new Date(stamp).toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" }));
+        expect(messageDateTime(stamp, locale)).toBe(new Date(stamp).toLocaleString(locale,
+          { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit" }));
+      }
+    }
   });
 });
 
